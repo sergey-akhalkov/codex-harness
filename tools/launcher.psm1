@@ -1,0 +1,138 @@
+#requires -Version 7.4
+# The dispatch table follows `codex --help` from the supported CLI (0.153.4).
+# This module only decides whether to prepend a native file-profile selector.
+Set-StrictMode -Version Latest
+$script:SingleValueOptions = @('-c', '--config', '--enable', '--disable', '--remote',
+    '--remote-auth-token-env', '-m', '--model', '--local-provider', '-p',
+    '--profile', '-s', '--sandbox', '-C', '--cd', '--add-dir', '-a',
+    '--ask-for-approval', '--thread-source', '--output-schema', '--color',
+    '-o', '--output-last-message', '--base', '--commit', '--title')
+
+function Get-HarnessArguments {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][AllowEmptyString()][string[]] $Arguments = @(),
+        [string] $ProfileName = 'harness'
+    )
+
+    $commands = @('agents', 'exec', 'e', 'review', 'login', 'logout', 'mcp', 'plugin',
+        'mcp-server', 'app-server', 'remote-control', 'app', 'completion', 'update',
+        'doctor', 'sandbox', 'debug', 'apply', 'a', 'resume', 'queue', 'archive',
+        'delete', 'migrate-rollouts', 'unarchive', 'fork', 'cloud', 'exec-server',
+        'features', 'help')
+    $command = $null
+    $debugCommand = $null
+    $sawPositional = $false
+    $commandPositionals = 0
+    $preserve = $false
+
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        if ($argument -ceq '--') { break }
+        if ($argument -cin @('-h', '--help', '-V', '--version') -or $argument -cmatch '^-[hV]+$') { $preserve = $true; continue }
+        if ($argument -cmatch '^--profile(?:=|$)' -or $argument -cmatch '^-p') {
+            $preserve = $true
+        }
+        if ($argument -cmatch '^--remote(?:=|$)') { $preserve = $true }
+        if ($argument -cin $script:SingleValueOptions) { $index++; continue }
+        # Images are a variable-length option: words after --image are image
+        # values until the next option, including words that name subcommands.
+        if ($argument -cin @('-i', '--image') -or $argument -cmatch '^--image=' -or $argument -cmatch '^-i.') {
+            while ($index + 1 -lt $Arguments.Count -and -not $Arguments[$index + 1].StartsWith('-')) { $index++ }
+            continue
+        }
+        if ($argument.StartsWith('-') -and $argument -cne '-') { continue }
+        if (-not $sawPositional) {
+            $sawPositional = $true
+            if ($argument -cin $commands) { $command = $argument }
+        } else {
+            $commandPositionals++
+            if ($command -cin @('exec', 'e') -and $commandPositionals -eq 1 -and $argument -ceq 'help') { $preserve = $true }
+            if ($command -ceq 'debug' -and $commandPositionals -eq 1) { $debugCommand = $argument }
+        }
+    }
+
+    $session = $null -eq $command -or $command -cin @('exec', 'e', 'review', 'resume', 'fork')
+    if ($command -ceq 'debug' -and $debugCommand -ceq 'prompt-input') { $session = $true }
+    if ($session -and -not $preserve) { '--profile'; $ProfileName }
+    # Do not stringify/reparse a command line: each original argument stays one
+    # argument, including empty strings, embedded quotes and `--` prompt text.
+    foreach ($argument in $Arguments) { $argument }
+}
+
+function Get-HarnessAdditionalRoots {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments = @(),
+        [string]$WorkingDirectory = (Get-Location).ProviderPath)
+    $directory = $WorkingDirectory
+    $roots = [Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        if ($argument -ceq '--') { break }
+        if ($argument -cmatch '^--remote(?:=|$)') { return }
+        if ($argument -cin @('--add-dir','-C','--cd')) {
+            if ($index + 1 -ge $Arguments.Count) { return }
+            $value = $Arguments[++$index]
+            if ($argument -ceq '--add-dir') { $roots.Add($value) } else { $directory = $value }
+        } elseif ($argument -cmatch '^--add-dir=(.*)$') { $roots.Add($Matches[1])
+        } elseif ($argument -cmatch '^--cd=(.*)$' -or $argument -cmatch '^-C(.+)$') { $directory = $Matches[1]
+        } elseif ($argument -cin $script:SingleValueOptions) { $index++
+        } elseif ($argument -cin @('-i','--image') -or $argument -cmatch '^--image=' -or $argument -cmatch '^-i.') {
+            while ($index + 1 -lt $Arguments.Count -and -not $Arguments[$index + 1].StartsWith('-')) { $index++ }
+        }
+    }
+    # Native 0.153.4 resolves --add-dir relative to the effective --cd directory.
+    # Capture only explicit CLI roots; do not infer paths from prompts or shell text.
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    try {
+        $directory = [IO.Path]::GetFullPath($directory, $WorkingDirectory)
+        foreach ($root in $roots) {
+            $full = [IO.Path]::GetFullPath($root, $directory)
+            if ((Test-Path -LiteralPath $full -PathType Container) -and $seen.Add($full)) { $full }
+        }
+    } catch { return } # Preserve native CLI argument validation and exit behavior.
+}
+
+function Resolve-HarnessFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer) { throw "Expected a file: $Path" }
+    if ($item.LinkType) {
+        $target = $item.ResolveLinkTarget($true)
+        if ($null -eq $target -or -not $target.Exists) { throw "Link source is unavailable: $Path" }
+        return $target.FullName
+    }
+    return $item.FullName
+}
+
+function Get-HarnessLaunchConfiguration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $LauncherSource)
+    $codexDirectory = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    $metadataPath = Join-Path $codexDirectory 'harness/installation.json'
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+        throw "Harness registration is missing at '$metadataPath'. Run install.ps1 from the checkout to connect this CODEX_HOME."
+    }
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($metadata.schemaVersion -ne 1 -or $metadata.profileName -cne 'harness') {
+        throw "Unsupported harness registration at '$metadataPath'. Run install.ps1 from the checkout to repair it."
+    }
+    if (-not [IO.Path]::IsPathFullyQualified($metadata.sourceRoot) -or -not [IO.Path]::IsPathFullyQualified($metadata.codexCommand)) {
+        throw "Harness sourceRoot and codexCommand must be absolute paths in '$metadataPath'."
+    }
+    $registeredLauncher = Resolve-HarnessFile (Join-Path $metadata.sourceRoot 'tools/codex.ps1')
+    if (-not [string]::Equals($registeredLauncher, $LauncherSource, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Harness source registration does not match this launcher. Run install.ps1 from the intended checkout to reconnect it."
+    }
+    $originalSource = Resolve-HarnessFile $metadata.codexCommand
+    if ([string]::Equals($originalSource, $LauncherSource, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Harness codexCommand points back to its launcher. Run install.ps1 to repair the original CLI registration."
+    }
+    if ([IO.Path]::GetExtension($metadata.codexCommand) -notin @('.ps1', '.exe')) {
+        throw 'The original Codex command must be a PowerShell script or executable, not a cmd/bat shim.'
+    }
+    return $metadata
+}
+
+Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessAdditionalRoots, Resolve-HarnessFile, Get-HarnessLaunchConfiguration

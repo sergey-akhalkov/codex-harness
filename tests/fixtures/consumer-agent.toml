@@ -1,0 +1,4 @@
+# Test-only role. The installer must never register tests/fixtures as production roles.
+name = "harness_consumer_fixture"
+description = "Harmless fixture for testing direct custom-agent configuration and resources."
+developer_instructions = "This is a harmless integration fixture. The caller supplies a fixture directory. Read only consumer-agent-resource.txt in that directory and return exactly AGENT_V1: followed by its trimmed content. Make no edits, spawn no agents, and perform no other work."

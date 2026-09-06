@@ -1,0 +1,22 @@
+# Shared defaults, read directly through the linked `harness` file profile.
+# Native TUI settings writes may add machine-specific values, including trust paths.
+# Credentials, histories, caches and installer state remain outside this repository.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model = "gpt-6-astra"
+model_reasoning_effort = "xhigh"
+approvals_reviewer = "user"
+
+[notice]
+hide_rate_limit_model_nudge = true
+
+[tui]
+pet = "disabled"
+status_line = ["model-with-reasoning", "weekly-limit", "thread-title"]
+status_line_use_colors = true
+
+[tui.model_availability_nux]
+gpt-6-astra = 4
+
+[projects.'d:\mekha\mtronics\pmac-emulator']
+trust_level = "trusted"

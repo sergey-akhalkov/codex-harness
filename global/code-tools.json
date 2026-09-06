@@ -1,0 +1,585 @@
+{
+  "schema_version": 1,
+  "scope": "connect-global-mcp-lsp",
+  "version_policy": "latest-stable-compatible-at-explicit-install-or-update",
+  "runtime_downloads": false,
+  "reuse_policy": "Adopt verified shared installations; preserve unrelated packages and project runtimes. No second permanent Codex installation.",
+  "verification_policy": "Discovery proves installation identity only. Negotiated capabilities and real project evidence are required before a language or operation is delivered.",
+  "mcp": [
+    {
+      "id": "serena",
+      "package": "serena-agent",
+      "manager": "uv",
+      "source": "https://pypi.org/project/serena-agent/",
+      "metadata": "https://pypi.org/pypi/serena-agent/json",
+      "runtime": [
+        "Python >=3.11",
+        "uv"
+      ],
+      "entrypoint": "serena.cli:top_level",
+      "arguments": [
+        "start-mcp-server",
+        "--context",
+        "codex",
+        "--project-from-cwd",
+        "--enable-web-dashboard",
+        "false"
+      ],
+      "required_operations": [
+        "symbol-navigation",
+        "references",
+        "semantic-edit",
+        "diagnostics"
+      ],
+      "verification": "Actual MCP handshake and navigation, diagnostic and disposable edit in two roots."
+    },
+    {
+      "id": "codebase-memory",
+      "package": "codebase-memory-mcp",
+      "manager": "npm",
+      "source": "https://github.com/DeusData/codebase-memory-mcp",
+      "metadata": "https://registry.npmjs.org/codebase-memory-mcp/latest",
+      "runtime": [
+        "Node.js",
+        "npm"
+      ],
+      "command": "codebase-memory-mcp",
+      "required_operations": [
+        "index",
+        "structured-query"
+      ],
+      "verification": "Index and query disposable projects with distinct root identities."
+    },
+    {
+      "id": "graphify",
+      "package": "graphifyy",
+      "extras": [
+        "mcp"
+      ],
+      "manager": "uv",
+      "source": "https://github.com/Graphify-Labs/graphify",
+      "metadata": "https://pypi.org/pypi/graphifyy/json",
+      "runtime": [
+        "Python >=3.11",
+        "uv"
+      ],
+      "entrypoint": "graphify.serve",
+      "excluded_packages": [
+        "@dreamtree-org/graphify"
+      ],
+      "required_operations": [
+        "graph-query",
+        "explicit-repository-operations"
+      ],
+      "verification": "Authenticated existing endpoint or stdio using the same graph; explicit repo validation; saved graph preserved."
+    },
+    {
+      "id": "nuphus",
+      "package": "@nuphus/nuphus-mcp",
+      "manager": "npm",
+      "source": "https://github.com/mrpulor-gh/nuphus-mcp",
+      "metadata": "https://registry.npmjs.org/@nuphus%2fnuphus-mcp/latest",
+      "runtime": [
+        "Node.js",
+        "npm",
+        "Windows interactive desktop",
+        "Native companion ONNX Runtime and cached OCR detector, recognizer and PaddleOCR dictionary"
+      ],
+      "command": "nuphus-mcp",
+      "required_operations": [
+        "desktop-inspection",
+        "browser-inspection",
+        "desktop-browser-interaction"
+      ],
+      "verification": "Actual read, offline OCR and bounded interaction with a disposable owned target. Missing OCR artifacts are provisioned explicitly with recoverable file journals; session startup never downloads models."
+    }
+  ],
+  "languages": [
+    {
+      "id": "rust",
+      "name": "Rust",
+      "required": true,
+      "backend": "rust-analyzer",
+      "serena_id": "rust",
+      "package": "rust-analyzer",
+      "manager": "rustup",
+      "source": "https://rust-analyzer.github.io/book/installation.html",
+      "runtime": [
+        "project Rust toolchain"
+      ],
+      "project_inputs": [
+        "Cargo.toml",
+        "rust-toolchain.toml"
+      ],
+      "extensions": [
+        ".rs"
+      ],
+      "provision": "Reuse the existing rustup component; install a missing component only in an explicitly selected installed toolchain. Never change a project toolchain.",
+      "verification": "Rust project symbols, definition, references; known error and clearance.",
+      "metadata": "https://static.rust-lang.org/dist/channel-rust-stable.toml",
+      "metadata_format": "rust-channel"
+    },
+    {
+      "id": "typescript",
+      "name": "TypeScript",
+      "required": true,
+      "backend": "typescript-language-server",
+      "serena_id": "typescript",
+      "package": "typescript-language-server",
+      "manager": "npm",
+      "source": "https://github.com/typescript-language-server/typescript-language-server",
+      "metadata": "https://registry.npmjs.org/typescript-language-server/latest",
+      "runtime": [
+        "Node.js",
+        "TypeScript"
+      ],
+      "project_inputs": [
+        "tsconfig.json",
+        "package.json"
+      ],
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".mts",
+        ".cts"
+      ],
+      "provision": "Reuse Serena's existing npm package directory; compatible server/runtime updates only in explicit lifecycle operations. Project TypeScript takes precedence.",
+      "verification": "TypeScript project symbols, definition, references; type error and clearance."
+    },
+    {
+      "id": "javascript",
+      "name": "JavaScript",
+      "required": true,
+      "backend": "typescript-language-server",
+      "serena_id": "typescript",
+      "package": "typescript-language-server",
+      "manager": "npm",
+      "source": "https://github.com/typescript-language-server/typescript-language-server",
+      "metadata": "https://registry.npmjs.org/typescript-language-server/latest",
+      "runtime": [
+        "Node.js",
+        "TypeScript"
+      ],
+      "project_inputs": [
+        "jsconfig.json",
+        "package.json",
+        "checkJs policy"
+      ],
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs"
+      ],
+      "provision": "Share the TypeScript server installation; honor project JavaScript diagnostic policy.",
+      "verification": "Separate JavaScript project navigation and configured diagnostic introduction/clearance."
+    },
+    {
+      "id": "powershell",
+      "name": "PowerShell",
+      "required": true,
+      "backend": "PowerShellEditorServices",
+      "serena_id": "powershell",
+      "package": "PowerShellEditorServices",
+      "manager": "serena-cache",
+      "source": "https://github.com/PowerShell/PowerShellEditorServices",
+      "metadata": "https://api.github.com/repos/PowerShell/PowerShellEditorServices/releases/latest",
+      "runtime": [
+        "PowerShell",
+        "PSScriptAnalyzer"
+      ],
+      "project_inputs": [
+        "PSScriptAnalyzerSettings.psd1",
+        "module paths"
+      ],
+      "extensions": [
+        ".ps1",
+        ".psm1",
+        ".psd1"
+      ],
+      "provision": "Reuse existing Serena PSES cache and its analyzer; acquire official release bundle on explicit install/update.",
+      "verification": "PowerShell project navigation, syntax/analyzer error and clearance."
+    },
+    {
+      "id": "python",
+      "name": "Python",
+      "required": true,
+      "backend": "basedpyright",
+      "serena_id": "python_basedpyright",
+      "package": "basedpyright",
+      "manager": "npm",
+      "source": "https://github.com/DetachHead/basedpyright",
+      "metadata": "https://registry.npmjs.org/basedpyright/latest",
+      "runtime": [
+        "Node.js",
+        "project Python interpreter"
+      ],
+      "project_inputs": [
+        "pyrightconfig.json",
+        "pyproject.toml",
+        "project environment"
+      ],
+      "extensions": [
+        ".py",
+        ".pyi"
+      ],
+      "provision": "Prefer an existing compatible Pyright installation; provision into shared Serena cache on explicit install only. Do not modify the project environment.",
+      "verification": "Project environment resolution, symbols, definition, references; configured error and clearance."
+    },
+    {
+      "id": "delphi",
+      "name": "Delphi",
+      "required": true,
+      "backend": "pasls",
+      "serena_id": "pascal",
+      "package": "pascal-language-server",
+      "manager": "serena-cache",
+      "source": "https://github.com/zen010101/pascal-language-server",
+      "metadata": "https://api.github.com/repos/zen010101/pascal-language-server/releases/latest",
+      "runtime": [
+        "Delphi-compatible backend",
+        "FPC compiler driver and matching sources for pasls CodeTools; explicit target OS/CPU",
+        "project Delphi SDK and unit/include paths"
+      ],
+      "project_inputs": [
+        ".dproj",
+        ".dpr",
+        "dialect/compiler options",
+        "unit/include paths",
+        "SDK paths"
+      ],
+      "extensions": [
+        ".pas",
+        ".dpr",
+        ".dpk",
+        ".inc"
+      ],
+      "provision": "Existing pasls is a candidate, not proven Delphi support. Preserve it and validate actual Delphi syntax/SDK. User-owned SDKs cannot be substituted with FPC-only tests.",
+      "verification": "Actual Delphi multiunit project, dialect and SDK recorded; cross-unit definition/references, known diagnostic and clearance."
+    },
+    {
+      "id": "cpp",
+      "name": "C++",
+      "required": true,
+      "backend": "clangd",
+      "serena_id": "cpp",
+      "package": "clangd",
+      "manager": "opencode-cache",
+      "source": "https://github.com/clangd/clangd",
+      "metadata": "https://api.github.com/repos/clangd/clangd/releases/latest",
+      "runtime": [
+        "project C++ compiler and headers"
+      ],
+      "project_inputs": [
+        "compile_commands.json",
+        ".clangd",
+        "include paths"
+      ],
+      "extensions": [
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx"
+      ],
+      "provision": "Reuse the existing OpenCode clangd binary; official release archive only on explicit install/update.",
+      "verification": "Project compiler flags, cross-file symbols/definition/references; diagnostic and clearance."
+    },
+    {
+      "id": "csharp",
+      "name": "C#",
+      "required": true,
+      "backend": "roslyn",
+      "serena_id": "csharp",
+      "package": "roslyn-language-server.win-x64",
+      "manager": "nuget",
+      "source": "https://github.com/dotnet/roslyn",
+      "metadata": "https://api.nuget.org/v3-flatcontainer/roslyn-language-server.win-x64/index.json",
+      "runtime": [
+        "project .NET SDK",
+        ".NET runtime compatible with the selected Roslyn server (10.0 for Roslyn 5.11)"
+      ],
+      "project_inputs": [
+        ".sln",
+        ".csproj",
+        "global.json"
+      ],
+      "extensions": [
+        ".cs"
+      ],
+      "provision": "Reuse the existing compatible Roslyn server, including a verified editor install; otherwise official NuGet package in shared Serena cache. Preserve project SDK choice.",
+      "verification": "Actual solution symbols/definition/references, compiler diagnostic and clearance."
+    },
+    {
+      "id": "json",
+      "name": "JSON",
+      "required": true,
+      "backend": "vscode-json-language-server",
+      "serena_id": "json",
+      "package": "vscode-langservers-extracted",
+      "manager": "npm",
+      "source": "https://github.com/microsoft/vscode-json-languageservice",
+      "metadata": "https://registry.npmjs.org/vscode-langservers-extracted/latest",
+      "runtime": [
+        "Node.js"
+      ],
+      "project_inputs": [
+        "JSON schema associations",
+        "JSONC file policy"
+      ],
+      "extensions": [
+        ".json",
+        ".jsonc"
+      ],
+      "provision": "Reuse existing VS Code JSON server package; otherwise explicit npm provisioning in shared Serena cache.",
+      "verification": "Actual JSON symbols and advertised navigation, syntax/schema diagnostic and clearance."
+    },
+    {
+      "id": "markdown",
+      "name": "Markdown",
+      "required": true,
+      "backend": "vscode-markdown-language-server",
+      "serena_id": "markdown",
+      "package": "vscode-langservers-extracted",
+      "manager": "npm",
+      "source": "https://github.com/hrsh7th/vscode-langservers-extracted",
+      "metadata": "https://registry.npmjs.org/vscode-langservers-extracted/latest",
+      "runtime": [
+        "node",
+        "markdown-it parser from the shared language-server prefix"
+      ],
+      "project_inputs": [
+        "workspace Markdown links",
+        "Markdown validation settings"
+      ],
+      "extensions": [
+        ".md",
+        ".markdown"
+      ],
+      "provision": "Reuse the existing shared VS Code language-server package and explicitly add only its markdown-it parser dependency through npm with retained prefix/lock rollback. Preserve an existing Marksman until replacement behavior is verified.",
+      "verification": "Heading/link symbols and advertised references/definition; broken-link diagnostic and clearance."
+    },
+    {
+      "id": "yaml",
+      "name": "YAML",
+      "required": false,
+      "conditional": "Activate only when a ready compatible backend is already available; do not install extra dependencies for this optional row.",
+      "backend": "yaml-language-server",
+      "serena_id": "yaml",
+      "package": "yaml-language-server",
+      "manager": "npm",
+      "source": "https://github.com/redhat-developer/yaml-language-server",
+      "metadata": "https://registry.npmjs.org/yaml-language-server/latest",
+      "runtime": [
+        "Node.js"
+      ],
+      "project_inputs": [
+        "YAML schema associations"
+      ],
+      "extensions": [
+        ".yaml",
+        ".yml"
+      ],
+      "provision": "Reuse-only conditional language.",
+      "verification": "If activated, actual YAML server symbols, syntax/schema diagnostic and clearance."
+    },
+    {
+      "id": "toml",
+      "name": "TOML",
+      "required": true,
+      "backend": "taplo",
+      "serena_id": null,
+      "package": "taplo",
+      "manager": "serena-cache",
+      "source": "https://github.com/tamasfe/taplo",
+      "runtime": [],
+      "project_inputs": [
+        "taplo.toml",
+        ".taplo.toml",
+        "schema associations"
+      ],
+      "extensions": [
+        ".toml"
+      ],
+      "provision": "Use the official native Taplo Windows release with LSP support. The @taplo/cli0.7.0 npm build was verified to omit LSP and is not a valid backend.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "metadata": "https://api.github.com/repos/tamasfe/taplo/releases/latest"
+    },
+    {
+      "id": "xml",
+      "name": "XML",
+      "required": true,
+      "backend": "lemminx",
+      "serena_id": null,
+      "package": "org.eclipse.lemminx",
+      "manager": "serena-cache",
+      "source": "https://github.com/eclipse-lemminx/lemminx",
+      "runtime": [],
+      "project_inputs": [
+        "XML catalogs",
+        "XSD schemas",
+        "Qt XML file identity"
+      ],
+      "extensions": [
+        ".xml",
+        ".xsd",
+        ".xsl",
+        ".xslt",
+        ".ui",
+        ".qrc"
+      ],
+      "provision": "Reuse/provision the official Red Hat LemMinX native Windows release; it requires no separate Java runtime.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "metadata": "https://api.github.com/repos/redhat-developer/vscode-xml/releases/latest"
+    },
+    {
+      "id": "cmake",
+      "name": "CMake",
+      "required": true,
+      "backend": "neocmakelsp",
+      "serena_id": null,
+      "package": "neocmakelsp",
+      "manager": "serena-cache",
+      "source": "https://github.com/neocmakelsp/neocmakelsp",
+      "runtime": [
+        "project CMake"
+      ],
+      "project_inputs": [
+        "CMakeLists.txt",
+        "CMakePresets.json"
+      ],
+      "extensions": [
+        ".cmake"
+      ],
+      "provision": "Use the official native neocmakelsp Windows release. Python cmake-language-server0.1.11 has no diagnostic/symbol handlers and does not meet this delivery scope.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "metadata": "https://api.github.com/repos/neocmakelsp/neocmakelsp/releases/latest"
+    },
+    {
+      "id": "bash",
+      "name": "Bash",
+      "required": true,
+      "backend": "bash-language-server",
+      "serena_id": "bash",
+      "package": "bash-language-server",
+      "manager": "npm",
+      "source": "https://github.com/bash-lsp/bash-language-server",
+      "runtime": [
+        "Node.js",
+        "ShellCheck",
+        "Bash"
+      ],
+      "project_inputs": [
+        "shellcheckrc",
+        "shell dialect"
+      ],
+      "extensions": [
+        ".sh",
+        ".bash"
+      ],
+      "provision": "Reuse an existing compatible installation; otherwise provision from the declared official source only during explicit install/update.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "metadata": "https://registry.npmjs.org/bash-language-server/latest"
+    },
+    {
+      "id": "qml",
+      "name": "QML",
+      "required": false,
+      "backend": "qmlls",
+      "serena_id": "qml",
+      "package": "qmlls",
+      "manager": "qt-sdk",
+      "source": "https://doc.qt.io/qt-6/qtqml-tool-qmlls.html",
+      "runtime": [
+        "Qt6 SDK with qmlls"
+      ],
+      "project_inputs": [
+        ".qmlls.ini",
+        "Qt import/build paths"
+      ],
+      "extensions": [
+        ".qml"
+      ],
+      "provision": "Reuse-only conditional language.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "conditional": "Activate only when a ready compatible backend is already available; no extra dependencies for this optional row."
+    },
+    {
+      "id": "html",
+      "name": "HTML",
+      "required": false,
+      "backend": "vscode-html-language-server",
+      "serena_id": "html",
+      "package": "vscode-langservers-extracted",
+      "manager": "npm",
+      "source": "https://github.com/microsoft/vscode-html-languageservice",
+      "runtime": [
+        "Node.js"
+      ],
+      "project_inputs": [
+        "HTML project settings"
+      ],
+      "extensions": [
+        ".html",
+        ".htm"
+      ],
+      "provision": "Reuse-only conditional language.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "conditional": "Activate only when a ready compatible backend is already available; no extra dependencies for this optional row.",
+      "metadata": "https://registry.npmjs.org/vscode-langservers-extracted/latest"
+    },
+    {
+      "id": "css",
+      "name": "CSS",
+      "required": false,
+      "backend": "vscode-css-language-server",
+      "serena_id": "scss",
+      "package": "vscode-langservers-extracted",
+      "manager": "npm",
+      "source": "https://github.com/microsoft/vscode-css-languageservice",
+      "runtime": [
+        "Node.js"
+      ],
+      "project_inputs": [
+        "CSS/SCSS project settings"
+      ],
+      "extensions": [
+        ".css",
+        ".scss",
+        ".sass"
+      ],
+      "provision": "Reuse-only conditional language.",
+      "verification": "Actual project initialization, advertised navigation operations, diagnostic introduction and clearance.",
+      "conditional": "Activate only when a ready compatible backend is already available; no extra dependencies for this optional row.",
+      "metadata": "https://registry.npmjs.org/vscode-langservers-extracted/latest"
+    }
+  ],
+  "operation_policy": {
+    "required_where_provided": [
+      "documentSymbol",
+      "definition",
+      "references",
+      "diagnostics"
+    ],
+    "negotiate_and_verify_before_exposing": [
+      "hover",
+      "implementation",
+      "workspaceSymbol",
+      "callHierarchy",
+      "rename"
+    ],
+    "automatic_diagnostics": "Fresh diagnostics after native patch, shell and MCP edits; authoritative current empty result is clean. Missing or stale output is unresolved.",
+    "exposed_operations": [],
+    "evidence": []
+  },
+  "language_resolution": {
+    "qt_translation_ts": "An XML declaration/TS root element or Qt project association identifies Qt translations. Do not treat these .ts files as TypeScript.",
+    "cmake_filenames": [
+      "CMakeLists.txt"
+    ],
+    "extension_only_selection": false
+  }
+}
