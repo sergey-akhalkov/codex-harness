@@ -13,6 +13,13 @@ installer includes its explicit dependency lifecycle and MCP registrations.
 `-CoreOnly` selects the previously accepted instructions/profile/skills/agents
 connection for an isolated core installation or its regression checks.
 
+The default installer also includes [subscription model routing](subscription-models.md)
+through pinned OpenCodex. `-SubscriptionsOnly` adds, checks or disconnects that
+component on an existing kit installation. It requires a native MSI/portable
+PowerShell 7.4+ host for Task Scheduler, Node/npm for dependency provisioning,
+and separate provider authorization. Microsoft Store PowerShell remains usable
+interactively but is not selected for the subscription background task.
+
 Native profiled TUI settings writes modify the linked repository source.
 The user explicitly accepted machine-specific values in this shared config,
 including trusted project paths. `/model` and trust persistence were both
@@ -226,3 +233,5 @@ writers were checked separately from the launcher and their evidence is scoped
 to the exercised operations. Unprofiled app-server writers do not establish the
 write target of a profiled TUI; its accepted shared-file persistence is described
 above.
+
+Для диагностики происхождения настроек и конфликтов из любого проекта доступна `codex-harness-check.ps1 -Json`, эквивалент `install.ps1 -Mode Check -Diagnose`. Команда входит в тот же жизненный цикл прямых ссылок. Формат отчёта, границы native-наблюдений и порядок восстановления описаны в [диагностике источников](source-diagnostics.md).

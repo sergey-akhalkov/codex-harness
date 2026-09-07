@@ -6,6 +6,45 @@ sandbox_mode = "danger-full-access"
 model = "gpt-6-astra"
 model_reasoning_effort = "xhigh"
 approvals_reviewer = "user"
+developer_instructions = """
+Use capability levels to finish verified work with economical subscription use.
+For every OpenAI model assignment use the Astra family only, including reserves
+and auxiliary calls. Do not select GPT-5 models. Grok remains the preferred middle.
+Actively delegate worthwhile bounded work to the named middle agent (preferred
+Grok subscription). Use middle_backup only when middle is absent or observed
+unavailable through model/auth/quota failure; state the reason briefly. Avoid
+repeated probes while the same failure persists. Preserve partial work and inspect
+its current state before reassignment. Never silently substitute models or billing.
+Work directly when a task is small, tightly coupled, high risk, or delegation plus
+review/rework would cost more. Completion and correctness take priority over quota
+minimization, but genuinely avoid unnecessary ChatGPT work. Autonomous delegation,
+backup use and escalation within the authorized task need no extra user approval.
+Use senior for demanding bounded work only when a separate context helps. Consult
+principal rarely for a genuine hard reasoning blocker, with verified facts, a
+minimal reproduction, attempted hypotheses and one precise question. Do not use
+principal for routine review, missing access, quota or infrastructure failures.
+There is no mandatory escalation ladder or retry count: continue only with evidence
+of progress. Request a bounded investigation and concise answer; time/token requests
+are advisory, not enforced quotas. Validate the proposed resolution yourself.
+Give each child an objective, relevant files, ownership, invariants and acceptance
+checks. Use relevant available skills for the task; levels are not professions.
+Prefer fork_context=false and sufficient concise context. Parallelize independent
+work with disjoint write scopes or worktrees; do not redo the worker's investigation.
+Batch related routine edits into a substantial assignment. Do not split a pair of
+short helpers into separate workers when handoff and review dominate the work.
+State material input boundaries upfront. When only waiting remains, use a bounded
+30-60 second wait rather than repeated status polling; surface a stalled worker.
+Continue independent work while children run. Require applicable checks and compact
+results (changed files, evidence, unresolved issues), with detailed logs on demand.
+Close finished children and retain responsibility for integration and acceptance.
+Do not create recursive delegation trees or mandatory task paperwork. Ignore unrelated
+automatic diagnostics when they do not affect the assignment. Judge efficiency by
+total accepted-result cost/time including coordination, all children and rework;
+never equate token counts or delegation counts with exact weekly quota savings.
+"""
+
+[agents]
+max_concurrent_threads_per_session = 2
 
 [notice]
 hide_rate_limit_model_nudge = true

@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'kit.psm1')
 Import-Module (Join-Path $PSScriptRoot 'code-tools.psm1')
+Import-Module (Join-Path $PSScriptRoot 'subscription-routing.psm1')
 
 function Get-BootstrapIdentity([string]$Directory) {
     Assert-CodeToolsPlain $Directory
@@ -220,7 +221,7 @@ function Restore-CodeToolsBootstrap([string]$UserHome, [string]$CodexHome, [stri
 function Complete-HarnessActivation([string]$CodexHome) {
     # The outer durable committed marker is written BEFORE any component journal
     # is removed. A crash here completes commit cleanup instead of undoing it.
-    foreach ($name in @('pending.json','code-tools-registration-pending.json','code-tools-files-pending.json','bootstrap-pending.json','bootstrap-graphify-pending.json','bootstrap-runtime-pending.json')) {
+    foreach ($name in @('pending.json','code-tools-registration-pending.json','code-tools-files-pending.json','bootstrap-pending.json','bootstrap-graphify-pending.json','bootstrap-runtime-pending.json','subscription-routing-pending.json')) {
         Remove-CodeToolsFile (Join-Path $CodexHome ('harness/' + $name))
     }
     Remove-CodeToolsFile (Join-Path $CodexHome 'harness/activation-pending.json')
@@ -246,6 +247,7 @@ function Restore-HarnessActivation {
     $errors = [Collections.Generic.List[string]]::new()
     # Continue independent recovery even when one component has an intervening edit.
     foreach ($operation in @(
+        { Restore-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -DependencyUserHome $DependencyUserHome -Preview:$Preview -DeferRestart | Out-Null },
         { Restore-CodeToolsRegistries $CodexHome -Preview:$Preview },
         { Restore-CodeToolsRegistration $CodexHome -Preview:$Preview | Out-Null },
         { Invoke-HarnessInstall -SourceRoot $SourceRoot -UserHome $UserHome -DependencyUserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -PathScope $PathScope -Mode Recover -Preview:$Preview | Out-Null }
@@ -290,6 +292,7 @@ function Restore-HarnessActivation {
         if ($pending -and -not $Preview) { $pending.phase = 'incompleteUpdate'; $pending.recovery_errors = $errors.ToArray(); Write-CodeToolsJson $pendingPath $pending }
         throw ('Recovery incomplete; preserved pending journal: ' + ($errors -join '; '))
     }
+    if (-not $Preview) { Resume-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome }
     if (-not $Preview) { Remove-CodeToolsFile $pendingPath }
     @{ status = if ($Preview) { 'Preview recovery' } else { 'Recovered' } }
 }
@@ -306,13 +309,21 @@ function Invoke-HarnessActivation {
     $pendingPath = Join-Path $CodexHome 'harness/activation-pending.json'
     if (Read-CodeToolsJson $pendingPath) { throw 'An incomplete combined activation needs install.ps1 -Mode Recover.' }
     $coreMode = if ($Mode -eq 'Update') { 'Install' } else { $Mode }
+    $subscriptionPlan = Invoke-HarnessSubscriptionRouting @common -Mode $Mode -Preview
     $codePlan = Invoke-HarnessCodeTools @common -Mode $Mode -Preview
     $corePlan = Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -IncludeCodeTools -Preview
-    if ($Preview) { $corePlan | Add-Member -NotePropertyName codeTools -NotePropertyValue $codePlan -Force; return $corePlan }
+    if ($Preview) {
+        $corePlan | Add-Member -NotePropertyName codeTools -NotePropertyValue $codePlan -Force
+        $corePlan | Add-Member -NotePropertyName subscriptions -NotePropertyValue $subscriptionPlan -Force
+        return $corePlan
+    }
     if ($Mode -eq 'Check') {
         $code = Invoke-HarnessCodeTools @common -Mode Check
         $corePlan | Add-Member -NotePropertyName codeTools -NotePropertyValue $code -Force
+        $subscriptions = Invoke-HarnessSubscriptionRouting @common -Mode Check
+        $corePlan | Add-Member -NotePropertyName subscriptions -NotePropertyValue $subscriptions -Force
         if ($code.status -ne 'protocol-ready') { $corePlan.status = 'Degraded' }
+        if ($subscriptions.status -ne 'ready') { $corePlan.status = 'Degraded' }
         return $corePlan
     }
     $record = @{ schema_version = 1; owner = 'codex-harness-activation'; id = [guid]::NewGuid().ToString('N');
@@ -328,6 +339,7 @@ function Invoke-HarnessActivation {
         $result = Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -IncludeCodeTools -DeferCommit
         if ($Checkpoint) { & $Checkpoint 'core' }
         $codeResult = Invoke-HarnessCodeTools @common -Mode $Mode -DeferCommit -TransactionId $record.id -Checkpoint $Checkpoint
+        $subscriptionResult = Invoke-HarnessSubscriptionRouting @common -Mode $Mode -DeferCommit -Checkpoint $Checkpoint
         if ($Checkpoint) { & $Checkpoint 'before-commit' }
         $record.phase = 'committed'
         Write-CodeToolsJson $pendingPath $record
@@ -335,6 +347,7 @@ function Invoke-HarnessActivation {
         if ($Checkpoint) { & $Checkpoint 'committed' }
         Complete-HarnessActivation $CodexHome
         $result | Add-Member -NotePropertyName codeTools -NotePropertyValue $codeResult -Force
+        $result | Add-Member -NotePropertyName subscriptions -NotePropertyValue $subscriptionResult -Force
         $result
     } catch {
         $original = $_.Exception.Message

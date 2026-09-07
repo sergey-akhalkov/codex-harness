@@ -58,6 +58,12 @@ function Reset-TestModule([switch] $RealRuntime) {
 function Read-State($Fixture) {
     Get-Content -LiteralPath (Join-Path $Fixture.CodexHome 'harness/installation.json') -Raw | ConvertFrom-Json -AsHashtable
 }
+function Assert-DiagnosticLink($Fixture) {
+    $link=@((Read-State $Fixture).links | Where-Object kind -eq 'diagnostic-launcher')
+    Assert-True ($link.Count -eq 1 -and $link[0].owned) 'Diagnostic launcher must be registered with ownership.'
+    $item=Get-Item -LiteralPath $link[0].destination -Force
+    Assert-True ($item.LinkType -eq 'SymbolicLink' -and $item.Target -eq (Join-Path $Fixture.SourceRoot 'tools/codex-harness-check.ps1')) 'Diagnostic launcher must link directly to the selected source.'
+}
 function Write-Pending($Fixture, $Pending) {
     Write-FixtureFile (Join-Path $Fixture.CodexHome 'harness/pending.json') ($Pending | ConvertTo-Json -Depth 30)
 }
@@ -99,6 +105,7 @@ try {
         Assert-True ($preview.status -eq 'Preview Install') 'Preview must return an explicit non-activation result.'
         Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Preview must not create the target home.'
         $result = & $entry -CoreOnly -CodexHome $fixture.CodexHome -UserHome $fixture.UserHome -CodexCommand $CodexCommand -PathScope Process
+        Assert-DiagnosticLink $fixture
         Assert-True ($result.runtime.fullGlobalInstructions -and $result.runtime.sandbox -eq 'danger-full-access') 'Real fresh Codex process must read instructions and Full Access.'
         $check = & $entry -CoreOnly -CodexHome $fixture.CodexHome -UserHome $fixture.UserHome -Mode Check
         Assert-True ($check.status -eq 'Connected') 'Actual Check must exercise the connected CLI.'
@@ -106,6 +113,7 @@ try {
         $check = & $entry -CoreOnly -CodexHome $fixture.CodexHome -UserHome $fixture.UserHome -Mode Check
         Assert-True ($check.runtime.fullGlobalInstructions) 'New Codex process must read edited instructions without reinstall.'
         & $entry -CoreOnly -CodexHome $fixture.CodexHome -UserHome $fixture.UserHome -Mode Disconnect | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness/bin/codex-harness-check.ps1'))) 'Disconnect must remove its owned diagnostic link.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness/installation.json'))) 'Disconnect must remove installation state.'
         Assert-True (Test-Path -LiteralPath $CodexCommand) 'Original CLI must remain present.'
     }
@@ -118,6 +126,7 @@ try {
         $before = $env:Path
         Invoke-HarnessInstall @fixture | Out-Null
         $state = Read-State $fixture
+        Assert-DiagnosticLink $fixture
         foreach ($link in $state.links) {
             $item = Get-Item -LiteralPath $link.destination -Force
             Assert-True ($item.LinkType -eq 'SymbolicLink' -and $item.Target -eq $link.source) 'Every managed artifact must be a direct source link.'
@@ -127,6 +136,7 @@ try {
         Assert-True ($preview.operations.Count -eq 0 -and -not $preview.pathChange) 'Repeat preview must be empty.'
         Invoke-HarnessInstall @fixture | Out-Null
         Assert-True ($env:Path -ceq $connectedPath) 'Repeat install must not duplicate PATH.'
+        Assert-DiagnosticLink $fixture
         Invoke-HarnessInstall @fixture -Mode Disconnect | Out-Null
         Assert-True ($env:Path -ceq $before) 'Disconnect must restore only its PATH registration.'
         Assert-True ((Get-Content -LiteralPath (Join-Path $fixture.CodexHome 'config.toml') -Raw).Contains('keep')) 'Local config must survive.'
@@ -279,6 +289,7 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         Invoke-HarnessInstall @fixture | Out-Null
         $state = Read-State $fixture
         Assert-True ($state.sourceRoot -eq $newSource) 'Metadata must refer to the relocated checkout.'
+        Assert-DiagnosticLink $fixture
         Assert-True (@($state.links | Where-Object { $_.source.StartsWith($oldSource) }).Count -eq 0) 'Old source paths must be gone.'
         Invoke-HarnessInstall @fixture -Mode Disconnect | Out-Null
     }

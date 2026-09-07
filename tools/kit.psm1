@@ -122,6 +122,7 @@ function Get-HarnessInventory([string] $SourceRoot, [string] $CodexHome, [string
     $links.Add(@{ destination = Join-Path $CodexHome 'AGENTS.md'; source = Join-Path $SourceRoot $manifest.Instructions; kind = 'instructions'; name = 'AGENTS' })
     $links.Add(@{ destination = Join-Path $CodexHome ($manifest.ProfileName + '.config.toml'); source = Join-Path $SourceRoot $manifest.Profile; kind = 'profile'; name = $manifest.ProfileName })
     $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/codex.ps1'; source = Join-Path $SourceRoot $manifest.Launcher; kind = 'launcher'; name = 'codex' })
+    $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/codex-harness-check.ps1'; source = Join-Path $SourceRoot $manifest.DiagnosticLauncher; kind = 'diagnostic-launcher'; name = 'codex-harness-check' })
     $links.Add(@{ destination = Join-Path $CodexHome 'agents/codex-harness'; source = Join-Path $SourceRoot $manifest.Agents; kind = 'agents'; name = 'codex-harness' })
     if ($IncludeCodeTools) {
         $links.Add(@{ destination = Join-Path $CodexHome 'hooks.json'; source = Join-Path $SourceRoot $manifest.Hooks; kind = 'hooks'; name = 'code-tools' })
@@ -164,6 +165,7 @@ function Assert-HarnessState($State, [string] $CodexHome, [string] $UserHome) {
         $allowed = (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'AGENTS.md')) -or
             (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'harness.config.toml')) -or
             (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'harness/bin/codex.ps1')) -or
+            (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'harness/bin/codex-harness-check.ps1')) -or
             (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'agents/codex-harness')) -or
             (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'hooks.json')) -or
             (Test-HarnessSamePath $link.destination (Join-Path $CodexHome 'harness/bin/hook.ps1')) -or

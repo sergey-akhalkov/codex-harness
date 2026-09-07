@@ -1,0 +1,6 @@
+{
+  "package": "@bitkyc08/opencodex",
+  "version": "2.44.0",
+  "nodeMinimum": "18",
+  "sourceCommit": "07b48da8fd63881e848d26e0bd50087864f5573e"
+}

@@ -35,20 +35,26 @@ the child can call all four MCPs, but its local `mcp_tool` hook manager does
 not connect harness-lsp. The real global child probe below verifies the
 command path. Connected ordinary consumers retain their warm LSP processes.
 Claims and completed-invocation records prevent duplicate checks; repeated
-Stop checks compare bytes again before reusing a recent completion.
+Stop checks compare bytes again before reusing a recent completion. The
+[2026-09-07 timeout correction](hook-timeouts.md) additionally preserves completed
+cohort members across partial batches for the same source and registry generation.
 
 | Boundary | Implemented limit and failure behavior |
 |---|---|
-| Pre baseline | Seven seconds shared across at most 32 explicit roots; native command timeout ten seconds |
-| Native diagnostic batch | 27 seconds including its ordinary snapshot/waits; native hook timeout 30 seconds; unresolved work remains journaled |
+| Pre baseline | Seven seconds shared across at most 32 explicit roots, including journal lock waits; source scanning holds no write transaction; native command timeout ten seconds |
+| Native diagnostic batch | 27-second service budget with 2.5 seconds reserved for final snapshot/delivery (20% for short test budgets); native hook timeout 30 seconds; unresolved work remains journaled |
 | Command fallback | 25-second internal budget, including a 0.6-second native-claim grace; bounded cleanup within the native 30-second handler timeout |
 | Individual analysis | Normally at most 20 seconds; remaining dependent-file budget is shared |
 | Source reconciliation | Initial scan at most five seconds, final scan at most two seconds, at most 8 MiB per file; exhaustion is explicit |
-| Summary | At most 60 files, 30 diagnostic entries, 12,000 message characters total, 2,000 per message and 1,000 per reason; omitted counts and full report path retained |
+| PostToolUse summary | At most 60 files, 30 diagnostic entries, 12,000 message characters total, 2,000 per message and 1,000 per reason; omitted counts and full report path retained |
+| Stop summary | At most five affected files, three diagnostics per file and 400 description characters per file; omitted counts and full report path retained |
 
-Stop and SubagentStop reconcile unfinished or late changes. Their first
-unresolved completion can block; an already active Stop hook produces a
-system message instead of an infinite retry loop. A parent that only
+Stop and SubagentStop reconcile unfinished or late changes. A new unresolved
+completion can block once; successful clearance and an already active Stop
+are informational. Identical outcomes are delivered once across native and
+command handlers, including continuation turns. The
+[Markdown and Stop correction](markdown-stop-hooks.md) records the delivery
+contract, sibling-link access and fresh global verification. A parent that only
 delegated and had no covered tool invocation is `not-applicable`, which is
 not a clean diagnostic claim. A missing baseline after an observed edit
 remains unavailable. Timeouts terminate only the fallback-owned process

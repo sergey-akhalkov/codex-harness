@@ -9,12 +9,22 @@ param(
     [string] $CodexCommand,
     [ValidateSet('User', 'Process')]
     [string] $PathScope = 'User',
-    [switch] $CoreOnly
+    [switch] $CoreOnly,
+    [switch] $SubscriptionsOnly,
+    [switch] $Diagnose,
+    [string] $ProjectPath = (Get-Location).Path
 )
 $ErrorActionPreference = 'Stop'
+if ($CoreOnly -and $SubscriptionsOnly) { throw '-CoreOnly and -SubscriptionsOnly are mutually exclusive.' }
 Import-Module (Join-Path $PSScriptRoot 'tools/kit.psm1') -Force
 if (-not $CodexHome) {
     $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $UserHome '.codex' }
+}
+if ($Diagnose) {
+    if ($Mode -ne 'Check' -or $CoreOnly -or $SubscriptionsOnly) { throw '-Diagnose requires -Mode Check without component selectors.' }
+    Import-Module (Join-Path $PSScriptRoot 'tools/source-diagnostics.psm1') -Force
+    Invoke-HarnessSourceDiagnostics -SourceRoot $PSScriptRoot -CodexHome $CodexHome -UserHome $UserHome -ProjectPath $ProjectPath -CodexCommand $CodexCommand
+    return
 }
 $coreMode = if ($Mode -eq 'Update') { 'Install' } else { $Mode }
 if (-not $DependencyUserHome) { $DependencyUserHome = $UserHome }
@@ -37,6 +47,10 @@ try {
     if ($CoreOnly) {
         if (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/activation-pending.json')) { throw 'A combined activation is pending. Run Recover without -CoreOnly.' }
         Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -Preview:$WhatIfPreference
+    } elseif ($SubscriptionsOnly) {
+        if (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/activation-pending.json')) { throw 'A combined activation is pending. Run Recover without -SubscriptionsOnly.' }
+        Import-Module (Join-Path $PSScriptRoot 'tools/subscription-routing.psm1') -Force
+        Invoke-HarnessSubscriptionRouting @common -Mode $Mode -Preview:$WhatIfPreference
     } else {
         Import-Module (Join-Path $PSScriptRoot 'tools/activation.psm1') -Force
         Invoke-HarnessActivation @common -Mode $Mode -PathScope $PathScope -Preview:$WhatIfPreference

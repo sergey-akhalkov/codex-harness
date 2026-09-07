@@ -15,7 +15,18 @@ function Assert-CodeToolsPlain([string]$Path) {
 }
 function Read-CodeToolsJson([string]$Path) {
     Assert-CodeToolsPlain $Path
-    if (Test-Path -LiteralPath $Path -PathType Leaf) { Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        # Readers keep one complete snapshot while a journal writer atomically
+        # replaces its path. Get-Content denies deletion on Windows and races
+        # the service's readiness observer against the installer journal.
+        try { $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)) }
+        catch [IO.FileNotFoundException] { return } # A transaction may just have committed and removed its journal.
+        try {
+            $reader = [IO.StreamReader]::new($stream)
+            try { $reader.ReadToEnd() | ConvertFrom-Json -AsHashtable }
+            finally { $reader.Dispose() }
+        } finally { $stream.Dispose() }
+    }
 }
 function Get-CodeToolsBytes([string]$Path) {
     Assert-CodeToolsPlain $Path
@@ -33,7 +44,10 @@ function Write-CodeToolsBytes([string]$Path, [byte[]]$Bytes) {
     try {
         $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try { $stream.Write($Bytes); $stream.Flush($true) } finally { $stream.Dispose() }
-        [IO.File]::Move($temporary, $Path, $true)
+        # Windows Move(overwrite) rejects even delete-sharing readers. Replace
+        # preserves their old snapshot and the destination's access controls.
+        if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($temporary, $Path) }
     } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary } }
 }
 function Write-CodeToolsJson([string]$Path, $Value) { Write-CodeToolsBytes $Path ([Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 60))) }

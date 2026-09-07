@@ -16,10 +16,12 @@ param(
     [switch]$ChildDiscoverTools,
     [switch]$ChildReadMcps,
     [switch]$RunAgent,
+    [switch]$MarkdownSibling,
     [switch]$KeepProbe
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($MarkdownSibling -and ($Language -ne 'markdown' -or $Scenario -ne 'patch')) { throw '-MarkdownSibling requires the Markdown patch scenario.' }
 . (Join-Path $PSScriptRoot 'consumer-rpc.ps1')
 . (Join-Path $PSScriptRoot 'native-hook-trust.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
@@ -102,6 +104,13 @@ try {
         $caseMap = (& $python -B (Join-Path $repository 'tests/lsp-languages.py') $Language --describe | ConvertFrom-Json -AsHashtable)
         if ($LASTEXITCODE -ne 0) { throw 'Could not read language fixture.' }
         $languageCase = $caseMap[$Language]
+        if ($MarkdownSibling) {
+            $sibling = Join-Path $ProbeRoot 'sibling docs'
+            $null = New-Item -ItemType Directory -Path $sibling
+            Write-LspFile (Join-Path $sibling 'guide.md') "# Topic`n"
+            $languageCase.good = "# Example`n`n[sibling](../sibling%20docs/guide.md#topic)`n"
+            $languageCase.bad = "# Example`n`n[sibling](../sibling%20docs/guide.md#absent)`n"
+        }
         $sourceFile = $languageCase.file
         $expectedGood = $languageCase.good.Trim()
         foreach ($name in @($languageCase.support.Keys) + @($sourceFile)) {
@@ -333,6 +342,11 @@ Before the same child performs the two patches, ask it to call these four actual
             Assert-Lsp ($receivedError -and ($Scenario -eq 'delayed' -or $final -match 'clean')) 'the agent receives the required actual diagnostic feedback'
         }
         Assert-Lsp ((Get-Content -LiteralPath (Join-Path $editWorkspace $sourceFile) -Raw).Trim() -eq $expectedGood) 'only the intended corrected source remains'
+        if ($MarkdownSibling) {
+            $stops = @($events | Where-Object { $_['method'] -eq 'hook/completed' -and $_['params']['run']['eventName'] -eq 'stop' })
+            Assert-Lsp ($stops.Count -eq 2 -and @($stops | Where-Object { $_['params']['run']['status'] -ne 'completed' }).Count -eq 0) 'native and command Stop handlers complete once without a continuation'
+            Assert-Lsp (@($reports | Where-Object status -EQ 'unresolved').Count -eq 0) 'sibling Markdown links never produce a root-access failure'
+        }
         if ($Scenario -eq 'roots') {
             Assert-Lsp ((Get-Content -LiteralPath (Join-Path $workspace 'index.ts') -Raw).Trim() -eq 'export const value: number = 1;') 'same-named source in the primary root remains unchanged'
             Assert-Lsp (@($errorResults | Where-Object {$_.workspace -eq $editWorkspace}).Count -ge 1) 'automatic result retains the approved additional root identity'

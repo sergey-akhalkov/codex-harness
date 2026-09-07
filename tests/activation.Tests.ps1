@@ -53,7 +53,14 @@ function Setup-Modules {
         }
     } $python $native $repository
     $script:activation = Import-Module (Join-Path $repository 'tools/activation.psm1') -Force -PassThru
-    & $activation { function script:Initialize-CodeToolsRuntime {} }
+    & $activation {
+        function script:Initialize-CodeToolsRuntime {}
+        # Subscription routing has its own real-link/recovery fixtures. This
+        # regression suite must never install a package or launch a live proxy.
+        function script:Invoke-HarnessSubscriptionRouting { @{ status = 'ready'; evidence = 'subscription fixture' } }
+        function script:Restore-HarnessSubscriptionRouting {}
+        function script:Resume-HarnessSubscriptionRouting {}
+    }
 }
 function New-Fixture([string]$Name) {
     $root = Join-Path $suite $Name
