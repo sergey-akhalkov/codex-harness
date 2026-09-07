@@ -11,4 +11,4 @@
 
 - [x] 3.1 Activate globally without restarting the control proxy, invoke the global command outside the repository and verify source links, native observations, freshness limits and preservation of existing user state.
 - [x] 3.2 Document commands, report contract, timing observations and evidence for every scenario; run applicable regressions, Markdown link checks and strict OpenSpec validation, resolving relevant failures.
-- [ ] 3.3 Sync the completed specification, archive the change, review and commit all repository changes requested by the user, push and verify remote HEAD and clean worktree.
+- [x] 3.3 Sync the completed specification, archive the change, review and commit all repository changes requested by the user, push and verify remote HEAD and clean worktree.
