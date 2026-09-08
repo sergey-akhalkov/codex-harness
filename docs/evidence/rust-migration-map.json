@@ -1,0 +1,1274 @@
+{
+  "schema": 1,
+  "head": "dfc2d6af49f2da949b2b1b0ed549a33c62d1eb4b",
+  "capturedUtc": "2026-09-08T15:42:28.4905858Z",
+  "scope": "Git-listed tracked and nonignored untracked executable units, including script owners of embedded/generated programs; pending entries do not prove replacement or safe retirement.",
+  "units": [
+    {
+      "path": ".agents/skills/reproduce-regression/scripts/__pycache__/process_case.cpython-313.pyc",
+      "sha256": "C75BC1D2BE8676B009B514CC2E815D7FD264F231D260A89EFFBD68EE8C2700E4",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": ".agents/skills/reproduce-regression/scripts/observe.ps1",
+      "sha256": "B1A1C7C8301447E6D7559501BE97033F5C89D145BF66F0FFAD4D664A6C0F4053",
+      "owner": "native-skill-helpers",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": ".agents/skills/reproduce-regression/scripts/process_case.py",
+      "sha256": "06A38112C854DE252D6DCEF9E87734966C0CA0B3B60D91C1C766D265236F82CE",
+      "owner": "native-skill-helpers",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": ".agents/skills/structured-codex-run/scripts/run.py",
+      "sha256": "7ED5F149537FF70CA75EC0A210DC9AD29103A7EFC2DB29B9B180C4FFAC5F2730",
+      "owner": "native-skill-helpers",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": ".agents/skills/structured-codex-run/scripts/stdin_bridge.py",
+      "sha256": "BF4FF69B6D7D0728476E32059E6AC502F1ABB4A6A7F8BB93DADCB357E2917FA0",
+      "owner": "native-skill-helpers",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "crates/codex-harness/src/bin/harness-process-fixture.rs",
+      "sha256": "92541D16C5E5FDD9BD8E22255334D69CCE78A51CA8A9705932831BF1727EF56D",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/codex-harness/src/main.rs",
+      "sha256": "7157494C62FD17013373091DC7B1CAD4C65C5F4F027F72ED52719BA573ACDA7C",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/codex-harness/tests/native_build.rs",
+      "sha256": "BC7B0757027F85536BD5554C75CA73091D75646A29C76E6E53CD6C1CD73E2701",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/harness-core/src/build_identity.rs",
+      "sha256": "12C9B2665A322404F3D8E336A87DE83612817B045DC84FACFC9F358C9DA70375",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/harness-core/src/lib.rs",
+      "sha256": "C263D3BB399AC343FBDB6D73E936C8A1F83255DB0A342003E9C42855D2C8FADD",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/harness-core/src/native_build.rs",
+      "sha256": "55F166A3F376719929122BAADDEE008517F94D2177C9B2F67E4FFE59D53CC972",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/harness-core/src/process.rs",
+      "sha256": "CF1228F93DDB678B978E8EE79A6F64B4FB9C1A706FD713750A52C1E98F384FD4",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "crates/harness-core/tests/process.rs",
+      "sha256": "0BE5D6BDF5BB0635DD70C62A63147DA873EF6A258D29CFD543633DC3FAAFEE90",
+      "owner": "native-workspace",
+      "state": "native-source"
+    },
+    {
+      "path": "install.ps1",
+      "sha256": "1CBB307FE6219027C3FB48EB7B745C5F21CE0D959060E35EB50E967C9A9FFEA6",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/delegation-usage.cpython-313.pyc",
+      "sha256": "5CEB8C9FF8958593929B2BCE8B1E68E491DD0C6A5012FD4D35E661F6797CD77F",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/graphify_update_native.cpython-313.pyc",
+      "sha256": "6C8F5E7499B34CFC34DF23C837EB83517825594E1E764DF02365A7BFE5A27585",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/lsp-languages.cpython-313.pyc",
+      "sha256": "5560D768386770754F3974C65D311F4417597D7F9B65AC3B9A2EBC885622D86B",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/lsp-navigation.cpython-313.pyc",
+      "sha256": "4C6412CDF3C496BE3975AFA74654EA88CDB9C7221B334478DB625B7C39C27FCB",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/native_contracts.cpython-313.pyc",
+      "sha256": "0EE4074D2163599B50A67EEE9B4922A867BEFBD42FD6EC50D0EDBCEFFC42BBB4",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/outcome-report-native.cpython-313.pyc",
+      "sha256": "55A811ED86BF059B07D4DAB2B8E65B1AA2C4F7CA34D538502235C4D0C42EA173",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/outcome-report.cpython-313.pyc",
+      "sha256": "874A8AFD4710A877798D456492C44BE4854473F01BBF23E2436A993A1AF76588",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/outcome-suite-native.cpython-313.pyc",
+      "sha256": "FA7953E4912AD4F9890EC8328AE09408DEC3E1CB166728499E9676CB86492576",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/outcome-suite.cpython-313.pyc",
+      "sha256": "5C59E9BA402148E62FC9929EFA1803DF8DA01F7FAB9E64FFB035AB202FDC22CB",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/__pycache__/serena-efficiency.cpython-313.pyc",
+      "sha256": "34CA33D45163DA47188B9773D1FC42E5C0D6835F26D7F2D9C7D8C76D234E01A8",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/activation.Tests.ps1",
+      "sha256": "1E01233B79D8CE063F7F16ACFFBB435B16ADB3D7059ABAC1B3B12EE234E2F73E",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/agent-delegation-evidence.py",
+      "sha256": "F2C23906890173707362AA9A070D5EDA52DBFA154E391026954F7CAA06E03558",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/agent-delegation.py",
+      "sha256": "4C7C9B193B94093B02A2ACAF38F0FDC11A5D3212B78D9EA972B9A12B8FC09DA2",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/bootstrap.Tests.ps1",
+      "sha256": "B3A1BDF530785D3F2B38274036BB790C32ECE9E294D1625D1F1EED1855384BEB",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/code_tools_discovery_test.py",
+      "sha256": "40796AB34A27FA9CCF0878D752C5A30A93DB019F37C65B9A2BAC33A9BAECD960",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/code_tools_registration_test.py",
+      "sha256": "C94F80CB313F09078E1CB674DF1ACA3502BD3B8C38DE4A696A147D154F2EE254",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/code-tools-io.Tests.ps1",
+      "sha256": "2F71394BA92CADDA2603993F3055B90840C01F196FBADA87F2D7388ED8F8FDA7",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/code-tools-native.Tests.ps1",
+      "sha256": "344AD5B06182E3DADB79737E14AE265B2AED42EC018B9FA516076D8A289618D4",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/code-tools-scoped.Tests.ps1",
+      "sha256": "9934C4A2DA466A6D66AEA21973E35E1BD0F9CE3905BF541CB851222CA0C63201",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/ConPty.cs",
+      "sha256": "10D8F56123C42709B0B5FA41FFD170AD67795C14D0428CB18F677F4C67FFA69B",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/consumer-rpc.ps1",
+      "sha256": "24452D67F26DEA61E410932F5C5572AAC52EC05694D2E167FC9EBAE592BFC901",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/consumer.Tests.ps1",
+      "sha256": "C548772E71C94016B39957D05D56E9C8B342863491F71F8A4574F99C9D5E55C0",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/delegation-usage.py",
+      "sha256": "A87DEB5F8980E9AC890FA1E97F0AEAA9B13C510AA9AABC5CED213DD0F21624DE",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/__pycache__/nuphus-probe.cpython-313.pyc",
+      "sha256": "28B66E7139606364930A92EA70C02475A85C36A032535B2C7E4EE81F74BB3FE6",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/graphify-update-fixture.py",
+      "sha256": "F38DA3CCDEA4172D6952D0B119B38C6F50FA97C77E5B3D07CCAB0103987FA5BB",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/mcp-fixture.mjs",
+      "sha256": "CD18ED143DA59E1FB1294B5AE73627C71B4ABBD70094AD75423EFA1D3707BF72",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/nuphus-browser-isolation.py",
+      "sha256": "17718F3CCF81B2009147D091CEE900065CBB6F7A1C673140F2CF169B80273BC1",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/nuphus-operations.py",
+      "sha256": "75CDE9646E96DDF7A09BEFEEE07FBF7C8D33C5E94BA7FFC1CE3D59E239EB0E57",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/nuphus-probe.py",
+      "sha256": "A7DEAF3257A21EC7BF7A781F7018ADDEB61F653A46CF1E9B534CF28B149373F0",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/nuphus-window.ps1",
+      "sha256": "BBFA0E94E9033713A70DBFF70D37E99E2BA4ADF3421775E8782A1D7507D8828A",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/code-tools-native/serena-guard-check.py",
+      "sha256": "54E4A84979033EE407FD522E4596D6DCE662B69FA27B0BC83C55422B6EDDEC18",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/lsp/delayed-mcp.py",
+      "sha256": "B046FC6199730FDD5A8A3157BBBA676F12ADBC1CEC8E536C9932689F15A495AF",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/lsp/mcp-edit.py",
+      "sha256": "B06CA02EB3DB8362BA239E77043CB962A22A3CD3B12459A74FEB1778BD06D357",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/fixtures/structured-codex.py",
+      "sha256": "723FD13AAE0FDA5FB8CB1A17B285C4B87CA849C7E566BA175292E090BB012CC8",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/full-source-move.Tests.ps1",
+      "sha256": "71FB005895C9A3B22514CFCE9B6F4487B0DE6417F9BE1D49727E478B5EE251E9",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/global-activation.Tests.ps1",
+      "sha256": "67EBAA507936B107888D39A52DF320129EFAB4F8A0C10E83E212D04C49931100",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/global-code-tools.Tests.ps1",
+      "sha256": "4E0105231F61E2088B3B19E0482349C2B79636D9585485AE502434C72FA1C5FE",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/global-session-lifecycle.Tests.ps1",
+      "sha256": "DE4E9AF132E8CB365FD688688F1E03890A7ABDDA6643AEA6D0EB22515810F13F",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/graphify_identity.py",
+      "sha256": "A4F077057C05AD9D86CCFC4AF28C3373F98BCAB6486B7DE4CDF79229690AD927",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/graphify_native.py",
+      "sha256": "D0805BA172119C3E07DC0DAC0DA609C7A4C7F9AAFF6CAA9664E27B739A5AC382",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/graphify_update_native.py",
+      "sha256": "3F766F5F31D9BE161D28A13B7E4B719AA6D0CA024EF5964C6FC17C3062E22C64",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/graphify_update_test.py",
+      "sha256": "B46F3E700D6FB0C4DA01DBAE13E7C3D146CAFC5879B3B61C6C0902686B4B3C3E",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/graphify-opencode.ts",
+      "sha256": "2ABD6E4F3261E9CBE0B3B1DBD8EA880E4F92700647975B4B87EEBCC8DF261AFD",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/grok-continuation-oracle.py",
+      "sha256": "B084F3CCD2160AE9C10DB8C6087F5DB1C6206D6961B5E17C9413055A7A1BE496",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/grok-continuation-oracle.Tests.py",
+      "sha256": "4B5F8259A1CCD297F35B8149A26E0150BBB217966FD34CA244352E4CD940AF62",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/grok-continuation.Tests.ps1",
+      "sha256": "9CA1D08C2A2CEE59DABB16D413E5151CFA0753F3589D9F718E0D24AA6A132C3A",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/grok-guards.mjs",
+      "sha256": "D7872D1E5D24F5C1FAE5DB90788ED7FB7453F00EFA33B3FA05052BB822061EE2",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/hook-encoding.Tests.ps1",
+      "sha256": "0C6A38A88F48963338CF6075F3CA47A3C0215C4FCA320D12847D7DED1FEE6744",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/hook-policy.Tests.ps1",
+      "sha256": "F60257D90D474762BA046EFD41B35F16058E5886ABDF50B6A8129EE837BF9761",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/installer.Tests.ps1",
+      "sha256": "80B3250C002B10636C36EFA85DEF6FAC91EE496EAC3BCF98E3FA2F40FD6BED71",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/isolated-worktree-example.ps1",
+      "sha256": "E230485D14AF041F526BADB508B7FEF2A489075B4845C1F3FB96EF06DE5F4C5B",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/launcher.Tests.ps1",
+      "sha256": "B651B9CD1F1A4EA03689061000265D23D10737F26E5EAEB1FAA1AF683FC6D69D",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lazy-stdio.py",
+      "sha256": "A9459A2501EF7230A141FA74C16CB9600F33BFCC5FB2F2DBF16F758AD173BD49",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-adapter.py",
+      "sha256": "11A052D697118C956664CDB78EE31088F0D4051A77927E10BD0AA1963545FE0A",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-evidence.py",
+      "sha256": "013B09A22D15636C120977AC792831671DEE7B6008ACDF8922549094394B38FF",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-hook-progress.py",
+      "sha256": "60AA61D4F5C4479A5A16661B62B284F98317882C63522FFEA77D3800453E54AD",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-installed-reconciliation.py",
+      "sha256": "9011CA8175F8D7216B9BE0F49F26F75F1B607EFB9696F15076EA9DABE58312FB",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-languages.py",
+      "sha256": "CED2A320F1F8E85F550773634A8C0E2FB99A3344381DCDADF757417B9BFE0D5F",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-markdown-workspace.py",
+      "sha256": "F4620A38671007F06F2CC1077D9595BDA80A5B207BAA7862589011BA91847916",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-native-mcp.Tests.ps1",
+      "sha256": "9C5D7DC6D13799034040714886B0B5425B448DEE2B96EDF937E97F790F40E5C9",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-native.Tests.ps1",
+      "sha256": "EEB1E1220219290E3BF8F7ADC57394342562F83C6548AA304678C7CAE7C88FF6",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-navigation.py",
+      "sha256": "A6CCD0BCD0A36E01E9CE2F5957C29815817D638E129E1F9CFCEAACDA2E853B12",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-pre-budget.py",
+      "sha256": "2533AF395D1C5758A5C342596243BC78C128676ED96144C5E18A7B9AD378E004",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-reconciliation.py",
+      "sha256": "ABC13C5E84D5AA384BF42AF32E7AB2E7CB99D1978FEB199BF71A65A3A6CCF74D",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-shared.py",
+      "sha256": "6A8E0D24D31E47B470251D4E62080B66EC5D1C9B2EFB97F5B07C539F0332A9EA",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/lsp-stop-delivery.py",
+      "sha256": "0A00E3B7E984BBDCFDB1C6344BBFC13B7F3DEA01D377D200EB28B7F7A95FBF51",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/mcp-codebase.py",
+      "sha256": "8BF494AC47C76C702E2E6EA35B12FCA2ACA145A9A03440D1252FC1153C2FA3EB",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/mcp-nuphus.Tests.ps1",
+      "sha256": "EC4D0B0B9D60CC18C2F2602372413ADDC5CE1A0AD3BA87D77B3C85535353EBDB",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/mcp-serena.Tests.ps1",
+      "sha256": "9DCC5C6FD878B7682316C451471EC865417C88ED73A67A2445F10E3BBC090902",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/native_contracts.py",
+      "sha256": "54DD4CC02317C5A1B108F34E19EE20C5E0F7E508735FED39598F02FD7E78EA53",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/native-context-contracts-hook.ps1",
+      "sha256": "F82BE4A4BB359E0403666F985B6F66098DE87D4905CA8E148640494CCFFA1204",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/native-context-contracts-oracle.py",
+      "sha256": "A57F74A3855ED2FCBA10F000BB7D910B5BBD3DAA5D450F7E386546B6BFD57976",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/native-context-contracts-shell.ps1",
+      "sha256": "BAB6AA3BF8979F8FE6D7C6FD270F3E66EB75DB8EFEAD81D9F7B9706E0421A218",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/native-context-contracts.ps1",
+      "sha256": "E8B1EB1D11983D7E4D0940DEF952EE8CD35EBBB40DE528D82B1F79374F6B508E",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/native-hook-trust.ps1",
+      "sha256": "A72F97C2BEC962FE2957D15A80FBE328D81CB4B9E421B3620B1D675F34E02921",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/nuphus-resources.py",
+      "sha256": "282ADA868BD6C01F80097C153171920EBF340BD137E12FBFEB376A1B0CF985BB",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/orphans.py",
+      "sha256": "5F31E291A4DB78D1C75CEAD315B38B926B84821EC5B17D26E117BC1F53636A89",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-fixtures.py",
+      "sha256": "CC98EAE83FE87680361C55D344A62BAD4B3AA7531D6803E7F56C064187DA3EB4",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-hooks.py",
+      "sha256": "62B05BB356AD4C2C3EA7ABE665CC212E48AEEE2BD30398564CE2CD419F7A5728",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-oracles.py",
+      "sha256": "B02078D7AF0E400E80561556066BCCA63532E1867601B7F37D6AAA51113F2207",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-process.py",
+      "sha256": "0EAFB96E1ACB69575174C587133BD48A39B9C2539841A5CA8C47FF0B2A4A4E0B",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-report-native.py",
+      "sha256": "4DF883B80479B3DAB9BF58ECC9B5E7EBEF18B77E2CD135DF6A2BB134DF128E43",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-report.py",
+      "sha256": "9CDDF2CB5D20D5B4BA816C7466C8835AD5D7C6E174EC34471C518BFB40D78104",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-suite-native.py",
+      "sha256": "419FDD680055984FF553A0E69EABE8072D42133B6637BFA9529BB3C73AB8F2F8",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/outcome-suite.py",
+      "sha256": "6B6FC8CFE21C1E520AF24E262AEE98F38E3F927C830722C6103B7787C4849FA1",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/process-ownership-service.py",
+      "sha256": "A472ED046C8237831CCA36CDC9AAB234F2281850DA81F6B2E5F4ED7408F164DF",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/process-ownership.py",
+      "sha256": "EE514F1116B9DCFDFF24BDB934F7A709C08750F3C10F03C1E4883D4A67A41CA6",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/rtk-adapter.py",
+      "sha256": "37962175F826B38016CFE9DF8D46ADB38FC1FCD3A7A5581196E21133C0F0B96C",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/rtk-measure.py",
+      "sha256": "887BCC6BE26ADEA924724C077120610C156653C37C6B0841EF449ACCB9AF2F38",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/serena-efficiency.py",
+      "sha256": "3292947438788FAAD4407FECA80377F102BD8056CC88E38ECDA5909DE462079E",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/serena-shared.py",
+      "sha256": "D550346966400CB9D0CE8FF616C1612C255212F6EF4154BDCF61C7C3E549B5C5",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/source-diagnostics-failures.Tests.ps1",
+      "sha256": "79753D7FF0EABD1705912F7E586D9A4A8FF1D76A9FFE338F7F680F477B2750B2",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/source-diagnostics.Tests.ps1",
+      "sha256": "CB0FCFDAC566F1A5DA77206C6F366F63A7C0C6C549E58DED5AF0920990465454",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/structured-codex-run.py",
+      "sha256": "182442E9D6783A80655D19CD62B254AE6AADECF40ECFA2E6BB1A893A2C70CEA9",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-config.Tests.ps1",
+      "sha256": "BE2EF6439F27F11BC993DDA6A46C43BA7F27959F479B569D09FA7784CC3E4D03",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-consumer.Tests.ps1",
+      "sha256": "697EFE5E38621C7FE991A30020FE4A4312BAD8F5C86D090594B556E7FA15475D",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-efficiency.py",
+      "sha256": "F4E3B9597D2B0A4CEED4D789A70219D12D3B410CEFD07C80975DEA5E10FFEF6C",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-global.Tests.ps1",
+      "sha256": "B919EB88CE44542E9B6E4AD8B858752C31EB6F1F93296F17BA94395774FAE9FA",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-isolated.Tests.ps1",
+      "sha256": "11C588DEBD2C8798D50C926C66FC534495D6B21B91D3E4069D7E25817F8F105F",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-memory.Tests.mjs",
+      "sha256": "8EEAFCC86D4D991343715DDD334AF636A6C5FD68AFCA8E6835D7F2A9577AE77E",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-memory.Tests.ps1",
+      "sha256": "AA1A58D35E4941CDAEBB00CDBCA2728F4F8A33684BB3C66686FC7F646CC62DD2",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-oauth.Tests.mjs",
+      "sha256": "F5BDDE5849765B82A4BAE6E315F552967665A9DA4E7E094680EF1F8965E0268A",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-process.Tests.ps1",
+      "sha256": "4870CC1A7F23C271A20DD943A976D0DFE62A36545660D2EFDED3ABEE172D5592",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-proxy.Tests.mjs",
+      "sha256": "4F0379AC392C8359A4F27A92F5D20D731190332AB033E85B4C1864C2B270B6B4",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-routing.Tests.ps1",
+      "sha256": "23F76B69345D9F9DA56F3B56FFF8D0A66AFF1770163105CEA59B3DF17453CB60",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/subscription-service-recovery.Tests.ps1",
+      "sha256": "A2C8CF466F5265198CF5A60B33DA69D079F8D9EFEA6735A77ED5E1DF0B2C9655",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/test_dependencies.py",
+      "sha256": "F78A2DB7FEFAE332989BB8C78D896F6E26E198694E1EECAB50EB9F463E480F2D",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/test_lsp_provision.py",
+      "sha256": "1B62B5EABA06508B4822E7387E43BA5186FF6F1578A7456D790673EDCA45AD58",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/token-semantic.py",
+      "sha256": "7F963141B014A7A16944A18B5AE86A4A81E648F0AB4FC68FA5A8798A609E53FC",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/token-workflow-native.ps1",
+      "sha256": "6E46E8352327D8441A0A808B7779CE6C2CA3C523E5ECE2C6C20A2164216E792E",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/token-workflow.Tests.ps1",
+      "sha256": "A17FF2988260FCA2BF88201A81198A9807916A3ECA8E16D260F3CE3C02413803",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/tool-resource-lifecycle.py",
+      "sha256": "8AFC3494910823A3C98308173B78D6DA0A915C0A043027D3D41C7E6FC8858DE8",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/tool-resource-lifecycle.Tests.ps1",
+      "sha256": "119D2A1713C92E0DB7BF3640AEA131F479DDE372E95D7BC55979CB6DBF8CB649",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/tool-resources-global.py",
+      "sha256": "53929034CB3D9DCF2EE6290FF40C9208CB3B524813494F5174A371D724CC4FF4",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/tool-resources.py",
+      "sha256": "BA659AD599D34A13F980C01992440BE57FEBF43BE9933D7C0E29761CC138A6D8",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tests/tui.Tests.ps1",
+      "sha256": "698519A2C840CB1D20A3D5B1CC363A3F681E1CD85CFAA70459FDDEA71FB7B09A",
+      "owner": "rust-acceptance-and-fixtures",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/delegation-usage.cpython-313.pyc",
+      "sha256": "0B7F6CCE644A7951FAE8194B099A3EEF2C6B52C9E43EA98BC34060FBCED5A97A",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/outcome_cases.cpython-313.pyc",
+      "sha256": "F95B5268B121D9D4BC46E776E332E09A3D9A16D5D73D097A9DD7525F619B6522",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/outcome_oracles.cpython-313.pyc",
+      "sha256": "A57D0FA2CEB41E6A6CF716003ED752ED1A80A9056F1DB3CFCB3712703C82DE1B",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/outcome_report.cpython-313.pyc",
+      "sha256": "EC529CDE15E0874B696999558E21E0CD2508F8BEB2A10C4D414130A0F60B1D80",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/outcome_runner.cpython-313.pyc",
+      "sha256": "8B2D3D89AA5BC4D38B51EE091AE3CB0CC0FA2609C5BC3F302896E25421F8D26E",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/outcome_suite.cpython-313.pyc",
+      "sha256": "5893269E56861418A16C56FE8F660F7C1D7551599307FB9280E1A2AE7195F195",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/__pycache__/process_ownership.cpython-313.pyc",
+      "sha256": "EC27A66F83463994846413ECF5BC6942507CDC0A7962073B99FF7387D628EE87",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/_tmp_header.py",
+      "sha256": "C0A50C3C5B36774084C456C000DB12C8E58134BFA259185EEC0805BC6D8D318F",
+      "owner": "temporary-helper-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/_tmp_show_lines.py",
+      "sha256": "EF47B939509AFE267245E2CEF90F214FF17C33DF267F6C43ADC8A06E25B0E7B4",
+      "owner": "temporary-helper-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/_write_check.py",
+      "sha256": "1E94DEE2EB923A8A2FA558FA173715B480B23CAAEE51FE81A64A533E7ED20E1F",
+      "owner": "temporary-helper-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/activation.psm1",
+      "sha256": "29568A0FC23C4BFB86E617C63B0E470CEEE68C424E2AEE42E92D780A3AE1A9D6",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools.psm1",
+      "sha256": "F8DC4EFAD0F8F1AC587FFCED22452F4DE1E1C6AC0DC893C86F8FC12DC7AB43FD",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/dependencies.cpython-313.pyc",
+      "sha256": "7C462F2883BE2A3414A9E434E090EF76BA43E64053AE11197DF4B60E5FE556BA",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/discovery.cpython-313.pyc",
+      "sha256": "1005206B0DC5A4BA308B1628129AAAAE3428CF2438446311E61818CD47EC914F",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/graphify_proxy.cpython-313.pyc",
+      "sha256": "3CB33FF4411B8C8F7B389BE298198D3C51416B0B348FC24BFE3655800D709FB0",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/graphify_update.cpython-313.pyc",
+      "sha256": "EDB7E4D380041B9FA8B7D0E06086684D80C31F1EEC18CA4369EB243DE30885BE",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/lazy_stdio.cpython-313.pyc",
+      "sha256": "29338495A2DF0BEE5F5EEFB6ACCB585B2762B283BE52B8F654AED1838AA17790",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/lsp_provision.cpython-313.pyc",
+      "sha256": "F378E6EF515E462F3C2C957E0FB6FB66F4DA392A78A57EFB302E2166C4C4EF95",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/registration.cpython-313.pyc",
+      "sha256": "531173D74244AF37699A62FF2DC396D79E2BF02AAA2DB1F14455DB432D3A6035",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/__pycache__/resources.cpython-313.pyc",
+      "sha256": "70BE2286A218C4EA4F8B00269B574C1C722743B8FFBB2FD3B32037A7B926D88D",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/cbm_proxy.py",
+      "sha256": "D1D7FC99CE3DA55A9A0F56DE612A2DE70474CD1370ADD013C5BCC6A0D5F061AE",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/check.py",
+      "sha256": "E04440107B0B64D1929CF29F591705B2BF818C569315EC735E536E075F58DC13",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/dependencies.py",
+      "sha256": "C60A66E2215F7A723B54EC8D76915C61BAAF1B298B78CEEA62F28CBE7BA7E882",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/discovery.py",
+      "sha256": "95D01785BE21FBC5A9D1426CEBFD3483C7AE41B329985285E1AF18A50EFD7F15",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/graphify_proxy.py",
+      "sha256": "37161A815CB86BA77E7A599C8A23631BA6012C1EBC96A04841F86F1280FCA907",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/graphify_update.py",
+      "sha256": "8CCC905222BA53250CA032E3BC17A5BED5471818FB03474EAF7BD68CF1547C48",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/launch.py",
+      "sha256": "FE8AB648AA0A79E06C7EC4F2B7CAA20C89E83D08FC2429ABAB5B3E72D8304F0C",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/lazy_stdio.py",
+      "sha256": "05ACF7331E519B4D5F3755023610B6B49075FB28235746ED9AE07D0983FD118B",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/lsp_provision.py",
+      "sha256": "AE25D9C3D6D40515B8DE151FF87A38DD83CE8B2170A7246AE919E0E377181C3B",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/mcp_provision.py",
+      "sha256": "277852DC4FCABF533A931C6307D9571CF67B5BFA879E711DDFCF1BF3C3BA7A56",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/nuphus_proxy.py",
+      "sha256": "142C2FA509C0AD997FB366BCC3946D6E1CC85EBBA1310250E4E1643884BCE81F",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/orphans.py",
+      "sha256": "552A276BE1DB266C3C8CFF008F080810D209933078C97E834EA1889444C10D91",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/registration.py",
+      "sha256": "17801E725C5007684599D91119B3DD0AA496D01D5855D1F85D2EE006799CDC35",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/resources.py",
+      "sha256": "E583EE00D1FB7BE112925F1AC1A182F85884BAB85F229BB7FEFE3F25F247BC36",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/serena_broker.py",
+      "sha256": "7B0FAC010B9A6D56EE99E24D89DF2BDDA50EFE25F1584C695A2CF3926821A36A",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/serena_entry.py",
+      "sha256": "A64472632710F9D3FA9F28AE6C77DE821D7D51FA4A658B81173FDF58535F75DF",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/code-tools/serena_proxy.py",
+      "sha256": "51B6F66034931461D10A44461431CDB9E4D0B9C5DA6823E243F735E1B4BBE7F1",
+      "owner": "native-dependency-and-mcp-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/codex-harness-check.ps1",
+      "sha256": "708CC898B76D9E820E2C8E472BF126E669B789E0E19E8119C600D47D7B7FFC14",
+      "owner": "native-launcher-and-diagnostics",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/codex.ps1",
+      "sha256": "480D05C17A2BC061E3911B834A33343DAC80D1FFEC2FFCB73174FE4FF6484DBC",
+      "owner": "native-launcher-and-diagnostics",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/delegation-usage.py",
+      "sha256": "A92408A8F767CF5986C5076EB20B640CF1450BC08FA480AFDD821CCB254E2B52",
+      "owner": "native-evaluation-and-usage",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/hook.ps1",
+      "sha256": "77D556DA3093F582D26AFA319FD23CFB5B39E40523F54216B895593874A70FE3",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/kit.psm1",
+      "sha256": "402688FF53E2334B504F3DD004225D39D04B60B5B8030D892E66FC9D0FA692F2",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/launcher.psm1",
+      "sha256": "D3ACF7B25901DCF519E40FB5916B8DC7742CA73EE81036AFF5F44D6FCB0B0FB5",
+      "owner": "native-launcher-and-diagnostics",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/backend.cpython-313.pyc",
+      "sha256": "95084B47ABBE72A5B0D8A953A7BBC46DCB2B7448BCC884CEF69FAB34B8F2B4AC",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/broker.cpython-313.pyc",
+      "sha256": "A943217BF3C8CEAFE3887D4188348C7417DE98AD20C7AC6364F746A0176F23B4",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/delphi.cpython-313.pyc",
+      "sha256": "F89A47B24CBF2080B23764E1087F3858E3090931CB5E6C7ED4A7A69EABAA0448",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/discovery.cpython-313.pyc",
+      "sha256": "C4E6E36A8F4B76A8F12FB9D2E97C565844983DAFE54EB6009C749502C2F71114",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/journal.cpython-313.pyc",
+      "sha256": "0C90C84E6FF94ADB71365CF9FB722DEFA63255C6D105348B03CF3F7678A7B1E4",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/markdown_client.cpython-313.pyc",
+      "sha256": "B300DF4D7957DB51AA900477039584923D13F3E2B66D7387E9E4EE025B29D15D",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/registry.cpython-313.pyc",
+      "sha256": "B59883638D6C3389C533C588D95B2CDE0986A86DD148B31EC203B9D20F74FFE1",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/__pycache__/server.cpython-313.pyc",
+      "sha256": "4D2FAC8D41E5F456C16B8B64C5EF96AE4C900F6A3A7C5FEBDAB92B16382794A7",
+      "owner": "derived-cache-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/backend.py",
+      "sha256": "18B6A23F2C5310AB9DAE7D4639067EF57858A820CA195D4B43DC17E28F346336",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/bash-windows.cjs",
+      "sha256": "860DC424B4911569842117E1698AFC9551D7BB8AB236F3E4BB36E795D208A3FE",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/broker.py",
+      "sha256": "3FFF8E88410F071C528D631771E64C89B0ECFDEF62FEAA087A604D0FD890D252",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/delphi.py",
+      "sha256": "9B95F53D7025D287A09FCEB7EDC9BB52BA1B15B0AC3F0F94FC14C3A306B7E9B1",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/discovery.py",
+      "sha256": "B4C8E63766CE51C155E0122EF7D1485ABECB278ACEB435A7343E8FE59C56DBD5",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/journal.py",
+      "sha256": "594DF0E7620D0049CEC1800E9EAED6966B679D6C0D218DF682CE5ABEEC221F0C",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/markdown_client.py",
+      "sha256": "8B93631DBE2AE085C74E698122FFAA9310389100E235B285C7C9157308CC4F20",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/markdown-parse.cjs",
+      "sha256": "A0EAA424EDB327335D3D0FEE3AC30A1DAD2963C108080D2EB72B51FFA4297D9B",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/powershell-diagnostics.ps1",
+      "sha256": "9581E0316C28709F536B24A73CA9230AFB4952C119C22EAF49AC66C3EFE2BE3A",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/registry.py",
+      "sha256": "7D246BA07C445D00A1181D1A9DC800A2C748B5111D811F7D40C2E93C61E875B0",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/server.py",
+      "sha256": "485C23B179357F2F8DA24B1C4410ECDAAF81E072F199A99C19001F65E6C5700F",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/lsp/xml-diagnostics.ps1",
+      "sha256": "430D99A358DA56D39A0D50C865C2B307440461473574ACFA7914FDD48FAD3266",
+      "owner": "shared-resources-or-verified-retirement",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/mcp.ps1",
+      "sha256": "14B4AF738900DCA9EC212546DFC0CB6C81102F8B128064635C96062A6B97FB11",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-config-check.mjs",
+      "sha256": "0BE4EA83E9F7C87038C43C69F51F810624629ED94D9633FFECEC2557B7B70B53",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-login.mjs",
+      "sha256": "17F289540A54D2951C7D59144AAFE72628BE4F82FB5C210692764C8AFFF52E75",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-login.ps1",
+      "sha256": "5626CA9F86E2821D165767C8226CE4B56E881E3CA33A9F41DABC3DCA618FAA56",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-native-restore.mjs",
+      "sha256": "D038677E311684F8954662E6591F30F72BF5B2A91BA0C1A86870B77B699EE7FB",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-process.cs",
+      "sha256": "122AA774A6A186E560139A2CE2F02C242FCD006614ABD49F3F7322FB106E82C5",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-process.ps1",
+      "sha256": "E1E303D9A07B51E0665F4D7E40ACD0B9FDFD875794E10F2F5FB485966E6C2234",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/opencodex-service.ps1",
+      "sha256": "E28D122CAD108815FC194287C9C39EFC5776F91B97B834101A3A66B5C243F705",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/outcome_cases.py",
+      "sha256": "EDBF957A28E57CE298C5549B993ABECC16117F849F3A0A0F53F748C579346D6D",
+      "owner": "native-evaluation-and-usage",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/outcome_oracles.py",
+      "sha256": "58A349980F2BBD536D665AB3307B97A32F1C7290E7FDAD10635A1F5429044EAC",
+      "owner": "native-evaluation-and-usage",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/outcome_report.py",
+      "sha256": "37D55337C1684243EC4A43E905C470558529023A897729AE776A139B712EBBF3",
+      "owner": "native-evaluation-and-usage",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/outcome_runner.py",
+      "sha256": "D4D0EAEB1028E5E002E5669312156A929EBCD895BE10D1F7AC0CFD75858B1CD0",
+      "owner": "native-evaluation-and-usage",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/outcome_suite.py",
+      "sha256": "71A341F0D8A81034D03C616439029827B063FE1D5D396B586343473248C80CCF",
+      "owner": "native-evaluation-and-usage",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/process_ownership.py",
+      "sha256": "71EC17A4CFBACA94ABB066F6AACAC2DE6807994F3D4FCEAF1AB92D32D167A35D",
+      "owner": "native-process-ownership",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/rtk-adapter/src/main.rs",
+      "sha256": "3A0718F6F050A774EBA1BC78BF5F85C1538E67B8F7AC773BFF7724B91E0BD17D",
+      "owner": "native-rtk",
+      "state": "native-source"
+    },
+    {
+      "path": "tools/source-diagnostics.psm1",
+      "sha256": "0D5FD19F89753012F15FDD4DAD1C83F5770E526446663AB408F34F365146D847",
+      "owner": "native-launcher-and-diagnostics",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/subscription-routing.psm1",
+      "sha256": "AC308E0D19A797D35A0E747835426530BF33C5D9DEACF0254C30D9F7F537058B",
+      "owner": "native-subscription-service",
+      "state": "pending-migration-or-consumer-check"
+    },
+    {
+      "path": "tools/token-workflow.psm1",
+      "sha256": "6D154E596F4EC3B5F74E09D8FA20874B6FE9BB8A413B4041A3FB940B6B2937C4",
+      "owner": "native-installation-and-component-lifecycle",
+      "state": "pending-migration-or-consumer-check"
+    }
+  ]
+}

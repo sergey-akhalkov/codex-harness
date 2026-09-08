@@ -16,7 +16,7 @@ $configPath = Join-Path $source 'global/opencodex/config.json'
 $rolePath = Join-Path $roles 'middle.toml'
 $cleanConfig = [IO.File]::ReadAllText((Join-Path $repo 'global/opencodex/config.json'))
 $cleanRole = [IO.File]::ReadAllText((Join-Path $repo 'global/opencodex/agents/middle.toml'))
-foreach ($scenario in @('valid','api-keys','role-token','implicit-search','implicit-vision','wrong-middle','recursive-middle')) {
+foreach ($scenario in @('valid','api-keys','role-token','implicit-search','implicit-vision','wrong-middle','recursive-middle','unverified-grok-wire','no-empty-recovery','no-terminal-recovery')) {
     [IO.File]::WriteAllText($configPath, $cleanConfig)
     [IO.File]::WriteAllText($rolePath, $cleanRole)
     if ($scenario -eq 'api-keys') {
@@ -32,7 +32,18 @@ foreach ($scenario in @('valid','api-keys','role-token','implicit-search','impli
         [IO.File]::WriteAllText($configPath, ($candidate | ConvertTo-Json -Depth 30))
     }
     if ($scenario -eq 'wrong-middle') { [IO.File]::WriteAllText($rolePath, $cleanRole.Replace('grok-4.6','grok-4.5')) }
+    if ($scenario -eq 'unverified-grok-wire') {
+        $candidate = $cleanConfig | ConvertFrom-Json -AsHashtable
+        [void]$candidate.providers.xai.Remove('modelAdapters')
+        [IO.File]::WriteAllText($configPath, ($candidate | ConvertTo-Json -Depth 30))
+    }
     if ($scenario -eq 'recursive-middle') { [IO.File]::WriteAllText($rolePath, $cleanRole.Replace('enabled = false','enabled = true')) }
+    if ($scenario -in @('no-empty-recovery','no-terminal-recovery')) {
+        $candidate = $cleanConfig | ConvertFrom-Json -AsHashtable
+        if ($scenario -eq 'no-empty-recovery') { $candidate.emptyCompletionRetry = $false }
+        else { $candidate.providers.xai.terminalContinuationGuard = $false }
+        [IO.File]::WriteAllText($configPath, ($candidate | ConvertTo-Json -Depth 30))
+    }
     $prefix = Join-Path $root $scenario
     $request = @{executable=Join-Path $PackageRoot 'node_modules/bun/bin/bun.exe'
         arguments=@('--no-env-file',(Join-Path $repo 'tools/opencodex-config-check.mjs'),$PackageRoot,$source)

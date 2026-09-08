@@ -157,12 +157,56 @@ class UsageTests(unittest.TestCase):
         self.assertIn("no_inputs", self.codes(usage.summarize_rollouts([])))
 
     def test_missing_or_conflicting_identity_cannot_contribute(self):
-        for events in ([context(), tokens()], [meta("a"), meta("b"), context(), tokens()]):
-            path = self.rollout("a", *events)
-            report = usage.summarize_rollouts([path])
-            self.assertIsNone(report["threads"][0]["id"])
-            self.assertIsNone(report["totals"]["total_tokens"])
-            self.assertTrue(report["partial"])
+        missing = self.rollout("missing", context(), tokens())
+        missing_report = usage.summarize_rollouts([missing])
+        self.assertIsNone(missing_report["threads"][0]["id"])
+        self.assertIsNone(missing_report["totals"]["total_tokens"])
+        self.assertTrue(missing_report["partial"])
+        conflicting = self.rollout("conflict", meta("a"), meta("unrelated"), context(), tokens())
+        conflicting_report = usage.summarize_rollouts([conflicting])
+        self.assertIsNone(conflicting_report["threads"][0]["id"])
+        self.assertIsNone(conflicting_report["totals"]["total_tokens"])
+        self.assertIn("conflicting_thread_ids", self.codes(conflicting_report))
+
+    def test_child_session_id_is_shared_context_not_a_second_thread(self):
+        parent = self.rollout("p", meta(), context(), tokens(10),
+                              {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                                  "type": "CollabAgentToolCall", "receiver_thread_ids": ["child"]}}})
+        child_meta = meta("child", "parent")
+        child_meta["payload"]["session_id"] = "parent"
+        child_meta["payload"]["parent_thread_id"] = "parent"
+        child = self.rollout(
+            "c", child_meta, context("xai/grok-4.6", "xhigh"), tokens(40),
+            response_record("resp_child", 40, 60),
+        )
+        report = usage.summarize_rollouts([parent, child])
+        by_id = {row["id"]: row for row in report["threads"]}
+        self.assertEqual(set(by_id), {"parent", "child"})
+        self.assertEqual(by_id["child"]["parent_id"], "parent")
+        self.assertEqual(by_id["child"]["total_tokens"], 60)
+        self.assertEqual(by_id["child"]["response_count"], 1)
+        self.assertEqual(by_id["child"]["response_usages"]["resp_child"]["total_tokens"], 60)
+        self.assertEqual(report["totals"]["total_tokens"], 75)
+        self.assertEqual(report["responses"]["response_count"], 1)
+        self.assertNotIn("conflicting_thread_ids", self.codes(report))
+
+    def test_inherited_second_meta_keeps_child_id(self):
+        first = meta("child", "parent")
+        first["payload"]["session_id"] = "parent"
+        first["payload"]["parent_thread_id"] = "parent"
+        first["payload"]["forked_from_id"] = "parent"
+        restated = meta("parent")
+        restated["payload"]["session_id"] = "parent"
+        path = self.rollout(
+            "c", first, restated, context("xai/grok-4.6", "xhigh"), tokens(40),
+            response_record("resp_child", 40, 60),
+        )
+        row = usage.summarize_rollouts([path])["threads"][0]
+        self.assertEqual(row["id"], "child")
+        self.assertEqual(row["parent_id"], "parent")
+        self.assertEqual(row["total_tokens"], 60)
+        self.assertEqual(row["response_count"], 1)
+        self.assertIn("forked_or_compacted_history", self.codes(usage.summarize_rollouts([path])))
 
     def test_conflicting_duplicates_invalidate_usage_in_every_order(self):
         a = self.rollout("a", meta(), context(), tokens(10))
@@ -214,6 +258,268 @@ class UsageTests(unittest.TestCase):
                                 text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(path.read_bytes(), before)
+
+
+def response_record(response_id, usage_amount, thread_total=None, timestamp="2026-09-08T00:00:00Z"):
+    usage = {
+        "input_tokens": usage_amount, "cached_input_tokens": usage_amount // 2,
+        "output_tokens": usage_amount // 2, "reasoning_output_tokens": usage_amount // 5,
+        "total_tokens": usage_amount + usage_amount // 2,
+    }
+    thread = {
+        "input_tokens": thread_total or usage["input_tokens"],
+        "cached_input_tokens": thread_total or usage["cached_input_tokens"] if False else usage["cached_input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "reasoning_output_tokens": usage["reasoning_output_tokens"],
+        "total_tokens": thread_total or usage["total_tokens"],
+    }
+    if thread_total is not None:
+        thread["total_tokens"] = thread_total
+    return {
+        "timestamp": timestamp,
+        "type": "token_usage_record",
+        "payload": {
+            "response_id": response_id,
+            "usage": usage,
+            "turn_token_usage": dict(thread),
+            "thread_token_usage": dict(thread),
+        },
+    }
+
+
+def message(role, text, phase=None, timestamp="2026-09-08T00:00:01Z"):
+    payload = {"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
+    if phase:
+        payload["phase"] = phase
+    return {"timestamp": timestamp, "type": "response_item", "payload": payload}
+
+
+class AttributionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def rollout(self, name, *events):
+        path = self.root / name
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        return path
+
+    def codes(self, report):
+        return {warning["code"] for warning in report["warnings"]}
+
+    def test_repeated_stable_response_ids_count_once(self):
+        first = self.rollout("a", meta(), context(), tokens(10),
+                             response_record("resp_aaa", 10, 15, "2026-09-08T00:00:00Z"),
+                             response_record("resp_aaa", 10, 15, "2026-09-08T00:01:00Z"))
+        copy = self.rollout("b", meta(), context(), tokens(10),
+                            response_record("resp_aaa", 10, 15, "2026-09-08T00:02:00Z"))
+        report = usage.summarize_rollouts([first, copy])
+        self.assertEqual(report["responses"]["response_count"], 1)
+        self.assertEqual(report["responses"]["total_tokens"], 15)
+        self.assertEqual(report["totals"]["total_tokens"], 15)
+
+    def test_conflicting_response_usage_invalidates_all_copies_in_every_order(self):
+        first = self.rollout("a", meta(), context(), tokens(10),
+                             response_record("resp_aaa", 10, 15))
+        second = self.rollout("b", meta(), context(), tokens(10),
+                              response_record("resp_aaa", 20, 15))
+        third = self.rollout("c", meta(), context(), tokens(10),
+                             response_record("resp_aaa", 10, 15))
+        for paths in itertools.permutations([first, second, third]):
+            report = usage.summarize_rollouts(list(paths))
+            self.assertEqual(report["responses"]["response_count"], 1)
+            self.assertIsNone(report["responses"]["total_tokens"])
+            self.assertEqual(report["responses"]["conflicting_response_ids"], 1)
+            self.assertEqual(report["totals"]["total_tokens"], 15)
+            usages = report["threads"][0]["response_usages"]["resp_aaa"]
+            self.assertIsNone(usages["total_tokens"])
+            self.assertIn("conflicting_duplicate_id", self.codes(report))
+
+    def test_missing_response_field_is_not_a_conflicting_identity(self):
+        incomplete = response_record("resp_partial", 10, 15)
+        incomplete["payload"]["usage"].pop("total_tokens")
+        path = self.rollout("a", meta(), context(), tokens(10), incomplete)
+        report = usage.summarize_rollouts([path])
+        self.assertEqual(report["responses"]["conflicting_response_ids"], 0)
+        self.assertIsNone(report["responses"]["total_tokens"])
+        self.assertTrue(report["responses"]["partial"])
+        self.assertIn("| Reconciled total | unknown |", usage.compact_markdown(report))
+
+    def test_divergent_series_do_not_claim_a_reconciled_total(self):
+        path = self.rollout("a", meta(), context(), tokens(100),
+                            response_record("resp_one", 10, 15))
+        report = usage.summarize_rollouts([path])
+        self.assertEqual(report["totals"]["total_tokens"], 150)
+        self.assertEqual(report["responses"]["total_tokens"], 15)
+        markdown = usage.compact_markdown(report)
+        self.assertIn("| Reconciled total | unknown |", markdown)
+        self.assertIn("| Response input / cached / uncached | 10 / 5 / 5 |", markdown)
+
+    def test_forked_history_does_not_add_compaction_usage(self):
+        path = self.rollout(
+            "a", meta(), context(), tokens(10),
+            response_record("resp_one", 10, 15),
+            {"type": "compacted", "payload": {
+                "window_id": "win2", "compaction_response_id": "resp_one",
+                "latest_token_usage_record": {"response_id": "resp_one", "usage": {
+                    "input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 5,
+                    "reasoning_output_tokens": 2, "total_tokens": 15}}}},
+        )
+        report = usage.summarize_rollouts([path])
+        self.assertEqual(report["threads"][0]["compacted_windows"], 1)
+        self.assertEqual(report["responses"]["response_count"], 1)
+        self.assertEqual(report["totals"]["total_tokens"], 15)
+        self.assertIn("forked_or_compacted_history", self.codes(report))
+
+    def test_cached_and_new_input_are_separated(self):
+        path = self.rollout("a", meta(), context(), tokens(20))
+        row = usage.summarize_rollouts([path])["threads"][0]
+        self.assertEqual(row["input_tokens"], 20)
+        self.assertEqual(row["cached_input_tokens"], 10)
+        self.assertEqual(row["output_tokens"], 10)
+        self.assertEqual(row["reasoning_output_tokens"], 4)
+        self.assertLessEqual(row["reasoning_output_tokens"], row["output_tokens"])
+
+    def test_reasoning_included_in_output_not_added(self):
+        path = self.rollout("a", meta(), context(), tokens(20),
+                            response_record("resp_out", 20, 30))
+        report = usage.summarize_rollouts([path])
+        usage_row = report["threads"][0]["response_usages"]["resp_out"]
+        self.assertEqual(usage_row["output_tokens"], 10)
+        self.assertEqual(usage_row["reasoning_output_tokens"], 4)
+        self.assertEqual(usage_row["total_tokens"], 30)
+        self.assertNotEqual(usage_row["total_tokens"], usage_row["output_tokens"] + usage_row["reasoning_output_tokens"])
+
+    def test_missing_child_stays_partial(self):
+        parent = self.rollout(
+            "p", meta(), context(), tokens(10),
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "CollabAgentToolCall", "receiver_thread_ids": ["child"]}}},
+        )
+        report = usage.summarize_rollouts([parent])
+        self.assertEqual(report["missing_children"][0]["child_id"], "child")
+        self.assertTrue(report["partial"])
+        self.assertIn("missing_child", self.codes(report))
+        self.assertTrue(report["threads"][0]["partial"])
+        self.assertEqual(report["threads"][0]["total_tokens"], 15)
+
+    def test_partial_concurrent_and_reset_window_limitations(self):
+        parent = self.rollout(
+            "p",
+            {**meta(), "timestamp": "2026-09-08T00:00:00Z"},
+            {**context(), "timestamp": "2026-09-08T00:00:01Z"},
+            {**tokens(10), "timestamp": "2026-09-08T00:10:00Z"},
+        )
+        child = self.rollout(
+            "c",
+            {**meta("child", "parent"), "timestamp": "2026-09-08T00:05:00Z"},
+            {**context("xai/grok-4.6", "xhigh"), "timestamp": "2026-09-08T00:05:01Z"},
+            {**tokens(40), "timestamp": "2026-09-08T00:08:00Z"},
+        )
+        report = usage.summarize_rollouts([parent, child])
+        self.assertTrue(report["overlapping_elapsed"])
+        self.assertIn("concurrent_or_overlapping_elapsed", self.codes(report))
+        markdown = usage.compact_markdown(report)
+        self.assertIn("reset windows are incomparable", markdown)
+        self.assertNotIn("%", markdown)
+
+    def test_hook_text_and_actual_continuation(self):
+        path = self.rollout(
+            "a", meta(), context(), tokens(10),
+            message("user", "<hook_prompt hook_run_id=abc>diagnostic</hook_prompt>"),
+            message("user", "<turn_aborted> The user interrupted the previous turn", timestamp="2026-09-08T00:00:02Z"),
+            message("assistant", "working", phase="commentary", timestamp="2026-09-08T00:00:03Z"),
+            {"timestamp": "2026-09-08T00:00:04Z", "type": "event_msg", "payload": {"type": "task_started"}},
+            {"timestamp": "2026-09-08T00:00:05Z", "type": "event_msg", "payload": {"type": "task_complete", "duration_ms": 1500}},
+        )
+        row = usage.summarize_rollouts([path])["threads"][0]
+        self.assertEqual(row["hook_messages"], 1)
+        self.assertGreater(row["hook_chars"], 10)
+        self.assertEqual(row["continuation_notices"], 1)
+        self.assertEqual(row["task_started"], 1)
+        self.assertEqual(row["commentary_messages"], 1)
+        self.assertEqual(row["actual_continuations"], 1)
+        self.assertGreaterEqual(row["elapsed_seconds"], 1)
+
+    def test_ordinary_turns_are_not_continuations(self):
+        path = self.rollout(
+            "a",
+            {"timestamp": "2026-09-08T00:00:00Z", **meta()},
+            {"timestamp": "2026-09-08T00:00:01Z", **context()},
+            {"timestamp": "2026-09-08T00:00:02Z", **tokens(10)},
+            {"timestamp": "2026-09-08T00:00:03Z", "type": "event_msg", "payload": {"type": "task_started"}},
+            message("assistant", "status", phase="commentary", timestamp="2026-09-08T00:00:04Z"),
+            {"timestamp": "2026-09-08T00:00:05Z", "type": "event_msg", "payload": {"type": "task_complete", "duration_ms": 900}},
+        )
+        row = usage.summarize_rollouts([path])["threads"][0]
+        self.assertEqual(row["task_started"], 1)
+        self.assertEqual(row["commentary_messages"], 1)
+        self.assertEqual(row["continuation_notices"], 0)
+        self.assertEqual(row["actual_continuations"], 0)
+        markdown = usage.compact_markdown(usage.summarize_rollouts([path]))
+        self.assertIn("Ordinary turns started", markdown)
+        self.assertIn("| Actual continuations | 0 |", markdown)
+        self.assertIn("Automatic context occurrences / chars", markdown)
+
+    def test_intervening_ordinary_user_request_is_not_a_continuation(self):
+        path = self.rollout(
+            "a", meta(), context(), tokens(10),
+            message("user", "<turn_aborted> The user interrupted the previous turn", timestamp="2026-09-08T00:00:02Z"),
+            message("user", "please continue with a new question", timestamp="2026-09-08T00:00:03Z"),
+            {"timestamp": "2026-09-08T00:00:04Z", "type": "event_msg", "payload": {"type": "task_started"}},
+        )
+        row = usage.summarize_rollouts([path])["threads"][0]
+        self.assertEqual(row["continuation_notices"], 1)
+        self.assertEqual(row["user_messages"], 1)
+        self.assertEqual(row["actual_continuations"], 0)
+
+    def test_two_triggers_share_one_resumed_turn(self):
+        path = self.rollout(
+            "a", meta(), context(), tokens(10),
+            message("user", "<turn_aborted> The user interrupted the previous turn", timestamp="2026-09-08T00:00:02Z"),
+            message("user", "resume after tool-host restart. if you are still working, continue.", timestamp="2026-09-08T00:00:03Z"),
+            {"timestamp": "2026-09-08T00:00:04Z", "type": "event_msg", "payload": {"type": "task_started"}},
+            response_record("resp_resume", 10, 15, "2026-09-08T00:00:05Z"),
+        )
+        row = usage.summarize_rollouts([path])["threads"][0]
+        self.assertEqual(row["continuation_notices"], 2)
+        self.assertEqual(row["actual_continuations"], 1)
+
+    def test_markdown_omits_raw_identities_and_quota_conversion(self):
+        path = self.rollout("PRIVATE_FILENAME", meta(), context(), tokens(10),
+                            response_record("resp_secret", 10, 15))
+        markdown = usage.compact_markdown(usage.summarize_rollouts([path]))
+        self.assertIn("gpt-6-astra", markdown)
+        self.assertIn("OpenAI", markdown)
+        self.assertNotIn("resp_secret", markdown)
+        self.assertNotIn("PRIVATE_FILENAME", markdown)
+        self.assertIn("not a quota share", markdown)
+        self.assertIn("not weekly quota", markdown)
+        self.assertIn("root x1", markdown)
+        self.assertIn("Reconciled total", markdown)
+        self.assertIn("disagreement is unresolved", markdown)
+        self.assertNotIn("harness-grok-reliability", markdown)
+
+    def test_cli_markdown_and_private_hashes_omit_paths(self):
+        path = self.rollout("PRIVATE_FILENAME", meta(), context(), tokens(10),
+                            response_record("resp_secret", 10, 15),
+                            message("user", "<hook_prompt hook_run_id=abc>secret</hook_prompt>"))
+        output = self.root / "report.md"
+        private = self.root / "sources.json"
+        result = subprocess.run(
+            [sys.executable, "-B", str(SCRIPT), str(path), "--format", "markdown",
+             "--output", str(output), "--private-sources", str(private)],
+            cwd=self.root, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = output.read_text(encoding="utf-8")
+        sources = json.loads(private.read_text(encoding="utf-8"))
+        blob = rendered + result.stdout + result.stderr + json.dumps(sources)
+        for secret in ("PRIVATE_FILENAME", "resp_secret", "secret</hook_prompt>", str(path)):
+            self.assertNotIn(secret, blob)
+        self.assertEqual(len(sources["sources"]), 1)
+        self.assertIn("sha256", sources["sources"][0])
+        self.assertIn("gpt-6-astra", rendered)
 
 
 if __name__ == "__main__":

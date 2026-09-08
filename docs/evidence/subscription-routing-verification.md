@@ -1,6 +1,6 @@
 # Subscription routing verification
 
-Status: global delivery complete on 2026-09-07; all 13 [implementation tasks](../../openspec/changes/connect-subscription-model-routing/tasks.md) are complete. The managed global proxy is running and ready. This record contains observations from Windows on 2026-09-06–07, including failed attempts and their later corrections. The user explicitly ended further investigation of the contained memory event; its cause is not claimed resolved.
+Status: global delivery complete on 2026-09-07; all 13 [implementation tasks](../../openspec/changes/archive/2026-09-08-connect-subscription-model-routing/tasks.md) are complete. The managed global proxy is running and ready. This record contains observations from Windows on 2026-09-06–07, including failed attempts and their later corrections. The user explicitly ended further investigation of the contained memory event; its cause is not claimed resolved.
 
 ## Actual subscription and contained runtime
 

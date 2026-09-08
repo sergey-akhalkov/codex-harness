@@ -1,7 +1,7 @@
 """Real Graphify counterexamples: another graph, corrupt graph, explicit worktree."""
 import anyio
-from contextlib import asynccontextmanager
-import importlib.util
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import AsyncGenerator
 import json
 import os
 from pathlib import Path
@@ -11,26 +11,44 @@ import sys
 import tempfile
 import time
 import psutil
+from typing import Protocol, cast, runtime_checkable
+from native_contracts import Inventory
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('proxy', ROOT / 'tools/code-tools/graphify_proxy.py')
-proxy = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(proxy)
+sys.path.insert(0, str(ROOT / 'tools'))
+from process_ownership import JobGuard
+sys.path.insert(0, str(ROOT / 'tools/code-tools'))
+import graphify_proxy
+
+
+@runtime_checkable
+class GraphifyProxy(Protocol):
+    def http_identity(self, endpoint: str, python: str, graph: str) -> tuple[int, float]: ...
+    def checked_result(self, result: types.CallToolResult) -> types.CallToolResult: ...
+    async def check_health(self, session: ClientSession) -> None: ...
+    def upstream(self, python: str, graph: str, endpoint: str | None, credential: str | None,
+                 *, cwd: str | None = None) -> AbstractAsyncContextManager[tuple[ClientSession, tuple[int, float] | None]]: ...
+    def validate_repository(self, name: str, arguments: dict[str, str]) -> str | None: ...
+
+
+assert isinstance(graphify_proxy, GraphifyProxy)
+proxy: GraphifyProxy = graphify_proxy
 
 
 @asynccontextmanager
-async def daemon(python, graph, folder):
+async def daemon(python: str, graph: Path, folder: Path) -> AsyncGenerator[tuple[str, int, Path]]:
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
-        port = sock.getsockname()[1]
+        port = cast(tuple[str, int], sock.getsockname())[1]
     log_path = folder / 'http.log'
     with log_path.open('w', encoding='utf-8') as log:
-        process = subprocess.Popen([python, '-B', '-u', '-m', 'graphify.serve', '--graph', str(graph),
+        guard = JobGuard()
+        process = guard.popen([python, '-B', '-u', '-m', 'graphify.serve', '--graph', str(graph),
             '--transport', 'http', '--host', '127.0.0.1', '--port', str(port), '--path', '/mcp', '--stateless'],
-            env={**os.environ, 'GRAPHIFY_API_KEY': 'owned-test-only', 'PYTHONDONTWRITEBYTECODE': '1'},
+            env={**os.environ, 'GRAPHIFY_API_KEY': 'owned-test-only', 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONUTF8': '1'},
             stdout=log, stderr=log, creationflags=0x08000000 if os.name == 'nt' else 0)
         try:
             deadline = time.monotonic() + 25
@@ -46,28 +64,24 @@ async def daemon(python, graph, folder):
                     await anyio.sleep(.1)
             yield f'http://127.0.0.1:{port}/mcp', process.pid, log_path
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            guard.close()
+            _ = process.wait(timeout=5)
 
 
-async def main():
-    inventory = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig'))
+async def main() -> None:
+    inventory = cast(Inventory, json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig')))
     python = next(i for i in inventory['mcp'] if i['id'] == 'graphify')['paths']['python']
     with tempfile.TemporaryDirectory(prefix='harness-graphify-identity-') as folder:
         temporary = Path(folder)
-        graphs = {}
+        graphs: dict[str, Path] = {}
         for name in ('A', 'B'):
             graphs[name] = temporary / f'{name}.json'
-            graphs[name].write_text(json.dumps({'directed': False, 'multigraph': False, 'graph': {},
+            _ = graphs[name].write_text(json.dumps({'directed': False, 'multigraph': False, 'graph': {},
                 'nodes': [{'id': name, 'label': f'UNIQUE_GRAPH_{name}', 'community': 0}], 'links': []}), encoding='utf-8')
         async with daemon(python, graphs['B'], temporary) as (endpoint, pid, log):
             with anyio.fail_after(30):
                 try:
-                    proxy.http_identity(endpoint, python, str(graphs['A']))
+                    _ = proxy.http_identity(endpoint, python, str(graphs['A']))
                 except ValueError:
                     pass
                 else:
@@ -82,14 +96,14 @@ async def main():
                     assert identity and (identity[0] == pid or psutil.Process(identity[0]).ppid() == pid)
                     await proxy.check_health(session)
         corrupt = temporary / 'corrupt.json'
-        corrupt.write_text('{ broken', encoding='utf-8')
+        _ = corrupt.write_text('{ broken', encoding='utf-8')
         # Upstream starts despite a corrupt default and returns an error in text
         # with isError=false. The adapter must not declare this backend healthy.
         params = StdioServerParameters(command=python,
             args=['-B', '-u', '-m', 'graphify.serve', '--graph', str(corrupt)])
         async with stdio_client(params) as streams:
             async with ClientSession(*streams) as session:
-                await session.initialize()
+                _ = await session.initialize()
                 result = await session.call_tool('graph_stats', {})
                 assert proxy.checked_result(result).isError
                 try:
@@ -100,10 +114,10 @@ async def main():
                     raise AssertionError('Corrupt graph accepted as healthy')
         worktree = temporary / 'explicit repo кириллица'
         worktree.mkdir()
-        subprocess.run(['git', 'init', '-q', str(worktree)], check=True)
+        _ = subprocess.run(['git', 'init', '-q', str(worktree)], check=True)
         assert proxy.validate_repository('list_prs', {'repo': str(worktree)}) == str(worktree.resolve())
         try:
-            proxy.validate_repository('list_prs', {'repo': str(temporary)})
+            _ = proxy.validate_repository('list_prs', {'repo': str(temporary)})
         except ValueError:
             pass
         else:

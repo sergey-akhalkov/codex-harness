@@ -24,6 +24,9 @@ try {
   assert.equal(validateConfigCandidate(config).ok, true, 'OpenCodex source configuration rejected by pinned schema');
   assert.equal(config.hostname, '127.0.0.1');
   assert.equal(config.providers.xai.authMode, 'oauth');
+  assert.equal(config.providers.xai.modelAdapters?.['grok-4.6'], 'openai-chat', 'Grok continuation requires the verified Chat wire');
+  assert.equal(config.providers.xai.terminalContinuationGuard, true, 'Grok status-only completion must have bounded recovery');
+  assert.equal(config.emptyCompletionRetry, true, 'Empty routed completion must have bounded recovery');
   const search = config.webSearchSidecar;
   assert.ok(search?.enabled === false || (search?.backend === 'xai' && search?.model === 'grok-4.6'), 'Search must not implicitly borrow OpenAI quota');
   assert.equal(config.visionSidecar?.enabled, false, 'Implicit vision helper must remain disabled');

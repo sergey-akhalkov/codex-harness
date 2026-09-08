@@ -5,12 +5,12 @@ Uses the installed pinned package read-only, real component functions and real
 2048 MiB service jobs. Private fixture wrappers isolate every home before import
 and reject external fetch/HTTP/socket calls; source config uses a free port,
 static models and disabled sidecars. This is not authenticated/global acceptance.
-A contained worker has a 330-second ceiling. The outer supervisor removes only
+A contained worker has a 330-second ceiling (510 with recovery probes). The outer supervisor removes only
 the exact task whose action points at its unique fixture. Evidence is retained;
 no recursive deletion or global configuration/service mutations are performed.
 #>
 [CmdletBinding()]
-param([switch]$RunIsolatedProbes, [string]$PackageRoot, [string]$WorkerConfig)
+param([switch]$RunIsolatedProbes, [switch]$RunRecoveryProbes, [string]$PackageRoot, [string]$WorkerConfig)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not $RunIsolatedProbes) { 'SKIP: pass -RunIsolatedProbes to run the isolated, credential-free scheduler probe.'; return }
@@ -38,6 +38,7 @@ if (-not $WorkerConfig) {
     $paths = & $module { param($p) Get-SubscriptionPaths $p.source $p.user $p.codex } $parameters
     if ($paths.task -eq $realPaths.task) { throw 'Isolated task identity collided with the global installation.' }
     $parameters.task=$paths.task
+    $parameters.recovery=[bool]$RunRecoveryProbes
     $workerPath=Join-Path $fixture 'worker-config.json'; Write-ProbeJson $workerPath $parameters
     $protected = @($realPaths.config, (Join-Path $realCodex 'auth.json'), (Join-Path $realCodex 'harness.config.toml'),
         (Join-Path $realUser '.opencodex/config.json'), (Join-Path $realUser '.opencodex/auth.json'),
@@ -47,7 +48,7 @@ if (-not $WorkerConfig) {
     foreach($path in $protected) { $baseline[$path]=if(Test-Path -LiteralPath $path -PathType Leaf){(Get-FileHash -LiteralPath $path).Hash}else{$null} }
     Write-ProbeJson (Join-Path $fixture 'global-hashes-before.json') $baseline
     $request=@{executable=$dependency.powershell;arguments=@('-NoLogo','-NoProfile','-File',$PSCommandPath,'-RunIsolatedProbes','-WorkerConfig',$workerPath)
-        workingDirectory=$fixture;stdoutPath=(Join-Path $fixture 'worker.stdout');stderrPath=(Join-Path $fixture 'worker.stderr');memoryLimitMiB=2048;timeoutSeconds=330;environment=@{}}
+        workingDirectory=$fixture;stdoutPath=(Join-Path $fixture 'worker.stdout');stderrPath=(Join-Path $fixture 'worker.stderr');memoryLimitMiB=2048;timeoutSeconds=$(if($RunRecoveryProbes){510}else{330});environment=@{}}
     Write-ProbeJson (Join-Path $fixture 'worker.request.json') $request
     $summary=@{status='running';fixture=$fixture;task=$paths.task;startedAt=[DateTime]::UtcNow.ToString('o');globalPreservation=@{};cleanup='pending'}
     Write-Output "Isolated lifecycle evidence: $fixture"
@@ -60,6 +61,12 @@ if (-not $WorkerConfig) {
         try {
             $task = & $module {param($name) Get-SubscriptionTask $name} $paths.task
             if ($task) {
+                # Retain the pre-cleanup native host boundary when no host log
+                # was created; a readiness timeout does not identify its cause.
+                $summary.taskBeforeCleanup=$task
+                $summary.fixtureProcesses=@(Get-CimInstance Win32_Process | Where-Object {
+                    $_.CommandLine -and $_.CommandLine.Contains($fixture)
+                } | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath,CommandLine)
                 [xml]$xml=$task.xml
                 $actions=@($xml.Task.Actions.Exec)
                 $expectedArgs='-NoLogo -NoProfile -WindowStyle Hidden -File "' + (Join-Path $paths.source 'tools/opencodex-service.ps1') + '" -StatePath "' + $paths.service + '"'
@@ -124,6 +131,19 @@ function Get-HttpComparison([int]$ProcessId) {
 }
 function Assert-Connected {
     $check=Invoke-ProbeMode Check
+    if ($check.status -ne 'ready') {
+        # Preserve the failed check before cleanup changes the observed state.
+        $started = & $module { param($p) Get-SubscriptionStarted $p } $paths
+        $detail = @{check=$check;time=[DateTime]::UtcNow.ToString('o');started=$started
+            task=(& $module {param($p) Get-SubscriptionTask $p.task} $paths)
+            runtime=(Read-ProbeJson (Join-Path $paths.opencodex 'runtime-port.json'))
+            links=@{}}
+        foreach ($name in @('configLink','roleLink')) {
+            $detail.links[$name]=& $module {param($p) Get-SubscriptionLink $p} $paths[$name]
+        }
+        if ($started) { $detail.http=Get-HttpComparison ([int]$started.processId) }
+        Write-ProbeJson (Join-Path $fixture 'failed-ready-check.json') $detail
+    }
     Assert-Probe ($check.status -eq 'ready') 'Actual component reports ready'
     foreach($name in @('configLink','roleLink')){$target=if($name -eq 'configLink'){$paths.configSource}else{$paths.roleSource};Assert-Probe ((& $module {param($p) Get-SubscriptionLink $p} $paths[$name]) -ceq $target) "Direct source link: $name"}
     $ready=Invoke-RestMethod "http://127.0.0.1:$port/readyz" -TimeoutSec 3 -NoProxy -DisableKeepAlive
@@ -192,7 +212,20 @@ fs.appendFileSync(path.join(fixture,'guard.jsonl'),JSON.stringify({time:new Date
     Copy-Item -LiteralPath (Join-Path $repository 'tools/opencodex-process.ps1') -Destination (Join-Path $paths.source 'tools/opencodex-process.ps1')
     Copy-Item -LiteralPath (Join-Path $repository 'tools/opencodex-process.cs') -Destination (Join-Path $paths.source 'tools/opencodex-process.cs')
     $originalService=(Join-Path $repository 'tools/opencodex-service.ps1').Replace("'","''")
-    $serviceWrapper="#requires -Version 7.4`nparam([string]`$StatePath)`n& '$originalService' -StatePath `$StatePath`n"
+    $serviceWrapper=@'
+#requires -Version 7.4
+param([string]$StatePath)
+$wrapperLog=Join-Path (Split-Path $StatePath) 'runs/wrapper.jsonl'
+function Write-WrapperReceipt([string]$Stage,$Failure=$null) {
+    $entry=@{stage=$Stage;pid=$PID;time=[DateTime]::UtcNow.ToString('o')}
+    if($Failure){$entry.exceptionType=$Failure.Exception.GetType().FullName;$entry.stack=$Failure.ScriptStackTrace}
+    [IO.File]::AppendAllText($wrapperLog,(($entry | ConvertTo-Json -Compress)+[Environment]::NewLine))
+}
+Write-WrapperReceipt 'entry'
+try { & '__ORIGINAL_SERVICE__' -StatePath $StatePath }
+catch { Write-WrapperReceipt 'failed' $_; throw }
+'@
+    $serviceWrapper=$serviceWrapper.Replace('__ORIGINAL_SERVICE__',$originalService)
     [IO.File]::WriteAllText((Join-Path $paths.source 'tools/opencodex-service.ps1'),$serviceWrapper)
     $cliWrapper=Join-Path $fixture 'cli.mjs'
     $cliUri=([uri]$parameters.dependency.cli).AbsoluteUri
@@ -201,7 +234,15 @@ fs.appendFileSync(path.join(fixture,'guard.jsonl'),JSON.stringify({time:new Date
     & $module {
         param($dependency)
         $script:isolatedDependency=$dependency
-        function script:Get-SubscriptionDependency {param($Paths,$CodexCommand) $script:isolatedDependency.Clone()}
+        function script:Get-SubscriptionDependency {
+            param($Paths,$CodexCommand)
+            $fixtureRoot = Split-Path $script:isolatedDependency.cli -Parent
+            if ($CodexCommand -or $Paths.source -ne (Join-Path $fixtureRoot 'source') -or
+                $Paths.user -ne (Join-Path $fixtureRoot 'user') -or $Paths.codex -ne (Join-Path $fixtureRoot 'codex')) {
+                throw 'Dependency fixture received paths outside its isolated homes or an unexpected Codex command.'
+            }
+            $script:isolatedDependency.Clone()
+        }
         function script:Initialize-SubscriptionDependency {throw 'Isolated fixture never installs packages.'}
     } $dependency
     $started=Invoke-ProbeMode Install
@@ -251,6 +292,43 @@ fs.appendFileSync(path.join(fixture,'guard.jsonl'),JSON.stringify({time:new Date
     & $module {param($p,$port) Wait-SubscriptionReady $p $port} $paths $port
     $restartPid=@(Assert-Connected)[-1];$report.restartPid=$restartPid
     Assert-Probe ($restartPid -ne $priorPid) 'Task restart creates a new ready process and reconnects its role'
+    if($parameters.recovery) {
+        # Migrate an actual legacy task in place before crashing this fixture only.
+        $registered=$scheduler.GetFolder('\').GetTask($paths.task)
+        $legacy=$registered.Definition
+        [xml]$legacyXml=$legacy.XmlText
+        $restartNode=$legacyXml.Task.Settings.RestartOnFailure
+        if($restartNode){[void]$restartNode.ParentNode.RemoveChild($restartNode)}
+        $legacy.XmlText=$legacyXml.OuterXml
+        $null=$scheduler.GetFolder('\').RegisterTaskDefinition($paths.task,$legacy,36,$null,$null,3,$null)
+        $state=Read-ProbeJson $paths.state
+        $state.task_xml=$scheduler.GetFolder('\').GetTask($paths.task).Xml
+        Write-ProbeJson $paths.state $state
+        $configured=Invoke-ProbeMode ConfigureRestart
+        Assert-Probe ($configured.status -eq 'subscriptions-restart-policy-configured') 'Native ConfigureRestart updates the existing task'
+        Assert-Probe (@(Assert-Connected)[-1] -eq $restartPid) 'Native ConfigureRestart preserves the live proxy PID'
+        $registered=$scheduler.GetFolder('\').GetTask($paths.task)
+        Assert-Probe ($registered.Definition.Settings.RestartCount -eq 3 -and $registered.Definition.Settings.RestartInterval -eq 'PT1M') 'Native task has three one-minute recovery attempts'
+        $crashed=& $module {param($p) Get-SubscriptionOwnedProcess $p} $paths
+        if(-not $crashed -or $crashed.Id -ne $restartPid){throw 'Fixture process identity changed before crash injection.'}
+        try { $crashed.Kill(); Assert-Probe ($crashed.WaitForExit(10000)) 'Only the attested fixture runtime is terminated' }
+        finally { $crashed.Dispose() }
+        $recoveryClock=[Diagnostics.Stopwatch]::StartNew()
+        $withdrawn=$false;$recoveredPid=0
+        do {
+            if(-not(Test-Path -LiteralPath $paths.roleLink)){$withdrawn=$true}
+            if((& $module {param($p,$port) Test-SubscriptionReady $p $port} $paths $port) -and (Test-Path -LiteralPath $paths.roleLink)) {
+                $observed=Invoke-RestMethod "http://127.0.0.1:$port/readyz" -TimeoutSec 3 -NoProxy -DisableKeepAlive
+                if($observed.pid -ne $restartPid){$recoveredPid=[int]$observed.pid;break}
+            }
+            Start-Sleep -Seconds 2
+        }while($recoveryClock.Elapsed.TotalSeconds -lt 150)
+        Assert-Probe ($withdrawn) 'Failed runtime withdraws its role before automatic recovery'
+        Assert-Probe ($recoveredPid -gt 0) 'Scheduled host automatically starts a new attested ready runtime'
+        Assert-Probe (@(Assert-Connected)[-1] -eq $recoveredPid) 'Automatic recovery republishes the exact role link'
+        $report.automaticRecovery=@{crashedPid=$restartPid;recoveredPid=$recoveredPid;seconds=$recoveryClock.Elapsed.TotalSeconds;roleWithdrawn=$withdrawn}
+        Save-ProbeReport
+    }
     $disconnect=Invoke-ProbeMode Disconnect
     Assert-Probe ($disconnect.status -eq 'disconnected') 'Disconnect succeeds'
     Assert-Native

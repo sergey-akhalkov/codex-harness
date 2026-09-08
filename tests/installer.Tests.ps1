@@ -14,12 +14,16 @@ $initialPath = $env:Path
 $failures = [Collections.Generic.List[string]]::new()
 $assertions = 0
 $cases = 0
+$verificationResources = @{
+    'project-verification' = @('SKILL.md', 'references/command-records.md')
+    'reproduce-regression' = @('SKILL.md', 'references/reduction.md', 'references/process-fixtures.md', 'scripts/process_case.py', 'scripts/observe.ps1')
+}
 
 function Assert-True([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
     $script:assertions++
 }
-function Assert-Throws([scriptblock] $Action, [string] $Pattern) {
+function Assert-Throw([scriptblock] $Action, [string] $Pattern) {
     $caught = $null
     try { & $Action | Out-Null } catch { $caught = $_.Exception.Message }
     Assert-True ($null -ne $caught -and $caught -match $Pattern) "Expected failure /$Pattern/; observed: $caught"
@@ -28,7 +32,9 @@ function Write-FixtureFile([string] $Path, [string] $Body) {
     New-Item -ItemType Directory -Path (Split-Path $Path) -Force | Out-Null
     Set-Content -LiteralPath $Path -Value $Body -Encoding utf8
 }
-function New-Fixture([string] $Name) {
+function New-Fixture {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates only the disposable suite fixture; lifecycle assertions require these writes without a new approval path.')]
+    param([string] $Name)
     $root = Join-Path $suiteRoot $Name
     $source = Join-Path $root 'checkout источник'
     $manifest = Import-PowerShellDataFile (Join-Path $repository 'global/kit.psd1')
@@ -46,11 +52,17 @@ function New-Fixture([string] $Name) {
     }
     @{ SourceRoot = $source; CodexHome = Join-Path $root 'codex'; UserHome = Join-Path $root 'user'; CodexCommand = $CodexCommand; PathScope = 'Process' }
 }
-function Reset-TestModule([switch] $RealRuntime) {
+function Reset-TestModule {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private test setup replaces module mocks in this process only; it must run deterministically.')]
+    param([switch] $RealRuntime)
     $script:testModule = Import-Module $modulePath -Force -PassThru
     if (-not $RealRuntime) {
         & $script:testModule {
-            function script:Assert-HarnessPrerequisites { @{ codex = 'lifecycle stub'; openspec = 'lifecycle stub'; powershell = $PSVersionTable.PSVersion.ToString() } }
+            function script:Assert-HarnessPrerequisites {
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Mock name must match the production command being overridden.')]
+                param()
+                @{ codex = 'lifecycle stub'; openspec = 'lifecycle stub'; powershell = $PSVersionTable.PSVersion.ToString() }
+            }
             function script:Test-HarnessRuntime { @{ evidence = 'Lifecycle stub only; actual startup covered separately.' } }
         }
     }
@@ -64,10 +76,33 @@ function Assert-DiagnosticLink($Fixture) {
     $item=Get-Item -LiteralPath $link[0].destination -Force
     Assert-True ($item.LinkType -eq 'SymbolicLink' -and $item.Target -eq (Join-Path $Fixture.SourceRoot 'tools/codex-harness-check.ps1')) 'Diagnostic launcher must link directly to the selected source.'
 }
+function Assert-VerificationResource($Fixture, [string] $Marker) {
+    $state = Read-State $Fixture
+    foreach ($name in $verificationResources.Keys) {
+        $source = Join-Path $Fixture.SourceRoot ".agents/skills/$name"
+        $destination = Join-Path $Fixture.UserHome ".agents/skills/$name"
+        $links = @($state.links | Where-Object destination -eq $destination)
+        Assert-True ($links.Count -eq 1 -and $links[0].owned) "$name must have one owned registration."
+        $item = Get-Item -LiteralPath $destination -Force
+        Assert-True ($item.LinkType -eq 'SymbolicLink' -and $item.Target -eq $source) "$name must link directly to its source directory."
+        foreach ($relative in $verificationResources[$name]) {
+            $sourceFile = Join-Path $source $relative
+            $installedFile = Join-Path $destination $relative
+            $body = Get-Content -LiteralPath $installedFile -Raw
+            Assert-True (-not [string]::IsNullOrWhiteSpace($body)) "$name/$relative must be readable through the installed link."
+            Assert-True ((Get-FileHash -LiteralPath $sourceFile).Hash -eq (Get-FileHash -LiteralPath $installedFile).Hash) "$name/$relative must expose the authoritative bytes."
+            if ($Marker) { Assert-True ($body.Contains($Marker)) "$name/$relative must expose the expected source revision."
+            }
+        }
+    }
+    foreach ($relative in 'tools/opencodex-process.ps1', 'tools/opencodex-process.cs') {
+        Assert-True (Test-Path -LiteralPath (Join-Path $Fixture.SourceRoot $relative) -PathType Leaf) "Linked process helper dependency must be portable: $relative"
+    }
+}
 function Write-Pending($Fixture, $Pending) {
     Write-FixtureFile (Join-Path $Fixture.CodexHome 'harness/pending.json') ($Pending | ConvertTo-Json -Depth 30)
 }
-function New-PendingFromInstalled($Fixture, [string] $BeforePath) {
+function Get-PendingFromInstalled($Fixture, [string] $BeforePath) {
     $state = Read-State $Fixture
     @{ previousState = $null; plannedState = $state; pathScope = 'Process'; pathBefore = $BeforePath; pathAfter = $env:Path;
         operations = @($state.links | Where-Object owned | ForEach-Object { @{ destination = $_.destination; oldSource = $null; newSource = $_.source } }) }
@@ -84,7 +119,9 @@ function Test-Case([string] $Name, [scriptblock] $Action) {
         Write-Output "FAIL: ${Name}: $($_.Exception.Message)"
     } finally { $env:Path = $before }
 }
-function Remove-FixtureTree([string] $Path) {
+function Remove-FixtureTree {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private cleanup validates every target within the owned suite and handles reparse points before traversal.')]
+    param([string] $Path)
     # Check every absolute target; handle reparse points before directory walking.
     $full = [IO.Path]::GetFullPath($Path)
     $prefix = [IO.Path]::GetFullPath($suiteRoot).TrimEnd('\')
@@ -97,6 +134,45 @@ function Remove-FixtureTree([string] $Path) {
 }
 
 try {
+    Test-Case 'core updates preserve connected hooks through repeat relocation repair and conflict' {
+        $fixture = New-Fixture 'core-hooks'
+        Invoke-HarnessInstall @fixture | Out-Null
+        Assert-True (@((Read-State $fixture).links | Where-Object kind -in 'hooks','hook-launcher').Count -eq 0) 'Fresh core install must not activate hooks.'
+        Invoke-HarnessInstall @fixture -IncludeCodeTools | Out-Null
+        $hookLinks = @((Read-State $fixture).links | Where-Object kind -in 'hooks','hook-launcher')
+        Assert-True ($hookLinks.Count -eq 2) 'Fixture must begin with both connected hooks.'
+        $preview = Invoke-HarnessInstall @fixture -Preview
+        Assert-True (@($preview.operations | Where-Object destination -in $hookLinks.destination).Count -eq 0) 'Core update preview must not remove connected hooks.'
+        foreach ($attempt in 1..2) {
+            Invoke-HarnessInstall @fixture | Out-Null
+            Assert-True (@((Read-State $fixture).links | Where-Object kind -in 'hooks','hook-launcher').Count -eq 2) 'Core update must keep both hook records.'
+            foreach ($link in $hookLinks) { Assert-True (Test-Path -LiteralPath $link.destination -PathType Leaf) 'Core update must keep each hook usable.' }
+        }
+        $moved = New-Fixture 'core-hooks-moved'
+        $fixture.SourceRoot = $moved.SourceRoot
+        Invoke-HarnessInstall @fixture | Out-Null
+        $hookLinks = @((Read-State $fixture).links | Where-Object kind -in 'hooks','hook-launcher')
+        foreach ($link in $hookLinks) {
+            Assert-True ($link.source.StartsWith($fixture.SourceRoot + '\')) 'Hook source must follow checkout relocation.'
+            Assert-True ((Get-Item -LiteralPath $link.destination).LinkTarget -eq $link.source) 'Hook must link directly to relocated source.'
+        }
+        $missing = $hookLinks[0]
+        Remove-Item -LiteralPath $missing.destination -Force
+        Invoke-HarnessInstall @fixture | Out-Null
+        Assert-True ((Get-Item -LiteralPath $missing.destination).LinkTarget -eq $missing.source) 'Core update must repair a missing recorded hook.'
+        Remove-Item -LiteralPath $missing.destination -Force
+        Write-FixtureFile $missing.destination 'foreign hook bytes'
+        $statePath = Join-Path $fixture.CodexHome 'harness/installation.json'
+        $stateHash = (Get-FileHash -LiteralPath $statePath).Hash
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'Target conflict; preserving'
+        Assert-True ((Get-Content -LiteralPath $missing.destination -Raw).Trim() -eq 'foreign hook bytes') 'Foreign replacement must survive failed update.'
+        Assert-True ((Get-FileHash -LiteralPath $statePath).Hash -eq $stateHash) 'Conflict must preserve installation metadata.'
+        Remove-Item -LiteralPath $missing.destination -Force
+        New-Item -ItemType SymbolicLink -Path $missing.destination -Target $missing.source | Out-Null
+        Invoke-HarnessInstall @fixture -Mode Disconnect | Out-Null
+        foreach ($link in $hookLinks) { Assert-True (-not (Test-Path -LiteralPath $link.destination)) 'Explicit disconnect must still remove owned hooks.' }
+    }
+
     Test-Case 'actual install.ps1 startup from a separate checkout with spaces and Cyrillic' {
         $fixture = New-Fixture 'actual'
         Reset-TestModule -RealRuntime
@@ -145,6 +221,71 @@ try {
         foreach ($link in $state.links) { Assert-True (Test-Path -LiteralPath $link.source) 'Disconnect must preserve source.' }
     }
 
+    Test-Case 'verification skill resources update directly and survive disconnect/reconnect' {
+        $fixture = New-Fixture 'verification-resources'
+        $foreign = Join-Path $fixture.UserHome '.agents/skills/foreign-resource/references/keep.md'
+        Write-FixtureFile $foreign 'unrelated resource'
+        $config = Join-Path $fixture.CodexHome 'config.toml'
+        Write-FixtureFile $config '# unrelated verification fixture config'
+        Invoke-HarnessInstall @fixture | Out-Null
+        $installedConfig = Get-Content -LiteralPath $config -Raw
+        Assert-True ($installedConfig.Contains('# unrelated verification fixture config')) 'Hook selection must preserve the unrelated configuration text.'
+        Assert-True ($installedConfig -match '(?m)^hooks = false$') 'Fresh install must persist the disabled base hook feature.'
+        $configHash = (Get-FileHash -LiteralPath $config).Hash
+        Assert-VerificationResource $fixture
+        $marker = '# disposable verification resource revision two'
+        foreach ($name in $verificationResources.Keys) {
+            foreach ($relative in $verificationResources[$name]) {
+                Add-Content -LiteralPath (Join-Path $fixture.SourceRoot ".agents/skills/$name/$relative") -Value $marker
+            }
+        }
+        # Reading before reinstall distinguishes live source links from deployment copies.
+        Assert-VerificationResource $fixture $marker
+        Invoke-HarnessInstall @fixture -Mode Disconnect | Out-Null
+        foreach ($name in $verificationResources.Keys) {
+            $destination = Join-Path $fixture.UserHome ".agents/skills/$name"
+            Assert-True (-not [bool](Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue)) "$name owned link must be removed."
+            foreach ($relative in $verificationResources[$name]) {
+                Assert-True ((Get-Content -LiteralPath (Join-Path $fixture.SourceRoot ".agents/skills/$name/$relative") -Raw).Contains($marker)) "$name/$relative source must survive disconnect."
+            }
+        }
+        Assert-True ((Get-Content -LiteralPath $foreign -Raw).Trim() -eq 'unrelated resource') 'Disconnect must preserve unrelated skill resources.'
+        Assert-True ((Get-FileHash -LiteralPath $config).Hash -eq $configHash) 'Disconnect must preserve unrelated configuration bytes.'
+        Invoke-HarnessInstall @fixture | Out-Null
+        Assert-VerificationResource $fixture $marker
+        Invoke-HarnessInstall @fixture -Mode Disconnect | Out-Null
+        Assert-True (Test-Path -LiteralPath $foreign) 'Reconnect/disconnect must preserve the foreign resource.'
+    }
+
+    Test-Case 'both verification skills preserve foreign directories and linked resources on collision' {
+        foreach ($name in $verificationResources.Keys) {
+            foreach ($kind in 'directory', 'link') {
+                $fixture = New-Fixture "verification-conflict-$name-$kind"
+                $destination = Join-Path $fixture.UserHome ".agents/skills/$name"
+                $foreign = if ($kind -eq 'link') { Join-Path (Split-Path $fixture.SourceRoot) 'foreign skill источник' } else { $destination }
+                Write-FixtureFile (Join-Path $foreign 'SKILL.md') "---`nname: $name`ndescription: foreign fixture`n---"
+                $resource = Join-Path $foreign 'references/keep.md'
+                Write-FixtureFile $resource 'foreign reference bytes'
+                if ($kind -eq 'link') {
+                    New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
+                    New-Item -ItemType SymbolicLink -Path $destination -Target $foreign | Out-Null
+                }
+                $before = $env:Path
+                Assert-Throw { Invoke-HarnessInstall @fixture -Preview } 'Target conflict|name collision'
+                Assert-Throw { Invoke-HarnessInstall @fixture } 'Target conflict|name collision'
+                Assert-True ($env:Path -ceq $before) 'Skill collision must not change PATH.'
+                Assert-True ((Get-Content -LiteralPath (Join-Path $destination 'references/keep.md') -Raw).Trim() -eq 'foreign reference bytes') "$name collision must preserve readable foreign resources."
+                $item = Get-Item -LiteralPath $destination -Force
+                if ($kind -eq 'link') {
+                    Assert-True ($item.LinkType -eq 'SymbolicLink' -and $item.Target -eq $foreign) 'Foreign skill link target must remain unchanged.'
+                } else {
+                    Assert-True (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Foreign skill directory must not be replaced with a link.'
+                }
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness'))) 'Skill collision must fail before activation.'
+            }
+        }
+    }
+
     Test-Case 'foreign target file, link, and higher-priority instructions are preserved' {
         foreach ($kind in 'file', 'link', 'override') {
             $fixture = New-Fixture "conflict-$kind"
@@ -155,8 +296,8 @@ try {
                 New-Item -ItemType Directory -Path $fixture.CodexHome -Force | Out-Null
                 New-Item -ItemType SymbolicLink -Path $destination -Target $foreign | Out-Null
             } else { Write-FixtureFile $destination 'foreign contents' }
-            Assert-Throws { Invoke-HarnessInstall @fixture -Preview } 'Target conflict|AGENTS.override.md'
-            Assert-Throws { Invoke-HarnessInstall @fixture } 'Target conflict|AGENTS.override.md'
+            Assert-Throw { Invoke-HarnessInstall @fixture -Preview } 'Target conflict|AGENTS.override.md'
+            Assert-Throw { Invoke-HarnessInstall @fixture } 'Target conflict|AGENTS.override.md'
             Assert-True ((Get-Content -LiteralPath $destination -Raw).Contains('foreign')) 'Conflicting contents must remain readable.'
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness'))) 'Conflict must fail before activation.'
         }
@@ -166,7 +307,7 @@ try {
         $fixture = New-Fixture 'missing-cli'
         Reset-TestModule -RealRuntime
         $fixture.CodexCommand = Join-Path (Split-Path $fixture.SourceRoot) 'missing-codex.ps1'
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'Original Codex command unavailable'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'Original Codex command unavailable'
         Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Missing original CLI must not create host state.'
         $fixture = New-Fixture 'missing-openspec'
         & $testModule {
@@ -177,7 +318,7 @@ try {
                 Microsoft.PowerShell.Core\Get-Command @PSBoundParameters
             }
         }
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'OpenSpec CLI is required'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'OpenSpec CLI is required'
         Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Missing OpenSpec must not create host state.'
     }
 
@@ -191,7 +332,7 @@ try {
 `$global:LASTEXITCODE = 0
 if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help without a file-profile selector' }
 "@
-            Assert-Throws { Invoke-HarnessInstall @fixture } 'Codex .+ is required|required file-profile contract'
+            Assert-Throw { Invoke-HarnessInstall @fixture } 'Codex .+ is required|required file-profile contract'
             Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Unsupported CLI must fail before host mutation.'
         }
     }
@@ -199,15 +340,15 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
     Test-Case 'missing required source and foreign profile filename fail before activation' {
         $fixture = New-Fixture 'missing-source'
         Remove-Item -LiteralPath (Join-Path $fixture.SourceRoot 'tools/launcher.psm1')
-        Assert-Throws { Invoke-HarnessInstall @fixture -Preview } 'Missing kit source'
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'Missing kit source'
+        Assert-Throw { Invoke-HarnessInstall @fixture -Preview } 'Missing kit source'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'Missing kit source'
         Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Missing source must not create host state.'
         $fixture = New-Fixture 'profile-name-conflict'
-        $profile = Join-Path $fixture.CodexHome 'harness.config.toml'
-        Write-FixtureFile $profile '# existing foreign profile'
-        Assert-Throws { Invoke-HarnessInstall @fixture -Preview } 'Target conflict'
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'Target conflict'
-        Assert-True ((Get-Content -LiteralPath $profile -Raw).Contains('existing foreign profile')) 'Foreign profile must not be overwritten.'
+        $fixtureProfile = Join-Path $fixture.CodexHome 'harness.config.toml'
+        Write-FixtureFile $fixtureProfile '# existing foreign profile'
+        Assert-Throw { Invoke-HarnessInstall @fixture -Preview } 'Target conflict'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'Target conflict'
+        Assert-True ((Get-Content -LiteralPath $fixtureProfile -Raw).Contains('existing foreign profile')) 'Foreign profile must not be overwritten.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness'))) 'Profile conflict must not start activation.'
     }
 
@@ -222,7 +363,7 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
             }
         }
         $before = $env:Path
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'required symbolic-link privilege.+Developer Mode/link privilege; no copy fallback'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'required symbolic-link privilege.+Developer Mode/link privilege; no copy fallback'
         Assert-True ($env:Path -ceq $before) 'Unavailable link privilege must leave PATH unchanged.'
         Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Failed link creation must remove its new empty host directories.'
         Assert-True (Test-Path -LiteralPath (Join-Path $fixture.SourceRoot 'global/principles-of-work.md')) 'Link failure must preserve its source.'
@@ -233,7 +374,7 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         Reset-TestModule -RealRuntime
         Write-FixtureFile (Join-Path $fixture.SourceRoot 'global/harness.config.toml') 'approval_policy = ['
         $before = $env:Path
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'prior connections restored: Codex startup failed'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'prior connections restored: Codex startup failed'
         Assert-True ($env:Path -ceq $before) 'Native profile failure must restore PATH.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness/installation.json'))) 'Invalid profile must not commit state.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness.config.toml'))) 'Invalid profile must not leave a deployed copy or link.'
@@ -244,17 +385,17 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         $firstSkill = Get-ChildItem -LiteralPath (Join-Path $fixture.SourceRoot '.agents/skills') -Directory | Select-Object -First 1
         $name = ([regex]::Match((Get-Content -LiteralPath (Join-Path $firstSkill.FullName 'SKILL.md') -Raw), '(?m)^name:\s*(.+)$')).Groups[1].Value.Trim()
         Write-FixtureFile (Join-Path $fixture.UserHome '.agents/skills/another-name/SKILL.md') "---`nname: $name`ndescription: foreign`n---"
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'name collision'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'name collision'
         $fixture = New-Fixture 'agent-name-collision'
         Write-FixtureFile (Join-Path $fixture.SourceRoot 'global/agents/repo.toml') "name = 'collision-agent'`ndescription = 'repository fixture'`ndeveloper_instructions = 'fixture'"
         Write-FixtureFile (Join-Path $fixture.CodexHome 'agents/personal.toml') "name = 'collision-agent'`ndescription = 'foreign fixture'`ndeveloper_instructions = 'foreign'"
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'name collision'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'name collision'
         Remove-Item -LiteralPath (Join-Path $fixture.CodexHome 'agents/personal.toml')
         Write-FixtureFile (Join-Path $fixture.CodexHome 'config.toml') "[agents.collision-agent]`ndescription = 'foreign local role'"
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'name collision'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'name collision'
         foreach ($inline in @("agents = { collision-agent = { description = 'foreign local role' } }", "[agents]`ncollision-agent = { description = 'foreign local role' }")) {
             Write-FixtureFile (Join-Path $fixture.CodexHome 'config.toml') $inline
-            Assert-Throws { Invoke-HarnessInstall @fixture } 'name collision'
+            Assert-Throw { Invoke-HarnessInstall @fixture } 'name collision'
         }
     }
 
@@ -285,7 +426,7 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         }
         Move-Item -LiteralPath $oldSource -Destination $newSource
         $fixture.SourceRoot = $newSource
-        Assert-Throws { Invoke-HarnessInstall @fixture -Mode Check } 'Source unavailable|Broken'
+        Assert-Throw { Invoke-HarnessInstall @fixture -Mode Check } 'Source unavailable|Broken'
         Invoke-HarnessInstall @fixture | Out-Null
         $state = Read-State $fixture
         Assert-True ($state.sourceRoot -eq $newSource) 'Metadata must refer to the relocated checkout.'
@@ -300,7 +441,7 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         $destination = Join-Path $fixture.CodexHome 'AGENTS.md'
         Remove-Item -LiteralPath $destination
         Write-FixtureFile $destination 'external replacement'
-        Assert-Throws { Invoke-HarnessInstall @fixture -Mode Disconnect } 'Ownership mismatch'
+        Assert-Throw { Invoke-HarnessInstall @fixture -Mode Disconnect } 'Ownership mismatch'
         Assert-True ((Get-Content -LiteralPath $destination -Raw).Contains('external replacement')) 'External replacement must survive disconnect.'
         Assert-True (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness/installation.json')) 'Failed disconnect must preserve recovery state.'
     }
@@ -319,10 +460,16 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         $fixture = New-Fixture 'runtime-failure'
         & $testModule { function script:Test-HarnessRuntime { throw 'injected consumer failure' } }
         $before = $env:Path
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'prior connections restored: injected consumer failure'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'prior connections restored: injected consumer failure'
         Assert-True ($env:Path -ceq $before) 'Failure must restore PATH.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness/installation.json'))) 'Failure must not commit installation state.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'AGENTS.md'))) 'Failure must remove its created instruction link.'
+        foreach ($name in $verificationResources.Keys) {
+            Assert-True (-not [bool](Get-Item -LiteralPath (Join-Path $fixture.UserHome ".agents/skills/$name") -Force -ErrorAction SilentlyContinue)) 'Failed first activation must remove each owned verification skill link.'
+            foreach ($relative in $verificationResources[$name]) {
+                Assert-True (Test-Path -LiteralPath (Join-Path $fixture.SourceRoot ".agents/skills/$name/$relative") -PathType Leaf) 'Failed first activation must retain verification source resources.'
+            }
+        }
     }
 
     Test-Case 'failure after earlier link mutations restores existing activation' {
@@ -331,20 +478,34 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         $previous = Read-State $fixture
         $originalSource = $fixture.SourceRoot
         $replacement = New-Fixture 'replacement-source'
+        foreach ($name in $verificationResources.Keys) {
+            foreach ($relative in $verificationResources[$name]) {
+                Add-Content -LiteralPath (Join-Path $originalSource ".agents/skills/$name/$relative") -Value '# original resource revision'
+                Add-Content -LiteralPath (Join-Path $replacement.SourceRoot ".agents/skills/$name/$relative") -Value '# replacement resource revision'
+            }
+        }
+        Assert-VerificationResource $fixture '# original resource revision'
         $fixture.SourceRoot = $replacement.SourceRoot
         & $testModule { function script:Test-HarnessRuntime { throw 'injected reconnect failure' } }
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'prior connections restored: injected reconnect failure'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'prior connections restored: injected reconnect failure'
         Assert-True ((Read-State $fixture).sourceRoot -eq $originalSource) 'Rollback must restore the old metadata.'
         foreach ($link in $previous.links) { Assert-True ((Get-Item -LiteralPath $link.destination).Target -eq $link.source) 'Rollback must restore each previous target.' }
+        $fixture.SourceRoot = $originalSource
+        Assert-VerificationResource $fixture '# original resource revision'
+        foreach ($name in $verificationResources.Keys) {
+            foreach ($relative in $verificationResources[$name]) {
+                Assert-True ((Get-Content -LiteralPath (Join-Path $replacement.SourceRoot ".agents/skills/$name/$relative") -Raw).Contains('# replacement resource revision')) 'Rollback must preserve replacement source resources too.'
+            }
+        }
     }
 
     Test-Case 'valid interrupted transaction can be recovered' {
         $fixture = New-Fixture 'recover'
         $before = $env:Path
         Invoke-HarnessInstall @fixture | Out-Null
-        $pending = New-PendingFromInstalled $fixture $before
+        $pending = Get-PendingFromInstalled $fixture $before
         Write-Pending $fixture $pending
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'interrupted installation'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'interrupted installation'
         Invoke-HarnessInstall @fixture -Mode Recover | Out-Null
         Assert-True ($env:Path -ceq $before) 'Recovery must restore its PATH.'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'harness/installation.json'))) 'Recovery must restore missing previous metadata.'
@@ -356,11 +517,11 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
             $fixture = New-Fixture "recover-tamper-$kind"
             $before = $env:Path
             Invoke-HarnessInstall @fixture | Out-Null
-            $pending = New-PendingFromInstalled $fixture $before
+            $pending = Get-PendingFromInstalled $fixture $before
             if ($kind -eq 'destination') { $pending.operations[0].destination = Join-Path (Split-Path $fixture.SourceRoot) 'foreign.md' }
             else { $pending.operations[0].newSource = Join-Path (Split-Path $fixture.SourceRoot) 'foreign-source.md' }
             Write-Pending $fixture $pending
-            Assert-Throws { Invoke-HarnessInstall @fixture -Mode Recover } 'Unrecorded recovery destination|Recovery source is not owned'
+            Assert-Throw { Invoke-HarnessInstall @fixture -Mode Recover } 'Unrecorded recovery destination|Recovery source is not owned'
             Assert-True (Test-Path -LiteralPath (Join-Path $fixture.CodexHome 'AGENTS.md')) 'Rejected recovery must not begin deleting connections.'
             $env:Path = $before
         }
@@ -371,20 +532,20 @@ if (`$args[0] -eq '--version') { 'codex-cli $version' } else { 'Legacy CLI help 
         $foreign = Join-Path (Split-Path $fixture.SourceRoot) 'foreign-directory'
         New-Item -ItemType Directory -Path $foreign, $fixture.UserHome -Force | Out-Null
         New-Item -ItemType SymbolicLink -Path (Join-Path $fixture.UserHome '.agents') -Target $foreign | Out-Null
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'Parent directory is a reparse point'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'Parent directory is a reparse point'
         Assert-True (@(Get-ChildItem -LiteralPath $foreign -Force).Count -eq 0) 'Installer must not write through a foreign directory link.'
         $fixture = New-Fixture 'path-precedence'
         $earlier = Join-Path (Split-Path $fixture.SourceRoot) 'earlier command'
         Write-FixtureFile (Join-Path $earlier 'codex.cmd') '@exit /b 0'
         $bin = Join-Path $fixture.CodexHome 'harness/bin'
-        Assert-Throws { & $testModule { param($pathValue, $entry) Assert-HarnessCommandPrecedence $pathValue $entry } ($earlier + ';' + $bin) $bin } 'Command precedence conflict'
+        Assert-Throw { & $testModule { param($pathValue, $entry) Assert-HarnessCommandPrecedence $pathValue $entry } ($earlier + ';' + $bin) $bin } 'Command precedence conflict'
         Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Precedence checks must be non-mutating.'
     }
 
     Test-Case 'rollback preserves concurrent unrelated PATH edit and records recovery' {
         $fixture = New-Fixture 'concurrent-path'
         & $testModule { function script:Test-HarnessRuntime { $env:Path += ';C:\harness-test-unrelated-path'; throw 'injected PATH race' } }
-        Assert-Throws { Invoke-HarnessInstall @fixture } 'Recovery incomplete: PATH changed concurrently'
+        Assert-Throw { Invoke-HarnessInstall @fixture } 'Recovery incomplete: PATH changed concurrently'
         Assert-True ($env:Path.EndsWith(';C:\harness-test-unrelated-path')) 'Unrelated PATH changes must survive rollback.'
         $pendingPath = Join-Path $fixture.CodexHome 'harness/pending.json'
         Assert-True (Test-Path -LiteralPath $pendingPath) 'Incomplete recovery must retain its journal.'
@@ -449,7 +610,7 @@ try {
             $deadline = [DateTime]::UtcNow.AddSeconds(8)
             while (-not (Test-Path -LiteralPath $ready) -and -not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }
             Assert-True (Test-Path -LiteralPath $ready) 'Separate process must acquire the installer mutex.'
-            Assert-Throws { Invoke-HarnessInstall @fixture } 'Another harness operation is active'
+            Assert-Throw { Invoke-HarnessInstall @fixture } 'Another harness operation is active'
             Assert-True (-not (Test-Path -LiteralPath $fixture.CodexHome)) 'Concurrent loser must not create host state.'
             Write-FixtureFile $release 'release'
             Assert-True ($process.WaitForExit(5000)) 'Lock fixture must exit promptly.'

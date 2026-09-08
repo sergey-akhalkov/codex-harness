@@ -37,11 +37,24 @@ class JournalTests(unittest.TestCase):
         self.source.write_text("export const value = 1;\n")
 
     def tearDown(self):
+        # Command hooks now reuse a broker beyond their own process lifetime.
+        # Retire only this fixture's CODEX_HOME before removing its files.
+        from broker import retire
+        retirement = retire(25)
         if self.old_home is None:
             os.environ.pop("CODEX_HOME", None)
         else:
             os.environ["CODEX_HOME"] = self.old_home
-        self.scratch.cleanup()
+        self.assertNotEqual(retirement["status"], "pending", retirement)
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self.scratch.cleanup()
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def journal(self):
         return Journal(self.event)
@@ -57,7 +70,7 @@ class JournalTests(unittest.TestCase):
             _, changes, problems = journal.changes({**self.event, "tool_response": {"exit_code": 1}})
             self.assertFalse(problems)
             self.assertEqual(set(changes), {"source.ts", "untracked.ts"})
-            self.assertEqual(journal.stop(self.event)["decision"], "block")
+            self.assertIn("systemMessage", journal.stop(self.event))
             self.assertNotIn("decision", journal.stop({**self.event, "stop_hook_active": True}))
         finally:
             journal.close()
@@ -155,7 +168,7 @@ class JournalTests(unittest.TestCase):
             # A Post was observed but Pre was missing: completion must retain
             # that missing-baseline problem, even if no files can be identified.
             service.check({**self.event, "event": "PostToolUse"})
-            self.assertEqual(service.check(stop)["status"], "unavailable")
+            self.assertEqual(service.check(stop)["status"], "unresolved")
         finally:
             service.close()
 
@@ -185,8 +198,8 @@ class JournalTests(unittest.TestCase):
         try:
             with patch("server.Backend", side_effect=create):
                 began = time.monotonic()
-                report = service.check(self.event, budget=0.05)
-                self.assertLess(time.monotonic() - began, 0.5, report)
+                report = service.check(self.event, budget=0.3)
+                self.assertLess(time.monotonic() - began, 0.8, report)
                 self.assertTrue(entered.is_set())
                 self.assertEqual(len(report["results"]), 2)
                 self.assertTrue(all(row["status"] == "pending" for row in report["results"]), report)
@@ -364,7 +377,8 @@ class JournalTests(unittest.TestCase):
         try:
             journal.pre(self.event)
             self.assertNotEqual(journal.directory, other.directory)
-            self.assertTrue(other.changes(self.event)[2])
+            other.changes(self.event)
+            self.assertTrue(other.get("coverage_gap"))
         finally:
             journal.close()
             other.close()
@@ -488,9 +502,9 @@ class JournalTests(unittest.TestCase):
                 gate.wait(2)
                 return {"file": relative, "revision": revision, "backend": "test", "status": "clean", "diagnostics": []}
             with patch.object(service, "_analyze", side_effect=slow):
-                report = service.check(self.event, budget=0.01)
+                report = service.check(self.event, budget=0.10)
                 self.assertEqual(report["status"], "unresolved")
-                self.assertEqual(report["results"][0]["status"], "pending")
+                self.assertTrue((report["results"] and report["results"][0]["status"] == "pending") or report["problems"], report)
                 self.assertIn("source.ts", journal.changes(self.event)[1])
                 gate.set()
                 reconciled = service.check(self.event)

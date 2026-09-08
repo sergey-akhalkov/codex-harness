@@ -96,6 +96,32 @@
   ],
   "languages": [
     {
+      "id": "python",
+      "name": "Python",
+      "required": true,
+      "backend": "basedpyright",
+      "serena_id": "python_basedpyright",
+      "package": "basedpyright",
+      "manager": "npm",
+      "source": "https://github.com/DetachHead/basedpyright",
+      "metadata": "https://registry.npmjs.org/basedpyright/latest",
+      "runtime": [
+        "Node.js",
+        "project Python interpreter"
+      ],
+      "project_inputs": [
+        "pyrightconfig.json",
+        "pyproject.toml",
+        "project environment"
+      ],
+      "extensions": [
+        ".py",
+        ".pyi"
+      ],
+      "provision": "Prefer an existing compatible Pyright installation; provision into shared Serena cache on explicit install only. Do not modify the project environment.",
+      "verification": "Retained explicit Serena Python navigation and suitable edits with project-native checks. Diagnostics are explicit-only; empty results do not establish clean current analysis."
+    },
+    {
       "id": "rust",
       "name": "Rust",
       "required": true,
@@ -118,7 +144,9 @@
       "verification": "Rust project symbols, definition, references; known error and clearance.",
       "metadata": "https://static.rust-lang.org/dist/channel-rust-stable.toml",
       "metadata_format": "rust-channel"
-    },
+    }
+  ],
+  "retired_language_candidates": [
     {
       "id": "typescript",
       "name": "TypeScript",
@@ -199,32 +227,6 @@
       ],
       "provision": "Reuse existing Serena PSES cache and its analyzer; acquire official release bundle on explicit install/update.",
       "verification": "PowerShell project navigation, syntax/analyzer error and clearance."
-    },
-    {
-      "id": "python",
-      "name": "Python",
-      "required": true,
-      "backend": "basedpyright",
-      "serena_id": "python_basedpyright",
-      "package": "basedpyright",
-      "manager": "npm",
-      "source": "https://github.com/DetachHead/basedpyright",
-      "metadata": "https://registry.npmjs.org/basedpyright/latest",
-      "runtime": [
-        "Node.js",
-        "project Python interpreter"
-      ],
-      "project_inputs": [
-        "pyrightconfig.json",
-        "pyproject.toml",
-        "project environment"
-      ],
-      "extensions": [
-        ".py",
-        ".pyi"
-      ],
-      "provision": "Prefer an existing compatible Pyright installation; provision into shared Serena cache on explicit install only. Do not modify the project environment.",
-      "verification": "Project environment resolution, symbols, definition, references; configured error and clearance."
     },
     {
       "id": "delphi",
@@ -571,7 +573,7 @@
       "callHierarchy",
       "rename"
     ],
-    "automatic_diagnostics": "Fresh diagnostics after native patch, shell and MCP edits; authoritative current empty result is clean. Missing or stale output is unresolved.",
+    "automatic_diagnostics": "Disabled. No automatic capability or hook exception is selected. Explicit Serena diagnostic results require truthful freshness assessment; empty output alone does not establish clean analysis.",
     "exposed_operations": [],
     "evidence": []
   },

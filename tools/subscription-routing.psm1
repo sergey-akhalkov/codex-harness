@@ -3,11 +3,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'code-tools.psm1')
 
-function Get-SubscriptionPaths([string]$SourceRoot, [string]$UserHome, [string]$CodexHome) {
+function Get-SubscriptionPaths {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Existing module-scope consumers use this name; preserve their compatibility contract.')]
+    param([string]$SourceRoot, [string]$UserHome, [string]$CodexHome)
     $SourceRoot = [IO.Path]::GetFullPath($SourceRoot); $UserHome = [IO.Path]::GetFullPath($UserHome); $CodexHome = [IO.Path]::GetFullPath($CodexHome)
     $identity = (Get-CodeToolsHash ([Text.Encoding]::UTF8.GetBytes($CodexHome.ToLowerInvariant()))).Substring(0,16)
     @{ source = $SourceRoot; user = $UserHome; codex = $CodexHome; opencodex = Join-Path $UserHome '.opencodex'
         state = Join-Path $CodexHome 'harness/subscription-routing.json'; pending = Join-Path $CodexHome 'harness/subscription-routing-pending.json'
+        restartPending = Join-Path $CodexHome 'harness/subscription-restart-policy-pending.json'
         service = Join-Path $CodexHome 'harness/subscriptions/service.json'; runtime = Join-Path $CodexHome 'harness/subscriptions/runs'
         config = Join-Path $CodexHome 'config.toml'; configLink = Join-Path $UserHome '.opencodex/config.json'
         configSource = Join-Path $SourceRoot 'global/opencodex/config.json'; roleLink = Join-Path $CodexHome 'agents/codex-harness-subscriptions'
@@ -20,7 +23,9 @@ function Get-SubscriptionLink([string]$Path) {
     if ($item.LinkType -ne 'SymbolicLink' -or -not $item.LinkTarget) { throw "Foreign connection preserved: $Path" }
     [IO.Path]::GetFullPath($item.LinkTarget, (Split-Path $Path))
 }
-function Set-SubscriptionLink([string]$Path, [AllowNull()][string]$Target, [AllowNull()][string]$Expected) {
+function Set-SubscriptionLink {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private journaled write checks the expected target; the owning lifecycle operation already handles Preview.')]
+    param([string]$Path, [AllowNull()][string]$Target, [AllowNull()][string]$Expected)
     $actual = [string](Get-SubscriptionLink $Path)
     if ($actual -ne $Expected) { throw "Subscription link changed; preserving: $Path" }
     if ($actual -eq $Target) { return }
@@ -63,7 +68,9 @@ function Get-SubscriptionOwnedProcess($Paths) {
     } catch [ArgumentException] { if ($process) { $process.Dispose() }; return $null }
     catch { if ($process) { $process.Dispose() }; throw }
 }
-function Stop-SubscriptionTaskRuntime($Task, $Paths) {
+function Stop-SubscriptionTaskRuntime {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private transaction step must stop and await the exact owned task before routing recovery continues.')]
+    param($Task, $Paths)
     $process = Get-SubscriptionOwnedProcess $Paths
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
@@ -78,7 +85,9 @@ function Stop-SubscriptionTaskRuntime($Task, $Paths) {
         }
     } finally { if ($process) { $process.Dispose() } }
 }
-function Set-SubscriptionTask([string]$Name, [AllowNull()][string]$Xml, [AllowNull()][string]$ExpectedXml, $Paths) {
+function Set-SubscriptionTask {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private transaction validates expected task XML; lifecycle callers own Preview and journal recovery.')]
+    param([string]$Name, [AllowNull()][string]$Xml, [AllowNull()][string]$ExpectedXml, $Paths)
     $current = Get-SubscriptionTask $Name
     if (($current -and $current.xml -cne $ExpectedXml) -or (-not $current -and $ExpectedXml)) { throw 'Scheduled task changed; preserving foreign definition.' }
     $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $folder = $scheduler.GetFolder('\')
@@ -89,11 +98,15 @@ function Set-SubscriptionTask([string]$Name, [AllowNull()][string]$Xml, [AllowNu
     }
     if ($Xml) { $null = $folder.RegisterTask($Name,$Xml,2,$null,$null,3,$null) }
 }
-function Start-SubscriptionTask([string]$Name) {
+function Start-SubscriptionTask {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private lifecycle step starts the owned task after the existing Preview gate.')]
+    param([string]$Name)
     $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
     $null = $scheduler.GetFolder('\').GetTask($Name).Run($null)
 }
-function New-SubscriptionTaskXml($Paths, [string]$PowerShell) {
+function New-SubscriptionTaskXml {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Builds an in-memory task definition only; no registration or execution occurs. Preserve the existing mock seam.')]
+    param($Paths, [string]$PowerShell)
     $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); $definition = $scheduler.NewTask(0)
     $definition.RegistrationInfo.Description = 'codex-harness subscription routing: ' + $Paths.codex
     $definition.RegistrationInfo.URI = '\' + $Paths.task
@@ -106,7 +119,8 @@ function New-SubscriptionTaskXml($Paths, [string]$PowerShell) {
     } finally { $identity.Dispose() }
     $definition.Principal.LogonType = 3
     $definition.Settings.Enabled = $true; $definition.Settings.Hidden = $true
-    $definition.Settings.ExecutionTimeLimit = 'PT0S'; $definition.Settings.RestartCount = 0
+    $definition.Settings.ExecutionTimeLimit = 'PT0S'
+    $definition.Settings.RestartCount = 3; $definition.Settings.RestartInterval = 'PT1M'
     $definition.Settings.MultipleInstances = 2; $definition.Settings.StartWhenAvailable = $true
     $definition.Settings.DisallowStartIfOnBatteries = $false; $definition.Settings.StopIfGoingOnBatteries = $false
     $trigger = $definition.Triggers.Create(9); $trigger.UserId = $definition.Principal.UserId
@@ -114,6 +128,111 @@ function New-SubscriptionTaskXml($Paths, [string]$PowerShell) {
     $action.Arguments = '-NoLogo -NoProfile -WindowStyle Hidden -File "' + (Join-Path $Paths.source 'tools/opencodex-service.ps1') + '" -StatePath "' + $Paths.service + '"'
     $action.WorkingDirectory = $Paths.source
     $definition.XmlText
+}
+function Get-SubscriptionRestartTaskXml([string]$Xml) {
+    $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
+    $definition = $scheduler.NewTask(0); $definition.XmlText = $Xml
+    if ($definition.Settings.RestartCount -eq 3 -and $definition.Settings.RestartInterval -eq 'PT1M') { return $Xml }
+    $definition.Settings.RestartCount = 3; $definition.Settings.RestartInterval = 'PT1M'
+    $definition.XmlText
+}
+function Get-SubscriptionTaskFolder {
+    $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
+    $scheduler.GetFolder('\')
+}
+function Test-SubscriptionTaskXmlEquivalent([string]$Left, [string]$Right) {
+    if ($Left -ceq $Right) { return $true }
+    # RegisteredTask.Xml omits defaults and uses a different element order
+    # from TaskDefinition.XmlText. Parse both through the native schema; do not
+    # drop arbitrary XML fields or relax exact committed ownership checks.
+    try {
+        $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
+        $leftDefinition = $scheduler.NewTask(0); $leftDefinition.XmlText = $Left
+        $rightDefinition = $scheduler.NewTask(0); $rightDefinition.XmlText = $Right
+        $leftDefinition.XmlText -ceq $rightDefinition.XmlText
+    } catch { $false } # Invalid or unsupported XML is never an ownership match.
+}
+function Set-SubscriptionTaskXmlInPlace {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private journaled task update validates expected XML and suppresses registration triggers; callers own Preview.')]
+    param([string]$Name, [string]$Xml, [string]$ExpectedXml)
+    $folder = Get-SubscriptionTaskFolder
+    $current = $folder.GetTask($Name)
+    if ($current.Xml -cne $ExpectedXml) { throw 'Subscription task changed before policy write; preserving.' }
+    # TASK_UPDATE | TASK_IGNORE_REGISTRATION_TRIGGERS: no Stop/Delete/Run,
+    # and no registration-trigger launch. The existing principal is unchanged.
+    $null = $folder.RegisterTask($Name, $Xml, 36, $null, $null, 3, $null)
+    $actual = $folder.GetTask($Name)
+    if (-not (Test-SubscriptionTaskXmlEquivalent $actual.Xml $Xml)) { throw 'Subscription task differs after policy write; recovery evidence preserved.' }
+    $actual.Xml
+}
+function Assert-SubscriptionRestartOperation($Paths) {
+    foreach ($name in @('activation-pending.json','pending.json','code-tools-registration-pending.json','code-tools-files-pending.json',
+            'bootstrap-pending.json','bootstrap-graphify-pending.json','bootstrap-runtime-pending.json','subscription-routing-pending.json')) {
+        if (Test-Path -LiteralPath (Join-Path $Paths.codex ('harness/' + $name))) {
+            throw "An unfinished harness operation prevents restart policy changes: $name. Run the owning Recover first."
+        }
+    }
+}
+function Restore-SubscriptionRestartPolicy($Paths, [switch]$Preview) {
+    Assert-SubscriptionRestartOperation $Paths
+    $pending = Read-CodeToolsJson $Paths.restartPending
+    Assert-SubscriptionState $pending $Paths
+    if ($pending.source -ne $Paths.source -or $pending.operation -ne 'restart-policy') { throw 'Restart policy journal ownership mismatch; preserving.' }
+    $task = Get-SubscriptionTask $Paths.task
+    $snapshot = Get-SubscriptionSnapshot $Paths.state
+    if (-not $task -or ($task.xml -cne $pending.task_before -and -not (Test-SubscriptionTaskXmlEquivalent $task.xml $pending.task_after))) { throw 'Subscription task changed during policy recovery; preserving.' }
+    if ($snapshot -cne $pending.state_before -and $snapshot -cne $pending.state_after) { throw 'Subscription ownership state changed during policy recovery; preserving.' }
+    if ($Preview) { return @{ status = 'preview-subscription-restart-policy-recovery' } }
+    if ($task.xml -cne $pending.task_before) {
+        $restoredXml = Set-SubscriptionTaskXmlInPlace -Name $Paths.task -Xml $pending.task_before -ExpectedXml $task.xml
+        if ($restoredXml -cne $pending.task_before) { throw 'Restored task serialization changed; preserving policy recovery evidence.' }
+    }
+    Restore-SubscriptionSnapshot -Path $Paths.state -Before $pending.state_before -After $pending.state_after
+    Remove-CodeToolsFile $Paths.restartPending
+    @{ status = 'subscriptions-restart-policy-recovered' }
+}
+function Update-HarnessSubscriptionRestartPolicy {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private transaction already implements Preview and journal recovery under the connection mutex.')]
+    param($Paths, [switch]$Preview)
+    # Public access is ConfigureRestart through install.ps1's connection mutex.
+    Assert-SubscriptionRestartOperation $Paths
+    if (Test-Path -LiteralPath $Paths.restartPending) { throw 'An interrupted restart policy update needs -SubscriptionsOnly -Mode Recover.' }
+    $before = Get-SubscriptionSnapshot $Paths.state
+    if (-not $before) { throw 'Restart policy requires a committed subscription installation.' }
+    $state = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($before)) | ConvertFrom-Json -AsHashtable
+    Assert-SubscriptionState $state $Paths
+    if ($state.source -ne $Paths.source) { throw 'Subscription source changed; preserving restart policy.' }
+    $task = Get-SubscriptionTask $Paths.task
+    if (-not $task -or $task.xml -cne $state.task_xml) { throw 'Foreign or changed subscription task preserved.' }
+    $xml = Get-SubscriptionRestartTaskXml $task.xml
+    if ($Preview) { return @{ status = 'preview-subscription-restart-policy'; task = $Paths.task; restartCount = 3; restartInterval = 'PT1M'; changed = ($xml -cne $task.xml) } }
+    if ($xml -ceq $task.xml) { return @{ status = 'subscriptions-restart-policy-configured'; task = $Paths.task; restartCount = 3; restartInterval = 'PT1M'; changed = $false } }
+    $state.task_xml = $xml
+    $pending = @{ schema_version = 1; owner = 'codex-harness-subscriptions'; operation = 'restart-policy'
+        source = $Paths.source; user = $Paths.user; codex = $Paths.codex; task = $Paths.task
+        task_before = $task.xml; task_after = $xml; state_before = $before
+        state_after = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($state | ConvertTo-Json -Depth 60))) }
+    Write-CodeToolsJson $Paths.restartPending $pending
+    try {
+        if ((Get-SubscriptionSnapshot $Paths.state) -cne $before) { throw 'Subscription ownership state changed before policy write; preserving.' }
+        $xml = Set-SubscriptionTaskXmlInPlace -Name $Paths.task -Xml $xml -ExpectedXml $task.xml
+        # Persist the actual scheduler representation before committing state.
+        # An interruption before this write can recover by native equivalence.
+        $state.task_xml = $xml; $pending.task_after = $xml
+        $pending.state_after = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($state | ConvertTo-Json -Depth 60)))
+        Write-CodeToolsJson $Paths.restartPending $pending
+        if ((Get-SubscriptionSnapshot $Paths.state) -cne $before) { throw 'Subscription ownership state changed during policy write; preserving.' }
+        Write-CodeToolsBytes $Paths.state ([Convert]::FromBase64String($pending.state_after))
+        $current = Get-SubscriptionTask $Paths.task
+        if (-not $current -or $current.xml -cne $xml -or (Get-SubscriptionSnapshot $Paths.state) -cne $pending.state_after) { throw 'Subscription policy changed before commit; preserving.' }
+        Remove-CodeToolsFile $Paths.restartPending
+    } catch {
+        $cause = $_.Exception.Message
+        try { Restore-SubscriptionRestartPolicy $Paths | Out-Null }
+        catch { throw "Restart policy update failed: $cause. Recovery pending: $($_.Exception.Message)" }
+        throw "Restart policy update failed and prior policy restored: $cause"
+    }
+    @{ status = 'subscriptions-restart-policy-configured'; task = $Paths.task; restartCount = 3; restartInterval = 'PT1M'; changed = $true }
 }
 function Resolve-SubscriptionPowerShell {
     # Store/MSIX pwsh can fail before script entry under Task Scheduler. Reuse
@@ -156,7 +275,7 @@ function Invoke-SubscriptionBounded($Paths, [string]$Executable, [string[]]$Argu
         $request.memoryLimitMiB = 2048
         # Retire a stopped run while active-run still points at its receipt.
         # Overwriting that proof first can strand stale upstream PID markers.
-        Remove-SubscriptionStoppedMarkers $Paths
+        Remove-SubscriptionStoppedMarker $Paths
         $request.startedPath = $prefix + '.started.json'
         Write-CodeToolsJson (Join-Path $Paths.runtime 'active-run.json') @{ started = $request.startedPath }
     }
@@ -174,20 +293,20 @@ function Initialize-SubscriptionDependency($Paths, [string]$CodexCommand) {
     $node = (Get-Command node -CommandType Application -ErrorAction Stop).Source
     $npmCli = Join-Path (Split-Path $node) 'node_modules/npm/bin/npm-cli.js'
     Assert-CodeToolsPlain $prefix
-    Invoke-SubscriptionBounded $Paths $node @($npmCli,'install','--prefix',$prefix,'--no-audit','--no-fund','@bitkyc08/opencodex@2.44.0') -Timeout 180 | Out-Null
+    Invoke-SubscriptionBounded -Paths $Paths -Executable $node -Arguments @($npmCli,'install','--prefix',$prefix,'--no-audit','--no-fund','@bitkyc08/opencodex@2.44.0') -Timeout 180 | Out-Null
     $dependency = Get-SubscriptionDependency $Paths $CodexCommand
     if (-not $dependency) { throw 'Private package installation did not produce the audited runtime; preserve the dependency prefix for inspection.' }
     $dependency
 }
 function Restore-SubscriptionNative($Paths, $Dependency) {
     Assert-SubscriptionRuntimeOwned $Paths
-    Remove-SubscriptionStoppedMarkers $Paths
+    Remove-SubscriptionStoppedMarker $Paths
     $environment = @{ CODEX_HOME = $Paths.codex; OPENCODEX_HOME = $Paths.opencodex }
-    Invoke-SubscriptionBounded $Paths $Dependency.bun @('--no-env-file',(Join-Path $Paths.source 'tools/opencodex-native-restore.mjs'), $Dependency.root) $environment | Out-Null
+    Invoke-SubscriptionBounded -Paths $Paths -Executable $Dependency.bun -Arguments @('--no-env-file',(Join-Path $Paths.source 'tools/opencodex-native-restore.mjs'), $Dependency.root) -Environment $environment | Out-Null
 }
 function Assert-SubscriptionConfiguration($Paths, $Dependency) {
     $environment = @{ CODEX_HOME = $Paths.codex; OPENCODEX_HOME = $Paths.opencodex }
-    Invoke-SubscriptionBounded $Paths $Dependency.bun @('--no-env-file',(Join-Path $Paths.source 'tools/opencodex-config-check.mjs'), $Dependency.root, $Paths.source) $environment | Out-Null
+    Invoke-SubscriptionBounded -Paths $Paths -Executable $Dependency.bun -Arguments @('--no-env-file',(Join-Path $Paths.source 'tools/opencodex-config-check.mjs'), $Dependency.root, $Paths.source) -Environment $environment | Out-Null
 }
 function Assert-SubscriptionRuntimeOwned($Paths) {
     $runtime = Read-CodeToolsJson (Join-Path $Paths.opencodex 'runtime-port.json')
@@ -212,7 +331,9 @@ function Test-SubscriptionProcessAlive([int]$ProcessId) {
     } catch [ArgumentException] { return $false }
     finally { if ($process) { $process.Dispose() } }
 }
-function Remove-SubscriptionStoppedMarkers($Paths) {
+function Remove-SubscriptionStoppedMarker {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private cleanup verifies stopped process ownership and unchanged marker snapshots before removal.')]
+    param($Paths)
     $markers = @()
     foreach ($name in @('runtime-port.json','ocx.pid')) {
         $path = Join-Path $Paths.opencodex $name
@@ -283,7 +404,9 @@ function Wait-SubscriptionReady($Paths, [int]$Port) {
 function Assert-SubscriptionState($State, $Paths) {
     if ($State.schema_version -ne 1 -or $State.owner -ne 'codex-harness-subscriptions' -or $State.codex -ne $Paths.codex -or $State.user -ne $Paths.user -or $State.task -ne $Paths.task) { throw 'Subscription ownership record mismatch; preserving state.' }
 }
-function Update-SubscriptionServiceReadiness($Paths, [int]$Port, $Monitor) {
+function Update-SubscriptionServiceReadiness {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private host transition restores the journaled owned link only after attested readiness; no interactive approval is possible.')]
+    param($Paths, [int]$Port, $Monitor)
     if ($Monitor.ready) { return }
     if (Test-SubscriptionReady $Paths $Port) {
         # Install/Recover own their journaled link writes. A later independent
@@ -295,15 +418,22 @@ function Update-SubscriptionServiceReadiness($Paths, [int]$Port, $Monitor) {
             if ($state.links.roleLink -ne $Paths.roleSource) { throw 'Subscription service role source changed; run Install.' }
             $role = Get-SubscriptionLink $Paths.roleLink
             if ($role -and $role -ne $state.links.roleLink) { throw 'Foreign subscription role preserved during service restart.' }
-            Set-SubscriptionLink $Paths.roleLink $Paths.roleSource $role
+            Set-SubscriptionLink -Path $Paths.roleLink -Target $Paths.roleSource -Expected $role
         }
         $Monitor.ready = $true
     } elseif ([DateTime]::UtcNow -ge $Monitor.deadline) { throw 'Subscription service startup did not become ready within 90 seconds.' }
 }
 function Invoke-SubscriptionServiceHost {
+    <#
+    .SYNOPSIS
+    Runs the owned subscription service from its committed descriptor.
+    .DESCRIPTION
+    Validates descriptor and source-link ownership before starting the bounded
+    runtime. Restores native routing and withdraws the owned role on exit.
+    #>
     param([Parameter(Mandatory)][string]$StatePath)
     $descriptor = Read-CodeToolsJson $StatePath
-    $paths = Get-SubscriptionPaths $descriptor.source $descriptor.user $descriptor.codex
+    $paths = Get-SubscriptionPaths -SourceRoot $descriptor.source -UserHome $descriptor.user -CodexHome $descriptor.codex
     if ([IO.Path]::GetFullPath($StatePath) -ne $paths.service) { throw 'Subscription service descriptor path mismatch.' }
     Assert-SubscriptionState $descriptor $paths
     # Independent task/logon starts bypass the installer checks. The runtime
@@ -321,24 +451,48 @@ function Invoke-SubscriptionServiceHost {
         Assert-SubscriptionConfiguration $paths $dependency
         $environment = @{ CODEX_HOME = $paths.codex; OPENCODEX_HOME = $paths.opencodex; OCX_SERVICE = '1' }
         $monitor = @{ ready = $false; deadline = [DateTime]::UtcNow.AddSeconds(90) }
-        $observer = { Update-SubscriptionServiceReadiness $paths $descriptor.port $monitor }
-        Invoke-SubscriptionBounded $paths $dependency.bun @('--no-env-file',$dependency.cli,'start','--port',[string]$descriptor.port) $environment -Timeout 0 -ServiceRun -OnRunning $observer | Out-Null
+        $observer = { Update-SubscriptionServiceReadiness -Paths $paths -Port $descriptor.port -Monitor $monitor }
+        try {
+            Invoke-SubscriptionBounded -Paths $paths -Executable $dependency.bun -Arguments @('--no-env-file',$dependency.cli,'start','--port',[string]$descriptor.port) -Environment $environment -Timeout 0 -ServiceRun -OnRunning $observer | Out-Null
+        } catch {
+            $_.Exception.Data['SubscriptionRuntimeRetryable'] = $true
+            throw
+        }
     } finally {
         # Task Scheduler Stop can forcibly terminate this PowerShell host. Its
         # caller performs this same restoration after the job has closed.
         try {
             Restore-SubscriptionNative $paths $dependency
             $role = Get-SubscriptionLink $paths.roleLink
-            if ($role -eq $paths.roleSource) { Set-SubscriptionLink $paths.roleLink $null $role }
+            if ($role -eq $paths.roleSource) { Set-SubscriptionLink -Path $paths.roleLink -Target $null -Expected $role }
         } catch { Write-CodeToolsJson (Join-Path $paths.runtime 'recovery-required.json') @{ message = $_.Exception.Message; action = 'Run install.ps1 -Mode Recover, then Install.' }; throw }
     }
 }
 function Complete-HarnessSubscriptionRouting([string]$CodexHome) {
+    <#
+    .SYNOPSIS
+    Clears the subscription journal after the coordinating transaction commits.
+    #>
     Remove-CodeToolsFile (Join-Path $CodexHome 'harness/subscription-routing-pending.json')
 }
 function Restore-HarnessSubscriptionRouting {
+    <#
+    .SYNOPSIS
+    Restores owned subscription state from the saved transaction.
+    .DESCRIPTION
+    Preview validates without writes; DeferRestart leaves service restart to the
+    outer coordinator. Recovery reuses the journaled dependency and never resolves
+    a replacement runtime from CodexCommand or DependencyUserHome.
+    .PARAMETER CodexCommand
+    Compatibility argument accepted by the shared lifecycle dispatcher.
+    .PARAMETER DependencyUserHome
+    Compatibility argument; the saved subscription dependency owns recovery.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'CodexCommand', Justification = 'Shared lifecycle signature is preserved; recovery must use the committed dependency even when the supplied launcher is unavailable.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'DependencyUserHome', Justification = 'Shared lifecycle signature is preserved; subscription recovery is bound to its saved dependency rather than rediscovery in another home.')]
     param([string]$SourceRoot,[string]$UserHome,[string]$CodexHome,[string]$CodexCommand,[string]$DependencyUserHome,[switch]$Preview,[switch]$DeferRestart)
-    $paths = Get-SubscriptionPaths $SourceRoot $UserHome $CodexHome
+    $paths = Get-SubscriptionPaths -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome
+    if (Test-Path -LiteralPath $paths.restartPending) { return Restore-SubscriptionRestartPolicy $paths -Preview:$Preview }
     $pending = Read-CodeToolsJson $paths.pending
     if (-not $pending) {
         $state = Read-CodeToolsJson $paths.state
@@ -351,7 +505,7 @@ function Restore-HarnessSubscriptionRouting {
                     Restore-SubscriptionNative $paths $state.dependency
                     $role = Get-SubscriptionLink $paths.roleLink
                     if ($role -and $role -ne $state.links.roleLink) { throw 'Foreign role link preserved during recovery.' }
-                    if ($role) { Set-SubscriptionLink $paths.roleLink $null $role }
+                    if ($role) { Set-SubscriptionLink -Path $paths.roleLink -Target $null -Expected $role }
                 }
                 return @{ status = 'native-recovered-subscriptions-stopped'; action = 'Install to reconnect subscriptions.' }
             }
@@ -371,14 +525,14 @@ function Restore-HarnessSubscriptionRouting {
         if ($actual -ne $pending.links_before[$name] -and $actual -ne $pending.links_after[$name]) { throw 'Subscription connection changed after interruption; preserving.' }
     }
     if ($Preview) { return @{ status = 'preview-subscription-recovery' } }
-    if ($task) { Set-SubscriptionTask $paths.task $null $taskXml $paths }
+    if ($task) { Set-SubscriptionTask -Name $paths.task -Xml $null -ExpectedXml $taskXml -Paths $paths }
     if ($pending.runtime_started -and (Get-SubscriptionStarted $paths)) { Restore-SubscriptionNative $paths $pending.dependency }
-    Restore-SubscriptionSnapshot $paths.config $pending.config_before $pending.config_after $pending.config_native
-    foreach ($name in @('roleLink','configLink')) { Set-SubscriptionLink $paths[$name] $pending.links_before[$name] (Get-SubscriptionLink $paths[$name]) }
-    Restore-SubscriptionSnapshot $paths.service $pending.service_before $pending.service_after
-    Restore-SubscriptionSnapshot $paths.state $pending.state_before $pending.state_after
+    Restore-SubscriptionSnapshot -Path $paths.config -Before $pending.config_before -After $pending.config_after -Native $pending.config_native
+    foreach ($name in @('roleLink','configLink')) { Set-SubscriptionLink -Path $paths[$name] -Target $pending.links_before[$name] -Expected (Get-SubscriptionLink $paths[$name]) }
+    Restore-SubscriptionSnapshot -Path $paths.service -Before $pending.service_before -After $pending.service_after
+    Restore-SubscriptionSnapshot -Path $paths.state -Before $pending.state_before -After $pending.state_after
     if ($pending.task_before) {
-        Set-SubscriptionTask $paths.task $pending.task_before $null $paths
+        Set-SubscriptionTask -Name $paths.task -Xml $pending.task_before -ExpectedXml $null -Paths $paths
     }
     if ($pending.package_attempted) { throw 'Private package acquisition was interrupted before verification; native connections recovered. Preserve the dependency prefix and pending journal for inspection.' }
     $pending.phase = 'recovered'; Write-CodeToolsJson $paths.pending $pending
@@ -386,8 +540,14 @@ function Restore-HarnessSubscriptionRouting {
     @{ status = 'subscriptions-recovered' }
 }
 function Resume-HarnessSubscriptionRouting {
+    <#
+    .SYNOPSIS
+    Restarts the recovered subscription task after outer recovery has completed.
+    .DESCRIPTION
+    Publishes the owned role only after the restored service passes readiness.
+    #>
     param([string]$SourceRoot,[string]$UserHome,[string]$CodexHome)
-    $paths = Get-SubscriptionPaths $SourceRoot $UserHome $CodexHome
+    $paths = Get-SubscriptionPaths -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome
     $pending = Read-CodeToolsJson $paths.pending
     if (-not $pending) { return }
     Assert-SubscriptionState $pending $paths
@@ -403,11 +563,21 @@ function Resume-HarnessSubscriptionRouting {
     Complete-HarnessSubscriptionRouting $CodexHome
 }
 function Invoke-HarnessSubscriptionRouting {
+    <#
+    .SYNOPSIS
+    Applies the requested subscription lifecycle operation to owned state.
+    .DESCRIPTION
+    Preview validates without writes. DeferCommit keeps the journal for the outer
+    activation coordinator; ConfigureRestart updates only the owned restart policy.
+    #>
     [CmdletBinding()]
+    [OutputType([hashtable])]
     param([string]$SourceRoot,[string]$UserHome,[string]$CodexHome,[string]$CodexCommand,[string]$DependencyUserHome,
-        [ValidateSet('Install','Update','Check','Disconnect','Recover')][string]$Mode,[switch]$Preview,[switch]$DeferCommit,[scriptblock]$Checkpoint)
-    if ($Mode -eq 'Recover') { return Restore-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Preview:$Preview }
-    $paths = Get-SubscriptionPaths $SourceRoot $UserHome $CodexHome
+        [ValidateSet('Install','Update','Check','Disconnect','Recover','ConfigureRestart')][string]$Mode,[switch]$Preview,[switch]$DeferCommit,[scriptblock]$Checkpoint)
+    if ($Mode -eq 'Recover') { return Restore-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -DependencyUserHome $DependencyUserHome -Preview:$Preview }
+    $paths = Get-SubscriptionPaths -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome
+    if ($Mode -eq 'ConfigureRestart') { return Update-HarnessSubscriptionRestartPolicy $paths -Preview:$Preview }
+    if (Test-Path -LiteralPath $paths.restartPending) { throw 'An interrupted restart policy update needs -SubscriptionsOnly -Mode Recover.' }
     $state = Read-CodeToolsJson $paths.state
     if ($state) { Assert-SubscriptionState $state $paths }
     if (Read-CodeToolsJson $paths.pending) { throw 'An interrupted subscription operation needs Recover.' }
@@ -436,10 +606,10 @@ function Invoke-HarnessSubscriptionRouting {
         links_before = $links; links_after = $links.Clone(); dependency = $dependency; runtime_started = $false; package_attempted = $false }
     Write-CodeToolsJson $paths.pending $pending
     try {
-        if ($task) { $pending.task_after = $null; Write-CodeToolsJson $paths.pending $pending; Set-SubscriptionTask $paths.task $null $task.xml $paths }
+        if ($task) { $pending.task_after = $null; Write-CodeToolsJson $paths.pending $pending; Set-SubscriptionTask -Name $paths.task -Xml $null -ExpectedXml $task.xml -Paths $paths }
         if ($state) { Restore-SubscriptionNative $paths $state.dependency; $pending.config_after = Get-SubscriptionSnapshot $paths.config; $pending.config_native = $pending.config_after; Write-CodeToolsJson $paths.pending $pending }
         if ($Mode -eq 'Disconnect') {
-            foreach ($name in @('roleLink','configLink')) { $pending.links_after[$name] = $null; Write-CodeToolsJson $paths.pending $pending; Set-SubscriptionLink $paths[$name] $null $links[$name] }
+            foreach ($name in @('roleLink','configLink')) { $pending.links_after[$name] = $null; Write-CodeToolsJson $paths.pending $pending; Set-SubscriptionLink -Path $paths[$name] -Target $null -Expected $links[$name] }
             $pending.state_after = $null; $pending.service_after = $null; Write-CodeToolsJson $paths.pending $pending
             Remove-CodeToolsFile $paths.state; Remove-CodeToolsFile $paths.service
         } else {
@@ -453,19 +623,19 @@ function Invoke-HarnessSubscriptionRouting {
             }
             Assert-SubscriptionConfiguration $paths $dependency
             $pending.links_after.configLink = $paths.configSource; Write-CodeToolsJson $paths.pending $pending
-            Set-SubscriptionLink $paths.configLink $paths.configSource $links.configLink
+            Set-SubscriptionLink -Path $paths.configLink -Target $paths.configSource -Expected $links.configLink
             $descriptor = @{ schema_version = 1; owner = 'codex-harness-subscriptions'; source = $paths.source; user = $paths.user; codex = $paths.codex; task = $paths.task; port = $config.port; dependency = $dependency }
             $pending.service_after = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($descriptor | ConvertTo-Json -Depth 60)))
             Write-CodeToolsJson $paths.pending $pending; Write-CodeToolsBytes $paths.service ([Convert]::FromBase64String($pending.service_after))
             $xml = New-SubscriptionTaskXml $paths $dependency.powershell
             $pending.task_after = $xml; Write-CodeToolsJson $paths.pending $pending
-            Set-SubscriptionTask $paths.task $xml $null $paths
+            Set-SubscriptionTask -Name $paths.task -Xml $xml -ExpectedXml $null -Paths $paths
             $pending.task_after = (Get-SubscriptionTask $paths.task).xml; Write-CodeToolsJson $paths.pending $pending
             $pending.runtime_started = $true; Write-CodeToolsJson $paths.pending $pending
             Start-SubscriptionTask $paths.task; Wait-SubscriptionReady $paths $config.port
             $pending.config_after = Get-SubscriptionSnapshot $paths.config; Write-CodeToolsJson $paths.pending $pending
             $pending.links_after.roleLink = $paths.roleSource; Write-CodeToolsJson $paths.pending $pending
-            Set-SubscriptionLink $paths.roleLink $paths.roleSource $links.roleLink
+            Set-SubscriptionLink -Path $paths.roleLink -Target $paths.roleSource -Expected $links.roleLink
             $descriptor.task_xml = $pending.task_after; $descriptor.links = $pending.links_after
             $pending.state_after = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($descriptor | ConvertTo-Json -Depth 60)))
             Write-CodeToolsJson $paths.pending $pending; Write-CodeToolsBytes $paths.state ([Convert]::FromBase64String($pending.state_after))

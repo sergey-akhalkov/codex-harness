@@ -13,6 +13,11 @@
     "xai": {
       "adapter": "openai-chat",
       "baseUrl": "https://cli-chat-proxy.grok.com/v1",
+      "xaiResponsesDefaultVersion": 1,
+      "terminalContinuationGuard": true,
+      "modelAdapters": {
+        "grok-4.6": "openai-chat"
+      },
       "authMode": "oauth",
       "models": [
         "grok-4.6",
@@ -93,8 +98,7 @@
         "grok-4.3",
         "grok-4.20-0309-reasoning"
       ],
-      "liveModels": true,
-      "xaiResponsesDefaultVersion": 1
+      "liveModels": true
     }
   },
   "defaultProvider": "openai",
@@ -130,5 +134,6 @@
     "enabled": false,
     "backend": "openai",
     "model": "gpt-6-astra"
-  }
+  },
+  "emptyCompletionRetry": true
 }

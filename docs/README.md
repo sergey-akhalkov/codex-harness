@@ -9,16 +9,23 @@
 - [Адаптация принципов](principles-port.md) — сверка с оригиналом и согласованные изменения.
 - [Глобальное подключение](global-instructions.md) — действующая ссылка, проверка загрузки, обновление и откат.
 - [Установка набора](installation.md) — зависимости, конфигурация, ссылки, проверка, обновление и отключение.
+- [Экономия токенов](token-workflow.md) — RTK-исключение, Code Mode, точные MCP-операции, scoped edits и native reasoning по задаче.
 - [Диагностика источников](source-diagnostics.md) — глобальный отчёт о ссылках, слоях настроек и конфликтах skills без model calls.
 - [Подписки и внешние модели](subscription-models.md) — OpenCodex, OAuth Grok, назначение моделей ролям и текущий статус приёмки.
+- [Снижение расхода подписки](evidence/subscription-efficiency.md) — реализация и проверки: хуки выключены по умолчанию, отдельный harness-lsp снят с регистрации, служебный контекст сокращён; [контракт](../openspec/changes/archive/2026-09-08-reduce-subscription-waste/proposal.md).
 - [Делегирование по уровням](agent-delegation.md) — приоритет Grok, резерв Astra, редкая max-консультация и проверка полной стоимости результата.
 - [Проверки потребителя](linked-kit-probes.md) — фактическое чтение профилей, skills и агентов установленным CLI.
 - [Приёмка набора](linked-kit-verification.md) — сверка сценариев, результаты тестов, реальная активация и очистка.
 - [Практики скорости и качества](best-practices.md).
+- [Боковой вопрос `/btw` и `/side`](native-side-questions.md) — использование и ограничения проверки CLI 0.153.4.
+- [Аудит архивации OpenSpec](evidence/spec-closure.md) — выполненные изменения и проверенные основания закрытия.
+- [Спека Git-памяти и native workflows](../openspec/changes/adopt-project-memory-and-native-workflows/proposal.md) — проектная память, worktrees и structured exec; реализация продолжается. [Подключение экспериментального контекста](evidence/native-context-delivery.md) различает пройденный Astra pilot, глобальную настройку и оставшуюся runtime-приёмку. Fast mode исключён.
+- [Спека ускорения проверенного результата](../openspec/changes/accelerate-verified-delivery/proposal.md) — два skill подключены глобально; [реализация и проверки](evidence/verified-delivery.md). Полный набор сравнений и подтверждение ускорения ещё открыты.
 - [Карта переноса из opencode-kit](opencode-kit-map.md).
 - [Аудит дополнительных заимствований](opencode-kit-audit.md) — приоритеты, конкретные исходники, проверки и цена адаптации; предложения от 2026-09-07.
 - [Глобальное MCP/LSP-подключение](code-tools.md) — выбранные инструменты, прямое чтение исходников, состояние реализации и доказательства; [спека и задачи](../openspec/changes/archive/2026-09-06-connect-global-mcp-lsp/proposal.md).
 - [Приёмка MCP/LSP](code-tools-verification.md) — соответствие требованиям, языковая матрица, глобальные consumers, обновления и ограничения проверок.
+- [Ресурсы MCP/LSP](evidence/tool-resources.md) — ограничения памяти/CPU, совместные сервисы, scoped lifecycle и текущая приёмка инцидента.
 - Ниже — 56 официальных страниц, сгруппированных по задачам.
 
 ## Как пользоваться

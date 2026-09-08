@@ -171,12 +171,61 @@ def install_runtime_guard(inventory):
     SerenaConfig.from_config_file = classmethod(load_config)
 
 
+def install_shared_client_sessions():
+    """Preserve Serena1.7 prompt/session state across multiplexed stdio calls.
+
+    The private broker attaches a client identity in MCP request metadata. The
+    native Tool.apply_ex reads only Context.session, using object identity for
+    session status. A bounded set of stable session objects gives each proxy its
+    own native prompt history without changing public tool signatures.
+    """
+    from collections import OrderedDict
+    from functools import wraps
+    from serena.tools.tools_base import Tool
+
+    original = Tool.apply_ex
+    sessions = OrderedDict()
+    removed_projects = set(json.loads(os.environ.get("HARNESS_SERENA_REMOVED_PROJECTS", "[]")))
+    restored_configuration = False
+
+    @wraps(original)
+    def apply_ex(self, log_call=True, catch_exceptions=True, mcp_ctx=None, **kwargs):
+        nonlocal restored_configuration
+        if not restored_configuration:
+            # Replay this client's optional in-memory removals after startup
+            # activation, which may register the selected project again.
+            self.agent.serena_config.projects[:] = [project for project in self.agent.serena_config.projects
+                                                    if project.project_name not in removed_projects]
+            self.agent.serena_config.__dict__.pop("project_names", None)
+            restored_configuration = True
+        if mcp_ctx is not None:
+            meta = mcp_ctx.request_context.meta
+            client = getattr(meta, "harness_serena_client", None) if meta is not None else None
+            if not isinstance(client, str) or len(client) != 32:
+                raise RuntimeError("Shared Serena call is missing its broker client identity")
+            if client not in sessions:
+                if len(sessions) >= 128:
+                    _, expired = sessions.popitem(last=False)
+                    self.agent._project_prompt_status._session_status_dict.pop("%x" % id(expired), None)
+                sessions[client] = SimpleNamespace(client_params=mcp_ctx.session.client_params)
+            sessions.move_to_end(client)
+            mcp_ctx = SimpleNamespace(session=sessions[client])
+        return original(self, log_call=log_call, catch_exceptions=catch_exceptions, mcp_ctx=mcp_ctx, **kwargs)
+
+    Tool.apply_ex = apply_ex
+
+
 def main():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from process_ownership import JobGuard
+    JobGuard().contain_current_process()
     registry = os.environ.get("HARNESS_CODE_TOOLS_REGISTRY")
     if not registry:
         unavailable("the adopted dependency registry is not configured")
     inventory = json.loads(Path(registry).read_text(encoding="utf-8-sig"))
     install_runtime_guard(inventory)
+    if os.environ.get("HARNESS_SERENA_SHARED_WORKER") == "1":
+        install_shared_client_sessions()
     from serena.cli import top_level
     top_level()
 

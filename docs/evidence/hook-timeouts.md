@@ -2,7 +2,7 @@
 
 Verified on Windows with globally installed Codex CLI 0.153.4 on 2026-09-07.
 Implementation: [journal.py](../../tools/lsp/journal.py) and
-[server.py](../../tools/lsp/server.py). [Tasks](../../openspec/changes/fix-diagnostic-hook-timeouts/tasks.md).
+[server.py](../../tools/lsp/server.py). [Tasks](../../openspec/changes/archive/2026-09-08-fix-diagnostic-hook-timeouts/tasks.md).
 
 ## Causes and correction
 

@@ -7,24 +7,45 @@ from __future__ import annotations
 
 import argparse
 import json
+import io
 from pathlib import Path
 import sys
+from typing import Required, TypedDict, cast
 
-REQUIRED = {"rust", "typescript", "javascript", "powershell", "python", "delphi", "cpp", "csharp", "json", "markdown", "toml", "xml", "cmake", "bash"}
+REQUIRED: set[str] = set()  # No harness language backend passed the benefit gate.
 CONDITIONAL = {"yaml", "qml", "html", "css"}
 
 
-def generate(inventory: dict) -> dict:
-    servers = {}
+class LanguageRecord(TypedDict, total=False):
+    id: Required[str]
+    command: list[str]
+    version: str | None
+    provenance: dict[str, object]
+    paths: dict[str, str]
+    sdk_candidates: list[object]
+    lsp: dict[str, object]
+
+
+class Inventory(TypedDict):
+    languages: list[LanguageRecord]
+
+
+class Arguments(argparse.Namespace):
+    inventory: str = ''
+
+
+def generate(inventory: Inventory) -> dict[str, object]:
+    servers: dict[str, dict[str, object]] = {}
     records = {record["id"]: record for record in inventory.get("languages", [])}
-    for language in sorted(REQUIRED | CONDITIONAL):
-        record = records.get(language, {})
+    for language in sorted(records):
+        record: LanguageRecord = records.get(language, {"id": language})
         key = "pascal" if language == "delphi" else language
         command = list(record.get("command") or [])
-        item = {"command": command, "adapter": "push", "language": language,
+        item: dict[str, object] = {"command": command, "adapter": "push", "language": language,
             "required": language in REQUIRED, "version": record.get("version"),
             "provenance": record.get("provenance", {}), "status": "configured-unverified"}
         paths = record.get("paths") or {}
+        environment: dict[str, str] = {}
         if not command:
             item.update(status="unavailable", reason="No installed compatible backend in discovery")
         elif language in {"typescript", "javascript", "python", "json", "yaml", "html", "css"}:
@@ -47,12 +68,13 @@ def generate(inventory: dict) -> dict:
             if record.get("version") == "v0.2.0":
                 item["adapter"] = "pasls-0.2"
             if paths.get("pp") and paths.get("fpcdir"):
-                item["env"] = {"PP": paths["pp"], "FPCDIR": paths["fpcdir"]}
+                environment = {"PP": paths["pp"], "FPCDIR": paths["fpcdir"]}
+                item["env"] = environment
                 # CodeTools otherwise follows the 64-bit host even when the
                 # selected, provisioned compiler/RTL cohort is Win32 i386.
                 # Restrict this inference to the compiler's explicit target dir.
                 if Path(paths["pp"]).parent.name.lower() == "i386-win32":
-                    item["env"].update(FPCTARGETCPU="i386", FPCTARGET="win32")
+                    environment.update(FPCTARGETCPU="i386", FPCTARGET="win32")
         elif language == "cpp":
             command.append("--background-index=false")
         elif language == "csharp":
@@ -78,22 +100,27 @@ def generate(inventory: dict) -> dict:
         elif language == "bash":
             command.append("start")
             if paths.get("shellcheck"):
-                item["env"] = {"SHELLCHECK_PATH": paths["shellcheck"]}
+                environment = {"SHELLCHECK_PATH": paths["shellcheck"]}
+                item["env"] = environment
         # Explicit settings are host-owned configuration, never copied from an
         # unrelated editor configuration during runtime.
+        overrides = record.get("lsp", {})
         for option in ("settings", "initialization_options", "encoding", "env", "analyzer_path", "schema_files", "project_properties"):
-            if option in record.get("lsp", {}):
-                item[option] = ({**item.get("env", {}), **record["lsp"][option]} if option == "env" else record["lsp"][option])
+            if option in overrides:
+                item[option] = ({**environment, **cast(dict[str, str], overrides[option])}
+                                if option == "env" else overrides[option])
         servers[key] = item
     return {"schema_version": 1, "servers": servers}
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--inventory", required=True)
-    arguments = parser.parse_args()
-    sys.stdout.reconfigure(encoding="utf-8")
-    inventory = json.loads(Path(arguments.inventory).read_text(encoding="utf-8-sig"))
+    _ = parser.add_argument("--inventory", required=True)
+    arguments = Arguments()
+    _ = parser.parse_args(namespace=arguments)
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        _ = sys.stdout.reconfigure(encoding="utf-8")
+    inventory = cast(Inventory, json.loads(Path(arguments.inventory).read_text(encoding="utf-8-sig")))
     print(json.dumps(generate(inventory), ensure_ascii=False, indent=2))
 
 

@@ -16,15 +16,7 @@ import uuid
 from backend import EXTENSIONS, digest, registry_path, runtime_home
 
 
-IGNORED_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".serena", ".codex", "target", "bin", "obj"}
-CONFIG_NAMES = {"tsconfig.json", "jsconfig.json", "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml",
-                "pyproject.toml", "pyrightconfig.json", "compile_commands.json", "compile_flags.txt", "CMakeLists.txt",
-                "PSScriptAnalyzerSettings.psd1", ".editorconfig", "package.json", "package-lock.json", "pnpm-lock.yaml",
-                "yarn.lock", "bun.lock", ".marksman.toml", "taplo.toml", ".taplo.toml", ".clangd", ".shellcheckrc"}
-# Arbitrarily named JSON files may supply schemas or imported project data;
-# XSD/DTD documents can affect unchanged XML instances. Their changes therefore
-# conservatively invalidate this root's analysis under the same finite budget.
-CONFIG_SUFFIXES = {".dproj", ".csproj", ".props", ".targets", ".sln", ".json", ".jsonc", ".xsd", ".dtd"}
+from discovery import IGNORED_DIRS, is_config, snapshot
 
 
 def identity(event: dict) -> tuple[Path, str, str]:
@@ -63,7 +55,9 @@ def workspace_events(event: dict, *, remember: bool = False, deadline: float | N
     The root list is owned by this session/agent, not shared across consumers.
     """
     primary = identity(event)[0]
-    values = json.loads(os.environ.get("HARNESS_LSP_WORKSPACE_ROOTS", "[]"))
+    values = event.get("_workspace_roots", json.loads(os.environ.get("HARNESS_LSP_WORKSPACE_ROOTS", "[]")))
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError("Invalid per-request workspace roots")
     if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
         raise ValueError("HARNESS_LSP_WORKSPACE_ROOTS must be a JSON array of directory paths")
     owner = Journal(event, deadline=deadline)
@@ -97,11 +91,6 @@ def workspace_events(event: dict, *, remember: bool = False, deadline: float | N
         owner.close()
 
 
-def is_config(path: str) -> bool:
-    item = Path(path)
-    return item.name in CONFIG_NAMES or item.suffix.lower() in CONFIG_SUFFIXES
-
-
 def invocation_key(event: dict) -> list[str]:
     return [str(event.get("event") or event.get("hook_event_name") or "PostToolUse").lower(),
         str(event.get("turn_id") or ""), str(event.get("tool_use_id") or "")]
@@ -111,7 +100,47 @@ def input_signature(files, registry_revision):
     return hashlib.sha256(json.dumps([files, registry_revision], sort_keys=True).encode()).hexdigest()
 
 
-def stop_output(event, state, message, *, successful=False):
+def process_alive(pid):
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.OpenProcess(0x1000, False, int(pid))
+        if handle:
+            kernel.CloseHandle(handle)
+            return True
+        return ctypes.get_last_error() == 5  # Access denied is not proof of death.
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def post_output(event, state, message):
+    """Keep repeated failure/context delivery bounded, independently of checks."""
+    journal = None
+    try:
+        journal = Journal(event, deadline=time.monotonic() + 0.25)
+        signature = hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        journal.db.execute("BEGIN IMMEDIATE")
+        if journal.get("last_post_delivery") == signature:
+            journal.db.rollback()
+            return {}
+        journal.put("last_post_delivery", signature)
+        journal.db.commit()
+    except Exception:
+        pass  # Still return an honest limitation if the journal is unavailable.
+    finally:
+        if journal:
+            journal.close()
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
+
+
+def stop_output(event, state, message, *, successful=False, blocking=False):
     """Publish a semantic completion once, shared by native/command processes.
 
     This is only delivery bookkeeping; it never accepts unfinished diagnostics.
@@ -122,9 +151,11 @@ def stop_output(event, state, message, *, successful=False):
     try:
         journal = Journal(event, deadline=time.monotonic() + 1.0)
         journal.db.execute("BEGIN IMMEDIATE")
-        if journal.get("last_stop_delivery") == signature:
+        deliveries = journal.get("stop_deliveries", [])
+        if signature in deliveries:
             journal.db.rollback()
             return {}
+        journal.put("stop_deliveries", [*deliveries, signature][-128:])
         journal.put("last_stop_delivery", signature)
         journal.db.commit()
     except Exception:
@@ -135,7 +166,7 @@ def stop_output(event, state, message, *, successful=False):
         if journal:
             journal.close()
     active = event.get("stop_hook_active") in (True, "true", "True", 1)
-    return {"systemMessage": message} if successful or active else {"decision": "block", "reason": message}
+    return {"decision": "block", "reason": message} if blocking and not successful and not active else {"systemMessage": message}
 
 
 def explicit_paths(event: dict, root: Path) -> list[Path]:
@@ -155,60 +186,6 @@ def explicit_paths(event: dict, root: Path) -> list[Path]:
         if path.is_relative_to(root):
             result.append(path)
     return result
-
-
-def snapshot(root: Path, extra: list[Path] = (), budget: float = 5.0, *, configurations_only: bool = False) -> tuple[dict[str, str], list[str]]:
-    """Hash actual bytes, including pre-dirty/untracked files; never follow outside roots."""
-    files, problems, visited, inspected = {}, [], set(), set()
-    deadline = time.monotonic() + budget
-
-    def check_deadline():
-        if time.monotonic() > deadline:
-            raise TimeoutError("File reconciliation exceeded its time budget")
-
-    def inspect(path):
-        check_deadline()
-        actual = path.resolve()
-        if not actual.is_relative_to(root) or actual in inspected:
-            return
-        inspected.add(actual)
-        if configurations_only and not is_config(str(actual)):
-            return
-        if actual.suffix.lower() not in EXTENSIONS and not is_config(str(actual)):
-            return
-        try:
-            if actual.is_file():
-                before = actual.stat()
-                if before.st_size > 8 * 1024 * 1024:
-                    problems.append(f"Source exceeds 8 MiB scan bound: {actual.relative_to(root)}")
-                    return
-                revision = digest(actual)
-                after = actual.stat()
-                if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
-                    problems.append(f"Source changed during snapshot: {actual.relative_to(root)}")
-                else:
-                    files[actual.relative_to(root).as_posix()] = revision
-        except OSError as error:
-            problems.append(f"Cannot read {path.name}: {type(error).__name__}")
-
-    try:
-        for folder, directories, names in os.walk(root, followlinks=True, onerror=lambda error: problems.append(str(error))):
-            check_deadline()
-            actual = Path(folder).resolve()
-            if not actual.is_relative_to(root) or actual in visited:
-                directories[:] = []
-                continue
-            visited.add(actual)
-            directories[:] = [name for name in directories if name not in IGNORED_DIRS]
-            for name in names:
-                inspect(Path(folder) / name)
-        for path in extra:
-            inspect(path)
-        # Even an empty traversal or the last file read can exhaust the budget.
-        check_deadline()
-    except TimeoutError as error:
-        problems.append(str(error))
-    return files, problems
 
 
 class DeadlineConnection(sqlite3.Connection):
@@ -283,15 +260,21 @@ class Journal:
                 files, problems = snapshot(self.root, explicit_paths(event, self.root),
                     budget=max(0.0, self.db.remaining() - 0.2))
             self.db.execute("BEGIN IMMEDIATE")
+            prior_observation = self.get("last_pre_identity") or self.get("observed_post_tool_use")
             self.put("last_pre_identity", {key: event.get(key) for key in
                 ("hook_event_name", "session_id", "agent_id", "turn_id", "tool_use_id", "transcript_path", "agent_transcript_path")})
             if not self.get("baseline"):
+                # Retain the earliest observed bytes even when a complete scan
+                # was impossible; a later pre cannot absorb an outstanding edit.
+                self.db.executemany("INSERT OR IGNORE INTO files VALUES (?,?)", files.items())
                 if problems:
                     self.put("baseline_problem", problems)
+                    self.put("coverage_gap", "Incomplete pre-edit baseline; changes outside observed files remain unverified")
                 else:
-                    self.db.executemany("INSERT OR REPLACE INTO files VALUES (?,?)", files.items())
                     self.put("baseline", True)
                     self.put("baseline_problem", [])
+                    if prior_observation:
+                        self.put("coverage_gap", "No complete pre-edit baseline; historical edits remain unverified; future changes are tracked")
             invocation = event.get("tool_use_id")
             if invocation:
                 self.db.execute("INSERT OR REPLACE INTO invocations VALUES (?,?,?)", (str(invocation), str(event.get("turn_id") or ""), time.time()))
@@ -304,22 +287,42 @@ class Journal:
             self.db.deadline = previous_deadline
         if problems:
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext":
-                "Automatic diagnostics baseline unavailable; edits remain unverified: " + "; ".join(problems)}}
+                "Automatic diagnostics baseline unavailable; edits remain unverified: " + "; ".join(str(item)[:1000] for item in problems[:10])
+                + (f"; {len(problems) - 10} further discovery problems retained in the journal" if len(problems) > 10 else "")}}
         return {}
 
     def changes(self, event, budget=5.0):
         extras = explicit_paths(event, self.root)
         # Include previously known files even beneath excluded directories.
         previous = dict(self.db.execute("SELECT path,revision FROM files"))
-        extras.extend(self.root / name for name in previous)
+        extras.extend(self.root / name for name in previous if any(part in IGNORED_DIRS for part in Path(name).parts[:-1]))
         current, problems = snapshot(self.root, extras, budget=budget)
-        if not self.get("baseline"):
-            return current, {}, ["No pre-edit baseline; missed edits cannot be identified", *self.get("baseline_problem", []), *problems]
-        changed = {name: revision for name, revision in current.items() if previous.get(name) != revision}
+        complete_baseline = self.get("baseline")
+        changed = {name: revision for name, revision in current.items()
+            if previous.get(name) != revision and (complete_baseline or name in previous)}
+        if not complete_baseline:
+            # First observation after a missed pre is a forward reference, never
+            # proof that the earlier edits were clean or that every file changed.
+            if (str(event.get("event") or event.get("hook_event_name") or "PostToolUse").lower() == "posttooluse"
+                    and re.search(r"(?:apply_patch|edit|write|rename|replace|create|delete)", str(event.get("tool_name", "")), re.I)):
+                changed.update({path.relative_to(self.root).as_posix(): current[path.relative_to(self.root).as_posix()]
+                    for path in explicit_paths(event, self.root) if path.relative_to(self.root).as_posix() in current})
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.executemany("INSERT OR IGNORE INTO files VALUES (?,?)", current.items())
+                self.put("coverage_gap", self.get("coverage_gap") or
+                    "No pre-edit baseline; historical edits remain unverified; future changes are tracked")
+                if not problems:
+                    self.put("baseline", True)
+                    self.put("baseline_problem", [])
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
         # A dependent file may have unchanged bytes but still need analysis after
         # another file or configuration changed. Keep that unfinished work visible.
         for name, revision, body in self.db.execute("SELECT path,revision,body FROM results"):
-            if json.loads(body).get("status") in ("pending", "stale", "failed", "unavailable") and name in current:
+            if json.loads(body).get("status") in ("pending", "stale", "failed", "unavailable", "skipped") and name in current:
                 changed[name] = current[name]
         if not problems:
             changed.update({name: None for name in previous if name not in current})
@@ -350,11 +353,12 @@ class Journal:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             current = self.get("active_claim", {})
-            if current.get("started", 0) > time.time() - 30:
+            if current.get("started", 0) > time.time() - 30 or (current.get("pid") and process_alive(current["pid"])):
                 self.db.rollback()
                 return None
             token = uuid.uuid4().hex
-            self.put("active_claim", {"token": token, "invocation": invocation_key(event), "origin": origin, "started": time.time()})
+            self.put("active_claim", {"token": token, "invocation": invocation_key(event), "origin": origin,
+                "started": time.time(), "pid": os.getpid()})
             self.db.commit()
             return token
         except Exception:
@@ -371,13 +375,40 @@ class Journal:
             self.db.rollback()
             raise
 
+    def transfer_claim(self, token):
+        """Atomically hand a thin worker's claim to the broker process."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.get("active_claim", {})
+            if current.get("token") != token:
+                self.db.rollback()
+                return None
+            replacement = uuid.uuid4().hex
+            self.put("active_claim", {**current, "token": replacement, "pid": os.getpid(), "started": time.time()})
+            self.db.commit()
+            return replacement
+        except Exception:
+            self.db.rollback()
+            raise
+
     def finish_check(self, token, event=None, *, checked_inputs=None):
         self.db.execute("UPDATE checks SET finished=? WHERE id=?", (time.time(), token))
         self.db.execute("DELETE FROM checks WHERE finished IS NOT NULL AND id NOT IN (SELECT id FROM checks ORDER BY started DESC LIMIT 128)")
         if event is not None:
-            self.put("last_completed_check", {"invocation": invocation_key(event), "origin": event.get("_origin", "native"),
-                "at": time.time(), "checked_inputs": checked_inputs})
+            completed = {"invocation": invocation_key(event), "origin": event.get("_origin", "native"),
+                "at": time.time(), "checked_inputs": checked_inputs}
+            self.put("last_completed_check", completed)
+            receipts = self.get("completed_invocations", {})
+            receipts[json.dumps(invocation_key(event))] = completed
+            self.put("completed_invocations", dict(sorted(receipts.items(), key=lambda item: item[1]["at"])[-128:]))
         self.db.commit()
+
+    def receipt(self, event):
+        key = invocation_key(event)
+        completed = self.get("completed_invocations", {}).get(json.dumps(key))
+        if completed is None:
+            completed = self.get("last_completed_check", {})
+        return completed if completed.get("invocation") == key else {}
 
     def stop(self, event, budget=29.0):
         began = time.monotonic()
@@ -396,13 +427,9 @@ class Journal:
             return {}
         report = "Automatic diagnostics remain unresolved: " + json.dumps({"workspace": str(self.root), "agent_id": self.agent,
             "files": sorted(changed), "problems": problems}, ensure_ascii=False)
-        # One continuation per *new* unresolved state; never loop on a missing server.
-        signature = hashlib.sha256(json.dumps([changed, problems], sort_keys=True).encode()).hexdigest()
-        if self.get("last_stop_signature") != signature and not event.get("stop_hook_active", False):
-            self.put("last_stop_signature", signature)
-            self.db.commit()
-            return {"decision": "block", "reason": report + ". Preserve this limitation in the completion report; do not claim a clean check."}
-        return {"systemMessage": report}
+        return stop_output(event, {"files": changed, "problems": problems},
+            report + ". Preserve this limitation in the completion report; do not claim a clean check.")
+
 
 
 def command_fallback(event: dict, budget=25.0) -> dict:
@@ -413,20 +440,27 @@ def command_fallback(event: dict, budget=25.0) -> dict:
     claim this invocation. Its process tree belongs solely to this invocation.
     """
     began, began_wall = time.monotonic(), time.time()
-    events = workspace_events(event)
+    deadline = began + budget
+    events = workspace_events(event, deadline=deadline)
+    verified = set()
     while True:
         active, handled = False, True
         for index, scoped in enumerate(events):
-            journal = Journal(scoped)
+            journal = Journal(scoped, deadline=deadline)
             try:
-                active = active or bool(journal.db.execute("SELECT 1 FROM checks WHERE finished IS NULL AND started>? LIMIT 1", (time.time() - 30,)).fetchone())
-                completed = journal.get("last_completed_check", {})
-                matching = completed.get("origin") == "native" and completed.get("invocation") == invocation_key(scoped) and completed.get("at", 0) >= began_wall - 5
-                if matching and invocation_key(scoped)[0] in ("stop", "subagentstop"):
+                claim = journal.get("active_claim", {})
+                active = active or bool(claim and (claim.get("started", 0) > time.time() - 30
+                    or (claim.get("pid") and process_alive(claim["pid"]))))
+                completed = journal.receipt(scoped)
+                matching = bool(completed) and completed.get("at", 0) >= began_wall - 30
+                if invocation_key(scoped)[0] == "posttooluse" and not scoped.get("tool_use_id"):
+                    matching = False
+                marker = (str(journal.directory), completed.get("at"))
+                if matching and invocation_key(scoped)[0] in ("stop", "subagentstop") and completed.get("at", 0) < began_wall and marker not in verified:
                     # Native Stop can repeat with the same turn/tool identity.
                     # A previous successful Stop never covers a later write.
                     if journal.get("baseline") or journal.get("observed_post_tool_use") or journal.db.execute("SELECT 1 FROM invocations LIMIT 1").fetchone():
-                        scan_budget = max(0.001, min(0.25, (budget - (time.monotonic() - began)) / (len(events) - index)))
+                        scan_budget = max(0.001, min(5.0, (deadline - time.monotonic() - 1) / (len(events) - index)))
                         current, changed, problems = journal.changes(scoped, budget=scan_budget)
                         if completed.get("checked_inputs"):
                             registry = registry_path()
@@ -435,6 +469,8 @@ def command_fallback(event: dict, budget=25.0) -> dict:
                         else:
                             # Compatibility with a still-running older MCP.
                             matching = not changed and not problems
+                    if matching:
+                        verified.add(marker)
                 handled = handled and matching
             finally:
                 journal.close()
@@ -449,7 +485,7 @@ def command_fallback(event: dict, budget=25.0) -> dict:
         return fallback_failure(event, "The native diagnostic check did not finish within the completion budget")
     claims = {}
     for scoped in events:
-        journal = Journal(scoped)
+        journal = Journal(scoped, deadline=deadline)
         try:
             token = journal.claim(scoped, "command")
             if token:
@@ -458,19 +494,22 @@ def command_fallback(event: dict, budget=25.0) -> dict:
             journal.close()
         if not token:
             for previous in events:
-                pending = Journal(previous)
+                pending = Journal(previous, deadline=deadline)
                 try:
                     if str(pending.directory) in claims:
                         pending.release_claim(claims[str(pending.directory)])
                 finally:
                     pending.close()
             return fallback_failure(event, "Another check is already reconciling this workspace")
-    payload = {**event, "_origin": "command", "_claims": claims, "_batch_budget": max(0.1, remaining - 4)}
     try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            return fallback_failure(event, "Diagnostic fallback exhausted its shared budget before startup")
+        payload = {**event, "_origin": "command", "_claims": claims, "_batch_budget": max(0.1, remaining - 4)}
         return run_fallback_worker(event, payload, remaining)
     finally:
         for scoped in events:
-            journal = Journal(scoped)
+            journal = Journal(scoped, deadline=time.monotonic() + 0.25)
             try:
                 journal.release_claim(claims[str(journal.directory)])
             finally:
@@ -507,7 +546,7 @@ def fallback_failure(event: dict, reason: str) -> dict:
     message = "Automatic diagnostics remain unresolved: " + reason + ". No clean result is established."
     if str(event.get("event") or event.get("hook_event_name") or "").lower() in ("stop", "subagentstop"):
         return stop_output(event, {"status": "unresolved", "reason": reason}, message)
-    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}}
+    return post_output(event, {"status": "unresolved", "reason": reason}, message)
 
 
 def main():
@@ -544,7 +583,6 @@ def main():
     except Exception as error:
         message = f"Automatic diagnostics journal unavailable: {type(error).__name__}: {error}"
         result = ({"hookSpecificOutput": {"hookEventName": "PreToolUse" if arguments.event == "pre" else "PostToolUse", "additionalContext": message}} if arguments.event in ("pre", "post")
-                  else {"decision": "block", "reason": message} if not locals().get("event", {}).get("stop_hook_active")
                   else {"systemMessage": message})
     finally:
         if journal:

@@ -53,7 +53,9 @@ function Assert-Lsp([bool]$Condition, [string]$Message) {
     Write-Output "PASS: $Message"
 }
 function Write-LspFile([string]$Path, [string]$Text) { [IO.File]::WriteAllText($Path, $Text, $utf8) }
-function Remove-LspProbe([string]$Path) {
+function Remove-LspProbe {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private fixture cleanup checks absolute containment and reparse points; prompting would leave owned probe resources behind.')]
+    param([string]$Path)
     $full = [IO.Path]::GetFullPath($Path)
     if ($full -ne $ProbeRoot -and -not $full.StartsWith($ProbeRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Cleanup escaped disposable probe.' }
     $item = Get-Item -LiteralPath $full -Force
@@ -192,7 +194,7 @@ required = true
     Assert-Lsp (@($listed.data[0].hooks | Where-Object trustStatus -NE 'trusted').Count -eq 0) 'fresh unprofiled app-server loads trusted live hook sources'
     if ($RunAgent) {
         # Native delegation requires a persisted parent thread in this version.
-        $thread = Invoke-ConsumerRpc $server 'thread/start' @{cwd=$workspace;ephemeral=($Scenario -ne 'child')}
+        $thread = Invoke-ConsumerRpc $server 'thread/start' @{cwd=$workspace;model='gpt-6-astra';ephemeral=($Scenario -ne 'child')}
         $runtime = Join-Path $codexHome 'harness/runtime/lsp'
         $previousReports = @{}
         if ($UseGlobalHome -and (Test-Path -LiteralPath $runtime)) {
@@ -287,12 +289,12 @@ Before the same child performs the two patches, ask it to call these four actual
             $line = $server.Process.StandardOutput.ReadLineAsync()
             if (-not $line.Wait([Math]::Max(1,[int]($deadline-[DateTime]::UtcNow).TotalMilliseconds))) { throw 'Actual LSP agent probe timed out.' }
             if ($null -eq $line.Result) { throw 'Native consumer exited before completing the LSP probe.' }
-            $event = $line.Result | ConvertFrom-Json -AsHashtable
-            $events.Add($event)
+            $rpcEvent = $line.Result | ConvertFrom-Json -AsHashtable
+            $events.Add($rpcEvent)
             # Preserve this fixture's own protocol evidence on bounded timeout,
             # without reading unrelated session transcripts.
             [IO.File]::AppendAllText((Join-Path $ProbeRoot 'private-agent-events.jsonl'), $line.Result + "`n", $utf8)
-            if ($event.ContainsKey('method') -and $event.method -eq 'turn/completed' -and $event.params.turn.id -eq $turn.turn.id) { $finished=$true; break }
+            if ($rpcEvent.ContainsKey('method') -and $rpcEvent.method -eq 'turn/completed' -and $rpcEvent.params.turn.id -eq $turn.turn.id) { $finished=$true; break }
         }
         Write-LspFile (Join-Path $ProbeRoot 'private-agent-events.json') ($events | ConvertTo-Json -Depth 70)
         Assert-Lsp $finished 'real Codex patch/error/correction turn finishes'

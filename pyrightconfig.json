@@ -1,0 +1,12 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonPlatform": "Windows",
+  "executionEnvironments": [
+    { "root": "tools/lsp", "extraPaths": ["tools", "."] },
+    { "root": "tools/code-tools", "extraPaths": ["tools", "tools/lsp", "."] },
+    { "root": "tools", "extraPaths": ["."] },
+    { "root": "tests", "extraPaths": ["tools/lsp", "tools/code-tools", "tools", "."] },
+    { "root": "." }
+  ]
+}

@@ -13,7 +13,19 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/lsp"))
+import discovery
 import journal
+
+
+class FakeScan:
+    def __init__(self, entries=()):
+        self.entries = list(entries)
+
+    def __enter__(self):
+        return iter(self.entries)
+
+    def __exit__(self, *_):
+        return False
 
 
 class PreBudgetTests(unittest.TestCase):
@@ -37,26 +49,25 @@ class PreBudgetTests(unittest.TestCase):
     def test_directory_only_walk_stops_at_deadline(self):
         visited = []
 
-        def empty_walk(*args, **kwargs):
-            for index in range(4):
-                time.sleep(0.025)
-                visited.append(index)
-                yield str(self.root / f"empty-{index}"), [], []
+        def slow_scandir(folder):
+            visited.append(folder)
+            time.sleep(0.03)
+            return FakeScan()
 
-        with patch.object(journal.os, "walk", empty_walk):
+        with patch.object(discovery.os, "scandir", slow_scandir):
             files, problems = journal.snapshot(self.root, budget=0.01)
         self.assertEqual(files, {})
-        self.assertEqual(visited, [0])
+        self.assertEqual(len(visited), 1, visited)
         self.assertTrue(any("time budget" in item for item in problems), problems)
 
     def test_last_file_overrun_is_not_a_complete_scan(self):
-        original = journal.digest
+        original = discovery.content_digest
 
-        def slow_digest(path):
-            time.sleep(0.025)
-            return original(path)
+        def slow_digest(path, deadline):
+            time.sleep(0.03)
+            return original(path, deadline)
 
-        with patch.object(journal, "digest", slow_digest):
+        with patch.object(discovery, "content_digest", slow_digest):
             _, problems = journal.snapshot(self.root, budget=0.01)
         self.assertTrue(any("time budget" in item for item in problems), problems)
 
@@ -67,7 +78,7 @@ class PreBudgetTests(unittest.TestCase):
             before = self.source.stat()
             self.source.write_text("export const value = 2;\n", encoding="utf-8")
             os.utime(self.source, ns=(before.st_atime_ns, before.st_mtime_ns))
-            with patch.object(journal, "digest", wraps=journal.digest) as digest:
+            with patch.object(discovery, "content_digest", wraps=discovery.content_digest) as digest:
                 _, changed, problems = entry.changes({**self.event, "tool_input": {"path": "source.ts"}})
             self.assertFalse(problems)
             self.assertEqual(set(changed), {"source.ts"})
@@ -114,14 +125,38 @@ class PreBudgetTests(unittest.TestCase):
             second.close()
             first.close()
 
-    def test_partial_scan_does_not_establish_baseline(self):
+    def test_empty_timed_out_scan_does_not_establish_complete_baseline(self):
         entry = journal.Journal(self.event)
         try:
             with patch.object(journal, "snapshot", return_value=({}, ["File reconciliation exceeded its time budget"])):
                 output = entry.pre(self.event)
             self.assertIn("unverified", json.dumps(output))
             self.assertFalse(entry.get("baseline"))
-            self.assertTrue(entry.changes(self.event)[2])
+            self.assertTrue(entry.get("coverage_gap"))
+            entry.changes(self.event)
+            self.assertTrue(entry.get("coverage_gap"))
+        finally:
+            entry.close()
+
+    def test_partial_scan_keeps_observed_files_and_does_not_invent_deletions(self):
+        sibling = self.root / "other.ts"
+        sibling.write_text("export const other = 1;\n", encoding="utf-8")
+        observed, _ = journal.snapshot(self.root)
+        self.assertIn("source.ts", observed)
+        entry = journal.Journal(self.event)
+        try:
+            partial = ({"source.ts": observed["source.ts"]}, ["File reconciliation exceeded its time budget"])
+            with patch.object(journal, "snapshot", return_value=partial):
+                output = entry.pre(self.event)
+            self.assertIn("unverified", json.dumps(output))
+            self.assertFalse(entry.get("baseline"))
+            self.assertEqual(dict(entry.db.execute("SELECT path, revision FROM files")),
+                {"source.ts": observed["source.ts"]})
+            with patch.object(journal, "snapshot", return_value=partial):
+                _, changed, problems = entry.changes(self.event)
+            self.assertTrue(problems)
+            self.assertNotIn("other.ts", changed)
+            self.assertEqual({row[0] for row in entry.db.execute("SELECT path FROM files")}, {"source.ts"})
         finally:
             entry.close()
 
@@ -167,8 +202,6 @@ class PreBudgetTests(unittest.TestCase):
         began = time.monotonic()
         deadline = began + 0.30
         try:
-            # First root consumes some of the allowance; the second cannot
-            # restart SQLite's former five-second busy timeout.
             journal.workspace_events(self.event, remember=True, deadline=deadline)
             self.assertGreater(time.monotonic() - began, 0.08)
             with self.assertRaises((sqlite3.OperationalError, TimeoutError)):

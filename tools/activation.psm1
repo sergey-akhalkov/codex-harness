@@ -167,7 +167,7 @@ function Initialize-CodeToolsRuntime([string]$UserHome, [string]$CodexHome, [str
     $runtime = Get-HarnessCodeToolsRuntime $UserHome $CodexHome $CodexCommand
     $definition = if ($Tool -eq 'serena') { @{ package = 'serena-agent'; requirement = 'serena-agent==1.7.0'; wrappers = @('serena.exe','serena-agent.exe','serena-hooks.exe'); journal = 'bootstrap-pending.json'; installed = $runtime.python } } else { @{ package = 'graphifyy'; requirement = 'graphifyy[mcp]==0.9.55'; wrappers = @('graphify.exe','graphify-mcp.exe'); journal = 'bootstrap-graphify-pending.json'; installed = $runtime.graphify_python } }
     if ($definition.installed) { return $runtime }
-    if (-not $runtime.uv -or -not $runtime.lifecycle_python) { $runtime = Initialize-BootstrapBase $UserHome $CodexHome $CodexCommand }
+    if (-not $runtime.uv -or -not $runtime.lifecycle_python) { $runtime = Initialize-BootstrapBase -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand }
     $target = Join-Path $runtime.uv_root $definition.package
     Assert-CodeToolsPlain $target
     if (Test-Path -LiteralPath $target) { throw "An incomplete $Tool environment exists; preserve it and resolve package ownership before bootstrap." }
@@ -221,14 +221,30 @@ function Restore-CodeToolsBootstrap([string]$UserHome, [string]$CodexHome, [stri
 function Complete-HarnessActivation([string]$CodexHome) {
     # The outer durable committed marker is written BEFORE any component journal
     # is removed. A crash here completes commit cleanup instead of undoing it.
-    foreach ($name in @('pending.json','code-tools-registration-pending.json','code-tools-files-pending.json','bootstrap-pending.json','bootstrap-graphify-pending.json','bootstrap-runtime-pending.json','subscription-routing-pending.json')) {
+    $activation = Read-CodeToolsJson (Join-Path $CodexHome 'harness/activation-pending.json')
+    if ($activation -and (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/tool-resources-pending.json'))) {
+        $dependencyHome = if ($activation.ContainsKey('dependency_user_home')) { $activation.dependency_user_home } else { $activation.user_home }
+        Invoke-CodeToolsResources $activation.source_root $dependencyHome $CodexHome $activation.codex_command -Mode commit -TransactionId $activation.id | Out-Null
+    }
+    $components = if ($activation -and $activation.ContainsKey('scope') -and $activation.scope -eq 'code-tools') {
+        @('code-tools-registration-pending.json','code-tools-files-pending.json')
+    } else { @('pending.json','code-tools-registration-pending.json','code-tools-files-pending.json','bootstrap-pending.json','bootstrap-graphify-pending.json','bootstrap-runtime-pending.json','subscription-routing-pending.json') }
+    foreach ($name in $components) {
         Remove-CodeToolsFile (Join-Path $CodexHome ('harness/' + $name))
     }
     Remove-CodeToolsFile (Join-Path $CodexHome 'harness/activation-pending.json')
 }
 
 function Restore-HarnessActivation {
+    <#
+    .SYNOPSIS
+    Restores an interrupted activation from its owned component journals.
+    .DESCRIPTION
+    Preview checks recovery without writes. PathScope selects the PATH layer
+    restored by the core installer; dependency ownership must match the journal.
+    #>
     param([string]$SourceRoot, [string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [string]$PathScope = 'User', [switch]$Preview, [string]$DependencyUserHome)
+    $recoveryPathScope = $PathScope
     $DependencyUserHome = [IO.Path]::GetFullPath($(if ($DependencyUserHome) { $DependencyUserHome } else { $UserHome }))
     $pendingPath = Join-Path $CodexHome 'harness/activation-pending.json'
     $pending = Read-CodeToolsJson $pendingPath
@@ -245,12 +261,28 @@ function Restore-HarnessActivation {
         }
     }
     $errors = [Collections.Generic.List[string]]::new()
+    if ($pending -and $pending.ContainsKey('scope') -and $pending.scope -eq 'code-tools') {
+        foreach ($operation in @(
+            { Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview },
+            { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode recover -Preview:$Preview -TransactionId $pending.id | Out-Null },
+            { Restore-CodeToolsRegistries $CodexHome -Preview:$Preview },
+            { Restore-CodeToolsRegistration $CodexHome -Preview:$Preview | Out-Null }
+        )) { try { & $operation } catch { $errors.Add($_.Exception.Message) } }
+        if ($errors.Count) {
+            if (-not $Preview) { $pending.phase = 'incompleteUpdate'; $pending.recovery_errors = $errors.ToArray(); Write-CodeToolsJson $pendingPath $pending }
+            throw ('Code-tools recovery incomplete; preserved pending state: ' + ($errors -join '; '))
+        }
+        if (-not $Preview) { Remove-CodeToolsFile $pendingPath }
+        return @{ status = if ($Preview) { 'Preview code-tools recovery' } else { 'Code tools recovered' } }
+    }
     # Continue independent recovery even when one component has an intervening edit.
     foreach ($operation in @(
+        { Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview },
+        { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode recover -Preview:$Preview | Out-Null },
         { Restore-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -DependencyUserHome $DependencyUserHome -Preview:$Preview -DeferRestart | Out-Null },
         { Restore-CodeToolsRegistries $CodexHome -Preview:$Preview },
         { Restore-CodeToolsRegistration $CodexHome -Preview:$Preview | Out-Null },
-        { Invoke-HarnessInstall -SourceRoot $SourceRoot -UserHome $UserHome -DependencyUserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -PathScope $PathScope -Mode Recover -Preview:$Preview | Out-Null }
+        { Invoke-HarnessInstall -SourceRoot $SourceRoot -UserHome $UserHome -DependencyUserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -PathScope $recoveryPathScope -Mode Recover -Preview:$Preview | Out-Null }
     )) { try { & $operation } catch { $errors.Add($_.Exception.Message) } }
     if ($pending) {
         $dependencyRoot = Join-Path $CodexHome ('harness/dependencies/transactions/' + $pending.id)
@@ -282,11 +314,11 @@ function Restore-HarnessActivation {
             }
         }
     }
-    try { Restore-CodeToolsBootstrap $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview -Tool graphify } catch { $errors.Add($_.Exception.Message) }
-    try { Restore-CodeToolsBootstrap $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview } catch { $errors.Add($_.Exception.Message) }
+    try { Restore-CodeToolsBootstrap -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Preview:$Preview -Tool graphify } catch { $errors.Add($_.Exception.Message) }
+    try { Restore-CodeToolsBootstrap -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Preview:$Preview } catch { $errors.Add($_.Exception.Message) }
     # Base Python/uv may be removed only after the dependent Serena tool is gone.
     if (-not $errors.Count -and -not (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/bootstrap-pending.json')) -and -not (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/bootstrap-graphify-pending.json'))) {
-        try { Restore-BootstrapBase $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview } catch { $errors.Add($_.Exception.Message) }
+        try { Restore-BootstrapBase -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Preview:$Preview } catch { $errors.Add($_.Exception.Message) }
     }
     if ($errors.Count) {
         if ($pending -and -not $Preview) { $pending.phase = 'incompleteUpdate'; $pending.recovery_errors = $errors.ToArray(); Write-CodeToolsJson $pendingPath $pending }
@@ -298,16 +330,61 @@ function Restore-HarnessActivation {
 }
 
 function Invoke-HarnessActivation {
+    <#
+    .SYNOPSIS
+    Coordinates kit activation and recovery across the owned components.
+    .DESCRIPTION
+    Runs the selected lifecycle mode with journaled rollback. Preview validates
+    planned operations without applying them; CodeToolsOnly limits component scope.
+    #>
     [CmdletBinding()]
+    [OutputType([hashtable])]
     param([string]$SourceRoot, [string]$UserHome, [string]$CodexHome, [string]$CodexCommand,
         [ValidateSet('Install','Update','Check','Disconnect','Recover')][string]$Mode,
-        [ValidateSet('User','Process')][string]$PathScope = 'User', [switch]$Preview, [scriptblock]$Checkpoint, [string]$DependencyUserHome)
+        [ValidateSet('User','Process')][string]$PathScope = 'User', [switch]$Preview, [scriptblock]$Checkpoint, [string]$DependencyUserHome,
+        [switch]$CodeToolsOnly)
     $DependencyUserHome = [IO.Path]::GetFullPath($(if ($DependencyUserHome) { $DependencyUserHome } else { $UserHome }))
     $common = @{ SourceRoot = $SourceRoot; UserHome = $UserHome; CodexHome = $CodexHome; CodexCommand = $CodexCommand; DependencyUserHome = $DependencyUserHome }
-    if ($Mode -eq 'Recover') { return Restore-HarnessActivation @common -PathScope $PathScope -Preview:$Preview }
+    if ($Mode -eq 'Recover') {
+        if ($CodeToolsOnly) {
+            $scopedPending = Read-CodeToolsJson (Join-Path $CodexHome 'harness/activation-pending.json')
+            if (-not $scopedPending) { return @{ status = 'No scoped activation pending' } }
+            if (-not $scopedPending.ContainsKey('scope') -or $scopedPending.scope -ne 'code-tools') { throw 'A combined activation is pending; Recover without -CodeToolsOnly to restore its full scope.' }
+        }
+        return Restore-HarnessActivation @common -PathScope $PathScope -Preview:$Preview
+    }
     $null = Resolve-CodeToolsDependencyHome $UserHome $CodexHome $DependencyUserHome
     $pendingPath = Join-Path $CodexHome 'harness/activation-pending.json'
     if (Read-CodeToolsJson $pendingPath) { throw 'An incomplete combined activation needs install.ps1 -Mode Recover.' }
+    if ($CodeToolsOnly) {
+        if ($Mode -notin @('Install','Check','Disconnect')) { throw '-CodeToolsOnly supports Install, Check, Disconnect and Recover; it never updates dependencies.' }
+        foreach ($name in @('code-tools-registration-pending.json','code-tools-files-pending.json','tool-resources-pending.json')) {
+            if (Test-Path -LiteralPath (Join-Path $CodexHome ('harness/' + $name))) { throw 'A code-tools component transaction is already pending; preserve it and run Recover.' }
+        }
+        if ($Preview -or $Mode -eq 'Check') { return Invoke-HarnessCodeTools @common -Mode $Mode -Preview:$Preview -SkipDependencyChanges }
+        $record = @{ schema_version = 1; owner = 'codex-harness-activation'; scope = 'code-tools'; id = [guid]::NewGuid().ToString('N');
+            mode = $Mode; phase = 'prepared'; source_root = [IO.Path]::GetFullPath($SourceRoot); user_home = [IO.Path]::GetFullPath($UserHome);
+            codex_home = [IO.Path]::GetFullPath($CodexHome); codex_command = $CodexCommand; dependency_user_home = $DependencyUserHome; recovery_errors = @() }
+        Write-CodeToolsJson $pendingPath $record
+        $committed = $false
+        try {
+            Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand
+            $result = Invoke-HarnessCodeTools @common -Mode $Mode -DeferCommit -TransactionId $record.id -Checkpoint $Checkpoint -SkipDependencyChanges
+            if ($Checkpoint) { & $Checkpoint 'before-commit' }
+            $record.phase = 'committed'
+            Write-CodeToolsJson $pendingPath $record
+            $committed = $true
+            if ($Checkpoint) { & $Checkpoint 'committed' }
+            Complete-HarnessActivation $CodexHome
+            return $result
+        } catch {
+            $original = $_.Exception.Message
+            if ($committed) { throw "Code-tools activation committed; cleanup remains pending. Run Recover. Cause: $original" }
+            try { Restore-HarnessActivation @common | Out-Null }
+            catch { throw "Code-tools activation failed: $original. $($_.Exception.Message)" }
+            throw "Code-tools activation failed and its prior state was restored: $original"
+        }
+    }
     $coreMode = if ($Mode -eq 'Update') { 'Install' } else { $Mode }
     $subscriptionPlan = Invoke-HarnessSubscriptionRouting @common -Mode $Mode -Preview
     $codePlan = Invoke-HarnessCodeTools @common -Mode $Mode -Preview
@@ -328,13 +405,14 @@ function Invoke-HarnessActivation {
     }
     $record = @{ schema_version = 1; owner = 'codex-harness-activation'; id = [guid]::NewGuid().ToString('N');
         mode = $Mode; phase = 'prepared'; source_root = [IO.Path]::GetFullPath($SourceRoot); user_home = [IO.Path]::GetFullPath($UserHome);
-        codex_home = [IO.Path]::GetFullPath($CodexHome); dependency_user_home = $DependencyUserHome; recovery_errors = @() }
+        codex_home = [IO.Path]::GetFullPath($CodexHome); codex_command = $CodexCommand; dependency_user_home = $DependencyUserHome; recovery_errors = @() }
     Write-CodeToolsJson $pendingPath $record
     $commitWritten = $false
     try {
+        Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand
         if ($Mode -in @('Install','Update')) {
-            Initialize-CodeToolsRuntime $DependencyUserHome $CodexHome $CodexCommand | Out-Null
-            Initialize-CodeToolsRuntime $DependencyUserHome $CodexHome $CodexCommand -Tool graphify | Out-Null
+            Initialize-CodeToolsRuntime -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand | Out-Null
+            Initialize-CodeToolsRuntime -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Tool graphify | Out-Null
         }
         $result = Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -IncludeCodeTools -DeferCommit
         if ($Checkpoint) { & $Checkpoint 'core' }

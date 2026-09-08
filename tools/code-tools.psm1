@@ -246,10 +246,18 @@ function Invoke-HarnessCodeTools {
     [CmdletBinding()]
     param([string]$SourceRoot, [string]$UserHome, [string]$CodexHome, [string]$CodexCommand,
         [ValidateSet('Install','Update','Check','Disconnect','Recover')][string]$Mode, [switch]$Preview,
-        [switch]$DeferCommit, [string]$TransactionId, [scriptblock]$Checkpoint, [string]$DependencyUserHome)
+        [switch]$DeferCommit, [string]$TransactionId, [scriptblock]$Checkpoint, [string]$DependencyUserHome,
+        [switch]$SkipDependencyChanges)
     $DependencyUserHome = Resolve-CodeToolsDependencyHome $UserHome $CodexHome $DependencyUserHome
-    if ($Mode -eq 'Recover') { return Restore-CodeToolsRegistration $CodexHome -Preview:$Preview }
-    if ($Mode -eq 'Disconnect') { return Disconnect-CodeToolsRegistration $CodexHome -Preview:$Preview -DeferCommit:$DeferCommit -SourceRoot $SourceRoot -UserHome $DependencyUserHome -CodexCommand $CodexCommand }
+    if ($Mode -eq 'Recover') {
+        Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode recover -Preview:$Preview | Out-Null
+        return Restore-CodeToolsRegistration $CodexHome -Preview:$Preview
+    }
+    if ($Mode -eq 'Disconnect') {
+        Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview
+        Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode restore -Preview:$Preview -DeferCommit:$DeferCommit -TransactionId $TransactionId | Out-Null
+        return Disconnect-CodeToolsRegistration $CodexHome -Preview:$Preview -DeferCommit:$DeferCommit -SourceRoot $SourceRoot -UserHome $DependencyUserHome -CodexCommand $CodexCommand
+    }
     $runtime = Get-HarnessCodeToolsRuntime $DependencyUserHome $CodexHome $CodexCommand
     if ($Mode -eq 'Check' -and -not $runtime.python) { return @{ status = 'degraded'; reason = 'Adopted Serena environment is missing; MCP health could not run. Recover and Disconnect remain available without Python.'; callable = $false } }
     if (-not $runtime.lifecycle_python) {
@@ -258,7 +266,9 @@ function Invoke-HarnessCodeTools {
     }
     if (-not $runtime.native) { throw 'Cannot resolve native Codex executable; pass -CodexCommand with the real codex.exe.' }
     $dependencies = $null
-    if ($Mode -in @('Install','Update')) {
+    $resourceHealth = $null
+    if ($Mode -in @('Install','Update') -and -not $SkipDependencyChanges) {
+        Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview
         $operation = if ($Preview) { 'plan' } elseif ($Mode -eq 'Update') { 'update' } else { 'apply' }
         $dependencyArgs = @((Join-Path $SourceRoot 'tools/code-tools/dependencies.py'), $operation, '--user-home', $DependencyUserHome, '--state-dir', (Join-Path $CodexHome 'harness/dependencies'), '--codex-home', $CodexHome)
         if ($TransactionId) { $dependencyArgs += @('--transaction-id', $TransactionId) }
@@ -274,27 +284,82 @@ function Invoke-HarnessCodeTools {
     $inventory = Invoke-CodeToolsPythonJson $runtime.lifecycle_python $discoveryArgs
     $registrationArgs = @((Join-Path $SourceRoot 'tools/code-tools/registration.py'), '--codex-home', $CodexHome, '--source-root', $SourceRoot,
         '--native-codex', $runtime.native, '--powershell', $runtime.powershell, '--mode', $Mode)
+    $serenaEntries = @($inventory.mcp | Where-Object id -EQ 'serena')
+    $mcpPython = if ($serenaEntries.Count) { $serenaEntries[0].paths.python } else { $null }
+    if ($mcpPython) { $registrationArgs += @('--python', $mcpPython) }
     if ($Preview) { $registrationArgs += '--preview' }
     if ($DeferCommit) { $registrationArgs += '--defer-commit' }
     $registration = Invoke-CodeToolsPythonJson $runtime.lifecycle_python $registrationArgs
     if ($Checkpoint -and -not $Preview) { & $Checkpoint 'registration' }
     if (-not $Preview -and $Mode -in @('Install','Update')) {
-        $temporary = Join-Path $CodexHome ('harness/registry-input-' + [guid]::NewGuid().ToString('N') + '.json')
-        try {
-            Write-CodeToolsJson $temporary $inventory
-            $lsp = Invoke-CodeToolsPythonJson $runtime.lifecycle_python @((Join-Path $SourceRoot 'tools/lsp/registry.py'), '--inventory', $temporary)
-        } finally { Remove-CodeToolsFile $temporary }
+        # Explicit Serena dependencies remain discoverable to its runtime guard.
+        # They do not select the retired, separately owned harness LSP backend.
+        $lsp = @{ schema_version = 1; servers = @{} }
         Write-CodeToolsRegistries $CodexHome $inventory $lsp $Checkpoint
+        $resourceHealth = Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode apply -DeferCommit:$DeferCommit -TransactionId $TransactionId
+        if ($Checkpoint) { & $Checkpoint 'resources' }
         if (-not $DeferCommit) { Remove-CodeToolsFile (Join-Path $CodexHome 'harness/code-tools-files-pending.json') }
     }
     $health = $null
     if (-not $Preview -and $Mode -eq 'Check' -and (Test-Path -LiteralPath $runtime.registry)) {
+        try { $resourceHealth = Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode check }
+        catch { $resourceHealth = @{ status = 'degraded'; reason = $_.Exception.Message } }
         $health = Invoke-CodeToolsPythonJson $runtime.python @((Join-Path $SourceRoot 'tools/code-tools/check.py'), '--registry', $runtime.registry, '--codex-home', $CodexHome)
     }
-    @{ registration = $registration; inventory = $inventory; dependencies = $dependencies; health = $health;
-        status = if ($Preview) { 'Preview code tools' } elseif ($Mode -eq 'Check' -and $registration.status -ne 'connected') { 'degraded' } elseif ($health) { $health.status } else { $registration.status } }
+    @{ registration = $registration; inventory = $inventory; dependencies = $dependencies; health = $health; resources = $resourceHealth;
+        status = if ($Preview) { 'Preview code tools' } elseif ($Mode -eq 'Check' -and ($registration.status -ne 'connected' -or ($resourceHealth -and $resourceHealth.status -eq 'degraded'))) { 'degraded' } elseif ($health) { $health.status } else { $registration.status } }
+}
+
+function Stop-CodeToolsServices([string]$SourceRoot, [string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [switch]$Preview) {
+    if ($Preview) { return }
+    $runtime = $null
+    $previousHome = $env:CODEX_HOME
+    try {
+        $env:CODEX_HOME = $CodexHome
+        foreach ($entry in @(@('lsp-broker','tools/lsp/broker.py'), @('serena-broker','tools/code-tools/serena_broker.py'))) {
+            $directory = Join-Path $CodexHome ('harness/runtime/' + $entry[0])
+            # No import or interpreter requirement when this installation has
+            # never run a shared service. Existing directories require a probe:
+            # an exclusive owner can still be starting without a ready receipt.
+            if (-not (Test-Path -LiteralPath $directory)) { continue }
+            if (-not $runtime) { $runtime = Get-HarnessCodeToolsRuntime $UserHome $CodexHome $CodexCommand }
+            if (-not $runtime.python) { throw 'An existing shared service needs its adopted Python to retire; preserving dependencies and connections.' }
+            $result = Invoke-CodeToolsPythonJson $runtime.python @((Join-Path $SourceRoot $entry[1]), '--retire')
+            if ($result.status -notin @('retired','not-running','absent')) { throw "Shared service retirement remains pending: $($entry[0])" }
+        }
+    } finally { $env:CODEX_HOME = $previousHome }
+}
+
+function Invoke-CodeToolsResources {
+    param([string]$SourceRoot, [string]$UserHome, [string]$CodexHome, [string]$CodexCommand,
+        [ValidateSet('apply','check','restore','recover','commit')][string]$Mode,
+        [switch]$Preview, [switch]$DeferCommit, [string]$TransactionId)
+    $pending = Join-Path $CodexHome 'harness/tool-resources-pending.json'
+    if ($Mode -in @('recover','commit') -and -not (Test-Path -LiteralPath $pending)) { return @{ status = 'not-pending' } }
+    if ($Preview) { return @{ status = 'preview'; operation = $Mode } }
+    $alternateOwner = -not [string]::Equals([IO.Path]::GetFullPath($UserHome), [Environment]::GetFolderPath('UserProfile'), [StringComparison]::OrdinalIgnoreCase)
+    $stateDirectory = if ($alternateOwner) { Join-Path $UserHome 'AppData/Local/codex-tool-resources' } elseif ($env:HARNESS_TOOL_RESOURCES_DIR) { $env:HARNESS_TOOL_RESOURCES_DIR } else { Join-Path $env:LOCALAPPDATA 'codex-tool-resources' }
+    if ($Mode -eq 'restore' -and -not (Test-Path -LiteralPath (Join-Path $stateDirectory 'cbm-configuration.json')) -and -not (Test-Path -LiteralPath $pending)) { return @{ status = 'not-owned' } }
+    $runtime = Get-HarnessCodeToolsRuntime $UserHome $CodexHome $CodexCommand
+    $arguments = @((Join-Path $SourceRoot 'tools/code-tools/resources.py'), $Mode, '--registry', $runtime.registry, '--pending', $pending, '--owner', $CodexHome)
+    # Isolated installation fixtures and explicit alternate dependency owners
+    # must never fall through to the invoking account's live native settings.
+    if ($alternateOwner) {
+        $arguments += @('--state-dir', (Join-Path $UserHome 'AppData/Local/codex-tool-resources'), '--cache-dir', (Join-Path $UserHome '.cache/codebase-memory-mcp'))
+    }
+    if ($TransactionId) { $arguments += @('--transaction-id', $TransactionId) }
+    if ($DeferCommit) { $arguments += '--defer-commit' }
+    if ($Mode -in @('apply','check')) {
+        $inventory = Read-CodeToolsJson $runtime.registry
+        if (-not $inventory -or -not @($inventory.mcp | Where-Object id -EQ 'codebase-memory').Count) {
+            return @{ status = 'unavailable'; reason = 'No discovered Codebase Memory executable; resource configuration was not mutated.' }
+        }
+    }
+    if (-not $runtime.lifecycle_python) { throw 'Owned resource settings need an existing Python runtime for compare-and-restore recovery; the pending journal and user configuration are preserved.' }
+    Invoke-CodeToolsPythonJson $runtime.lifecycle_python $arguments
 }
 
 Export-ModuleMember -Function Invoke-HarnessCodeTools, Get-HarnessCodeToolsRuntime, Invoke-CodeToolsPythonJson, Restore-CodeToolsRegistries,
     Restore-CodeToolsRegistration, Read-CodeToolsJson, Write-CodeToolsJson, Remove-CodeToolsFile, Write-CodeToolsRegistries,
-    Assert-CodeToolsPlain, Get-CodeToolsBytes, Write-CodeToolsBytes, Get-CodeToolsHash, Resolve-CodeToolsDependencyHome
+    Assert-CodeToolsPlain, Get-CodeToolsBytes, Write-CodeToolsBytes, Get-CodeToolsHash, Resolve-CodeToolsDependencyHome,
+    Stop-CodeToolsServices, Invoke-CodeToolsResources

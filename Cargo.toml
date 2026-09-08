@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/harness-core", "crates/codex-harness", "tools/rtk-adapter"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

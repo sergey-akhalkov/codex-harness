@@ -1,5 +1,10 @@
 # Global MCP/LSP acceptance
 
+Historical acceptance of the 2026-09-06 selection. The current
+[efficiency selection](evidence/subscription-efficiency.md) disables all hooks,
+retires the separate harness diagnostic carrier and retains explicit Python
+operations through Serena. The results below are preserved as historical evidence.
+
 Observed on Windows x64 on 2026-09-06: Codex CLI 0.153.4, PowerShell 7.6.5,
 OpenSpec 1.12.0. The archived change is
 [connect-global-mcp-lsp](../openspec/changes/archive/2026-09-06-connect-global-mcp-lsp/tasks.md).

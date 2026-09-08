@@ -13,6 +13,7 @@ import tempfile
 import tomllib
 
 NAMES = ('serena', 'codebase-memory', 'graphify', 'nuphus', 'harness-lsp')
+SELECTED_NAMES = NAMES[:-1]  # Keep retired names in the ownership/migration set.
 MARKERS = {'# BEGIN codex-harness MCP registrations', '# END codex-harness MCP registrations'}
 READINESS_KEY = 'mcp_optional_startup_grace_ms'
 READINESS_STATEMENT = READINESS_KEY + ' = 0\n'
@@ -55,6 +56,20 @@ def assert_plain(path):
 
 
 def registration(source, powershell, name, home):
+    selected = os.environ.get('HARNESS_MCP_PYTHON')
+    inventory = read_json(home / 'harness/code-tools.json')
+    if not selected and inventory:
+        selected = next((item.get('paths', {}).get('python') for item in inventory.get('mcp', []) if item['id'] == 'serena'), None)
+    if selected:
+        if not Path(selected).is_file():
+            raise FileNotFoundError('Adopted MCP interpreter is missing')
+        target = {'command': str(selected),
+                'args': ['-B', '-u', str(source / 'tools/code-tools/launch.py'), name,
+                         '--registry', str(home / 'harness/code-tools.json')],
+                'env': {'CODEX_HOME': str(home)}}
+        if name == 'codebase-memory':
+            target['tool_timeout_sec'] = 660
+        return target
     return {'command': str(powershell), 'args': ['-NoLogo', '-NoProfile', '-File', str(source / 'tools/mcp.ps1'), '-Server', name],
             'env': {'CODEX_HOME': str(home)}}
 
@@ -260,7 +275,7 @@ def inspect(home, source, powershell, mode):
     for name in NAMES:
         old = state['registrations'].get(name)
         actual = existing.get(name)
-        target = registration(source, powershell, name, home) if mode != 'Disconnect' else None
+        target = registration(source, powershell, name, home) if mode != 'Disconnect' and name in SELECTED_NAMES else None
         # A same-named unmanaged registration is a conflict, even if it looks similar.
         if actual is not None and (old is None or actual != old):
             raise ValueError(f'MCP name/ownership conflict: {name}; preserving current registration.')
@@ -336,6 +351,11 @@ def run(home, source, native, powershell, mode, preview=False, defer_commit=Fals
                 # Never emit editor stdout/stderr: it may contain local settings.
                 raise RuntimeError(f'Native MCP editor failed for {name}, exit {process.returncode}. Live configuration unchanged.')
         rendered = (stage / 'config.toml').read_bytes()
+        if desired.get('codebase-memory', {}).get('tool_timeout_sec'):
+            header = b'[mcp_servers.codebase-memory]\n'
+            if rendered.count(header) != 1:
+                raise RuntimeError('Unexpected native CBM registration layout; live configuration unchanged.')
+            rendered = rendered.replace(header, header + b'tool_timeout_sec = 660\n', 1)
         block = (b'\n# BEGIN codex-harness MCP registrations\n' + rendered +
                  b'# END codex-harness MCP registrations\n') if desired else b''
         after = untouched + block
@@ -396,10 +416,13 @@ def main():
     parser.add_argument('--source-root', default=str(Path(__file__).resolve().parents[2]), type=Path)
     parser.add_argument('--native-codex', required=True, type=Path)
     parser.add_argument('--powershell', required=True, type=Path)
+    parser.add_argument('--python', type=Path)
     parser.add_argument('--mode', choices=['Install', 'Update', 'Check', 'Disconnect', 'Recover'], default='Install')
     parser.add_argument('--preview', action='store_true')
     parser.add_argument('--defer-commit', action='store_true')
     args = parser.parse_args()
+    if args.python:
+        os.environ['HARNESS_MCP_PYTHON'] = str(args.python.resolve())
     print(json.dumps(run(args.codex_home.absolute(), args.source_root.resolve(), args.native_codex, args.powershell, args.mode, args.preview, args.defer_commit)))
 
 

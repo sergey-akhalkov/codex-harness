@@ -7,24 +7,27 @@ import sys
 import tempfile
 import psutil
 from contextlib import contextmanager
+from collections.abc import Generator
+from typing import cast
+from native_contracts import Inventory, Json
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 
-def payload(result):
+def payload(result: types.CallToolResult) -> Json:
     assert not result.isError, str(result)
     if result.structuredContent:
-        return result.structuredContent
+        return cast(dict[str, Json], result.structuredContent)
     text = '\n'.join(c.text for c in result.content if c.type == 'text')
     try:
-        return json.loads(text)
+        return cast(Json, json.loads(text))
     except ValueError:
         return text
 
 
 @contextmanager
-def owned_processes(processes):
+def owned_processes(processes: dict[int, psutil.Process]) -> Generator[None]:
     try:
         yield
     finally:
@@ -37,17 +40,17 @@ def owned_processes(processes):
         _, alive = psutil.wait_procs(list(processes.values()), timeout=3)
         for process in alive:
             process.kill()
-        psutil.wait_procs(alive, timeout=3)
+        _ = psutil.wait_procs(alive, timeout=3)
 
 
-async def main():
-    inventory = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig'))
+async def main() -> None:
+    inventory = cast(Inventory, json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig')))
     record = next(item for item in inventory['mcp'] if item['id'] == 'codebase-memory')
     # Codebase verifies every ancestor of its private IPC/cache path. The host's
     # shared TEMP has a sandbox-user mutation ACL, so use the private kit state.
     probe_parent = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'harness' / 'verification'
     probe_parent.mkdir(parents=True, exist_ok=True)
-    processes = {}
+    processes: dict[int, psutil.Process] = {}
     with tempfile.TemporaryDirectory(prefix='codebase-isolation-', dir=probe_parent) as folder, owned_processes(processes):
         root = Path(folder)
         environment = {**os.environ}
@@ -61,29 +64,31 @@ async def main():
             directory = root / name
             directory.mkdir()
             environment[variable] = str(directory)
-        projects = []
+        projects: list[tuple[str, Path]] = []
         for tag in ('alpha', 'beta'):
             project = root / tag / 'same name кириллица'
             project.mkdir(parents=True)
-            (project / 'sample.py').write_text(f'def shared_symbol():\n    return {tag!r}\n\ndef only_{tag}():\n    return shared_symbol()\n', encoding='utf-8')
+            _ = (project / 'sample.py').write_text(f'def shared_symbol():\n    return {tag!r}\n\ndef only_{tag}():\n    return shared_symbol()\n', encoding='utf-8')
             projects.append((tag, project))
         parameters = StdioServerParameters(command=record['paths']['native_executable'], args=[], env=environment, cwd=str(root))
         async with stdio_client(parameters) as streams:
             async with ClientSession(*streams) as client:
                 with anyio.fail_after(60):
-                    await client.initialize()
+                    _ = await client.initialize()
                     processes.update({p.pid: p for p in psutil.Process().children(recursive=True)})
                     tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-                    names = []
-                    for tag, project in projects:
-                        indexed = payload(await client.call_tool('index_repository', {'repo_path': str(project)}))
+                    names: list[str] = []
+                    for _tag, project in projects:
+                        _ = payload(await client.call_tool('index_repository', {'repo_path': str(project)}))
                         listed = payload(await client.call_tool('list_projects', {}))
                         items = listed.get('projects', []) if isinstance(listed, dict) else listed
+                        assert isinstance(items, list), 'list_projects must return a project list'
                         possible = [p.get('name', p.get('project')) if isinstance(p, dict) else p for p in items]
-                        created = [name for name in possible if name not in names]
+                        assert all(isinstance(name, str) for name in possible), 'Project names must be strings'
+                        created = [name for name in possible if isinstance(name, str) and name not in names]
                         assert len(created) == 1, 'Same-named roots must retain distinct project identities: ' + str(listed)
                         names.extend(created)
-                    for (tag, project), name in zip(projects, names):
+                    for (tag, _project), name in zip(projects, names):
                         query = payload(await client.call_tool('query_graph', {'project': name, 'query': 'MATCH (n:Function) RETURN n.name'}))
                         encoded = json.dumps(query)
                         assert 'shared_symbol' in encoded and f'only_{tag}' in encoded
@@ -94,7 +99,7 @@ async def main():
         async with stdio_client(parameters) as streams:
             async with ClientSession(*streams) as client:
                 with anyio.fail_after(30):
-                    await client.initialize()
+                    _ = await client.initialize()
                     processes.update({p.pid: p for p in psutil.Process().children(recursive=True)})
                     listed = payload(await client.call_tool('list_projects', {}))
                     assert all(name in json.dumps(listed) for name in names)

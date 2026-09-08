@@ -226,6 +226,7 @@ try {
         else { [IO.File]::WriteAllText($childFile, "$childMarker`nRequirement: the result must equal 42.`nObserved result: 41.`n", $utf8) }
         $childHash = (Get-FileHash -LiteralPath $childFile).Hash
         $parentPrompt = 'This is a bounded read-only integration probe, not a development task. Spawn exactly one agent of agent_type middle with a fresh context (no history fork). In its task, instruct it to read review-fixture.txt in the current directory using one local shell call, report the exact marker from that file, and describe the discrepancy between the requirement and the observed result. Tell it not to use network tools, MCP, other files, further agents, or write operations. You must not inspect the file yourself. Do not override the role model. Wait for this agent to finish and relay its actual marker and finding. Do not retry with another role or model if it fails. No other work.'
+        $parentPrompt += ' Include this tool contract in the child task: when using functions.exec, print the nested shell result with text(await tools.exec_command(...)); a bare awaited call discards the output. Read the visible output before answering.'
         $begin = [DateTime]::UtcNow.ToString('o')
         $parentEvents = @(Read-SubscriptionJsonLines (Invoke-SubscriptionCli @('exec','--skip-git-repo-check','--json','--model',$ParentModel,$parentPrompt) 'delegation'))
         $parentId = Get-SubscriptionThread $parentEvents

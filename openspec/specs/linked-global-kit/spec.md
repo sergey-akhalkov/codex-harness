@@ -64,23 +64,23 @@ The shared configuration SHALL provide `approval_policy = "never"` and `sandbox_
 
 ### Requirement: Global capability discovery
 
-The kit SHALL expose the existing portable principles, the repository's OpenSpec skills, repository-owned agent definitions and declared MCP/LSP/hook capabilities to sessions outside the harness while preserving applicable project instructions and unrelated user capabilities. Discovery SHALL refer to live source files. An empty agent source directory SHALL be reported accurately; supporting agent loading does not imply delivery of an unrequested agent catalogue. Duplicate discovery through repository and global paths SHALL not result in conflicting copies of the same managed source. Global MCP and automatic diagnostics activation SHALL not rely solely on a CLI-only profile when another supported installed local Codex consumer does not load it; native configuration consumption and explicit overrides SHALL be verified for each applicable entry point.
+The kit SHALL expose portable principles, OpenSpec skills, managed agents and the accepted MCP/LSP/hook selection outside the harness while preserving project instructions and unrelated user capabilities. Discovery SHALL refer to live source files and accurately distinguish delivered, disabled and retired capabilities. An empty agent directory SHALL not imply an unrequested catalogue. Duplicate discovery SHALL not create conflicting copies. Base and profile consumers SHALL agree on hook suspension; retained global integrations SHALL not depend solely on a CLI-only profile when another supported installed consumer does not load it. Explicit native overrides SHALL remain visible.
 
 #### Scenario: Instructions and skills are consumed elsewhere
-- **WHEN** Codex starts in an unrelated repository with its own AGENTS.md
-- **THEN** the global principles and project instructions are in the initial context and the managed skills are discoverable from the checkout
+- **WHEN** Codex starts in another repository with its own instructions
+- **THEN** managed instructions and skills remain available from their owning source
 
 #### Scenario: An agent definition is connected
-- **WHEN** a valid repository-owned agent definition is registered
-- **THEN** Codex discovers that definition globally and uses its repository source while unrelated personal agents remain discoverable
-
-#### Scenario: Codex starts within the harness
-- **WHEN** global registration and project discovery both reach a managed skill
-- **THEN** there is one effective source identity or documented native deduplication, with no separately maintained content or ambiguous conflicting definition
+- **WHEN** a managed agent is registered
+- **THEN** it is discovered alongside preserved personal agents without conflicting source copies
 
 #### Scenario: Global code tools are consumed elsewhere
-- **WHEN** a new supported local Codex consumer starts in another project after global activation
-- **THEN** the declared MCP/LSP capabilities and automatic edit diagnostics are available without project-local kit configuration, together with preserved unrelated capabilities
+- **WHEN** it starts after activation
+- **THEN** retained capabilities are available and suspension or intentional retirement is reported without claiming automatic diagnostics
+
+#### Scenario: Codex starts within the harness
+- **WHEN** global and project discovery both reach a managed skill
+- **THEN** there is one effective source identity or verified native deduplication without conflicting copies or duplicate instruction loading
 
 ### Requirement: Source updates and checkout availability
 
@@ -137,3 +137,67 @@ Acceptance SHALL exercise the installed CLI entry point in both a neutral direct
 #### Scenario: A disposable agent is used to verify loading
 - **WHEN** a representative agent is exercised because no production role exists yet
 - **THEN** the report identifies it as a fixture and removes its test registration without claiming a delivered production agent catalogue
+
+### Requirement: Core updates preserve connected hooks
+
+A core install or update SHALL preserve the user's recorded hook selection, including disabled definitions and suspension. It SHALL update source targets on relocation, repair owned links, preserve foreign-file conflicts and transactional recovery, and SHALL NOT enable hooks on a fresh core-only installation. Previously connected hooks SHALL NOT override a later suspension or retirement decision.
+
+#### Scenario: Update an installation with diagnostics
+- **WHEN** hooks are selected and have passed the benefit gate
+- **THEN** their owned links remain usable and recorded through repeated updates
+
+#### Scenario: Relocate or repair recorded connections
+- **WHEN** a recorded hook link is missing or the checkout moves
+- **THEN** repair preserves suspension instead of restoring previously active definitions
+
+#### Scenario: Foreign replacement at a hook destination
+- **WHEN** another file replaces a managed hook link
+- **THEN** update reports the ownership conflict without overwriting it or losing state
+
+#### Scenario: Fresh core installation
+- **WHEN** only the core is installed
+- **THEN** installation does not activate hooks
+
+### Requirement: Hook and MCP diagnostic runtime agreement
+
+When diagnostic transports are retained, command and native MCP handlers using the same installed registry SHALL share a compatible runtime identity and mutation delivery ownership. Suspension SHALL be honored by both, including previously loaded clients, without declaring that a skipped check passed. Runtime transition SHALL use owned graceful retirement and preserve unrelated services and in-flight explicit operations.
+
+#### Scenario: Native runtime exists during suspension
+- **WHEN** an old command or native hook calls it
+- **THEN** no analysis or diagnostic output occurs
+
+#### Scenario: Native diagnostics broker already running
+- **WHEN** suspension has been lifted for a benefit-proven capability
+- **THEN** the created/modified supported file receives one current scoped result without a false runtime mismatch
+
+### Requirement: Persistent global hook suspension
+
+The kit SHALL support a recoverable suspension of all Codex lifecycle hooks across user/base configuration, the managed profile and installed hook definitions. Development without ordinary lifecycle hooks SHALL remain the reusable default after completion, update and archive. The specifically accepted RTK command-compression hook SHALL be the only newly enabled managed exception, with bounded execution and native trust. Already-running sessions retaining cached diagnostic harness handlers SHALL perform no automatic diagnostic analysis, fallback scan, context injection or completion continuation. A fresh consumer outside the checkout SHALL observe only the accepted selection, with base and managed profile agreement. Machine-local markers and backups SHALL remain outside reusable source. A fresh core-only installation without the accepted capability SHALL not enable hooks.
+
+#### Scenario: A cached session invokes an old handler
+- **WHEN** an old automatic diagnostic handler is invoked
+- **THEN** it returns without diagnostic work or feedback
+
+#### Scenario: Another project starts a new session
+- **WHEN** it consumes the installed base or managed profile with RTK selected
+- **THEN** only the trusted RTK exception is enabled among managed hooks, without project-local configuration
+
+#### Scenario: The optimization change is completed
+- **WHEN** its tasks are closed, archived or followed by a kit update
+- **THEN** the consumer retains the accepted RTK selection and no backup or lifecycle label reactivates rejected hooks
+
+#### Scenario: Explicit suspension or disconnection
+- **WHEN** the RTK capability is disabled or disconnected
+- **THEN** its hook is inactive, rollback remains recoverable and unrelated user configuration is preserved
+
+### Requirement: Accepted capability selection survives lifecycle operations
+
+Install, update, repair, source relocation, recovery and disconnect SHALL preserve explicit suspension and the accepted retained/retired capability selection. No lifecycle operation or implementation-complete label SHALL silently restore a rejected hook, LSP backend or LSP carrier. Shared external package removal SHALL require verified ownership and absence of other consumers; disconnecting only Codex registrations SHALL be sufficient when packages are shared. Recovery SHALL preserve user edits and credentials.
+
+#### Scenario: Update repairs links after suspension
+- **WHEN** a core or code-tools update repairs managed links
+- **THEN** repaired links still consume the disabled selection and cannot revive previous automatic diagnostics
+
+#### Scenario: Shared language installation has another consumer
+- **WHEN** its Codex LSP integration is retired
+- **THEN** that registration is removed while the shared installation and other application's configuration are preserved

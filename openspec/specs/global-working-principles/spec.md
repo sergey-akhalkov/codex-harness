@@ -46,6 +46,22 @@ The reusable principles SHALL be self-contained and independent of a particular 
 - **WHEN** activation encounters an existing instruction source
 - **THEN** it preserves that source and resolves composition before replacing or obscuring any existing rules
 
+### Requirement: Working environment precedes dependent implementation
+
+The portable principles SHALL require the agent to establish a convenient, effective working environment in the intended repository before dependent implementation and maintain ease of understanding, navigating, editing, running and verifying work throughout the task. Preparation SHALL verify relevant language support, actual source coverage and exclusions, navigation/editing tools, dependencies and execution/check entry points through representative operations. The agent SHALL resolve concrete setup friction autonomously within the authorized scope, preserve unrelated state, reuse unchanged verified setup and reassess when the task or environment changes. Newly observed obstacles and recurring manual workarounds SHALL be addressed in the owning setup before continuing dependent work, with proportionate verification. Unavailable required capabilities SHALL have an explicit cause and a verified usable fallback, without disguising incomplete evidence or expanding preparation into unrelated work.
+
+#### Scenario: A required language is absent or source appears excluded
+- **WHEN** preparation finds missing language support or a suspected source-coverage gap
+- **THEN** the agent verifies the actual failure, corrects the applicable setup before dependent implementation, and exercises navigation and an applicable check in the intended repository
+
+#### Scenario: Setup already works for the task
+- **WHEN** relevant source, runtime and configuration inputs are unchanged and prior checks remain applicable
+- **THEN** the agent reuses the verified setup and proceeds without repeating installation or unrelated environment work
+
+#### Scenario: Working friction appears during implementation
+- **WHEN** the agent discovers a concrete obstacle or recurring manual workaround while understanding, editing, running or verifying the work
+- **THEN** it makes and checks a bounded improvement to the owning setup before continuing dependent work, or reports the cause and verifies a usable fallback if restoration is unavailable
+
 ### Requirement: Traceable adaptation
 
 Supporting documentation SHALL identify the source revision, account for every original principle through a retained, adapted, or consolidated disposition, and record the user's resolution of substantive tensions. Detailed comparison and verification notes SHALL remain outside the always-loaded principles.
@@ -61,3 +77,27 @@ The change SHALL verify actual initial-prompt loading from at least two separate
 #### Scenario: The user wants to disconnect the global principles
 - **WHEN** the documented rollback is applied to the activation created by this change
 - **THEN** future sessions stop loading that global source while the repository source and unrelated host state remain intact
+
+### Requirement: Mandatory use of relevant available skills
+
+The global instructions SHALL require main agents and tool-capable subagents to assess available skills for their actual task and use each applicable, nonredundant workflow. Use SHALL include reading the skill instructions and following their relevant process, not merely naming the skill. Selection SHALL be reconsidered when task context changes. Task familiarity or the ability to use ordinary tools SHALL NOT justify skipping an applicable skill.
+
+#### Scenario: Task matches an available skill
+- **WHEN** the current task matches a skill's stated scope and invocation conditions
+- **THEN** the agent reads and applies it without requiring a separate user reminder, announces first use, and loads only relevant supporting resources
+
+#### Scenario: Several skills apply to different parts
+- **WHEN** complementary skill workflows cover different parts of the accepted task
+- **THEN** the agent applies those workflows while avoiding duplicate equivalent procedures
+
+#### Scenario: Keyword overlap or explicit-only skill
+- **WHEN** a skill only shares a keyword with the task or its explicit invocation condition has not been met
+- **THEN** the agent does not activate it solely to satisfy the mandatory-use rule
+
+#### Scenario: Skill conflicts with authorization or cannot be accessed
+- **WHEN** skill guidance conflicts with a higher-priority instruction or a relevant skill cannot be read or used
+- **THEN** the agent reports the concrete conflict or limitation, preserves the controlling instruction, and continues safe authorized work where possible without silently claiming skill use
+
+#### Scenario: Ordinary session starts in another project
+- **WHEN** a new session loads the linked global AGENTS.md outside the harness
+- **THEN** the mandatory skill-use rule is present alongside the applicable local project instructions and covers child agents

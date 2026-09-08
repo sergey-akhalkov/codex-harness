@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('registration', ROOT / 'tools/code-tools/registration.py')
@@ -36,9 +38,24 @@ class RegistrationTests(unittest.TestCase):
     def test_preview_has_no_filesystem_effect(self):
         files = list(self.home.iterdir())
         result = self.run_mode('Install', True)
-        self.assertEqual(6, len(result['operations']))
+        self.assertEqual(5, len(result['operations']))
         self.assertEqual(files, list(self.home.iterdir()))
         self.assertEqual(self.original, self.config.read_bytes())
+
+    def test_direct_interpreter_timeout_and_native_consumer(self):
+        with patch.dict(os.environ, {'HARNESS_MCP_PYTHON': sys.executable}):
+            self.assertEqual('connected', self.run_mode('Install')['status'])
+            servers = module.tomllib.loads(self.config.read_text())['mcp_servers']
+            self.assertEqual(servers['codebase-memory']['tool_timeout_sec'], 660)
+            self.assertEqual(servers['serena']['command'], sys.executable)
+            self.assertIn('launch.py', servers['serena']['args'][2])
+            result = subprocess.run([str(self.native), 'mcp', 'get', 'codebase-memory', '--json'],
+                env={**os.environ, 'CODEX_HOME': str(self.home)}, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual(json.loads(result.stdout)['tool_timeout_sec'], 660)
+            self.assertEqual('connected', self.run_mode('Check')['status'])
+            self.run_mode('Disconnect')
+            self.assertEqual(self.config.read_bytes(), self.original)
 
     def test_native_install_idempotence_and_disconnect_preserve_unrelated(self):
         self.assertEqual('connected', self.run_mode('Install')['status'])
@@ -52,6 +69,19 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual('disconnected', self.run_mode('Disconnect')['status'])
         self.assertEqual(self.original, self.config.read_bytes())
         self.assertEqual(module.tomllib.loads(self.original.decode()), module.tomllib.loads(self.config.read_text()))
+
+    def test_retired_carrier_is_removed_on_upgrade_and_stays_absent(self):
+        with patch.object(module, 'SELECTED_NAMES', module.NAMES):
+            self.run_mode('Install')
+        self.assertIn('harness-lsp', module.tomllib.loads(self.config.read_text())['mcp_servers'])
+        self.run_mode('Install')
+        connected = self.config.read_bytes()
+        self.assertNotIn('harness-lsp', module.tomllib.loads(connected.decode())['mcp_servers'])
+        self.assertEqual('unchanged-registration', self.run_mode('Install')['status'])
+        self.assertEqual('no-pending-registration', self.run_mode('Recover')['status'])
+        self.assertEqual(connected, self.config.read_bytes())
+        self.run_mode('Disconnect')
+        self.assertEqual(self.original, self.config.read_bytes())
 
     def test_unmanaged_collision_is_preserved(self):
         self.config.write_bytes(self.original + b'\n[mcp_servers.serena]\ncommand = "mine.exe"\n')
@@ -140,7 +170,7 @@ class RegistrationTests(unittest.TestCase):
         expected = module.tomllib.loads(normalized.decode())
         expected.pop(module.READINESS_KEY)
         for name in module.NAMES:
-            expected['mcp_servers'].pop(name)
+            expected['mcp_servers'].pop(name, None)
         self.assertEqual(expected, module.tomllib.loads(after.decode()))
         self.assertIn(b'# retain my comment', after)
         self.assertIn(b'[mcp_servers.foreign-second]\ncommand = "foreign-second.exe"', after)
@@ -163,7 +193,7 @@ class RegistrationTests(unittest.TestCase):
         expected = module.tomllib.loads(before.decode())
         expected.pop(module.READINESS_KEY)
         for name in module.NAMES:
-            expected['mcp_servers'].pop(name)
+            expected['mcp_servers'].pop(name, None)
         self.assertEqual(expected, module.tomllib.loads(after.decode()))
 
     def test_quoted_dotted_owned_tables_bom_and_intervening_comment_survive(self):

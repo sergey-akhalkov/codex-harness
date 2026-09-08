@@ -8,6 +8,11 @@ model_reasoning_effort = "xhigh"
 approvals_reviewer = "user"
 developer_instructions = """
 Use capability levels to finish verified work with economical subscription use.
+Use Code Mode for worthwhile independent tool batches and return decision-relevant
+results with errors and detail access intact. Prefer apply_patch for suitable scoped
+text edits; reuse unchanged inspected context and applicable checks. The installed
+token-efficient-workflow skill covers RTK raw recovery and native task-effort
+selection when verbose output or repeated work is material. Keep its detail on demand.
 For every OpenAI model assignment use the Astra family only, including reserves
 and auxiliary calls. Do not select GPT-5 models. Grok remains the preferred middle.
 Actively delegate worthwhile bounded work to the named middle agent (preferred
@@ -15,6 +20,18 @@ Grok subscription). Use middle_backup only when middle is absent or observed
 unavailable through model/auth/quota failure; state the reason briefly. Avoid
 repeated probes while the same failure persists. Preserve partial work and inspect
 its current state before reassignment. Never silently substitute models or billing.
+Empty or status-only child completion is an output defect, not proof of model,
+auth or quota unavailability; it does not authorize middle_backup. Inspect visible
+tool events and partial work. Continue the same child only with a concrete correction
+or new information; otherwise finish the bounded task directly and report the defect.
+Do not decode opaque reasoning/compaction state to judge work: use visible messages,
+tool results, artifacts and checks. Its presence alone is not an access failure.
+After restoring a parent session, do not resurrect a saved Grok child with
+resume_agent: the current native resume can inherit Astra and reject Grok's
+encrypted state; the old transcript's model does not verify the new binding.
+Inspect saved partial work and
+spawn a fresh middle with a concise visible handoff instead. A stale thread's
+state-verification error does not prove the current Grok subscription unavailable.
 Work directly when a task is small, tightly coupled, high risk, or delegation plus
 review/rework would cost more. Completion and correctness take priority over quota
 minimization, but genuinely avoid unnecessary ChatGPT work. Autonomous delegation,
@@ -34,6 +51,9 @@ Batch related routine edits into a substantial assignment. Do not split a pair o
 short helpers into separate workers when handoff and review dominate the work.
 State material input boundaries upfront. When only waiting remains, use a bounded
 30-60 second wait rather than repeated status polling; surface a stalled worker.
+That interval is not a task deadline. Do not send status-only nudges, "hurry up"
+messages or interrupt running work because a wait elapsed. Steering must add new
+facts, correct a demonstrated problem or convey a changed user requirement.
 Continue independent work while children run. Require applicable checks and compact
 results (changed files, evidence, unresolved issues), with detailed logs on demand.
 Close finished children and retain responsibility for integration and acceptance.
@@ -45,6 +65,9 @@ never equate token counts or delegation counts with exact weekly quota savings.
 
 [agents]
 max_concurrent_threads_per_session = 2
+
+[features.context_management]
+experimental_mode = true
 
 [notice]
 hide_rate_limit_model_nudge = true
@@ -59,3 +82,7 @@ gpt-6-astra = 4
 
 [projects.'d:\mekha\mtronics\pmac-emulator']
 trust_level = "trusted"
+
+
+# Native base configuration owns the accepted RTK exception and suspension.
+# Avoid a profile override that disagrees with other installed consumers.

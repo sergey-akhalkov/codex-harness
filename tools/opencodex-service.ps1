@@ -22,8 +22,14 @@ if (-not (Test-Path -LiteralPath (Split-Path $StatePath) -PathType Container)) {
 [void][IO.Directory]::CreateDirectory($entryDirectory)
 $entryPath = Join-Path $entryDirectory ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmss') + '-' + [guid]::NewGuid().ToString('N') + '.host.jsonl')
 $entryStream = [IO.File]::Open($entryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-function Write-ServiceEntry([string]$Stage, $Failure = $null) {
+function Write-ServiceEntry([string]$Stage, $Failure = $null, [int]$Attempt = 0, [int]$RetryCount = 0, [int]$RetryDelaySeconds = 0) {
     $record = @{time=[DateTime]::UtcNow.ToString('o');processId=$PID;stage=$Stage}
+    if ($Attempt -gt 0) {
+        $record.attempt = $Attempt
+        $record.retryCount = $RetryCount
+        $record.maxRetries = 3
+    }
+    if ($RetryDelaySeconds -gt 0) { $record.retryDelaySeconds = $RetryDelaySeconds }
     if ($Failure) {
         $record.exceptionType = $Failure.Exception.GetType().FullName
         $record.hresult = $Failure.Exception.HResult
@@ -50,8 +56,27 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'subscription-routing.psm1')
     Write-ServiceEntry 'module-imported'
     $stage = 'service-host'
-    Invoke-SubscriptionServiceHost -StatePath $StatePath
-    Write-ServiceEntry 'completed'
+    # Scheduler startup recovery does not reliably retry an action that launched
+    # successfully and then exited nonzero. Keep the finite runtime budget here.
+    # The module marks only runtime failures after its normal cleanup; ownership,
+    # configuration and cleanup conflicts must never be retried by this loop.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        Write-ServiceEntry 'service-attempt' -Attempt $attempt -RetryCount ($attempt - 1)
+        try {
+            Invoke-SubscriptionServiceHost -StatePath $StatePath
+            Write-ServiceEntry 'completed' -Attempt $attempt -RetryCount ($attempt - 1)
+            break
+        } catch {
+            $retryable = $_.Exception.Data['SubscriptionRuntimeRetryable']
+            if ($retryable -isnot [bool] -or -not $retryable) { throw }
+            if ($attempt -eq 4) {
+                Write-ServiceEntry 'service-exhausted' $_ -Attempt $attempt -RetryCount 3
+                throw
+            }
+            Write-ServiceEntry 'service-retry' $_ -Attempt $attempt -RetryCount $attempt -RetryDelaySeconds 60
+            Start-Sleep -Seconds 60
+        }
+    }
 } catch {
     Write-ServiceEntry ('failed:' + $stage) $_
     throw "Subscription service failed during $stage; private entry record: $entryPath"

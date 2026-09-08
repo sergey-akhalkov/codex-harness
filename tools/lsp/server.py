@@ -1,11 +1,13 @@
 """MCP entry point for automatic diagnostics using installed shared backends."""
 from __future__ import annotations
 
-import atexit
+from contextlib import contextmanager
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import json
 import logging
+import os
+import sqlite3
 import sys
 from pathlib import Path
 import threading
@@ -13,19 +15,47 @@ import time
 from mcp.types import CallToolResult, TextContent
 
 from backend import Backend, digest, language_for, registry_path
-from journal import Journal, identity, is_config, snapshot, state_directory, workspace_events, invocation_key, input_signature, stop_output
+from journal import Journal, identity, is_config, snapshot, state_directory, workspace_events, invocation_key, input_signature, stop_output, post_output
+from discovery import IGNORED_DIRS, MAX_ANALYSIS_BYTES
 
 
 class DiagnosticsService:
-    def __init__(self):
+    def __init__(self, *, shared=False):
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="harness-lsp")
         self.guard = threading.RLock()
         self.backends = {}
         self.jobs = {}
         self.client_locks = {}
         self.closed = False
+        self.shared_pool = None
+        if shared:
+            from broker import BackendPool, setting
+            self.shared_pool = BackendPool(Backend, maximum=setting("HARNESS_LSP_MAX_BACKENDS", 4, maximum=32),
+                idle_seconds=setting("HARNESS_LSP_BACKEND_IDLE_SECONDS", 300))
+
+    @contextmanager
+    def backend_lease(self, event, language):
+        if self.shared_pool is None:
+            client = self.backend(event, language)
+            with client.lock:
+                yield client
+            return
+        from backend import runtime_home
+        root, _, _ = identity(event)
+        registry = registry_path()
+        signature = digest(registry) if registry.is_file() else "discovery"
+        project = None
+        if language == "pascal":
+            from delphi import project_file
+            project = project_file(root, root / event["_source_file"] if event.get("_source_file") else None)
+        key = (os.path.normcase(str(root)), language, str(project), signature, event.get("_settings_revision", ""))
+        directory = runtime_home() / "shared-backends" / hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        with self.shared_pool.lease(key, (root, language, directory, event.get("_source_file"))) as client:
+            yield client
 
     def backend(self, event, language):
+        if self.shared_pool is not None:
+            raise RuntimeError("Shared backends require an operation lease")
         root, session, agent = identity(event)
         # Registry edits invalidate the client just like project configuration edits.
         registry = registry_path()
@@ -65,6 +95,9 @@ class DiagnosticsService:
 
     def invalidate(self, event):
         root, session, agent = identity(event)
+        if self.shared_pool is not None:
+            self.shared_pool.invalidate(os.path.normcase(str(root)))
+            return
         with self.guard:
             keys = [key for key in self.backends if key[:3] == (str(root), session, agent)]
             retired = [self.backends.pop(key) for key in keys]
@@ -77,16 +110,20 @@ class DiagnosticsService:
         result = {"file": relative, "revision": revision, "backend": language, "diagnostics": []}
         if revision is None:
             owner = identity(event)
+            if self.shared_pool is not None:
+                self.shared_pool.forget(os.path.normcase(str(root)), relative)
+                return {**result, "status": "deleted"}
             with self.guard:
                 clients = [client for key, client in self.backends.items() if key[:3] == (str(owner[0]), owner[1], owner[2])]
             for client in clients:
                 client.forget(relative)
             return {**result, "status": "deleted"}
         try:
+            if (root / relative).stat().st_size > MAX_ANALYSIS_BYTES:
+                return {**result, "status": "skipped", "reason": "Changed file exceeds 8 MiB language-analysis limit; content revision was discovered but language diagnostics were not run"}
             if language is None:
                 return {**result, "status": "unavailable", "reason": "No applicable language mapping"}
-            backend = self.backend({**event, "_source_file": relative}, language)
-            with backend.lock:
+            with self.backend_lease({**event, "_source_file": relative}, language) as backend:
                 began = time.monotonic()
                 result = backend.diagnostics(relative, timeout=20)
                 if result["status"] in ("clean", "diagnostics"):
@@ -107,8 +144,16 @@ class DiagnosticsService:
             return {**result, "status": "failed", "reason": f"{type(error).__name__}: {error}"}
 
     def check(self, event, budget=27.0):
+        try:
+            return self._check_roots(event, budget)
+        except (TimeoutError, sqlite3.OperationalError) as error:
+            root, session, agent = identity(event)
+            return {"workspace": str(root), "session_id": session, "agent_id": agent,
+                "status": "unresolved", "results": [], "problems": [f"Diagnostic reconciliation unavailable: {error}"]}
+
+    def _check_roots(self, event, budget=27.0):
         began = time.monotonic()
-        events = workspace_events(event)
+        events = workspace_events(event, deadline=began + budget)
         if len(events) == 1:
             return self._check(events[0], budget=max(0.01, budget - (time.monotonic() - began)))
         reports = []
@@ -135,21 +180,42 @@ class DiagnosticsService:
         # the entire batch on language servers used to make every completed
         # result stale when the final snapshot received only 0.1 seconds.
         analysis_deadline = began + budget - min(2.5, budget * 0.2)
-        journal = Journal(event)
-        claim = event.get("_claims", {}).get(str(journal.directory))
-        if claim and journal.get("active_claim", {}).get("token") != claim:
-            claim = None
-        if not claim:
-            claim = journal.claim(event, event.get("_origin", "native"))
-        if not claim:
-            active = journal.get("active_claim", {})
-            delegated = active.get("origin") == "command" and active.get("invocation") == invocation_key(event)
-            journal.close()
-            return {"workspace": str(identity(event)[0]), "session_id": identity(event)[1], "agent_id": identity(event)[2],
-                "results": [], "status": "delegated" if delegated else "unresolved", "problems": [] if delegated else ["Another diagnostic check is still reconciling this workspace"]}
-        check_token = journal.begin_check()
+        journal = Journal(event, deadline=began + budget)
+        claim, check_token = None, None
         reconciled, checked_inputs = False, None
         try:
+            claim = event.get("_claims", {}).get(str(journal.directory))
+            if claim and journal.get("active_claim", {}).get("token") != claim:
+                claim = None
+            if claim and self.shared_pool is not None:
+                # A thin command may exit or time out while this daemon still
+                # reconciles. Transfer to a new token so its finally block
+                # cannot release the daemon's live ownership.
+                claim = journal.transfer_claim(claim)
+            if not claim:
+                claim = journal.claim(event, event.get("_origin", "native"))
+            while not claim:
+                active = journal.get("active_claim", {})
+                if event.get("tool_use_id") and active.get("invocation") == invocation_key(event):
+                    # Same invocation is already owned by its companion; its
+                    # pending/completed output belongs to that handler.
+                    return {"workspace": str(identity(event)[0]), "session_id": identity(event)[1], "agent_id": identity(event)[2],
+                        "results": [], "status": "delegated", "problems": []}
+                if time.monotonic() >= began + budget - 1:
+                    break
+                time.sleep(min(0.05, max(0, began + budget - 1 - time.monotonic())))
+                claim = journal.claim(event, event.get("_origin", "native"))
+            if not claim:
+                active = journal.get("active_claim", {})
+                delegated = bool(event.get("tool_use_id")) and active.get("origin") == "command" and active.get("invocation") == invocation_key(event)
+                return {"workspace": str(identity(event)[0]), "session_id": identity(event)[1], "agent_id": identity(event)[2],
+                    "results": [], "status": "delegated" if delegated else "unresolved", "problems": [] if delegated else ["Another diagnostic check is still reconciling this workspace"]}
+            receipt = journal.receipt(event)
+            if (event.get("_origin") and invocation_key(event)[0] == "posttooluse"
+                    and event.get("tool_use_id") and receipt.get("at", 0) > time.time() - 30):
+                return {"workspace": str(journal.root), "session_id": journal.session, "agent_id": journal.agent,
+                    "results": [], "status": "delegated", "problems": []}
+            check_token = journal.begin_check()
             event_name = str(event.get("event") or event.get("hook_event_name") or "PostToolUse").lower()
             if event_name == "posttooluse":
                 journal.put("observed_post_tool_use", True)
@@ -164,15 +230,18 @@ class DiagnosticsService:
                 return {"workspace": str(journal.root), "session_id": journal.session, "agent_id": journal.agent,
                     "status": "not-applicable", "results": [], "problems": [],
                     "reason": "No covered tool invocation was observed for this agent"}
-            current, changed, problems = journal.changes(event, budget=max(0.01, min(5.0, budget)))
+            current, changed, problems = journal.changes(event,
+                budget=max(0, min(5.0, began + budget - time.monotonic() - min(0.05, budget * 0.05))))
+            # A large root needs the same discovery allowance before delivery.
+            # Reserve measured scan time inside the existing total hook budget.
+            scan_reserve = min(5.0, max(min(2.5, budget * 0.2), (time.monotonic() - began) * 1.25))
+            analysis_deadline = began + budget - scan_reserve
             output = {"workspace": str(journal.root), "session_id": journal.session, "agent_id": journal.agent,
                 "turn_id": event.get("turn_id"), "tool_use_id": event.get("tool_use_id"), "tool_name": event.get("tool_name"),
                 "event": event.get("event") or event.get("hook_event_name"), "results": [], "problems": problems}
             output["transcript_path"] = event.get("transcript_path")
-            if not journal.get("baseline"):
-                output["status"] = "unavailable"
-                reconciled = True
-                return output
+            output["coverage"] = {"discovery_complete": not problems,
+                "historical_gap": journal.get("coverage_gap"), "observed_files": len(current)}
             config_snapshot = {name: revision for name, revision in current.items() if is_config(name)}
             event = {**event, "_settings_revision": json.dumps(config_snapshot, sort_keys=True)}
             registry = registry_path()
@@ -187,7 +256,12 @@ class DiagnosticsService:
                     if old_key[0] == str(journal.directory) and old_key[-1] != source_generation:
                         # A dependent can keep the same bytes while one of its
                         # inputs changes. Never reuse that older pending job.
-                        self.jobs.pop(old_key).cancel()
+                        # A shared service must still account for old running
+                        # AND queued work until its worker consumes it. Dropping
+                        # canceled Futures lets rapid generations bypass the
+                        # admission cap while executor work items retain input.
+                        if self.shared_pool is None or self.jobs[old_key].done():
+                            self.jobs.pop(old_key).cancel()
             if any(is_config(name) for name in changed):
                 # Source results derived from old project settings must be recomputed.
                 changed.update(current)
@@ -212,7 +286,9 @@ class DiagnosticsService:
             changed = {name: revision for name, revision in changed.items()
                 if not (cached.get(name, {}).get("source_generation") == source_generation
                     and cached[name].get("revision") == revision
-                    and cached[name].get("status") in ("clean", "diagnostics", "deleted"))}
+                    and (cached[name].get("status") in ("clean", "diagnostics", "deleted", "skipped")
+                        or (cached[name].get("status") in ("unavailable", "failed")
+                            and cached[name].get("attempted_at", 0) > time.time() - 60)))}
             completed = set()
             # Give unattempted work priority over a repeatedly slow/failed file.
             for relative, revision in sorted(changed.items(), key=lambda item: cached.get(item[0], {}).get("attempted_at", 0)):
@@ -221,7 +297,14 @@ class DiagnosticsService:
                 key = (str(journal.directory), relative, revision, event["_settings_revision"], source_generation)
                 remaining = max(0, analysis_deadline - time.monotonic())
                 with self.guard:
-                    if key not in self.jobs and remaining > 0:
+                    if self.shared_pool is not None:
+                        # Finished jobs from disconnected sessions must not
+                        # accumulate in a service which outlives its clients.
+                        for old_key, old_job in list(self.jobs.items()):
+                            if old_key != key and old_job.done():
+                                self.jobs.pop(old_key, None)
+                    capacity = self.shared_pool is None or len(self.jobs) < 16
+                    if key not in self.jobs and remaining > 0 and capacity:
                         self.jobs[key] = self.pool.submit(self._analyze, dict(event), relative, revision)
                     job = self.jobs.get(key)
                 try:
@@ -251,8 +334,9 @@ class DiagnosticsService:
                 # Compare the complete configuration identity, including newly
                 # created files. Checking only previous entries misses a new
                 # tsconfig arriving while an old-defaults analysis is running.
-                final_files, config_problems = snapshot(journal.root, [journal.root / name for name in current],
-                    budget=max(0.1, min(2.0, budget - (time.monotonic() - began))))
+                final_files, config_problems = snapshot(journal.root, [journal.root / name for name in current
+                    if any(part in IGNORED_DIRS for part in Path(name).parts[:-1])],
+                    budget=max(0, min(5.0, budget - (time.monotonic() - began))))
                 final_configs = {name: revision for name, revision in final_files.items() if is_config(name)}
                 problems.extend(config_problems)
                 final_registry_revision = digest(registry) if registry.is_file() else "discovery"
@@ -260,7 +344,8 @@ class DiagnosticsService:
                     problems.append("Language backend registry changed during analysis; reconciliation is required")
                 changed_config = bool(problems) or final_configs != config_snapshot
                 late_files = {name: revision for name, revision in final_files.items() if current.get(name) != revision}
-                late_files.update({name: None for name in current if name not in final_files})
+                if not config_problems:
+                    late_files.update({name: None for name in current if name not in final_files})
                 if late_files:
                     problems.append("Workspace source contents changed during analysis; the newer generation requires reconciliation")
                     reported = {result["file"] for result in output["results"]}
@@ -277,13 +362,22 @@ class DiagnosticsService:
                     elif late_files:
                         result.update(status="stale", reason="Workspace source generation changed before delivery")
                     journal.accept(result)
+            # Delivered failures remain visible but do not restart a failed
+            # backend for every read-only tool. New inputs invalidate this cache.
+            reported = {result["file"] for result in output["results"]}
+            output["results"].extend(result for name, result in cached.items() if name not in reported
+                and result.get("source_generation") == source_generation and result.get("revision") == current.get(name)
+                and result.get("status") in ("diagnostics", "unavailable", "failed", "skipped"))
+            # Historical coverage is independent of current analysis freshness.
+            if journal.get("coverage_gap"):
+                problems.append(journal.get("coverage_gap"))
             # Keep the full result host-local; the hook summary is bounded separately.
             output["status"] = ("unresolved" if problems or any(r["status"] not in ("clean", "diagnostics", "deleted") for r in output["results"])
                                 else "diagnostics" if any(r["diagnostics"] for r in output["results"]) else "clean" if changed else "unchanged")
             output["elapsed_seconds"] = round(time.monotonic() - began, 3)
             # Receipt of completed reconciliation is separate from successful
             # analysis. A failed result was still delivered by the native hook.
-            if not problems and (not output["results"] or (final_files == current and final_registry_revision == registry_revision)):
+            if output["coverage"]["discovery_complete"] and (not changed or (not config_problems and final_files == current and final_registry_revision == registry_revision)):
                 checked_inputs = source_generation
             if output["status"] == "unchanged":
                 reconciled = True
@@ -294,15 +388,25 @@ class DiagnosticsService:
             reconciled = True
             return output
         finally:
-            journal.finish_check(check_token, event if reconciled else None, checked_inputs=checked_inputs)
-            journal.release_claim(claim)
-            journal.close()
+            try:
+                # Delivery bookkeeping has its own small reserve after analysis.
+                journal.db.deadline = time.monotonic() + 0.25
+                if check_token:
+                    journal.finish_check(check_token, event if reconciled else None, checked_inputs=checked_inputs)
+            finally:
+                try:
+                    if claim:
+                        journal.release_claim(claim)
+                finally:
+                    journal.close()
 
     @staticmethod
     def hook_result(report, event):
         if report.get("status") in ("unchanged", "delegated", "not-applicable"):
             return {}
         summary = {key: value for key, value in report.items() if key != "results"}
+        summary["problems"] = [str(problem)[:1000] for problem in report.get("problems", [])[:10]]
+        summary["omitted_problems"] = max(0, len(report.get("problems", [])) - 10)
         remaining, omitted = 30, 0
         summary["results"] = []
         # Prioritize errors across files, not only within the first scanned file.
@@ -361,8 +465,14 @@ class DiagnosticsService:
             if report.get("report_path"):
                 details.append("Report: " + report["report_path"])
             text = "\n".join(details)
-            return stop_output(event, state, text, successful=report.get("status") == "clean")
-        return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}
+            findings = [row for row in rows if row.get("status") == "diagnostics" and row.get("diagnostics")]
+            # Infrastructure churn cannot re-arm already delivered findings.
+            delivery_state = {"findings": findings} if findings else state
+            return stop_output(event, delivery_state, text, successful=report.get("status") == "clean", blocking=bool(findings))
+        fields = ("workspace", "file", "revision", "backend", "status", "diagnostics", "reason")
+        state = {"status": report.get("status"), "problems": sorted(report.get("problems", [])),
+            "results": [{key: row[key] for key in fields if key in row} for row in sorted(report.get("results", []), key=lambda row: (row.get("workspace", ""), row.get("file", "")))]}
+        return post_output(event, state, text)
 
     def close(self):
         with self.guard:
@@ -370,71 +480,87 @@ class DiagnosticsService:
             clients = list(self.backends.values())
             self.backends.clear()
         self.pool.shutdown(wait=False, cancel_futures=True)
+        if self.shared_pool is not None:
+            self.shared_pool.close()
         for backend in clients:
             try:
                 backend.close()
             except Exception:
                 logging.exception("Language server shutdown failed")
 
+    def explicit_diagnostics(self, workspace, session_id, file, agent_id="", transcript_path=None, **context):
+        payload = dict(workspace=workspace, session_id=session_id, agent_id=agent_id, transcript_path=transcript_path, **context)
+        root, _, _ = identity(payload)
+        configs, problems = snapshot(root, configurations_only=True)
+        if problems:
+            return {"workspace": str(root), "file": file, "status": "unavailable", "problems": problems, "diagnostics": []}
+        payload["_settings_revision"] = json.dumps(configs, sort_keys=True)
+        source = (root / file).resolve()
+        if not source.is_relative_to(root):
+            raise ValueError("Source path escapes applicable workspace")
+        result = self._analyze(payload, source.relative_to(root).as_posix(), digest(source))
+        final_configs, problems = snapshot(root, configurations_only=True)
+        if problems or final_configs != configs:
+            result.update(status="stale", reason="Project configuration changed or could not be verified before delivery")
+        if digest(source) != result.get("revision"):
+            result.update(status="stale", reason="Content changed before result delivery")
+        return {"workspace": str(root), **result}
+
+    def navigate(self, workspace, session_id, file, operation, agent_id="", line=0, character=0,
+            transcript_path=None, query="", new_name="", item=None, **context):
+        payload = dict(workspace=workspace, session_id=session_id, agent_id=agent_id, transcript_path=transcript_path, **context)
+        root, _, _ = identity(payload)
+        source = (root / file).resolve()
+        if not source.is_relative_to(root):
+            raise ValueError("Source path escapes applicable workspace")
+        configs, problems = snapshot(root, configurations_only=True)
+        if problems:
+            raise RuntimeError("Cannot establish current project configuration: " + "; ".join(problems))
+        payload["_settings_revision"] = json.dumps(configs, sort_keys=True)
+        payload["_source_file"] = source.relative_to(root).as_posix()
+        revision = digest(source)
+        with self.backend_lease(payload, language_for(source)) as backend:
+            result = backend.navigation(payload["_source_file"], operation, line, character, query, new_name, item)
+        final_configs, problems = snapshot(root, configurations_only=True)
+        if problems or configs != final_configs or digest(source) != revision:
+            raise RuntimeError("Source or project configuration changed before navigation delivery")
+        return {"workspace": str(root), "file": file, "operation": operation, "result": result}
+
 
 def main():
+    from broker import request
     if sys.argv[1:] == ["--once"]:
-        # The independent command owns the timeout/process tree. Flush a valid
-        # completed hook result before graceful shutdown, which a faulty server
-        # must not be allowed to turn into an unbounded hook wait.
+        # This is a disposable client. Its timeout must never kill the shared
+        # broker or another session's language processes.
         sys.stdin.reconfigure(encoding="utf-8-sig")
         sys.stdout.reconfigure(encoding="utf-8")
         payload = json.load(sys.stdin)
-        service = DiagnosticsService()
         try:
-            report = service.check(payload, budget=float(payload.get("_batch_budget", 20)))
-            print(json.dumps(service.hook_result(report, payload), ensure_ascii=False), flush=True)
-        finally:
-            service.close()
+            output = request("hook", payload, timeout=min(29, float(payload.get("_batch_budget", 20)) + 1))
+        except Exception as error:
+            output = DiagnosticsService.hook_result({"status": "unavailable", "results": [],
+                "problems": [f"Diagnostics broker unavailable: {type(error).__name__}: {error}"]}, payload)
+        print(json.dumps(output, ensure_ascii=False), flush=True)
         return
     import anyio
     from mcp.server.fastmcp import FastMCP
 
     logging.basicConfig(level=logging.ERROR)
-    service = DiagnosticsService()
-    atexit.register(service.close)
-    mcp = FastMCP("harness-lsp", instructions="Automatic project-scoped diagnostics. Never installs packages or edits sources.")
+    mcp = FastMCP("harness-lsp", instructions="Retired managed adapter. Cached hook calls are silent; use project-native verification.")
 
     @mcp.tool()
     async def diagnostics_after_tool(event: str = "PostToolUse", cwd: str = "", workspace: str = "", session_id: str = "",
             agent_id: str | None = None, turn_id: str = "", tool_use_id: str = "", tool_name: str = "",
             tool_input: dict | None = None, tool_response: object = None, stop_hook_active: bool = False,
             transcript_path: str | None = None, agent_transcript_path: str | None = None) -> CallToolResult:
-        payload = dict(event=event, cwd=cwd, workspace=workspace, session_id=session_id, agent_id=agent_id, turn_id=turn_id, _origin="native",
-            tool_use_id=tool_use_id, tool_name=tool_name, tool_input=tool_input, tool_response=tool_response, stop_hook_active=stop_hook_active,
-            transcript_path=transcript_path, agent_transcript_path=agent_transcript_path)
-        try:
-            report = await anyio.to_thread.run_sync(service.check, payload)
-        except Exception as error:
-            report = {"status": "unavailable", "problems": [f"{type(error).__name__}: {error}"], "results": []}
-        output = service.hook_result(report, payload)
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(output, ensure_ascii=False))], structuredContent=output)
+        return CallToolResult(content=[], structuredContent={})
 
     @mcp.tool()
     async def diagnostics(workspace: str, session_id: str, file: str, agent_id: str = "",
             transcript_path: str | None = None) -> dict:
         """Explicit current-file diagnostics; no pre-edit baseline or source writes required."""
-        def run():
-            payload = dict(workspace=workspace, session_id=session_id, agent_id=agent_id, transcript_path=transcript_path)
-            root, _, _ = identity(payload)
-            configs, problems = snapshot(root, configurations_only=True)
-            if problems:
-                return {"workspace": str(root), "file": file, "status": "unavailable", "problems": problems, "diagnostics": []}
-            payload["_settings_revision"] = json.dumps(configs, sort_keys=True)
-            source = (root / file).resolve()
-            if not source.is_relative_to(root):
-                raise ValueError("Source path escapes applicable workspace")
-            result = service._analyze(payload, source.relative_to(root).as_posix(), digest(source))
-            final_configs, problems = snapshot(root, configurations_only=True)
-            if problems or final_configs != configs:
-                result.update(status="stale", reason="Project configuration changed or could not be verified before delivery")
-            return {"workspace": str(root), **result}
-        return await anyio.to_thread.run_sync(run)
+        payload = dict(workspace=workspace, session_id=session_id, file=file, agent_id=agent_id, transcript_path=transcript_path)
+        return await anyio.to_thread.run_sync(request, "diagnostics", payload)
 
     @mcp.tool()
     async def navigate(workspace: str, session_id: str, file: str, operation: str, agent_id: str = "", line: int = 0, character: int = 0,
@@ -446,23 +572,11 @@ def main():
         incoming_calls, outgoing_calls, rename_preview and capabilities.
         Availability follows the selected server's actual capabilities.
         """
-        def run():
-            payload = dict(workspace=workspace, session_id=session_id, agent_id=agent_id, transcript_path=transcript_path)
-            root, _, _ = identity(payload)
-            files, problems = snapshot(root)
-            if problems:
-                raise RuntimeError("Cannot establish current project configuration: " + "; ".join(problems))
-            payload["_settings_revision"] = json.dumps({name: revision for name, revision in files.items() if is_config(name)}, sort_keys=True)
-            language = language_for(root / file)
-            payload["_source_file"] = file
-            return {"workspace": str(root), "file": file, "operation": operation,
-                "result": service.backend(payload, language).navigation(file, operation, line, character, query, new_name, item)}
-        return await anyio.to_thread.run_sync(run)
+        payload = dict(workspace=workspace, session_id=session_id, file=file, operation=operation, agent_id=agent_id,
+            line=line, character=character, transcript_path=transcript_path, query=query, new_name=new_name, item=item)
+        return await anyio.to_thread.run_sync(request, "navigate", payload)
 
-    try:
-        mcp.run(transport="stdio")
-    finally:
-        service.close()
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

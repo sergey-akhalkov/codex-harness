@@ -4,21 +4,28 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import TypeAlias
 
 import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-import launch
+
+class Arguments(argparse.Namespace):
+    registry: Path = Path()
+    codex_home: Path = Path()
 
 
-def failure_reason(error):
+CheckResult: TypeAlias = dict[str, str | int | None]
+
+
+def failure_reason(error: BaseException) -> str:
     if isinstance(error, BaseExceptionGroup):
         return '; '.join(failure_reason(item) for item in error.exceptions)
     return f'{type(error).__name__}: {error}'
 
 
-async def check_one(name, registry, environment):
+async def check_one(name: str, registry: Path, environment: dict[str, str]) -> CheckResult:
     try:
         # Some adopted MCPs keep a shared daemon alive after the stdio client
         # exits. Its working directory must remain valid; Check must neither
@@ -42,21 +49,23 @@ async def check_one(name, registry, environment):
         return {'id': name, 'status': 'failed', 'reason': failure_reason(error)}
 
 
-async def main():
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--registry', type=Path, required=True)
-    parser.add_argument('--codex-home', type=Path, required=True)
-    args = parser.parse_args()
+    _ = parser.add_argument('--registry', type=Path, required=True)
+    _ = parser.add_argument('--codex-home', type=Path, required=True)
+    args = Arguments()
+    _ = parser.parse_args(namespace=args)
     # Explicit CODEX_HOME remains necessary even when the native MCP host filters it.
     environment = {**os.environ, 'CODEX_HOME': str(args.codex_home)}
-    results = []
+    results: list[CheckResult] = []
 
-    async def collect(name):
+    async def collect(name: str) -> None:
         results.append(await check_one(name, args.registry, environment))
 
-    async with anyio.create_task_group() as group:
-        for name in ('serena', 'codebase-memory', 'graphify', 'nuphus', 'harness-lsp'):
-            group.start_soon(collect, name)
+    # Verify only the accepted global selection, sequentially.
+    from registration import SELECTED_NAMES
+    for name in SELECTED_NAMES:
+        await collect(name)
     print(json.dumps({'status': 'protocol-ready' if all(r['status'] == 'protocol-ready' for r in results) else 'degraded', 'servers': results}))
 
 

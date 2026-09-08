@@ -1,7 +1,7 @@
 # Agent delegation acceptance, 2026-09-07
 
 Status: implementation and global acceptance complete; all nine items in the
-[task list](../../openspec/changes/adaptive-agent-delegation/tasks.md) are closed.
+[task list](../../openspec/changes/archive/2026-09-08-adaptive-agent-delegation/tasks.md) are closed.
 Runtime: Codex CLI 0.153.4, OpenCodex 2.44.0,
 PowerShell 7.6.5, Python 3.13. No paid API credentials were introduced.
 

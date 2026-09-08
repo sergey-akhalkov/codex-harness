@@ -1,6 +1,7 @@
 #requires -Version 7.4
-# Real temporary links/files. Package, task and proxy operations are isolated
-# fixtures; the Windows Job Object itself is tested by subscription-process.
+# Real temporary links/files. Package, runtime and lifecycle use fixtures;
+# one unique native task exercises XML registration without ever running.
+# The Windows Job Object itself is tested by subscription-process.
 [CmdletBinding()]
 param()
 Set-StrictMode -Version Latest
@@ -11,12 +12,14 @@ $suite = Join-Path ([IO.Path]::GetTempPath()) ('codex-subscription-routing-' + [
 $module = Import-Module (Join-Path $repository 'tools/subscription-routing.psm1') -Force -PassThru
 $assertions = 0
 function Assert-True([bool]$Value,[string]$Message) { if (-not $Value) { throw $Message }; $script:assertions++ }
-function Assert-Throws([scriptblock]$Action,[string]$Pattern) {
+function Assert-Throw([scriptblock]$Action,[string]$Pattern) {
     $caught = $null
     try { & $Action | Out-Null } catch { $caught = $_.Exception.Message }
     Assert-True ($caught -and $caught -match $Pattern) "Expected /$Pattern/, got: $caught"
 }
-function New-Fixture([string]$Name) {
+function New-Fixture {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates only disposable suite state; transactional tests require deterministic setup.')]
+    param([string]$Name)
     $root = Join-Path $suite $Name
     $fixture = @{ SourceRoot = Join-Path $root 'source'; UserHome = Join-Path $root 'user'; CodexHome = Join-Path $root 'codex'; CodexCommand = 'C:\fixture\codex.ps1' }
     [void][IO.Directory]::CreateDirectory((Join-Path $fixture.SourceRoot 'global/opencodex/agents'))
@@ -40,6 +43,7 @@ function Assert-Snapshot($Fixture,$Before) {
 & $module {
     $script:tasks = @{}; $script:descriptors = @{}; $script:started = @{}; $script:missingPackage = $false; $script:failReady = $false
     $script:nativeRestoreCalls = 0; $script:boundedServiceCalls = 0
+    $script:taskSetCalls = 0; $script:taskStartCalls = 0
     $script:realReady = (Get-Command Test-SubscriptionReady).ScriptBlock
     $script:realWaitReady = (Get-Command Wait-SubscriptionReady).ScriptBlock
     $script:taskSamples = [Collections.Generic.Queue[hashtable]]::new()
@@ -51,6 +55,8 @@ function Assert-Snapshot($Fixture,$Before) {
     $script:useActualReceipt = $false
     $script:realTaskRead = (Get-Command Get-SubscriptionTask).ScriptBlock
     $script:realTaskXml = (Get-Command New-SubscriptionTaskXml).ScriptBlock
+    $script:realTaskFolder = (Get-Command Get-SubscriptionTaskFolder).ScriptBlock
+    $script:failCleanup = $false
     function script:Get-SubscriptionDependency {
         if ($script:missingPackage) { return $null }
         @{ root='C:\fixture\package';bun='C:\fixture\bun.exe';cli='C:\fixture\index.ts';powershell='C:\fixture\pwsh.exe';version='2.44.0' }
@@ -63,11 +69,13 @@ function Assert-Snapshot($Fixture,$Before) {
     }
     function script:New-SubscriptionTaskXml($Paths,$PowerShell) { $script:descriptors[$Paths.task] = $Paths; '<Task>' + $Paths.task + '</Task>' }
     function script:Set-SubscriptionTask([string]$Name,$Xml,$ExpectedXml,$Paths) {
+        $script:taskSetCalls++
         $current = $script:tasks[$Name]
         if (($current -and $current.xml -cne $ExpectedXml) -or (-not $current -and $ExpectedXml)) { throw 'Fixture task changed.' }
         if ($Xml) { $script:tasks[$Name] = @{ xml=$Xml;running=$false } } else { $script:tasks.Remove($Name) }
     }
     function script:Start-SubscriptionTask([string]$Name) {
+        $script:taskStartCalls++
         $script:tasks[$Name].running = $true
         $paths = $script:descriptors[$Name]
         $text = [Text.Encoding]::UTF8.GetString((Get-CodeToolsBytes $paths.config))
@@ -82,6 +90,7 @@ function Assert-Snapshot($Fixture,$Before) {
     }
     function script:Restore-SubscriptionNative($Paths,$Dependency) {
         $script:nativeRestoreCalls++
+        if ($script:failCleanup) { throw 'fixture cleanup conflict' }
         $text = [Text.Encoding]::UTF8.GetString((Get-CodeToolsBytes $Paths.config))
         Write-CodeToolsBytes $Paths.config ([Text.Encoding]::UTF8.GetBytes($text.Replace("# fixture route`r`n",'')))
     }
@@ -114,7 +123,7 @@ try {
 
     $failed = New-Fixture startupFailure; $before = Snapshot $failed
     & $module { $script:failReady = $true }
-    Assert-Throws { Invoke-HarnessSubscriptionRouting @failed -Mode Install } 'readiness failed'
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @failed -Mode Install } 'readiness failed'
     & $module { $script:failReady = $false }
     Assert-Snapshot $failed $before
     Assert-True (-not (Test-Path (Join-Path $failed.CodexHome 'harness/subscription-routing-pending.json'))) 'Startup failure did not recover.'
@@ -123,12 +132,12 @@ try {
     Invoke-HarnessSubscriptionRouting @fixture -Mode Install | Out-Null
     $before = Snapshot $fixture
     foreach ($mode in @('Update','Disconnect')) {
-        Assert-Throws { Invoke-HarnessSubscriptionRouting @fixture -Mode $mode -Checkpoint { throw 'injected late failure' } } 'injected late failure'
+        Assert-Throw { Invoke-HarnessSubscriptionRouting @fixture -Mode $mode -Checkpoint { throw 'injected late failure' } } 'injected late failure'
         Assert-Snapshot $fixture $before
     }
     Write-Output 'PASS late update/disconnect failure restores routed prior state'
 
-    Assert-Throws { Invoke-HarnessSubscriptionRouting @fixture -Mode Update -DeferCommit -Checkpoint { throw 'outer failure fixture' } } 'coordinator recovery required'
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @fixture -Mode Update -DeferCommit -Checkpoint { throw 'outer failure fixture' } } 'coordinator recovery required'
     Restore-HarnessSubscriptionRouting @fixture -DeferRestart | Out-Null
     $paths = & $module { param($f) Get-SubscriptionPaths $f.SourceRoot $f.UserHome $f.CodexHome } $fixture
     Assert-True (-not (& $module { param($p) (Get-SubscriptionTask $p.task).running } $paths)) 'Routing writer restarted before outer recovery.'
@@ -142,7 +151,7 @@ try {
     $before = Snapshot $fixture
     Write-Output 'PASS outer recovery defers restart; interrupted resume preserves completed MCP recovery'
 
-    Assert-Throws { Invoke-HarnessSubscriptionRouting @fixture -Mode Update -Checkpoint {
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @fixture -Mode Update -Checkpoint {
         Add-Content -LiteralPath (Join-Path $fixture.CodexHome 'config.toml') '# concurrent foreign edit'
         throw 'injected conflict'
     } } 'Recovery pending'
@@ -169,17 +178,20 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $restartPaths.roleLink)) 'Service raced the installer journal link writer.'
     Remove-CodeToolsFile $restartPaths.pending
     Write-CodeToolsBytes $restartPaths.roleLink ([Text.Encoding]::UTF8.GetBytes('foreign role'))
-    Assert-Throws { & $module { param($p) Update-SubscriptionServiceReadiness $p 10100 @{ready=$false;deadline=[DateTime]::UtcNow.AddSeconds(30)} } $restartPaths } 'Foreign connection'
+    Assert-Throw { & $module { param($p) Update-SubscriptionServiceReadiness $p 10100 @{ready=$false;deadline=[DateTime]::UtcNow.AddSeconds(30)} } $restartPaths } 'Foreign connection'
     Assert-True ((Get-Content -LiteralPath $restartPaths.roleLink -Raw) -eq 'foreign role') 'Service restart overwrote a foreign role.'
     Remove-CodeToolsFile $restartPaths.roleLink
     & $module { $script:failReady=$true }
-    Assert-Throws { & $module { param($p) Update-SubscriptionServiceReadiness $p 10100 @{ready=$false;deadline=[DateTime]::UtcNow.AddSeconds(-1)} } $restartPaths } 'within 90 seconds'
+    Assert-Throw { & $module { param($p) Update-SubscriptionServiceReadiness $p 10100 @{ready=$false;deadline=[DateTime]::UtcNow.AddSeconds(-1)} } $restartPaths } 'within 90 seconds'
     & $module {
         $script:failReady=$false; $script:observedServiceReady=$false
         $script:failPort = $false
         function script:Assert-SubscriptionPortFree { if ($script:failPort) { throw 'fixture port occupied by another listener' } }
         function script:Invoke-SubscriptionBounded {
             param($Paths,$Executable,$Arguments,$Environment,$Timeout,[switch]$ServiceRun,$OnRunning)
+            if ($Executable -ne 'C:\fixture\bun.exe' -or ($Arguments -join '|') -ne '--no-env-file|C:\fixture\index.ts|start|--port|10100' -or
+                $Environment.CODEX_HOME -ne $Paths.codex -or $Environment.OPENCODEX_HOME -ne $Paths.opencodex -or
+                $Environment.OCX_SERVICE -ne '1' -or $Timeout -ne 0) { throw 'Unexpected service command or isolation parameters.' }
             $script:boundedServiceCalls++
             if (-not $ServiceRun) { throw 'Unexpected bounded command in service fixture.' }
             & $OnRunning
@@ -188,10 +200,18 @@ try {
         }
     }
     foreach ($attempt in 1..2) {
-        Assert-Throws { Invoke-SubscriptionServiceHost -StatePath $restartPaths.service } 'fixture service exit'
+        $runtimeFailure=$null
+        try { Invoke-SubscriptionServiceHost -StatePath $restartPaths.service } catch { $runtimeFailure=$_ }
+        Assert-True ($runtimeFailure -and $runtimeFailure.Exception.Message -match 'fixture service exit' -and $runtimeFailure.Exception.Data['SubscriptionRuntimeRetryable'] -eq $true) 'Runtime failure lost its original error or retry marker.'
         Assert-True (& $module { $script:observedServiceReady }) 'Service entry did not observe ready role before exit.'
         Assert-True (-not (Test-Path -LiteralPath $restartPaths.roleLink)) 'Service exit left its role active after native restore.'
     }
+    & $module { $script:failCleanup=$true }
+    try {
+        $cleanupFailure=$null
+        try { Invoke-SubscriptionServiceHost -StatePath $restartPaths.service } catch { $cleanupFailure=$_ }
+        Assert-True ($cleanupFailure -and $cleanupFailure.Exception.Message -match 'fixture cleanup conflict' -and $cleanupFailure.Exception.Data['SubscriptionRuntimeRetryable'] -ne $true) 'Cleanup conflict incorrectly retained runtime retry permission.'
+    } finally { & $module { $script:failCleanup=$false } }
     Write-Output 'PASS ready service restart reconnects roles; pending/foreign role/timeout and exit cleanup protected'
 
     $portFixture = New-Fixture portOccupied
@@ -200,7 +220,7 @@ try {
     $portPaths = & $module { param($f) Get-SubscriptionPaths $f.SourceRoot $f.UserHome $f.CodexHome } $portFixture
     & $module { $script:failPort=$true; $script:nativeRestoreCalls=0; $script:boundedServiceCalls=0 }
     try {
-        Assert-Throws { Invoke-SubscriptionServiceHost -StatePath $portPaths.service } 'fixture port occupied'
+        Assert-Throw { Invoke-SubscriptionServiceHost -StatePath $portPaths.service } 'fixture port occupied'
         Assert-True (& $module { $script:nativeRestoreCalls -eq 1 -and $script:boundedServiceCalls -eq 0 }) 'Busy-port failure did not restore owned routing before exiting without a runtime launch.'
         Assert-True (-not (Test-Path -LiteralPath $portPaths.roleLink)) 'Busy-port failure left the Grok role active.'
         Assert-True ([Convert]::ToBase64String((Get-CodeToolsBytes $portPaths.config)) -ceq $portNativeBefore) 'Busy-port failure did not restore exact native configuration bytes.'
@@ -222,7 +242,7 @@ try {
         $sourceBefore = Get-FileHash -LiteralPath $guardPaths.configSource
         $foreignBefore = if ($replacement -ne 'missing') { Get-FileHash -LiteralPath $guardPaths.configLink } else { $null }
         & $module { $script:nativeRestoreCalls = 0; $script:boundedServiceCalls = 0 }
-        Assert-Throws { Invoke-SubscriptionServiceHost -StatePath $guardPaths.service } 'Foreign connection|configuration link is missing or changed'
+        Assert-Throw { Invoke-SubscriptionServiceHost -StatePath $guardPaths.service } 'Foreign connection|configuration link is missing or changed'
         Assert-True (& $module { $script:boundedServiceCalls -eq 0 }) 'Changed service config reached bounded process launch.'
         Assert-True (& $module { $script:nativeRestoreCalls -eq 0 }) 'Changed service config triggered native restoration.'
         Assert-Snapshot $guardFixture $guardBefore
@@ -259,11 +279,11 @@ try {
             $runtimeBefore = [Convert]::ToBase64String((Get-CodeToolsBytes $markerRuntime))
             $pidBefore = [Convert]::ToBase64String((Get-CodeToolsBytes $markerPidPath))
             if ($scenario -eq 'dead-owned') {
-                & $module { param($p) Remove-SubscriptionStoppedMarkers $p; Remove-SubscriptionStoppedMarkers $p } $markerPaths
+                & $module { param($p) Remove-SubscriptionStoppedMarker $p; Remove-SubscriptionStoppedMarker $p } $markerPaths
                 Assert-True (-not (Test-Path -LiteralPath $markerRuntime) -and -not (Test-Path -LiteralPath $markerPidPath)) 'Dead owned markers survived repeated cleanup.'
                 Assert-True ((Read-CodeToolsJson $markerActive).started -eq $markerReceipt) 'Marker cleanup discarded its current ownership receipt.'
             } else {
-                Assert-Throws { & $module { param($p) Remove-SubscriptionStoppedMarkers $p } $markerPaths } 'preserving'
+                Assert-Throw { & $module { param($p) Remove-SubscriptionStoppedMarker $p } $markerPaths } 'preserving'
                 Assert-True ([Convert]::ToBase64String((Get-CodeToolsBytes $markerRuntime)) -ceq $runtimeBefore) 'Rejected cleanup changed runtime marker.'
                 Assert-True ([Convert]::ToBase64String((Get-CodeToolsBytes $markerPidPath)) -ceq $pidBefore) 'Rejected cleanup changed PID marker.'
             }
@@ -300,10 +320,10 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
             }
             $stopProcess | Add-Member ScriptMethod Dispose { $this.events.Add('dispose'); $this.disposed=$true }
             $stopTask = [pscustomobject]@{events=$stopEvents;State=4}
-            $stopTask | Add-Member ScriptMethod Stop { param($flags) $this.events.Add('stop'); $this.State=3 }
+            $stopTask | Add-Member ScriptMethod Stop { param($flags) if ($flags -ne 0) { throw 'Unexpected task stop flags.' }; $this.events.Add('stop'); $this.State=3 }
             & $module { param($process) $script:stopProcess=$process } $stopProcess
             if ($exitsAfterStop) { & $module { param($task,$p) Stop-SubscriptionTaskRuntime $task $p } $stopTask $markerPaths }
-            else { Assert-Throws { & $module { param($task,$p) Stop-SubscriptionTaskRuntime $task $p } $stopTask $markerPaths } 'runtime did not stop within 10 seconds' }
+            else { Assert-Throw { & $module { param($task,$p) Stop-SubscriptionTaskRuntime $task $p } $stopTask $markerPaths } 'runtime did not stop within 10 seconds' }
             Assert-True (($stopEvents -join ',') -eq 'stop,wait,dispose') 'Task stop did not wait for its runtime before disposing the process handle.'
             Assert-True ($stopProcess.waitMilliseconds -gt 0 -and $stopProcess.waitMilliseconds -le 10000) 'Runtime stop exceeded the shared 10-second deadline.'
             Assert-True $stopProcess.disposed 'Runtime stop leaked its process handle.'
@@ -312,11 +332,11 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
     Write-Output 'PASS owned task stop waits for delayed runtime exit and refuses a runtime that remains alive'
 
     Write-CodeToolsJson (Join-Path $paths.opencodex 'runtime-port.json') @{pid=999;port=10101}
-    Assert-Throws { & $module { param($p) & $script:realNativeRestore $p @{bun='must-not-execute.exe';root='foreign'} } $paths } 'Another OpenCodex runtime'
+    Assert-Throw { & $module { param($p) & $script:realNativeRestore $p @{bun='must-not-execute.exe';root='foreign'} } $paths } 'Another OpenCodex runtime'
     Write-CodeToolsJson (Join-Path $paths.opencodex 'runtime-port.json') @{pid=42;port=10100}
     $readyChecks = & $module {
         param($p)
-        function script:Invoke-RestMethod { param($Uri,$TimeoutSec,[switch]$NoProxy,[switch]$DisableKeepAlive) if ($Uri -ne 'http://127.0.0.1:10100/readyz' -or -not $NoProxy -or -not $DisableKeepAlive) { throw 'Wrong loopback readiness transport.' }; $script:readyResponse }
+        function script:Invoke-RestMethod { param($Uri,$TimeoutSec,[switch]$NoProxy,[switch]$DisableKeepAlive) if ($Uri -ne 'http://127.0.0.1:10100/readyz' -or -not $NoProxy -or -not $DisableKeepAlive -or $TimeoutSec -ne 2) { throw 'Wrong loopback readiness transport.' }; $script:readyResponse }
         $script:readyResponse = @{status='ready';service='opencodex';pid=999;port=10100}
         $mismatched = & $script:realReady $p 10100
         $script:readyResponse.pid = 42
@@ -333,7 +353,7 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
         $script:taskSamples.Enqueue(@{running=$false;task_state=2;last_result=0x41303;last_run=[DateTime]::UtcNow.AddDays(-1).ToString('o')})
         $script:taskSamples.Enqueue(@{running=$false;task_state=3;last_result=1;last_run=[DateTime]::UtcNow.ToString('o')})
     }
-    Assert-Throws { & $module { param($p) & $script:realWaitReady $p 10100 } $paths } 'lastResult=0x00000001'
+    Assert-Throw { & $module { param($p) & $script:realWaitReady $p 10100 } $paths } 'lastResult=0x00000001'
     Assert-True (& $module { $script:taskSamples.Count -eq 0 }) 'Queued task was misclassified as a fresh completed failure.'
     Write-Output 'PASS scheduler failure retains fresh result code and permits queued startup'
 
@@ -343,6 +363,7 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
         $script:restartReadyCalls = 0
         function script:Test-SubscriptionReady {
             param($Paths, $Port)
+            if ($Port -ne 10100) { throw 'Unexpected readiness fixture port.' }
             $script:restartReadyCalls++
             if ($script:restartReadyCalls -eq 2) { Set-SubscriptionLink $Paths.roleLink $Paths.roleSource $null }
             return $true
@@ -369,7 +390,7 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
     $entryDescriptor = Join-Path $serviceEntry.CodexHome 'harness/subscriptions/service.json'
     Write-CodeToolsJson $entryDescriptor @{fixture='never-log-this-secret'}
     foreach ($attempt in 1..2) {
-        Assert-Throws { & (Join-Path $repository 'tools/opencodex-service.ps1') -StatePath $entryDescriptor } 'private entry record'
+        Assert-Throw { & (Join-Path $repository 'tools/opencodex-service.ps1') -StatePath $entryDescriptor } 'private entry record'
     }
     $entryLogs = @(Get-ChildItem -LiteralPath (Join-Path (Split-Path $entryDescriptor) 'runs') -Filter '*.host.jsonl')
     Assert-True ($entryLogs.Count -eq 2) 'Repeated early service failures overwrote entry logs.'
@@ -386,11 +407,11 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
     $foreign = New-Fixture foreign
     $foreignPath = Join-Path $foreign.UserHome '.opencodex/config.json'
     Write-CodeToolsJson $foreignPath @{ foreign = $true }
-    Assert-Throws { Invoke-HarnessSubscriptionRouting @foreign -Mode Install -Preview } 'Foreign connection'
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @foreign -Mode Install -Preview } 'Foreign connection'
     Assert-True ((Read-CodeToolsJson $foreignPath).foreign) 'Foreign config was overwritten.'
     $paths = & $module { param($f) Get-SubscriptionPaths $f.SourceRoot $f.UserHome $f.CodexHome } $fixture
     & $module { param($p) $script:tasks[$p.task].xml = '<Task>foreign</Task>' } $paths
-    Assert-Throws { Invoke-HarnessSubscriptionRouting @fixture -Mode Disconnect } 'changed subscription task'
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @fixture -Mode Disconnect } 'changed subscription task'
     Write-Output 'PASS foreign configuration and changed task refused without overwrite'
     $nativeTask = & $module {
         param($p)
@@ -401,7 +422,7 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
     Assert-True (-not $nativeTask.missing) 'Missing Windows task did not produce an absent result.'
     $taskXml = [xml]$nativeTask.xml
     $restart = $taskXml.Task.Settings.SelectSingleNode('*[local-name()="RestartOnFailure"]')
-    Assert-True (-not $restart -or $restart.SelectSingleNode('*[local-name()="Count"]').InnerText -eq '0') 'Task definition requested automatic restart retries.'
+    Assert-True ($restart -and $restart.SelectSingleNode('*[local-name()="Count"]').InnerText -eq '3' -and $restart.SelectSingleNode('*[local-name()="Interval"]').InnerText -eq 'PT1M') 'Task definition did not limit recovery to three attempts one minute apart.'
     Assert-True ($taskXml.Task.Actions.Exec.Arguments.Contains('-WindowStyle Hidden') -and $taskXml.Task.Settings.ExecutionTimeLimit -eq 'PT0S') 'Native task factory did not produce the hidden foreground action.'
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
@@ -410,22 +431,198 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
         Assert-True ($taskXml.Task.Principals.Principal.UserId -eq $currentIdentity.User.Value) 'Task principal changed the installer user identity.'
     } finally { $currentIdentity.Dispose() }
     Write-Output 'PASS actual Windows Task Scheduler read/definition APIs (no task registered)'
+    # Real task-definition parsing, with only the task folder writes replaced.
+    # Any unexpected Stop/Delete/Run call has no fixture method and fails.
+    $policyFixture = New-Fixture restartPolicy
+    Invoke-HarnessSubscriptionRouting @policyFixture -Mode Install | Out-Null
+    $policyPaths = & $module { param($f) Get-SubscriptionPaths $f.SourceRoot $f.UserHome $f.CodexHome } $policyFixture
+    $policyLegacy = & $module {
+        param($p)
+        $xml = & $script:realTaskXml $p (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+        $scheduler = New-Object -ComObject 'Schedule.Service'; $scheduler.Connect()
+        $definition = $scheduler.NewTask(0); $definition.XmlText = $xml
+        # A zero Count with the old Interval still present is invalid on reload.
+        $legacyDocument = [xml]$definition.XmlText
+        $legacyRestart = $legacyDocument.Task.Settings.SelectSingleNode('*[local-name()="RestartOnFailure"]')
+        [void]$legacyRestart.ParentNode.RemoveChild($legacyRestart)
+        $definition.XmlText = $legacyDocument.OuterXml
+        $xml = $definition.XmlText
+        $script:tasks[$p.task].xml = $xml
+        $state = Read-CodeToolsJson $p.state; $state.task_xml = $xml; Write-CodeToolsJson $p.state $state
+        $script:policyFolder = [pscustomobject]@{ Tasks=$script:tasks; Calls=0; FailRollback=$false; Legacy=$xml; ChangeTaskOnRead=$false }
+        $script:policyFolder | Add-Member ScriptMethod GetTask {
+            param($name)
+            if ($this.ChangeTaskOnRead) { $this.ChangeTaskOnRead=$false; $this.Tasks[$name].xml='<Task>foreign at write</Task>' }
+            [pscustomobject]@{ Xml=$this.Tasks[$name].xml }
+        }
+        function Invoke-FixtureTaskRegistration {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'password', Justification = 'COM mock preserves RegisterTask arguments and rejects every non-null credential; no password is accepted or stored.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'COM mock must retain the RegisterTask signature; assertions require null user and password arguments.')]
+            param($name,$xml,$flags,$userId,$password,$logonType,$sddl)
+            if ($flags -ne 36 -or $null -ne $userId -or $null -ne $password -or $logonType -ne 3 -or $null -ne $sddl) { throw 'Unexpected live task update effects.' }
+            $this.Calls++
+            if ($this.FailRollback -and $xml -ceq $this.Legacy) { $this.FailRollback=$false; throw 'fixture rollback interrupted' }
+            $this.Tasks[$name].xml=$xml
+        }
+        $script:policyFolder | Add-Member ScriptMethod RegisterTask ${function:Invoke-FixtureTaskRegistration}
+        function script:Get-SubscriptionTaskFolder { $script:policyFolder }
+        $script:realPolicyWriter = (Get-Command Write-CodeToolsBytes).ScriptBlock
+        $script:policyStatePath = $p.state; $script:failPolicyStateWrite=$false; $script:foreignPolicyState=$false
+        function script:Write-CodeToolsBytes {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Mock name must match the production command being overridden.')]
+            param([string]$Path, [byte[]]$Bytes)
+            if ($Path -eq $script:policyStatePath -and $script:failPolicyStateWrite) {
+                $script:failPolicyStateWrite=$false
+                if ($script:foreignPolicyState) { & $script:realPolicyWriter $Path ([Text.Encoding]::UTF8.GetBytes('{"foreign":true}')) }
+                throw 'fixture policy state write failed'
+            }
+            & $script:realPolicyWriter $Path $Bytes
+        }
+        $xml
+    } $policyPaths
+    $policyBefore = Snapshot $policyFixture
+    $policyAuth = Get-CodeToolsHash (Get-CodeToolsBytes (Join-Path $policyFixture.UserHome '.opencodex/auth.json'))
+    $policyRuntime = & $module { @($script:taskSetCalls,$script:taskStartCalls,$script:nativeRestoreCalls,$script:boundedServiceCalls) -join ',' }
+    $policyPreview = Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart -Preview
+    Assert-True ($policyPreview.changed -and $policyPreview.restartCount -eq 3 -and $policyPreview.restartInterval -eq 'PT1M') 'Policy preview did not describe bounded recovery.'
+    Assert-Snapshot $policyFixture $policyBefore
+    Assert-True ((& $module { $script:policyFolder.Calls }) -eq 0 -and -not (Test-Path $policyPaths.restartPending)) 'Policy preview wrote task or journal.'
+    $policyResult = Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart
+    $policyAfter = Snapshot $policyFixture
+    Assert-True ($policyResult.changed -and (Invoke-HarnessSubscriptionRouting @policyFixture -Mode Check).status -eq 'ready') 'Configured policy broke committed task ownership or readiness.'
+    $policyState = Read-CodeToolsJson $policyPaths.state
+    $policyOriginalXml = [xml]$policyLegacy; $policyNewXml = [xml]$policyState.task_xml
+    foreach ($document in @($policyOriginalXml,$policyNewXml)) {
+        $node=$document.Task.Settings.SelectSingleNode('*[local-name()="RestartOnFailure"]')
+        if ($node) { [void]$node.ParentNode.RemoveChild($node) }
+    }
+    Assert-True ($policyOriginalXml.OuterXml -ceq $policyNewXml.OuterXml) 'Policy update changed unrelated task settings.'
+    Assert-True (-not (Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart).changed -and (& $module { $script:policyFolder.Calls }) -eq 1) 'Repeated policy update was not idempotent.'
+    Assert-Snapshot $policyFixture $policyAfter
+    foreach ($name in @('config.toml','harness/subscriptions/service.json')) { Assert-True ($policyBefore[$name] -ceq $policyAfter[$name]) 'Policy update changed configuration or service descriptor.' }
+    Assert-True ($policyAuth -ceq (Get-CodeToolsHash (Get-CodeToolsBytes (Join-Path $policyFixture.UserHome '.opencodex/auth.json')))) 'Policy update changed authentication.'
+    foreach ($name in @('configLink','roleLink')) { Assert-True ((& $module { param($path) Get-SubscriptionLink $path } $policyPaths[$name]) -eq $policyState.links[$name]) 'Policy update changed a source link.' }
+    foreach ($pendingName in @('activation-pending.json','pending.json','subscription-routing-pending.json','code-tools-files-pending.json')) {
+        $pendingPath=Join-Path $policyPaths.codex ('harness/' + $pendingName)
+        Write-CodeToolsJson $pendingPath @{fixture='unfinished'}
+        Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'unfinished harness operation'
+        Remove-CodeToolsFile $pendingPath
+    }
+    # Return only this owned fixture to its recorded legacy state for failures.
+    & $module { param($p,$xml) $script:tasks[$p.task].xml=$xml } $policyPaths $policyLegacy
+    Write-CodeToolsBytes $policyPaths.state ([Convert]::FromBase64String($policyBefore['harness/subscription-routing.json']))
+    & $module { $script:failPolicyStateWrite=$true }
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'prior policy restored.*fixture policy state write failed'
+    Assert-Snapshot $policyFixture $policyBefore
+    Assert-True ((& $module {param($p) $script:tasks[$p.task].xml} $policyPaths) -ceq $policyLegacy -and -not (Test-Path $policyPaths.restartPending)) 'Failed policy write did not restore exact task/journal state.'
+    & $module { $script:failPolicyStateWrite=$true; $script:policyFolder.FailRollback=$true }
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'Recovery pending.*fixture rollback interrupted'
+    Assert-True (Test-Path $policyPaths.restartPending) 'Interrupted rollback lost its journal.'
+    foreach ($mode in @('Install','Update','Check','Disconnect','ConfigureRestart')) { Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode $mode } 'restart policy update needs' }
+    $policyInterruptedTask = & $module {param($p) $script:tasks[$p.task].xml} $policyPaths
+    Assert-True ((Invoke-HarnessSubscriptionRouting @policyFixture -Mode Recover -Preview).status -eq 'preview-subscription-restart-policy-recovery') 'Policy recovery preview was not routed.'
+    Assert-True ((& $module {param($p) $script:tasks[$p.task].xml} $policyPaths) -ceq $policyInterruptedTask -and (Test-Path $policyPaths.restartPending)) 'Policy recovery preview mutated task or journal.'
+    Assert-True ((Invoke-HarnessSubscriptionRouting @policyFixture -Mode Recover).status -eq 'subscriptions-restart-policy-recovered') 'Interrupted policy rollback did not recover.'
+    Assert-Snapshot $policyFixture $policyBefore
+    & $module { $script:failPolicyStateWrite=$true; $script:foreignPolicyState=$true }
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'Recovery pending.*ownership state changed'
+    Assert-True ((Read-CodeToolsJson $policyPaths.state).foreign -and (Test-Path $policyPaths.restartPending)) 'Policy recovery overwrote foreign state or removed evidence.'
+    Write-CodeToolsBytes $policyPaths.state ([Convert]::FromBase64String($policyBefore['harness/subscription-routing.json']))
+    Invoke-HarnessSubscriptionRouting @policyFixture -Mode Recover | Out-Null
+    & $module { $script:policyFolder.ChangeTaskOnRead=$true }
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'Recovery pending.*task changed'
+    Assert-True ((& $module {param($p) $script:tasks[$p.task].xml} $policyPaths) -ceq '<Task>foreign at write</Task>' -and (Test-Path $policyPaths.restartPending)) 'Policy writer overwrote a task changed immediately before COM update.'
+    & $module {param($p,$xml) $script:tasks[$p.task].xml=$xml} $policyPaths $policyLegacy
+    Invoke-HarnessSubscriptionRouting @policyFixture -Mode Recover | Out-Null
+    $foreignPolicy = Read-CodeToolsJson $policyPaths.state; $foreignPolicy.source += '-foreign'; Write-CodeToolsJson $policyPaths.state $foreignPolicy
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'source changed'
+    Write-CodeToolsBytes $policyPaths.state ([Convert]::FromBase64String($policyBefore['harness/subscription-routing.json']))
+    & $module { param($p) $script:tasks[$p.task].xml='<Task>foreign</Task>' } $policyPaths
+    Assert-Throw { Invoke-HarnessSubscriptionRouting @policyFixture -Mode ConfigureRestart } 'Foreign or changed subscription task'
+    Assert-True ($policyRuntime -ceq (& $module { @($script:taskSetCalls,$script:taskStartCalls,$script:nativeRestoreCalls,$script:boundedServiceCalls) -join ',' })) 'Live policy update or recovery stopped, started or rewrote runtime routing.'
+    Write-Output 'PASS live restart policy preview/idempotence, exact ownership, preservation, rollback and interrupted recovery without runtime mutations'
+    # Capture the actual scheduler normalization: registration prunes defaults
+    # and changes element order. This unique task is never run, even on logon.
+    $nativePolicyFixture=New-Fixture nativePolicyXml
+    Invoke-HarnessSubscriptionRouting @nativePolicyFixture -Mode Install | Out-Null
+    $nativePolicyPaths=& $module {param($f) Get-SubscriptionPaths $f.SourceRoot $f.UserHome $f.CodexHome} $nativePolicyFixture
+    $nativeScheduler=New-Object -ComObject 'Schedule.Service'; $nativeScheduler.Connect(); $nativeFolder=$nativeScheduler.GetFolder('\')
+    $nativeDefinition=$nativeScheduler.NewTask(0)
+    $nativeDefinition.XmlText=& $module {param($p,$exe) & $script:realTaskXml $p $exe} $nativePolicyPaths $scheduledHost
+    $nativeDefinition.Triggers.Clear()
+    $nativeDefinition.Actions.Item(1).Arguments='-NoLogo -NoProfile -WindowStyle Hidden -Command "exit 0"'
+    [xml]$nativeLegacy=$nativeDefinition.XmlText
+    $nativeRestart=$nativeLegacy.Task.Settings.SelectSingleNode('*[local-name()="RestartOnFailure"]')
+    [void]$nativeRestart.ParentNode.RemoveChild($nativeRestart)
+    $nativeBeforeXml=$null; $nativeCandidateXml=$null
+    try {
+        $nativeTask=$nativeFolder.RegisterTask($nativePolicyPaths.task,$nativeLegacy.OuterXml,34,$null,$null,3,$null)
+        $nativeBeforeXml=$nativeTask.Xml
+        $nativeState=Read-CodeToolsJson $nativePolicyPaths.state; $nativeState.task_xml=$nativeBeforeXml; Write-CodeToolsJson $nativePolicyPaths.state $nativeState
+        $nativeBeforeState=[Convert]::ToBase64String((Get-CodeToolsBytes $nativePolicyPaths.state))
+        $nativeCandidateXml=& $module {param($xml) Get-SubscriptionRestartTaskXml $xml} $nativeBeforeXml
+        & $module {
+            function script:Get-SubscriptionTask([string]$Name) { & $script:realTaskRead $Name }
+            function script:Get-SubscriptionTaskFolder { & $script:realTaskFolder }
+        }
+        Assert-True ((Invoke-HarnessSubscriptionRouting @nativePolicyFixture -Mode ConfigureRestart).changed) 'Native policy update did not apply.'
+        $nativeActual=$nativeFolder.GetTask($nativePolicyPaths.task)
+        Assert-True ($nativeActual.Xml -cne $nativeCandidateXml -and (& $module {param($a,$b) Test-SubscriptionTaskXmlEquivalent $a $b} $nativeActual.Xml $nativeCandidateXml)) 'Native regression did not exercise registered XML normalization.'
+        Assert-True ((Read-CodeToolsJson $nativePolicyPaths.state).task_xml -ceq $nativeActual.Xml) 'Committed policy state did not store actual scheduler XML.'
+        Assert-True (-not (Invoke-HarnessSubscriptionRouting @nativePolicyFixture -Mode ConfigureRestart).changed) 'Native policy update is not idempotent.'
+        foreach ($field in @('arguments','principal','count')) {
+            [xml]$foreignXml=$nativeCandidateXml
+            if ($field -eq 'arguments') { $foreignXml.Task.Actions.Exec.Arguments += ' foreign' }
+            elseif ($field -eq 'principal') { $foreignXml.Task.Principals.Principal.RunLevel=if($foreignXml.Task.Principals.Principal.RunLevel -eq 'HighestAvailable'){'LeastPrivilege'}else{'HighestAvailable'} }
+            else { $foreignXml.Task.Settings.RestartOnFailure.Count='4' }
+            Assert-True (-not (& $module {param($a,$b) Test-SubscriptionTaskXmlEquivalent $a $b} $nativeActual.Xml $foreignXml.OuterXml)) "Native normalization accepted a material $field change."
+        }
+        # Simulate interruption after RegisterTask, before actual XML is journaled.
+        Write-CodeToolsBytes $nativePolicyPaths.state ([Convert]::FromBase64String($nativeBeforeState))
+        $nativeState.task_xml=$nativeCandidateXml
+        $nativePending=@{schema_version=1;owner='codex-harness-subscriptions';operation='restart-policy';source=$nativePolicyPaths.source;user=$nativePolicyPaths.user;codex=$nativePolicyPaths.codex;task=$nativePolicyPaths.task
+            task_before=$nativeBeforeXml;task_after=$nativeCandidateXml;state_before=$nativeBeforeState;state_after=[Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($nativeState|ConvertTo-Json -Depth 60)))}
+        Write-CodeToolsJson $nativePolicyPaths.restartPending $nativePending
+        Assert-True ((Invoke-HarnessSubscriptionRouting @nativePolicyFixture -Mode Recover).status -eq 'subscriptions-restart-policy-recovered') 'Native normalized candidate did not recover after interruption.'
+        $nativeActual=$nativeFolder.GetTask($nativePolicyPaths.task)
+        Assert-True ($nativeActual.Xml -ceq $nativeBeforeXml -and [Convert]::ToBase64String((Get-CodeToolsBytes $nativePolicyPaths.state)) -ceq $nativeBeforeState -and -not(Test-Path $nativePolicyPaths.restartPending)) 'Native rollback lost exact prior task/state or journal cleanup.'
+        Assert-True ($nativeActual.State -ne 4 -and $nativeActual.LastRunTime.Year -lt 2000) 'The native XML fixture unexpectedly ran.'
+    } finally {
+        if ($nativeBeforeXml) {
+            $nativeCleanup=$nativeFolder.GetTask($nativePolicyPaths.task)
+            $nativeOwned=$nativeCleanup.Xml -ceq $nativeBeforeXml -or ($nativeCandidateXml -and (& $module {param($a,$b) Test-SubscriptionTaskXmlEquivalent $a $b} $nativeCleanup.Xml $nativeCandidateXml))
+            if (-not $nativeOwned -or $nativeCleanup.State -eq 4) { throw 'Native XML fixture changed or running; preserving its task.' }
+            $nativeFolder.DeleteTask($nativePolicyPaths.task,0)
+        }
+    }
+    Write-Output 'PASS actual never-run task XML normalization, committed bytes, idempotence, material-change rejection and interrupted recovery'
     $entryFixture = New-Fixture installerEntry
     $entryBefore = Snapshot $entryFixture
     $installer = Join-Path $repository 'install.ps1'
     $entryArgs = @{UserHome=$entryFixture.UserHome;CodexHome=$entryFixture.CodexHome;SubscriptionsOnly=$true;PathScope='Process'}
-    Assert-Throws { & $installer @entryArgs -CoreOnly -Mode Check } 'mutually exclusive'
+    Assert-Throw { & $installer @entryArgs -CoreOnly -Mode Check } 'mutually exclusive'
+    $policyEntryArgs = @{UserHome=$entryFixture.UserHome;CodexHome=$entryFixture.CodexHome;PathScope='Process'}
+    Assert-Throw { & $installer @policyEntryArgs -Mode ConfigureRestart } 'ConfigureRestart requires -SubscriptionsOnly'
+    Assert-Throw { & $installer @policyEntryArgs -CoreOnly -Mode ConfigureRestart } 'ConfigureRestart requires -SubscriptionsOnly'
     $entryPlan = & $installer @entryArgs -Mode Install -WhatIf
     Assert-True ($entryPlan.status -eq 'preview-subscriptions') 'Actual installer did not route subscriptions-only preview.'
     $entryCheck = & $installer @entryArgs -Mode Check
     Assert-True ($entryCheck.status -eq 'disconnected') 'Actual installer did not route subscriptions-only Check.'
     Assert-Snapshot $entryFixture $entryBefore
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $entryFixture.CodexHome 'harness'))) 'Subscriptions-only preview/Check wrote host state.'
+    $entryPolicyJournal = Join-Path $entryFixture.CodexHome 'harness/subscription-restart-policy-pending.json'
+    Write-CodeToolsJson $entryPolicyJournal @{fixture='policy transaction'}
+    foreach ($entryMode in @(@{Mode='Install'},@{Mode='Recover'},@{CoreOnly=$true;Mode='Check'},@{SubscriptionsOnly=$true;Mode='Check'},@{SubscriptionsOnly=$true;Mode='ConfigureRestart'})) {
+        Assert-Throw { & $installer @policyEntryArgs @entryMode } 'interrupted restart-policy update requires'
+    }
+    Assert-Snapshot $entryFixture $entryBefore
+    Assert-True ((Read-CodeToolsJson $entryPolicyJournal).fixture -eq 'policy transaction' -and -not (Test-Path (Join-Path $entryFixture.CodexHome 'harness/activation-pending.json'))) 'Installer policy guard changed state before dispatch.'
+    Remove-CodeToolsFile $entryPolicyJournal
     Write-CodeToolsJson (Join-Path $entryFixture.CodexHome 'harness/activation-pending.json') @{fixture='outer transaction'}
-    Assert-Throws { & $installer @entryArgs -Mode Recover } 'without -SubscriptionsOnly'
+    Assert-Throw { & $installer @entryArgs -Mode Recover } 'without -SubscriptionsOnly'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $entryFixture.CodexHome 'harness/subscriptions'))) 'Pending outer transaction did not block component execution.'
     Write-Output 'PASS actual install.ps1 -SubscriptionsOnly preview/Check, mutual exclusion and outer recovery guard'
-    Write-Output "$assertions subscription lifecycle assertions passed; scheduler/runtime were fixtures."
+    Write-Output "$assertions subscription lifecycle assertions passed; runtime was a fixture and the native XML task never ran."
 } finally {
     # Remove links individually before any recursive cleanup; never traverse a
     # target from a link during fixture disposal.

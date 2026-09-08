@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "codebase_memory": {
+    "workers": 2,
+    "internal_memory_mb": 1024,
+    "retain_total_mb": 8,
+    "retain_per_file_mb": 1,
+    "job_memory_mb": 2048,
+    "cpu_percent": 25,
+    "deadline_seconds": 600,
+    "admission_seconds": 2,
+    "output_limit_mb": 16,
+    "configuration": {"auto_index": "false", "auto_watch": "false", "ui_enabled": "false"}
+  },
+  "serena": {"max_projects": 3, "idle_seconds": 300},
+  "graphify": {"max_contexts": 2},
+  "nuphus": {"idle_seconds": 300}
+}

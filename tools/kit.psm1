@@ -125,7 +125,9 @@ function Get-HarnessInventory([string] $SourceRoot, [string] $CodexHome, [string
     $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/codex-harness-check.ps1'; source = Join-Path $SourceRoot $manifest.DiagnosticLauncher; kind = 'diagnostic-launcher'; name = 'codex-harness-check' })
     $links.Add(@{ destination = Join-Path $CodexHome 'agents/codex-harness'; source = Join-Path $SourceRoot $manifest.Agents; kind = 'agents'; name = 'codex-harness' })
     if ($IncludeCodeTools) {
-        $links.Add(@{ destination = Join-Path $CodexHome 'hooks.json'; source = Join-Path $SourceRoot $manifest.Hooks; kind = 'hooks'; name = 'code-tools' })
+        $tokenSelection = Read-HarnessJson (Join-Path $CodexHome 'harness/token-workflow.json')
+        $hookSource = if ($tokenSelection -and $tokenSelection.enabled) { $manifest.TokenHooks } else { $manifest.Hooks }
+        $links.Add(@{ destination = Join-Path $CodexHome 'hooks.json'; source = Join-Path $SourceRoot $hookSource; kind = 'hooks'; name = 'code-tools' })
         $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/hook.ps1'; source = Join-Path $SourceRoot $manifest.HookLauncher; kind = 'hook-launcher'; name = 'code-tools-bootstrap' })
     }
     $agentNames = [Collections.Generic.List[object]]::new()
@@ -286,6 +288,85 @@ function Test-HarnessConnections($State) {
     [pscustomobject]@{ status = 'Connected'; sourceRoot = $State.sourceRoot; codexHome = $State.codexHome; launcher = Join-Path $entry 'codex.ps1'; links = $State.links.Count; skills = @($State.links | Where-Object kind -eq 'skill').Count; agents = @(Get-ChildItem -LiteralPath (Join-Path $State.sourceRoot 'global/agents') -Recurse -Filter '*.toml' -File).Count; versions = $State.versions; runtime = $runtime }
 }
 
+function Set-HarnessNativeFeature([string]$CodexHome, [string]$CodexCommand,
+    [ValidateSet('hooks','code_mode')][string]$Feature, [bool]$Enabled) {
+    $config = Join-Path $CodexHome 'config.toml'
+    Assert-HarnessOrdinaryParents $config
+    $item = Get-HarnessItem $config
+    if ($item -and ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+        throw 'Hook policy requires an ordinary base config; preserving the current path.'
+    }
+    $before = if ($item) { ,([IO.File]::ReadAllBytes($config)) } else { ,([byte[]]@()) }
+    $root = Join-Path $CodexHome ('harness/hook-policy-' + [guid]::NewGuid().ToString('N'))
+    Assert-HarnessWithin $root (Join-Path $CodexHome 'harness')
+    [void][IO.Directory]::CreateDirectory($root)
+    try {
+        [IO.File]::WriteAllBytes((Join-Path $root 'config.toml'), $before)
+        $start = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.WorkingDirectory = $root
+        $start.Environment['CODEX_HOME'] = $root
+        $start.Environment['HARNESS_POLICY_CODEX'] = $CodexCommand
+        $start.Environment['HARNESS_POLICY_FEATURE'] = $Feature
+        $start.Environment['HARNESS_POLICY_ACTION'] = if ($Enabled) { 'enable' } else { 'disable' }
+        $start.Environment['HARNESS_POLICY_VALUE'] = $Enabled.ToString().ToLowerInvariant()
+        foreach ($argument in @('-NoLogo','-NoProfile','-Command',
+            '& $env:HARNESS_POLICY_CODEX features $env:HARNESS_POLICY_ACTION $env:HARNESS_POLICY_FEATURE *> $null; if ($LASTEXITCODE -ne 0) { exit 1 }; $result = & $env:HARNESS_POLICY_CODEX features list 2>$null; $pattern = "^" + [regex]::Escape($env:HARNESS_POLICY_FEATURE) + "\s+.+\s+" + $env:HARNESS_POLICY_VALUE + "\s*$"; if ($LASTEXITCODE -ne 0 -or -not ($result -match $pattern)) { exit 2 }')) {
+            $start.ArgumentList.Add($argument)
+        }
+        $process = [Diagnostics.Process]::Start($start)
+        try {
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(30000)) { $process.Kill($true); throw 'Native hook-policy editor timed out; base config unchanged.' }
+            $null = $stdout.GetAwaiter().GetResult()
+            $null = $stderr.GetAwaiter().GetResult()
+            if ($process.ExitCode -ne 0) { throw "Native hook-policy editor failed (exit $($process.ExitCode)); base config unchanged." }
+        } finally { $process.Dispose() }
+        $after = [IO.File]::ReadAllBytes((Join-Path $root 'config.toml'))
+        if ([Convert]::ToBase64String($before) -ceq [Convert]::ToBase64String($after)) { return }
+        $current = if (Test-Path -LiteralPath $config) { ,([IO.File]::ReadAllBytes($config)) } else { ,([byte[]]@()) }
+        if ([Convert]::ToBase64String($before) -cne [Convert]::ToBase64String($current)) { throw 'Base config changed during hook-policy preparation; preserving concurrent edits.' }
+        if ($item) {
+            $backup = Join-Path $CodexHome ('harness/backups/feature-' + $Feature + '-' + [guid]::NewGuid().ToString('N') + '.toml')
+            Assert-HarnessOrdinaryParents $backup
+            [void][IO.Directory]::CreateDirectory((Split-Path $backup))
+            Write-HarnessBytes $backup $before
+        }
+        Write-HarnessBytes $config $after
+    } finally {
+        Assert-HarnessWithin $root (Join-Path $CodexHome 'harness')
+        Remove-Item -LiteralPath $root -Recurse -Force
+    }
+}
+
+function Disable-HarnessHooks([string]$CodexHome, [string]$CodexCommand) {
+    Set-HarnessNativeFeature $CodexHome $CodexCommand 'hooks' $false
+}
+
+function Get-HarnessNativeFeatures([string]$CodexHome, [string]$CodexCommand) {
+    $start = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+    $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    $start.Environment['CODEX_HOME']=$CodexHome
+    $start.Environment['HARNESS_POLICY_CODEX']=$CodexCommand
+    foreach($arg in @('-NoLogo','-NoProfile','-Command','& $env:HARNESS_POLICY_CODEX features list; exit $LASTEXITCODE')) { $start.ArgumentList.Add($arg) }
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $out=$process.StandardOutput.ReadToEndAsync(); $err=$process.StandardError.ReadToEndAsync()
+        if(-not $process.WaitForExit(30000)) { $process.Kill($true); throw 'Native feature discovery timed out.' }
+        $body=$out.GetAwaiter().GetResult(); $null=$err.GetAwaiter().GetResult()
+        if($process.ExitCode) { throw 'Native feature discovery failed.' }
+        $result=@{}
+        foreach($line in $body -split '\r?\n') { if($line -match '^(hooks|code_mode)\s+.+\s+(true|false)\s*$') { $result[$Matches[1]]=$Matches[2] -eq 'true' } }
+        if($result.Count -ne 2) { throw 'Native feature discovery returned incomplete coverage.' }
+        return $result
+    } finally { $process.Dispose() }
+}
+
 function Invoke-HarnessInstallCore {
     [CmdletBinding()]
     param([string] $SourceRoot, [string] $CodexHome, [string] $UserHome,
@@ -354,7 +435,11 @@ function Invoke-HarnessInstallCore {
         $beforePath = Get-HarnessPathValue $scope
         $afterPath = if ($state.pathAdded) { Get-HarnessPathWithout $beforePath (Join-Path $CodexHome 'harness/bin') } else { $beforePath }
     } else {
-        $inventory = Get-HarnessInventory $SourceRoot $CodexHome $UserHome ([bool]$IncludeCodeTools)
+        # A core update is additive with respect to already connected code tools.
+        # Include their source links in reconciliation so they remain recorded,
+        # follow checkout moves and can be repaired instead of becoming obsolete.
+        $hasHookConnections = $state -and @($state.links | Where-Object { $_.kind -in 'hooks', 'hook-launcher' }).Count -gt 0
+        $inventory = Get-HarnessInventory $SourceRoot $CodexHome $UserHome ($IncludeCodeTools -or $hasHookConnections)
         if (-not $CodexCommand) {
             $CodexCommand = if ($state) { $state.codexCommand } else { (Get-Command codex -ErrorAction Stop).Source }
         }
@@ -462,6 +547,10 @@ function Invoke-HarnessInstallCore {
                 catch { throw "Cannot create direct link $($op.destination): $($_.Exception.Message). Check Windows Developer Mode/link privilege; no copy fallback is used." }
             }
         }
+        $tokenSelection = Read-HarnessJson (Join-Path $CodexHome 'harness/token-workflow.json')
+        # An accepted RTK installation owns its explicit selection. Preserve a
+        # subsequent native suspension instead of re-enabling hooks on update.
+        if ($nextState -and -not ($tokenSelection -and $tokenSelection.enabled)) { Disable-HarnessHooks $CodexHome $CodexCommand }
         Set-HarnessPathValue $scope $afterPath
         if ($nextState) { Write-HarnessBytes $statePath $stateAfterBytes }
         elseif (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath }
@@ -515,4 +604,4 @@ function Invoke-HarnessInstall {
     }
 }
 
-Export-ModuleMember -Function Invoke-HarnessInstall, Get-HarnessInventory
+Export-ModuleMember -Function Invoke-HarnessInstall, Get-HarnessInventory, Set-HarnessNativeFeature, Get-HarnessNativeFeatures

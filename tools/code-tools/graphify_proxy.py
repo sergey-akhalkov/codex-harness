@@ -1,7 +1,7 @@
 """Keep Graphify's graph identity across HTTP reuse and session-local stdio fallback."""
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -12,11 +12,17 @@ from urllib.parse import urlparse
 
 import anyio
 import psutil
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
+from lazy_stdio import LazyStdio
+from resources import policy
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from process_ownership import JobGuard
 
 REPOSITORY_TOOLS = {'list_prs', 'get_pr_impact', 'triage_prs'}
 
@@ -131,9 +137,9 @@ async def upstream(python, graph, endpoint, credential, *, cwd=None):
             # Do not log an HTTP exception: it can embed request authentication.
             print('Shared Graphify unavailable; using the selected graph via local stdio.', file=sys.stderr)
     parameters = StdioServerParameters(command=python, args=['-B', '-u', '-m', 'graphify.serve', '--graph', graph],
-                                       env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8', 'PYTHONDONTWRITEBYTECODE': '1'}, cwd=cwd)
-    async with stdio_client(parameters) as streams:
-        async with ClientSession(*streams) as session:
+                                       env={**os.environ, 'GRAPHIFY_MAX_CONTEXTS': str(policy()['graphify']['max_contexts']), 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8', 'PYTHONDONTWRITEBYTECODE': '1'}, cwd=cwd)
+    async with LazyStdio(parameters, idle_seconds=300) as session:
+        with nullcontext():
             with anyio.fail_after(60):
                 info = await session.initialize()
                 if info.serverInfo.name != 'graphify':
@@ -156,6 +162,7 @@ def validate_repository(name: str, arguments: dict):
 
 
 async def main():
+    JobGuard().contain_current_process()
     python, graph, endpoint, credential = configuration()
     async with upstream(python, graph, endpoint, credential) as (remote, identity):
         server = Server('harness-graphify')

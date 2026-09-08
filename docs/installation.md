@@ -2,6 +2,22 @@
 
 [Documentation map](README.md) · [Source inventory](../global/kit.psd1)
 
+Current selection, 2026-09-08: ordinary diagnostic and Stop hooks remain disabled.
+The accepted RTK exception enables native hooks and Code Mode in base settings;
+the profile inherits that selection. Diagnostic definitions remain empty and
+cached diagnostic handlers return before analysis. The separate `harness-lsp` registration and managed
+diagnostic backend provisioning are retired; explicit Serena Python discovery
+is retained and shared packages are preserved. See
+[current acceptance](evidence/subscription-efficiency.md) and the
+[selection contract](../openspec/changes/archive/2026-09-08-reduce-subscription-waste/proposal.md).
+Earlier automatic LSP acceptance below is historical.
+The explicitly authorized RTK exception is globally implemented and verified in
+[optimize-agent-token-workflow](../openspec/changes/archive/2026-09-08-optimize-agent-token-workflow/proposal.md);
+it does not revive diagnostic or Stop hooks.
+Its component lifecycle is available through `-TokenWorkflowOnly`; full installation
+includes it after core and existing integrations. See [token workflow](token-workflow.md)
+for the pinned native dependency, trust, suspension, recovery and task-effort selector.
+
 The checkout is the source of the portable kit. `install.ps1` connects its files
 and directories to native Codex locations using symbolic links. It creates no
 copied or merged deployment configuration.
@@ -12,6 +28,23 @@ records actual consumers, language coverage and environment limits. The default
 installer includes its explicit dependency lifecycle and MCP registrations.
 `-CoreOnly` selects the previously accepted instructions/profile/skills/agents
 connection for an isolated core installation or its regression checks.
+On an existing installation, core Install/Update also retains recorded hook
+connections, repairs missing managed links and follows a relocated checkout.
+It does not provision code tools or change their MCP registrations. A fresh
+core-only installation still has no hooks. See the [hook repair evidence](evidence/core-update-hook-links.md).
+`-CodeToolsOnly` reconciles existing MCP/LSP connections and resource policy
+without provisioning or updating dependencies, core links or subscription routing.
+
+Without an accepted RTK selection, core installation persists `features.hooks = false` in the native base
+configuration using the installed CLI's editor, with a private backup and
+concurrent-change check. This explicit selection survives failed connection
+activation, Recover, Disconnect and archive; backups are not automatically
+restored to enabled hooks. The profile and other reusable artifacts remain live
+source links. Normal code-tools lifecycle output is concise; add `-Detailed`
+to an explicit Check for full discovery, dependency and health records.
+When RTK is selected, core updates preserve its linked definition and the current
+native feature state, including explicit manual suspension. The profile inherits
+the base hook selection so it cannot accidentally re-enable a suspended exception.
 
 The default installer also includes [subscription model routing](subscription-models.md)
 through pinned OpenCodex. `-SubscriptionsOnly` adds, checks or disconnects that
@@ -171,6 +204,30 @@ not redirect writes or create a synchronized configuration copy.
 
 ## Update and move
 
+For an already installed kit, apply code-tool connection/resource changes with
+the scoped coordinator:
+
+```powershell
+pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Install -WhatIf
+pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Install
+pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Check
+```
+
+This scope adopts existing discovered packages and uses the same ownership and
+transaction checks for registrations, registries and resource settings. It does
+not run dependency bootstrap or upgrades. Missing packages remain explicit;
+provision them through the full installation lifecycle. `-CodeToolsOnly -Mode Update`
+is rejected. Component selectors are mutually exclusive. Keep the same explicit
+home and dependency-owner parameters on subsequent scoped operations.
+
+The [resource contract](code-tools.md#resource-limits-and-reuse) bounds CBM indexing
+and shares compatible Serena workers. The selected Python dependency supports
+explicit Serena operations; the separate harness backend registry stays empty.
+Restart existing native Codex sessions
+after migration: they retain previously loaded MCP processes and catalogues.
+Current global activation and remaining large-index acceptance are recorded in
+the [resource evidence](evidence/tool-resources.md).
+
 Edits to already connected files are read by a new Codex process without another
 install. Running sessions do not automatically reload their initial instruction
 context. Files added inside a connected skill or agent directory are also live.
@@ -186,6 +243,27 @@ different path, pass `-CodexCommand` with its real `.ps1` or `.exe` entry point;
 never point it back to the harness launcher.
 
 ## Disconnect and recovery
+
+To disconnect or recover only code tools on an existing kit:
+
+```powershell
+pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Disconnect
+pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Recover
+```
+
+Scoped Disconnect drains owned shared services, removes still-owned registrations
+and releases this `CODEX_HOME` from the account resource receipt. Other installation
+owners keep the policy active. The last owner restores original native settings
+only where they still match the applied values; later user edits are preserved.
+Core links, subscription state and unrelated pending journals remain intact.
+
+Scoped Recover rolls back an unfinished scoped activation, or finishes journal
+cleanup after a durable commit. Preserve pending files; do not delete journals to
+unblock a service. A pending full-kit activation must be recovered without
+`-CodeToolsOnly`, since its transaction also owns other components. Shared service
+admission remains blocked by an unfinished activation until recovery succeeds.
+
+For the full kit:
 
 ```powershell
 .\install.ps1 -Mode Disconnect -WhatIf
@@ -214,6 +292,21 @@ unlinks directory references without recursively traversing repository sources.
 
 ## CLI scope and native contracts
 
+The kit also supplies the source-linked
+[project-verification](../.agents/skills/project-verification/SKILL.md) and
+[reproduce-regression](../.agents/skills/reproduce-regression/SKILL.md) skills.
+Normal Install/Check/reconnect discovers their directories and nested resources;
+references and scripts remain in the authoritative checkout. The optional Windows
+process helper depends on the kit's `tools/opencodex-process.ps1` and `.cs`, so
+copying an individual script is not a supported deployment. Run verification from
+the consumer's actual project and keep command records in its documentation home.
+
+Their [implementation evidence](evidence/verified-delivery.md) distinguishes
+isolated lifecycle checks from native outcome and ordinary global consumption
+acceptance. Model evaluation is opt-in through `tools/outcome_suite.py` with an
+explicit case subset; installation and ordinary documentation checks do not invoke
+it. Current acceptance remains open; skill registration alone proves no speed gain.
+
 Automatic profile selection covers local TUI, exec, review, resume, fork and
 `debug prompt-input`. An explicit profile wins. Management/help/version commands
 keep their native invocation; remote sessions and app-server are not given an
@@ -235,3 +328,20 @@ write target of a profiled TUI; its accepted shared-file persistence is describe
 above.
 
 Для диагностики происхождения настроек и конфликтов из любого проекта доступна `codex-harness-check.ps1 -Json`, эквивалент `install.ps1 -Mode Check -Diagnose`. Команда входит в тот же жизненный цикл прямых ссылок. Формат отчёта, границы native-наблюдений и порядок восстановления описаны в [диагностике источников](source-diagnostics.md).
+
+## Анализ Python при разработке набора
+
+Проектный [pyrightconfig.json](../pyrightconfig.json) описывает import roots
+самостоятельных скриптов и локальное окружение `.venv`. На Windows `.venv`
+может быть ссылкой на уже подключённое окружение Serena: путь его Python хранится
+в записи `serena.paths.python` файла `$CODEX_HOME/harness/code-tools.json`.
+Для Python в `Scripts/python.exe` целью ссылки служит родитель `Scripts`.
+Создавайте ссылку только при отсутствии `.venv`; существующее окружение не заменяйте.
+Ссылка исключена из Git и не переносит машинный путь в общую конфигурацию.
+
+CLI-проверка выбранных файлов: `basedpyright --project pyrightconfig.json
+--pythonpath <полный-путь-к-python.exe> <файлы>`. Используйте тот же установленный
+BasedPyright, что указан в инвентаризации LSP. Правила диагностики в проектном
+конфиге не отключены. Эти настройки относятся к разработке harness; другие
+проекты продолжают выбирать собственные окружения. Контракт относительных путей
+и окружений: [документация BasedPyright](https://docs.basedpyright.com/latest/configuration/config-files/).

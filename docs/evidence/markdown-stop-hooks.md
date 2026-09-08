@@ -3,7 +3,7 @@
 Verified on Windows with globally installed Codex CLI 0.153.4 on 2026-09-07.
 Sources: [Markdown client](../../tools/lsp/markdown_client.py),
 [journal](../../tools/lsp/journal.py), [service](../../tools/lsp/server.py).
-[OpenSpec tasks](../../openspec/changes/fix-markdown-stop-hooks/tasks.md).
+[OpenSpec tasks](../../openspec/changes/archive/2026-09-08-fix-markdown-stop-hooks/tasks.md).
 
 ## Causes and correction
 

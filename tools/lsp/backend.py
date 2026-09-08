@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import unquote, urlparse
@@ -51,7 +52,8 @@ def language_for(path: Path) -> str | None:
 
 
 def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
 
 
 def runtime_home() -> Path:
@@ -164,6 +166,33 @@ class Backend:
         from solidlsp.ls_config import LanguageServerId
         from solidlsp.ls_process import StdioLanguageServer
         from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
+        if os.name == "nt":
+            from solidlsp.util.subprocess_util import ManagedSubprocess, convert_shell_cmd, subprocess_kwargs
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from process_ownership import JobGuard
+
+            class OwnedStdioLanguageServer(StdioLanguageServer):
+                """Preserve the installed transport with per-instance atomic Job admission."""
+                def _start(connection):
+                    connection._job_guard = JobGuard()
+                    info = connection._process_launch_info
+                    try:
+                        child = connection._job_guard.popen(convert_shell_cmd(info.cmd),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env={**os.environ, **info.env}, cwd=info.cwd, shell=True,
+                            start_new_session=connection._start_independent_lsp_process, **subprocess_kwargs())
+                        connection._process = ManagedSubprocess(child, f"LS[{connection.ls_id.value}]",
+                            connection._start_independent_lsp_process)
+                        if child.poll() is not None:
+                            raise RuntimeError(f"Language server exited during startup ({child.returncode})")
+                        for stream in ("stdout", "stderr"):
+                            threading.Thread(target=getattr(connection, f"_read_ls_process_{stream}"),
+                                name=f"LSP-{stream}-reader:{connection.ls_id.value}", daemon=True).start()
+                    except BaseException:
+                        connection._job_guard.close()
+                        raise
+
+            StdioLanguageServer = OwnedStdioLanguageServer
 
         self.root = root.resolve()
         self.language = language
@@ -340,7 +369,11 @@ class Backend:
         path = (self.root / relative).resolve()
         if not path.is_relative_to(self.root):
             raise ValueError("Source path escapes workspace")
-        content = path.read_bytes()
+        from discovery import MAX_ANALYSIS_BYTES
+        with path.open("rb") as source:
+            content = source.read(MAX_ANALYSIS_BYTES + 1)
+        if len(content) > MAX_ANALYSIS_BYTES:
+            raise ValueError("Source exceeds 8 MiB language-analysis limit; diagnostics were not run")
         revision = hashlib.sha256(content).hexdigest()
         if self.language == "pascal" and not self.definition.get("encoding"):
             try:
@@ -677,14 +710,20 @@ class Backend:
 
     def _close(self):
         process = getattr(self.connection, "_process", None)
-        if self.language == "cmake" and process and process.poll() is None:
-            # neocmakelsp 0.11 writes .cache/neocmakelsp under project_root on
-            # LSP shutdown and offers no cache-dir setting. Terminate only this
-            # adapter-owned process, avoiding unsolicited project mutations.
-            self.connection._is_stopping = True
-            process.terminate(timeout=2.0)
-        self.connection.stop(timeout=2.0)
-        if process:
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream and not stream.closed:
-                    stream.close()
+        try:
+            if self.language == "cmake" and process and process.poll() is None:
+                # neocmakelsp 0.11 writes .cache/neocmakelsp under project_root
+                # on shutdown; terminate this owned process to avoid writes.
+                self.connection._is_stopping = True
+                process.terminate(timeout=2.0)
+            self.connection.stop(timeout=2.0)
+        finally:
+            # The shell may have exited before transport stop enumerates its
+            # descendants. The Job retains their ownership through that exit.
+            guard = getattr(self.connection, "_job_guard", None)
+            if guard is not None:
+                guard.close()
+            if process:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream and not stream.closed:
+                        stream.close()

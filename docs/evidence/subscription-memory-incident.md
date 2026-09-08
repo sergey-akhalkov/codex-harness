@@ -1,6 +1,6 @@
 # OpenCodex OAuth memory incident, 2026-09-06
 
-Status: investigated; global subscription activation is still unfinished. See the [active tasks](../../openspec/changes/connect-subscription-model-routing/tasks.md).
+Status: investigated; later global subscription activation completed and is archived. See the [archived tasks](../../openspec/changes/archive/2026-09-08-connect-subscription-model-routing/tasks.md).
 
 ## Observations
 

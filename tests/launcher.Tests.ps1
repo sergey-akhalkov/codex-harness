@@ -155,6 +155,19 @@ exit $LASTEXITCODE
 
     $trickyArguments = @('exec', '-c', 'message="some spaces and quoted text"', '--', '',
         'путь с пробелами', 'quote"inside', 'C:\trailing slash\', '--profile', "line 1`nline 2")
+    foreach ($pair in @(@('routine','low'),@('standard','high'),@('demanding','xhigh'))) {
+        $effortArgs = @('--harness-effort',$pair[0]) + $trickyArguments
+        $effortResult = Invoke-Recorder -Arguments $effortArgs -ExitCode 7
+        Assert-True ($effortResult.ExitCode -eq 7) 'Task effort preserves native failure'
+        Assert-Arguments @((ConvertFrom-Json $effortResult.Stdout).argv) (@('--profile','harness','-c',('model_reasoning_effort="'+$pair[1]+'"'))+$trickyArguments) 'Task effort retains every prompt argument'
+    }
+    $overrideArgs = @('--harness-effort=routine','-c','model_reasoning_effort="max"','exec','hello')
+    $effortResult = Invoke-Recorder -Arguments $overrideArgs
+    Assert-Arguments @((ConvertFrom-Json $effortResult.Stdout).argv) @('--profile','harness','-c','model_reasoning_effort="max"','exec','hello') 'Explicit native effort wins'
+    Assert-Arguments (Get-HarnessTaskArguments @('--harness-effort','routine','--profile','personal','exec','hello')) @('--profile','personal','exec','hello') 'Explicit profile wins'
+    Assert-Arguments (Get-HarnessTaskArguments @('exec','--','--harness-effort','routine')) @('exec','--','--harness-effort','routine') 'Prompt tokens are not task selectors'
+    $effortResult = Invoke-Recorder -Arguments @('--harness-effort','invalid','exec','hello')
+    Assert-True ($effortResult.ExitCode -eq 1 -and $effortResult.Stdout -eq '') 'Invalid effort never starts native CLI'
     $result = Invoke-Recorder -Arguments $trickyArguments -ExitCode 37
     Assert-True ($result.ExitCode -eq 37) 'Native exit code must survive the launcher.'
     Assert-True ($result.Stderr -ceq "native stderr marker`n") 'Native stderr must stay on stderr.'

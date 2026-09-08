@@ -14,15 +14,19 @@ $initialPath = $env:Path
 $assertions = 0
 $cases = 0
 function Assert-True([bool]$Value, [string]$Message) { if (-not $Value) { throw $Message }; $script:assertions++ }
-function Assert-Throws([scriptblock]$Action, [string]$Pattern) {
+function Assert-Throw([scriptblock]$Action, [string]$Pattern) {
     $errorText = $null
     try { & $Action | Out-Null } catch { $errorText = $_.Exception.Message }
     Assert-True ($errorText -and $errorText -match $Pattern) "Expected /$Pattern/: $errorText"
 }
-function Setup-Modules {
+function Initialize-FixtureModule {
     $script:core = Import-Module (Join-Path $repository 'tools/kit.psm1') -Force -PassThru
     & $core {
-        function script:Assert-HarnessPrerequisites { @{ codex = 'fixture'; openspec = 'fixture'; powershell = '7.6.5' } }
+        function script:Assert-HarnessPrerequisites {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Mock name must match the production command being overridden.')]
+            param()
+            @{ codex = 'fixture'; openspec = 'fixture'; powershell = '7.6.5' }
+        }
         function script:Test-HarnessRuntime { @{ evidence = 'Lifecycle fixture; real neutral startup tested by installer.Tests.ps1.' } }
     }
     $script:code = Import-Module (Join-Path $repository 'tools/code-tools.psm1') -Force -PassThru
@@ -34,6 +38,7 @@ function Setup-Modules {
         $script:realPythonJson = (Get-Command Invoke-CodeToolsPythonJson).ScriptBlock
         function script:Get-HarnessCodeToolsRuntime {
             param($UserHome, $CodexHome, $CodexCommand)
+            if (-not [IO.Path]::IsPathFullyQualified($UserHome) -or -not $CodexCommand) { throw 'Fixture runtime requires an explicit user home and Codex command.' }
             @{ python = $script:fixturePython; lifecycle_python = $script:fixturePython; native = $script:fixtureNative; powershell = (Get-Command pwsh).Source; registry = (Join-Path $CodexHome 'harness/code-tools.json') }
         }
         function script:Invoke-CodeToolsPythonJson {
@@ -62,13 +67,13 @@ function Setup-Modules {
         function script:Resume-HarnessSubscriptionRouting {}
     }
 }
-function New-Fixture([string]$Name) {
+function Get-Fixture([string]$Name) {
     $root = Join-Path $suite $Name
     @{ SourceRoot = $repository; UserHome = (Join-Path $root 'user'); CodexHome = (Join-Path $root 'codex'); CodexCommand = $original.codexCommand; PathScope = 'Process' }
 }
-function Seed-Fixture($Fixture) {
+function Initialize-FixtureState($Fixture) {
     $fixtureHome = $Fixture.CodexHome
-    Write-CodeToolsBytes (Join-Path $fixtureHome 'config.toml') ([Text.Encoding]::UTF8.GetBytes('# exact foreign bytes' + [char]10 + 'model = "gpt-6-astra"' + [char]10))
+    Write-CodeToolsBytes (Join-Path $fixtureHome 'config.toml') ([Text.Encoding]::UTF8.GetBytes('# exact foreign bytes' + [char]10 + 'model = "gpt-6-astra"' + [char]10 + '[features]' + [char]10 + 'hooks = false' + [char]10))
     Write-CodeToolsJson (Join-Path $fixtureHome 'harness/code-tools.json') @{ mcp = @(); fixture = 'old-inventory' }
     Write-CodeToolsJson (Join-Path $fixtureHome 'harness/lsp-servers.json') @{ servers = @{}; fixture = 'old-lsp' }
 }
@@ -86,26 +91,27 @@ function Assert-Restored($Fixture, $Before, [string]$BeforePath) {
     Assert-True ($env:Path -ceq $BeforePath) 'PATH did not restore.'
     Assert-True (-not (Test-Path (Join-Path $Fixture.CodexHome 'harness/activation-pending.json'))) 'Outer transaction did not clear.'
 }
-Setup-Modules
+Initialize-FixtureModule
 if ($CrashRoot) {
-    $fixture = New-Fixture 'crash'
-    Seed-Fixture $fixture
-    Invoke-HarnessActivation @fixture -Mode Install -Checkpoint { param($Phase) if ($Phase -eq $CrashAt) { [Environment]::Exit(86) } } | Out-Null
+    $script:crashCheckpoint = $CrashAt
+    $fixture = Get-Fixture 'crash'
+    Initialize-FixtureState $fixture
+    Invoke-HarnessActivation @fixture -Mode Install -Checkpoint { param($Phase) if ($Phase -eq $script:crashCheckpoint) { [Environment]::Exit(86) } } | Out-Null
     throw 'Crash checkpoint was not reached.'
 }
 try {
     foreach ($phase in @('core','registration','registry:code-tools.json','registry:lsp-servers.json','before-commit')) {
-        $fixture = New-Fixture ($phase.Replace(':','-'))
-        Seed-Fixture $fixture
+        $fixture = Get-Fixture ($phase.Replace(':','-'))
+        Initialize-FixtureState $fixture
         $before = Snapshot $fixture; $beforePath = $env:Path
-        Assert-Throws { Invoke-HarnessActivation @fixture -Mode Install -Checkpoint { param($value) if ($value -eq $phase) { throw "injected $phase" } } } 'injected'
-        Assert-Restored $fixture $before $beforePath
+        Assert-Throw { Invoke-HarnessActivation @fixture -Mode Install -Checkpoint { param($value) if ($value -eq $phase) { throw "injected $phase" } } } 'injected'
+        Assert-Restored -Fixture $fixture -Before $before -BeforePath $beforePath
         Assert-True (-not (Test-Path (Join-Path $fixture.UserHome '.agents/skills/openspec-explore'))) 'A core skill link remained after rollback.'
         $cases++; Write-Output "PASS: rollback after $phase"
     }
-    $additiveFixture = New-Fixture 'additive-effect'
-    Seed-Fixture $additiveFixture
-    Assert-Throws { Invoke-HarnessActivation @additiveFixture -Mode Install -Checkpoint {
+    $additiveFixture = Get-Fixture 'additive-effect'
+    Initialize-FixtureState $additiveFixture
+    Assert-Throw { Invoke-HarnessActivation @additiveFixture -Mode Install -Checkpoint {
         param($value)
         if ($value -eq 'core') {
             $pending = Read-CodeToolsJson (Join-Path $additiveFixture.CodexHome 'harness/activation-pending.json')
@@ -121,10 +127,10 @@ try {
     Invoke-HarnessActivation @additiveFixture -Mode Recover | Out-Null
     Assert-True (-not (Test-Path (Join-Path $additiveFixture.CodexHome 'harness/activation-pending.json'))) 'Resolved fixture recovery remained pending.'
     $cases++; Write-Output 'PASS: additive effects without an inverse remain visibly incomplete'
-    $graphifyFixture = New-Fixture 'graphify-result-contract'
-    Seed-Fixture $graphifyFixture
+    $graphifyFixture = Get-Fixture 'graphify-result-contract'
+    Initialize-FixtureState $graphifyFixture
     $graphifyBefore = Snapshot $graphifyFixture; $graphifyPathBefore = $env:Path
-    Assert-Throws { Invoke-HarnessActivation @graphifyFixture -Mode Install -Checkpoint {
+    Assert-Throw { Invoke-HarnessActivation @graphifyFixture -Mode Install -Checkpoint {
         param($value)
         if ($value -eq 'before-commit') {
             $pending = Read-CodeToolsJson (Join-Path $graphifyFixture.CodexHome 'harness/activation-pending.json')
@@ -138,36 +144,36 @@ try {
             throw 'later failure after Graphify update'
         }
     } } 'later failure after Graphify update'
-    Assert-Restored $graphifyFixture $graphifyBefore $graphifyPathBefore
+    Assert-Restored -Fixture $graphifyFixture -Before $graphifyBefore -BeforePath $graphifyPathBefore
     Assert-True ((Get-Content (Join-Path $graphifyFixture.UserHome 'AppData/Roaming/uv/tools/graphifyy/version.txt') -Raw) -eq 'old') 'Graphify actual helper result did not permit directory rollback.'
     Invoke-HarnessActivation @graphifyFixture -Mode Recover | Out-Null
     & $code { $script:fixtureGraphifyJournal = $null }
     $cases++; Write-Output 'PASS: actual Graphify result contract and later failure complete coordinator recovery'
-    $ownerFixture = New-Fixture 'separate-dependency-owner'
+    $ownerFixture = Get-Fixture 'separate-dependency-owner'
     $ownerFixture.DependencyUserHome = Join-Path $suite 'explicit-shared-owner'
-    Seed-Fixture $ownerFixture
+    Initialize-FixtureState $ownerFixture
     Invoke-HarnessActivation @ownerFixture -Mode Install | Out-Null
     Assert-True ((Read-CodeToolsJson (Join-Path $ownerFixture.CodexHome 'harness/installation.json')).dependencyUserHome -eq $ownerFixture.DependencyUserHome) 'Explicit dependency owner was not persisted.'
     $ownerBefore = Snapshot $ownerFixture; $ownerPathBefore = $env:Path
     $wrongOwner = $ownerFixture.Clone(); $wrongOwner.DependencyUserHome = $ownerFixture.UserHome
-    Assert-Throws { Invoke-HarnessActivation @wrongOwner -Mode Check } 'Dependency owner differs'
-    Assert-Throws { Invoke-HarnessActivation @ownerFixture -Mode Update -Checkpoint {
+    Assert-Throw { Invoke-HarnessActivation @wrongOwner -Mode Check } 'Dependency owner differs'
+    Assert-Throw { Invoke-HarnessActivation @ownerFixture -Mode Update -Checkpoint {
         param($value)
         if ($value -eq 'core') {
             $pendingPath = Join-Path $ownerFixture.CodexHome 'harness/activation-pending.json'
             $pending = Read-CodeToolsJson $pendingPath
             Assert-True ($pending.dependency_user_home -eq $ownerFixture.DependencyUserHome) 'Pending activation omitted its explicit dependency owner.'
             $pendingHash = Get-CodeToolsHash (Get-CodeToolsBytes $pendingPath)
-            Assert-Throws { Restore-HarnessActivation @wrongOwner -Preview } 'Dependency owner differs'
+            Assert-Throw { Restore-HarnessActivation @wrongOwner -Preview } 'Dependency owner differs'
             Assert-True ((Get-CodeToolsHash (Get-CodeToolsBytes $pendingPath)) -eq $pendingHash) 'Wrong-owner recovery changed its pending journal.'
             throw 'explicit owner rollback'
         }
     } } 'explicit owner rollback'
-    Assert-Restored $ownerFixture $ownerBefore $ownerPathBefore
+    Assert-Restored -Fixture $ownerFixture -Before $ownerBefore -BeforePath $ownerPathBefore
     Invoke-HarnessActivation @ownerFixture -Mode Disconnect | Out-Null
     $cases++; Write-Output 'PASS: explicit dependency owner persists through rollback and rejects wrong-owner Check/Recover'
-    $readinessFixture = New-Fixture 'legacy-readiness'
-    Seed-Fixture $readinessFixture
+    $readinessFixture = Get-Fixture 'legacy-readiness'
+    Initialize-FixtureState $readinessFixture
     $readinessOriginal = Get-CodeToolsBytes (Join-Path $readinessFixture.CodexHome 'config.toml')
     Invoke-HarnessActivation @readinessFixture -Mode Install | Out-Null
     $readinessStatePath = Join-Path $readinessFixture.CodexHome 'harness/code-tools-registration.json'
@@ -184,14 +190,14 @@ try {
     Invoke-HarnessActivation @readinessFixture -Mode Disconnect | Out-Null
     Assert-True ((Get-CodeToolsHash (Get-CodeToolsBytes (Join-Path $readinessFixture.CodexHome 'config.toml'))) -eq (Get-CodeToolsHash $readinessOriginal)) 'Readiness migration Disconnect did not restore prior config bytes.'
     $cases++; Write-Output 'PASS: legacy native readiness migration is visibly degraded until installed and restores prior absence'
-    $fixture = New-Fixture 'update'
-    Seed-Fixture $fixture
+    $fixture = Get-Fixture 'update'
+    Initialize-FixtureState $fixture
     Invoke-HarnessActivation @fixture -Mode Install | Out-Null
     $before = Snapshot $fixture; $beforePath = $env:Path
-    Assert-Throws { Invoke-HarnessActivation @fixture -Mode Update -Checkpoint { param($value) if ($value -eq 'registry:lsp-servers.json') { throw 'update failure' } } } 'update failure'
-    Assert-Restored $fixture $before $beforePath
+    Assert-Throw { Invoke-HarnessActivation @fixture -Mode Update -Checkpoint { param($value) if ($value -eq 'registry:lsp-servers.json') { throw 'update failure' } } } 'update failure'
+    Assert-Restored -Fixture $fixture -Before $before -BeforePath $beforePath
     $cases++; Write-Output 'PASS: update failure preserves pre-existing links and exact state'
-    Assert-Throws { Invoke-HarnessActivation @fixture -Mode Update -Checkpoint {
+    Assert-Throw { Invoke-HarnessActivation @fixture -Mode Update -Checkpoint {
         param($value)
         if ($value -eq 'core') {
             $statePath = Join-Path $fixture.CodexHome 'harness/installation.json'
@@ -203,9 +209,9 @@ try {
     Assert-True ((Read-CodeToolsJson (Join-Path $fixture.CodexHome 'harness/installation.json')).foreignMarker -eq 'keep') 'Concurrent core state was overwritten.'
     Write-CodeToolsBytes (Join-Path $fixture.CodexHome 'harness/installation.json') ([Convert]::FromBase64String($before['harness/installation.json']))
     Invoke-HarnessActivation @fixture -Mode Recover | Out-Null
-    Assert-Restored $fixture $before $beforePath
+    Assert-Restored -Fixture $fixture -Before $before -BeforePath $beforePath
     $cases++; Write-Output 'PASS: concurrent core metadata preserved and recovery resumed after resolution'
-    Assert-Throws { Invoke-HarnessActivation @fixture -Mode Update -Checkpoint {
+    Assert-Throw { Invoke-HarnessActivation @fixture -Mode Update -Checkpoint {
         param($value)
         if ($value -eq 'registry:code-tools.json') {
             Add-Content -LiteralPath (Join-Path $fixture.CodexHome 'harness/lsp-servers.json') ' '
@@ -215,14 +221,14 @@ try {
     Assert-True ((Get-CodeToolsHash (Get-CodeToolsBytes (Join-Path $fixture.CodexHome 'harness/lsp-servers.json'))) -ne (Get-CodeToolsHash ([Convert]::FromBase64String($before['harness/lsp-servers.json'])))) 'Concurrent registry bytes were overwritten.'
     Write-CodeToolsBytes (Join-Path $fixture.CodexHome 'harness/lsp-servers.json') ([Convert]::FromBase64String($before['harness/lsp-servers.json']))
     Invoke-HarnessActivation @fixture -Mode Recover | Out-Null
-    Assert-Restored $fixture $before $beforePath
+    Assert-Restored -Fixture $fixture -Before $before -BeforePath $beforePath
     $cases++; Write-Output 'PASS: both registry records retain concurrent-change protection'
-    Assert-Throws { Invoke-HarnessActivation @fixture -Mode Disconnect -Checkpoint { param($value) if ($value -eq 'before-commit') { throw 'disconnect failure' } } } 'disconnect failure'
-    Assert-Restored $fixture $before $beforePath
+    Assert-Throw { Invoke-HarnessActivation @fixture -Mode Disconnect -Checkpoint { param($value) if ($value -eq 'before-commit') { throw 'disconnect failure' } } } 'disconnect failure'
+    Assert-Restored -Fixture $fixture -Before $before -BeforePath $beforePath
     $cases++; Write-Output 'PASS: disconnect failure restores core and native registrations'
 
     # An intervening config edit is never overwritten. Other components still recover.
-    Assert-Throws { Invoke-HarnessActivation @fixture -Mode Disconnect -Checkpoint {
+    Assert-Throw { Invoke-HarnessActivation @fixture -Mode Disconnect -Checkpoint {
         param($value)
         if ($value -eq 'before-commit') {
             Add-Content -LiteralPath (Join-Path $fixture.CodexHome 'config.toml') '# intervening edit'
@@ -236,7 +242,7 @@ try {
     $registrationPending = Read-CodeToolsJson (Join-Path $fixture.CodexHome 'harness/code-tools-registration-pending.json')
     Write-CodeToolsBytes (Join-Path $fixture.CodexHome 'config.toml') ([Convert]::FromBase64String($registrationPending.before))
     Invoke-HarnessActivation @fixture -Mode Recover | Out-Null
-    Assert-Restored $fixture $before $beforePath
+    Assert-Restored -Fixture $fixture -Before $before -BeforePath $beforePath
     $cases++; Write-Output 'PASS: concurrent edit preserved, independent recovery continued, explicit resolution recovered'
 
     # The actual native writer can normalize and interleave registration tables.
@@ -251,17 +257,18 @@ try {
         $script:fixturePython = (& (Get-Command uv).Source python find --no-project --managed-python --offline --no-python-downloads '>=3.11')
         function script:Get-HarnessCodeToolsRuntime {
             param($UserHome, $CodexHome, $CodexCommand)
+            if (-not [IO.Path]::IsPathFullyQualified($UserHome) -or -not $CodexCommand) { throw 'Fixture runtime requires an explicit user home and Codex command.' }
             @{ python = $null; lifecycle_python = $script:fixturePython; native = $script:fixtureNative; powershell = (Get-Command pwsh).Source; registry = (Join-Path $CodexHome 'harness/code-tools.json') }
         }
     }
     $normalizedBefore = Snapshot $fixture
-    Assert-Throws { Invoke-HarnessActivation @fixture -Mode Disconnect -Checkpoint { param($value) if ($value -eq 'before-commit') { throw 'normalized disconnect rollback' } } } 'normalized disconnect rollback'
-    Assert-Restored $fixture $normalizedBefore $beforePath
+    Assert-Throw { Invoke-HarnessActivation @fixture -Mode Disconnect -Checkpoint { param($value) if ($value -eq 'before-commit') { throw 'normalized disconnect rollback' } } } 'normalized disconnect rollback'
+    Assert-Restored -Fixture $fixture -Before $normalizedBefore -BeforePath $beforePath
     Invoke-HarnessActivation @fixture -Mode Disconnect | Out-Null
     Assert-True ((Get-Content (Join-Path $fixture.CodexHome 'config.toml') -Raw).Contains('[mcp_servers.foreign-normalized]')) 'Normalized foreign MCP table was removed.'
     $cases++; Write-Output 'PASS: normalized native config disconnect and rollback use stdlib base Python without Serena'
     # Reconnect the fixture to retain the separate all-Python-unavailable case.
-    Setup-Modules
+    Initialize-FixtureModule
     Invoke-HarnessActivation @fixture -Mode Install | Out-Null
 
     # Recovery and disconnect never call a Python runtime.
@@ -273,7 +280,7 @@ try {
     Invoke-HarnessActivation @fixture -Mode Recover | Out-Null
     $cases++; Write-Output 'PASS: Disconnect/Recover do not require Python'
     $env:Path = $initialPath
-    Setup-Modules
+    Initialize-FixtureModule
 
     foreach ($crashPhase in @('registration','registry:code-tools.json','committed')) {
         $childRoot = Join-Path $suite ('hard-' + $crashPhase.Replace(':','-'))

@@ -8,6 +8,37 @@ $script:SingleValueOptions = @('-c', '--config', '--enable', '--disable', '--rem
     '--ask-for-approval', '--thread-source', '--output-schema', '--color',
     '-o', '--output-last-message', '--base', '--commit', '--title')
 
+function Get-HarnessTaskArguments {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments = @())
+    # An optional first-position selector only; never scan prompt text as code.
+    if (-not $Arguments.Count -or $Arguments[0] -cnotmatch '^--harness-effort(?:=|$)') { return ,$Arguments }
+    $offset = 1
+    if ($Arguments[0] -cmatch '^--harness-effort=(.*)$') { $choice = $Matches[1] }
+    else {
+        if ($Arguments.Count -lt 2) { throw '--harness-effort requires routine, standard or demanding.' }
+        $choice = $Arguments[1]; $offset = 2
+    }
+    $efforts = @{routine='low';standard='high';demanding='xhigh'}
+    if (-not $efforts.ContainsKey($choice)) { throw 'Unknown task effort; choose routine, standard or demanding.' }
+    [string[]]$rest = if ($Arguments.Count -gt $offset) { $Arguments[$offset..($Arguments.Count-1)] } else { @() }
+    $explicit = $false
+    for ($i=0; $i -lt $rest.Count; $i++) {
+        $item = $rest[$i]
+        if ($item -ceq '--') { break }
+        if ($item -cmatch '^(?:--profile(?:=|$)|-p|--remote(?:=|$))') { $explicit=$true; break }
+        if ($item -cin @('-c','--config') -and $i+1 -lt $rest.Count) {
+            if ($rest[$i+1] -match '^\s*model_reasoning_effort\s*=') { $explicit=$true; break }
+            $i++; continue
+        }
+        if ($item -cmatch '^(?:--config=|-c)\s*model_reasoning_effort\s*=') { $explicit=$true; break }
+        if ($item -cin $script:SingleValueOptions) { $i++; continue }
+        if ($item -cin @('-i','--image')) { while($i+1 -lt $rest.Count -and -not $rest[$i+1].StartsWith('-')) { $i++ } }
+    }
+    if ($explicit) { return ,$rest }
+    return ,([string[]](@('-c',('model_reasoning_effort="' + $efforts[$choice] + '"')) + $rest))
+}
+
 function Get-HarnessArguments {
     [CmdletBinding()]
     param(
@@ -135,4 +166,4 @@ function Get-HarnessLaunchConfiguration {
     return $metadata
 }
 
-Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessAdditionalRoots, Resolve-HarnessFile, Get-HarnessLaunchConfiguration
+Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessTaskArguments, Get-HarnessAdditionalRoots, Resolve-HarnessFile, Get-HarnessLaunchConfiguration

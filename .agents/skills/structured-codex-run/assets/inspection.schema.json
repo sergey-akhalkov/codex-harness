@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "findings", "unresolved_issues"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line", "description", "evidence"],
+        "properties": {
+          "path": {"type": "string"},
+          "line": {"type": "integer"},
+          "description": {"type": "string"},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "unresolved_issues": {"type": "array", "items": {"type": "string"}}
+  }
+}

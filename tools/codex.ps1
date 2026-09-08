@@ -11,8 +11,9 @@ try {
     $harnessSource = if ($harnessEntry.LinkType) { $harnessEntry.ResolveLinkTarget($true).FullName } else { $harnessEntry.FullName }
     Import-Module (Join-Path (Split-Path $harnessSource -Parent) 'launcher.psm1') -Scope Local -Force
     $harnessRegistration = Get-HarnessLaunchConfiguration -LauncherSource $harnessSource
-    [string[]] $harnessArguments = @(Get-HarnessArguments -Arguments $args -ProfileName $harnessRegistration.profileName)
-    $harnessRoots = @(Get-HarnessAdditionalRoots -Arguments $args)
+    [string[]] $harnessTaskArguments = Get-HarnessTaskArguments -Arguments $args
+    [string[]] $harnessArguments = @(Get-HarnessArguments -Arguments $harnessTaskArguments -ProfileName $harnessRegistration.profileName)
+    $harnessRoots = @(Get-HarnessAdditionalRoots -Arguments $harnessTaskArguments)
 } catch {
     [Console]::Error.WriteLine("codex-harness: $($_.Exception.Message)")
     exit 1
