@@ -127,5 +127,5 @@ This increment's logs are in
 `%LOCALAPPDATA%/codex-harness-evidence/outcome-arm-1757f8d3341e48279fed9884b87a95e3/`:
 `fixture-integration.*`, `fixture-clippy-fixed.*`, `controlled-cli-smoke.json`,
 `controlled-process-acceptance.json` and the individual native process receipts.
-The directory also contains unfinished arm-preparation work; these passed target
-checks do not imply that the arm command or installer ownership guard passed.
+These target checks cover only the fixtures. [Arm preparation](rust-outcome-arm.md)
+records the separate later consumer and installation guard acceptance in that directory.

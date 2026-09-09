@@ -74,13 +74,13 @@ actual outside-checkout CLI checks.
 [--output PATH] [--private-sources PATH]` reads explicit local telemetry without
 model calls. [Native usage acceptance](evidence/rust-delegation-usage.md) records
 the ported cases, attribution/privacy boundaries and a real-log comparison.
-Outcome execution/oracle migration and global lifecycle integration remain open.
+Suite/oracle migration and global lifecycle integration remain open.
 
 `codex-harness.exe outcome-run --request PATH --run-model-probes` executes one
 explicit native launcher in an isolated temporary case/home. Its [request,
 evidence and process acceptance](evidence/rust-outcome-run.md) keep execution
 status separate from correctness; the command defaults to a model-free skip.
-Comparison preparation and independent outcome oracles still require migration.
+Full suite preparation and independent outcome oracles still require migration.
 
 `codex-harness.exe outcome-discover --request PATH` performs model-free native
 skill/config discovery in an isolated temporary case/home. Its [protocol and

@@ -4,8 +4,9 @@
 model-free native `initialize`, `skills/list` and `config/read` exchange. The
 [implementation](../../crates/codex-harness/src/outcome_discovery.rs) and
 [transport](../../crates/codex-harness/src/outcome_discovery_rpc.rs) replace the
-discovery portion of the outcome helper. Treatment preparation, suites/oracles,
-remaining consumers and global migration are still unfinished under task 7.3.
+discovery portion of the outcome helper. [Arm preparation](rust-outcome-arm.md)
+now consumes it; suites/oracles, remaining consumers and global migration are
+still unfinished under task 7.3.
 
 The strict JSON request requires `case_root`, `codex_home` and an absolute
 original native `upstream` executable. Case and home must be distinct existing
