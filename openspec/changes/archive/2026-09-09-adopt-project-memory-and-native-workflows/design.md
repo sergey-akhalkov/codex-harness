@@ -2,14 +2,14 @@
 
 Мотивация и подтверждённый объём — в [proposal.md](proposal.md). Срез исследования: **2026-09-07–08**, установленный **Codex CLI 0.153.4**, Windows / PowerShell. Обычный `codex` разрешается в установленный harness launcher, который выбирает файловый профиль `harness` и передаёт аргументы native CLI. Просмотренный `tools/launcher.psm1` сам slash-команды не обрабатывает.
 
-В [наборе](../../../global/kit.psd1) уже предусмотрены прямые подключения `.agents/skills/`, профиля и инструкций; [linked-global-kit](../../specs/linked-global-kit/spec.md) требует работу вне checkout и сохраняет native persistence настроек. В [docs/project-decisions.md](../../../docs/project-decisions.md) уже хранится постоянный контекст пользователя. `project-verification` и `reproduce-regression` присутствуют в текущих исходниках; их отдельная глобальная приёмка развивается в соседнем change. Здесь переиспользуем их контракты, не объявляя чужую работу завершённой.
+В [наборе](../../../../global/kit.psd1) уже предусмотрены прямые подключения `.agents/skills/`, профиля и инструкций; [linked-global-kit](../../../specs/linked-global-kit/spec.md) требует работу вне checkout и сохраняет native persistence настроек. В [docs/project-decisions.md](../../../../docs/project-decisions.md) уже хранится постоянный контекст пользователя. `project-verification` и `reproduce-regression` присутствуют в текущих исходниках; их отдельная глобальная приёмка развивается в соседнем change. Здесь переиспользуем их контракты, не объявляя чужую работу завершённой.
 
 ### Проверенные контракты
 
 | Возможность | Наблюдение | Граница доказательства |
 | --- | --- | --- |
-| Context management | `features list`: under development, false; CLI принимает вложенный boolean `features.context_management.experimental_mode`, неверный строковый тип отвергает | Парсер не доказывает runtime activation или доступность аккаунту |
-| Native memories | `memories=false`; официальное хранилище — `$CODEX_HOME/memories` | Это generated local state; переноса native memory root в Git проекта текущая проверенная schema не задаёт |
+| Context management | Accepted Astra runtime pilot 2.1 and ordinary source-linked runtime, explicit false override and profile rollback 2.2 on CLI 0.153.4 | Separate global skill lifecycle acceptance passed; see the final evidence |
+| Native memories | `memories=false`; official store is generated local state under Codex home (`~/.codex/memories/` by default) | Native memories remain excluded; Git project memory is the selected owner |
 | `/btw`, `/side` | Зарегистрированы в native TUI 0.153.4 при `multi_agent_v2=false` и `true`; подробности ниже | Боковой диалог текущей пользовательской сессии не инспектировался |
 | Worktrees | Можно использовать обычные команды Git в Windows CLI | Managed worktrees, Handoff и app local-environment относятся к desktop app |
 | Structured exec | Native help содержит `--output-schema`, `--json`, `--output-last-message`, `--ephemeral`, `--sandbox` | Ни JSONL, ни exit 0 сами по себе не доказывают правильность результата |
@@ -57,6 +57,8 @@ experimental_mode = true
 ```
 
 Начать с one-shot `-c 'features.context_management.experimental_mode=true'` на новом Astra task, затем при подтверждённой доступности подключить выбранное значение в `global/harness.config.toml`. Не смешивать boolean и table на одном TOML-пути. Добавить проверку нужного managed setting в существующие manifest/diagnostics только если без неё жизненный цикл не покрыт. Проверять новый процесс: текущая сессия автоматически не приобретает новый механизм.
+
+Accepted Astra runtime pilot 2.1 already distinguished parser, effective setting, eligibility and sampling `ContextManagement`. Linked source flag is enabled; separate ordinary runtime, false override and profile rollback passed task 2.2 with actual sampling records. Native memories and Fast stay excluded. [Delivery evidence](../../../../docs/evidence/native-context-delivery.md) retains the earlier model-free limitations and setup failures.
 
 Страница моделей указывает opt-in для поддерживаемых клиентов с ChatGPT Plus/Pro и отсутствие Business/Enterprise/API-key sign-in на старте. Схема подтверждает допустимость настройки, но не тариф или право конкретного аккаунта. Фиксировать фактическую subscription route и признак effective activation, доступный текущему runtime. Если такой признак нельзя установить, не выдавать принятие TOML за успешный пилот.
 
@@ -115,7 +117,7 @@ Grok остаётся preferred middle для подходящего делег�
 
 - Устаревшая память подменяет актуальные условия → короткие записи с областью и основанием, проверка изменившихся источников и приоритет текущих инструкций.
 - Индекс превращается в ещё один большой prompt → индекс содержит маршруты, тела читаются по задаче; лишняя запись не обязательна.
-- Пилот принят по TOML, а runtime не включился → отдельные результаты парсера, effective setting, eligibility и наблюдаемого поведения; незавершённая runtime приёмка остаётся открытой.
+- Bounded Astra runtime pilot 2.1 и ordinary runtime/false override/profile rollback 2.2 приняты по отдельным sampling records. Общая lifecycle-приёмка навыков пройдена отдельно; parser/flag/model-free startup сами по себе её не заменяют.
 - Worktree тест затрагивает live proxy → собственные ресурсы и запрет считать filesystem-изоляцию изоляцией глобальных сервисов.
 - Валидный JSON скрывает неверный итог/timeout → natural termination, schema и независимый oracle проверяются отдельно; partial evidence сохраняется.
 - Работа в параллельных сессиях меняет исходники и документы → точечные изменения поверх свежего состояния, без сброса чужого diff; stale граф/диагностика не считаются проверкой.
@@ -124,6 +126,6 @@ Grok остаётся preferred middle для подходящего делег�
 
 1. Создать переносимые skills и примеры, используя `skill-creator`, добавить короткие проектные маршруты и связать существующие записи harness. Новых обязательных сервисов нет.
 2. Подключить через существующий install lifecycle, проверить обнаружение из независимого проекта; поправить managed registration только при необходимости. Источники должны оставаться прямыми, без ручных копий.
-3. Выполнить bounded context pilot и сохранить результаты; переиспользовать уже полученные данные и пользовательское подтверждение для документации `/btw`. Promoted настройка контекста применяется только после подтверждения её работы на выбранной route.
+3. Bounded Astra runtime pilot 2.1, ordinary runtime/false override/profile rollback 2.2 и `/btw` confirmation already exist. Global skill lifecycle also passed, without restoring ordinary hooks, Fast or native memories; final results are in docs/evidence/native-workflows.md.
 4. Проверить Git-memory clone, worktree интеграцию и structured-exec consumer; прогнать соответствующие отказные и lifecycle случаи. Отдельно записать фактическое время и rework; не обещать процент экономии по одному примеру.
 5. Обновить documentation/evidence и закрыть implementation tasks только по результатам. Отключение удаляет свои global registrations и возвращает своё изменённое значение контекста; проектную память и полезные результаты не удаляет. Не останавливать shared services текущих сессий.

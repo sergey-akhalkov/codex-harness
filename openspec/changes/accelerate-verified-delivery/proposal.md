@@ -22,6 +22,8 @@ not required. Its completed runs remain historical evidence. The separate
 decision about retaining the two-consumer quantitative benchmark is pending;
 no repeatable acceleration is claimed.
 
+This reconciliation does not resume opencode-kit work, restore ordinary hooks, or close tasks 5.3, 5.4 or 6.4. Fast remains excluded; OpenAI assignments remain Astra-only.
+
 Playwright CLI, a Git snapshot helper, additional domain skills and larger property/simulation frameworks remain conditional follow-ups. Their adoption criteria and research sources are captured in the design; they are not unconditional deliverables. No new model provider, orchestrator, approval layer, global instruction catalogue or autonomous learning loop is introduced.
 
 ## Capabilities

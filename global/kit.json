@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "profile_name": "harness",
+  "profile": "global/harness.config.toml",
+  "instructions": "global/principles-of-work.md",
+  "skills": ".agents/skills",
+  "agents": "global/agents",
+  "hooks": "global/hooks.json",
+  "token_hooks": "global/rtk-hooks.json"
+}

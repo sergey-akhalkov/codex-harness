@@ -83,6 +83,9 @@ gpt-6-astra = 4
 [projects.'d:\mekha\mtronics\pmac-emulator']
 trust_level = "trusted"
 
+[projects.'c:\users\noilw']
+trust_level = "trusted"
+
 
 # Native base configuration owns the accepted RTK exception and suspension.
 # Avoid a profile override that disagrees with other installed consumers.

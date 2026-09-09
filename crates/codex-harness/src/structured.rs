@@ -1,8 +1,8 @@
 //! Bounded structured Codex inspection helper.
 //!
 //! Native process jobs own the launched prefix and the independent oracle. The
-//! helper records separate final JSON and event JSONL evidence and never calls a
-//! model itself.
+//! helper records separate final JSON and event JSONL evidence. A caller-selected
+//! Codex command performs the explicitly requested model call.
 
 use harness_core::process::{
     Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, StopReason,
@@ -19,30 +19,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-const SCHEMA: &str = r#"{
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["run_id", "findings", "unresolved_issues"],
-  "properties": {
-    "run_id": {"type": "string"},
-    "findings": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["path", "line", "description", "evidence"],
-        "properties": {
-          "path": {"type": "string"},
-          "line": {"type": "integer"},
-          "description": {"type": "string"},
-          "evidence": {"type": "string"}
-        }
-      }
-    },
-    "unresolved_issues": {"type": "array", "items": {"type": "string"}}
-  }
-}"#;
 
 const CLEANUP: Duration = Duration::from_secs(5);
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,6 +39,7 @@ pub struct InspectionRequest {
     pub timeout: u64,
     pub output_limit: u64,
     pub codex_home: Option<PathBuf>,
+    pub schema: PathBuf,
 }
 
 #[derive(Debug)]
@@ -151,8 +128,14 @@ fn execute(
     run_id: &str,
     result: &mut Value,
 ) -> io::Result<()> {
-    let schema_path = evidence.join("inspection.schema.json");
-    fs::write(&schema_path, SCHEMA.as_bytes())?;
+    let schema_path = request.schema.canonicalize()?;
+    let schema_bytes = schema_bytes(&schema_path)?;
+    let schema: Value = serde_json::from_slice(&schema_bytes)
+        .map_err(|_| io::Error::other("invalid inspection schema"))?;
+    if !supported_schema(&schema) {
+        return Err(io::Error::other("unsupported inspection schema contract"));
+    }
+    let schema_hash = hash_bytes(&schema_bytes);
     let before = fingerprint(cwd, &request.inputs)?;
     let git = git_state(cwd)?;
     let final_path = evidence.join("final.json");
@@ -204,7 +187,8 @@ Return the contracted inspection JSON with run_id exactly {run_id}. Do not modif
             "output_limit": request.output_limit,
             "oracle": request.oracle,
             "executable_sha256": hash_file(Path::new(&request.launch[0]))?,
-            "schema_sha256": hash_bytes(SCHEMA.as_bytes()),
+            "schema_path": schema_path,
+            "schema_sha256": schema_hash,
             "codex_home": request
                 .codex_home
                 .as_ref()
@@ -229,10 +213,11 @@ Return the contracted inspection JSON with run_id exactly {run_id}. Do not modif
     let status = if limit_marker.exists() && receipt.get("status") == Some(&json!("exited")) {
         "output-limit".into()
     } else {
-        inspect_result(evidence, run_id, &receipt, request.output_limit)?
+        inspect_result(evidence, run_id, &receipt, request.output_limit, &schema)?
             .unwrap_or_else(|| "oracle-pending".into())
     };
     result["status"] = json!(status);
+    schema_unchanged(&schema_path, &schema_hash, result);
     let after = fingerprint(cwd, &request.inputs)?;
     write_json(&evidence.join("inputs-after.json"), &json!(after))?;
     if before != after {
@@ -272,7 +257,33 @@ Return the contracted inspection JSON with run_id exactly {run_id}. Do not modif
             }
         }
     }
+    schema_unchanged(&schema_path, &schema_hash, result);
     Ok(())
+}
+
+fn schema_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(PROMPT_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > PROMPT_LIMIT {
+        return Err(io::Error::other("inspection schema exceeds its bound"));
+    }
+    Ok(bytes)
+}
+
+fn schema_unchanged(path: &Path, before: &str, result: &mut Value) {
+    if schema_bytes(path)
+        .ok()
+        .map(|bytes| hash_bytes(&bytes))
+        .as_deref()
+        != Some(before)
+    {
+        result["schema_changed"] = json!(true);
+        if result["status"] == "success" || result["status"] == "oracle-pending" {
+            result["status"] = json!("schema-changed");
+        }
+    }
 }
 
 fn inspect_result(
@@ -280,6 +291,7 @@ fn inspect_result(
     run_id: &str,
     receipt: &Value,
     output_limit: u64,
+    schema: &Value,
 ) -> io::Result<Option<String>> {
     let stderr = if evidence.join("stderr.txt").is_file() {
         let mut text = String::new();
@@ -313,7 +325,7 @@ fn inspect_result(
         Ok(value) => value,
         Err(_) => return Ok(Some("malformed-json".into())),
     };
-    if !validate_inspection(&value) {
+    if !validate_schema(&value, schema) {
         return Ok(Some("schema-invalid".into()));
     }
     if value.get("run_id").and_then(Value::as_str) != Some(run_id) {
@@ -550,6 +562,7 @@ fn parse_args(args: &[OsString]) -> io::Result<InspectionRequest> {
             .get("--codex-home")
             .and_then(|v| v.last())
             .map(PathBuf::from),
+        schema: schema_source(values.get("--schema").and_then(|v| v.last()))?,
     })
 }
 
@@ -584,7 +597,7 @@ fn validate_request(request: &InspectionRequest) -> io::Result<()> {
 
 fn command(value: &[String]) -> io::Result<()> {
     if value.is_empty()
-        || value.iter().any(|arg| arg.contains(' '))
+        || value.iter().any(|arg| arg.contains('\0'))
         || !Path::new(&value[0]).is_absolute()
     {
         return Err(io::Error::other(
@@ -668,11 +681,68 @@ fn parse_events(path: &Path) -> io::Result<Vec<Value>> {
     Ok(events)
 }
 
-fn validate_inspection(value: &Value) -> bool {
-    validate_schema(
-        value,
-        &serde_json::from_str(SCHEMA).expect("bundled schema"),
-    )
+fn schema_source(explicit: Option<&String>) -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let build = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("missing executable directory"))?;
+    let installed = if build.join("build.json").exists() {
+        let health = harness_core::build_identity::check(build, None);
+        if !health.runtime_allowed {
+            return Err(io::Error::other(health.action));
+        }
+        Some(harness_core::build_identity::read_record(build)?.source_root)
+    } else {
+        None
+    };
+    match (explicit, installed) {
+        (Some(path), _) => PathBuf::from(path).canonicalize(),
+        (None, Some(source)) => source
+            .join(harness_core::build_identity::INSPECTION_SCHEMA)
+            .canonicalize(),
+        _ => Err(io::Error::other(
+            "unregistered native helper requires --schema with the source skill asset path",
+        )),
+    }
+}
+
+// This helper supports the bounded inspection schema's type/object/array subset.
+// Reject extensions we cannot enforce instead of silently ignoring a new rule.
+fn supported_schema(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    let allowed: &[&str] = match schema.get("type").and_then(Value::as_str) {
+        Some("object") => &["type", "additionalProperties", "required", "properties"],
+        Some("array") => &["type", "items"],
+        Some("string" | "integer") => &["type"],
+        _ => return false,
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return false;
+    }
+    match schema["type"].as_str().unwrap() {
+        "object" => {
+            let (Some(properties), Some(required)) = (
+                schema["properties"].as_object(),
+                schema["required"].as_array(),
+            ) else {
+                return false;
+            };
+            schema["additionalProperties"] == false
+                && required.len() == properties.len()
+                && properties.iter().all(|(name, child)| {
+                    required
+                        .iter()
+                        .filter(|item| item.as_str() == Some(name))
+                        .count()
+                        == 1
+                        && supported_schema(child)
+                })
+        }
+        "array" => supported_schema(&schema["items"]),
+        _ => true,
+    }
 }
 
 fn validate_schema(value: &Value, schema: &Value) -> bool {

@@ -25,7 +25,7 @@
 
 ## 5. Согласовать owning документы и инструкции
 
-- [ ] 5.1 Сверить связанные OpenSpec artifacts памяти, skill evolution и verified delivery; scoped правками устранить противоречащие hooks-off assumptions, сохранив все согласованные outcomes и честные незакрытые задачи. Проверка: diff показывает сохранение требований, unsupported compact/resume delivery остаётся owning blocker, остановленное пользователем исследование не возобновлено, другие change не объявлены завершёнными; применимая strict validation проходит.
+- [x] 5.1 Сверить связанные OpenSpec artifacts памяти, skill evolution и verified delivery; scoped правками устранить противоречащие hooks-off assumptions, сохранив все согласованные outcomes и честные незакрытые задачи. Проверка: diff показывает сохранение требований, unsupported compact/resume delivery остаётся owning blocker, остановленное пользователем исследование не возобновлено, другие change не объявлены завершёнными; применимая strict validation проходит.
 - [ ] 5.2 Свести подробные маршруты к существующим skills/references и коротким глобальным entry points, согласовать `memory_maintenance` и проектные правила. Проверка: relevant task обнаруживает нужный маршрут, unrelated task не загружает весь каталог/всю память, инструкции не копируются между владельцами, ordinary diagnostic/context/Stop hooks и CBM auto index/watch остаются выключенными.
 
 ## 6. Подтвердить качество и оценить полную стоимость

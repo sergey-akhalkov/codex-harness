@@ -8,7 +8,16 @@ use std::{
 };
 
 pub const SCHEMA: u32 = 1;
-pub const BINARIES: &[&str] = &["codex-harness.exe", "harness-rtk.exe"];
+pub const BINARIES: &[&str] = &[
+    "codex-harness.exe",
+    "codex.exe",
+    "harness-rtk.exe",
+    "harness-inspect.exe",
+    "harness-observe.exe",
+];
+// Live source data resolved by native consumers; never embedded in a binary.
+pub const INSPECTION_SCHEMA: &str =
+    ".agents/skills/structured-codex-run/assets/inspection.schema.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +51,7 @@ pub enum Health {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildCheck {
     pub status: Health,
     pub management_allowed: bool,
@@ -180,6 +190,56 @@ pub fn read_record(build: &Path) -> io::Result<BuildRecord> {
     serde_json::from_reader(file).map_err(io::Error::other)
 }
 
+pub(crate) fn verify_record_metadata(record: &BuildRecord) -> io::Result<()> {
+    if record.schema != 1
+        || record.profile != "release"
+        || record.target != "x86_64-pc-windows-msvc"
+        || !record.source_root.is_absolute()
+        || !record.binaries.contains_key("codex-harness.exe")
+        || record.binaries.len() > 64
+        || record.source.files.is_empty()
+        || record.source.sha256 != hash_bytes(&serde_json::to_vec(&record.source.files)?)
+        || record.source.files.keys().any(|p| {
+            p.is_empty()
+                || Path::new(p)
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+        })
+        || record.binaries.keys().any(|name| {
+            !name.ends_with(".exe")
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                || Path::new(name).components().count() != 1
+        })
+    {
+        return Err(io::Error::other(
+            "Unsupported native v1 transport metadata; explicit current Cargo bootstrap is required.",
+        ));
+    }
+    Ok(())
+}
+
+/// Stable v1 transport integrity, independent of this consumer's binary set.
+/// This does not grant runtime permission: the actual consumer must also check
+/// its own compiled contract before reuse or activation.
+pub fn verify_record_integrity(build: &Path) -> io::Result<BuildRecord> {
+    crate::native_build::ordinary_ancestors(build)?;
+    let record = read_record(build)?;
+    verify_record_metadata(&record)?;
+    for (name, expected) in &record.binaries {
+        let path = build.join(name);
+        ordinary(&path)?;
+        if hash_file(&path)? != *expected {
+            return Err(io::Error::other(
+                "Native transport binary integrity mismatch.",
+            ));
+        }
+    }
+    Ok(record)
+}
+
 pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
     let record = match read_record(build) {
         Ok(record) => record,
@@ -265,6 +325,8 @@ pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
 mod tests {
     use super::*;
     fn source(root: &Path) {
+        fs::create_dir_all(root.join(INSPECTION_SCHEMA).parent().unwrap()).unwrap();
+        fs::write(root.join(INSPECTION_SCHEMA), "{}").unwrap();
         fs::create_dir_all(root.join("crates/test/src")).unwrap();
         fs::create_dir_all(root.join("tools/rtk-adapter/src")).unwrap();
         for path in [
@@ -316,6 +378,10 @@ mod tests {
                 .contains_key("crates/test/src/examples/mod.rs")
         );
         assert!(changed.files.contains_key("crates/test/src/banner.md"));
+        fs::write(temp.path().join(INSPECTION_SCHEMA), "{\"type\":\"object\"}").unwrap();
+        let schema_changed = source_identity(temp.path()).unwrap();
+        assert_eq!(schema_changed, changed);
+        assert!(!schema_changed.files.contains_key(INSPECTION_SCHEMA));
     }
     #[test]
     fn stale_source_allows_repair_but_altered_manager_does_not() {

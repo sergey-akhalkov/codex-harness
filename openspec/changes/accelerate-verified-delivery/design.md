@@ -105,6 +105,8 @@ Before/after hook measurements pin the same project workload, skill configuratio
 
 Skill comparisons run on the same accepted capability selection in both arms: the durable hooks-off default now owned by `reduce-subscription-waste`. Completed stabilized-hook comparisons remain historical evidence, not a restoration prerequisite. Any future candidate hook comparison is isolated and cannot reactivate the global configuration. A report must not attribute combined gains entirely to skills. Applicable consuming-task checks remain required; silence does not establish diagnostic correctness.
 
+The accepted capability selection also keeps Fast off, native memories off, CBM automatic index/watch off, and OpenAI assignments Astra-only. The remaining quantitative decision is whether to retain a two-consumer benefit benchmark after opencode-kit support was withdrawn; that decision is pending and does not authorize further opencode-kit runs.
+
 ### 6. Global delivery is an actual consumer test
 
 Use the existing linked installer discovery and ownership mechanisms. New registration reconciliation, resource resolution, source-body update visibility, paths with spaces/Unicode, foreign collisions, disconnect and reconnect are checked in isolated installation homes before normal global activation. Rollback removes only owned links and restores previous registrations; sources and unrelated user state survive.
@@ -128,7 +130,7 @@ Then start fresh ordinary native Codex sessions outside the harness in recorded 
 - **Noisy model and subscription data:** equivalent arms, repeated benefit cases, per-case variation and unknown usage; no fabricated quota conversion.
 - **Contaminated comparisons:** inspect actual discovery, reset case-owned state and separate hook changes from skill treatment.
 - **Second consumer is only lint-capable:** scope its evidence honestly; require real process regression consumption elsewhere and do not claim application correctness.
-- **Dependency timing:** skills can progress independently, but integrated acceptance remains dependent on diagnostic repair; no competing edits to its files.
+- **Dependency timing:** skills can progress independently. Historical diagnostic-hook repair remains archived evidence and is not a restoration prerequisite. Remaining open tasks 5.3, 5.4 and 6.4 wait on the pending two-consumer quantitative decision, not on restoring ordinary hooks.
 
 ## Migration Plan
 

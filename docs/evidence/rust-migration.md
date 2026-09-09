@@ -6,6 +6,22 @@ unimplemented lifecycle or foreign-integration requirements.
 
 ## Selected inputs and ownership
 
+The [native PATH primitive and atomic receipts](rust-environment-path.md) have
+owned-key publication, rollback/conflict and killed-process evidence, including
+one KTM transaction for the registry write and confirming file. Installer
+journal orchestration and global activation remain open.
+
+The [native outcome report](rust-outcome-report.md) now preserves attempts,
+verification/retry timing and comparison exclusions through an explicit local
+CLI consumer. The [native usage parser](rust-delegation-usage.md) now passes
+ported CLI cases and a real closed-log comparison. The [native single-attempt
+executor](rust-outcome-run.md) uses owned jobs and separate event/process
+evidence. [Native discovery](rust-outcome-discovery.md) now verifies the selected
+home, skill/config responses and unchanged inputs through installed CLI 0.153.4.
+[Arm preparation](rust-outcome-arm.md) now consumes schema 1/2 installation link
+checks and exact configuration publication, verified against both native modes.
+Task 7.3 still requires suite/oracle migration and the remaining integrations.
+
 The input receipt at
 `%LOCALAPPDATA%/codex-harness-evidence/rust-inputs-62dc5d72165947b88d7e400181e180fa/inputs.json`
 records HEAD `dfc2d6af49f2da949b2b1b0ed549a33c62d1eb4b`, the exact capture time,
@@ -164,9 +180,60 @@ selection, already damaged starting states and foreign conflicts are also
 covered by the deterministic library tests. This is process-boundary recovery
 evidence, not a simulated power-loss guarantee or global cutover.
 
-Tasks 2.1, 2.3, 2.4 and 2.5 are closed for this native foundation. Runtime
-task 2.2 still needs the ordinary native launcher. Global lifecycle, foreign
-integration parity and final combined acceptance remain unfinished.
+Task 2.3 was reopened after an actual old-producer/new-consumer counterexample:
+`%LOCALAPPDATA%/codex-harness-evidence/update-producer-4c889ee82b54442191819ce9d3eabb3c/`.
+A copied old manager was healthy, became source-stale after current Rust inputs
+were overlaid, then built and selected a candidate with exit 0. Its old validator
+reported healthy; the actual new manager reported incompatible with both runtime
+and management disabled. The old producer omitted the new `harness-observe.exe`
+and used its own source-identity rules. Global registrations were untouched.
+The [native version handoff](rust-self-update.md) now passes the real transition,
+cross-version recovery and independent review. A second reproduced P1 in
+indeterminate predecessor classification was corrected and checked before task
+2.3 closed again; previous same-contract repair evidence remains valid.
+
+Tasks 2.1 through 2.5 are closed for the native foundation. The subsequent
+[native launcher acceptance](rust-launcher.md) supplies task 2.2's ordinary
+launch, complete input/build identity and actual outside-checkout CLI evidence.
+Global lifecycle, foreign integration parity and final combined acceptance
+remain unfinished.
 
 The next increment verifies the [native OpenCodex validation boundary](rust-opencodex.md).
 It leaves browser-only OAuth, restoration and the rest of task 3.1 open.
+The [structured Rust helper](rust-structured.md) also passed an actual Astra
+schema-constrained consumer; native skill registration remains unfinished.
+The [native core data inventory](rust-inventory.md) reads current links and
+descriptors through a declarative manifest; installation mutation remains open.
+The [installation mutex](rust-installation-lock.md) now serializes that native
+consumer with the old installer. [Legacy metadata inspection](rust-installation-state.md)
+retains host, dependency-owner and adopted-link distinctions without mutation.
+The [native registration foundation](rust-registration.md) now verifies owned
+link staging/publication/recovery, including real process interruption and
+same-target competing actors. Full configuration and installer integration,
+relocation and global activation remain open in tasks 4.1 through 4.3.
+The [native feature editor](rust-feature-edit.md) prepares and verifies Hooks and
+Code Mode candidates through the actual upstream CLI, preserving unrelated
+configuration. Its [existing-file publication](rust-config-file.md) now verifies
+atomic writes, guarded rollback and abrupt process termination. The registration
+journal now includes those configuration changes and passes interrupted combined
+recovery. [Absent configuration creation](rust-config-creation.md) now shares
+the journal and passes mixed interrupted recovery, foreign conflict, alias and
+immediate reconnection checks. [Existing-link replacement/removal](rust-link-changes.md)
+then adds original-object rollback, including interrupted publication and an
+unavailable old checkout. [Finish](rust-registration-finish.md) adds
+irreversible commitment and restartable cleanup with an explicit old-reader
+version boundary. The current [schema 8 metadata builder](rust-registration-metadata.md)
+also persists reused IDs and feeds the [stable ownership document](rust-installation-metadata.md),
+including a verified isolated legacy conversion. Complete installer orchestration
+and PATH journal integration remain open.
+
+The combined checkpoint after the launcher/inventory increments passed
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --offline
+--locked --jobs 1 -- -D warnings`, and `cargo test --workspace --offline --locked
+--jobs 1 -- --test-threads=1`: 55 tests passed. The explicit installed OpenCodex
+test is ignored by the default suite; its separate accepted run is linked above.
+This checkpoint precedes the concurrent regression-helper integration and does
+not replace the still-required final global migration acceptance.
+The [Rust regression observer](rust-regression.md) subsequently passed its nine
+scoped tests, including parent-requested preservation corrections. Global skill
+invocation and final combined acceptance remain open.

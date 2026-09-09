@@ -36,6 +36,8 @@ Workflow promotion SHALL use a predeclared task, input identity, independent ora
 
 Reports SHALL distinguish measured tokens, estimated tokens, response size, elapsed time and subscription consumption. Unavailable measurements SHALL remain unknown. Completion SHALL include delivered required routes, their correctness evidence, the declared decisions for optional candidates and applicable global checks. Optional rejection MUST NOT close an unrelated mandatory requirement or transfer historical evidence to changed inputs. The selected hooks, resources, model families, provider routes and billing SHALL remain unchanged unless separately authorized.
 
+The selected hooks remain the durable ordinary-off default with the accepted RTK exception only. CBM automatic index/watch, Fast and native memories SHALL stay disabled. OpenAI assignments SHALL remain Astra-only.
+
 #### Scenario: Only response-size evidence exists
 - **WHEN** a comparison measures output bytes but cannot observe attributable native token or subscription use
 - **THEN** the report describes the byte reduction and measurement limits without claiming a corresponding session or weekly-quota saving

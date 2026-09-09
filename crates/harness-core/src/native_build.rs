@@ -1,12 +1,11 @@
 //! Explicit candidate preparation. This module never changes active registrations.
 //! Compiler concurrency stays within the installation's fixed resource budget.
-use crate::build_identity::{self, BINARIES, BuildRecord, SCHEMA};
+use crate::build_identity::{self, BINARIES};
 use crate::process::{
     Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, StopReason,
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
     ffi::OsStr,
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -16,6 +15,18 @@ use std::{
 
 const OWNER: &[u8] = b"codex-harness-native-state-v1\n";
 const TARGET: &str = "x86_64-pc-windows-msvc";
+
+#[path = "native_handoff.rs"]
+mod handoff;
+
+// Shared bounded execution for explicit management operations. Configuration
+// preparation uses the same job/output protections as build handoff.
+pub(crate) use handoff::invoke as invoke_management;
+
+/// Versioned internal command executed only by the fresh compiler output.
+pub fn finalize(request: &Path) -> io::Result<()> {
+    handoff::finalize(request)
+}
 
 fn verify_compiled_inputs(
     target: &Path,
@@ -292,7 +303,7 @@ fn find_reusable(
         {
             continue;
         }
-        if build_identity::check(&path, Some(source)).runtime_allowed {
+        if consumer_check(&path, Some(source)).is_ok_and(|check| check.runtime_allowed) {
             return Ok(Some(PreparedBuild {
                 build: path,
                 reused: true,
@@ -301,6 +312,130 @@ fn find_reusable(
         }
     }
     Ok(None)
+}
+
+/// Run an integrity-verified candidate's model-free Check during explicit
+/// management. Ordinary launch and public Check never call this function.
+pub fn consumer_check(
+    build: &Path,
+    source: Option<&Path>,
+) -> io::Result<build_identity::BuildCheck> {
+    let before = build_identity::verify_record_integrity(build)?;
+    let receipt_hash = build_identity::hash_file(&build.join("build.json"))?;
+    let evidence = tempfile::Builder::new().prefix("hcc-").tempdir()?;
+    let mut command = CommandSpec::new(build.join("codex-harness.exe"));
+    command.args = vec![
+        "check".into(),
+        "--build".into(),
+        build.as_os_str().to_owned(),
+    ];
+    if let Some(source) = source {
+        command
+            .args
+            .extend(["--source".into(), source.as_os_str().to_owned()]);
+    }
+    let output = evidence.path().join("stdout.json");
+    let result = handoff::invoke(
+        command,
+        &evidence.path().join("stderr.log"),
+        Some(&output),
+        Duration::from_secs(10),
+    );
+    let verified = (|| {
+        let result = result?;
+        let report: build_identity::BuildCheck =
+            serde_json::from_slice(&handoff::bounded_bytes(&output)?)?;
+        if result.reason != StopReason::Exited
+            || result.exit_code != if report.runtime_allowed { 0 } else { 1 }
+            || report.runtime_allowed != (report.status == build_identity::Health::Healthy)
+            || (report.runtime_allowed && !report.management_allowed)
+            || receipt_hash != build_identity::hash_file(&build.join("build.json"))?
+            || build_identity::verify_record_integrity(build)?.binaries != before.binaries
+        {
+            return Err(io::Error::other(
+                "Candidate Check response or integrity is inconsistent.",
+            ));
+        }
+        Ok(report)
+    })();
+    verified.map_err(|error| {
+        let path = evidence.keep();
+        io::Error::other(format!(
+            "Actual candidate Check failed: {error}; see {}",
+            path.display()
+        ))
+    })
+}
+
+/// Hand selection to the actual verified consumer before it acquires the lock.
+/// A different release's compiled validator cannot authorize this candidate.
+pub fn activate_candidate(
+    state: &Path,
+    build: &Path,
+) -> io::Result<crate::build_selection::Selection> {
+    verify_owned_state(state)?;
+    ordinary_ancestors(build)?;
+    let build = build.canonicalize()?;
+    let state = state.canonicalize()?;
+    if build.parent() != Some(state.join("builds").canonicalize()?.as_path()) {
+        return Err(io::Error::other(
+            "Candidate must be published in the selected owned state.",
+        ));
+    }
+    build_identity::verify_record_integrity(&build)?;
+    let manager = build.join("codex-harness.exe");
+    if manager.canonicalize()? == std::env::current_exe()?.canonicalize()? {
+        return crate::build_selection::activate(&state, &build);
+    }
+    let check = consumer_check(&build, None)?;
+    if !check.runtime_allowed {
+        return Err(io::Error::other(check.action));
+    }
+    let evidence = tempfile::Builder::new().prefix("hca-").tempdir()?;
+    let mut command = CommandSpec::new(manager);
+    command.args = vec![
+        "activate-build".into(),
+        "--state".into(),
+        state.as_os_str().to_owned(),
+        "--build".into(),
+        build.as_os_str().to_owned(),
+    ];
+    let output = evidence.path().join("stdout.json");
+    let result = handoff::invoke(
+        command,
+        &evidence.path().join("stderr.log"),
+        Some(&output),
+        Duration::from_secs(15),
+    );
+    let verified = (|| {
+        let result = result?;
+        if result.reason != StopReason::Exited || result.exit_code != 0 {
+            return Err(io::Error::other(
+                "Candidate selection did not complete; inspect retained state before recovery.",
+            ));
+        }
+        let report: crate::build_selection::Selection =
+            serde_json::from_slice(&handoff::bounded_bytes(&output)?)?;
+        let pointer: serde_json::Value =
+            serde_json::from_slice(&handoff::bounded_bytes(&state.join("active-build.json"))?)?;
+        if report.build.as_ref() != Some(&build)
+            || pointer["schema"] != 1
+            || pointer["build"].as_str() != build.file_name().and_then(|s| s.to_str())
+            || pointer["record_sha256"] != build_identity::hash_file(&build.join("build.json"))?
+        {
+            return Err(io::Error::other(
+                "Candidate selection response does not match its actual pointer.",
+            ));
+        }
+        Ok(report)
+    })();
+    verified.map_err(|error| {
+        let path = evidence.keep();
+        io::Error::other(format!(
+            "Native selection handoff failed: {error}; see {}",
+            path.display()
+        ))
+    })
 }
 
 /// Build into installation-owned state, then publish an immutable candidate.
@@ -430,36 +565,23 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
             "Native sources changed during the build; candidate not accepted. Retry explicit build with stable inputs.",
         ));
     }
-    verify_compiled_inputs(&target, &source, &before)?;
-    let mut binaries = BTreeMap::new();
-    for name in BINARIES {
-        let built = target.join(TARGET).join("release").join(name);
-        ordinary_ancestors(&built)?;
-        let candidate = staging.join(name);
-        fs::copy(built, &candidate)
-            .map_err(|e| io::Error::other(format!("Staging native binary {name} failed: {e}")))?;
-        binaries.insert((*name).to_owned(), build_identity::hash_file(&candidate)?);
-    }
-    let record = BuildRecord {
-        schema: SCHEMA,
-        source_root: source.clone(),
-        source: before,
+    let compiled_manager = target.join(TARGET).join("release/codex-harness.exe");
+    ordinary_ancestors(&compiled_manager)?;
+    let record = handoff::run(handoff::Request {
+        schema: 1,
+        source: source.clone(),
+        target: target.clone(),
+        staging: staging.clone(),
+        before: before.clone(),
         rustc,
         cargo: cargo_version,
-        target: TARGET.into(),
+        build_target: TARGET.into(),
         profile: "release".into(),
-        binaries,
-    };
-    let mut receipt = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staging.join("build.json"))?;
-    receipt.write_all(&serde_json::to_vec_pretty(&record)?)?;
-    receipt.sync_all()?;
-    drop(receipt);
-    if !build_identity::check(&staging, Some(&source)).runtime_allowed {
+        manager_sha256: build_identity::hash_file(&compiled_manager)?,
+    })?;
+    if build_identity::source_identity(&source)? != before {
         return Err(io::Error::other(
-            "Native candidate verification failed; active installation preserved.",
+            "Native sources changed during finalization; active installation preserved.",
         ));
     }
     let builds = state.join("builds");

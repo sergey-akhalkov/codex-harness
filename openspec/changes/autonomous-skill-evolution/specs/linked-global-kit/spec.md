@@ -19,6 +19,7 @@ A new Codex process SHALL consume edited contents of already connected source fi
 #### Scenario: An accepted skill changes in a running session
 - **WHEN** the autonomous workflow activates a created, updated or restored skill
 - **THEN** the current session can apply the accepted revision before its next relevant action and recover it after compaction without requiring a new process
+- **AND** recovery uses a currently allowed ordinary-CLI path; restoring ordinary diagnostic, context or Stop hooks, or substituting App Server-only success, does not satisfy this scenario
 
 ## ADDED Requirements
 

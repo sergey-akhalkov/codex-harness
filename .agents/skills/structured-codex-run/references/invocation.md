@@ -1,5 +1,17 @@
 # Bounded inspection helper
 
+During the kit's Rust migration, an explicitly prepared native candidate also
+provides `harness-inspect.exe` with the flags below. Use its verified absolute
+path instead of `$pythonExe $runScript`; the oracle remains a caller-selected
+command array. It uses Windows Job containment directly, with no PowerShell or
+Python prerequisite for the helper itself. It reads the schema from its verified
+build's source checkout. For a development binary without a build receipt, pass
+`--schema <absolute installed skill asset path>` explicitly. It passes that
+source path directly to Codex, records its hash and rejects changes during the
+run. Unsupported schema extensions fail before launch; they are never silently
+ignored. Global native command registration is still pending, so do not assume
+this executable is already on PATH.
+
 `scripts/run.py` uses the bundled fixed inspection schema and the existing Windows process observer. Pass a JSON array for the launch prefix: either an absolute native Codex `.exe`, or an absolute `pwsh.exe` plus `-NoProfile -File` and the installed launcher path. There is no shell-command string parsing. Resolve the original CLI through the kit installation receipt when PATH points to a wrapper; record its version with `--version` before the run.
 
 Example with caller-resolved paths and an already authorized route:

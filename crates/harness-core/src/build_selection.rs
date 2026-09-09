@@ -32,7 +32,8 @@ struct Journal {
     rollback_usable: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Selection {
     pub build: Option<PathBuf>,
     pub changed: bool,
@@ -103,7 +104,13 @@ fn finish_journal(state: &Path, receipt: &[u8]) -> io::Result<()> {
 
 fn verified_previous(state: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let build = pointer_path(state, bytes)?;
-    let check = build_identity::check(&build, None);
+    let mut check = build_identity::check(&build, None);
+    if check.status == Health::Incompatible {
+        // A v1 predecessor may have a different compiled binary/input set.
+        // Verify every recorded artifact before asking that exact manager.
+        // Runtime validation stays with its owning consumer.
+        check = native_build::consumer_check(&build, None)?;
+    }
     if !matches!(
         check.status,
         Health::Healthy | Health::SourceStale | Health::SourceUnavailable
@@ -162,6 +169,42 @@ pub fn selected(state: &Path) -> io::Result<PathBuf> {
     Ok(build)
 }
 
+/// Only observed missing/changed owned bytes establish a damaged predecessor.
+/// Unsupported metadata, unreadable files, and failed checks are indeterminate
+/// and must stop selection before its journal or pointer is written.
+fn predecessor_rollback_usable(state: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let (build, pointer) = pointer_reference(state, bytes)?;
+    let record = match build_identity::read_record(&build) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "Unknown predecessor metadata or unreadable record; preserving selection: {error}"
+            )));
+        }
+    };
+    build_identity::verify_record_metadata(&record).map_err(|error| {
+        io::Error::other(format!(
+            "Unknown predecessor metadata; preserving selection: {error}"
+        ))
+    })?;
+    if build_identity::hash_file(&build.join("build.json"))? != pointer.record_sha256 {
+        return Ok(false);
+    }
+    for (name, expected) in &record.binaries {
+        let path = build.join(name);
+        native_build::ordinary_ancestors(&path)?;
+        match build_identity::hash_file(&path) {
+            Ok(actual) if actual == *expected => (),
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    verified_previous(state, bytes)?;
+    Ok(true)
+}
+
 fn stage(state: &Path, build: &Path) -> io::Result<Journal> {
     if read_optional(&state.join(JOURNAL))?.is_some() {
         return Err(io::Error::other(
@@ -180,14 +223,11 @@ fn stage(state: &Path, build: &Path) -> io::Result<Journal> {
         return Err(io::Error::other(check.action));
     }
     let before = read_optional(&state.join(ACTIVE))?;
-    if let Some(bytes) = &before {
-        // Ownership of the pointer is independent of the old executable's health:
-        // explicit bootstrap must be able to replace an altered/missing manager.
-        pointer_reference(state, bytes)?;
-    }
     let rollback_usable = before
         .as_ref()
-        .is_none_or(|bytes| verified_previous(state, bytes).is_ok());
+        .map(|bytes| predecessor_rollback_usable(state, bytes))
+        .transpose()?
+        .unwrap_or(true);
     let after = serde_json::to_vec_pretty(&Pointer {
         schema: 1,
         build: build
@@ -297,6 +337,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let source = temp.path().join("source");
+        let schema = source.join(build_identity::INSPECTION_SCHEMA);
+        fs::create_dir_all(schema.parent().unwrap()).unwrap();
+        fs::write(schema, "{}").unwrap();
         fs::create_dir_all(source.join("crates/one/src")).unwrap();
         fs::create_dir_all(source.join("tools/rtk-adapter/src")).unwrap();
         for name in ["Cargo.toml", "Cargo.lock", "crates/one/src/lib.rs"] {
@@ -437,6 +480,114 @@ mod tests {
         assert!(recover(&state).is_err());
         assert_eq!(fs::read(state.join(ACTIVE)).unwrap(), active);
         assert!(state.join(JOURNAL).exists());
+    }
+
+    #[test]
+    fn unknown_predecessor_metadata_preserves_selection_and_both_builds() {
+        for unknown_field in ["schema", "top-level", "nested-source"] {
+            let (_temp, state, a, b) = fixture();
+            activate(&state, &a).unwrap();
+            let mut pointer: Pointer =
+                serde_json::from_slice(&fs::read(state.join(ACTIVE)).unwrap()).unwrap();
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(a.join("build.json")).unwrap()).unwrap();
+            match unknown_field {
+                "top-level" => record["future_contract"] = true.into(),
+                "nested-source" => record["source"]["future_contract"] = true.into(),
+                _ => record["schema"] = 2.into(),
+            }
+            let bytes = serde_json::to_vec(&record).unwrap();
+            fs::write(a.join("build.json"), &bytes).unwrap();
+            pointer.record_sha256 = build_identity::hash_bytes(&bytes);
+            let pointer = serde_json::to_vec_pretty(&pointer).unwrap();
+            fs::write(state.join(ACTIVE), &pointer).unwrap();
+            let error = activate(&state, &b).unwrap_err();
+            assert!(error.to_string().contains("Unknown predecessor"));
+            assert_eq!(fs::read(state.join(ACTIVE)).unwrap(), pointer);
+            assert_eq!(fs::read(a.join("build.json")).unwrap(), bytes);
+            assert!(b.join("codex-harness.exe").is_file());
+            assert!(!state.join(JOURNAL).exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn indeterminate_legacy_check_never_becomes_confirmed_damage() {
+        use crate::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
+        use std::time::Duration;
+        for mode in ["malformed", "timeout"] {
+            let (temp, state, a, b) = fixture();
+            let root = temp.keep();
+            let source = root.join("predecessor.rs");
+            fs::write(&source, include_str!("../tests/fixtures/predecessor.rs")).unwrap();
+            let rustc = std::process::Command::new("where.exe")
+                .arg("rustc.exe")
+                .output()
+                .unwrap();
+            let rustc = String::from_utf8(rustc.stdout).unwrap();
+            let mut command = CommandSpec::new(PathBuf::from(rustc.lines().next().unwrap()));
+            command.args = vec![
+                source.as_os_str().to_owned(),
+                "--edition=2024".into(),
+                "-o".into(),
+                a.join("codex-harness.exe").into_os_string(),
+            ];
+            let log = fs::File::create(root.join("compile.log")).unwrap();
+            command.stdout = Some(log.try_clone().unwrap());
+            command.stderr = Some(log);
+            let job = Job::new(Limits {
+                memory_bytes: Some(512 * 1024 * 1024),
+                cpu_percent: Some(50.0),
+            })
+            .unwrap();
+            let child = job.spawn(&command).unwrap();
+            let outcome = job
+                .wait(
+                    &child,
+                    Deadline::after(Duration::from_secs(30)).unwrap(),
+                    &Cancellation::default(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!((outcome.reason, outcome.exit_code), (StopReason::Exited, 0));
+            fs::write(a.join("failure-mode.txt"), mode).unwrap();
+            let mut record = build_identity::read_record(&a).unwrap();
+            record.binaries.remove("harness-observe.exe");
+            record.binaries.insert(
+                "codex-harness.exe".into(),
+                build_identity::hash_file(&a.join("codex-harness.exe")).unwrap(),
+            );
+            fs::write(
+                a.join("build.json"),
+                serde_json::to_vec_pretty(&record).unwrap(),
+            )
+            .unwrap();
+            let pointer = serde_json::to_vec_pretty(&Pointer {
+                schema: 1,
+                build: "a".into(),
+                record_sha256: build_identity::hash_file(&a.join("build.json")).unwrap(),
+            })
+            .unwrap();
+            fs::write(state.join(ACTIVE), &pointer).unwrap();
+            assert!(build_identity::verify_record_integrity(&a).is_ok());
+            let result = activate(&state, &b);
+            let observed = serde_json::json!({"mode":mode, "activation_accepted":result.is_ok(), "error":result.as_ref().err().map(ToString::to_string), "pointer_preserved":fs::read(state.join(ACTIVE)).unwrap()==pointer, "journal_present":state.join(JOURNAL).exists()});
+            fs::write(
+                root.join("predecessor-result.json"),
+                serde_json::to_vec_pretty(&observed).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                result.is_err(),
+                "indeterminate predecessor accepted; evidence {}",
+                root.display()
+            );
+            assert_eq!(fs::read(state.join(ACTIVE)).unwrap(), pointer);
+            assert!(!state.join(JOURNAL).exists());
+            assert!(a.join("codex-harness.exe").is_file());
+            assert!(b.join("codex-harness.exe").is_file());
+            println!("predecessor refusal evidence {}", root.display());
+        }
     }
 
     #[test]

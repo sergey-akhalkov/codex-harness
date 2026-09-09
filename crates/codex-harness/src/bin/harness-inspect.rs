@@ -127,6 +127,14 @@ fn run_fixture(args: &[std::ffi::OsString]) -> io::Result<i32> {
             std::thread::sleep(Duration::from_secs(30));
         }
         "changed" => fs::write("input.txt", "changed")?,
+        "schema-changed" => {
+            use std::io::Write;
+            let path = arg_value(&argv, "--output-schema")?;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)?
+                .write_all(b"\n")?;
+        }
         _ => {}
     }
     match mode {

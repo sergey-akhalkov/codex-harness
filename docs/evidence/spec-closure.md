@@ -103,3 +103,27 @@ model probes, service stop and paid-API checks were not rerun. Historical
 private receipts remain on disk; this audit did not reopen live subscription
 destructive probes. Concurrent unrelated dirty work was preserved and not
 committed.
+
+## Native workflows — 2026-09-09
+
+Archived [adopt-project-memory-and-native-workflows](../../openspec/changes/archive/2026-09-09-adopt-project-memory-and-native-workflows/proposal.md)
+after all 16 tasks passed their applicable checks. The
+[requirement map](native-workflows.md) links actual Git-memory/fresh-clone,
+worktree/conflict, structured Astra and experimental-context/override/rollback
+consumers. The final owned lifecycle and ordinary native discovery preserve
+project memory, user configuration and unrelated capabilities; the real global
+core Check reports 19 links, 12 skills and three agents without proxy restart.
+
+The four new main specs contain all 15 requirements and 25 scenarios from the
+accepted deltas. Exact post-sync comparison and strict validation passed:
+18 main specs, zero failures. The move retained `.openspec.yaml`, adjusted nine
+documents' relative links, and the subsequent reference check resolved 163
+local file targets. The owned lifecycle evidence includes `archive-receipt.json`
+with the source/target and pre-move file hashes. Runtime observations stay in
+the owning evidence/design; main specs retain behavioral requirements.
+
+Four other changes remain active: `migrate-harness-to-rust`,
+`improve-installed-tool-workflows`, `autonomous-skill-evolution` and
+`accelerate-verified-delivery`. This archive does not declare them complete.
+The requested main-repository commit/push still follows completion of all active
+changes; no main-repository commit or push was made by this archive.

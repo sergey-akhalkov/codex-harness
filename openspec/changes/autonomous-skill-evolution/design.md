@@ -7,10 +7,10 @@
 - [Манифест](../../../global/kit.psd1) задаёт `.agents/skills` как источник. `Get-HarnessInventory` в [tools/kit.psm1](../../../tools/kit.psm1) перечисляет непосредственные каталоги скиллов, проверяет `SKILL.md` и запрещает reparse points в исходниках. Нельзя просто заменить исходную папку ссылкой на произвольное хранилище версий.
 - [Установщик](../../../install.ps1) имеет Install/Update/Check/Disconnect/Recover, сериализует операции по владельцу установки и разделяет core, MCP/LSP и подписки. Для нового скилла нужен узкий путь согласования регистраций; запуск всего Update из каждого обучения затронул бы лишние сервисы и зависимости.
 - [Основная спека](../../specs/linked-global-kit/spec.md) требует прямое чтение исходников и сохранение чужих файлов; до этого изменения не требовала обновлять контекст работающей сессии. Delta меняет только гарантию для скиллов, активируемых новым workflow.
-- [hooks.json](../../../global/hooks.json) сейчас обслуживает диагностику через PreToolUse/PostToolUse/Stop/SubagentStop. [tools/hook.ps1](../../../tools/hook.ps1) принимает `pre`, `post`, `stop`. Обработку каталога следует сделать отдельной по ответственности, сохранив действующую диагностику и её сообщения о неполной проверке.
+- [hooks.json](../../../global/hooks.json) сейчас пустой (`{"hooks":{}}`) и сохраняется для ownership/relocation. Ordinary diagnostic/context/Stop handlers remain OFF. The only accepted exception is the narrow RTK PreToolUse adapter in `global/rtk-hooks.json`. Catalogue delivery cannot restore those ordinary hooks; unsupported compact/resume delivery stays an owning blocker.
 - [Проверки consumers](../../../tests/consumer.Tests.ps1) и [source diagnostics](../../../tools/source-diagnostics.psm1) уже используют `skills/list` с `forceReload`. Это основа протокольной проверки; она не доказывает применение нового скилла в старом TUI-потоке. [consumer-rpc.ps1](../../../tests/consumer-rpc.ps1) содержит ограниченный RPC consumer, а `tests/` — проверки installer, hooks, ConPTY и outcome-сценариев.
-- [Git-память проекта](../adopt-project-memory-and-native-workflows/specs/git-project-memory/spec.md) спроектирована в соседнем незавершённом change. Здесь используем её модель владельца и существующие записи, но не объявляем её реализацию завершённой и не создаём обязательную зависимость от native memories.
-- Codebase Memory был обновлён, но затем сообщил `metadata_changed` и несогласованную generation; граф не использован для окончательных утверждений. Активная Serena поддерживала Python; точки PowerShell проверены через harness-lsp и целевые чтения текущего текста. Во время планирования исходники и действующая конфигурация не изменялись.
+- [Git-память проекта](../archive/2026-09-09-adopt-project-memory-and-native-workflows/specs/git-project-memory/spec.md) имеет принятую bounded приёмку 1.3/1.4. Здесь используем её модель владельца и существующие записи, но не объявляем глобальную поставку завершённой и не создаём обязательную зависимость от native memories.
+- Codebase Memory automatic index/watch remain OFF; graph freshness is explicit `index_repository` only. Активная Serena поддерживала Python; harness-lsp is retired from managed install and is not a required backend. Planning observations are not current runtime proof after later source changes.
 
 ### Основания и границы внешних источников
 
@@ -120,7 +120,11 @@ Baseline/candidate получают отдельные свежие контек
 
 После публикации workflow явно читает окончательный descriptor и выдаёт в текущий контекст запись `name / applicability / canonical path / revision`, затем продолжает подходящую работу. Это покрывает создание агентом в середине текущего turn. Для изменений от ребёнка/другого writer обработчик PostToolUse доставляет revision delta перед следующим действием. Пропущенное событие обнаруживается проверкой ревизии перед повторным использованием скилла.
 
+Owned probe 1.1 proved that path on CLI 0.153.4 through trusted SessionStart/UserPromptSubmit/PostToolUse additionalContext, including compact and resume. Current user policy keeps ordinary diagnostic/context/Stop hooks OFF, so that demonstrated path is not a global delivery mechanism. The required same-session compact/resume/child outcome remains; if no supported hooks-off replacement is established, tasks 5.2–5.4 and 7.2 stay open as owning blockers. Official Codex docs still document SessionStart sources `startup`, `resume`, `clear` and `compact`, and additionalContext on those events; this is the documented contract, not authorization to restore ordinary hooks.
+
 Однократно установленный SessionStart handler обслуживает startup/resume/compact и восстанавливает каталог из текущих файлов; при `source=compact` требуется доставка до непосредственного продолжения, включая automatic mid-turn compaction. Использование этих событий и формата additionalContext проверяется на target CLI; нельзя выводить поддержку из наличия похожего события в другом клиенте. Для App Server clients отдельно используется invalidation + `skills/list(forceReload=true)`. Вызов в постороннем server-процессе не является fallback для живого CLI.
+
+A SessionStart/PostToolUse handler is not currently installable under the durable hooks-off default. Implementation must either prove a supported ordinary-CLI path that does not restore those hooks, or leave compact/resume delivery incomplete. App Server `skills/list(forceReload=true)` remains a separate client check and is not a CLI fallback.
 
 Catalogue metadata передаётся как явно обозначенные данные в фиксированном доверенном шаблоне; экранируются поля и разделители, не вставляются сырые внешние инструкции как новые правила. Перед применением агент читает body. Новая ревизия заменяет прежнюю для следующего использования, а уже законченный результат сохраняет исходную атрибуцию.
 
@@ -136,20 +140,22 @@ Catalogue metadata передаётся как явно обозначенные
 
 Установка самого workflow, policy и session handlers входит в обычный kit lifecycle. Проверка и отключение сохраняют все project records/skills. Релокация harness обновляет связи и сбрасывает производные сведения с прежними путями. Сторонние hooks/skills и действующая диагностика должны продолжать работать.
 
+Session handlers cannot restore ordinary diagnostic/context/Stop hooks. Foreign RTK/user hooks and project records remain intact; disabled ordinary diagnostics stay disabled rather than being preserved as an active stack.
+
 ## Risks / Trade-offs
 
 - **Закрепление ошибочного или вредоносного вывода** → evidence routing, фиксированные oracles, непересекающийся acceptance case и защита контролирующих файлов. Это проверка процесса, а не обещание отсутствия любых ошибок модели.
 - **Глобальный дефект из одной локальной правки** → отдельный promotion, переносимость в другом проекте, проверка parent hash, короткая публикация, recovery и immutable resource paths.
 - **Переобучение или skill bypass** → fresh contexts, held-out варианты, наблюдение чтения/использования и проверка похожих неподходящих запросов.
 - **Разрастание библиотеки и контекста** → маршрутизация фактов в память, минимальные scoped skills, дедупликация, consolidation/retirement по evidence и bounded catalogue с маршрутом к остатку.
-- **Таймауты/зацикливание hooks** → metadata-only handlers, конечные сроки, отсутствие Stop continuations ради обучения, реальный замер задержки и сохранение диагностики. Конкретные значения лимитов фиксируются до приёмочных прогонов после замера установленного runtime.
+- **Таймауты/зацикливание hooks** → ordinary diagnostic/context/Stop hooks remain OFF; any remaining delivery path must stay metadata-only, bounded and silent on success, without Stop continuations or restored diagnostics. If that path is the retired SessionStart/PostToolUse stack, the required compact/resume outcome stays an owning blocker.
 - **Неполный native hot reload** → отдельные проверки discovery, delivery и use; прямое чтение известного актуального path в той же сессии. Если required same-session сценарий не достигается штатными поддержанными средствами, это реальный блокер реализации, а не основание заменить его restart-only поведением.
 - **Стоимость проверок выше пользы** → no-op без learning signal, выборочность, бюджет эпизода и учёт расходов на создание/проверку/переделки. Неудачные попытки входят в измерение.
 - **История ресурсов занимает место** → хранить только нужную для восстановления и возможных readers историю; безопасное удаление требует известной области потребителей. До этого предпочтительнее удержать предыдущую ревизию.
 
 ## Migration Plan
 
-1. В owned test roots подтвердить target CLI hooks/delivery/compaction и revision-safe публикацию. Исследуется конкретный контракт, а не заново весь рынок. Проверить схемы установленной версии и сохранить сценарии, включая неудачные результаты.
+1. Owned probe 1.1 already confirmed the hook additionalContext compact/resume path and is closed. Remaining work is a supported hooks-off replacement or an explicit owning blocker, plus revision-safe publication. Do not restore ordinary hooks to close later tasks.
 2. Реализовать ядро и helpers с выключенной публикацией для непрошедших кандидатов, интегрировать с существующими project records, затем добавить scoped registration и session handlers.
 3. Провести полный набор проверок по матрице ниже; исправить найденные нарушения. Применить глобально через lifecycle без остановки канала управления текущей сессии.
 4. Проверить реальное чтение workflow из harness и поведение вне него; обновить документацию установки/отката и owning запись решений с подтверждённым результатом. До завершения приёмки маркировать статус как незавершённый.

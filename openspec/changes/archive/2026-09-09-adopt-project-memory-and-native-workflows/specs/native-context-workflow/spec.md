@@ -8,6 +8,8 @@
 
 The kit SHALL provide and exercise a reversible trial of the installed client's supported experimental context-management setting for new Astra tasks. Verification SHALL distinguish configuration parsing, effective activation, account/provider eligibility and observed task behavior. It MUST NOT claim runtime success from a feature-list or schema check alone. The chosen setting and rollback SHALL participate in the existing global installation lifecycle and respect explicit user overrides.
 
+Native memories and Fast SHALL remain excluded.
+
 #### Scenario: Eligible new task
 - **WHEN** a new Astra task starts with the experimental setting enabled on an eligible route
 - **THEN** evidence identifies the client, effective setting and model route, and a bounded continuation case verifies that an earlier constraint is retained and applied

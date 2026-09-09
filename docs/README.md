@@ -19,7 +19,7 @@
 - [Практики скорости и качества](best-practices.md).
 - [Боковой вопрос `/btw` и `/side`](native-side-questions.md) — использование и ограничения проверки CLI 0.153.4.
 - [Аудит архивации OpenSpec](evidence/spec-closure.md) — выполненные изменения и проверенные основания закрытия.
-- [Спека Git-памяти и native workflows](../openspec/changes/adopt-project-memory-and-native-workflows/proposal.md) — проектная память, worktrees и structured exec; реализация продолжается. [Подключение экспериментального контекста](evidence/native-context-delivery.md) различает пройденный Astra pilot, глобальную настройку и оставшуюся runtime-приёмку. Fast mode исключён.
+- [Спека Git-памяти и native workflows](../openspec/changes/archive/2026-09-09-adopt-project-memory-and-native-workflows/proposal.md) — проектная память, worktrees и structured exec; [глобальная поставка и приёмка](evidence/native-workflows.md). [Подключение экспериментального контекста](evidence/native-context-delivery.md) подтверждает Astra pilot, обычный запуск с глобальным профилем, явный override и runtime-откат. Fast mode исключён.
 - [Спека ускорения проверенного результата](../openspec/changes/accelerate-verified-delivery/proposal.md) — два skill подключены глобально; [реализация и проверки](evidence/verified-delivery.md). Полный набор сравнений и подтверждение ускорения ещё открыты.
 - [Карта переноса из opencode-kit](opencode-kit-map.md).
 - [Аудит дополнительных заимствований](opencode-kit-audit.md) — приоритеты, конкретные исходники, проверки и цена адаптации; предложения от 2026-09-07.

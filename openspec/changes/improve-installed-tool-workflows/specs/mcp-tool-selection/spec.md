@@ -72,6 +72,7 @@ The change SHALL reconcile affected guidance with existing memory, skill-evoluti
 #### Scenario: Existing plan assumes retired hooks
 - **WHEN** related planning artifacts still assume a hook that current user policy disables
 - **THEN** the assumption and supported replacement or unresolved blocker are recorded in the owning plan, while the required outcome remains intact and the hook remains disabled
+- **AND** ordinary diagnostic, context and Stop hooks remain disabled, the accepted RTK exception is unchanged, CBM automatic index/watch remain off, Fast and native memories remain excluded, and OpenAI assignments remain Astra-only
 
 #### Scenario: External parent and child use the route
 - **WHEN** a new native session starts in either of two independent outside repositories and delegates a suitable bounded task

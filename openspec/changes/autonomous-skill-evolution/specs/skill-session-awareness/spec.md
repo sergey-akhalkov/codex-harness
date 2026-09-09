@@ -40,6 +40,8 @@ After an accepted creation, update, consolidation or retirement, the workflow SH
 
 The system SHALL restore skill awareness after manual compaction, automatic compaction during a turn and session resume, using current source identities rather than relying solely on the previous conversation summary. Restoration SHALL happen before the next relevant model continuation, including mid-turn automatic compaction. Deleted, disabled, retired or superseded skills SHALL not be revived from stale session metadata. The restored context SHALL be compact and load skill bodies only when relevant.
 
+Owned CLI evidence established this outcome through SessionStart/UserPromptSubmit/PostToolUse additionalContext. Ordinary diagnostic, context and Stop hooks remain disabled, so that demonstrated path is not currently installable. A supported hooks-off replacement MUST be proven, or this requirement remains an owning blocker. Restoring ordinary hooks, substituting App Server-only success, or treating a new process as sufficient SHALL NOT close the requirement.
+
 #### Scenario: Automatic compaction interrupts ongoing work
 - **WHEN** automatic compaction occurs after a skill was created and before the current task's next use of it
 - **THEN** the immediate continuation recovers the catalogue and applies the current skill without waiting for another user message
@@ -64,6 +66,8 @@ Delegated work SHALL receive enough relevant skill identity and location informa
 
 Awareness delivery SHALL use supported mechanisms verified on the installed target runtime, keep per-event work bounded and avoid unconditional model calls. Repeated unchanged events SHALL not repeatedly inject the full catalogue. A failing delivery mechanism SHALL report its exact limit and use an available direct refresh/read path where possible; an unsupported required scenario SHALL remain incomplete. New-process discovery or App Server-only success MUST NOT substitute for required behavior in the ordinary installed CLI session.
 
+Supported here means a currently allowed ordinary-CLI mechanism. Official Codex documentation still lists SessionStart sources `startup`, `resume`, `clear` and `compact`; that documented contract does not authorize restoring ordinary hooks under the durable hooks-off default.
+
 #### Scenario: Native catalogue cache does not refresh
 - **WHEN** a running CLI does not expose a newly accepted skill through its cached selector
 - **THEN** the workflow uses a verified current-session delivery and direct-read path to meet the behavior requirement, or reports activation incomplete without silently substituting a restart
@@ -71,3 +75,4 @@ Awareness delivery SHALL use supported mechanisms verified on the installed targ
 #### Scenario: Repeated unchanged hook events
 - **WHEN** successive tool events observe the same scoped catalogue revision
 - **THEN** they perform bounded freshness checks without repeated full-context injection or model-backed maintenance
+- **AND** ordinary diagnostic, context and Stop hooks remain disabled; the accepted RTK exception is unchanged

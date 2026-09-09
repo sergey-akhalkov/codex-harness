@@ -12,6 +12,16 @@ Read only for a reproduction that launches processes. Use the consuming project'
 
 ## Optional linked helper
 
+During the kit's Rust migration, an explicitly prepared native candidate provides
+`harness-observe.exe`. Invoke its verified absolute path with `--cwd DIR
+--timeout SECONDS [--ready-timeout SECONDS] [--output-limit BYTES] [--stdin FILE]
+-- ABSOLUTE_EXE ARGUMENTS`. It directly uses Windows Jobs, with the same receipt
+and readiness contract below. An optional `--root` must name a new absolute
+directory; existing roots and redirected receipt writes are refused. Missing
+receipt persistence is an infrastructure failure even when the child exited
+zero. Global native command registration remains pending, so do not assume the
+native helper is already on PATH. Existing linked scripts remain transitional.
+
 [scripts/process_case.py](../scripts/process_case.py) wraps [scripts/observe.ps1](../scripts/observe.ps1) and reuses the kit's existing Windows Job supervisor. Use it only when the native test helper is insufficient and the installed linked resources are available. It requires Windows, Python, PowerShell 7.4+ on PATH, and the authoritative kit tree containing `tools/opencodex-process.ps1`; copying the Python file alone is insufficient. Read the current helper docstring/API before use, since these resources may be updated together.
 
 The Python API is:

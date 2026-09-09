@@ -14,12 +14,72 @@ fn cli(args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn manager_source(program: &str) -> String {
+    let dispatch = r#"
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "finalize-build-v1") {
+        if let Err(error) = harness_core::native_build::finalize(std::path::Path::new(&args[1])) {
+            eprintln!("{error}"); std::process::exit(2);
+        }
+        return;
+    }
+    if args.first().is_some_and(|a| a == "check") {
+        let source = args.windows(2).find(|w| w[0] == "--source").map(|w| std::path::Path::new(&w[1]));
+        let build = args.windows(2).find(|w| w[0] == "--build").unwrap();
+        let report = harness_core::build_identity::check(std::path::Path::new(&build[1]), source);
+        println!("{}", serde_json::to_string(&report).unwrap());
+        std::process::exit(if report.runtime_allowed { 0 } else { 1 });
+    }
+    if args.first().is_some_and(|a| a == "activate-build") {
+        let state = args.windows(2).find(|w| w[0] == "--state").unwrap();
+        let build = args.windows(2).find(|w| w[0] == "--build").unwrap();
+        match harness_core::build_selection::activate(std::path::Path::new(&state[1]), std::path::Path::new(&build[1])) {
+            Ok(result) => println!("{}", serde_json::to_string(&result).unwrap()),
+            Err(error) => { eprintln!("{error}"); std::process::exit(2); }
+        }
+        return;
+    }
+"#;
+    program.replacen("fn main() {", &format!("fn main() {{{dispatch}"), 1)
+}
+
+fn copy_source_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        assert!(!entry.file_type().unwrap().is_symlink());
+        if path.is_dir() {
+            copy_source_tree(&path, &destination.join(entry.file_name()));
+        } else {
+            fs::copy(&path, destination.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
 fn fixture(source: &Path) {
+    let schema = source.join(harness_core::build_identity::INSPECTION_SCHEMA);
+    fs::create_dir_all(schema.parent().unwrap()).unwrap();
+    fs::write(schema, "{}").unwrap();
     fs::create_dir_all(source.join("crates/manager/src")).unwrap();
     fs::create_dir_all(source.join("tools/rtk-adapter/src")).unwrap();
     fs::write(
         source.join("Cargo.toml"),
-        "[workspace]\nmembers=['crates/manager','tools/rtk-adapter']\nresolver='3'\n",
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
+            .unwrap()
+            .replace("crates/codex-harness", "crates/manager")
+            .split("[profile.release]")
+            .next()
+            .unwrap()
+            .to_owned()
+            + "\n[profile.release]\nopt-level=0\n",
+    )
+    .unwrap();
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../harness-core");
+    copy_source_tree(&core.join("src"), &source.join("crates/harness-core/src"));
+    fs::copy(
+        core.join("Cargo.toml"),
+        source.join("crates/harness-core/Cargo.toml"),
     )
     .unwrap();
     for (directory, name) in [
@@ -28,14 +88,30 @@ fn fixture(source: &Path) {
     ] {
         fs::write(
             source.join(directory).join("Cargo.toml"),
-            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n"),
+            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n{}", if name == "codex-harness" { "[dependencies]\nharness-core={path='../harness-core'}\nserde_json.workspace=true\n" } else { "" }),
         )
         .unwrap();
         fs::write(
             source.join(directory).join("src/main.rs"),
-            "fn main() { println!(\"owned native fixture\"); }\n",
+            if name == "codex-harness" {
+                manager_source("fn main() { println!(\"owned native fixture\"); }\n")
+            } else {
+                "fn main() {}\n".into()
+            },
         )
         .unwrap();
+    }
+    fs::create_dir_all(source.join("crates/manager/src/bin")).unwrap();
+    for name in harness_core::build_identity::BINARIES {
+        if !["codex-harness.exe", "harness-rtk.exe"].contains(name) {
+            fs::write(
+                source
+                    .join("crates/manager/src/bin")
+                    .join(name.replace(".exe", ".rs")),
+                "fn main() {}\n",
+            )
+            .unwrap();
+        }
     }
     let lock = Command::new("cargo")
         .args(["generate-lockfile", "--offline"])
@@ -152,7 +228,7 @@ fn cli_build_reuse_source_staleness_integrity_and_failed_update() {
     assert_eq!(altered["management_allowed"], true);
     fs::write(
         source.join("crates/manager/src/main.rs"),
-        "fn main() { println!(\"repaired fixture\"); }\n",
+        manager_source("fn main() { println!(\"repaired fixture\"); }\n"),
     )
     .unwrap();
     let repair = cli(&arguments);
@@ -241,7 +317,11 @@ fn changed_bytes_with_restored_mtime_cannot_certify_a_cached_old_binary() {
     let state = temp.path().join("state");
     fixture(&source);
     let code = source.join("crates/manager/src/main.rs");
-    fs::write(&code, "fn main() { println!(\"candidate-a\"); }\n").unwrap();
+    fs::write(
+        &code,
+        manager_source("fn main() { println!(\"candidate-a\"); }\n"),
+    )
+    .unwrap();
     let original_time = fs::metadata(&code).unwrap().modified().unwrap();
     let arguments = [
         "build",
@@ -256,7 +336,11 @@ fn changed_bytes_with_restored_mtime_cannot_certify_a_cached_old_binary() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    fs::write(&code, "fn main() { println!(\"candidate-b\"); }\n").unwrap();
+    fs::write(
+        &code,
+        manager_source("fn main() { println!(\"candidate-b\"); }\n"),
+    )
+    .unwrap();
     fs::File::options()
         .write(true)
         .open(&code)
@@ -332,7 +416,7 @@ fn compiler_resources_are_covered_or_refused_and_overrides_do_not_reuse_builds()
     fs::write(&resource, "resource-a").unwrap();
     fs::write(
         &code,
-        "fn main() { println!(\"{}\", include_str!(\"banner.md\")); }\n",
+        manager_source("fn main() { println!(\"{}\", include_str!(\"banner.md\")); }\n"),
     )
     .unwrap();
     let args = [
@@ -383,15 +467,19 @@ fn compiler_resources_are_covered_or_refused_and_overrides_do_not_reuse_builds()
     .unwrap();
     fs::write(
         &code,
-        "fn main() { println!(\"{}\", include_str!(\"../README.md\")); }\n",
+        manager_source("fn main() { println!(\"{}\", include_str!(\"../README.md\")); }\n"),
     )
     .unwrap();
     let count = fs::read_dir(state.join("builds")).unwrap().count();
     let uncovered = cli(&args);
     assert!(!uncovered.status.success());
     assert!(
-        String::from_utf8_lossy(&uncovered.stderr).contains("outside the native input inventory")
+        String::from_utf8_lossy(&uncovered.stderr).contains("Fresh manager finalization failed")
     );
+    assert!(fs::read_dir(state.join("staging")).unwrap().any(|entry| {
+        fs::read_to_string(entry.unwrap().path().join("finalize.log"))
+            .is_ok_and(|log| log.contains("outside the native input inventory"))
+    }));
     assert_eq!(fs::read_dir(state.join("builds")).unwrap().count(), count);
 }
 
@@ -422,4 +510,329 @@ fn ancestor_cargo_configuration_changes_invalidate_build_identity() {
         serde_json::from_slice::<Value>(&check.stdout).unwrap()["status"],
         "source-stale"
     );
+}
+
+#[test]
+fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules() {
+    use harness_core::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
+    use std::time::Duration;
+    let temp = tempfile::Builder::new()
+        .prefix("harness-native-transition-")
+        .tempdir()
+        .unwrap();
+    // Retain all artifacts on failures as well as success for version inspection.
+    let root = temp.keep();
+    let source = root.join("source");
+    let state = root.join("state");
+    fixture(&source);
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        source.join("crates/manager/src/main.rs"),
+    )
+    .unwrap();
+    let identity_path = source.join("crates/harness-core/src/build_identity.rs");
+    let current_identity = fs::read_to_string(&identity_path).unwrap();
+    assert!(current_identity.contains("    \"harness-observe.exe\",\n"));
+    let old_identity = current_identity.replacen("    \"harness-observe.exe\",\n", "", 1)
+        .replacen("    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);",
+            "    collect(&root, &root.join(INSPECTION_SCHEMA), &mut files)?;\n    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);", 1);
+    assert_ne!(old_identity, current_identity);
+    fs::write(&identity_path, old_identity).unwrap();
+    let target = tempfile::Builder::new().prefix("hct-").tempdir().unwrap();
+    let log = fs::File::create(root.join("bridge-bootstrap.log")).unwrap();
+    let cargo = Command::new("where.exe").arg("cargo.exe").output().unwrap();
+    assert!(cargo.status.success());
+    let cargo = String::from_utf8(cargo.stdout).unwrap();
+    let mut command = CommandSpec::new(std::path::PathBuf::from(cargo.lines().next().unwrap()));
+    command.args = vec![
+        "build".into(),
+        "--release".into(),
+        "--offline".into(),
+        "--locked".into(),
+        "--jobs".into(),
+        "1".into(),
+        "-p".into(),
+        "codex-harness".into(),
+        "--bin".into(),
+        "codex-harness".into(),
+        "--target-dir".into(),
+        target.path().as_os_str().to_owned(),
+    ];
+    command.current_dir = Some(source.clone());
+    command.stdout = Some(log.try_clone().unwrap());
+    command.stderr = Some(log);
+    let job = Job::new(Limits {
+        memory_bytes: Some(2048 * 1024 * 1024),
+        cpu_percent: Some(50.0),
+    })
+    .unwrap();
+    let child = job.spawn(&command).unwrap();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(300)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(
+        (outcome.reason, outcome.exit_code),
+        (StopReason::Exited, 0),
+        "{}",
+        root.display()
+    );
+    let bare_manager = target.path().join("release/codex-harness.exe");
+    let build_args = [
+        "build",
+        "--source",
+        source.to_str().unwrap(),
+        "--state",
+        state.to_str().unwrap(),
+    ];
+    let first = Command::new(&bare_manager)
+        .args(build_args)
+        .output()
+        .unwrap();
+    fs::write(root.join("old-prepare.stderr"), &first.stderr).unwrap();
+    fs::write(root.join("old-prepare.json"), &first.stdout).unwrap();
+    assert!(
+        first.status.success(),
+        "{}; {}",
+        String::from_utf8_lossy(&first.stderr),
+        root.display()
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let old_build = Path::new(first["build"].as_str().unwrap());
+    let old_manager = old_build.join("codex-harness.exe");
+    let old_record = harness_core::build_identity::read_record(old_build).unwrap();
+    assert_eq!(old_record.binaries.len(), 4);
+    assert!(
+        old_record
+            .source
+            .files
+            .contains_key(harness_core::build_identity::INSPECTION_SCHEMA)
+    );
+    assert!(
+        Command::new(&old_manager)
+            .args([
+                "activate-build",
+                "--state",
+                state.to_str().unwrap(),
+                "--build",
+                old_build.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let old_pointer = fs::read(state.join("active-build.json")).unwrap();
+    fs::write(&identity_path, &current_identity).unwrap();
+    let stale = Command::new(&old_manager)
+        .args(["check", "--build", old_build.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(stale.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stale.stdout).unwrap()["management_allowed"],
+        true
+    );
+    let updated = Command::new(&old_manager)
+        .args(build_args)
+        .output()
+        .unwrap();
+    fs::write(root.join("transition.stderr"), &updated.stderr).unwrap();
+    fs::write(root.join("transition.json"), &updated.stdout).unwrap();
+    assert!(
+        updated.status.success(),
+        "{}; {}",
+        String::from_utf8_lossy(&updated.stderr),
+        root.display()
+    );
+    assert_eq!(
+        fs::read(state.join("active-build.json")).unwrap(),
+        old_pointer
+    );
+    let updated: Value = serde_json::from_slice(&updated.stdout).unwrap();
+    let new_build = Path::new(updated["build"].as_str().unwrap());
+    let new_record = harness_core::build_identity::read_record(new_build).unwrap();
+    assert_eq!(new_record.binaries.len(), 5);
+    assert!(new_build.join("harness-observe.exe").is_file());
+    assert!(
+        !new_record
+            .source
+            .files
+            .contains_key(harness_core::build_identity::INSPECTION_SCHEMA)
+    );
+    let request: Value =
+        serde_json::from_slice(&fs::read(new_build.join("finalize-request.json")).unwrap())
+            .unwrap();
+    assert!(
+        request["before"]["files"]
+            .get(harness_core::build_identity::INSPECTION_SCHEMA)
+            .is_some()
+    );
+    let cargo_log = fs::read_to_string(new_build.join("cargo.log")).unwrap();
+    assert_eq!(cargo_log.matches("Finished `release`").count(), 1);
+    let healthy = Command::new(new_build.join("codex-harness.exe"))
+        .args(["check", "--build", new_build.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(healthy.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&healthy.stdout).unwrap()["status"],
+        "healthy"
+    );
+    let activated = Command::new(&old_manager)
+        .args([
+            "activate-build",
+            "--state",
+            state.to_str().unwrap(),
+            "--build",
+            new_build.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    fs::write(root.join("transition-activation.stderr"), &activated.stderr).unwrap();
+    assert!(
+        activated.status.success(),
+        "{}; {}",
+        String::from_utf8_lossy(&activated.stderr),
+        root.display()
+    );
+    let history: Vec<Value> = fs::read_dir(state.join("build-selection-history"))
+        .unwrap()
+        .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    assert!(
+        history
+            .iter()
+            .any(|entry| entry["before"].is_array() && entry["rollback_usable"] == true)
+    );
+    let journal = history
+        .iter()
+        .find(|entry| entry["before"].is_array() && entry["rollback_usable"] == true)
+        .unwrap();
+    let journal_bytes = serde_json::to_vec_pretty(journal).unwrap();
+    let after: Vec<u8> = serde_json::from_value(journal["after"].clone()).unwrap();
+    let new_manager = new_build.join("codex-harness.exe");
+    let recovery_args = ["recover-build", "--state", state.to_str().unwrap()];
+    let new_activation_args = [
+        "activate-build",
+        "--state",
+        state.to_str().unwrap(),
+        "--build",
+        new_build.to_str().unwrap(),
+    ];
+    for replaced in [false, true] {
+        fs::write(
+            state.join("active-build.json"),
+            if replaced { &after } else { &old_pointer },
+        )
+        .unwrap();
+        fs::write(state.join("build-selection-journal.json"), &journal_bytes).unwrap();
+        let recovered = Command::new(&new_manager)
+            .args(recovery_args)
+            .output()
+            .unwrap();
+        assert!(
+            recovered.status.success(),
+            "{}; {}",
+            String::from_utf8_lossy(&recovered.stderr),
+            root.display()
+        );
+        assert_eq!(
+            fs::read(state.join("active-build.json")).unwrap(),
+            old_pointer
+        );
+        assert!(!state.join("build-selection-journal.json").exists());
+        assert!(
+            Command::new(&new_manager)
+                .args(new_activation_args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let original_manager = fs::read(&old_manager).unwrap();
+    fs::write(
+        &old_manager,
+        [original_manager.as_slice(), b"changed after interruption"].concat(),
+    )
+    .unwrap();
+    fs::write(state.join("build-selection-journal.json"), &journal_bytes).unwrap();
+    let refused = Command::new(&new_manager)
+        .args(recovery_args)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert_eq!(fs::read(state.join("active-build.json")).unwrap(), after);
+    assert_eq!(
+        fs::read(state.join("build-selection-journal.json")).unwrap(),
+        journal_bytes
+    );
+    fs::write(&old_manager, &original_manager).unwrap();
+    fs::write(state.join("active-build.json"), b"foreign edit").unwrap();
+    let conflicted = Command::new(&new_manager)
+        .args(recovery_args)
+        .output()
+        .unwrap();
+    assert!(!conflicted.status.success());
+    assert_eq!(
+        fs::read(state.join("active-build.json")).unwrap(),
+        b"foreign edit"
+    );
+    assert_eq!(
+        fs::read(state.join("build-selection-journal.json")).unwrap(),
+        journal_bytes
+    );
+    fs::write(state.join("active-build.json"), &after).unwrap();
+    assert!(
+        Command::new(&new_manager)
+            .args(recovery_args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read(state.join("active-build.json")).unwrap(),
+        old_pointer
+    );
+    assert!(
+        Command::new(&new_manager)
+            .args(new_activation_args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::write(root.join("cross-version-recovery.json"), b"{\"before_swap\":true,\"after_swap\":true,\"altered_previous_preserved\":true,\"foreign_pointer_preserved\":true,\"retry_after_restoration\":true}").unwrap();
+    let reused = Command::new(&old_manager)
+        .args(build_args)
+        .output()
+        .unwrap();
+    assert!(
+        reused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    let reused: Value = serde_json::from_slice(&reused.stdout).unwrap();
+    assert_eq!(reused["reused"], true);
+    assert_eq!(reused["build"], updated["build"]);
+    fs::write(
+        source.join(harness_core::build_identity::INSPECTION_SCHEMA),
+        "{\"changed\":true}",
+    )
+    .unwrap();
+    let live_data = Command::new(&old_manager)
+        .args(build_args)
+        .output()
+        .unwrap();
+    assert!(live_data.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&live_data.stdout).unwrap()["reused"],
+        true
+    );
+    println!("transition evidence {}", root.display());
 }

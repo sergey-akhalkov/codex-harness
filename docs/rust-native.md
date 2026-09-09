@@ -34,6 +34,15 @@ acceptance sequential; `--jobs 1` also bounds the native manager's compiler
 concurrency without increasing its 2 GiB Job limit. A failed compilation retains
 its log and does not alter the active installation. It is not a successful check.
 
+Windows also keeps a running test executable locked after Cargo releases its
+build lock. During parallel source work, a later compilation into that same
+target directory produced LNK1104. Keep build/resource checks sequential and use
+an explicit separate `--target-dir <owned-verification-directory>` when a retained
+test executable could still occupy the default target. This is a Cargo test
+output choice, not an ambient `CARGO_TARGET_DIR` override for native build identity.
+The isolated retry passed; the original failure log remains in the PATH evidence
+linked below.
+
 Explicit preparation of a versioned candidate outside the source tree:
 
 ```powershell
@@ -44,6 +53,69 @@ The result identifies the immutable build directory. Check an explicit candidate
 with `codex-harness.exe check --build <directory>`. Optional `--source <checkout>`
 checks relocation against the selected source without modifying its registration.
 Check is model-free and executes no Cargo, project command or hooks.
+
+`codex-harness.exe inventory --source <checkout> --codex-home <directory>
+--user-home <directory>` reads the live native manifest and reports core data
+links/names without mutation. Its [current scope](evidence/rust-inventory.md)
+does not yet include the full installer or dependency checks.
+
+Native inventory holds the [legacy-compatible installation mutex](evidence/rust-installation-lock.md).
+`codex-harness.exe inspect-installation --codex-home <directory> --user-home
+<directory> [--dependency-user-home <directory>]` reads and validates the old
+installation metadata without changing it; [metadata acceptance](evidence/rust-installation-state.md)
+distinguishes owned/adopted links and unresolved migration work.
+
+`codex-harness.exe outcome-report --input <private-json> [--markdown]` formats
+local attempt accounting without executing anything. [Native report acceptance](evidence/rust-outcome-report.md)
+records retry/verification accounting, comparison exclusions, input bounds and
+actual outside-checkout CLI checks.
+
+`codex-harness.exe delegation-usage [ROLLOUT ...] [--format json|markdown]
+[--output PATH] [--private-sources PATH]` reads explicit local telemetry without
+model calls. [Native usage acceptance](evidence/rust-delegation-usage.md) records
+the ported cases, attribution/privacy boundaries and a real-log comparison.
+Outcome execution/oracle migration and global lifecycle integration remain open.
+
+`codex-harness.exe outcome-run --request PATH --run-model-probes` executes one
+explicit native launcher in an isolated temporary case/home. Its [request,
+evidence and process acceptance](evidence/rust-outcome-run.md) keep execution
+status separate from correctness; the command defaults to a model-free skip.
+Comparison preparation and independent outcome oracles still require migration.
+
+`codex-harness.exe outcome-discover --request PATH` performs model-free native
+skill/config discovery in an isolated temporary case/home. Its [protocol and
+acceptance](evidence/rust-outcome-discovery.md) cover input identity, bounded
+process lifetime and incomplete/contradictory responses. Detailed JSON is private.
+
+`codex-harness.exe outcome-arm --request PATH` prepares and verifies both skill
+comparison modes in an owned temporary installation. [Arm acceptance](evidence/rust-outcome-arm.md)
+covers schema 1/2 link checks, all discovered registrations, exact config rollback
+and installed native discovery. Full suite/oracle and lifecycle migration remain open.
+
+[User PATH publication](evidence/rust-environment-path.md) provides exact-value
+TxR publication/rollback and atomic file receipts with owned-key and killed-process
+acceptance. Native installer journal orchestration remains unfinished; the real
+user PATH has not been changed by this acceptance.
+
+The [native registration foundation](evidence/rust-registration.md) adds
+journaled source links with object identity, protected publication/deletion and
+actual interrupted-process recovery. It currently requires local NTFS with TxF
+and is not yet connected to the global installer.
+
+[Existing-link changes](evidence/rust-link-changes.md) preserve original objects
+for rollback during replacement/removal. The [finish protocol](evidence/rust-registration-finish.md)
+commits a journaled metadata witness and safely retires rollback objects. The
+current [schema 8 builder](evidence/rust-registration-metadata.md) supplies actual
+object IDs to [stable installation metadata](evidence/rust-installation-metadata.md).
+Full lifecycle integration remains unfinished.
+
+[Native feature preparation](evidence/rust-feature-edit.md) uses the original
+Codex executable to edit and observe a candidate in an owned home.
+[Existing-file publication](evidence/rust-config-file.md) checks original bytes
+and object identity, with atomic commit and guarded rollback. The registration
+journal includes these existing-file changes and
+[exclusive creation of absent configurations](evidence/rust-config-creation.md).
+Full installer orchestration remains unfinished.
 
 Select an already verified immutable candidate inside its owned build state:
 
@@ -60,7 +132,10 @@ already damaged build, recovery finishes the verified replacement instead.
 Unexpected edits preserve both target and journal for explicit repair. Completed
 journals remain in the owned selection history, including damaged starting-state
 evidence. Old binaries are never overwritten or removed.
-Ordinary consumers must reject an unfinished selection journal or stale build.
+The [version handoff contract and acceptance](evidence/rust-self-update.md) explain
+fresh-manager finalization, explicit candidate Check/activation, and the required
+Cargo bootstrap for preprotocol managers. Ordinary consumers must reject an
+unfinished selection journal or stale build.
 An integrity-verified manager may select a repaired build even if the old binary
 was altered; recovery refuses to restore an altered previous build as usable.
 
@@ -82,6 +157,8 @@ these initial commands do not establish delivery of that larger contract.
 
 Compiler dep-info is compared with the captured input inventory before accepting
 a candidate. Executable text resources belong under the crate's `src` directory;
+source-owned skill/configuration data, including the inspection schema, remains
+live filesystem input and must not be embedded in a deployed binary. Therefore
 compiling an omitted documentation file or an input outside owned source/build
 roots fails explicitly. Source subdirectories named `tests` or `examples` are
 included. Root documentation and noncompiled Markdown outside `src` do not
@@ -89,13 +166,13 @@ require recompilation. Ancestor/user Cargo config contents contribute hashes
 without being copied into receipts; unsupported ambient compiler override
 families are rejected before build reuse or state creation.
 
-The native launcher argument policy is implemented and tested in
-`harness_core::launcher`. The actual global launcher still uses its existing
-script. Its port must preserve upstream-managed background-process lifetime and
-package-manager metadata as well as argv, streams and cancellation; the bounded
-job's whole-tree cleanup cannot be applied to the upstream CLI without checking
-that behavior. The adopted npm entry point in Codex 0.153.4 forwards arguments
-and signals and supplies `CODEX_MANAGED_PACKAGE_ROOT` and its manager selector.
+The native launcher and argument policy are implemented and tested in
+`harness_core::{native_launcher,launcher}`. An owned registered release candidate
+passed [actual CLI and console acceptance](evidence/rust-launcher.md), preserving
+upstream-managed background-process lifetime, package-manager metadata, argv,
+streams and Ctrl+C. The actual global launcher still uses its existing script
+until journaled global installation is ready. The adopted npm entry point in
+Codex 0.153.4 supplies `CODEX_MANAGED_PACKAGE_ROOT` and its manager selector.
 Native profile/config precedence is documented in
 [OpenAI's configuration contract](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence).
 

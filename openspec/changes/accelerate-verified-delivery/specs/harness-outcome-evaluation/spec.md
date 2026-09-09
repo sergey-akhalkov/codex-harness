@@ -50,6 +50,8 @@ Integrated acceptance MUST include repeated paired executions in two existing co
 
 The evaluation SHALL preserve completed `stabilize-diagnostic-reconciliation` comparisons as historical evidence and distinguish their diagnostic effect from skill effects. New comparisons SHALL use the same accepted capability selection in both arms, currently the hooks-off default owned by `reduce-subscription-waste`. Any isolated candidate hook comparison SHALL measure latency and correctness separately using unchanged-tree, edit and concurrent-work cases without restoring rejected global operations. Required consuming-task verification and honest incomplete states SHALL remain intact; silence SHALL NOT mean clean diagnostics. This change MUST NOT duplicate diagnostic implementation ownership.
 
+The accepted capability selection also keeps Fast off, native memories off, CBM automatic index/watch off, and OpenAI assignments Astra-only. Withdrawn opencode-kit support SHALL NOT be resumed. Incomplete quantitative benefit tasks remain open until the pending two-consumer decision is made.
+
 #### Scenario: Both hooks and skills changed during the work
 
 - **WHEN** integrated results are evaluated

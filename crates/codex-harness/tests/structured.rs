@@ -66,6 +66,23 @@ fn run_case(root: &Path, mode: &str, expected: &str, timeout: u64, output_limit:
     let prompt = root.join(format!("{mode}-prompt.txt"));
     fs::write(&prompt, PROMPT).unwrap();
     let inspect = inspect();
+    let schema = root.join(format!("{mode}-schema.json"));
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agents/skills/structured-codex-run/assets/inspection.schema.json"),
+        &schema,
+    )
+    .unwrap();
+    if mode == "live-schema" || mode == "unsupported-schema" {
+        let mut value: Value = serde_json::from_slice(&fs::read(&schema).unwrap()).unwrap();
+        if mode == "live-schema" {
+            value["properties"]["findings"]["items"]["properties"]["line"]["type"] =
+                "string".into();
+        } else {
+            value["properties"]["run_id"]["pattern"] = "^expected$".into();
+        }
+        fs::write(&schema, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
     let command_json = serde_json::to_string(&[
         inspect.to_string_lossy().into_owned(),
         "--fixture".into(),
@@ -86,6 +103,8 @@ fn run_case(root: &Path, mode: &str, expected: &str, timeout: u64, output_limit:
         .args([
             "--cwd",
             case.to_str().unwrap(),
+            "--schema",
+            schema.to_str().unwrap(),
             "--prompt-file",
             prompt.to_str().unwrap(),
             "--command-json",
@@ -128,6 +147,19 @@ fn run_case(root: &Path, mode: &str, expected: &str, timeout: u64, output_limit:
     assert_eq!(result["status"], expected, "{result}");
     assert_eq!(code, if expected == "success" { 0 } else { 1 });
     let evidence = PathBuf::from(result["evidence_root"].as_str().unwrap());
+    assert!(!evidence.join("inspection.schema.json").exists());
+    if mode == "unsupported-schema" {
+        assert!(!evidence.join("process.json").exists());
+        assert!(!evidence.join("captured.json").exists());
+        assert_eq!(result["error"], "unsupported inspection schema contract");
+        return result;
+    }
+    let contract: Value =
+        serde_json::from_slice(&fs::read(evidence.join("contract.json")).unwrap()).unwrap();
+    assert_eq!(
+        Path::new(contract["schema_path"].as_str().unwrap()),
+        schema.canonicalize().unwrap()
+    );
     assert!(evidence.join("process.json").is_file());
     assert!(evidence.join("events.jsonl").is_file());
     assert!(evidence.join("stderr.txt").is_file());
@@ -192,6 +224,30 @@ fn success_preserves_independent_inputs_and_distinct_evidence() {
         .tempdir()
         .unwrap();
     run_case(root.path(), "success", "success", 15, 1_048_576);
+}
+
+#[test]
+fn source_schema_is_live_bounded_and_must_remain_unchanged() {
+    let root = tempfile::Builder::new()
+        .prefix("structured-schema-")
+        .tempdir()
+        .unwrap();
+    run_case(root.path(), "live-schema", "schema-invalid", 15, 1_048_576);
+    let changed = run_case(
+        root.path(),
+        "schema-changed",
+        "schema-changed",
+        15,
+        1_048_576,
+    );
+    assert_eq!(changed["schema_changed"], true);
+    run_case(
+        root.path(),
+        "unsupported-schema",
+        "infrastructure-failure",
+        15,
+        1_048_576,
+    );
 }
 
 #[test]

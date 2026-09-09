@@ -56,6 +56,8 @@ Acceptance criteria and their authoritative evidence SHALL remain outside the ca
 
 Each nontrivial improvement episode SHALL have an explicit time/model-work budget and a stopping condition, selected for expected value and concrete risk. Routine no-signal tasks SHALL not incur a separate model-backed maintenance run. Exhausted budgets, repeated unchanged failures and unavailable evaluators SHALL stop the episode while preserving useful partial evidence and the prior active skill. Lifecycle hooks SHALL not initiate recursive learning or prevent ordinary task completion to force skill maintenance.
 
+Ordinary diagnostic, context and Stop hooks remain disabled. Any remaining delivery path MUST NOT restore those hooks, create Stop continuations, or treat silence as successful diagnostics. The accepted RTK exception stays unrelated to skill learning.
+
 #### Scenario: No new evidence after an unsuccessful attempt
 - **WHEN** another refinement would repeat the same inputs and failed hypothesis
 - **THEN** the workflow stops that episode with a concise pending or rejected status instead of continuing an unbounded self-improvement loop
@@ -63,3 +65,4 @@ Each nontrivial improvement episode SHALL have an explicit time/model-work budge
 #### Scenario: Learning hook failure
 - **WHEN** metadata delivery times out during otherwise successful task work
 - **THEN** the failure is reported as incomplete skill awareness and does not suppress existing diagnostics, terminate shared services or create repeated Stop continuation requests
+- **AND** ordinary diagnostic/context/Stop hooks remain off; the incomplete awareness result does not authorize restoring them
