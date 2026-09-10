@@ -81,6 +81,9 @@ if ($MyInvocation.ExpectingInput) {
 }
 exit $LASTEXITCODE
 '@ | Set-Content -LiteralPath $recorderScript -Encoding utf8
+    # An owned native PATH alternative exercises recovery without selecting a
+    # real model-capable CLI when the recorded command points back to the kit.
+    Copy-Item -LiteralPath $recorderScript -Destination (Join-Path $temporaryRoot 'codex.ps1')
     @'
 const fs = require('node:fs');
 if (process.env.HARNESS_RECORDER_WAIT) {
@@ -94,7 +97,10 @@ if (process.env.HARNESS_RECORDER_WAIT) {
 }
 '@ | Set-Content -LiteralPath (Join-Path $temporaryRoot 'recorder.cjs') -Encoding utf8
     $metadataPath = Join-Path $temporaryRoot 'harness/installation.json'
-    $metadata = @{ schemaVersion = 1; sourceRoot = $repository; codexCommand = $recorderScript; profileName = 'harness' }
+    $bridge = Join-Path $repository 'target/debug/codex-harness.exe'
+    $metadata = @{ schemaVersion = 1; sourceRoot = $repository; codexCommand = $recorderScript; profileName = 'harness'; configBridge = $bridge }
+    [string[]]$defaultArguments = @((& $bridge config-overrides --source $repository --codex-home $temporaryRoot) | ConvertFrom-Json)
+    if ($LASTEXITCODE -ne 0) { throw 'Build the native configuration bridge before running launcher tests.' }
     $metadata | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding utf8
     $launcher = Join-Path $temporaryRoot 'harness/bin/codex.ps1'
     New-Item -ItemType SymbolicLink -Path $launcher -Target (Join-Path $repository 'tools/codex.ps1') | Out-Null
@@ -123,6 +129,7 @@ exit $LASTEXITCODE
         # parameter-value rewriting (e.g. --remote=ws:// becomes two tokens).
         foreach ($argument in @('-NoLogo', '-NoProfile', '-File', $runner)) { $start.ArgumentList.Add($argument) }
         $start.Environment['CODEX_HOME'] = $temporaryRoot
+        $start.Environment['PATH'] = $temporaryRoot + ';' + $env:PATH
         $start.Environment['HARNESS_RECORDER_NODE'] = $node
         $start.Environment['HARNESS_RECORDER_EXIT'] = [string]$ExitCode
         $start.Environment['HARNESS_RECORDER_ENTRY'] = $EntryPoint
@@ -159,11 +166,11 @@ exit $LASTEXITCODE
         $effortArgs = @('--harness-effort',$pair[0]) + $trickyArguments
         $effortResult = Invoke-Recorder -Arguments $effortArgs -ExitCode 7
         Assert-True ($effortResult.ExitCode -eq 7) 'Task effort preserves native failure'
-        Assert-Arguments @((ConvertFrom-Json $effortResult.Stdout).argv) (@('--profile','harness','-c',('model_reasoning_effort="'+$pair[1]+'"'))+$trickyArguments) 'Task effort retains every prompt argument'
+        Assert-Arguments @((ConvertFrom-Json $effortResult.Stdout).argv) ($defaultArguments+@('-c',('model_reasoning_effort="'+$pair[1]+'"'))+$trickyArguments) 'Task effort retains every prompt argument'
     }
     $overrideArgs = @('--harness-effort=routine','-c','model_reasoning_effort="max"','exec','hello')
     $effortResult = Invoke-Recorder -Arguments $overrideArgs
-    Assert-Arguments @((ConvertFrom-Json $effortResult.Stdout).argv) @('--profile','harness','-c','model_reasoning_effort="max"','exec','hello') 'Explicit native effort wins'
+    Assert-Arguments @((ConvertFrom-Json $effortResult.Stdout).argv) ($defaultArguments+@('-c','model_reasoning_effort="max"','exec','hello')) 'Explicit native effort wins'
     Assert-Arguments (Get-HarnessTaskArguments @('--harness-effort','routine','--profile','personal','exec','hello')) @('--profile','personal','exec','hello') 'Explicit profile wins'
     Assert-Arguments (Get-HarnessTaskArguments @('exec','--','--harness-effort','routine')) @('exec','--','--harness-effort','routine') 'Prompt tokens are not task selectors'
     $effortResult = Invoke-Recorder -Arguments @('--harness-effort','invalid','exec','hello')
@@ -171,14 +178,14 @@ exit $LASTEXITCODE
     $result = Invoke-Recorder -Arguments $trickyArguments -ExitCode 37
     Assert-True ($result.ExitCode -eq 37) 'Native exit code must survive the launcher.'
     Assert-True ($result.Stderr -ceq "native stderr marker`n") 'Native stderr must stay on stderr.'
-    Assert-Arguments @((ConvertFrom-Json $result.Stdout).argv) (@('--profile', 'harness') + $trickyArguments) 'Native argument boundaries'
+    Assert-Arguments @((ConvertFrom-Json $result.Stdout).argv) ($defaultArguments + $trickyArguments) 'Native argument boundaries'
     $nativeCases = $dispatchCases | Where-Object { $_.Name -notlike 'management *' -and $_.Name -notlike 'help *' -and $_.Name -notlike 'exec help *' }
     $nativeCases += $dispatchCases | Where-Object { $_.Name -in @('management mcp', 'management app-server', 'help --version', 'exec help --help', 'exec help subcommand') }
     foreach ($case in $nativeCases) {
         $result = Invoke-Recorder -Arguments $case.Arguments
         Assert-True ($result.ExitCode -eq 0) "Native dispatch exits cleanly: $($case.Name): $($result.Stderr)"
         $expected = @()
-        if ($case.Select) { $expected += @('--profile', 'harness') }
+        if ($case.Select) { $expected += $defaultArguments }
         $expected += $case.Arguments
         Assert-Arguments @((ConvertFrom-Json $result.Stdout).argv) $expected "Native dispatch: $($case.Name)"
     }
@@ -201,7 +208,8 @@ exit $LASTEXITCODE
     $metadata.codexCommand = $launcher
     $metadata | ConvertTo-Json | Set-Content -LiteralPath $metadataPath -Encoding utf8
     $result = Invoke-Recorder -Arguments @('--version')
-    Assert-True ($result.ExitCode -eq 1 -and $result.Stderr.Contains('points back')) 'Direct link recursion must fail before invoking CLI.'
+    Assert-True ($result.ExitCode -eq 0 -and $result.Stderr.Contains('Harness unavailable')) 'Direct link recursion must use the ordinary CLI alternative without looping.'
+    Assert-Arguments @((ConvertFrom-Json $result.Stdout).argv) @('--version') 'Recovery preserves original CLI arguments.'
     $indirect = Join-Path $temporaryRoot 'indirect.ps1'
     '& (Join-Path $env:CODEX_HOME ''harness/bin/codex.ps1'') @args; exit $LASTEXITCODE' | Set-Content -LiteralPath $indirect -Encoding utf8
     $metadata.codexCommand = $indirect

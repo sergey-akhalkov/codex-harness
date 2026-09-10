@@ -1,170 +1,165 @@
-# Делегирование по уровням
+# Level-based delegation
 
-Набор использует штатные именованные агенты Codex. Главная сессия выбирает способ
-работы по сложности, риску и полной стоимости принятого результата. Отдельного
-оркестратора, обязательных карточек делегирования и цепочки согласований нет.
+The pack uses ordinary named Codex agents. The main session chooses how to work
+from complexity, risk and the full cost of the accepted result. There is no
+separate orchestrator, mandatory delegation cards or approval chain.
 
-| Назначение | Имя агента | Модель | Reasoning |
+| Purpose | Agent | Model | Reasoning |
 | --- | --- | --- | --- |
-| Приоритетный middle | `middle` | `xai/grok-4.6` | `xhigh` |
-| Резерв middle при недоступности Grok | `middle_backup` | `gpt-6-astra` | `high` |
-| Главная сессия; отдельный сложный участок при необходимости | `senior` | `gpt-6-astra` | `xhigh` |
-| Редкая консультация по трудному интеллектуальному блокеру | `principal` | `gpt-6-astra` | `max` |
+| Preferred middle | `middle` | `xai/grok-4.6` | `xhigh` |
+| Backup middle when Grok is unavailable | `middle_backup` | `gpt-6-astra` | `high` |
+| Main session; a separate hard slice when needed | `senior` | `gpt-6-astra` | `xhigh` |
+| Rare consultation on a hard intellectual blocker | `principal` | `gpt-6-astra` | `max` |
 
-Резерв — альтернативный middle, а не дополнительная ступень интеллекта.
-Имена обозначают возможности, а не профессии: один и тот же middle может писать
-код, проверять изменение или исследовать вопрос. Деятельность задают задача и
-подходящие skills. Прежний `grok_reviewer` удалён; старые отчёты сохраняют прежнее
-имя как историческое свидетельство.
+Backup is an alternative middle, not an extra intelligence rung. Names describe
+capability, not job titles. The former `grok_reviewer` is removed.
 
-## Как работает выбор
+## How selection works
 
-Для достаточно самостоятельной рутинной работы родитель активно предпочитает
-Grok. Короткую правку, тесно связанный участок или задачу с дорогой передачей
-контекста разумно выполнить непосредственно. Оценивается всё: постановка,
-исполнение, ожидание, проверка, интеграция и переделки. Количество субагентов не
-является показателем экономии.
+For sufficiently independent routine work the parent prefers Grok. A short edit,
+tightly coupled slice or expensive context handoff is often cheaper to do
+directly. Count briefing, execution, waiting, checking, integration and rework.
+The number of children is not a savings metric.
 
-Связанную рутину следует объединять в содержательное задание. Делить пару коротких
-функций между двумя исполнителями невыгодно: [первое сравнение](evidence/agent-delegation.md)
-показало рост времени и расхода родителя. Существенные границы входных данных лучше
-указать сразу. Когда остаётся только ожидание, используется ограниченное ожидание
-30–60 секунд вместо частого опроса состояния; отсутствие прогресса должно быть видно.
+Combine related routine into one substantial assignment. Splitting a pair of
+short functions between two children increased parent time and spend in the
+first comparison. State material input bounds up front. When only waiting
+remains, use a bounded 30–60 second wait instead of frequent polling; lack of
+progress must be visible.
 
-Этот интервал не является сроком задания. Сообщение работающему агенту должно
-добавлять факты, исправлять установленную ошибку или передавать изменение задачи.
-Пустой либо промежуточный итог требует проверки текущей работы; сам по себе он
-не разрешает `middle_backup`. Если нового основания для продолжения нет,
-родитель завершает ограниченную задачу непосредственно и сообщает о дефекте.
+That interval is not the assignment deadline. A message to a working agent must
+add facts, correct an established error or change the task. An empty or
+intermediate result requires checking current work; by itself it does not
+authorize `middle_backup`. If there is no new reason to continue, the parent
+finishes the bounded task directly and reports the defect.
 
-После восстановления родительской сессии `resume_agent` может потерять прежнюю
-привязку Grok и унаследовать Astra. Поэтому сохранённый Grok через этот инструмент
-не восстанавливается: нужно проверить частичную работу и передать её новому
-`middle` с кратким контекстом. Старая запись модели не подтверждает новую привязку.
-Ошибка проверки служебного состояния старого диалога не означает постоянную
-недоступность подписки. Детали — в [разборе стабильности Grok](evidence/grok-reliability.md).
+After restoring a parent session, `resume_agent` can lose the previous Grok
+binding and inherit Astra. Do not recover a saved Grok through that tool:
+inspect partial work and hand it to a new `middle` with brief context. An old
+model record does not prove a new binding. A service-state check error on an
+old conversation does not mean the subscription is permanently unavailable.
 
-Родитель передаёт цель, нужные файлы, границы изменений, инварианты и критерий
-приёмки. Обычно `fork_context=false`: достаточно нужного контекста, без полной
-истории. Два независимых участка можно выполнять параллельно, с непересекающимися
-файлами либо отдельными worktree. Во время исполнения родитель делает другую
-полезную работу; затем проверяет результат и важные крайние случаи.
+The parent passes the goal, needed files, change bounds, invariants and
+acceptance. Usually `fork_context=false`: needed context, not full history.
+Two independent slices can run in parallel on non-overlapping files or separate
+worktrees. While they run, the parent does other useful work, then checks the
+result and important edge cases.
 
-Если Grok отсутствует в каталоге или получена ошибка доступа, модели либо квоты,
-родитель кратко сообщает причину и использует Astra high либо выполняет задачу
-сам. Повторная попытка оправданна изменившимися обстоятельствами; одинаковую ошибку
-не нужно проверять снова на каждом шаге. Перед переназначением проверяется
-сохранённая частичная работа. Ошибка транспорта не является поводом вызывать max.
+If Grok is missing from the catalogue or an access, model or quota error is
+returned, the parent briefly reports the cause and uses Astra high or does the
+task itself. A retry is justified by changed circumstances; do not recheck the
+same error on every step. Inspect saved partial work before reassignment. A
+transport error is not a reason to call principal. There is no mandatory
+middle → senior → principal ladder.
 
-Principal получает один точный сложный вопрос, проверенные факты, минимальный
-пример и уже проверенные гипотезы. Родитель проверяет предложенное решение.
-Обязательной лестницы middle → senior → principal и произвольного числа повторов
-нет. Решения внутри согласованной задачи автономны; границы пользовательской
-авторизации сохраняются.
+## Global connection and limits
 
-## Глобальное подключение и ограничения
-
-[Профиль harness](../global/harness.config.toml) содержит короткую постоянную
-политику и ограничение двух одновременно работающих дочерних потоков.
-[Определения Astra](../global/agents/README.md) подключены постоянной ссылкой
+The [harness profile](../global/harness.config.toml) contains a short standing
+policy and a limit of two concurrent child threads.
+[Astra definitions](../global/agents/README.md) connect through a standing link
 `~/.codex/agents/codex-harness`; [middle](../global/opencodex/agents/middle.toml)
-доступен через условную ссылку подписочной интеграции. Все четыре определения
-используют `[agents] enabled=false`, поэтому их собственное делегирование выключено.
-Это штатные параметры [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+is available through the subscription integration link. All four definitions
+use `[agents] enabled=false`, so their own delegation is off. These are ordinary
+[Codex subagent](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+settings.
 
-`developer_instructions` — скалярная настройка: выбранный профиль заменяет
-одноимённое значение базового config.toml, а не склеивает строки. Базовый файл
-сохраняется и снова применяется без этого профиля. Инструкции AGENTS.md продолжают
-загружаться; явные настройки CLI и доверенного проекта следуют нативному порядку
-приоритетов. Это проверяется [тестом потребителя](../tests/consumer.Tests.ps1).
-Политика выбора — инструкция агенту, не принудительный программный планировщик.
-Просьба ограничить исследование временем или токенами сама по себе не создаёт
-жёсткого лимита. Лимит потоков и запрет дочернего spawning задаются конфигурацией;
-таймаут и Windows Job Object у приёмочных проб обеспечиваются отдельным runner.
+`developer_instructions` is a scalar: the selected profile replaces the same
+base config.toml value rather than concatenating strings. The base file remains
+and applies again without that profile. AGENTS.md instructions still load;
+explicit CLI and trusted-project settings follow native precedence. Selection
+policy is an instruction to the agent, not a forced scheduler. Asking to limit
+research by time or tokens does not by itself create a hard limit. Thread limit
+and child-spawning prohibition are configuration; timeout and Windows Job Object
+for acceptance probes are provided by a separate runner.
 
-Исходники читаются через прямые ссылки при новом запуске. Уже открытый каталог
-инструментов может оставаться прежним. Отключение подписок снимает только их
-ссылку; Astra-уровни и главная модель сохраняются. Команды установки, проверки,
-отключения и восстановления описаны в [подписочной интеграции](subscription-models.md).
-Не останавливайте прокси из использующей его сессии.
+Sources are read through direct links on a new start. An already open tool
+catalogue may remain previous. Disconnecting subscriptions removes only their
+link; Astra levels and the main model remain. Install, check, disconnect and
+recovery commands are in [subscription models](subscription-models.md).
+Do not stop the proxy from a session that uses it.
 
-## Подписки и вспомогательные вызовы
+## Subscriptions and auxiliary calls
 
-Все назначенные OpenAI-модели относятся к Astra. Поиск адаптера явно направлен
-на Grok 4.6 через xAI OAuth; автоматический vision-helper выключен. Grok 4.6
-поддерживает собственный ввод изображений. Если выбранной модели не хватает
-возможности, это должно стать видимым ограничением либо отдельным явным заданием,
-а не скрытым заимствованием квоты ChatGPT. Настройки находятся в
-[едином JSON](../global/opencodex/config.json). Поддержка Grok `xhigh` описана в
-[официальном контракте reasoning](https://docs.x.ai/developers/model-capabilities/text/reasoning).
+All assigned OpenAI models belong to Astra. Adapter search is explicitly aimed
+at Grok 4.6 through xAI OAuth; the automatic vision helper is off. Grok 4.6
+supports its own image input. If a selected model lacks a capability, that must
+become a visible limit or a separate explicit assignment, not a hidden ChatGPT
+quota borrow. Settings live in [one JSON](../global/opencodex/config.json).
+Grok `xhigh` support is described in the
+[official reasoning contract](https://docs.x.ai/developers/model-capabilities/text/reasoning).
 
-Платные API-ключи, покупки и скрытая замена модели не включаются. Резерв Astra
-расходует ту же подписку ChatGPT, что и родитель. Неизвестный остаток квоты не равен
-нулю. Токены помогают сравнивать прогоны, но не дают точного пересчёта недельного
-лимита: [Codex учитывает модель, контекст, reasoning и инструменты](https://learn.chatgpt.com/docs/pricing).
+Paid API keys, purchases and hidden model substitution are not enabled. Astra
+backup spends the same ChatGPT subscription as the parent. An unknown remaining
+quota is not zero. Tokens help compare runs but do not exactly convert a weekly
+limit: [Codex accounts for model, context, reasoning and tools](https://learn.chatgpt.com/docs/pricing).
 
-Для остатка ChatGPT используется штатный статус аккаунта Codex; программный контракт
-app-server — [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server).
-Сохраняйте время наблюдения и область лимита: снимок относится к аккаунту, а не
-только к текущей задаче. Для Grok ориентир — доступная информация о лимитах в
-интерфейсе подписки Grok и фактические ответы об исчерпании; отдельный надёжный
-endpoint остатка недельной квоты этой OAuth-интеграции здесь не подтверждён.
-[Grok FAQ](https://docs.x.ai/grok/faq) описывает ограничения подписки.
-Локальный `~/.opencodex/usage.jsonl` отражает обслуженные запросы, а не гарантированный
-остаток подписки. Его значения нельзя смешивать с накопительными счётчиками Codex
-без проверки корреляции и устранения дублей. Неизвестный остаток не требует
-предварительных модельных запросов перед каждым делегированием.
+For remaining ChatGPT quota use ordinary Codex account status; the app-server
+contract is [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server).
+Keep observation time and limit scope: a snapshot belongs to the account, not
+only the current task. For Grok, use available Grok-subscription limit
+information and actual exhaustion responses; a reliable weekly-quota remaining
+endpoint for this OAuth integration is not confirmed.
+[Grok FAQ](https://docs.x.ai/grok/faq) describes subscription limits.
+Local `~/.opencodex/usage.jsonl` reflects served requests, not a guaranteed
+subscription remainder. Do not mix those values with Codex cumulative counters
+without correlation and duplicate removal. Unknown remainder does not require
+preliminary model requests before every delegation.
 
-## Проверка и замена модели
+## Checks and replacing a model
 
-Бесплатные локальные проверки: `tests/consumer.Tests.ps1`,
-`tests/subscription-config.Tests.ps1`, `tests/subscription-routing.Tests.ps1` и
-`tests/delegation-usage.py`, `tests/agent-delegation-evidence.py`. Изолированный lifecycle использует отдельные home,
-порт и задачу Windows. Модельные пробы включаются явно:
+Model-free checks: `tests/consumer.Tests.ps1`,
+`tests/subscription-config.Tests.ps1`, `tests/subscription-routing.Tests.ps1`
+and `tests/delegation-usage.py`. Isolated lifecycle uses separate homes, port
+and Windows task. Model probes are opt-in:
 
 ```powershell
 & (uv python find) tests/agent-delegation.py --run-model-probes --scenario all
 ./tests/subscription-consumer.Tests.ps1 -RunModelProbes -GrokModel xai/grok-4.6 -GrokReasoningEffort xhigh -Scenario Delegation
 ```
 
-Первая проба сравнивает одинаковые задачи прямой Astra и двух Grok, проверяет
-результат независимо и отдельно проверяет привязки Astra-уровней. Одна короткая
-max-консультация в ней служит проверкой конфигурации, не примером порога для
-производственного использования. Private evidence остаётся во временном каталоге.
-[Счётчик usage](../tools/delegation-usage.py) принимает явные пути родителя и детей,
-сохраняет последнюю накопительную запись каждого потока для прежних потребителей
-и отдельно устраняет повторы по стабильному ID ответа. Наследуемая история может
-перекрывать накопительные суммы; при неполных данных или расхождении серий
-согласованный итог неизвестен. Отсутствующие, конфликтующие и неатрибутируемые
-данные отмечены в [отчёте](evidence/subscription-usage.md). Счётчик не загружает полные
-журналы в контекст главного агента. Включать оценку в каждую рабочую задачу не нужно.
-`null` означает отсутствие данных; нулевой итог провайдера с `thread_count=0`
-означает отсутствие его потоков среди переданных файлов, а не нулевой остаток квоты.
-Флаг `partial` консервативно распространяется на агрегаты при предупреждениях.
-Ошибочный прогон сохраняет доступные данные о расходе и причину отказа в приёмке.
-Уже сохранённые результаты можно проверить без повторной траты подписки:
+The first probe compares the same tasks for direct Astra and two Grok children,
+checks the result independently, and separately checks Astra-level bindings. One
+short max consultation in it is a configuration check, not a production
+threshold. Private evidence stays in a temporary directory.
 
-Счётчик доступен из любого каталога через глобальную запись установки, без
-копии скрипта в потребляющем проекте. Передайте только нужные существующие
-rollout-файлы; результаты и подробные журналы сохраняйте вне Git:
+The [usage counter](../tools/delegation-usage.py) takes explicit parent and
+child paths, keeps the last cumulative record of each thread for former
+consumers, and separately removes repeats by stable response ID. Inherited
+history can overlap cumulative sums; with incomplete data or series disagreement
+the reconciled total is unknown. Missing, conflicting and unattributable data
+are marked. The counter does not load full journals into the main-agent context.
+Including an estimate in every working task is unnecessary. `null` means no
+data; a provider total of zero with `thread_count=0` means none of its threads
+were among the supplied files, not a zero remaining quota. The `partial` flag
+conservatively spreads to aggregates on warnings. A failed run keeps available
+spend data and the acceptance-failure cause.
+
+The counter is available from any directory through the global installation
+record, without copying the script into a consuming project. Pass only needed
+existing rollout files; keep results and detailed logs outside Git:
 
 ```powershell
 $usageHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $usageState = Get-Content (Join-Path $usageHome 'harness/installation.json') -Raw | ConvertFrom-Json
 $usageRegistry = Get-Content (Join-Path $usageHome 'harness/code-tools.json') -Raw | ConvertFrom-Json
 $usagePython = ($usageRegistry.mcp | Where-Object id -eq 'serena').paths.python
-$rolloutPaths = @('C:/path/to/parent.jsonl', 'C:/path/to/child.jsonl')
+$rolloutPaths = @('<parent-rollout.jsonl>', '<child-rollout.jsonl>')
 & $usagePython -B (Join-Path $usageState.sourceRoot 'tools/delegation-usage.py') @rolloutPaths --format markdown --output (Join-Path $env:TEMP 'usage.md')
 ```
 
-Прежняя проверка сохранённой модельной пробы также не запускает модель:
+A previous saved model probe can also be rechecked without spending the
+subscription:
 
 ```powershell
-& (uv python find) -B tests/agent-delegation.py --revalidate 'путь-к-private-evidence'
+& (uv python find) -B tests/agent-delegation.py --revalidate '<private-evidence-path>'
 ```
 
-Для замены провайдера меняются привязка `middle`, подписочная конфигурация и
-проверки точной модели после подтверждения авторизованного каталога и возможностей.
-Политика по уровням остаётся той же. OpenAI-варианты должны оставаться в семействе
-Astra согласно решению пользователя. Готовность и ограничения конкретной поставки
-фиксируются в [отчёте](evidence/agent-delegation.md).
+To replace a provider, change the `middle` binding, subscription configuration
+and exact-model checks after confirming the authorized catalogue and
+capabilities. Level policy stays the same. OpenAI variants must remain in the
+Astra family.
+
+After a main conversation has started, `/btw` and `/side` open a side question.
+Return with the TUI prompt (`Ctrl+C`). Nested side chats and review mode are
+unsupported. On CLI 0.153.4 both names work with `multi_agent_v2=false`. Side
+chats do not isolate files; use a Git worktree for independent edits.

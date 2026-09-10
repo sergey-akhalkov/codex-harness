@@ -1,4 +1,4 @@
-//! Account-scoped resource admission compatible with the transitional byte locks.
+//! Named resource admission compatible with the transitional byte locks.
 #![cfg(windows)]
 
 use crate::{
@@ -14,6 +14,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 pub enum Resource {
     CodebaseIndex,
     CodebaseCatalogue,
+    BrokerStartup,
+    BrokerInstance,
 }
 
 impl Resource {
@@ -21,6 +23,8 @@ impl Resource {
         match self {
             Self::CodebaseIndex => "cbm-index.lock",
             Self::CodebaseCatalogue => "cbm-catalogue.lock",
+            Self::BrokerStartup => "startup.lock",
+            Self::BrokerInstance => "instance.lock",
         }
     }
 }
@@ -33,6 +37,17 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// Nonblocking broker ownership probe. Busy is not evidence of an absent
+    /// owner, even when no valid endpoint has been published yet.
+    pub fn try_acquire(directory: &Path, resource: Resource) -> io::Result<Option<Self>> {
+        let guard = Self::open(directory, resource)?;
+        match guard.file.try_lock() {
+            Ok(()) => Ok(Some(Self { _guard: guard })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
     pub fn acquire(
         directory: &Path,
         resource: Resource,
@@ -40,6 +55,20 @@ impl Lease {
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
         check_stop(deadline, cancellation)?;
+        let guard = Self::open(directory, resource)?;
+        loop {
+            check_stop(deadline, cancellation)?;
+            match guard.file.try_lock() {
+                Ok(()) => return Ok(Self { _guard: guard }),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(20).min(deadline.remaining()));
+                }
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+
+    fn open(directory: &Path, resource: Resource) -> io::Result<ReadGuard> {
         let path = directory.join(resource.filename());
         let guard = match ReadGuard::open_shared(&path) {
             Ok(guard) => guard,
@@ -60,16 +89,7 @@ impl Lease {
                 "resource lock is not an unaliased ordinary file",
             ));
         }
-        loop {
-            check_stop(deadline, cancellation)?;
-            match guard.file.try_lock() {
-                Ok(()) => return Ok(Self { _guard: guard }),
-                Err(TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(20).min(deadline.remaining()));
-                }
-                Err(TryLockError::Error(error)) => return Err(error),
-            }
-        }
+        Ok(guard)
     }
 }
 

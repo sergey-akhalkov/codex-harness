@@ -118,6 +118,11 @@ fn parse_release(spec: &Value, body: &[u8]) -> Result<Parsed, &'static str> {
     match spec["id"].as_str() {
         Some("serena" | "graphify") => parse_pypi(package, text),
         Some("codebase-memory" | "nuphus" | "python") => parse_npm(package, text),
+        Some("codegraph") => crate::dependency_discovery::dependency_codegraph::parse_release(body)
+            .map(|version| Parsed {
+                version,
+                rust: None,
+            }),
         Some("rust") => parse_rust_channel(text),
         _ => Err("unsupported-metadata-source"),
     }
@@ -393,7 +398,10 @@ fn inventory_records<'a>(
     let mut expected = BTreeMap::new();
     for spec in specs {
         let id = spec["id"].as_str().unwrap();
-        let group = if matches!(id, "serena" | "graphify" | "codebase-memory" | "nuphus") {
+        let group = if matches!(
+            id,
+            "serena" | "graphify" | "codebase-memory" | "nuphus" | "codegraph"
+        ) {
             "mcp"
         } else {
             "languages"
@@ -543,6 +551,7 @@ mod tests {
             "nuphus" => {
                 json!({"id":"nuphus","package":"@nuphus/nuphus-mcp","manager":"npm","metadata":"https://registry.npmjs.org/@nuphus%2fnuphus-mcp/latest","runtime":["Node.js"]})
             }
+            "codegraph" => crate::dependency_discovery::dependency_codegraph::spec(),
             "python" => {
                 json!({"id":"python","package":"basedpyright","manager":"npm","required":true,"metadata":"https://registry.npmjs.org/basedpyright/latest","runtime":["Node.js"]})
             }
@@ -576,7 +585,9 @@ mod tests {
         let mut languages = Vec::new();
         for id in ids {
             match *id {
-                "serena" | "graphify" | "codebase-memory" | "nuphus" => mcp.push(spec(id)),
+                "serena" | "graphify" | "codebase-memory" | "nuphus" | "codegraph" => {
+                    mcp.push(spec(id))
+                }
                 _ => languages.push(spec(id)),
             }
         }
@@ -588,7 +599,7 @@ mod tests {
         let mut languages = Vec::new();
         for item in records {
             match item["id"].as_str() {
-                Some("serena" | "graphify" | "codebase-memory" | "nuphus") => {
+                Some("serena" | "graphify" | "codebase-memory" | "nuphus" | "codegraph") => {
                     mcp.push(item.clone())
                 }
                 _ => languages.push(item.clone()),
@@ -618,6 +629,19 @@ mod tests {
             "graphify" => pypi("Graphifyy", version),
             "codebase-memory" => npm("codebase-memory-mcp", version),
             "nuphus" => npm("@nuphus/nuphus-mcp", version),
+            "codegraph" => serde_json::to_vec(&json!({
+                "tag_name": format!("v{version}"),
+                "draft": false,
+                "prerelease": false,
+                "assets": [{
+                    "name": crate::dependency_discovery::dependency_codegraph::ARCHIVE_NAME,
+                    "id": crate::dependency_discovery::dependency_codegraph::ASSET_ID,
+                    "size": crate::dependency_discovery::dependency_codegraph::ARCHIVE_BYTES,
+                    "state": "uploaded",
+                    "digest": format!("sha256:{}", crate::dependency_discovery::dependency_codegraph::ARCHIVE_SHA256),
+                    "browser_download_url": "https://github.com/colbymchenry/codegraph/releases/download/v1.6.0/codegraph-win32-x64.zip"
+                }]
+            })).unwrap(),
             "python" => npm("basedpyright", version),
             "rust" => rust_channel(version, "0.0.0", "2026-09-03"),
             _ => panic!("unsupported fixture id"),

@@ -1,6 +1,7 @@
 #requires -Version 7.4
 # Standalone Windows lifecycle checks. Fixtures copy source only to simulate a
-# separate checkout; installation itself must create direct links, never copies.
+# separate checkout. Shared resources stay linked; the resilient command
+# bootstrap is an explicit installer-owned copy independent of that checkout.
 [CmdletBinding()]
 param([string] $CodexCommand)
 $ErrorActionPreference = 'Stop'

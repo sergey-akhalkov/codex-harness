@@ -1,4 +1,4 @@
-//! Explicit native CBM MCP connection. Shared broker/global discovery is separate.
+//! Explicit native CBM MCP connections with optional owned shared broker routing.
 #![cfg(windows)]
 
 use crate::{
@@ -12,6 +12,8 @@ use std::{fs::File, io, path::PathBuf};
 
 /// Every path is selected by the connection owner. The catalogue is explicit
 /// local configuration; its claimed artifact digest does not certify origin.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub executable: PathBuf,
     pub cache: PathBuf,
@@ -21,7 +23,7 @@ pub struct Configuration {
 }
 
 impl Configuration {
-    fn call(&self, operation: Operation) -> io::Result<Value> {
+    pub(crate) fn call(&self, operation: Operation) -> io::Result<Value> {
         if operation.cancellation.is_cancelled() || operation.deadline.expired() {
             // Nothing started. The session suppresses a cancelled response or
             // emits its deadline error when completing this slot.
@@ -52,6 +54,12 @@ impl Configuration {
                     && cbm_index::failure_reclaimed(&error) =>
             {
                 return Ok(json!({"content":[],"isError":true}));
+            }
+            Err(error) if cbm_index::resource_failure_message(&error).is_some() => {
+                return Ok(json!({
+                    "content":[{"type":"text","text":cbm_index::resource_failure_message(&error)}],
+                    "isError":true
+                }));
             }
             Err(error) => return Err(error),
         };
@@ -85,5 +93,28 @@ pub fn serve(
         cancellation,
         deadline,
         move |operation| configuration.call(operation),
+    )
+}
+
+/// Same local handshake and queue semantics, with resource-confirmed shared
+/// requests. The owner supplies a newly prepared private broker root explicitly.
+pub fn serve_shared(
+    configuration: Configuration,
+    broker_root: PathBuf,
+    input: File,
+    output: File,
+    cancellation: &Cancellation,
+    deadline: Deadline,
+) -> io::Result<()> {
+    let definitions = cbm_catalogue::read(&configuration.catalogue)?;
+    let session = Session::new("codex-harness-codebase-memory", definitions)?;
+    let client = crate::cbm_broker::Client::new(configuration, broker_root)?;
+    mcp_stdio::serve_fallible(
+        session,
+        input,
+        output,
+        cancellation,
+        deadline,
+        move |operation| client.call(operation),
     )
 }

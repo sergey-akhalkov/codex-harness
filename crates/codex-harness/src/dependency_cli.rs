@@ -244,6 +244,21 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(0);
     }
+    if args.first().is_some_and(|arg| arg == "inspect-codegraph") {
+        if args == ["inspect-codegraph", "--help"] {
+            println!(
+                "codex-harness dependencies inspect-codegraph --package-root DIRECTORY\nRead-only verification of a staged or adopted CodeGraph 1.6.0 Windows package. Requires pinned file identity; no download, toolchain or installer side effects."
+            );
+            return Ok(0);
+        }
+        if args.len() != 3 || args[1] != "--package-root" {
+            return Err(invalid());
+        }
+        let inspected =
+            harness_core::dependency_discovery::inspect_package(&PathBuf::from(&args[2]))?;
+        println!("{}", serde_json::to_string_pretty(&inspected.report())?);
+        return Ok(0);
+    }
     if args.first().is_some_and(|arg| arg == "stage") {
         if args == ["stage", "--help"] {
             println!(
@@ -301,10 +316,13 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
         );
         println!(
+            "codex-harness dependencies inspect-codegraph --package-root DIRECTORY (read-only pinned CodeGraph 1.6.0 identity)"
+        );
+        println!(
             "codex-harness dependencies audit --package-root DIRECTORY (explicit official archive comparison)"
         );
         println!(
-            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY] [--npm-prefix DIRECTORY ...] [--uv-tools-dir DIRECTORY] [--serena-cache DIRECTORY] [--rustup-home DIRECTORY] [--graphify-manifest FILE] [--nuphus-models DIRECTORY] [--full-records] [--probe-versions] [--processes] [--include-process-environment|--no-process-environment]\nDefault discovery executes no packages. --probe-versions requests a bounded native Rust analyzer version read. --processes observes existing host consumers without retaining arguments. Plan explicitly reads official release metadata through system curl and proposes actions requiring further compatibility checks. Neither command installs packages or changes a project."
+            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY] [--npm-prefix DIRECTORY ...] [--codegraph-root DIRECTORY ...] [--uv-tools-dir DIRECTORY] [--serena-cache DIRECTORY] [--rustup-home DIRECTORY] [--graphify-manifest FILE] [--nuphus-models DIRECTORY] [--full-records] [--probe-versions] [--processes] [--include-process-environment|--no-process-environment]\nDefault discovery executes no packages. --probe-versions requests a bounded native Rust analyzer version read. --processes observes existing host consumers without retaining arguments. --codegraph-root observes a published CodeGraph package without installing it. Plan explicitly reads official release metadata through system curl and proposes actions requiring further compatibility checks. Neither command installs packages or changes a project."
         );
         return Ok(0);
     }
@@ -314,6 +332,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     let mut values = BTreeMap::new();
     let mut prefixes = Vec::new();
+    let mut codegraph_roots = Vec::new();
     let mut full = false;
     let mut probes = false;
     let mut processes = false;
@@ -331,6 +350,9 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             }
             Some("--npm-prefix") => {
                 prefixes.push(PathBuf::from(arguments.next().ok_or_else(invalid)?))
+            }
+            Some("--codegraph-root") => {
+                codegraph_roots.push(PathBuf::from(arguments.next().ok_or_else(invalid)?))
             }
             Some(
                 "--source"
@@ -397,6 +419,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             })
         }),
         nuphus_models: selected("--nuphus-models", "NUPHUS_MODELS_DIR"),
+        codegraph_roots,
         full_records: full,
         probe_versions: probes,
         processes,

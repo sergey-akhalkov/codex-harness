@@ -148,17 +148,9 @@ def _project_label(cwd, roots):
     return "mixed"
 
 
-GENERIC_PROJECTS = {
-    "codex-harness", "pmac-emulator", "fixture", "neutral", "direct", "levels",
-    "mixed", "project", "projects", "unknown", "workspace with spaces",
-}
-
-
 def _public_project(label):
-    if label in GENERIC_PROJECTS or label is None:
-        return label or "unknown"
-    if " with spaces" in label:
-        return "workspace with spaces"
+    if label is None:
+        return "unknown"
     digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:8]
     return f"workspace-{digest}"
 

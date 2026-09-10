@@ -5,8 +5,8 @@ The user approved the research direction and requested this OpenSpec proposal on
 Observed integration points:
 
 - The kit already links `.agents/skills/` through the lifecycle defined by [linked-global-kit](../../specs/linked-global-kit/spec.md) and `global/kit.psd1`. Skill resources must follow the same authoritative-source model.
-- `tests/agent-delegation.py` and `tools/delegation-usage.py` provide native execution/evidence machinery. Existing [delegation evidence](../../../docs/evidence/agent-delegation.md) includes coordination overhead on small tasks and limits to provider accounting. Reuse the mechanisms; do not copy a claim that delegation always saves time.
-- Automatic hooks in this research session repeatedly reported roughly 25 seconds of diagnostic work per tool. This is an observation of a bottleneck, not a controlled before/after measurement. [stabilize-diagnostic-reconciliation](../archive/2026-09-08-stabilize-diagnostic-reconciliation/design.md) already owns the repair and its correctness cases.
+- `tests/agent-delegation.py` and `tools/delegation-usage.py` provide native execution/evidence machinery. The [delegation guide](../../../docs/agent-delegation.md) preserves verification commands and the limits of provider accounting. Include coordination overhead when comparing small tasks; do not assume delegation always saves time.
+- Automatic hooks in this research session repeatedly reported roughly 25 seconds of diagnostic work per tool. This is an observation of a bottleneck, not a controlled before/after measurement. [stabilize-diagnostic-reconciliation](../../specs/automatic-lsp-diagnostics/spec.md) already owns the repair and its correctness cases.
 - The sibling `opencode-kit` has useful command knowledge states in `docs/adapters.md` and `templates/project/validation.md`, focused script tests, and a read-only Git snapshot helper. Its dirty checkout must be preserved. The snapshot helper needs its own exit-status and UTF-8 byte-limit review before reuse.
 - Browser automation is already available through Nuphus. A new browser integration needs evidence of additional value; availability of Playwright alone is insufficient.
 
@@ -99,7 +99,7 @@ If benefit is inconclusive or harmful, retain the results and leave benefit acce
 
 ### 5. Keep diagnostic ownership and attribution separate
 
-The [diagnostic change tasks](../archive/2026-09-08-stabilize-diagnostic-reconciliation/tasks.md) remain authoritative for implementation and native diagnostic acceptance. This proposal adds integrated outcome evidence, not a second scan/cache/receipt implementation.
+The [current diagnostic requirements](../../specs/automatic-lsp-diagnostics/spec.md) remain authoritative for supported behavior and conditional native diagnostic acceptance. This proposal adds integrated outcome evidence, not a second scan/cache/receipt implementation.
 
 Before/after hook measurements pin the same project workload, skill configuration, tool calls and actual diagnostic assertions: unchanged tree, single changed file, concurrent parent/child work, findings delivered, resolved findings cleared, and incomplete work reported honestly. Preserve the old executable/source identity before it becomes unavailable. Historic session timings alone cannot establish a controlled speedup.
 

@@ -183,6 +183,82 @@ fn codebase_binary(
     )
 }
 
+fn npm_package(root: &Path, request: &Request, request_bytes: &[u8]) -> io::Result<(Value, Value)> {
+    let (metadata_url, _) = dependency_audit::endpoints(&request.package, &request.version)?;
+    let client = Client::new().map_err(io::Error::other)?;
+    let metadata = client
+        .fetch_validated(&metadata_url, MAX_DOCUMENT)
+        .map_err(io::Error::other)?;
+    let (archive_url, integrity) =
+        dependency_audit::release(&metadata, &request.package, &request.version)?;
+    let bytes = client
+        .fetch_validated(&archive_url, MAX_ARCHIVE)
+        .map_err(io::Error::other)?;
+    let mut listing = unpack(root, &request.package, &request.version, &bytes, &integrity)
+        .map_err(|_| io::Error::other("npm-candidate-archive-rejected"))?;
+    let native_asset = if request.package == "codebase-memory-mcp" {
+        codebase_binary(&client, root, &request.version, &mut listing)?
+    } else {
+        Value::Null
+    };
+    Ok((
+        json!({
+            "schema_version":1,"operation":"npm-candidate-preparation","status":"staged-unverified",
+            "package":request.package,"version":request.version,"stage":root,"candidate":root.join("package"),
+            "source":{"metadata":metadata_url,"archive":archive_url,"integrity":integrity,"metadata_sha256":format!("{:x}",Sha256::digest(&metadata)),"archive_sha256":format!("{:x}",Sha256::digest(&bytes)),"client_version":client.version},"native_asset":native_asset,
+            "request_sha256":format!("{:x}",Sha256::digest(request_bytes)),
+            "file_count":listing["file_count"],"payload_bytes":listing["payload_bytes"],
+            "activation_allowed":false,"runtime_compatibility":"not-probed","package_code_executed":false,"model_calls":0
+        }),
+        listing,
+    ))
+}
+
+fn codegraph_package(
+    root: &Path,
+    request: &Request,
+    request_bytes: &[u8],
+) -> io::Result<(Value, Value)> {
+    let metadata_url =
+        crate::dependency_discovery::dependency_codegraph::metadata_url(&request.version)
+            .map_err(io::Error::other)?;
+    let client = Client::new().map_err(io::Error::other)?;
+    let metadata = client
+        .fetch_validated(metadata_url, MAX_DOCUMENT)
+        .map_err(io::Error::other)?;
+    let asset = crate::dependency_discovery::dependency_codegraph::select(
+        &metadata,
+        &request.version,
+        std::env::consts::ARCH,
+    )
+    .map_err(io::Error::other)?;
+    let bytes = client.github_asset(&asset).map_err(io::Error::other)?;
+    if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
+        return Err(io::Error::other("native-asset-integrity-rejected"));
+    }
+    let listing =
+        crate::dependency_discovery::dependency_codegraph::unpack(root, &bytes, &asset.sha256)?;
+    let native_asset = json!({
+        "metadata": metadata_url,
+        "metadata_sha256": format!("{:x}", Sha256::digest(&metadata)),
+        "asset_id": asset.id,
+        "archive": asset.url,
+        "archive_sha256": asset.sha256,
+        "archive_bytes": asset.size
+    });
+    Ok((
+        json!({
+            "schema_version":1,"operation":"codegraph-candidate-preparation","status":"staged-unverified",
+            "package":request.package,"version":request.version,"stage":root,"candidate":root.join("package"),
+            "source":{"metadata":metadata_url,"archive":asset.url,"integrity":format!("sha256:{}", asset.sha256),"metadata_sha256":format!("{:x}",Sha256::digest(&metadata)),"archive_sha256":asset.sha256,"client_version":client.version},"native_asset":native_asset,
+            "request_sha256":format!("{:x}",Sha256::digest(request_bytes)),
+            "file_count":listing["file_count"],"payload_bytes":listing["payload_bytes"],
+            "activation_allowed":false,"runtime_compatibility":"not-probed","package_code_executed":false,"model_calls":0
+        }),
+        listing,
+    ))
+}
+
 /// Internal bounded manager consumer. No foreign entrypoint is executed here.
 pub fn worker(root: &Path) -> io::Result<Value> {
     dependency_audit::worker_limits()?;
@@ -205,38 +281,13 @@ pub fn worker(root: &Path) -> io::Result<Value> {
         return Err(invalid());
     }
     native_build::verify_owned_state(&state)?;
-    let (metadata_url, _) = dependency_audit::endpoints(&request.package, &request.version)?;
-    let client = Client::new().map_err(io::Error::other)?;
-    let metadata = client
-        .fetch_validated(&metadata_url, MAX_DOCUMENT)
-        .map_err(io::Error::other)?;
-    let (archive_url, integrity) =
-        dependency_audit::release(&metadata, &request.package, &request.version)?;
-    let bytes = client
-        .fetch_validated(&archive_url, MAX_ARCHIVE)
-        .map_err(io::Error::other)?;
-    let mut listing = unpack(
-        &root,
-        &request.package,
-        &request.version,
-        &bytes,
-        &integrity,
-    )
-    .map_err(|_| io::Error::other("npm-candidate-archive-rejected"))?;
-    let native_asset = if request.package == "codebase-memory-mcp" {
-        codebase_binary(&client, &root, &request.version, &mut listing)?
-    } else {
-        Value::Null
-    };
-    let mut report = json!({
-        "schema_version":1,"operation":"npm-candidate-preparation","status":"staged-unverified",
-        "package":request.package,"version":request.version,"stage":root,"candidate":root.join("package"),
-        "source":{"metadata":metadata_url,"archive":archive_url,"integrity":integrity,"metadata_sha256":format!("{:x}",Sha256::digest(&metadata)),"archive_sha256":format!("{:x}",Sha256::digest(&bytes)),"client_version":client.version},"native_asset":native_asset,
-        "request_sha256":format!("{:x}",Sha256::digest(&request_bytes)),
-        "file_count":listing["file_count"],"payload_bytes":listing["payload_bytes"],
-        "activation_allowed":false,"runtime_compatibility":"not-probed","package_code_executed":false,"model_calls":0
-    });
-    let manifest = serde_json::to_vec(&json!({"report":report,"contents":listing}))?;
+    let (mut report, listing) =
+        if crate::dependency_discovery::dependency_codegraph::is_package(&request.package) {
+            codegraph_package(&root, &request, &request_bytes)?
+        } else {
+            npm_package(&root, &request, &request_bytes)?
+        };
+    let manifest = serde_json::to_vec(&json!({ "report": report, "contents": listing }))?;
     if manifest.len() > MAX_MANIFEST {
         return Err(invalid());
     }
@@ -248,6 +299,11 @@ pub fn worker(root: &Path) -> io::Result<Value> {
 /// Explicit preparation can initialize an empty native owned state. It never
 /// overwrites an installation, selects an active candidate or runs package code.
 pub fn prepare(manager: &Path, package: &str, version: &str, state: &Path) -> io::Result<Value> {
+    let package = if crate::dependency_discovery::dependency_codegraph::is_package(package) {
+        crate::dependency_discovery::dependency_codegraph::PACKAGE
+    } else {
+        package
+    };
     dependency_audit::endpoints(package, version)?;
     let state = dependency_discovery::local_path(state).map_err(|_| invalid())?;
     native_build::owner_root(&state)?;
@@ -310,7 +366,13 @@ pub fn prepare(manager: &Path, package: &str, version: &str, state: &Path) -> io
         let report: Value =
             serde_json::from_slice(&read(&stdout, 64 * 1024)?).map_err(|_| invalid())?;
         let manifest = read(&stage.path().join("manifest.json"), MAX_MANIFEST as u64)?;
-        if report["operation"] != "npm-candidate-preparation"
+        let expected_operation =
+            if crate::dependency_discovery::dependency_codegraph::is_package(package) {
+                "codegraph-candidate-preparation"
+            } else {
+                "npm-candidate-preparation"
+            };
+        if report["operation"] != expected_operation
             || report["schema_version"] != 1
             || report["status"] != "staged-unverified"
             || report["activation_allowed"] != false

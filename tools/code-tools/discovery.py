@@ -573,6 +573,9 @@ class Discovery:
     def run(self):
         mcp = []
         for spec in self.catalogue["mcp"]:
+            if spec["manager"] == "native":
+                # The native owner supplies these records to the dispatcher.
+                continue
             if spec["manager"] == "uv":
                 candidates = [uv_candidate(spec, self.uv, self.verify_records)]
             else:

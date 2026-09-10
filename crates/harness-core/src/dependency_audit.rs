@@ -35,6 +35,15 @@ fn invalid() -> io::Error {
 
 /// The selected catalogue's npm tools and Nuphus's two Windows payloads only.
 pub(crate) fn endpoints(name: &str, version: &str) -> io::Result<(String, String)> {
+    if crate::dependency_discovery::dependency_codegraph::is_package(name) {
+        let metadata = crate::dependency_discovery::dependency_codegraph::metadata_url(version)
+            .map_err(|_| invalid())?;
+        return Ok((
+            metadata.to_owned(),
+            "https://github.com/colbymchenry/codegraph/releases/download/v1.6.0/codegraph-win32-x64.zip"
+                .to_owned(),
+        ));
+    }
     if !matches!(
         name,
         "codebase-memory-mcp"

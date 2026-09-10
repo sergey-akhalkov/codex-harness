@@ -234,6 +234,22 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(report["totals"]["total_tokens"], 15)
         self.assertIn("cumulative_usage_decreased", self.codes(report))
 
+    def test_public_markdown_has_no_named_workspace_exceptions(self):
+        for name in ("fixture", "neutral", "direct", "synthetic-private-consumer"):
+            with self.subTest(name=name):
+                turn = context()
+                turn["payload"]["cwd"] = str(self.root / name)
+                path = self.rollout("input.jsonl", meta(), turn, tokens())
+                result = subprocess.run(
+                    [sys.executable, "-B", str(SCRIPT), str(path), "--format", "markdown"],
+                    cwd=self.root, text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(f"| {name} |", result.stdout)
+                self.assertNotIn(str(self.root / name), result.stdout)
+                self.assertIn("workspace-", result.stdout)
+                self.assertEqual(usage.summarize_rollouts([path])["totals"]["total_tokens"], 15)
+
     def test_redaction_and_actual_cli_output(self):
         event = meta()
         event["payload"].update(base_instructions="PRIVATE_PROMPT", auth="RAW_AUTH", cwd="PRIVATE_PATH")

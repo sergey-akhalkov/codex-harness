@@ -16,6 +16,20 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
+    // A separate native bridge mode avoids leaking the fixture behavior into
+    // the eventual upstream CLI, which receives the user's original arguments.
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "config-overrides")
+        && env::var("HARNESS_LAUNCH_FIXTURE_BRIDGE_MODE").as_deref() == Ok("hang")
+    {
+        std::fs::write(
+            env::var_os("HARNESS_LAUNCH_FIXTURE_BRIDGE_STARTED").unwrap(),
+            std::process::id().to_string(),
+        )?;
+        std::thread::sleep(Duration::from_secs(20));
+        return Ok(());
+    }
     if let Some(path) = env::var_os("HARNESS_LAUNCH_FIXTURE_STARTED") {
         std::fs::write(path, std::process::id().to_string())?;
     }

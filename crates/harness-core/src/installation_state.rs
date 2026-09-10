@@ -22,6 +22,8 @@ struct State {
     user_home: PathBuf,
     dependency_user_home: Option<PathBuf>,
     codex_command: PathBuf,
+    #[serde(default)]
+    config_bridge: Option<PathBuf>,
     profile_name: String,
     links: Vec<LegacyLink>,
     path_scope: PathScope,
@@ -202,6 +204,9 @@ impl LegacyInstallation {
         }
         let source_root = normal(&state.source_root)?;
         normal(&state.codex_command)?;
+        if let Some(bridge) = &state.config_bridge {
+            normal(bridge)?;
+        }
         // The old checkout and upstream may be missing after relocation. Check
         // only recorded names here; do not follow/read their former locations.
         let source_prefix = format!("{}\\", key(&source_root)?);

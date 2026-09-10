@@ -218,7 +218,7 @@ async def run(home, evidence):
             async with client(configuration['graphify'], evidence, log) as session:
                 stats = await session.call_tool('graph_stats', {'project_path': str(graph_project)})
                 assert not stats.isError and 'Nodes:' in str(stats), stats
-                query = await session.call_tool('query_graph', {'project_path': str(graph_project), 'question': 'Pmac', 'token_budget': 200})
+                query = await session.call_tool('query_graph', {'project_path': str(graph_project), 'question': 'Summarize the indexed project structure', 'token_budget': 200})
                 assert not query.isError and query.content, query
                 report['checks']['graphify'] = {'project_path': str(graph_project), 'graph': str(graph),
                     'stats': str(stats), 'query': str(query)}

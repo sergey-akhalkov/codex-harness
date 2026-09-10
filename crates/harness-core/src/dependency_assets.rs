@@ -76,11 +76,19 @@ pub(crate) fn select(
 pub(crate) fn admitted_redirect(url: &str) -> bool {
     // Repo id was independently confirmed via the connected GitHub repository
     // API. Retain this identity if a similarly named repository is recreated.
-    let Some(tail) = url.strip_prefix(
-        "https://release-assets.githubusercontent.com/github-production-release-asset/1166102148/",
-    ) else {
+    const PREFIX: &str =
+        "https://release-assets.githubusercontent.com/github-production-release-asset/";
+    let Some(rest) = url.strip_prefix(PREFIX) else {
         return false;
     };
+    let Some((repo, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    if repo != "1166102148"
+        && repo != crate::dependency_discovery::dependency_codegraph::REPOSITORY_ID
+    {
+        return false;
+    }
     if url.len() > 16 * 1024
         || !url.is_ascii()
         || url
@@ -144,5 +152,7 @@ mod tests {
         ] {
             assert!(!admitted_redirect(&invalid));
         }
+        let codegraph = valid.replace("1166102148", "1137078255");
+        assert!(admitted_redirect(&codegraph));
     }
 }

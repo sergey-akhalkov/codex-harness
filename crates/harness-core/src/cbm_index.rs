@@ -27,6 +27,7 @@ const CLEANUP: Duration = Duration::from_secs(5);
 struct OperationFailure {
     source: io::Error,
     reclaimed: bool,
+    public_message: Option<String>,
 }
 impl std::fmt::Display for OperationFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,13 +40,28 @@ impl std::error::Error for OperationFailure {
     }
 }
 fn marked_failure(source: io::Error, reclaimed: bool) -> io::Error {
-    io::Error::new(source.kind(), OperationFailure { source, reclaimed })
+    io::Error::new(
+        source.kind(),
+        OperationFailure {
+            source,
+            reclaimed,
+            public_message: None,
+        },
+    )
 }
 pub(crate) fn failure_reclaimed(error: &io::Error) -> bool {
     error
         .get_ref()
         .and_then(|error| error.downcast_ref::<OperationFailure>())
         .is_some_and(|error| error.reclaimed)
+}
+
+/// Only a verified, reclaimed resource stop can become a normal MCP error.
+/// Foreign output and private diagnostic paths never enter the public message.
+pub(crate) fn resource_failure_message(error: &io::Error) -> Option<&str> {
+    let failure = error.get_ref()?.downcast_ref::<OperationFailure>()?;
+    failure.reclaimed.then_some(())?;
+    failure.public_message.as_deref()
 }
 
 #[cfg(test)]
@@ -512,6 +528,17 @@ fn execute_attempt(
         "stderr_error":stderr.as_ref().err().map(ToString::to_string),
         "caller_cancelled":caller.is_cancelled(),"automatic_retry":false
     });
+    let public_message = outcome.as_ref().ok().and_then(|outcome| match outcome.reason {
+        StopReason::MemoryLimit => Some(format!(
+            "CBM worker exceeded its {} MiB memory limit; owned workers reclaimed. Private diagnostics retained.",
+            outcome.job.memory_limit_bytes / (1024 * 1024)
+        )),
+        StopReason::Timeout => Some(
+            "CBM worker exceeded its deadline; owned workers reclaimed. Private diagnostics retained."
+                .to_owned(),
+        ),
+        _ => None,
+    });
     let completed = (|| -> io::Result<Value> {
         let outcome = outcome?;
         observed?;
@@ -619,12 +646,18 @@ fn execute_attempt(
             } else {
                 ""
             };
-            Err(marked_failure(
-                io::Error::new(
-                    error.kind(),
-                    format!("{error}{detail}; private evidence: {}", retained.display()),
-                ),
-                reclaimed,
+            Err(io::Error::new(
+                error.kind(),
+                OperationFailure {
+                    source: io::Error::new(
+                        error.kind(),
+                        format!("{error}{detail}; private evidence: {}", retained.display()),
+                    ),
+                    reclaimed,
+                    public_message: (!incomplete && reclaimed)
+                        .then_some(public_message)
+                        .flatten(),
+                },
             ))
         }
     }
@@ -840,6 +873,32 @@ mod tests {
         );
         let error = run("hang", Duration::from_millis(200), &Cancellation::default()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            resource_failure_message(&error),
+            Some(
+                "CBM worker exceeded its deadline; owned workers reclaimed. Private diagnostics retained."
+            )
+        );
+    }
+
+    #[test]
+    fn public_resource_errors_require_confirmed_reclamation_and_typed_cause() {
+        let message = "CBM worker exceeded its 2048 MiB memory limit; owned workers reclaimed.";
+        for reclaimed in [false, true] {
+            let error = io::Error::other(OperationFailure {
+                source: io::Error::other("private sentinel must stay out of MCP"),
+                reclaimed,
+                public_message: Some(message.to_owned()),
+            });
+            assert_eq!(
+                resource_failure_message(&error),
+                reclaimed.then_some(message)
+            );
+        }
+        assert!(
+            resource_failure_message(&marked_failure(io::Error::other(message), true)).is_none()
+        );
+        assert!(resource_failure_message(&io::Error::other(message)).is_none());
     }
 
     #[test]

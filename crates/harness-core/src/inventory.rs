@@ -275,12 +275,6 @@ pub fn read(source: &Path, codex_home: &Path, user_home: &Path) -> io::Result<In
             codex_home.join("AGENTS.md"),
         )?,
         link(
-            "profile",
-            "harness",
-            source.join(&manifest.profile),
-            codex_home.join("harness.config.toml"),
-        )?,
-        link(
             "agents",
             "codex-harness",
             owned_source(&source, &manifest.agents)?,

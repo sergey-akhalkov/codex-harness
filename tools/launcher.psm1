@@ -1,6 +1,6 @@
 #requires -Version 7.4
 # The dispatch table follows `codex --help` from the supported CLI (0.153.4).
-# This module only decides whether to prepend a native file-profile selector.
+# Dispatch preserves explicit overrides; Rust supplies live shared defaults.
 Set-StrictMode -Version Latest
 $script:SingleValueOptions = @('-c', '--config', '--enable', '--disable', '--remote',
     '--remote-auth-token-env', '-m', '--model', '--local-provider', '-p',
@@ -124,6 +124,45 @@ function Get-HarnessAdditionalRoots {
     } catch { return } # Preserve native CLI argument validation and exit behavior.
 }
 
+# Transitional shell transport only; TOML and precedence belong to Rust.
+function Get-HarnessLaunchArguments($Registration, [string[]]$Arguments) {
+    [string[]]$classified = @(Get-HarnessArguments -Arguments $Arguments -ProfileName $Registration.profileName)
+    if ($classified.Count -eq $Arguments.Count) { return ,$Arguments }
+    try {
+        if (-not $Registration.PSObject.Properties['configBridge']) {
+            throw 'Shared configuration bridge is missing.'
+        }
+        $codexDirectory = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
+        $start = [Diagnostics.ProcessStartInfo]::new($Registration.configBridge)
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        foreach ($argument in @('config-overrides', '--source', $Registration.sourceRoot, '--codex-home', $codexDirectory)) { $start.ArgumentList.Add($argument) }
+        $process = [Diagnostics.Process]::Start($start)
+        try {
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(5000)) {
+                $process.Kill($true)
+                $null = $process.WaitForExit(2000)
+                throw 'Shared configuration bridge timed out.'
+            }
+            if ($process.ExitCode -ne 0 -or -not $stdout.Wait(1000) -or -not $stderr.Wait(1000)) { throw 'Shared configuration bridge is unavailable.' }
+            $json = $stdout.GetAwaiter().GetResult()
+            $decoded = ConvertFrom-Json -InputObject $json -NoEnumerate -ErrorAction Stop
+            if ($decoded -isnot [array] -or @($decoded | Where-Object { $_ -isnot [string] }).Count) { throw 'Shared configuration bridge returned invalid arguments.' }
+            [string[]]$defaults = $decoded
+        } finally { $process.Dispose() }
+        return ,([string[]]($defaults + $Arguments))
+    } catch {
+        [Console]::Error.WriteLine('codex-harness: Shared defaults unavailable; starting ordinary Codex CLI with your original arguments and local settings.')
+        return ,$Arguments
+    }
+}
+
 function Resolve-HarnessFile {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $Path)
@@ -140,7 +179,7 @@ function Resolve-HarnessFile {
 function Get-HarnessLaunchConfiguration {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $LauncherSource)
-    $codexDirectory = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    $codexDirectory = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
     $metadataPath = Join-Path $codexDirectory 'harness/installation.json'
     if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
         throw "Harness registration is missing at '$metadataPath'. Run install.ps1 from the checkout to connect this CODEX_HOME."
@@ -152,7 +191,9 @@ function Get-HarnessLaunchConfiguration {
     if (-not [IO.Path]::IsPathFullyQualified($metadata.sourceRoot) -or -not [IO.Path]::IsPathFullyQualified($metadata.codexCommand)) {
         throw "Harness sourceRoot and codexCommand must be absolute paths in '$metadataPath'."
     }
-    $registeredLauncher = Resolve-HarnessFile (Join-Path $metadata.sourceRoot 'tools/codex.ps1')
+    $registeredLauncher = if ($metadata.PSObject.Properties['launcherSource']) {
+        Resolve-HarnessFile $metadata.launcherSource
+    } else { Resolve-HarnessFile (Join-Path $metadata.sourceRoot 'tools/codex.ps1') }
     if (-not [string]::Equals($registeredLauncher, $LauncherSource, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Harness source registration does not match this launcher. Run install.ps1 from the intended checkout to reconnect it."
     }
@@ -166,4 +207,4 @@ function Get-HarnessLaunchConfiguration {
     return $metadata
 }
 
-Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessTaskArguments, Get-HarnessAdditionalRoots, Resolve-HarnessFile, Get-HarnessLaunchConfiguration
+Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessTaskArguments, Get-HarnessAdditionalRoots, Get-HarnessLaunchArguments, Resolve-HarnessFile, Get-HarnessLaunchConfiguration

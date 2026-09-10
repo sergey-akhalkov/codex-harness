@@ -1031,16 +1031,27 @@ impl ReadGuard {
         Self::from_parents_with_share(ParentGuard::open(path)?, FILE_SHARE_READ | FILE_SHARE_WRITE)
     }
 
+    /// Immutable broker credentials also require descriptor inspection on the
+    /// retained file object. Ordinary source/package readers retain their
+    /// narrower original access mask.
+    pub(crate) fn open_security(path: &Path) -> io::Result<Self> {
+        Self::from_parents_with_access(ParentGuard::open(path)?, FILE_SHARE_READ, 0x00020000)
+    }
+
     fn from_parents(parents: ParentGuard) -> io::Result<Self> {
         Self::from_parents_with_share(parents, FILE_SHARE_READ)
     }
 
     fn from_parents_with_share(parents: ParentGuard, share: u32) -> io::Result<Self> {
+        Self::from_parents_with_access(parents, share, 0)
+    }
+
+    fn from_parents_with_access(parents: ParentGuard, share: u32, extra: u32) -> io::Result<Self> {
         let handle = relative_open_access(
             parents.handle(),
             &parents.leaf,
             share,
-            FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+            FILE_READ_ATTRIBUTES | FILE_READ_DATA | extra,
         )?;
         let metadata = info(handle.as_raw_handle())?;
         if metadata.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
@@ -1107,6 +1118,11 @@ fn volume_root(handle: HANDLE) -> io::Result<std::path::PathBuf> {
 struct LocalPath {
     drive: u8,
     names: Vec<OsString>,
+}
+
+/// Lexical validation only: reject UNC/device/ambiguous paths before any I/O.
+pub(crate) fn validate_local_path(path: &Path) -> io::Result<()> {
+    local_path(path).map(|_| ())
 }
 
 fn local_path(path: &Path) -> io::Result<LocalPath> {

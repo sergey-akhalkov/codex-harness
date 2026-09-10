@@ -12,7 +12,7 @@ The important execution paths are:
 - `launch.py` rejects `harness-lsp`, while `global/kit.psd1` still requires many LSP sources, including `tools/lsp/broker.py`. This manifest reference alone does not establish live use or safe retirement: current consumers must be checked per file.
 - First-party skill helpers live under `.agents/skills/structured-codex-run/scripts/` and `.agents/skills/reproduce-regression/scripts/`; tests also contain generated executable fixtures and embedded C#.
 
-Confirmed user decisions: this migration targets Rust for all maintained first-party executable code in `codex-harness`; third-party tools may retain their languages/runtimes. On 2026-09-09 the user additionally selected Rust as the programming default and PowerShell as the shell default across all projects and delegated work, as recorded in [the owning decision](../../../docs/project-decisions.md#языки-по-умолчанию-во-всех-проектах). These global defaults permit explicit user or concrete integration/platform exceptions and do not require unrelated project rewrites. Earlier discussion of retaining harness PowerShell implementations is not an exception to the full migration target. The user values execution speed and the full cost/time of achieving a verified result. Repository guidance and migration documentation must remain consistent with the portable defaults while preserving the harness's stronger migration commitment.
+Confirmed user decisions: this migration targets Rust for all maintained first-party executable code in `codex-harness`; third-party tools may retain their languages/runtimes. On 2026-09-09 the user additionally selected Rust as the programming default and PowerShell as the shell default across all projects and delegated work, as recorded in [the owning decision](../../../docs/project-decisions.md#language-and-shell-defaults). These global defaults permit explicit user or concrete integration/platform exceptions and do not require unrelated project rewrites. Earlier discussion of retaining harness PowerShell implementations is not an exception to the full migration target. The user values execution speed and the full cost/time of achieving a verified result. Repository guidance and migration documentation must remain consistent with the portable defaults while preserving the harness's stronger migration commitment.
 
 ## Goals / Non-Goals
 
@@ -24,7 +24,7 @@ Confirmed user decisions: this migration targets Rust for all maintained first-p
 
 **Non-Goals:**
 
-- Rewriting upstream Codex, OpenSpec, OpenCodex, Serena, Graphify, Codebase Memory, Nuphus, RTK or external language servers.
+- Rewriting upstream Codex, OpenSpec, OpenCodex, Serena, Graphify, Codebase Memory, CodeGraph, Nuphus, RTK or external language servers; continuing a CBM-specific port or indexer optimization after its replacement was selected.
 - Changing provider/model assignments, billing, accepted hook selection, credentials, or the language of projects using the kit.
 - Adding platform support beyond the currently accepted native Windows environment, reviving retired diagnostics, or replaying previously excluded `opencode-kit` evaluations.
 - Implementing functionality from unrelated unfinished changes or treating their historical task counts as completion evidence for this migration.
@@ -72,6 +72,25 @@ Port existing argument, containment and recovery oracles early. Test subprocesse
 ### 5. Keep foreign tools across explicit, verifiable interfaces
 
 For out-of-process MCP adapters, preserve JSON-RPC IDs, framing, stdout purity, cancellation, EOF, initialization, schemas and tool results. Keep registry selection, resource bounds, lazy startup, shared-worker isolation, project identity and explicit dependency provisioning. Native runtime startup must not acquire packages. Existing tool language support belongs to the foreign tool/user project and is unaffected by the harness language policy.
+
+The large-project acceptance now targets CodeGraph through [replace-cbm-with-codegraph](../replace-cbm-with-codegraph/proposal.md). A successful full index of the current `<large-acceptance-root>`, useful representative queries, bounded automatic/manual refresh, coverage, resource ownership and recovery remain required through the actual managed MCP. This supersedes the provider-specific requirement to make CBM index that project; it does not waive the underlying acceptance or authorize raising the 2 GiB limit. Small fixtures and the initial upstream trial do not establish complete managed/global acceptance. Preserve product sources and do not contact controllers.
+
+The concrete consumer and representative source/symbol stay in local acceptance inputs outside Git. Existing `HARNESS_CBM_LARGE_PROJECT`, `HARNESS_CBM_LARGE_SOURCE` and `HARNESS_CBM_LARGE_SYMBOL` describe the historical CBM test entry point, not the new execution target. Replacement task 3.5 owns carrying the selected consumer and useful source oracles into CodeGraph acceptance with its verified command/input contract. Missing inputs keep that task open; they do not justify choosing a toy repository or resuming CBM development.
+
+#### Graph-provider ownership and order
+
+| Work | Single owner | Rust migration dependency |
+| --- | --- | --- |
+| Existing generic Jobs, framing, cancellation and broker primitives | This migration, tasks 2.4 and 5.3 | Reuse verified implementation; close only remaining generic integration gaps |
+| Published CodeGraph dependency, native Rust adapter, concurrent-project observation, shared same-project resources, bounded scheduling/storage/results and large-project acceptance | Replacement tasks 2.1–3.5 | Task 5.4 adopts the same implementation and applicable evidence; no parallel CBM or second CodeGraph adapter |
+| Provider activation, rollback, retirement of owned CBM registration and outside-checkout MCP verification | Replacement tasks 4.2–4.3 | Final native installation tasks 9.1–9.3 preserve and verify that selection |
+| Complete native installer/launcher and retirement of remaining first-party script paths | This migration, tasks 4, 8 and 9 | Replacement may use the current lifecycle and does not wait for full Rust cutover |
+
+Order: reuse the available native foundation, implement/verify CodeGraph in its owning replacement change, integrate that result into the remaining Rust migration, then complete the full native installation. This is not a circular dependency: replacement acceptance covers its changed adapter and current global MCP consumer, not completion of every Rust migration task. The published CodeGraph implementation and Node runtime remain third-party; only the harness adapter, supervision and executable tests must be Rust.
+
+The replacement's current [concurrency contract](../replace-cbm-with-codegraph/specs/bounded-tool-resources/spec.md#requirement-deliberate-scope-and-honest-freshness) requires automatic service in all simultaneously open Codex CLI projects, shared same-project resources across clients and continued healthy operation beyond 600 seconds. Observation may stop after a project's last session closes; reopening catches up automatically. A single heavy indexing slot is an operation resource limit, not an exclusive active-project selection. Earlier single-project and finite-lifetime candidate checks do not establish these requirements; task 5.4 must adopt their completed replacement evidence before closing.
+
+Existing CBM code and baseline evidence remain available for current operation, compatibility/rollback and consumer-backed retirement. Do not improve or re-port CBM to satisfy the inventory. Preserve generic transport/resource oracles, reuse applicable tests after checking identity, and retire CBM-only paths after the replacement's accepted cutover rather than blindly translating every old file.
 
 Two focused feasibility checks precede their dependent ports:
 

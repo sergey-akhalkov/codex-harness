@@ -14,6 +14,20 @@ struct Fixture {
     bin: PathBuf,
 }
 impl Fixture {
+    fn select_legacy_cbm(&self) {
+        let path = self.source.join("global/code-tools.json");
+        let mut catalogue: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let provider = catalogue["mcp"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"] == "codegraph")
+            .unwrap();
+        *provider = json!({"id":"codebase-memory","package":"codebase-memory-mcp",
+            "manager":"npm","source":"https://github.com/DeusData/codebase-memory-mcp",
+            "metadata":"https://registry.npmjs.org/codebase-memory-mcp/latest"});
+        fs::write(path, serde_json::to_vec(&catalogue).unwrap()).unwrap();
+    }
     fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("dependency-observation проверка-")
@@ -196,7 +210,7 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
     for id in [
         "serena",
         "graphify",
-        "codebase-memory",
+        "codegraph",
         "nuphus",
         "python",
         "rust",
@@ -208,8 +222,70 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
 }
 
 #[test]
+fn discover_reports_missing_codegraph_without_mutating_or_downloading() {
+    let fixture = Fixture::new();
+    let report = fixture.observe(&["--no-process-environment"]);
+    assert_eq!(report["mcp"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        report["mcp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["id"] == "codegraph")
+            .count(),
+        1
+    );
+    assert!(
+        !report["mcp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "codebase-memory")
+    );
+    let row = record(&report, "codegraph");
+    assert_eq!(row["status"], "missing");
+    assert_eq!(row["identity"], "@colbymchenry/codegraph");
+    assert_eq!(row["health"]["callable"], Value::Null);
+    assert_eq!(
+        report["release_checks"],
+        "not-requested; explicit lifecycle operation required"
+    );
+    assert_eq!(report["processes_started"], 0);
+}
+
+#[test]
+fn inspect_codegraph_rejects_synthetic_layout_without_network() {
+    let fixture = Fixture::new();
+    let pkg = fixture.root.path().join("fake-codegraph");
+    fs::create_dir_all(pkg.join("lib/dist/bin")).unwrap();
+    fs::create_dir_all(pkg.join("lib/kernel")).unwrap();
+    fs::create_dir_all(pkg.join("lib/node_modules")).unwrap();
+    fs::write(pkg.join("node.exe"), b"not-official-node").unwrap();
+    fs::write(pkg.join("lib/dist/bin/codegraph.js"), b"not-official-entry").unwrap();
+    fs::write(
+        pkg.join("lib/kernel/codegraph-kernel.node"),
+        b"not-official-kernel",
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("lib/package.json"),
+        br#"{"name":"@colbymchenry/codegraph","version":"1.6.0"}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["dependencies", "inspect-codegraph", "--package-root"])
+        .arg(&pkg)
+        .current_dir(fixture.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn native_payloads_are_observed_without_shims_or_runtimes_and_versions_must_match() {
     let fixture = Fixture::new();
+    fixture.select_legacy_cbm();
     let prefix = fixture.home.join("AppData/Roaming/npm");
     let codebase = fixture.npm(&prefix, "codebase-memory-mcp", "codebase-memory-mcp");
     let nuphus = fixture.npm(&prefix, "@nuphus/nuphus-mcp", "nuphus-mcp");
@@ -538,6 +614,7 @@ fn cli_process_observation_sees_owned_consumer_without_disclosing_arguments_or_s
         }
     }
     let fixture = Fixture::new();
+    fixture.select_legacy_cbm();
     let prefix = fixture.home.join("AppData/Roaming/npm");
     let root = fixture.npm(&prefix, "codebase-memory-mcp", "codebase-memory-mcp");
     fs::create_dir(root.join("bin")).unwrap();

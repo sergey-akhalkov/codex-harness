@@ -76,7 +76,14 @@ impl Fixture {
 fn fresh_inventory_reads_current_descriptors_without_installing_anything() {
     let f = Fixture::new();
     let report = f.success();
-    assert_eq!(report["links"].as_array().unwrap().len(), 4);
+    assert_eq!(report["links"].as_array().unwrap().len(), 3);
+    assert!(
+        report["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|link| link["kind"] != "profile")
+    );
     assert_eq!(report["agents"][0]["name"], "middle");
     assert!(
         report["links"]
@@ -172,13 +179,26 @@ fn direct_links_are_distinct_from_foreign_files_and_dangling_links() {
         links.iter().find(|v| v["kind"] == "instructions").unwrap()["connection"],
         "linked"
     );
-    assert_eq!(
-        links.iter().find(|v| v["kind"] == "profile").unwrap()["connection"],
-        "conflict"
-    );
+    assert!(links.iter().all(|link| link["kind"] != "profile"));
     assert_eq!(
         fs::read_to_string(f.home.join("harness.config.toml")).unwrap(),
         "foreign configuration"
+    );
+    fs::remove_file(f.home.join("AGENTS.md")).unwrap();
+    fs::write(f.home.join("AGENTS.md"), "foreign instructions").unwrap();
+    let foreign = f.success();
+    assert_eq!(
+        foreign["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["kind"] == "instructions")
+            .unwrap()["connection"],
+        "conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(f.home.join("AGENTS.md")).unwrap(),
+        "foreign instructions"
     );
     fs::remove_file(f.home.join("AGENTS.md")).unwrap();
     symlink_file(f.root.path().join("absent.md"), f.home.join("AGENTS.md")).unwrap();

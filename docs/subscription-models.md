@@ -1,12 +1,17 @@
-# Подписки внешних провайдеров в Codex CLI
+# External provider subscriptions in Codex CLI
 
-Статус: глобальное подключение выполнено 2026-09-07, все задачи [OpenSpec](../openspec/changes/archive/2026-09-08-connect-subscription-model-routing/tasks.md) закрыты. Проверены отдельная авторизация SuperGrok Heavy, основная модель Grok, делегирование роли и восстановление установки. Результаты и границы проверок — в [отчёте приёмки](evidence/subscription-routing-verification.md).
+Status: globally connected. Uses official Codex CLI with the existing kit
+launcher and pinned [OpenCodex](https://github.com/lidge-jun/opencodex) **2.44.0**,
+source commit `07b48da8fd63881e848d26e0bd50087864f5573e`. OpenCodex accepts
+requests on `127.0.0.1:10100` and forwards them to the selected provider. The
+main model remains GPT-6 Astra. The [middle](../global/opencodex/agents/middle.toml)
+role selects `xai/grok-4.6` and reasoning `xhigh`. See
+[subscription-model-routing](../openspec/specs/subscription-model-routing/spec.md)
+and [project decisions](project-decisions.md#subscriptions).
 
-Используется официальный Codex CLI с прежним launcher набора и зависимостью [OpenCodex](https://github.com/lidge-jun/opencodex) **2.44.0**, исходный commit `07b48da8fd63881e848d26e0bd50087864f5573e`. OpenCodex принимает запросы на `127.0.0.1:10100` и направляет их выбранному провайдеру. Главная модель остаётся GPT-6 Astra. Роль [middle](../global/opencodex/agents/middle.toml) выбирает `xai/grok-4.6` и reasoning `xhigh`.
+## Connect and authorize
 
-## Подключение и авторизация
-
-Из каталога набора:
+From the pack checkout:
 
 ```powershell
 ./install.ps1 -WhatIf
@@ -15,46 +20,104 @@
 ./install.ps1 -Mode Check
 ```
 
-Установщик повторно использует проверенную версию зависимости либо устанавливает её в отдельный каталог пользователя. Конфигурация `~/.opencodex/config.json` является прямой ссылкой на [исходный JSON](../global/opencodex/config.json). Каталог ролей подключается отдельной ссылкой `~/.codex/agents/codex-harness-subscriptions`. Устанавливается скрытая задача Windows для текущего пользователя, запускающая foreground-процесс внутри Windows Job Object с лимитом 2048 MiB. После падения процесса служебный host выполняет до трёх повторных запусков с интервалом в минуту. После исчерпания попыток служба остаётся остановленной, а ошибки сохраняются в журнале. Ошибки владения и конфигурации не запускают повторные попытки.
+The installer reuses a verified dependency version or installs it in a separate
+user directory. `~/.opencodex/config.json` is a direct link to
+[the source JSON](../global/opencodex/config.json). Role definitions connect
+through `~/.codex/agents/codex-harness-subscriptions`. A hidden Windows task
+for the current user starts a foreground process inside a Windows Job Object
+with a 2048 MiB limit. After process failure the host retries up to three times
+at one-minute intervals. After those attempts the service stays stopped and
+errors remain in the log. Ownership and configuration errors do not retry.
 
-На компьютере с уже подключённым набором `./install.ps1 -SubscriptionsOnly` добавляет только подписки. Этот режим использует тот же компонент, блокировку операции и журнал восстановления. Для задачи Windows выбирается обычная установка PowerShell 7.4+; на проверяемом ПК присутствует `C:\Program Files\PowerShell\7\pwsh.exe` версии 7.6.5. Выбор фонового интерпретатора не меняет пользовательский PATH или работающие терминалы. Задача сохраняет уровень прав установщика: при установке из повышенного процесса используется `HighestAvailable`, иначе `LeastPrivilege`. Это позволяет после `Recover` заново создать ссылку на роль на Windows без Developer Mode. Готовность запуска ожидается не более 90 секунд; остановка ждёт завершения принадлежащего задаче процесса перед очисткой его записей.
+On a machine that already has the kit, `./install.ps1 -SubscriptionsOnly` adds
+only subscriptions. This mode uses the same component, operation lock and
+recovery journal. The Windows task selects an ordinary PowerShell 7.4+
+installation, not Microsoft Store PowerShell. Interpreter selection does not
+change user PATH or running terminals. The task keeps the installer privilege
+level: `HighestAvailable` from an elevated process, otherwise `LeastPrivilege`.
+Startup readiness waits at most 90 seconds; stop waits for the owned process
+before cleaning its records.
 
-Вход открывает локальную страницу с переходом в xAI. Если xAI выдаёт одноразовый код, его нужно вставить в форму на этой локальной странице. Код не требуется отправлять в чат. Вход ограничен шестью минутами и отдельным лимитом 768 MiB. Используется отдельная OAuth-авторизация; токены OpenCode не копируются. Не используйте обычный `ocx login` в процессе без интерактивного stdin: в закреплённой версии воспроизведён [дефект ожидания ручного ввода](evidence/subscription-memory-incident.md).
+Login opens a local page that continues to xAI. If xAI issues a one-time code,
+paste it into that local form; do not send the code in chat. Login is limited
+to six minutes and a separate 768 MiB job. Use separate OAuth; do not copy
+OpenCode tokens. Do not use ordinary `ocx login` in a process without
+interactive stdin: the pinned version reproduced a closed-stdin retry defect.
 
-OAuth хранится в `~/.opencodex/auth.json`, журналы и состояния установки — на ПК, вне репозитория. При переносе набора на другой компьютер авторизация выполняется заново. В JSON и TOML ролей не добавляйте ключи, access/refresh tokens или заголовки Authorization.
+OAuth stays in `~/.opencodex/auth.json`; logs and installation state stay on
+the machine, outside the repository. After moving the pack to another computer,
+authorize again. Do not add keys, access/refresh tokens or Authorization
+headers to JSON or role TOML.
 
-Генерация локальных API-ключей через управление OpenCodex сохраняет `apiKeys` в его JSON. Для связанной переносимой конфигурации эта операция не поддерживается: валидатор запрещает credential-bearing поля, включая `apiKeys` и токены в файлах ролей. Проверка использует имена полей и не заменяет проверку произвольных строк перед сохранением в Git.
+Local API-key generation through OpenCodex management stores `apiKeys` in its
+JSON. That operation is unsupported for the linked portable configuration: the
+validator forbids credential-bearing fields, including `apiKeys` and tokens in
+role files. Field-name checks do not replace scanning arbitrary strings before
+saving to Git.
 
-## Основная модель и конкретные субагенты
+## Main model and named agents
 
-Из любого проекта:
+From any project:
 
 ```powershell
 codex
 codex -m xai/grok-4.6 -c 'model_reasoning_effort="xhigh"'
 ```
 
-Первый запуск сохраняет модель профиля GPT-6 Astra. Второй явно выбирает Grok. В сессии GPT попросите: «Поручи агенту middle проверить …». Нативная роль задаёт модель независимо от модели родителя. Это проверяется по метаданным сессий и фактическим запросам прокси, а не по тому, как агент называет себя.
+The first start keeps the profile model GPT-6 Astra. The second explicitly
+selects Grok. In a GPT session ask: "Have agent middle review …". The native
+role sets the model independently of the parent. Check session metadata and
+actual proxy requests, not how the agent names itself.
 
-Чтобы добавить другую роль, создайте TOML в `global/opencodex/agents/` по примеру `middle.toml`. Укажите уникальные `name`, `description`, `developer_instructions`, точный `model = "provider/model-id"` и поддерживаемый `model_reasoning_effort`. Для этой интеграции `model_provider = "openai"` сохраняет нативный транспорт Codex до локального прокси; префикс в `model` выбирает фактического внешнего провайдера. Поля модели находятся в файле роли, а не в таблице `[agents.role]` основного config.toml. Контракт следует сверять с установленной версией [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+To add another role, create TOML in `global/opencodex/agents/` from
+`middle.toml`. Provide unique `name`, `description`, `developer_instructions`,
+exact `model = "provider/model-id"` and a supported `model_reasoning_effort`.
+For this integration `model_provider = "openai"` keeps Codex native transport
+to the local proxy; the `model` prefix selects the actual external provider.
+Model fields belong in the role file, not in the main config.toml
+`[agents.role]` table. Recheck the contract against the installed
+[Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+version.
 
-Смешанное делегирование использует v1. Передача полной истории и зашифрованных заданий v2 между разными провайдерами не входит в проверенную конфигурацию. Автоматическая подмена модели, fallback и перекрывающие точный идентификатор aliases не настроены. При недоступности назначенной модели ожидается видимая ошибка.
+Mixed delegation uses v1. Passing full history and encrypted v2 tasks between
+different providers is outside the verified configuration. Automatic model
+substitution, fallback and aliases that override an exact identifier are not
+configured. An unavailable assigned model should produce a visible error.
 
-## Модели, подписка и другие провайдеры
+## Models, subscription and other providers
 
-На 2026-09-06 авторизованный `/v1/models` подписки вернул `grok-4.6` и `grok-4.5`. Проверенный запрос `grok-4.6` получил ответ с серверным именем `grok-4.6-build`. Это имя вернул сам xAI; OpenCodex не выбирал другую модель. Статический каталог OpenCodex содержит и другие Grok IDs, поэтому наличие строки в меню само по себе не доказывает доступность через аккаунт.
+An authorized `/v1/models` listing returned `grok-4.6` and `grok-4.5`. A
+verified `grok-4.6` request received a server name `grok-4.6-build`. That name
+came from xAI; OpenCodex did not choose a different model. The static OpenCodex
+catalogue contains other Grok IDs, so a menu string alone does not prove account
+availability.
 
-При `authMode: "oauth"` закреплённый [транспорт xAI](https://github.com/lidge-jun/opencodex/blob/07b48da8fd63881e848d26e0bd50087864f5573e/src/providers/xai-transport.ts) направляет запросы на `https://cli-chat-proxy.grok.com/v1`. Платный API с отдельным ключом — другой режим; он здесь не включён. Возвращаемые сервером оценочные поля стоимости не являются доказательством отдельного списания. Доступ и ограничения определяет подписка; xAI отдельно описывает использование подписок во внешних инструментах в [Grok for Kilo Code](https://x.ai/news/grok-kilocode).
+With `authMode: "oauth"` the pinned
+[xAI transport](https://github.com/lidge-jun/opencodex/blob/07b48da8fd63881e848d26e0bd50087864f5573e/src/providers/xai-transport.ts)
+sends requests to `https://cli-chat-proxy.grok.com/v1`. A paid API with a
+separate key is a different mode and is not enabled here. Server-estimated cost
+fields are not proof of a separate charge. Access is defined by the
+subscription; xAI describes subscription use in external tools in
+[Grok for Kilo Code](https://x.ai/news/grok-kilocode).
 
-OpenCodex позволяет добавлять провайдеров в `providers`, выполнять соответствующую авторизацию и выбирать `provider/model-id` в основной модели или роли. Для каждого нового провайдера нужно проверить, поддерживает ли конкретная подписка OAuth-доступ, какие модели возвращает авторизованный каталог и какой адрес обслуживает запрос. Наличие API-адаптера не доказывает поддержку потребительской подписки. На этом ПК подтверждён только xAI; остальные аккаунты не подключались. Browser-only helper набора сейчас реализован для xAI.
+OpenCodex can add providers in `providers`, perform the matching authorization
+and select `provider/model-id` as the main model or a role. For each new
+provider, check whether the specific subscription supports OAuth, which models
+the authorized catalogue returns, and which address serves the request. An API
+adapter does not prove consumer-subscription support. Only xAI is confirmed
+here. The pack's browser-only helper is currently implemented for xAI.
 
-Поиск адаптера явно настроен на Grok 4.6 через xAI OAuth, автоматический vision-helper выключен. Все назначенные OpenAI-модели принадлежат семейству Astra. Уровни, резерв и правила расхода описаны в [делегировании по уровням](agent-delegation.md); результаты новых проверок — в [отчёте](evidence/agent-delegation.md).
+Adapter search is explicitly set to Grok 4.6 through xAI OAuth; the automatic
+vision helper is off. All assigned OpenAI models belong to the Astra family.
+Levels, backup and spend rules are in [agent delegation](agent-delegation.md).
 
-Основной GPT по-прежнему использует авторизацию Codex. Изменение маршрутизации относится к новым нативным сессиям; уже запущенная сессия не служит проверкой обновлённого каталога.
+Main GPT still uses Codex authorization. Routing changes apply to new native
+sessions; an already running session is not a check of the updated catalogue.
 
-## Обновление, остановка и восстановление
+## Update, stop and recovery
 
-Чтобы включить политику автоперезапуска на уже установленной службе, сохранив работающий процесс:
+To enable the restart policy on an already installed service without stopping
+the running process:
 
 ```powershell
 ./install.ps1 -SubscriptionsOnly -Mode ConfigureRestart -WhatIf
@@ -62,11 +125,28 @@ OpenCodex позволяет добавлять провайдеров в `provi
 ./install.ps1 -SubscriptionsOnly -Mode Check
 ```
 
-Режим изменяет только параметры перезапуска принадлежащей набору задачи и запись её владельца. Повторный вызов идемпотентен. Если обновление прервано, `./install.ps1 -SubscriptionsOnly -Mode Recover` откатывает его по отдельному журналу без остановки прокси. Чужие изменения сохраняются и требуют разрешения конфликта. Новые `Install`/`Update` создают задачу с той же политикой.
+The mode changes only restart parameters of the owned task and its owner
+record. Repeat calls are idempotent. If the update is interrupted,
+`./install.ps1 -SubscriptionsOnly -Mode Recover` rolls it back from a separate
+journal without stopping the proxy. Foreign edits are preserved and require
+conflict resolution. New `Install`/`Update` create the task with the same
+policy.
 
-Это фоновый host с запуском при входе текущего пользователя через Планировщик Windows. Его настройки [RestartCount](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-restartcount) и [RestartInterval](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-restartinterval) страхуют ошибки запуска; нативная проверка показала, что для падения уже запущенного процесса необходим цикл восстановления внутри host. Уже выполняющийся старый host требует однократного переподключения через `Install` из независимого терминала, чтобы загрузить новый код. При падении текущий запрос может оборваться. Grok возвращается в каталог после готовности нового процесса; уже открытой сессии с прежним каталогом нужен новый запуск Codex. Ошибки OAuth или отдельного запроса без падения процесса сами по себе не запускают перезапуск службы.
+This is a background host started at current-user logon through Task Scheduler.
+[RestartCount](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-restartcount)
+and [RestartInterval](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-restartinterval)
+cover launch failures; a native check showed that a crash of an already running
+process needs the host's own recovery loop. An already running old host needs a
+one-time reconnect through `Install` from an independent terminal to load new
+code. A current request may break on crash. Grok returns to the catalogue after
+the new process is ready; an already open session with the old catalogue needs a
+new Codex start. OAuth or request errors without process crash do not restart
+the service.
 
-При исчерпании попыток используйте подключение `./install.ps1 -SubscriptionsOnly -Mode Install` из независимого терминала. Оно перезапускает компонент, поэтому перед выполнением завершите использующие его сессии. Точная первопричина нативного падения и отсутствие будущих падений не следуют из успешного восстановления. Проверки и ограничения — в [приёмке автоперезапуска](evidence/subscription-autorestart.md).
+After retries are exhausted, use `./install.ps1 -SubscriptionsOnly -Mode Install`
+from an independent terminal. It restarts the component, so finish sessions that
+use it first. Successful recovery does not identify the native crash cause or
+prove future crashes will not happen.
 
 ```powershell
 ./install.ps1 -Mode Update -WhatIf
@@ -76,21 +156,48 @@ OpenCodex позволяет добавлять провайдеров в `provi
 ./install.ps1 -Mode Disconnect
 ```
 
-`Update` применяет исходники набора и закреплённую зависимость. Переход на новую версию OpenCodex требует изменения [декларации](../global/opencodex/dependency.json) и повторной проверки контрактов. `Recover` обрабатывает прерванную транзакцию; при изменённых чужими процессами файлах сохраняет журнал и сообщает конфликт. После восстановления остановленной интеграции `Install` подключает её снова.
+`Update` applies pack sources and the pinned dependency. Moving to a new
+OpenCodex version requires changing [the declaration](../global/opencodex/dependency.json)
+and rechecking contracts. `Recover` handles an interrupted transaction; if
+foreign processes changed files, it keeps the journal and reports a conflict.
+After a stopped integration is recovered, `Install` connects it again.
 
-Общий `Disconnect` отключает набор вместе с его MCP и подписками. OAuth не удаляется. Для отключения только подписок существует компонент `Invoke-HarnessSubscriptionRouting -Mode Disconnect` в [модуле](../tools/subscription-routing.psm1); ему нужны те же SourceRoot, UserHome и CodexHome, что использовались при установке. Отключение удаляет принадлежащие компоненту связи и возвращает нативную маршрутизацию Codex.
+Full `Disconnect` disconnects the kit together with its MCP and subscriptions.
+OAuth is not deleted. To disconnect only subscriptions, use
+`Invoke-HarnessSubscriptionRouting -Mode Disconnect` in
+[the module](../tools/subscription-routing.psm1) with the same SourceRoot,
+UserHome and CodexHome used at install. Disconnect removes owned links and
+returns native Codex routing.
 
-Для повседневного отключения и возврата только подписок с сохранением MCP и остальных возможностей набора:
+Everyday disconnect and restore of only subscriptions, keeping MCP and other
+kit capabilities:
 
 ```powershell
 ./install.ps1 -SubscriptionsOnly -Mode Disconnect
 ./install.ps1 -SubscriptionsOnly -Mode Install
 ```
 
-Если прервана общая установка, `-SubscriptionsOnly` не обходит её восстановление: сначала выполните общий `./install.ps1 -Mode Recover`.
+If a combined installation is interrupted, `-SubscriptionsOnly` does not bypass
+its recovery: run `./install.ps1 -Mode Recover` first.
 
-Остановка прокси обрывает использующие его сессии Codex. Возврат нативного маршрута на диске применяется к новым запускам; уже открытая сессия может продолжить попытки соединения со старым адресом. Команды остановки и отключения выполняйте из независимого терминала, закончив зависящие от прокси сессии. Глобальный lifecycle-тест из Codex запрещён; изолированная проверка использует отдельные каталоги, порт и задачу Windows. [Инцидент приёмки](evidence/subscription-memory-incident.md#acceptance-session-disconnected-2026-09-07) сохранён вместе с решением пользователя прекратить его дальнейший разбор; ограничение памяти остаётся включённым.
+Stopping the proxy breaks Codex sessions that use it. Returning the native
+route on disk applies to new launches; an already open session may keep trying
+the old address. Run stop and disconnect commands from an independent terminal
+after finishing sessions that depend on the proxy. A global lifecycle test from
+Codex is forbidden; isolated checks use separate directories, port and Windows
+task. Memory containment remains enabled.
 
-Для наблюдения за уже запущенной глобальной службой предусмотрен [режим проверки готовности](../tests/subscription-global.Tests.ps1) `-RunReadinessProbe -BaselinePath <путь-к-прежним-хэшам>`. Он не меняет установку: проверяет тот же процесс не менее двух минут, запускает нативные команды просмотра вне checkout и сверяет сохранность конфигурации и авторизации. Проверка возвращает ошибку при потере готовности и сохраняет отчёт, не пытаясь перезапустить службу.
+To observe an already running global service, use
+[the readiness probe](../tests/subscription-global.Tests.ps1)
+`-RunReadinessProbe -BaselinePath <path-to-previous-hashes>`. It does not change
+the installation: it checks the same process for at least two minutes, runs
+native inspection commands outside the checkout, and verifies configuration and
+authorization remain intact. The check fails if readiness is lost and stores a
+report without restarting the service.
 
-Журналы ограниченного процесса находятся в `~/.codex/harness/subscriptions/runs/`; результаты содержат причину завершения, exit code и peak memory, без токенов. Код 124 означает таймаут, 125 — ограничение памяти. Состояние 2048 MiB относится ко всему job процесса OpenCodex; это не ограничение всего Codex CLI, браузера или других программ. Реальный перезапуск задачи и перезагрузка Windows — разные проверки; перезагрузка без фактического выполнения не заявляется.
+Bounded-process logs live in `~/.codex/harness/subscriptions/runs/`; results
+contain completion reason, exit code and peak memory, without tokens. Exit 124
+is timeout, 125 is the memory limit. The 2048 MiB state applies to the whole
+OpenCodex process job; it is not a limit for the entire Codex CLI, browser or
+other programs. Actual task restart and a Windows reboot are different checks;
+a reboot without execution is not claimed.

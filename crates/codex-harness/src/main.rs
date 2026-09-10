@@ -57,6 +57,96 @@ fn verify_entrypoint(require_runtime: bool) -> io::Result<()> {
 fn run() -> io::Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     #[cfg(windows)]
+    if args
+        .first()
+        .is_some_and(|a| a == "config-overrides" || a == "config-localize")
+    {
+        verify_runtime()?;
+        if args.len() != 5 || args[1] != "--source" || args[3] != "--codex-home" {
+            return Err(io::Error::other(
+                "Expected config-overrides|config-localize --source CHECKOUT --codex-home DIRECTORY",
+            ));
+        }
+        let shared = PathBuf::from(&args[2]).join("global/harness.config.toml");
+        let home = PathBuf::from(&args[4]);
+        if args[0] == "config-localize" {
+            let conflicts = harness_core::profile_state::migrate(&shared, &home)?;
+            if conflicts > 0 {
+                eprintln!(
+                    "{conflicts} configuration conflicts: existing local values retained; originals preserved in CODEX_HOME/harness/private-profile-migration."
+                );
+            }
+        } else {
+            let values = harness_core::portable_config::overrides(&shared, &home)?;
+            println!(
+                "{}",
+                serde_json::to_string(
+                    &values
+                        .iter()
+                        .map(|v| v.to_string_lossy())
+                        .collect::<Vec<_>>()
+                )?
+            );
+        }
+        return Ok(0);
+    }
+    #[cfg(windows)]
+    if args == [harness_core::process_service::CREATE_ARGUMENT] {
+        verify_runtime()?;
+        harness_core::process_service::create_helper_entry()
+    }
+    #[cfg(windows)]
+    if args
+        .first()
+        .is_some_and(|arg| arg == harness_core::process_service::RUN_ARGUMENT)
+    {
+        // WMI does not inherit the first client's Job. Contain the service
+        // before runtime verification, configuration reads or provider work.
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid native service arguments",
+            )
+        };
+        let until = args
+            .get(1)
+            .and_then(|arg| arg.to_str())
+            .and_then(|arg| arg.parse().ok())
+            .ok_or_else(invalid)?;
+        let account = args
+            .get(2)
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(invalid)?;
+        let guard = harness_core::process_service::ServiceGuard::enter(
+            until,
+            account,
+            harness_core::process::Limits {
+                memory_bytes: Some(2048 * 1024 * 1024),
+                cpu_percent: Some(25.0),
+            },
+        )?;
+        verify_runtime()?;
+        if args.len() != 6 {
+            return Err(invalid());
+        }
+        let expected = args[4].to_str().ok_or_else(invalid)?;
+        let encoded = args[5].to_str().ok_or_else(invalid)?;
+        match args[3].to_str() {
+            Some("codebase-memory") => harness_core::cbm_broker::serve(
+                guard,
+                expected,
+                serde_json::from_str(encoded).map_err(|_| invalid())?,
+            )?,
+            Some("codegraph") => harness_core::codegraph_broker::serve(
+                guard,
+                expected,
+                serde_json::from_str(encoded).map_err(|_| invalid())?,
+            )?,
+            _ => return Err(invalid()),
+        }
+        return Ok(0);
+    }
+    #[cfg(windows)]
     if args.len() == 2 && args[0] == "dependency-stage-worker-v1" {
         verify_manager()?;
         let report = harness_core::dependency_stage::worker(&PathBuf::from(&args[1]))?;
@@ -123,7 +213,16 @@ fn run() -> io::Result<i32> {
     }
     #[cfg(windows)]
     if args[0] == "mcp" {
-        verify_runtime()?;
+        if args.get(1).is_some_and(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("broker-retire" | "retire-codegraph" | "prepare-codegraph")
+            )
+        }) {
+            verify_manager()?;
+        } else {
+            verify_runtime()?;
+        }
         return mcp_cli::run(&args[1..]);
     }
     #[cfg(windows)]

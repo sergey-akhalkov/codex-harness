@@ -1,2 +1,9 @@
 /.venv
 /target/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/.codebase-memory/
+/.serena/project.local.yml

@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from process_ownership import JobGuard
 
 
-async def calls(registry: Path, environment: dict[str, str]) -> dict[str, str | int | bool]:
+async def calls(registry: Path, environment: dict[str, str], project: Path) -> dict[str, str | int | bool]:
     process = StdioServerParameters(command=sys.executable, args=['-B', '-u', str(ROOT / 'tools/code-tools/graphify_proxy.py')],
                                    env={**environment, 'HARNESS_CODE_TOOLS_REGISTRY': str(registry), 'PYTHONDONTWRITEBYTECODE': '1'})
     async with stdio_client(process) as streams:
@@ -32,10 +32,10 @@ async def calls(registry: Path, environment: dict[str, str]) -> dict[str, str | 
                 assert info.serverInfo.name == 'harness-graphify'
                 names = {tool.name for tool in (await client.list_tools()).tools}
                 assert {'graph_stats', 'query_graph', 'get_node', 'list_prs'}.issubset(names)
-                stats = await client.call_tool('graph_stats', {})
+                stats = await client.call_tool('graph_stats', {'project_path': str(project)})
                 stats_text = [item.text for item in stats.content if item.type == 'text']
                 assert not stats.isError and any('Nodes:' in text for text in stats_text)
-                query = await client.call_tool('query_graph', {'question': 'Pmac', 'token_budget': 200})
+                query = await client.call_tool('query_graph', {'project_path': str(project), 'question': 'Summarize the indexed project structure', 'token_budget': 200})
                 assert not query.isError and query.content
                 rejected = await client.call_tool('list_prs', {})
                 rejected_text = [item.text for item in rejected.content if item.type == 'text']
@@ -65,7 +65,7 @@ async def main() -> None:
         environment = {**os.environ, 'HARNESS_GRAPHIFY_TEST_TOKEN': token}
         _ = settings.write_text(json.dumps({'graph_path': str(graph), 'endpoint': f'http://127.0.0.1:{port}/mcp',
                                         'credential_env': 'HARNESS_GRAPHIFY_TEST_TOKEN'}), encoding='utf-8')
-        fallback = await calls(registry, environment)
+        fallback = await calls(registry, environment, graph.parent.parent)
         log_path = temporary / 'http.log'
         with log_path.open('w+', encoding='utf-8') as log:
             guard = JobGuard()
@@ -85,7 +85,7 @@ async def main() -> None:
                         if time.monotonic() > deadline:
                             raise TimeoutError('Owned Graphify HTTP fixture did not start')
                         await anyio.sleep(0.2)
-                shared = await calls(registry, environment)
+                shared = await calls(registry, environment, graph.parent.parent)
                 log.flush()
                 # Successful proxy requests reached this exact authenticated fixture.
                 assert b'POST /mcp' in log_path.read_bytes()

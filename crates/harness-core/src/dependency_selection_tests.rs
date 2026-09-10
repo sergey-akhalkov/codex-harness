@@ -300,6 +300,23 @@ fn traversal_slot_schema_digest_and_runtime_mismatch_are_rejected() {
 }
 
 #[test]
+fn codegraph_slot_maps_to_the_published_package_without_a_node_companion() {
+    assert_eq!(package("codegraph").unwrap(), "@colbymchenry/codegraph");
+    let bytes = serde_json::to_vec(&Pointer {
+        schema: 1,
+        slot: "codegraph".into(),
+        stage: "candidate-good".into(),
+        manifest_sha256: "a".repeat(64),
+        node: None,
+    })
+    .unwrap();
+    let pointer = Pointer::parse(&bytes, "codegraph").unwrap();
+    assert_eq!(pointer.slot, "codegraph");
+    assert!(pointer.node().is_none());
+    assert!(package("codegraph-win32-x64").is_err());
+}
+
+#[test]
 fn absent_inspection_and_recovery_have_no_acquisition_or_selection_side_effects() {
     let (_temp, state) = fixture();
     assert_eq!(selected(&state, "nuphus").unwrap()["status"], "absent");

@@ -10,6 +10,10 @@ use std::{
     path::{Component, Path, PathBuf, Prefix},
 };
 
+#[path = "dependency_codegraph.rs"]
+pub mod dependency_codegraph;
+pub use dependency_codegraph::{InspectedCodeGraph, inspect_package};
+
 #[derive(Default)]
 pub struct Request {
     pub catalogue: PathBuf,
@@ -21,6 +25,7 @@ pub struct Request {
     pub path: Option<OsString>,
     pub graphify_manifest: Option<PathBuf>,
     pub nuphus_models: Option<PathBuf>,
+    pub codegraph_roots: Vec<PathBuf>,
     pub full_records: bool,
     pub probe_versions: bool,
     pub processes: bool,
@@ -245,6 +250,7 @@ struct Discovery {
     node: Option<PathBuf>,
     models: PathBuf,
     graphify_manifest: Option<PathBuf>,
+    codegraph_roots: Vec<PathBuf>,
     full: bool,
     probe_versions: bool,
 }
@@ -263,6 +269,7 @@ impl Discovery {
                     ("mcp", "serena") => ("serena-agent", "uv"),
                     ("mcp", "graphify") => ("graphifyy", "uv"),
                     ("mcp", "codebase-memory") => ("codebase-memory-mcp", "npm"),
+                    ("mcp", "codegraph") => ("@colbymchenry/codegraph", "native"),
                     ("mcp", "nuphus") => ("@nuphus/nuphus-mcp", "npm"),
                     ("languages", "python") => ("basedpyright", "npm"),
                     ("languages", "rust") => ("rust-analyzer", "rustup"),
@@ -277,7 +284,11 @@ impl Discovery {
                 }
             }
         }
-        if ids.len() != 6 {
+        if ids.len() != 6
+            || ["serena", "graphify", "nuphus", "python", "rust"]
+                .iter()
+                .any(|id| !ids.contains(id))
+        {
             return Err(package::invalid());
         }
         let home = local_path(&request.user_home)?;
@@ -349,6 +360,13 @@ impl Discovery {
                 .as_deref()
                 .map(local_path)
                 .transpose()?,
+            codegraph_roots: {
+                let mut roots = Vec::new();
+                for path in &request.codegraph_roots {
+                    roots.push(local_path(path)?);
+                }
+                unique(roots)
+            },
             home,
             full: request.full_records,
             probe_versions: request.probe_versions,
@@ -461,6 +479,9 @@ impl Discovery {
             "serena" | "graphify" => uv(spec, &self.uv, self.full),
             "codebase-memory" => self.npm("codebase-memory-mcp", "codebase-memory-mcp", None),
             "nuphus" => self.npm("@nuphus/nuphus-mcp", "nuphus-mcp", None),
+            "codegraph" => {
+                crate::dependency_discovery::dependency_codegraph::observe(&self.codegraph_roots)
+            }
             "python" => self
                 .npm(
                     "basedpyright",
@@ -478,10 +499,15 @@ impl Discovery {
             "rust" => self.rust(),
             _ => unreachable!(),
         };
+        let base = if spec["id"] == "codegraph" {
+            dependency_codegraph::missing()
+        } else {
+            package::base(spec)
+        };
         let mut record = match result {
-            Ok(candidates) => package::select(package::base(spec), candidates),
+            Ok(candidates) => package::select(base, candidates),
             Err(_) => {
-                let mut record = package::base(spec);
+                let mut record = base;
                 record["status"] = json!("incomplete");
                 record["evidence"] = json!([{"kind":"unavailable-observation","detail":"A dependency input is unreadable, malformed or exceeds the observation limit; no package was executed or changed."}]);
                 record
@@ -571,10 +597,11 @@ pub(crate) fn discover_with_catalogue(request: &Request, spec: Value) -> io::Res
     let mut all = records("mcp");
     let mcp_count = all.len();
     all.extend(records("languages"));
+    let language_count = all.len() - mcp_count;
     if request.processes {
         crate::dependency_process::observe(&mut all)?;
     }
-    let languages = all.split_off(mcp_count);
+    let languages = all.split_off(all.len() - language_count);
     Ok(
         json!({"schema_version":1,"catalogue":discovery.catalogue,"user_home":discovery.home,
         "read_only":true,"model_calls":0,"processes_started":if request.probe_versions {Value::Null} else {json!(0)},

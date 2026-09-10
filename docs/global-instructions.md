@@ -1,56 +1,61 @@
-# Глобальные рабочие принципы
+# Global working principles
 
-[Карта документации](README.md) · [Канонический текст](../global/principles-of-work.md) · [Карта адаптации](principles-port.md)
+[Documentation map](README.md) · [Canonical text](../global/principles-of-work.md) ·
+[Working-principles specification](../openspec/specs/global-working-principles/spec.md)
 
-На этой машине принципы подключены через штатный глобальный `AGENTS.md` Codex. Полный текст попадает в начальный контекст новых сессий, использующих этот Codex home, в том числе при работе в других репозиториях. Проверено **2026-09-06** на **codex-cli 0.153.4**.
+Principles enter the initial context of new Codex sessions through the host
+global `AGENTS.md`. That file is a symbolic link to the repository-owned source.
+A separate copied body is not maintained. `CODEX_HOME` stays the native Codex
+home; this checkout is not used as the authentication or session store.
+Connecting the link must not edit local `config.toml`, authorization or model
+settings.
 
-## Что подключено
+Official discovery: [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
+and [environment variables](https://learn.chatgpt.com/docs/config-file/environment-variables).
 
-```text
-D:\home\sergey-akhalkov\codex-harness\global\principles-of-work.md
-                                ^
-                                | symbolic link target
-C:\Users\noilw\.codex\AGENTS.md
-                                |
-                                v
-                 new Codex session in a project
-                                +
-                 applicable project instructions
-```
+## Update and scope
 
-- Исходник принадлежит этому репозиторию: `global/principles-of-work.md`.
-- Файл в Codex home — символическая ссылка на исходник. Отдельная копия текста не поддерживается.
-- Перед подключением глобальные `AGENTS.md` и `AGENTS.override.md` отсутствовали. Существующие инструкции не заменялись.
-- `CODEX_HOME` в проверенном окружении не задан; используется `C:\Users\noilw\.codex`. Checkout не назначался хранилищем авторизации и сессий.
-- SHA-256 `config.toml` до и после подключения совпал. Его содержимое, авторизация и настройки моделей этой операцией не редактировались.
+Edit the canonical file in the repository. A new session reads the current text
+through the live link; a separate install is not required after each edit. An
+already running session must be started again to guarantee an updated initial
+context. Creating a child agent from an already open parent does not reload the
+parent's initial instructions.
 
-Механизм поиска глобальных и проектных инструкций описан в официальной документации [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md); роль `CODEX_HOME` — в [Environment variables](https://learn.chatgpt.com/docs/config-file/environment-variables).
+A later global `AGENTS.override.md` would take precedence over global
+`AGENTS.md`. Project instructions add to the hierarchy and may refine the
+common rules. Another account or another `CODEX_HOME` needs its own connection.
+The link depends on checkout location; after a move, reconnect it to the new
+existing source. A Markdown link inside `AGENTS.md` does not include another
+document: this connection uses a filesystem link.
 
-## Обновление и область действия
+The [kit installer](installation.md) recognizes a correct existing principles
+link as already connected and preserves it on disconnect. Other platforms remain
+separate work. If links are unavailable, fix the cause; copy fallback is
+excluded.
 
-Редактировать нужно канонический файл в репозитории. Новая сессия читает его актуальное содержимое через ссылку; отдельная установка после каждой правки не требуется. Уже работающую сессию следует начать заново, чтобы гарантированно получить обновлённый начальный контекст.
+## Language defaults and early delivery
 
-Глобальный `AGENTS.override.md`, если появится, имеет приоритет над глобальным `AGENTS.md`. Проектные инструкции добавляются по штатной иерархии и могут уточнять общие правила. Другая учётная запись или другой `CODEX_HOME` требуют отдельного подключения. Эти границы следуют из [правил обнаружения AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
+Rust is the default programming language and PowerShell is the default shell in
+every project, including delegated work. See
+[project decisions](project-decisions.md#language-and-shell-defaults).
+Model-free `codex debug prompt-input` confirmed that the current source loads
+exactly once outside this checkout, with project `AGENTS.md` appearing after
+the global text when present.
 
-Ссылка зависит от расположения checkout. После его переноса нужно переподключить ссылку к новому существующему исходнику. При диагностике проверить эффективный Codex home, оба глобальных файла, цель ссылки и применимые инструкции проекта. Ссылка внутри текста `AGENTS.md` сама по себе не обеспечивает включение содержимого другого документа: здесь используется файловая ссылка.
+The early end-to-end delivery philosophy is in the same canonical source and
+[project decisions](project-decisions.md#outcome-quality-and-speed). A fresh
+child `middle` created from a new parent session can state those rules from
+already loaded instructions without tools. That check confirms instruction
+loading, not later product builds or unfinished Rust work.
 
-Общий [установщик набора](installation.md) реализован в [link-global-codex-kit](../openspec/changes/archive/2026-09-06-link-global-codex-kit/proposal.md); его итоговая приёмка учитывается отдельно от первоначального подключения принципов ниже. Установщик распознаёт существующую правильную ссылку как предварительно подключённую и сохраняет её при отключении набора. Поддержка других платформ остаётся отдельной работой. Если ссылки недоступны, требуется устранить причину; fallback на копирование исключён.
+## Reconnect
 
-## Проверка глобальных языковых предпочтений
-
-**2026-09-09:** в [канонические принципы](../global/principles-of-work.md#language-and-shell-defaults) добавлены Rust как язык программирования по умолчанию и PowerShell для shell во всех проектах, включая делегированную работу. [Решение пользователя и мотивация](project-decisions.md#языки-по-умолчанию-во-всех-проектах) сохранены отдельно.
-
-На установленном **codex-cli 0.153.4** команда `codex -C $env:TEMP debug prompt-input 'Instruction loading probe.'` без вызова модели подтвердила загрузку полного текущего текста вне checkout. Новый раздел присутствовал ровно один раз; отдельно проверены Rust, PowerShell и область действия для основного агента и субагентов. SHA-256 канонического файла и активного глобального `AGENTS.md` совпали; глобальный `AGENTS.override.md` отсутствовал. Переустановка не потребовалась: действующая символическая ссылка уже ведёт на исходник.
-
-Проверка подтверждает начальный контекст, а не соблюдение правила моделью во всех будущих задачах. Новые сессии получают обновлённый текст согласно [штатной загрузке глобальных инструкций](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
-
-## Как воспроизвести подключение на этой машине
-
-Следующий PowerShell-фрагмент предназначен для указанных путей. Он создаёт ссылку только при отсутствии обоих глобальных источников инструкций; существующие файлы требуют отдельного решения об объединении.
+Create the link only when both global instruction files are absent. Existing
+files need a separate composition decision.
 
 ```powershell
-$principlesSource = 'D:\home\sergey-akhalkov\codex-harness\global\principles-of-work.md'
-$codexConfigRoot = 'C:\Users\noilw\.codex'
+$principlesSource = Join-Path <checkout> 'global/principles-of-work.md'
+$codexConfigRoot = Join-Path $env:USERPROFILE '.codex'
 $globalInstructions = Join-Path $codexConfigRoot 'AGENTS.md'
 $globalOverride = Join-Path $codexConfigRoot 'AGENTS.override.md'
 
@@ -65,13 +70,12 @@ foreach ($instructionPath in @($globalInstructions, $globalOverride)) {
 New-Item -ItemType SymbolicLink -Path $globalInstructions -Target $principlesSource
 ```
 
-## Откат подключения
-
-В PowerShell сначала проверить, что активный объект — именно созданная нами ссылка на ожидаемый файл, затем удалить только эту ссылку:
+To roll back, confirm the active object is the expected symbolic link, then
+remove only that link:
 
 ```powershell
-$principlesSource = 'D:\home\sergey-akhalkov\codex-harness\global\principles-of-work.md'
-$globalInstructions = 'C:\Users\noilw\.codex\AGENTS.md'
+$principlesSource = Join-Path <checkout> 'global/principles-of-work.md'
+$globalInstructions = Join-Path $env:USERPROFILE '.codex\AGENTS.md'
 $instructionLink = Get-Item -LiteralPath $globalInstructions -Force -ErrorAction Stop
 if ($instructionLink.LinkType -ne 'SymbolicLink' -or
     [string]$instructionLink.Target -ne $principlesSource) {
@@ -80,27 +84,9 @@ if ($instructionLink.LinkType -ne 'SymbolicLink' -or
 Remove-Item -LiteralPath $globalInstructions
 ```
 
-Операция удаляет файловую ссылку; исходник в репозитории сохраняется. Следующие сессии перестанут получать принципы через этот глобальный файл. Корневой `AGENTS.md` самого harness по-прежнему ссылается на них для работы над harness. Откат описан, но на активном подключении не выполнялся.
+The operation removes the filesystem link; the repository source remains. Later
+sessions stop receiving principles through that global file. The pack's own
+root `AGENTS.md` still routes to the same source for work on this repository.
 
-## Что проверено
-
-Исследованный исходник opencode-kit: **12 844 байта**. Адаптированный глобальный текст: **8 436 байт**, шесть разделов. SHA-256 исходника harness и содержимого активной ссылки совпали:
-
-```text
-6232AFCF0A3384453B91BB3ACC873235E39C6B1A4B7D14C072F23E24E882578E
-```
-
-Для проверки использован доступный в установленном CLI `codex debug prompt-input 'Instruction loading probe.'`. Команда формирует фактические начальные сообщения без вызова модели; её назначение сверено с локальным `--help`. JSON разбирался в памяти, полные сообщения в репозиторий не сохранялись. Сравнивался весь текст исходника с нормализацией переводов строк, а также наличие каждого раздела.
-
-| Отдельный временный Git-репозиторий | Полный текст принципов | Все шесть разделов | Число включений | Локальные инструкции |
-| --- | --- | --- | --- | --- |
-| `plain` | Да | Да | 1 | Отсутствовали, как и ожидалось |
-| `with-local-guidance` | Да | Да | 1 | Уникальный маркер из проектного `AGENTS.md` присутствовал после глобальных правил |
-
-Оба запуска завершились с кодом 0. До подключения такой же инструмент не обнаруживал заголовок принципов. Проверка подтверждает загрузку инструкций; соблюдение всех правил и влияние на скорость и дефекты оцениваются по последующей работе.
-
-Дополнительно проверены локальные ссылки в документации, наличие в карте адаптации всех 38 исходных принципов и синтаксис обоих PowerShell-примеров. Ошибок не обнаружено. Перед архивацией `openspec validate --all --strict` проверил change и основную спеку: оба прошли. SHA-256 исходного файла в opencode-kit остался прежним. Проверка синтаксиса примеров не означает выполнение отката.
-
-Очистка пробных каталогов завершена. После удаления временных файлов пользователь удалил оставшиеся каталоги вручную: автоматическая проверка инструмента блокировала удаление скрытых каталогов. Его команда завершилась с кодом 0; последующая проверка подтвердила отсутствие всего временного корня. Глобальная ссылка сохранена, её содержимое совпадает с каноническим источником.
-
-Все шесть задач выполнены; change [архивирован 2026-09-06](../openspec/changes/archive/2026-09-06-port-global-working-principles/tasks.md). Шесть требований и восемь сценариев синхронизированы с [основной спекой](../openspec/specs/global-working-principles/spec.md) без расхождений.
+Loading checks use `codex debug prompt-input` without a model call. They
+confirm initial context, not that a model will follow every rule in later tasks.

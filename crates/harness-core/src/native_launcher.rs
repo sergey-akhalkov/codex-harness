@@ -70,6 +70,88 @@ fn fail(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
 
+const DEGRADED_NOTICE: &str = "codex-harness: shared harness unavailable; launching registered Codex without harness overrides";
+
+fn registered_runtime(registration: &Registration) -> io::Result<(PathBuf, bool)> {
+    let selected = match (
+        registration.schema,
+        &registration.state,
+        &registration.build,
+    ) {
+        (1, Some(state), None) if state.is_absolute() => match build_selection::selected(state) {
+            Ok(build) => return Ok((build, true)),
+            Err(error) => schema_one_build(state).ok_or(error)?,
+        },
+        (2, None, Some(build)) if build.is_absolute() => build.clone(),
+        _ => return Err(fail("unsupported native launch registration")),
+    };
+    if launcher_identity_matches(&selected)? {
+        let shared = matches!(
+            build_identity::check(&selected, None).status,
+            build_identity::Health::Healthy
+        );
+        Ok((selected.canonicalize()?, shared))
+    } else {
+        Err(fail(
+            "registered native build is stale, missing or altered; explicit update required",
+        ))
+    }
+}
+
+fn schema_one_build(state: &Path) -> Option<PathBuf> {
+    crate::native_build::verify_owned_state(state).ok()?;
+    if std::fs::metadata(state.join("build-selection-journal.json")).is_ok() {
+        return None;
+    }
+    let bytes = std::fs::read(state.join("active-build.json")).ok()?;
+    let pointer: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if pointer.get("schema")?.as_u64()? != 1 {
+        return None;
+    }
+    let name = pointer.get("build")?.as_str()?;
+    if Path::new(name).components().count() != 1 {
+        return None;
+    }
+    let expected = pointer.get("record_sha256")?.as_str()?;
+    let build = state.join("builds").join(name);
+    if build_identity::hash_file(&build.join("build.json"))
+        .ok()?
+        .as_str()
+        != expected
+    {
+        return None;
+    }
+    Some(build)
+}
+
+fn launcher_identity_matches(build: &Path) -> io::Result<bool> {
+    let record = match build_identity::read_record(build) {
+        Ok(record) => record,
+        Err(_) => return Ok(false),
+    };
+    let Some(expected) = record.binaries.get("codex.exe") else {
+        return Ok(false);
+    };
+    let launcher = build.join("codex.exe");
+    Ok(build_identity::ordinary(&launcher).is_ok()
+        && build_identity::hash_file(&launcher).is_ok_and(|actual| actual == *expected))
+}
+
+fn shared_config_args(build: &Path, home: &Path) -> io::Result<Vec<OsString>> {
+    let record = build_identity::read_record(build)?;
+    let bytes = std::fs::read(record.source_root.join("global/kit.json"))?;
+    let manifest: crate::inventory::Manifest =
+        serde_json::from_slice(&bytes).map_err(|_| fail("invalid live kit manifest"))?;
+    crate::portable_config::overrides(&record.source_root.join(manifest.profile), home)
+}
+
+fn notice_degraded_session(task_args: &[OsString]) {
+    let classified = launcher::profile_arguments(task_args);
+    if classified.len() != task_args.len() {
+        eprintln!("{DEGRADED_NOTICE}");
+    }
+}
+
 pub fn codex_home() -> io::Result<PathBuf> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -90,22 +172,7 @@ pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<
     }
     let registration: Registration = serde_json::from_slice(&bytes)
         .map_err(|_| fail("invalid native launch registration; explicit repair is required"))?;
-    let selected = match (registration.schema, registration.state, registration.build) {
-        (1, Some(state), None) if state.is_absolute() => build_selection::selected(&state)?,
-        (2, None, Some(build)) if build.is_absolute() => {
-            // Installation selects this immutable artifact in the same link
-            // journal as its launch registration. Later build-tool selections
-            // cannot silently move the installed runtime to another artifact.
-            let check = build_identity::check(&build, None);
-            if !check.runtime_allowed {
-                return Err(fail(
-                    "registered native build is stale, missing or altered; explicit update required",
-                ));
-            }
-            build.canonicalize()?
-        }
-        _ => return Err(fail("unsupported native launch registration")),
-    };
+    let (selected, shared) = registered_runtime(&registration)?;
     let executable = executable.canonicalize()?;
     if selected.join("codex.exe").canonicalize()? != executable {
         return Err(fail("this launcher is not the selected native build"));
@@ -136,7 +203,20 @@ pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<
     let task_args = launcher::task_arguments(args)?;
     let roots = launcher::additional_roots(&task_args, &env::current_dir()?);
     let mut command = Command::new(target);
-    command.args(launcher::profile_arguments(&task_args));
+    let classified = launcher::profile_arguments(&task_args);
+    if shared && classified.len() != task_args.len() {
+        match shared_config_args(&selected, home) {
+            Ok(overrides) => {
+                command.args(overrides);
+            }
+            Err(_) => {
+                notice_degraded_session(&task_args);
+            }
+        }
+    } else if !shared {
+        notice_degraded_session(&task_args);
+    }
+    command.args(&task_args);
     if roots.is_empty() {
         command.env_remove("HARNESS_LSP_WORKSPACE_ROOTS");
     } else {

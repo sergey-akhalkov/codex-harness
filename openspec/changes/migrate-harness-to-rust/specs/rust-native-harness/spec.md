@@ -36,9 +36,15 @@ Completion SHALL include a current inventory and executable ownership check cove
 
 The kit SHALL expose native executable management, launcher, diagnostic, service, tool and skill-helper entry points. Ordinary `codex` usage, argument boundaries, Unicode, cwd/environment, streams, exit codes, native option precedence and accepted task-effort selection SHALL retain their supported behavior. Native lifecycle commands SHALL retain component isolation, preview, Check, explicit recovery and ownership rules. Replaced script command names SHALL have a documented native equivalent and existing managed registrations SHALL migrate without requiring the user to recreate every connection. Launcher discovery MUST distinguish the upstream command from its own executable.
 
+Ordinary upstream CLI availability SHALL be independent of optional harness health. If harness preparation or shared build/source/configuration validation fails, the launcher SHALL use the available original CLI with native arguments and local settings, identify the degraded enhancement, and preserve command/stream/exit behavior without automatic provisioning. It SHALL NOT weaken integrity checks for executing harness extensions or retry by launching another upstream session after the first starts.
+
 #### Scenario: Existing user's ordinary launch
 - **WHEN** an upgraded user opens a fresh terminal outside the checkout and invokes `codex` with explicit native options and quoted Unicode arguments
 - **THEN** the connected configuration is selected, each argument reaches the intended upstream command unchanged apart from documented harness options, and no recursive launcher invocation occurs
+
+#### Scenario: Shared configuration cannot be prepared
+- **WHEN** harness shared configuration is stale, missing or malformed and the registered original CLI remains usable
+- **THEN** the original CLI starts without harness-injected defaults, receives native arguments and stdin unchanged, and its output and exit status are preserved without a second invocation
 
 #### Scenario: Component-only operation
 - **WHEN** a native lifecycle command selects only one accepted component or requests preview
@@ -87,6 +93,22 @@ The four selected MCP tools, subscription routing, source diagnostics, RTK and a
 #### Scenario: Serena integration replacement
 - **WHEN** the native implementation starts the adopted Serena tool for two independently owned project contexts
 - **THEN** implicit package provisioning stays disabled, project/worker ownership remains isolated as required, and explicit semantic operations work through the intended actual foreign process
+
+#### Scenario: Large real CodeGraph index
+- **WHEN** acceptance builds a full CodeGraph index for the current `<large-acceptance-root>` project through the actual managed MCP entry point
+- **THEN** indexing completes and publishes a usable current graph under the retained resource controls, representative maintained source can be queried, bounded automatic/manual refresh and response budgets work, and material coverage gaps remain visible; a small fixture does not substitute for this acceptance, product-source files remain unchanged and no controller operation occurs
+
+#### Scenario: Graph provider replacement is shared with the Rust migration
+- **WHEN** the native migration reaches the graph adapter or classifies a legacy CBM implementation
+- **THEN** it integrates the first-party Rust CodeGraph adapter and applicable acceptance evidence owned by `replace-cbm-with-codegraph`, does not resume a separate CBM port or rewrite upstream CodeGraph, and leaves dependent tasks open until the replacement and integrated behavior pass
+
+#### Scenario: Concurrent CLI projects use the native graph provider
+- **WHEN** several Codex CLI sessions keep distinct indexed projects open and another client shares one of those projects
+- **THEN** each project receives automatic refresh and correctly scoped queries throughout the healthy session lifetime, same-project clients share suitable backend/index/watcher resources, aggregate limits remain enforced, and closing one client does not interrupt the others; a single-active-project or periodic-manual-renewal restriction leaves acceptance incomplete
+
+#### Scenario: Provider replacement precedes full native cutover
+- **WHEN** CodeGraph is accepted through the existing global installation lifecycle while other Rust migration tasks remain open
+- **THEN** replacement acceptance does not depend on completing the entire Rust migration, and subsequent native installation preserves the accepted CodeGraph selection instead of restoring CBM
 
 ### Requirement: Rust verification and skill delivery
 

@@ -516,8 +516,14 @@ pub(crate) fn inspect(
     let envelope: ManifestEnvelope =
         serde_json::from_slice(&manifest_bytes).map_err(|_| invalid())?;
     let report = envelope.report;
+    let codegraph = crate::dependency_discovery::dependency_codegraph::is_package(&request.package);
+    let preparation = if codegraph {
+        "codegraph-candidate-preparation"
+    } else {
+        "npm-candidate-preparation"
+    };
     if report.get("schema_version") != Some(&json!(1))
-        || report.get("operation") != Some(&json!("npm-candidate-preparation"))
+        || report.get("operation") != Some(&json!(preparation))
         || report.get("status") != Some(&json!("staged-unverified"))
         || report.get("activation_allowed") != Some(&json!(false))
         || report.get("package") != Some(&json!(request.package))
@@ -562,7 +568,14 @@ pub(crate) fn inspect(
     )?;
     let package_json = files
         .iter()
-        .find(|file| file.path == "package.json")
+        .find(|file| {
+            file.path
+                == if codegraph {
+                    "lib/package.json"
+                } else {
+                    "package.json"
+                }
+        })
         .ok_or_else(invalid)?;
     let mut identity_bytes = Vec::new();
     package_json
@@ -653,6 +666,19 @@ pub(crate) fn inspect(
                 "sha256": file.sha256,
                 "size": file.size,
                 "node_sha256": node_digest.ok_or_else(invalid)?
+            })
+        }
+        "@colbymchenry/codegraph" | "codegraph" => {
+            let inspected = crate::dependency_discovery::inspect_package(&stage)?;
+            json!({
+                "kind": "bundled-node",
+                "path": crate::dependency_discovery::dependency_codegraph::ENTRY,
+                "node": crate::dependency_discovery::dependency_codegraph::NODE,
+                "kernel": crate::dependency_discovery::dependency_codegraph::KERNEL,
+                "sha256": crate::dependency_discovery::dependency_codegraph::ENTRY_SHA256,
+                "node_sha256": crate::dependency_discovery::dependency_codegraph::NODE_SHA256,
+                "kernel_sha256": crate::dependency_discovery::dependency_codegraph::KERNEL_SHA256,
+                "root": inspected.root
             })
         }
         _ => return Err(invalid()),
@@ -800,6 +826,9 @@ pub fn validate(
     let runtime = match inspected.package() {
         "codebase-memory-mcp" | "@nuphus/nuphus-mcp-win32-x64" => probe_mcp(&inspected)?,
         "basedpyright" => probe_basedpyright(&inspected)?,
+        "@colbymchenry/codegraph" | "codegraph" => {
+            crate::codegraph_runtime::probe_package(&stage.join("package"))?
+        }
         _ => return Err(invalid()),
     };
     let mut report = inspected.report.clone();

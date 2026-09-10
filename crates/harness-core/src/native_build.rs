@@ -555,7 +555,10 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         .map_err(|e| io::Error::other(format!("Starting bounded Cargo failed: {e}")))?;
     let status = job.wait(
         &child,
-        Deadline::after(Duration::from_secs(600))?,
+        // A cold release build includes optimized manager variants and native
+        // dependencies. Keep it finite without applying an indexing deadline
+        // to compilation; the compiler Job still bounds memory and CPU.
+        Deadline::after(Duration::from_secs(1800))?,
         &Cancellation::default(),
         Duration::from_secs(5),
     )?;

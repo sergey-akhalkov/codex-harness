@@ -1,12 +1,14 @@
-# Codex Harness
+# coding-agents-harness-pack
 
-A portable configuration and capability kit for Codex CLI. Managed sources stay
-in this checkout: the full global instructions, configuration, skills, agents and
-connection tools are read through direct filesystem links.
+A reusable public source of coding-agent instructions, skills, MCP connections
+and installation tooling. The currently delivered automatic entry point is
+Codex CLI on Windows. Compatible `codex-harness` command and package
+identifiers remain until a separate migration changes them.
 
-The shared configuration is writable through its link: native TUI model changes
-and machine-specific settings, including trusted project paths, may be saved
-directly in this repository. This behavior is explicitly accepted.
+The checkout is the live source of the portable kit. Installation connects those
+files through filesystem links. Machine-specific TUI settings, authentication,
+session history, caches and recovery copies stay on the local machine. Shared
+defaults continue to be read live from this repository.
 
 On Windows, with PowerShell 7.4+, Codex CLI and OpenSpec installed:
 
@@ -24,18 +26,15 @@ configuration override retains Codex's normal precedence.
 .\install.ps1 -Mode Disconnect
 ```
 
-Installation registers links and a user command-path entry. The local base
-`config.toml`, authentication and session state stay on the machine. There is no
-artifact-copy mode.
-
-- [Installation, prerequisites, updates and recovery](docs/installation.md)
-- [Documentation and project decisions](docs/README.md)
+- [Installation, updates and recovery](docs/installation.md)
+- [Documentation map and official contracts](docs/README.md)
+- [Confirmed product decisions](docs/project-decisions.md)
 - [Full global instruction source](global/principles-of-work.md)
 - [Shared configuration](global/harness.config.toml)
 - [Managed source and prerequisite inventory](global/kit.psd1)
-- [Verification evidence and supported limits](docs/linked-kit-verification.md)
+- [Native Rust commands](docs/rust-native.md)
 
-The supported automatic entry point is the local Codex CLI command in Windows
-PowerShell. Clients that start their own executable, such as IDE/app-server
-integrations, need their own profile selection; this CLI registration does not
-claim to configure those clients.
+Clients that start their own executable, such as IDE or app-server integrations,
+need their own profile selection. This CLI registration does not configure those
+clients. Additional agents or operating systems are not claimed by the current
+delivery.

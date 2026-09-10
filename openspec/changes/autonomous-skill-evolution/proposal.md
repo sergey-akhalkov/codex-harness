@@ -29,6 +29,6 @@
 
 Ordinary diagnostic, context and Stop hooks remain OFF. `global/hooks.json` is empty ownership/relocation state, not an active diagnostic stack. The only accepted hook exception is the narrow RTK PreToolUse adapter. Same-session compact/resume skill recovery remains required; without a supported hooks-off delivery path it stays an owning blocker rather than a restored SessionStart/PostToolUse/Stop implementation.
 
-Интеграция использует выбранную [проектную Git-память](../archive/2026-09-09-adopt-project-memory-and-native-workflows/specs/git-project-memory/spec.md) без второго авторитетного хранилища. Bounded Git-память 1.3/1.4 is accepted; native memories remain excluded. Self-contained skill installation must still use existing project records. First target environment remains Windows, PowerShell 7.4+ and installed Codex CLI 0.153.4.
+Интеграция использует выбранную [проектную Git-память](../../specs/git-project-memory/spec.md) без второго авторитетного хранилища. Bounded Git-память 1.3/1.4 is accepted; native memories remain excluded. Self-contained skill installation must still use existing project records. First target environment remains Windows, PowerShell 7.4+ and installed Codex CLI 0.153.4.
 
 Фоновый обход неактивных репозиториев, собственный оркестратор, автоматический commit/push, перезапись сторонних или встроенных скиллов и самостоятельное изменение правил контроля в объём не входят. Этот change содержит план; создание артефактов не активирует механизм и не запускает модельные испытания.

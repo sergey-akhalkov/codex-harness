@@ -207,7 +207,7 @@ def without_readiness(before, state):
     return after
 
 
-def without_owned(before, state):
+def without_owned(before, state, known_names=NAMES):
     """Remove only semantically owned statements, never a stale marker range.
 
     Native TUI writes can interleave foreign sections inside the old BEGIN/END
@@ -217,7 +217,7 @@ def without_owned(before, state):
     parsed = tomllib.loads(before.decode('utf-8-sig')) if before else {}
     existing = parsed.get('mcp_servers', {})
     for name, expected in owned.items():
-        if name not in NAMES or existing.get(name) != expected:
+        if name not in known_names or existing.get(name) != expected:
             raise ValueError(f'MCP name/ownership conflict: {name}; preserving current registration.')
     if not owned:
         return before
@@ -259,7 +259,7 @@ def without_owned(before, state):
     return after
 
 
-def inspect(home, source, powershell, mode):
+def inspect(home, source, powershell, mode, native_providers=None):
     config = home / 'config.toml'
     state_path = home / 'harness/code-tools-registration.json'
     assert_plain(config)
@@ -272,10 +272,21 @@ def inspect(home, source, powershell, mode):
         raise ValueError('Unknown registration state schema.')
     policy, operations = readiness_policy(parsed, state, mode)
     desired = {}
-    for name in NAMES:
+    native_providers = native_providers or {}
+    native_targets = native_providers.get('registrations', {})
+    retired = native_providers.get('retired', [])
+    if mode != 'Disconnect' and any(name not in NAMES and name not in native_targets for name in state['registrations']):
+        raise ValueError('Native provider projection is required; preserving current registrations.')
+    names = tuple(dict.fromkeys((*NAMES, *state['registrations'], *native_targets)))
+    for name in names:
         old = state['registrations'].get(name)
         actual = existing.get(name)
-        target = registration(source, powershell, name, home) if mode != 'Disconnect' and name in SELECTED_NAMES else None
+        target = None
+        if mode != 'Disconnect':
+            if name in native_targets:
+                target = native_targets[name]
+            elif name in SELECTED_NAMES and name not in retired:
+                target = registration(source, powershell, name, home)
         # A same-named unmanaged registration is a conflict, even if it looks similar.
         if actual is not None and (old is None or actual != old):
             raise ValueError(f'MCP name/ownership conflict: {name}; preserving current registration.')
@@ -319,7 +330,7 @@ def recover(home, preview=False):
     return {'status': 'registration-recovered'}
 
 
-def run(home, source, native, powershell, mode, preview=False, defer_commit=False):
+def run(home, source, native, powershell, mode, preview=False, defer_commit=False, native_providers=None):
     pending_path = home / 'harness/code-tools-registration-pending.json'
     if mode == 'Recover':
         return recover(home, preview)
@@ -327,11 +338,14 @@ def run(home, source, native, powershell, mode, preview=False, defer_commit=Fals
         raise ValueError('Interrupted MCP registration: run install.ps1 -Mode Recover.')
     config = home / 'config.toml'
     state_path = home / 'harness/code-tools-registration.json'
-    before, state, desired, policy, operations = inspect(home, source, powershell, mode)
+    before, state, desired, policy, operations = inspect(home, source, powershell, mode, native_providers)
+    names = tuple(dict.fromkeys((*NAMES, *state['registrations'], *desired)))
     if mode == 'Check':
         return {'status': 'connected' if not operations else 'degraded', 'callable': None, 'operations': operations,
                 'note': 'This checks registrations; real MCP calls are separate acceptance evidence.'}
-    untouched = without_readiness(without_owned(before, state), state) if operations else before
+    catalogue = read_json(source / 'global/code-tools.json') or {}
+    known_names = (*NAMES, *(item['id'] for item in catalogue.get('mcp', []) if item.get('manager') == 'native'))
+    untouched = without_readiness(without_owned(before, state, known_names), state) if operations else before
     if preview:
         return {'status': 'preview-registration', 'operations': operations, 'mutated': False}
     if not operations:
@@ -351,11 +365,14 @@ def run(home, source, native, powershell, mode, preview=False, defer_commit=Fals
                 # Never emit editor stdout/stderr: it may contain local settings.
                 raise RuntimeError(f'Native MCP editor failed for {name}, exit {process.returncode}. Live configuration unchanged.')
         rendered = (stage / 'config.toml').read_bytes()
-        if desired.get('codebase-memory', {}).get('tool_timeout_sec'):
-            header = b'[mcp_servers.codebase-memory]\n'
-            if rendered.count(header) != 1:
-                raise RuntimeError('Unexpected native CBM registration layout; live configuration unchanged.')
-            rendered = rendered.replace(header, header + b'tool_timeout_sec = 660\n', 1)
+        for name, target in desired.items():
+            settings = b''.join((key + ' = ' + str(target[key]) + '\n').encode('utf-8')
+                                for key in ('startup_timeout_sec', 'tool_timeout_sec') if key in target)
+            if settings:
+                header = ('[mcp_servers.' + name + ']\n').encode('utf-8')
+                if rendered.count(header) != 1:
+                    raise RuntimeError('Unexpected native MCP registration layout; live configuration unchanged.')
+                rendered = rendered.replace(header, header + settings, 1)
         block = (b'\n# BEGIN codex-harness MCP registrations\n' + rendered +
                  b'# END codex-harness MCP registrations\n') if desired else b''
         after = untouched + block
@@ -371,11 +388,11 @@ def run(home, source, native, powershell, mode, preview=False, defer_commit=Fals
             expected_readiness = 0 if policy is not None or state['connection_policy']['previous_present'] else None
             if new_structure.pop(READINESS_KEY, None) != expected_readiness:
                 raise RuntimeError('Unexpected native MCP readiness result; live configuration unchanged.')
-        old_unmanaged = {name: value for name, value in old_servers.items() if name not in NAMES}
-        new_unmanaged = {name: value for name, value in new_servers.items() if name not in NAMES}
+        old_unmanaged = {name: value for name, value in old_servers.items() if name not in names}
+        new_unmanaged = {name: value for name, value in new_servers.items() if name not in names}
         if old_structure != new_structure or old_unmanaged != new_unmanaged:
             raise RuntimeError('Native editor changed unrelated settings; live configuration unchanged.')
-        for name in NAMES:
+        for name in names:
             if new_servers.get(name) != desired.get(name):
                 raise RuntimeError(f'Native editor produced an unexpected registration for {name}.')
     if bytes_at(config) != before:
@@ -420,10 +437,20 @@ def main():
     parser.add_argument('--mode', choices=['Install', 'Update', 'Check', 'Disconnect', 'Recover'], default='Install')
     parser.add_argument('--preview', action='store_true')
     parser.add_argument('--defer-commit', action='store_true')
+    parser.add_argument('--plan-only', action='store_true', help='Emit desired registrations JSON for a retained MCP planner handoff; do not mutate configuration.')
+    parser.add_argument('--native-providers-json', help='Prepared native provider projection from the Rust owner')
     args = parser.parse_args()
     if args.python:
         os.environ['HARNESS_MCP_PYTHON'] = str(args.python.resolve())
-    print(json.dumps(run(args.codex_home.absolute(), args.source_root.resolve(), args.native_codex, args.powershell, args.mode, args.preview, args.defer_commit)))
+    projection = json.loads(args.native_providers_json) if args.native_providers_json else None
+    if args.plan_only:
+        if args.mode == 'Recover':
+            raise ValueError('Plan-only retained MCP planner handoff does not recover interrupted activation.')
+        _before, _state, desired, _policy, _operations = inspect(
+            args.codex_home.absolute(), args.source_root.resolve(), args.powershell, args.mode, projection)
+        print(json.dumps({'registrations': desired}))
+        return
+    print(json.dumps(run(args.codex_home.absolute(), args.source_root.resolve(), args.native_codex, args.powershell, args.mode, args.preview, args.defer_commit, projection)))
 
 
 if __name__ == '__main__':

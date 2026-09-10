@@ -222,6 +222,8 @@ impl Job {
 }
 
 #[cfg(windows)]
+pub(crate) use windows::quote as quote_argument;
+#[cfg(windows)]
 pub use windows::{Job, OwnedProcess, SuspendedProcess};
 
 #[cfg(windows)]
@@ -319,7 +321,7 @@ mod windows {
 
     // Microsoft CRT argv quoting, operating on UTF-16 so unpaired surrogates
     // are preserved. Always quote, including empty arguments and trailing '\'.
-    fn quote(value: &OsStr, result: &mut Vec<u16>) -> io::Result<()> {
+    pub(crate) fn quote(value: &OsStr, result: &mut Vec<u16>) -> io::Result<()> {
         result.push(34);
         let mut slashes = 0;
         for unit in value.encode_wide() {
@@ -605,6 +607,19 @@ mod windows {
 
         pub fn contains(&self, process: &OwnedProcess) -> io::Result<bool> {
             in_job(process.handle.as_raw_handle(), self.handle.as_raw_handle())
+        }
+
+        /// For the trusted service bootstrap only, before starting any worker.
+        /// Closing this Job also terminates the current process. Normal service
+        /// exit must use process::exit so the OS closes the Job after exit begins.
+        pub fn contain_current_process(&self) -> io::Result<()> {
+            checked(unsafe {
+                AssignProcessToJobObject(self.handle.as_raw_handle(), GetCurrentProcess())
+            })?;
+            if !in_job(unsafe { GetCurrentProcess() }, self.handle.as_raw_handle())? {
+                return Err(io::Error::other("service Job assignment was not observed"));
+            }
+            Ok(())
         }
 
         /// Read-only reconciliation: mismatch, exit and foreign membership all

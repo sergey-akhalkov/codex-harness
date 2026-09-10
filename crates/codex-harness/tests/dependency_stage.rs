@@ -130,6 +130,19 @@ fn invalid_version_and_foreign_state_are_preserved_without_acquisition() {
 }
 
 #[test]
+fn codegraph_checksum_mismatch_is_rejected_without_creating_owned_state() {
+    let root = tempfile::tempdir().unwrap();
+    let absent = root.path().join("absent-codegraph-state");
+    let output = package_command(&absent, "@colbymchenry/codegraph", "1.6.1")
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!absent.exists());
+}
+
+#[test]
 #[ignore = "explicit public npm archive preparation and 404; only owned staging is written"]
 fn actual_official_candidate_and_failed_download_preserve_prior_staging() {
     let root = tempfile::Builder::new()

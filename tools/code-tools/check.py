@@ -32,9 +32,10 @@ async def check_one(name: str, registry: Path, environment: dict[str, str]) -> C
         # kill that consumer nor mask its result with Windows cleanup errors.
         workspace = Path(environment['CODEX_HOME']) / 'harness' / 'verification' / 'mcp-check' / name
         workspace.mkdir(parents=True, exist_ok=True)
-        parameters = StdioServerParameters(command=sys.executable,
-            args=['-B', '-u', str(Path(__file__).with_name('launch.py')), name, '--registry', str(registry)],
-            env={**environment, 'HARNESS_CODE_TOOLS_REGISTRY': str(registry), 'PYTHONDONTWRITEBYTECODE': '1'}, cwd=str(workspace))
+        state = json.loads((Path(environment['CODEX_HOME']) / 'harness/code-tools-registration.json').read_text(encoding='utf-8-sig'))
+        target = state['registrations'][name]
+        parameters = StdioServerParameters(command=target['command'], args=target['args'],
+            env={**environment, **target.get('env', {}), 'HARNESS_CODE_TOOLS_REGISTRY': str(registry), 'PYTHONDONTWRITEBYTECODE': '1'}, cwd=str(workspace))
         with anyio.fail_after(75):
             async with stdio_client(parameters) as streams:
                 async with ClientSession(*streams) as session:
@@ -63,8 +64,8 @@ async def main() -> None:
         results.append(await check_one(name, args.registry, environment))
 
     # Verify only the accepted global selection, sequentially.
-    from registration import SELECTED_NAMES
-    for name in SELECTED_NAMES:
+    state = json.loads((args.codex_home / 'harness/code-tools-registration.json').read_text(encoding='utf-8-sig'))
+    for name in state['registrations']:
         await collect(name)
     print(json.dumps({'status': 'protocol-ready' if all(r['status'] == 'protocol-ready' for r in results) else 'degraded', 'servers': results}))
 

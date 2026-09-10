@@ -240,9 +240,39 @@ fn observe(
     if !project.is_dir() {
         return Err(invalid());
     }
-    let profile_path = request
-        .codex_home
-        .join(format!("{}.config.toml", request.profile));
+    let shared_consumer = request.profile == "harness";
+    let profile_path = if shared_consumer {
+        let source = match &request.source {
+            Some(source) => source.clone(),
+            None => {
+                let state: Value =
+                    serde_json::from_slice(&fs::read(home.join("harness/installation.json"))?)
+                        .map_err(|_| invalid())?;
+                PathBuf::from(
+                    state["sourceRoot"]
+                        .as_str()
+                        .or_else(|| state["settings"]["sourceRoot"].as_str())
+                        .ok_or_else(invalid)?,
+                )
+            }
+        };
+        let manifest: harness_core::inventory::Manifest =
+            serde_json::from_slice(&fs::read(source.join("global/kit.json"))?)
+                .map_err(|_| invalid())?;
+        source.join(manifest.profile)
+    } else {
+        request
+            .codex_home
+            .join(format!("{}.config.toml", request.profile))
+    };
+    let overrides: Vec<String> = if shared_consumer {
+        harness_core::portable_config::overrides(&profile_path, &home)?
+            .into_iter()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let base_snapshot = Snapshot::read(request.codex_home.join("config.toml"))?;
     let profile_snapshot = Snapshot::read(profile_path.clone())?;
     if !profile_path.is_file() {
@@ -278,7 +308,7 @@ fn observe(
                     case,
                     working_directory: &root,
                     home,
-                    extra: &[],
+                    extra: &overrides,
                     root: evidence,
                     timeout: remaining,
                     output_limit: 16 * 1024 * 1024,
@@ -289,21 +319,25 @@ fn observe(
         };
         let base = read(&project, &home, &base_evidence, rpc::Protocol::Sources)?;
         let version = regex::Regex::new(r"/([0-9]+\.[0-9]+\.[0-9]+)").map_err(|_| invalid())?;
-        if version
+        let observed_version = version
             .captures(base["native"]["userAgent"].as_str().ok_or_else(invalid)?)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str())
-            != Some("0.153.4")
-        {
+            .ok_or_else(invalid)?;
+        if !["0.153.4", "0.154.0"].contains(&observed_version) {
             return Err(invalid());
         }
         let profile_home = profile_home.canonicalize()?;
-        let profile = read(
-            &profile_home,
-            &profile_home,
-            &profile_evidence,
-            rpc::Protocol::Profile,
-        )?;
+        let profile = if shared_consumer {
+            json!({"config":{"layers":[{"name":{"type":"user"},"config":{}}]}})
+        } else {
+            read(
+                &profile_home,
+                &profile_home,
+                &profile_evidence,
+                rpc::Protocol::Profile,
+            )?
+        };
         let layers = profile["config"]["layers"].as_array().ok_or_else(invalid)?;
         let users: Vec<_> = layers
             .iter()
@@ -328,8 +362,8 @@ fn observe(
         }
         Ok((
             json!({"status":"observed","executable":local(&upstream.executable)?,
-            "protocol":"config/read + configRequirements/read + skills/list","version":"0.153.4",
-            "profileSelection":"reconstructed; app-server does not accept file profiles","skillsScope":"native base consumer"}),
+            "protocol":"config/read + configRequirements/read + skills/list","version":observed_version,
+            "profileSelection": if shared_consumer {"live shared CLI overrides; native base persistence"} else {"reconstructed; app-server does not accept file profiles"},"skillsScope":"native base consumer"}),
             view,
         ))
     })();

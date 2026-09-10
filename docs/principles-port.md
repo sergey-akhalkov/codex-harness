@@ -1,83 +1,45 @@
-# Адаптация принципов opencode-kit
+# Adaptation of source-kit principles
 
-[Карта документации](README.md) · [Рабочие принципы](../global/principles-of-work.md) · [Глобальное подключение](global-instructions.md) · [Решения пользователя](project-decisions.md)
+[Documentation map](README.md) · [Working principles](../global/principles-of-work.md) ·
+[Working-principles specification](../openspec/specs/global-working-principles/spec.md)
 
-Дата: **2026-09-06**. Исходник: `opencode-kit/global/principles-of-work.md`, прочитан целиком из соседнего checkout. SHA-256 исследованного файла: `D591FC050B8A6AABD4B954971613575BB92166E128E7D755F4703A9614B2DABB`. Исходный репозиторий не изменялся.
+The operational text is `global/principles-of-work.md`. It is self-contained
+and intended for Codex initial context. This note records the agreed
+adaptations; it is not a second policy manual.
 
-Операционный текст находится в `global/principles-of-work.md`. Он самодостаточен и предназначен для начального контекста Codex. Эта сравнительная записка остаётся справочным материалом.
+**2026-09-10:** early verified end-to-end delivery, transparent operating
+conditions and defenses chosen by concrete risk refine delivery priority while
+preserving product correctness, required acceptance and completion of the whole
+agreed task. Canonical wording is in the working principles and
+[project decisions](project-decisions.md#outcome-quality-and-speed).
 
-## Что согласовали
+## Agreed adaptations
 
-Базовая философия исходника совместима с нашими целями. Три конкретных напряжения были показаны пользователю; он ответил: **«Да, адаптируем правила по спеке и рискам»**.
+The source philosophy is compatible with this pack's goals. Three tensions were
+resolved by adapting rules to the specification and concrete risk:
 
-| Исходное правило | Почему потребовалась адаптация | Принятое применение |
+| Source rule | Why it was adapted | Agreed application |
 | --- | --- | --- |
-| Falsification Before Confidence: свежий контекст для существенного решения и максимум одно повторное ревью | Обязательный этап может не добавлять полезной проверки; жёсткий максимум не учитывает оставшийся серьёзный дефект | Независимое ревью по требованиям и конкретному риску. Повторять проверку, когда изменения или нерешённая проблема это оправдывают |
-| Foundation Value Ready: production-потребитель и отдельное доказательство интеграции | Условия полезны для заявления о production-готовности, но их универсальное применение может добавить работу сверх согласованной спеки | Сохранять соответствующие доказательства для заявляемой готовности и повторного использования; завершение задачи определять всей её согласованной спекой |
-| Causally Different Retries: после двух похожих неудач менять механизм | Временный сбой иногда имеет понятный путь восстановления через повтор с ожиданием | Обоснованные ограниченные повторы допустимы. Менять гипотезу или подход, когда повторение не приносит прогресса или новых данных |
+| Falsification Before Confidence: fresh context for a material decision and at most one repeat review | A mandatory extra pass may add no useful check; a hard maximum may ignore a remaining serious defect | Independent review from requirements and concrete risk. Repeat a check when changes or an unresolved issue justify it |
+| Foundation Value Ready: production consumer and separate integration proof | Useful for a production-readiness claim, but universal application can exceed the agreed spec | Keep matching evidence for the claimed readiness and reuse; task completion is the whole agreed spec |
+| Causally Different Retries: change mechanism after two similar failures | A transient failure sometimes has a understood wait-and-retry path | Bounded justified retries are allowed. Change hypothesis or approach when repetition adds no progress or new evidence |
 
-Практическое следствие для проверки результата: документация, исследование или локальная инфраструктура могут быть самостоятельным результатом, если именно они согласованы. Проверяется обещанный эффект такого результата. Незавершённая фича при этом остаётся незавершённой, даже если отдельный полезный этап уже работает.
+Documentation, research or local infrastructure can be a complete result when
+that is what was agreed. An unfinished feature remains unfinished even if a
+useful intermediate stage works.
 
-## Сверка с официальными рекомендациями
+Official alignment used [model guidance](https://developers.openai.com/api/docs/guides/latest-model),
+[best practices](https://learn.chatgpt.com/guides/best-practices) and
+[subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+Detailed source-kit process labels were not copied into the standing text.
 
-- [Model guidance](https://developers.openai.com/api/docs/guides/latest-model) рекомендует проверять конфликты в инструкциях, поддерживать выполнение задачи до конца, явно задавать делегирование и соразмерять тестирование изменению. Это основа формулировок про автономность и достаточную проверку.
-- [Best practices](https://learn.chatgpt.com/guides/best-practices) рекомендует практичные короткие инструкции, точный контекст, критерии завершения и улучшение повторяемых workflows. Подробный разбор переноса поэтому вынесен из постоянного контекста.
-- [Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents) описывает пользу отдельного контекста и независимой работы вместе со стоимостью агентных вызовов. Делегирование имеет конкретную задачу и ожидаемую пользу.
-- [Build skills](https://learn.chatgpt.com/docs/build-skills) описывает загрузку подробностей по необходимости. Основная философия остаётся в глобальных инструкциях, а будущие специализированные процедуры могут стать skills.
-- [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md) задаёт механизм глобальной загрузки, порядок приоритетов и ограничение размера.
-- [Testing Agent Skills Systematically with Evals](https://developers.openai.com/blog/eval-skills) даёт подход к оценке результата, срабатывания и эффективности. Измерения помогают выбирать изменения, сохраняя результат главным критерием.
+## Completeness
 
-Конкретные замены спорных правил — наши решения, согласованные пользователем. Официальные источники обосновывают подход; они не содержат анализа именно этого файла opencode-kit.
+All 38 named source principles were accounted for in the working text:
+preserved, simplified, merged or adapted as above. Source process labels such as
+Material, Value Ready, split-or-justify and Delivery Checkpoint State are not
+standing product rules.
 
-## Полнота переноса
-
-В таблице учтены все 38 именованных принципов исходника. Названия разделов назначения относятся к [рабочему тексту](../global/principles-of-work.md).
-
-| Принцип исходника | Решение | Раздел назначения и сохранённый смысл |
-| --- | --- | --- |
-| Outcome over Output | Сохранён | Outcome and completion: согласованный эффект и полный объём |
-| Working Software Is the Primary Measure of Progress | Уточнён по типу задачи | Quality and evidence: проверять изменённое поведение; для документов проверять их собственный результат |
-| Dogfooding / Test What You Ship | Сохранён | Quality and evidence: реальная точка входа и пригодное окружение |
-| Evidence Bounds Claims | Упрощён | Quality and evidence: выводы ограничены реально проверенным |
-| Trust, but Verify | Уточнён | Quality and evidence: документация и схемы задают контракт, наблюдение проверяет фактическое поведение |
-| The Scientific Method | Сохранён | Quality and evidence; Speed, feedback, and recovery: факты, гипотезы и различающие проверки |
-| Falsification Before Confidence | Адаптирован по решению пользователя | Quality and evidence: проверка предположений и независимое ревью по риску |
-| Goodhart's Law | Сохранён | Quality and evidence: метрики поддерживают оценку результата |
-| Definition of Done | Уточнён по решению пользователя | Outcome and completion: вся спека и все задачи, фактическая работа и проверки |
-| Consumer-Grounded Value | Уточнён по типу результата | Outcome and completion; Simplicity and reuse: проверять обещанный эффект и соответствие заявлений |
-| Foundation Value Ready | Адаптирован по решению пользователя | Simplicity and reuse: потребитель и интеграция для заявляемой production-готовности и reuse |
-| Reachability And Retirement | Упрощён | Simplicity and reuse: проверять поддерживаемое использование до удаления осиротевшего кода |
-| Knowledge Freshness | Упрощён | Quality and evidence: актуальность и применимость источников, границы проверки |
-| Value Visibility | Сохранён без служебного протокола | Outcome and completion; Context and collaboration: полезный прогресс и оставшаяся работа |
-| Occam's Razor | Объединён с KISS | Simplicity and reuse: обоснованная сложность |
-| KISS | Сохранён | Simplicity and reuse: простое понятное решение полного требования |
-| YAGNI | Сохранён | Outcome and completion; Simplicity and reuse: текущая потребность и ограничение объёма |
-| Gall's Law | Сохранён | Simplicity and reuse: от работающего пути к полной спеке |
-| AHA / Rule of Three | Сохранён без числового порога | Simplicity and reuse: обобщать при устойчивой общей потребности |
-| Single Responsibility / High Cohesion, Low Coupling | Упрощён | Simplicity and reuse: связность, владение, понятные границы и проверка интеграции по риску |
-| Theory of Constraints | Сохранён | Speed, feedback, and recovery: оптимизация наблюдаемого узкого места |
-| Fast Feedback / Small Batches | Сохранён | Speed, feedback, and recovery: ранний полезный сигнал и короткий цикл |
-| Two-Way Door Decisions | Сохранён | Autonomy and authority: обратимые действия в согласованной области и реальные решения владельца |
-| Chesterton's Fence | Сохранён | Speed, feedback, and recovery: понять защитную функцию перед упрощением |
-| Kaizen / PDCA | Сохранён | Speed, feedback, and recovery: улучшения по наблюдениям отдельно от завершения продукта |
-| Fail Fast, Fail Loud, Fail Closed | Сохранён | Speed, feedback, and recovery: исходная причина, своевременная диагностика и сохранение безопасного состояния |
-| Causally Different Retries | Адаптирован по решению пользователя | Speed, feedback, and recovery: повторы по причине сбоя и получаемым данным |
-| First, Do No Harm | Сохранён | Quality and evidence; Autonomy and authority: корректность, данные и восстанавливаемость |
-| Principle of Least Authority | Сохранён | Autonomy and authority: необходимые полномочия и эффекты |
-| Zero Trust | Сохранён | Context and collaboration: внешние данные и защита секретов |
-| Preserve the Worktree | Сохранён | Context and collaboration: сохранность чужой работы и ограниченные изменения |
-| Reversibility | Сохранён | Autonomy and authority: обратимость там, где существенны последствия |
-| Information Foraging | Сохранён | Context and collaboration: целевой поиск и чтение по задаче |
-| Safe Parallelism | Сохранён | Context and collaboration: независимые чтения и изолированные изменения |
-| Determinism over Guesswork | Сохранён | Context and collaboration: детерминированные помощники для повторяемой механической работы |
-| Brooks's Law | Сохранён | Context and collaboration: стоимость координации и ответственность основного агента |
-| Evidence Is Not Authority | Сохранён | Autonomy and authority: результаты проверки не расширяют полномочия |
-| Principle of Least Surprise | Упрощён | Context and collaboration: ясная коммуникация, точный статус и нужные решения |
-
-Дополнительно перенесены вводные положения, Governance, Order Of Precedence и Completion: уважение области задачи и иерархии инструкций, изменение философии по указанию пользователя, отдельное хранение наблюдений и честное завершение. Приоритеты сформулированы в терминах договорённости этого проекта: полный результат, условия качества и скорость до результата.
-
-Служебные метки `Material`, `Value Ready`, `split-or-justify`, `Delivery Checkpoint State`, suppression/continuation protocols в постоянный текст не включены. Это детали исходного процесса; полезные идеи переданы обычными правилами про область задачи, риски, ответственность и прогресс. Отдельные обязательные отчёты или жизненные циклы из этих меток не создаются.
-
-## Границы результата
-
-Смысловая сверка и проверка загрузки подтверждают перенос инструкций. Влияние на число багов и скорость будущих задач нужно оценивать по реальной работе в проектах; процент ускорения и гарантия отсутствия инцидентов этим изменением не установлены.
+Loading checks confirm instruction transfer. Effect on later defects and speed
+is evaluated in real project work; this adaptation does not claim a speed
+percentage or an incident-free guarantee.

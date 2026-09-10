@@ -120,8 +120,8 @@ function Get-HarnessInventory([string] $SourceRoot, [string] $CodexHome, [string
     }
     $links = [Collections.Generic.List[object]]::new()
     $links.Add(@{ destination = Join-Path $CodexHome 'AGENTS.md'; source = Join-Path $SourceRoot $manifest.Instructions; kind = 'instructions'; name = 'AGENTS' })
-    $links.Add(@{ destination = Join-Path $CodexHome ($manifest.ProfileName + '.config.toml'); source = Join-Path $SourceRoot $manifest.Profile; kind = 'profile'; name = $manifest.ProfileName })
-    $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/codex.ps1'; source = Join-Path $SourceRoot $manifest.Launcher; kind = 'launcher'; name = 'codex' })
+    $launcherHash = (Get-FileHash -LiteralPath (Join-Path $SourceRoot $manifest.Launcher) -Algorithm SHA256).Hash.ToLowerInvariant()
+    $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/codex.ps1'; source = Join-Path $CodexHome "harness/launchers/$launcherHash/codex.ps1"; kind = 'launcher'; name = 'codex' })
     $links.Add(@{ destination = Join-Path $CodexHome 'harness/bin/codex-harness-check.ps1'; source = Join-Path $SourceRoot $manifest.DiagnosticLauncher; kind = 'diagnostic-launcher'; name = 'codex-harness-check' })
     $links.Add(@{ destination = Join-Path $CodexHome 'agents/codex-harness'; source = Join-Path $SourceRoot $manifest.Agents; kind = 'agents'; name = 'codex-harness' })
     if ($IncludeCodeTools) {
@@ -276,6 +276,13 @@ function Test-HarnessRuntime($State) {
 }
 
 function Test-HarnessConnections($State) {
+    if ($State.ContainsKey('launcherSource')) {
+        $expectedLauncherHash = Split-Path (Split-Path $State.launcherSource) -Leaf
+        if ($expectedLauncherHash -notmatch '^[a-f0-9]{64}$' -or
+            (Get-FileHash -LiteralPath $State.launcherSource -Algorithm SHA256 -ErrorAction Stop).Hash -ine $expectedLauncherHash) {
+            throw 'Installed command bootstrap changed; run explicit core update to recover its owned copy.'
+        }
+    }
     foreach ($link in $State.links) {
         if (-not (Test-HarnessSamePath (Get-HarnessLinkTarget $link.destination) $link.source)) { throw "Broken or changed connection: $($link.destination). Reconnect from the checkout after resolving ownership conflicts." }
         if (-not (Test-Path -LiteralPath $link.source)) { throw "Source unavailable: $($link.source). Run install.ps1 from its new location." }
@@ -528,6 +535,36 @@ function Invoke-HarnessInstallCore {
         $operations = $operations.ToArray()
     }
     if ($Preview) { return [pscustomobject]@{ status = "Preview $Mode"; operations = $operations; pathScope = $scope; pathChange = ($beforePath -cne $afterPath); note = 'No files or environment values changed; actual link creation is checked during activation.' } }
+    if ($nextState) {
+        # The command entry must survive an unavailable checkout. Stage a
+        # content-addressed bootstrap before the existing link journal commits.
+        # Its shared policy module stays live through sourceRoot when healthy.
+        $launcherLink = $nextState.links | Where-Object kind -EQ 'launcher' | Select-Object -First 1
+        $launcherBytes = [IO.File]::ReadAllBytes((Join-Path $SourceRoot $inventory.manifest.Launcher))
+        $launcherHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($launcherBytes)).ToLowerInvariant()
+        $launcherPath = Join-Path $CodexHome "harness/launchers/$launcherHash/codex.ps1"
+        if (-not (Test-HarnessSamePath $launcherLink.source $launcherPath)) { throw 'Launcher source changed during preparation; existing connections preserved.' }
+        Assert-HarnessOrdinaryParents $launcherPath
+        $existingLauncher = Get-HarnessItem $launcherPath
+        if ($existingLauncher) {
+            if ($existingLauncher.PSIsContainer -or $existingLauncher.Attributes -band [IO.FileAttributes]::ReparsePoint -or
+                (Get-FileHash -LiteralPath $launcherPath -Algorithm SHA256).Hash -ine $launcherHash) { throw 'Owned launcher copy changed; preserving it for explicit recovery.' }
+        } else {
+            New-Item -ItemType Directory -Path (Split-Path $launcherPath) -Force | Out-Null
+            Write-HarnessBytes $launcherPath $launcherBytes
+        }
+        $nextState.launcherSource = $launcherPath
+        $buildState = Join-Path $CodexHome 'harness/config-bridge'
+        if ($state -and $state.ContainsKey('configBridge') -and (Test-Path -LiteralPath $state.configBridge)) {
+            $prepared = & $state.configBridge build --source $SourceRoot --state $buildState
+        } else {
+            $prepared = & cargo run --quiet --locked --jobs 1 --manifest-path (Join-Path $SourceRoot 'Cargo.toml') --target-dir (Join-Path $SourceRoot 'target') -p codex-harness --bin codex-harness -- build --source $SourceRoot --state $buildState
+        }
+        if ($LASTEXITCODE -ne 0) { throw 'Native configuration bridge build failed; existing connections preserved.' }
+        $nextState.configBridge = Join-Path (($prepared | Out-String | ConvertFrom-Json).build) 'codex-harness.exe'
+        & $nextState.configBridge config-localize --source $SourceRoot --codex-home $CodexHome
+        if ($LASTEXITCODE -ne 0) { throw 'Legacy configuration migration failed; inspect local recovery copies before retrying.' }
+    }
     $createdDirectories = [Collections.Generic.List[string]]::new()
     $applied = [Collections.Generic.List[object]]::new()
     $stateBeforeBytes = if (Test-Path -LiteralPath $statePath) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath)) } else { $null }

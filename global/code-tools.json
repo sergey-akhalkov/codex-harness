@@ -34,21 +34,24 @@
       "verification": "Actual MCP handshake and navigation, diagnostic and disposable edit in two roots."
     },
     {
-      "id": "codebase-memory",
-      "package": "codebase-memory-mcp",
-      "manager": "npm",
-      "source": "https://github.com/DeusData/codebase-memory-mcp",
-      "metadata": "https://registry.npmjs.org/codebase-memory-mcp/latest",
+      "id": "codegraph",
+      "package": "@colbymchenry/codegraph",
+      "manager": "native",
+      "source": "https://github.com/colbymchenry/codegraph",
+      "metadata": "https://api.github.com/repos/colbymchenry/codegraph/releases/tags/v1.6.0",
+      "version": "1.6.0",
+      "version_policy": "Pinned published Windows x64 package; qualification and acquisition belong to the Rust owner.",
       "runtime": [
-        "Node.js",
-        "npm"
+        "Published CodeGraph and bundled Node.js",
+        "Rust managed MCP adapter on Windows x64"
       ],
-      "command": "codebase-memory-mcp",
+      "command": "codegraph",
       "required_operations": [
         "index",
-        "structured-query"
+        "structured-query",
+        "bounded-watch-and-catch-up"
       ],
-      "verification": "Index and query disposable projects with distinct root identities."
+      "verification": "Real-root source oracles, full index, bounded watcher/catch-up, recovery and global lifecycle acceptance."
     },
     {
       "id": "graphify",

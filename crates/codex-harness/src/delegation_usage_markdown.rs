@@ -13,26 +13,6 @@ fn public_project(value: &Value) -> String {
     let Some(label) = value.as_str() else {
         return "unknown".into();
     };
-    if [
-        "codex-harness",
-        "pmac-emulator",
-        "fixture",
-        "neutral",
-        "direct",
-        "levels",
-        "mixed",
-        "project",
-        "projects",
-        "unknown",
-        "workspace with spaces",
-    ]
-    .contains(&label)
-    {
-        return label.to_owned();
-    }
-    if label.contains(" with spaces") {
-        return "workspace with spaces".into();
-    }
     format!(
         "workspace-{}",
         &format!("{:x}", Sha256::digest(label.as_bytes()))[..8]

@@ -1,5 +1,5 @@
-# Shared defaults, read directly through the linked `harness` file profile.
-# Native TUI settings writes may add machine-specific values, including trust paths.
+# Portable defaults, read live by the launcher through native CLI overrides.
+# Native TUI settings and project trust persist in the machine-local config.toml.
 # Credentials, histories, caches and installer state remain outside this repository.
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
@@ -76,16 +76,3 @@ hide_rate_limit_model_nudge = true
 pet = "disabled"
 status_line = ["model-with-reasoning", "weekly-limit", "thread-title"]
 status_line_use_colors = true
-
-[tui.model_availability_nux]
-gpt-6-astra = 4
-
-[projects.'d:\mekha\mtronics\pmac-emulator']
-trust_level = "trusted"
-
-[projects.'c:\users\noilw']
-trust_level = "trusted"
-
-
-# Native base configuration owns the accepted RTK exception and suspension.
-# Avoid a profile override that disagrees with other installed consumers.

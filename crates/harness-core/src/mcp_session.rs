@@ -45,6 +45,7 @@ struct Active {
 
 pub struct Session {
     name: String,
+    instructions: Option<String>,
     definitions: Vec<Value>,
     names: BTreeSet<String>,
     phase: Phase,
@@ -76,12 +77,23 @@ impl Session {
         Message::result(&json!(0), json!({"tools":definitions}))?.encode()?;
         Ok(Self {
             name: name.into(),
+            instructions: None,
             definitions,
             names,
             phase: Phase::New,
             queue: VecDeque::new(),
             active: None,
         })
+    }
+
+    /// Provider-specific, compact instructions replace upstream guidance only
+    /// for the explicitly selected managed endpoint.
+    pub fn with_instructions(mut self, instructions: &str) -> io::Result<Self> {
+        if instructions.len() > 4096 {
+            return Err(invalid("MCP instructions exceed the byte limit"));
+        }
+        self.instructions = Some(instructions.into());
+        Ok(self)
     }
 
     /// Accept one validated envelope. Errors here terminate the connection;
@@ -158,14 +170,14 @@ impl Session {
                 return error(-32602, "Invalid initialize parameters");
             }
             self.phase = Phase::Initializing;
-            return Message::result(
-                id,
-                json!({
-                    "protocolVersion":PROTOCOL,"capabilities":{"tools":{}},
-                    "serverInfo":{"name":self.name,"version":env!("CARGO_PKG_VERSION")}
-                }),
-            )
-            .map(Some);
+            let mut result = json!({
+                "protocolVersion":PROTOCOL,"capabilities":{"tools":{}},
+                "serverInfo":{"name":self.name,"version":env!("CARGO_PKG_VERSION")}
+            });
+            if let Some(instructions) = &self.instructions {
+                result["instructions"] = json!(instructions);
+            }
+            return Message::result(id, result).map(Some);
         }
         if self.phase != Phase::Ready {
             return error(-32000, "MCP initialization is incomplete");
@@ -205,7 +217,14 @@ impl Session {
                     name: name.into(),
                     arguments,
                     deadline: Deadline::after(Duration::from_secs(
-                        if name == "index_repository" { 600 } else { 60 },
+                        if matches!(
+                            name,
+                            "index_repository" | "codegraph_index" | "codegraph_sync"
+                        ) {
+                            600
+                        } else {
+                            60
+                        },
                     ))?,
                     cancellation: Cancellation::default(),
                 });

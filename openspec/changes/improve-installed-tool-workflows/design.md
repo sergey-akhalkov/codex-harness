@@ -6,7 +6,7 @@
 
 CBM project/status указали правильный root и 18 частично разобранных PowerShell-файлов. Индекс в исследовании не обновлялся, поэтому его текущая полнота не подтверждалась. Выборка запросов 12 сессий была эвристическим основанием гипотез; она не является benchmark или измерением квоты.
 
-Проверенные owning records: [code tools](../../../docs/code-tools.md), [Serena qualification](../../../docs/evidence/serena-efficiency.md), [token workflow](../../../docs/token-workflow.md), [Git memory](../archive/2026-09-09-adopt-project-memory-and-native-workflows/design.md), [resource policy](../../../global/tool-resources.json). Предыдущие проверки переиспользуются только при совпадении существенных source/runtime/dirty inputs. Состав поддерживаемых языков не расширяется автоматически из каталога возможностей.
+Проверенные owning records: [code tools](../../../docs/code-tools.md), [Serena qualification](../../../docs/code-tools.md), [token workflow](../../../docs/token-workflow.md), [Git memory](../../specs/git-project-memory/spec.md), [resource policy](../../../global/tool-resources.json). Предыдущие проверки переиспользуются только при совпадении существенных source/runtime/dirty inputs. Состав поддерживаемых языков не расширяется автоматически из каталога возможностей.
 
 ## Goals / Non-Goals
 
@@ -40,7 +40,7 @@ Baseline — существующий маршрут `AGENTS.md -> docs/memory/R
 
 Сравнение включает выбор темы, устаревшую команду, новое решение, отсутствие нового знания, rename/битую ссылку, свежий clone без истории/MCP и конфликт двух worktrees. В owned фикстурах проверить topic listing, явные reads, read-only/ignored patterns и отказ записи. Onboarding не запускает повторное широкое изучение уже описанного проекта: текущие records читаются выборочно. `memory_maintenance` используется только после согласования с existing skill; второй набор расходящихся правил не создаётся.
 
-Результат выбора: `adopted` с обозначенной областью либо `retain-native` с причиной. Отсутствие преимущества или нарушение переносимости оставляет baseline. Даже при `retain-native` обязательны исправленные маршруты, документированный выбор и внешняя проверка; это не разрешение пропустить сравнение. Данная возможность дополняет, а не закрывает [git-project-memory](../archive/2026-09-09-adopt-project-memory-and-native-workflows/specs/git-project-memory/spec.md).
+Результат выбора: `adopted` с обозначенной областью либо `retain-native` с причиной. Отсутствие преимущества или нарушение переносимости оставляет baseline. Даже при `retain-native` обязательны исправленные маршруты, документированный выбор и внешняя проверка; это не разрешение пропустить сравнение. Данная возможность дополняет, а не закрывает [git-project-memory](../../specs/git-project-memory/spec.md).
 
 ### 3. Дополнительные возможности с конечной областью оценки
 
@@ -64,7 +64,7 @@ Baseline — существующий маршрут `AGENTS.md -> docs/memory/R
 
 Не вводить жёсткий общий лимит, молча обрезающий полезный ответ. Сначала ограничивать scope/поля/page size; при превышении возвращать признак неполноты и путь к продолжению. Для sequential browser шагов сохранять исходы выполненных действий; после частичного успеха не повторять весь пакет. Скриншоты сохраняются для визуальных свойств, текстовые снимки — для доступных элементов.
 
-Для сравнения переиспользовать подходящие части существующих [outcome checks](../../../docs/evidence/verified-delivery.md) и [token evidence](../../../docs/evidence/token-workflow.md), без нового evaluation framework и без переноса исторического вывода о пользе на новые inputs. До первого запуска зафиксировать scoped source/dirty/runtime identities, независимый oracle, allowed effects, измеряемые размеры, приемлемую малую потерю времени и число/условия дополнительных пар. Порог нельзя менять после просмотра результата ради принятия candidate.
+Для сравнения переиспользовать подходящие части существующих [outcome checks](../../../docs/rust-native.md#outcome-usage-and-helpers) и [token evidence](../../../docs/token-workflow.md), без нового evaluation framework и без переноса исторического вывода о пользе на новые inputs. До первого запуска зафиксировать scoped source/dirty/runtime identities, независимый oracle, allowed effects, измеряемые размеры, приемлемую малую потерю времени и число/условия дополнительных пар. Порог нельзя менять после просмотра результата ради принятия candidate.
 
 Решение принимается по следующим правилам:
 
@@ -98,7 +98,7 @@ C1/S1/O1 и B1 объединяются в короткие соответств
 
 ### 7. Владение и согласование со связанными изменениями
 
-- `adopt-project-memory-and-native-workflows` владеет базовой памятью, context pilot, worktree и structured exec. Текущее evidence: Git-память 1.3/1.4 принята в независимом fixture, свежем clone и конфликте двух worktrees; Astra runtime pilot 2.1 и ordinary runtime/false override/profile rollback 2.2 приняты. Общая lifecycle-приёмка глобальных навыков также пройдена и сведена в docs/evidence/native-workflows.md. Этот change добавляет только выбор интерфейса памяти и использует готовые элементы; не объявляет недостающую приёмку выполненной. Нужные memory prerequisites проверяются до M1/M2; остальные ветви не блокируют независимые C/S/O/B работы.
+- `adopt-project-memory-and-native-workflows` владеет базовой памятью, context pilot, worktree и structured exec. Текущее evidence: Git-память 1.3/1.4 принята в независимом fixture, свежем clone и конфликте двух worktrees; Astra runtime pilot 2.1 и ordinary runtime/false override/profile rollback 2.2 приняты. Общая lifecycle-приёмка глобальных навыков также пройдена и сведена в [текущих решениях о native workflows](../../../docs/project-decisions.md#native-workflows). Этот change добавляет только выбор интерфейса памяти и использует готовые элементы; не объявляет недостающую приёмку выполненной. Нужные memory prerequisites проверяются до M1/M2; остальные ветви не блокируют независимые C/S/O/B работы.
 - `autonomous-skill-evolution` владеет извлечением/проверкой/публикацией skills и session awareness. Owned probe 1.1 доказал current-session skill delivery через hook additionalContext на startup/resume/manual/automatic compact. Глобальная политика это запрещает: ordinary diagnostic/context/Stop hooks остаются OFF, кроме узкого RTK-исключения. Same-session compact/resume delivery без этих хуков остаётся owning blocker; требования не снижаются и не закрываются. Настоящее изменение не возвращает хуки и не обещает закрыть этот контракт.
 - `accelerate-verified-delivery` владеет своими outcome cases и прежними benefit claims. Переиспользуется подходящая механика, но остановленное пользователем исследование opencode-kit не возобновляется и его задачи не закрываются этим change. Наши узкие сравнения относятся только к перечисленным новым tool workflows. Quantitative benefit 5.3/5.4/6.4 остаётся открытым и ждёт отдельного решения пользователя.
 - `migrate-harness-to-rust` меняет owning runtime файлы. Будущая реализация сначала проверяет актуальную identity и правит существующего владельца; параллельный Python/Rust интерфейс ради этой спеки не создаётся.

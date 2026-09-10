@@ -57,9 +57,27 @@ function Remove-CodeToolsFile([string]$Path) {
 }
 
 function Restore-CodeToolsRegistration([string]$CodexHome, [switch]$Preview) {
+    $manager = Resolve-CodeGraphManager '' $CodexHome
+    $owner = Get-CodeGraphOwnerHome $CodexHome
+    $ownedCodeGraph = Test-OwnedCodeGraphRegistration $CodexHome
     $pendingPath = Join-Path $CodexHome 'harness/code-tools-registration-pending.json'
     $pending = Read-CodeToolsJson $pendingPath
-    if (-not $pending) { return @{ status = 'no-pending-registration' } }
+    $codeGraphPending = $false
+    if ($pending) {
+        $previous = $pending.previous_state
+        $codeGraphPending = ($previous -and $previous.registrations -and $previous.registrations.ContainsKey('codegraph')) -or
+            ($pending.ContainsKey('after_state') -and $pending.after_state -and $pending.after_state.registrations -and $pending.after_state.registrations.ContainsKey('codegraph'))
+    }
+    if ($ownedCodeGraph -or $codeGraphPending) {
+        if (-not $manager) { throw 'Owned CodeGraph recovery requires a native manager; existing connections are preserved.' }
+        if (-not $Preview -and $owner) { Invoke-CodeGraphPrepare $manager 'Recover' $CodexHome $owner $null | Out-Null }
+        $arguments = @('mcp', 'apply-codegraph-registration', '--mode', 'Recover', '--codex-home', $CodexHome)
+        if ($Preview) { $arguments += '--preview' }
+        return (Invoke-CodeGraphNativeJson $manager $arguments).value
+    }
+    if (-not $pending) {
+        return @{ status = 'no-pending-registration' }
+    }
     $config = Join-Path $CodexHome 'config.toml'
     $state = Join-Path $CodexHome 'harness/code-tools-registration.json'
     $before = [Convert]::FromBase64String($pending.before)
@@ -242,20 +260,119 @@ function Resolve-CodeToolsDependencyHome([string]$UserHome, [string]$CodexHome, 
     return $selected
 }
 
+function Get-CodeGraphDependencyState([string]$UserHome) {
+    Join-Path $UserHome '.cache/coding-agents-harness-codegraph'
+}
+
+function Get-CodeGraphOwnerHome([string]$CodexHome) {
+    $state = Read-CodeToolsJson (Join-Path $CodexHome 'harness/installation.json')
+    if ($state -and $state.ContainsKey('dependencyUserHome') -and $state.dependencyUserHome) { return [IO.Path]::GetFullPath($state.dependencyUserHome) }
+    $registry = Read-CodeToolsJson (Join-Path $CodexHome 'harness/code-tools.json')
+    if ($registry -and $registry.ContainsKey('user_home') -and $registry.user_home) { return [IO.Path]::GetFullPath($registry.user_home) }
+}
+
+function Get-CodeGraphPackageRoot([string]$Explicit) {
+    if ($Explicit) { return [IO.Path]::GetFullPath($Explicit) }
+    if ($env:HARNESS_CODEGRAPH_PACKAGE_ROOT) { return [IO.Path]::GetFullPath($env:HARNESS_CODEGRAPH_PACKAGE_ROOT) }
+}
+
+function Resolve-CodeGraphManager([string]$SourceRoot, [string]$CodexHome, [switch]$Build) {
+    $registry = Read-CodeToolsJson (Join-Path $CodexHome 'harness/code-tools.json')
+    $manager = $null
+    if ($registry -and $registry.ContainsKey('mcp')) {
+        $row = @($registry.mcp | Where-Object { $_.id -eq 'codegraph' })
+        if ($row.Count -eq 1 -and $row[0].ContainsKey('paths') -and $row[0].paths -and $row[0].paths.ContainsKey('manager') -and (Test-Path -LiteralPath $row[0].paths.manager -PathType Leaf)) {
+            $manager = $row[0].paths.manager
+        }
+    }
+    if (-not $manager) {
+        $state = Read-CodeToolsJson (Join-Path $CodexHome 'harness/installation.json')
+        if ($state -and $state.ContainsKey('configBridge') -and (Test-Path -LiteralPath $state.configBridge -PathType Leaf)) {
+            $manager = $state.configBridge
+        }
+    }
+    if (-not $Build) { return $manager }
+    $buildState = Join-Path $CodexHome 'harness/config-bridge'
+    if ($manager) {
+        $prepared = & $manager build --source $SourceRoot --state $buildState
+    } else {
+        $prepared = & cargo run --quiet --locked --jobs 1 --manifest-path (Join-Path $SourceRoot 'Cargo.toml') --target-dir (Join-Path $SourceRoot 'target') -p codex-harness --bin codex-harness -- build --source $SourceRoot --state $buildState
+    }
+    if ($LASTEXITCODE -ne 0) { throw 'Native CodeGraph manager build failed; existing connections preserved.' }
+    Join-Path (($prepared | Out-String | ConvertFrom-Json).build) 'codex-harness.exe'
+}
+
+function Invoke-CodeGraphNativeJson([string]$Manager, [string[]]$Arguments) {
+    if (-not $Manager -or -not (Test-Path -LiteralPath $Manager -PathType Leaf)) { throw 'Native CodeGraph manager is missing; existing connections are preserved.' }
+    $raw = & $Manager @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "Native CodeGraph operation failed (exit $LASTEXITCODE): $($Arguments[0..1] -join ' '). Pending recovery records are retained." }
+    $text = ($raw -join [Environment]::NewLine)
+    @{ raw = $text; value = ($text | ConvertFrom-Json -AsHashtable) }
+}
+
+function Invoke-CodeGraphPrepare([string]$Manager, [string]$Mode, [string]$CodexHome, [string]$UserHome, [string]$PackageRoot) {
+    $arguments = @('mcp', 'prepare-codegraph', '--mode', $Mode, '--codex-home', $CodexHome, '--dependency-state', (Get-CodeGraphDependencyState $UserHome))
+    if ($PackageRoot) { $arguments += @('--package-root', $PackageRoot) }
+    Invoke-CodeGraphNativeJson $Manager $arguments
+}
+
+function Invoke-CodeGraphApplyRegistration([string]$Manager, [string]$Mode, [string]$CodexHome, [string]$PackageRoot, [string]$RetainedJson, [switch]$Preview, [switch]$DeferCommit) {
+    $arguments = @('mcp', 'apply-codegraph-registration', '--mode', $Mode, '--codex-home', $CodexHome, '--command', $Manager)
+    if ($PackageRoot) { $arguments += @('--package-root', $PackageRoot) }
+    if ($RetainedJson) { $arguments += @('--retained-registrations-json', $RetainedJson) }
+    if ($Preview) { $arguments += '--preview' }
+    if ($DeferCommit) { $arguments += '--defer-commit' }
+    Invoke-CodeGraphNativeJson $Manager $arguments
+}
+
+function Merge-CodeGraphInventory($Inventory, $Projection) {
+    if (-not $Projection) { return $Inventory }
+    $retired = @()
+    if ($Projection.ContainsKey('retired') -and $null -ne $Projection.retired) { $retired = @($Projection.retired) }
+    $replacements = @{}
+    if ($Projection.ContainsKey('mcp') -and $null -ne $Projection.mcp) {
+        foreach ($item in @($Projection.mcp)) { $replacements[$item.id] = $item }
+    }
+    $mcp = @()
+    foreach ($item in @($Inventory.mcp)) {
+        if ($retired -contains $item.id) { continue }
+        if ($replacements.ContainsKey($item.id)) { continue }
+        $mcp += $item
+    }
+    foreach ($item in @($replacements.Values)) { $mcp += $item }
+    $Inventory.mcp = $mcp
+    $Inventory
+}
+
+function Test-OwnedCodeGraphRegistration([string]$CodexHome) {
+    $state = Read-CodeToolsJson (Join-Path $CodexHome 'harness/code-tools-registration.json')
+    [bool]($state -and $state.ContainsKey('registrations') -and $state.registrations -and $state.registrations.ContainsKey('codegraph'))
+}
+
 function Invoke-HarnessCodeTools {
     [CmdletBinding()]
     param([string]$SourceRoot, [string]$UserHome, [string]$CodexHome, [string]$CodexCommand,
         [ValidateSet('Install','Update','Check','Disconnect','Recover')][string]$Mode, [switch]$Preview,
         [switch]$DeferCommit, [string]$TransactionId, [scriptblock]$Checkpoint, [string]$DependencyUserHome,
-        [switch]$SkipDependencyChanges)
+        [switch]$SkipDependencyChanges, [string]$CodeGraphPackageRoot)
     $DependencyUserHome = Resolve-CodeToolsDependencyHome $UserHome $CodexHome $DependencyUserHome
+    $CodeGraphPackageRoot = Get-CodeGraphPackageRoot $CodeGraphPackageRoot
+    $nativeProjection = $null
     if ($Mode -eq 'Recover') {
         Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode recover -Preview:$Preview | Out-Null
         return Restore-CodeToolsRegistration $CodexHome -Preview:$Preview
     }
     if ($Mode -eq 'Disconnect') {
         Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview
+        $manager = Resolve-CodeGraphManager $SourceRoot $CodexHome
+        if ($manager -and -not $Preview -and (Test-OwnedCodeGraphRegistration $CodexHome)) {
+            Invoke-CodeGraphNativeJson $manager @('mcp', 'retire-codegraph') | Out-Null
+        }
         Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode restore -Preview:$Preview -DeferCommit:$DeferCommit -TransactionId $TransactionId | Out-Null
+        if (Test-OwnedCodeGraphRegistration $CodexHome) {
+            if (-not $manager) { throw 'Owned CodeGraph disconnection requires a native manager; existing connections are preserved.' }
+            return (Invoke-CodeGraphApplyRegistration $manager 'Disconnect' $CodexHome $null -Preview:$Preview -DeferCommit:$DeferCommit).value
+        }
         return Disconnect-CodeToolsRegistration $CodexHome -Preview:$Preview -DeferCommit:$DeferCommit -SourceRoot $SourceRoot -UserHome $DependencyUserHome -CodexCommand $CodexCommand
     }
     $runtime = Get-HarnessCodeToolsRuntime $DependencyUserHome $CodexHome $CodexCommand
@@ -289,24 +406,62 @@ function Invoke-HarnessCodeTools {
     if ($mcpPython) { $registrationArgs += @('--python', $mcpPython) }
     if ($Preview) { $registrationArgs += '--preview' }
     if ($DeferCommit) { $registrationArgs += '--defer-commit' }
-    $registration = Invoke-CodeToolsPythonJson $runtime.lifecycle_python $registrationArgs
+    $manager = Resolve-CodeGraphManager $SourceRoot $CodexHome -Build:($Mode -in @('Install','Update') -and -not $Preview)
+    $ownedCodeGraph = Test-OwnedCodeGraphRegistration $CodexHome
+    if ($manager) {
+        $prepareMode = if ($Preview -and $Mode -in @('Install','Update')) { 'Check' } else { $Mode }
+        $prepared = Invoke-CodeGraphPrepare $manager $prepareMode $CodexHome $DependencyUserHome $CodeGraphPackageRoot
+        $nativeProjection = $prepared.value
+        if ($Mode -eq 'Check' -and $nativeProjection.status -eq 'missing' -and $ownedCodeGraph) {
+            return @{ status = 'degraded'; reason = 'Owned CodeGraph registration is present, but the native package projection is missing. Current configuration is preserved.'; callable = $false; inventory = $inventory; projection = $nativeProjection }
+        }
+        if ($nativeProjection.status -eq 'prepared' -or ($nativeProjection.ContainsKey('registrations') -and $nativeProjection.registrations.Count)) {
+            $inventory = Merge-CodeGraphInventory $inventory $nativeProjection
+        }
+    } elseif ($ownedCodeGraph -and $Mode -eq 'Check') {
+        return @{ status = 'degraded'; reason = 'Owned CodeGraph registration is present, but the native manager is unavailable. Current configuration is preserved.'; callable = $false; inventory = $inventory }
+    } elseif ($ownedCodeGraph) {
+        throw 'Owned CodeGraph registration requires a native manager; existing connections are preserved.'
+    }
+    $packageRoot = $null
+    if ($nativeProjection -and $nativeProjection.ContainsKey('mcp') -and $nativeProjection.mcp) {
+        $graph = @($nativeProjection.mcp | Where-Object { $_.id -eq 'codegraph' })
+        if ($graph.Count -eq 1 -and $graph[0].ContainsKey('paths') -and $graph[0].paths.package_root) { $packageRoot = $graph[0].paths.package_root }
+    }
+    if (-not $packageRoot) { $packageRoot = $CodeGraphPackageRoot }
+    $selectedCodeGraph = $ownedCodeGraph -or ($nativeProjection -and $nativeProjection.ContainsKey('registrations') -and $nativeProjection.registrations -and $nativeProjection.registrations.ContainsKey('codegraph'))
+    if ($selectedCodeGraph) {
+        if (-not $manager) { throw 'Selected CodeGraph activation requires a native manager; existing connections are preserved.' }
+        $planProjection = @{}
+        if ($nativeProjection) { foreach ($key in @($nativeProjection.Keys)) { $planProjection[$key] = $nativeProjection[$key] } }
+        if (-not $planProjection.ContainsKey('registrations') -or $null -eq $planProjection.registrations) { $planProjection['registrations'] = @{} }
+        if (-not $planProjection.registrations.ContainsKey('codegraph')) { $planProjection.registrations['codegraph'] = @{ command = $manager } }
+        if (-not $planProjection.ContainsKey('retired') -or $null -eq $planProjection.retired) { $planProjection['retired'] = @('codebase-memory') }
+        $planArgs = @($registrationArgs + @('--plan-only', '--native-providers-json', ($planProjection | ConvertTo-Json -Compress -Depth 60)))
+        $planned = Invoke-CodeToolsPythonJson $runtime.lifecycle_python $planArgs
+        $retainedJson = ($planned | ConvertTo-Json -Compress -Depth 60)
+        $registration = (Invoke-CodeGraphApplyRegistration $manager $Mode $CodexHome $packageRoot $retainedJson -Preview:$Preview -DeferCommit:$DeferCommit).value
+    } else {
+        $registration = Invoke-CodeToolsPythonJson $runtime.lifecycle_python $registrationArgs
+    }
     if ($Checkpoint -and -not $Preview) { & $Checkpoint 'registration' }
     if (-not $Preview -and $Mode -in @('Install','Update')) {
         # Explicit Serena dependencies remain discoverable to its runtime guard.
         # They do not select the retired, separately owned harness LSP backend.
         $lsp = @{ schema_version = 1; servers = @{} }
         Write-CodeToolsRegistries $CodexHome $inventory $lsp $Checkpoint
-        $resourceHealth = Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode apply -DeferCommit:$DeferCommit -TransactionId $TransactionId
+        $resourceHealth = if ($selectedCodeGraph) { $nativeProjection.resources } else { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode apply -DeferCommit:$DeferCommit -TransactionId $TransactionId }
         if ($Checkpoint) { & $Checkpoint 'resources' }
         if (-not $DeferCommit) { Remove-CodeToolsFile (Join-Path $CodexHome 'harness/code-tools-files-pending.json') }
     }
     $health = $null
     if (-not $Preview -and $Mode -eq 'Check' -and (Test-Path -LiteralPath $runtime.registry)) {
-        try { $resourceHealth = Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode check }
+        try { $resourceHealth = if ($selectedCodeGraph) { $nativeProjection.resources } else { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode check } }
         catch { $resourceHealth = @{ status = 'degraded'; reason = $_.Exception.Message } }
         $health = Invoke-CodeToolsPythonJson $runtime.python @((Join-Path $SourceRoot 'tools/code-tools/check.py'), '--registry', $runtime.registry, '--codex-home', $CodexHome)
     }
     @{ registration = $registration; inventory = $inventory; dependencies = $dependencies; health = $health; resources = $resourceHealth;
+        projection = $nativeProjection;
         status = if ($Preview) { 'Preview code tools' } elseif ($Mode -eq 'Check' -and ($registration.status -ne 'connected' -or ($resourceHealth -and $resourceHealth.status -eq 'degraded'))) { 'degraded' } elseif ($health) { $health.status } else { $registration.status } }
 }
 
@@ -352,7 +507,7 @@ function Invoke-CodeToolsResources {
     if ($Mode -in @('apply','check')) {
         $inventory = Read-CodeToolsJson $runtime.registry
         if (-not $inventory -or -not @($inventory.mcp | Where-Object id -EQ 'codebase-memory').Count) {
-            return @{ status = 'unavailable'; reason = 'No discovered Codebase Memory executable; resource configuration was not mutated.' }
+            return @{ status = 'unavailable'; reason = 'No discovered Codebase Memory executable; resource configuration was not mutated.'; preserved = $true }
         }
     }
     if (-not $runtime.lifecycle_python) { throw 'Owned resource settings need an existing Python runtime for compare-and-restore recovery; the pending journal and user configuration are preserved.' }
@@ -362,4 +517,5 @@ function Invoke-CodeToolsResources {
 Export-ModuleMember -Function Invoke-HarnessCodeTools, Get-HarnessCodeToolsRuntime, Invoke-CodeToolsPythonJson, Restore-CodeToolsRegistries,
     Restore-CodeToolsRegistration, Read-CodeToolsJson, Write-CodeToolsJson, Remove-CodeToolsFile, Write-CodeToolsRegistries,
     Assert-CodeToolsPlain, Get-CodeToolsBytes, Write-CodeToolsBytes, Get-CodeToolsHash, Resolve-CodeToolsDependencyHome,
-    Stop-CodeToolsServices, Invoke-CodeToolsResources
+    Stop-CodeToolsServices, Invoke-CodeToolsResources, Get-CodeGraphDependencyState, Get-CodeGraphPackageRoot,
+    Resolve-CodeGraphManager, Invoke-CodeGraphPrepare, Invoke-CodeGraphApplyRegistration, Merge-CodeGraphInventory

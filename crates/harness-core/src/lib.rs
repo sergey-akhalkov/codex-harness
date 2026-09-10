@@ -1,12 +1,40 @@
 //! Native harness primitives. Read-only checks never build or acquire dependencies.
 pub mod agent_config;
+#[cfg(windows)]
+pub mod broker_endpoint;
+#[cfg(windows)]
+pub mod broker_http;
+#[cfg(windows)]
+pub mod broker_launch;
+#[cfg(windows)]
+mod broker_requests;
+#[cfg(windows)]
+pub mod broker_rpc;
+#[cfg(windows)]
+pub mod broker_service;
+#[cfg(windows)]
+pub mod broker_state;
 pub mod build_identity;
 pub mod build_selection;
 pub mod cancellable_pipe;
+pub mod cbm_broker;
 pub mod cbm_catalogue;
 pub mod cbm_configuration;
 pub mod cbm_index;
 pub mod cbm_stdio;
+pub mod codegraph_account;
+pub mod codegraph_broker;
+pub mod codegraph_catalogue;
+pub mod codegraph_generation;
+pub mod codegraph_integration;
+pub mod codegraph_observer;
+pub mod codegraph_registration;
+pub mod codegraph_response;
+pub mod codegraph_runtime;
+pub mod codegraph_scheduler;
+pub mod codegraph_stdio;
+pub mod codegraph_store;
+pub mod codegraph_transport;
 pub mod config_create;
 pub mod config_file;
 pub mod console;
@@ -50,8 +78,12 @@ pub mod native_upstream;
 pub mod opencodex;
 pub mod outcome_report;
 pub mod path_plan;
+pub mod portable_config;
 pub mod process;
 mod process_path;
+#[cfg(windows)]
+pub mod process_service;
+pub mod profile_state;
 pub mod registration;
 mod registration_native;
 pub mod resource_admission;

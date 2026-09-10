@@ -113,6 +113,23 @@ const ORDERS: [[usize; 3]; 6] = [
 ];
 
 #[test]
+fn public_markdown_has_no_named_workspace_exceptions() {
+    let f = Fixture::new();
+    for name in ["fixture", "neutral", "direct", "synthetic-private-consumer"] {
+        let mut rows = base();
+        let workspace = f.path(name);
+        rows[1]["payload"]["cwd"] = json!(workspace);
+        let path = f.rollout("input.jsonl", rows);
+        let report = f.report(std::slice::from_ref(&path));
+        assert_eq!(report["totals"]["total_tokens"], 15);
+        let markdown = f.markdown(&[path]);
+        assert!(!markdown.contains(&format!("| {name} |")));
+        assert!(!markdown.contains(workspace.to_str().unwrap()));
+        assert!(markdown.contains("workspace-"));
+    }
+}
+
+#[test]
 fn legacy_json_keeps_project_labels_but_markdown_hides_private_identity() {
     let f = Fixture::new();
     let mut rows = base();

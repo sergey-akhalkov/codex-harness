@@ -224,7 +224,7 @@ def check_release(spec, getter=fetch_json):
 
 def plan(catalogue, inventory, getter=fetch_json):
     records = {x["id"]: x for x in inventory["mcp"] + inventory["languages"]}
-    specs = catalogue["mcp"] + catalogue["languages"]
+    specs = [spec for spec in catalogue["mcp"] + catalogue["languages"] if spec["manager"] != "native"]
     with ThreadPoolExecutor(max_workers=6) as pool:
         releases = list(pool.map(lambda spec: check_release(spec, getter) if spec.get("required", True) or records[spec["id"]]["status"] != "missing" else {"state": "not-requested", "reason": "Conditional reuse-only backend is absent.", "version": None}, specs))
     result = []

@@ -2,12 +2,14 @@
 # Actual Windows TUI smoke test using a headless native pseudoconsole.
 # No model request is submitted. Uses live auth via a temporary link if present.
 [CmdletBinding()]
-param([string] $CodexCommand, [switch] $KeepFailureArtifact)
+param([string] $CodexCommand, [string] $ConfigBridge, [switch] $KeepFailureArtifact)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'This native terminal test requires Windows.' }
 if (-not ('Harness.Tests.ConPty' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'ConPty.cs') }
 $repository = Split-Path $PSScriptRoot -Parent
+if (-not $ConfigBridge) { $ConfigBridge = Join-Path $repository 'target/debug/codex-harness.exe' }
+if (-not (Test-Path -LiteralPath $ConfigBridge)) { throw 'Build codex-harness before running this test.' }
 $hostCodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 if (-not $CodexCommand) {
     $hostRegistration = Join-Path $hostCodexHome 'harness/installation.json'
@@ -47,7 +49,6 @@ try {
     New-Item -ItemType Directory -Path $binDirectory, $workspace -Force | Out-Null
     $registrations = @(
         @{ Destination = (Join-Path $binDirectory 'codex.ps1'); Source = (Join-Path $repository 'tools/codex.ps1') },
-        @{ Destination = (Join-Path $codexDirectory 'harness.config.toml'); Source = (Join-Path $repository 'global/harness.config.toml') },
         @{ Destination = (Join-Path $codexDirectory 'AGENTS.md'); Source = (Join-Path $repository 'global/principles-of-work.md') }
     )
     if (Test-Path -LiteralPath (Join-Path $hostCodexHome 'auth.json')) {
@@ -57,10 +58,10 @@ try {
         New-Item -ItemType SymbolicLink -Path $registration.Destination -Target $registration.Source | Out-Null
         $links += $registration.Destination
     }
-    @{ schemaVersion = 1; sourceRoot = $repository; codexCommand = $CodexCommand; profileName = 'harness' } |
+    @{ schemaVersion = 1; sourceRoot = $repository; codexCommand = $CodexCommand; profileName = 'harness'; configBridge = $ConfigBridge } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $codexDirectory 'harness/installation.json') -Encoding utf8
     $workspaceToml = ConvertTo-Json -InputObject $workspace -Compress
-    "model = `"harness_tui_base_fixture`"`nmodel_reasoning_effort = `"low`"`n[projects.$workspaceToml]`ntrust_level = `"trusted`"`n" |
+    "model = `"gpt-6-astra`"`nmodel_reasoning_effort = `"low`"`n[projects.$workspaceToml]`ntrust_level = `"trusted`"`n" |
         Set-Content -LiteralPath (Join-Path $codexDirectory 'config.toml') -Encoding utf8
     $entry = Join-Path $temporaryRoot 'entry.ps1'
     @'
@@ -77,9 +78,8 @@ exit $LASTEXITCODE
     Write-Output 'Headless ConPTY reached the actual Codex TUI through ordinary codex resolution.'
     # This first stage intentionally gives an actionable signal before later
     # interaction so terminal support can be distinguished from TUI onboarding.
-    Wait-Terminal 'gpt-6-astra|harness_tui_base_fixture' 20
-    if ($terminal.Transcript.Contains('harness_tui_base_fixture')) { throw 'TUI used the base fixture model instead of the live harness profile.' }
-    Write-Output 'Actual TUI displays gpt-6-astra from the linked profile.'
+    Wait-Terminal 'gpt-6-astra low' 20
+    Write-Output 'Actual TUI observes the local reasoning preference with live shared policy.'
     $terminal.Send('/status')
     Start-Sleep -Milliseconds 300
     $terminal.Send("`r")
@@ -97,18 +97,9 @@ exit $LASTEXITCODE
     $terminal.Dispose()
     $terminal = $null
 
-    # A separately authored source fixture permits exercising the ordinary
-    # /model writer without changing the repository's real shared preference.
-    $fixtureProfile = Join-Path $temporaryRoot 'writer-source.config.toml'
-    @'
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-model = "gpt-6-astra"
-model_reasoning_effort = "xhigh"
-'@ | Set-Content -LiteralPath $fixtureProfile -Encoding utf8
-    $profileLink = Join-Path $codexDirectory 'harness.config.toml'
-    Remove-Item -LiteralPath $profileLink -Force
-    New-Item -ItemType SymbolicLink -Path $profileLink -Target $fixtureProfile | Out-Null
+    # Native /model must persist locally and survive a subsequent real launch.
+    $localConfig = Join-Path $codexDirectory 'config.toml'
+    (Get-Content -LiteralPath $localConfig -Raw).Replace('model_reasoning_effort = "low"','model_reasoning_effort = "xhigh"') | Set-Content -LiteralPath $localConfig -Encoding utf8
     $baseBeforeWriter = Get-Content -LiteralPath (Join-Path $codexDirectory 'config.toml') -Raw
     $terminal = [Harness.Tests.ConPty]::new($pwsh, ('"' + $pwsh + '" -NoLogo -NoProfile -File "' + $entry + '"'), $workspace)
     Wait-Terminal 'gpt-6-astra xhigh' 30
@@ -124,14 +115,13 @@ model_reasoning_effort = "xhigh"
     Start-Sleep -Milliseconds 300
     $terminal.Send("`r")
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    while ((Get-Content -LiteralPath $fixtureProfile -Raw) -notmatch 'model_reasoning_effort\s*=\s*"high"' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
-    if ((Get-Content -LiteralPath $fixtureProfile -Raw) -notmatch 'model_reasoning_effort\s*=\s*"high"') {
+    while ((Get-Content -LiteralPath $localConfig -Raw) -notmatch 'model_reasoning_effort\s*=\s*"high"' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    if ((Get-Content -LiteralPath $localConfig -Raw) -notmatch 'model_reasoning_effort\s*=\s*"high"') {
         $terminal.Transcript | Set-Content -LiteralPath (Join-Path $temporaryRoot 'failure-transcript.txt') -Encoding utf8
-        throw "Native /model writer did not persist the selected effort in the linked source. Diagnostic: $temporaryRoot/failure-transcript.txt"
+        throw "Native /model writer did not persist the selected effort locally. Diagnostic: $temporaryRoot/failure-transcript.txt"
     }
-    if ((Get-Item -LiteralPath $profileLink -Force).LinkType -ne 'SymbolicLink') { throw 'Native /model writer severed the profile source link.' }
-    if ((Get-Content -LiteralPath (Join-Path $codexDirectory 'config.toml') -Raw) -cne $baseBeforeWriter) { throw 'Native /model writer unexpectedly modified the base configuration.' }
-    Write-Output 'Native /model persisted xhigh -> high in its linked profile source; local base and source link remained intact.'
+    if ((Get-FileHash -LiteralPath $sharedProfile).Hash -cne $sharedProfileHash) { throw 'Native /model modified shared source.' }
+    Write-Output 'Native /model persisted xhigh -> high locally; shared source stayed unchanged.'
     $terminal.Send('/quit')
     Start-Sleep -Milliseconds 300
     $terminal.Send("`r")
@@ -139,15 +129,12 @@ model_reasoning_effort = "xhigh"
     $terminal.Dispose()
     $terminal = $null
 
-    # Observe the ordinary trust writer against the synthetic linked source.
-    # This records a native behavior conflict; it does not claim host-local
-    # trust isolation has passed merely because the observed target is stable.
+    # Exercise native trust persistence in a fresh owned repository.
     $trustWorkspace = Join-Path $temporaryRoot 'untrusted git workspace'
     New-Item -ItemType Directory -Path $trustWorkspace | Out-Null
     & git -C $trustWorkspace init --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the disposable trust repository.' }
     $baseBeforeTrust = Get-Content -LiteralPath (Join-Path $codexDirectory 'config.toml') -Raw
-    $profileBeforeTrust = Get-Content -LiteralPath $fixtureProfile -Raw
     $trustEntry = Join-Path $temporaryRoot 'trust-entry.ps1'
     @'
 # Select the supported token-based mechanism so this read-only UI fixture
@@ -164,15 +151,12 @@ exit $LASTEXITCODE
         $terminal.Send("`r")
         Wait-Terminal 'gpt-6-astra high' 30
         $baseAfterTrust = Get-Content -LiteralPath (Join-Path $codexDirectory 'config.toml') -Raw
-        $profileAfterTrust = Get-Content -LiteralPath $fixtureProfile -Raw
         $baseChanged = $baseAfterTrust -cne $baseBeforeTrust
-        $profileChanged = $profileAfterTrust -cne $profileBeforeTrust
-        $profileContainsTrust = $profileAfterTrust.Contains('untrusted git workspace') -and $profileAfterTrust -match 'trust_level\s*=\s*"trusted"'
-        if (-not $profileContainsTrust -and -not ($baseAfterTrust.Contains('untrusted git workspace') -and $baseAfterTrust -match 'trust_level\s*=\s*"trusted"')) { throw 'The accepted trust decision was not found in either configuration source.' }
-        if ((Get-Item -LiteralPath $profileLink -Force).LinkType -ne 'SymbolicLink') { throw 'Native trust writer severed the profile source link.' }
-        Write-Output "Native Full Access TUI trust prompt accepted (windows.sandbox=unelevated avoids host provisioning): profileChanged=$profileChanged; baseChanged=$baseChanged; machinePathInProfile=$profileContainsTrust; source link intact."
+        if (-not $baseChanged -or -not ($baseAfterTrust.Contains('untrusted git workspace') -and $baseAfterTrust -match 'trust_level\s*=\s*"trusted"')) { throw 'The accepted trust decision was not persisted locally.' }
+        if ((Get-FileHash -LiteralPath $sharedProfile).Hash -cne $sharedProfileHash) { throw 'Native trust writer modified shared source.' }
+        Write-Output 'Native trust decision persisted in local base configuration; shared source unchanged.'
     } else {
-        Write-Output 'Native Full Access TUI skipped the trust prompt; this launch did not exercise the trust writer.'
+        throw 'Trust fixture did not exercise the native trust writer.'
     }
     $terminal.Send('/quit')
     Start-Sleep -Milliseconds 300

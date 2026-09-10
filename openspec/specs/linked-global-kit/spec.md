@@ -12,7 +12,7 @@ The repository SHALL own the complete source of its declared global toolkit: the
 
 #### Scenario: The kit is deployed on a new PC
 - **WHEN** a fresh checkout is connected on another Windows account with the documented prerequisites
-- **THEN** every declared managed capability and its required resources are available from the checkout or an explicitly declared external dependency, without depending on files from the former PC; saved machine-specific settings may remain in the shared configuration
+- **THEN** every declared managed capability and its required resources are available from the checkout or an explicitly declared external dependency, without depending on files from the former PC; machine-specific settings remain local and the shared source contains only portable defaults
 
 #### Scenario: The global instruction source is inspected
 - **WHEN** the user follows the active global AGENTS.md connection
@@ -52,7 +52,7 @@ On the initial supported Windows native environment, `install.ps1` SHALL discove
 
 ### Requirement: Shared configuration and local state
 
-The shared configuration SHALL provide `approval_policy = "never"` and `sandbox_mode = "danger-full-access"` as the previously selected Full Access default and SHALL record the declared reusable model, reasoning and tool preferences needed to reproduce the kit. Existing local configuration outside explicitly managed defaults SHALL remain active under native configuration precedence. Authentication, session history, caches and installer state SHALL remain outside tracked repository artifacts. The entire checkout MUST NOT become `CODEX_HOME`. Configuration-management operations SHALL retain native persistence behavior: settings, including model preferences and machine-specific trusted project paths, MAY be written through the linked profile into the repository. Documentation SHALL identify the observed write targets and this accepted shared-file effect. The installer SHALL preserve the existing local base configuration without automatically migrating its contents.
+The shared configuration SHALL provide `approval_policy = "never"` and `sandbox_mode = "danger-full-access"` as the previously selected Full Access default and SHALL record the declared reusable model, reasoning and tool preferences needed to reproduce the kit. Existing local configuration outside explicitly managed defaults SHALL remain active under native configuration precedence. Authentication, session history, caches and installer state SHALL remain outside tracked repository artifacts. The entire checkout MUST NOT become `CODEX_HOME`. Native configuration-management operations SHALL persist user-specific model preferences, trust paths and other machine state outside tracked source files. Shared defaults SHALL continue to be read live from the checkout. Installation and migration SHALL preserve local configuration, authentication and unrelated capabilities, retain a recoverable copy of relocated local settings, and report conflicting values rather than discard them.
 
 #### Scenario: Existing machine configuration is present
 - **WHEN** a host with provider/model preferences, trusted project paths and saved authentication is connected
@@ -60,7 +60,11 @@ The shared configuration SHALL provide `approval_policy = "never"` and `sandbox_
 
 #### Scenario: A setting is persisted through its native writer
 - **WHEN** a supported ordinary Codex operation persists a model preference or machine-specific setting after connection
-- **THEN** its native write target is preserved, including the repository profile for profiled TUI model selection and project trust; the direct connection remains intact and authentication, session history, caches and installer state stay outside the repository
+- **THEN** the setting persists on the local machine, the shared source remains unchanged, and a subsequent session observes applicable local preferences together with the live portable defaults
+
+#### Scenario: A previously connected shared profile contains machine state
+- **WHEN** the installation is migrated to the public-source boundary
+- **THEN** existing machine settings are preserved locally before their tracked source entries are removed, the installed entry point uses the corrected boundary, and failure leaves a documented recoverable state
 
 ### Requirement: Global capability discovery
 

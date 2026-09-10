@@ -560,6 +560,16 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
             runtime: None,
         });
     }
+    let manifest: crate::inventory::Manifest =
+        serde_json::from_slice(&fs::read(request.source.join("global/kit.json"))?)
+            .map_err(|_| conflict())?;
+    let conflicts =
+        crate::profile_state::migrate(&request.source.join(manifest.profile), &request.codex_home)?;
+    if conflicts > 0 {
+        eprintln!(
+            "{conflicts} legacy configuration conflicts retained locally; recovery originals saved outside source."
+        );
+    }
     let config_path = request.codex_home.join("config.toml");
     let config = match fs::symlink_metadata(&config_path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -827,7 +837,7 @@ mod tests {
             let fixture = Fixture::new();
             let report = connect(&fixture.request, true).unwrap();
             assert_eq!(report.status, "preview");
-            assert_eq!(report.links, 11);
+            assert_eq!(report.links, 10);
             assert!(!fixture.request.codex_home.exists());
             assert!(!fixture.request.user_home.exists());
             assert!(!fixture.request.dependency_user_home.exists());

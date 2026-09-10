@@ -53,8 +53,9 @@ function Invoke-DiagnosticRpc($Server, [string]$Method, $Parameters) {
     }
 }
 
-function Start-DiagnosticConsumer([string]$Native, [string]$ConfigHome, [string]$Directory, [DateTime]$Deadline) {
+function Start-DiagnosticConsumer([string]$Native, [string]$ConfigHome, [string]$Directory, [DateTime]$Deadline, [string[]]$Overrides = @()) {
     $start=[Diagnostics.ProcessStartInfo]::new($Native)
+    foreach ($argument in $Overrides) { $start.ArgumentList.Add($argument) }
     foreach ($argument in @('app-server','--stdio')) { $start.ArgumentList.Add($argument) }
     $start.WorkingDirectory=$Directory; $start.UseShellExecute=$false; $start.CreateNoWindow=$true
     $start.RedirectStandardInput=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
@@ -182,15 +183,23 @@ function Invoke-HarnessSourceDiagnostics {
         }
         if ($ProfileName -cnotmatch '^[a-zA-Z0-9_-]+$') { throw 'invalid-profile-name' }
         $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-        $server=Start-DiagnosticConsumer $native $CodexHome ([IO.Path]::GetTempPath()) $deadline
+        $sharedConsumer = $ProfileName -ceq 'harness'
+        [string[]]$overrides = @()
+        if ($sharedConsumer) {
+            $registration = Get-Content -LiteralPath (Join-Path $CodexHome 'harness/installation.json') -Raw | ConvertFrom-Json
+            $encoded = & $registration.configBridge config-overrides --source $SourceRoot --codex-home $CodexHome
+            if ($LASTEXITCODE -ne 0) { throw 'shared-config-unavailable' }
+            $overrides = @($encoded | ConvertFrom-Json)
+        }
+        $server=Start-DiagnosticConsumer $native $CodexHome ([IO.Path]::GetTempPath()) $deadline $overrides
         $init=Initialize-DiagnosticConsumer $server
         $nativeVersion=[regex]::Match($init.userAgent,'/([0-9]+\.[0-9]+\.[0-9]+)').Groups[1].Value
-        if ($nativeVersion -ne '0.153.4') { throw 'unverified-profile-precedence-contract' }
+        if ($nativeVersion -notin @('0.153.4','0.154.0')) { throw 'unverified-profile-precedence-contract' }
         $read = Invoke-DiagnosticRpc $server 'config/read' @{includeLayers=$true;cwd=$report.project}
         if (-not $read.ContainsKey('origins') -or -not $read.ContainsKey('layers')) { throw 'unsupported-contract' }
         $requirements=Invoke-DiagnosticRpc $server 'configRequirements/read' @{}
-        $profilePath=Join-Path $CodexHome ($ProfileName+'.config.toml')
-        $profileConfig=Read-DiagnosticProfile $native $profilePath $deadline
+        $profilePath=if ($sharedConsumer) { Join-Path $SourceRoot 'global/harness.config.toml' } else { Join-Path $CodexHome ($ProfileName+'.config.toml') }
+        $profileConfig=if ($sharedConsumer) { @{} } else { Read-DiagnosticProfile $native $profilePath $deadline }
         # These inputs can change project discovery/trust or skill selection before merging.
         $contextChanged=$false
         foreach ($key in @('project_root_markers','credential_broker','skills')) {
@@ -243,7 +252,7 @@ function Invoke-HarnessSourceDiagnostics {
         foreach ($group in @($report.skills | Where-Object enabled | Group-Object name | Where-Object Count -gt 1)) {
             $findings.Add(@{code='skill-name-collision';name=$group.Name;sources=@($group.Group.path);action='Rename or explicitly disable the unintended skill source; same-name skills are ambiguous.'})
         }
-        $report.native=@{status='observed';executable=$native;protocol='config/read + configRequirements/read + skills/list';version=$nativeVersion;profileSelection='reconstructed; app-server does not accept file profiles';skillsScope='native base consumer'}
+        $report.native=@{status='observed';executable=$native;protocol='config/read + configRequirements/read + skills/list';version=$nativeVersion;profileSelection=$(if ($sharedConsumer) {'live shared CLI overrides; native base persistence'} else {'reconstructed; app-server does not accept file profiles'});skillsScope='native base consumer'}
     } catch {
         $category = if ($_.Exception -is [TimeoutException]) {'native-timeout'} else {'native-unavailable-or-incompatible'}
         $findings.Add(@{code=$category;source=$CodexCommand;action='Check the installed CLI, selected profile, project path and TOML locally; native error text is withheld.'})

@@ -25,7 +25,17 @@ from mcp.client.stdio import stdio_client
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--consumer', type=Path)
+    parser.add_argument('--consumer-preserved-file', type=Path,
+                        help='Existing consumer-relative file whose hash must remain unchanged')
     args = parser.parse_args()
+    if bool(args.consumer) != bool(args.consumer_preserved_file):
+        parser.error('--consumer and --consumer-preserved-file must be supplied together')
+    preserved = None
+    if args.consumer:
+        consumer_root = args.consumer.resolve(strict=True)
+        preserved = (consumer_root / args.consumer_preserved_file).resolve(strict=True)
+        if not preserved.is_relative_to(consumer_root) or not preserved.is_file():
+            parser.error('The preserved file must be an existing file inside the consumer')
     codex = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex'))
     installation = json.loads((codex / 'harness/installation.json').read_text(encoding='utf-8-sig'))
     hooks = json.loads((codex / 'hooks.json').read_text(encoding='utf-8-sig'))['hooks']
@@ -128,7 +138,8 @@ def main():
 
     if args.consumer:
         consumer = args.consumer.resolve(strict=True)
-        archive = consumer / 'openspec/changes/archive/2026-08-25-accelerate-phases-with-profile-bound-evidence/evidence/virt-stend-configuration-candidate-map-2026-08-25-r1.json'
+        assert preserved is not None
+        archive = preserved
         with archive.open('rb') as stream:
             before = hashlib.file_digest(stream, 'sha256').hexdigest()
         fresh = event(consumer, probe.name + '-consumer-fresh')

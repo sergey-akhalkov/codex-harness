@@ -37,6 +37,7 @@ impl Fixture {
         let build = state.join("builds/fixture");
         for path in [
             home.join("harness"),
+            source.join("global"),
             source.join("crates/one/src"),
             source.join("tools/rtk-adapter/src"),
             source.join(INSPECTION_SCHEMA).parent().unwrap().to_owned(),
@@ -52,6 +53,12 @@ impl Fixture {
         ] {
             fs::write(source.join(name), "fixture").unwrap();
         }
+        fs::write(
+            source.join("global/harness.config.toml"),
+            "approval_policy = 'never'\n",
+        )
+        .unwrap();
+        fs::write(source.join("global/kit.json"), serde_json::to_vec(&json!({"schema":1,"profile_name":"harness","profile":"global/harness.config.toml","instructions":"AGENTS.md","skills":"skills","agents":"agents","hooks":"hooks.json","token_hooks":"rtk-hooks.json"})).unwrap()).unwrap();
         fs::write(state.join("owner"), "codex-harness-native-state-v1\n").unwrap();
         let launcher = build.join("codex.exe");
         let upstream = root.path().join("upstream.exe");
@@ -187,8 +194,11 @@ fn immutable_registration_is_independent_of_build_tool_selection_and_rejects_amb
     )
     .unwrap();
     let stale = fixture.command().stdin(Stdio::null()).output().unwrap();
-    assert!(!stale.status.success());
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("registered native build is stale"));
+    assert!(
+        stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
 }
 
 #[test]
@@ -326,8 +336,8 @@ fn native_argv_unicode_stdin_streams_cwd_and_nonzero_exit() {
     assert_eq!(
         report["args"],
         json!([
-            "--profile",
-            "harness",
+            "-c",
+            "approval_policy=\"never\"",
             "-c",
             "model_reasoning_effort=\"low\"",
             "exec",
@@ -402,19 +412,10 @@ fn explicit_native_precedence_and_package_manager_metadata() {
 
 #[test]
 fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() {
-    for mode in [
-        "source",
-        "binary",
-        "registration",
-        "journal",
-        "upstream",
-        "recursion",
-    ] {
+    for mode in ["registration", "journal", "upstream", "recursion"] {
         let f = Fixture::new();
         let before = fs::read(f.state.join("active-build.json")).unwrap();
         match mode {
-            "source" => fs::write(f.source.join("crates/one/src/lib.rs"),"changed").unwrap(),
-            "binary" => fs::write(f.launcher.parent().unwrap().join("harness-rtk.exe"),"changed").unwrap(),
             "registration" => fs::remove_file(f.home.join("harness/native-launch.json")).unwrap(),
             "journal" => fs::write(f.state.join("build-selection-journal.json"),"interrupted").unwrap(),
             "upstream" => { let mut file=fs::OpenOptions::new().append(true).open(&f.upstream).unwrap(); file.write_all(b"changed").unwrap(); },
@@ -429,6 +430,107 @@ fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() 
             .unwrap();
         assert!(!out.status.success(), "{mode}");
         assert!(out.stdout.is_empty(), "{mode}");
+        assert_eq!(
+            fs::read(f.state.join("active-build.json")).unwrap(),
+            before,
+            "{mode}"
+        );
+        assert!(
+            !f.state.join("staging").exists(),
+            "ordinary launch compiled: {mode}"
+        );
+    }
+}
+
+#[test]
+fn missing_stale_source_and_shared_toml_fail_open_to_verified_upstream() {
+    let args = [
+        "--harness-effort",
+        "routine",
+        "exec",
+        "",
+        "проверка \"кавычки\"",
+        "trailing\\",
+        "$() `literal` ; &",
+    ];
+    let expected_args = json!([
+        "-c",
+        "model_reasoning_effort=\"low\"",
+        "exec",
+        "",
+        "проверка \"кавычки\"",
+        "trailing\\",
+        "$() `literal` ; &"
+    ]);
+    for mode in [
+        "stale-source",
+        "missing-source",
+        "shared-toml",
+        "schema2-stale",
+        "companion-altered",
+        "companion-missing",
+    ] {
+        let f = Fixture::new();
+        if mode == "schema2-stale" {
+            f.register_immutable();
+        }
+        let before = fs::read(f.state.join("active-build.json")).unwrap();
+        match mode {
+            "stale-source" | "schema2-stale" => {
+                fs::write(f.source.join("crates/one/src/lib.rs"), "changed").unwrap()
+            }
+            "missing-source" => fs::remove_dir_all(&f.source).unwrap(),
+            "shared-toml" => fs::write(
+                f.source.join("global/harness.config.toml"),
+                "approval_policy = [\n",
+            )
+            .unwrap(),
+            "companion-altered" => fs::write(
+                f.launcher.parent().unwrap().join("harness-rtk.exe"),
+                "changed",
+            )
+            .unwrap(),
+            "companion-missing" => {
+                fs::remove_file(f.launcher.parent().unwrap().join("harness-rtk.exe")).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let mut child = f
+            .command()
+            .args(args)
+            .env("CARGO", "must-not-run")
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all("первая строка\nsecond line\n".as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(19), "{mode}");
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            stderr.contains(
+                "codex-harness: shared harness unavailable; launching registered Codex without harness overrides"
+            ),
+            "{mode}: {stderr}"
+        );
+        assert!(stderr.contains("upstream stderr"), "{mode}: {stderr}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["args"], expected_args, "{mode}");
+        assert_eq!(report["stdin"], "первая строка\nsecond line\n", "{mode}");
+        assert_eq!(
+            Path::new(report["cwd"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            f.root.path().canonicalize().unwrap(),
+            "{mode}"
+        );
         assert_eq!(
             fs::read(f.state.join("active-build.json")).unwrap(),
             before,

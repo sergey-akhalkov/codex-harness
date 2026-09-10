@@ -39,6 +39,11 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
             "npm",
             "https://registry.npmjs.org/@nuphus%2fnuphus-mcp/latest",
         ),
+        Some("codegraph") => (
+            "@colbymchenry/codegraph",
+            "github-release",
+            "https://api.github.com/repos/colbymchenry/codegraph/releases/tags/v1.6.0",
+        ),
         Some("python") => (
             "basedpyright",
             "npm",
@@ -51,7 +56,10 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
         ),
         _ => return Err("unsupported-metadata-source"),
     };
-    if spec["package"] != package || spec["manager"] != manager {
+    // The lifecycle catalogue delegates this provider to the native owner;
+    // the owner's dependency records name the actual acquisition transport.
+    let native_codegraph = spec["id"] == "codegraph" && spec["manager"] == "native";
+    if spec["package"] != package || (spec["manager"] != manager && !native_codegraph) {
         return Err("unsupported-metadata-source");
     }
     Ok(url)
