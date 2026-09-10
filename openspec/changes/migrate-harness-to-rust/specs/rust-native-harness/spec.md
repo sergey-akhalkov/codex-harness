@@ -4,9 +4,9 @@ Provide the globally connected harness through maintainable first-party Rust cod
 
 ## ADDED Requirements
 
-### Requirement: Repository-local Rust ownership policy
+### Requirement: Harness Rust ownership policy
 
-The kit SHALL use Rust for all maintained first-party executable code in the delivered repository, including runtime, installation/recovery/build helpers, tests, executable fixtures and skill helpers. The repository's owning guidance and decision record SHALL identify this policy as local to `codex-harness`. It MUST NOT impose a language choice on other projects through the portable global instructions. Third-party tools and their required runtimes SHALL remain allowed under documented external ownership and provenance. Declarative configuration, documentation and inert language-analysis samples SHALL be distinguished from executable harness code.
+The kit SHALL use Rust for all maintained first-party executable code in the delivered repository, including runtime, installation/recovery/build helpers, tests, executable fixtures and skill helpers. The repository's owning guidance and decision record SHALL distinguish this full migration commitment from the separately confirmed portable Rust programming and PowerShell shell defaults, which apply across projects and delegated work. Those defaults MUST NOT be interpreted as authorization for unrelated rewrites of existing projects. Third-party tools and their required runtimes SHALL remain allowed under documented external ownership and provenance. Declarative configuration, documentation and inert language-analysis samples SHALL be distinguished from executable harness code.
 
 #### Scenario: New first-party helper
 - **WHEN** a runtime, test, build or skill helper is added to the maintained kit
@@ -14,7 +14,7 @@ The kit SHALL use Rust for all maintained first-party executable code in the del
 
 #### Scenario: Foreign tool and project language
 - **WHEN** the installed harness uses a third-party Python/TypeScript tool or operates in a non-Rust project
-- **THEN** the external language/runtime remains supported and the harness does not apply its local Rust policy to that project's implementation
+- **THEN** the external language/runtime remains supported, the portable language/shell defaults and their explicit exceptions guide new work, and the harness does not require that project's existing implementation to undergo this full Rust migration
 
 ### Requirement: Complete executable ownership accounting
 

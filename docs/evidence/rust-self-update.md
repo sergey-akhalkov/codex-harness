@@ -97,6 +97,31 @@ handoff changes. Task 2.3 is closed using this additional evidence and the earli
 explicit missing/altered-manager bootstrap evidence in [Rust migration](rust-migration.md).
 Build preparation is not global installation acceptance.
 
+An additional publication review on 2026-09-10 reproduced four deterministic
+foreign-writer races in the old compare-then-rename/delete path, even with the
+native state lock held. Changed bytes and replacement objects could be lost.
+Selection publication now uses the existing native transaction/handle guards:
+exclusive creation, identity-and-byte-checked replacement, and guarded removal.
+Sixteen selection tests and 30 native guard tests passed. The real CLI
+build/reuse/source-stale/failed-update/repair case also passed. The cross-version
+fixture first failed before execution because it omitted the real manager's
+new sibling modules; it now copies current manager sources and dependencies
+while retaining the inert auxiliary binaries and deliberate four/five split.
+The actual cross-version activation/recovery scenario then passed in 171.08 s.
+Task 2.3 remains closed after this correction and affected acceptance.
+
+Evidence is under the `build-selection-race` directory of the dependency/native
+lifecycle evidence root recorded in [dependency preparation](rust-dependency-archives.md).
+`HANDOFF.md`, `baseline-inputs.json`, `candidate-inputs.json`,
+`native-cli-inputs.json`, `parent-transition-checkpoint.json` and
+`parent-transition.stdout`/`.stderr` preserve the
+baseline failures, exact source/artifact identities and commands. The parent
+transition retained its owned source/builds in
+`%TEMP%/harness-native-transition-uIDs8o`. This closes the demonstrated
+within-call race; the existing build journal still has its original byte-based
+contract between separate invocations. Native protection fails closed on
+unsupported filesystems; no non-Windows or global cutover claim is added.
+
 Commands:
 
 ```powershell

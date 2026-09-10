@@ -19,15 +19,15 @@
 
 ## 4. Native installation, launcher and diagnostics
 
-- [ ] 4.1 Replace the PowerShell manifest reader and shared registration/configuration primitives with native declarative equivalents; verify direct source links, current-machine path resolution, foreign ownership conflicts, lock serialization and machine-local credential/state separation.
+- [x] 4.1 Replace the PowerShell manifest reader and shared registration/configuration primitives with native declarative equivalents; verify direct source links, current-machine path resolution, foreign ownership conflicts, lock serialization and machine-local credential/state separation.
 - [ ] 4.2 Port install/update/preview/Check and component selectors; verify existing-installation metadata migration, fresh/repeated/component-only operations, checksum/identity failures and preservation of unrelated capabilities using the migrated installer acceptance cases.
 - [ ] 4.3 Port recover/disconnect and relocation, including temporary old-layout rollback state; verify interrupted operations, conflicting foreign edits, dangling links, adopted dependency preservation and no deletion through a link into source or shared caches.
 - [ ] 4.4 Replace ordinary `codex` registration and launcher with Rust; verify actual argv/Unicode/streams/exit handling, native precedence, task-effort options, cwd-independent discovery and prevention of self-recursion or selection of the wrong upstream executable.
-- [ ] 4.5 Port focused source diagnostics and its global native alias; verify Check versus Diagnose, native source observations, secret-free bounded failures, no model/project/hook execution and legacy diagnostic registration upgrade.
+- [x] 4.5 Port focused source diagnostics and its global native alias; verify Check versus Diagnose, native source observations, secret-free bounded failures, no model/project/hook execution and legacy diagnostic registration upgrade.
 
 ## 5. Native dependency and MCP lifecycle
 
-- [ ] 5.1 Port external dependency discovery and compatibility selection; verify reuse of adopted packages/runtimes, missing/ambiguous/modified statuses and the current selected dependency catalogue without treating project language support as first-party code.
+- [x] 5.1 Port external dependency discovery and compatibility selection; verify reuse of adopted packages/runtimes, missing/ambiguous/modified statuses and the current selected dependency catalogue without treating project language support as first-party code.
 - [ ] 5.2 Port explicit provisioning/update and registration lifecycle; verify checksums, compatible version selection, rollback, preview/Check silence, no runtime acquisition and preservation of existing OpenCode/shared consumers.
 - [ ] 5.3 Port lazy stdio forwarding, shared resource brokers and orphan/owner reconciliation; verify real Windows pipes, request IDs, cancellation/EOF, output purity, indexing resource bounds, idle cleanup and preservation of ambiguous/foreign workers.
 - [ ] 5.4 Integrate the proven Serena boundary and native Codebase Memory adapter; verify separate project identities, current indexing/coverage semantics, shared-worker behavior, semantic operations and accepted explicit diagnostics through actual foreign MCP processes.
@@ -50,7 +50,7 @@
 
 - [ ] 8.1 Classify remaining legacy LSP files, temp helpers and caches by actual consumers; port shared/accepted behavior and retire only proven obsolete owned paths, verifying dynamic manifest references, global registrations and affected acceptance cases before deletion.
 - [ ] 8.2 Implement the executable ownership check and remove remaining supported first-party Python/PowerShell/JS/C# paths; verify embedded/generated programs and owned-package relabeling fail the check while documented third-party dependencies and inert data remain distinguishable.
-- [ ] 8.3 Update local AGENTS.md, docs/project-decisions.md, installation/verification documentation, manifest requirements and supported old/new command mappings; verify local links, global resource discovery and that the Rust language policy does not propagate into portable instructions for other projects.
+- [ ] 8.3 Update local AGENTS.md, docs/project-decisions.md, installation/verification documentation, manifest requirements and supported old/new command mappings; verify local links, global resource discovery and consistency with the confirmed portable Rust programming and PowerShell shell defaults, distinguishing the harness's full migration from defaults that do not authorize unrelated project rewrites.
 - [ ] 8.4 Run the complete applicable Rust format/lint/unit/integration checks and an independent review of process containment, authentication boundaries, ownership and rollback; resolve material findings and verify every affected check again before global activation.
 
 ## 9. Global delivery and closure

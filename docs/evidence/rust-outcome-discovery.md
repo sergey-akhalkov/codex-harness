@@ -3,7 +3,7 @@
 2026-09-09. `codex-harness outcome-discover --request PATH` performs the fixed,
 model-free native `initialize`, `skills/list` and `config/read` exchange. The
 [implementation](../../crates/codex-harness/src/outcome_discovery.rs) and
-[transport](../../crates/codex-harness/src/outcome_discovery_rpc.rs) replace the
+[transport](../../crates/codex-harness/src/native_read_rpc.rs) replace the
 discovery portion of the outcome helper. [Arm preparation](rust-outcome-arm.md)
 now consumes it; suites/oracles, remaining consumers and global migration are
 still unfinished under task 7.3.

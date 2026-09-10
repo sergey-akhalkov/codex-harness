@@ -162,7 +162,7 @@ fn metadata_actual_apply_finish_reload_reuse_update_preserves_recorded_ids() {
     assert_eq!(fs::read(root.join("config")).unwrap(), b"after");
     assert_eq!(fs::read(root.join("created")).unwrap(), b"created");
     let journal: Journal = serde_json::from_slice(&fs::read(reg.journal_path()).unwrap()).unwrap();
-    assert_eq!(journal.schema, 8);
+    assert_eq!(journal.schema, SCHEMA);
     let witness = journal
         .creations
         .iter()

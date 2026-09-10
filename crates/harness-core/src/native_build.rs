@@ -8,12 +8,12 @@ use serde::Serialize;
 use std::{
     ffi::OsStr,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const OWNER: &[u8] = b"codex-harness-native-state-v1\n";
+pub(crate) const OWNER: &[u8] = b"codex-harness-native-state-v1\n";
 const TARGET: &str = "x86_64-pc-windows-msvc";
 
 #[path = "native_handoff.rs"]
@@ -104,11 +104,19 @@ pub(crate) fn lock_owned_state(state: &Path) -> io::Result<ExclusiveFileLock> {
     })
 }
 
+fn owner_matches(marker: &Path) -> io::Result<bool> {
+    let mut bytes = Vec::new();
+    fs::File::open(marker)?
+        .take((OWNER.len() + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes == OWNER)
+}
+
 pub(crate) fn verify_owned_state(state: &Path) -> io::Result<()> {
     ordinary_ancestors(state)?;
     let marker = state.join("owner");
     build_identity::ordinary(&marker)?;
-    if fs::read(marker)? != OWNER {
+    if !owner_matches(&marker)? {
         return Err(io::Error::other(
             "Native state has foreign ownership; preserving it.",
         ));
@@ -245,7 +253,7 @@ fn directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn owner_root(state: &Path) -> io::Result<()> {
+pub(crate) fn owner_root(state: &Path) -> io::Result<()> {
     ordinary_ancestors(state)?;
     let marker = state.join("owner");
     if state.exists() {
@@ -257,7 +265,7 @@ fn owner_root(state: &Path) -> io::Result<()> {
         }
         if marker.exists() {
             build_identity::ordinary(&marker)?;
-            if fs::read(&marker)? != OWNER {
+            if !owner_matches(&marker)? {
                 return Err(io::Error::other(
                     "Native state has foreign ownership; preserving it.",
                 ));

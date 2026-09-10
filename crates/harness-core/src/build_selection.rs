@@ -7,8 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Component, Path, PathBuf},
 };
 
@@ -121,32 +120,67 @@ fn verified_previous(state: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 }
 
 fn replace_expected(path: &Path, before: Option<&[u8]>, after: Option<&[u8]>) -> io::Result<()> {
-    if read_optional(path)?.as_deref() != before {
-        return Err(io::Error::other(
-            "Native selection ownership conflict; target and recovery journal preserved.",
-        ));
+    #[cfg(windows)]
+    {
+        replace_expected_at_publication(
+            path,
+            before,
+            after,
+            #[cfg(test)]
+            || {},
+        )
     }
-    if let Some(bytes) = after {
-        let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-        temp.write_all(bytes)?;
-        temp.as_file().sync_all()?;
-        // Recheck after preparing the file. The state lock serializes kit writers.
-        if read_optional(path)?.as_deref() != before {
-            return Err(io::Error::other(
-                "Native selection changed while preparing the write; preserving it.",
-            ));
-        }
-        let file = if before.is_some() {
-            temp.persist(path)
+    #[cfg(not(windows))]
+    {
+        let _ = (path, before, after);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Native selection publication requires Windows transaction guards.",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn replace_expected_at_publication(
+    path: &Path,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    #[cfg(test)] before_publication: impl FnOnce(),
+) -> io::Result<()> {
+    use crate::registration_native::{FileGuard, StagedFile};
+
+    if let Some(expected) = before {
+        let guard = FileGuard::open_regular(path, expected)?;
+        if let Some(bytes) = after {
+            let identity = guard.object_identity()?;
+            // The read guard cannot be upgraded to a writer. The native write
+            // transaction revalidates BOTH identity and bytes after reacquiring
+            // the target, then retains exclusion through write/truncate/commit.
+            drop(guard);
+            #[cfg(test)]
+            before_publication();
+            FileGuard::replace_regular(path, &identity, expected, bytes)
         } else {
-            temp.persist_noclobber(path)
+            #[cfg(test)]
+            before_publication();
+            // Delete this guarded object, never a freshly resolved pathname.
+            guard.remove()
         }
-        .map_err(|e| e.error)?;
-        file.sync_all()?;
-    } else if before.is_some() {
-        fs::remove_file(path)?;
+    } else if let Some(bytes) = after {
+        // CREATE_NEW inside TxF reserves the absent name and pins its ordinary
+        // ancestors. Drop/process termination rolls back an uncommitted create;
+        // no persistent sibling stage needs a separate recovery protocol.
+        let staged = StagedFile::create(path, bytes)?;
+        #[cfg(test)]
+        before_publication();
+        staged.commit()
+    } else if read_optional(path)?.is_none() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "Native selection ownership conflict; target and recovery journal preserved.",
+        ))
     }
-    Ok(())
 }
 
 /// Resolve a healthy selection without Cargo, hooks, model calls or mutation.
@@ -327,6 +361,10 @@ pub fn recover(state: &Path) -> io::Result<Selection> {
     })
 }
 
+#[cfg(all(test, windows))]
+#[path = "build_selection_tests.rs"]
+mod publication_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +506,35 @@ mod tests {
         fs::write(state.join("owner"), "foreign owner").unwrap();
         assert!(recover(&state).is_err());
         assert!(activate(&state, &a).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refused_publication_retains_recoverable_journal_and_foreign_pointer() {
+        let (_temp, state, a, b) = fixture();
+        activate(&state, &a).unwrap();
+        interrupt(&state, &b, false);
+        let receipt = fs::read(state.join(JOURNAL)).unwrap();
+        let journal: Journal = serde_json::from_slice(&receipt).unwrap();
+        {
+            let _lock = native_build::lock_owned_state(&state).unwrap();
+            let result = replace_expected_at_publication(
+                &state.join(ACTIVE),
+                journal.before.as_deref(),
+                Some(&journal.after),
+                || fs::write(state.join(ACTIVE), b"foreign").unwrap(),
+            );
+            assert!(result.is_err());
+        }
+        assert!(recover(&state).is_err());
+        assert_eq!(fs::read(state.join(ACTIVE)).unwrap(), b"foreign");
+        assert_eq!(fs::read(state.join(JOURNAL)).unwrap(), receipt);
+        // Only the owned test actor restores the original bytes for retry.
+        fs::write(state.join(ACTIVE), journal.before.as_ref().unwrap()).unwrap();
+        assert!(recover(&state).unwrap().changed);
+        assert!(!recover(&state).unwrap().changed);
+        assert_eq!(selected(&state).unwrap(), a.canonicalize().unwrap());
+        assert!(b.join("codex-harness.exe").is_file());
     }
 
     #[test]

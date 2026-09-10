@@ -11,6 +11,15 @@ codex-harness-check.ps1 -ProjectPath D:\path\to\project -Json
 
 ## Что возвращается
 
+В native-кандидате доступна `codex-harness.exe diagnose` (также `check --diagnose`) с параметрами
+`--project`, `--source`, `--codex-home`, `--user-home`,
+`--dependency-user-home`, `--upstream`, `--profile` и `--timeout-seconds`.
+Его core-установка регистрирует `codex-harness-check.exe`, который вызывает ту же
+диагностику. Пути CLI разрешаются относительно каталога вызывающей команды;
+отчёт всегда JSON. [Проверки native-порта](evidence/rust-source-diagnostics.md)
+отделены от ещё не выполненного глобального переключения: текущая глобальная
+команда `.ps1` пока остаётся рабочим входом.
+
 | Поле | Значение |
 | --- | --- |
 | `status` | `healthy`: проверка завершилась без находок; `attention`: есть конфликт или намеренное переопределение; `incomplete`: часть обязательных наблюдений недоступна |

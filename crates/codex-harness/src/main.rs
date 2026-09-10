@@ -3,14 +3,112 @@ use std::{collections::BTreeMap, env, ffi::OsString, io, path::PathBuf};
 
 mod delegation_usage;
 #[cfg(windows)]
+mod dependency_cli;
+#[cfg(windows)]
+mod dependency_selection_cli;
+#[cfg(windows)]
+mod install_cli;
+#[cfg(windows)]
+mod mcp_cli;
+#[cfg(windows)]
+mod native_read_rpc;
+#[cfg(windows)]
 mod outcome_arm;
+mod outcome_case_fixture;
 mod outcome_discovery;
+#[cfg(windows)]
+mod outcome_oracle;
+mod outcome_prepare;
 mod outcome_report_cli;
 mod outcome_run;
+#[cfg(windows)]
+mod source_diagnostics;
+#[cfg(windows)]
+mod source_diagnostics_view;
+
+fn verify_manager() -> io::Result<()> {
+    verify_entrypoint(false)
+}
+
+fn verify_runtime() -> io::Result<()> {
+    verify_entrypoint(true)
+}
+
+fn verify_entrypoint(require_runtime: bool) -> io::Result<()> {
+    // Cargo bootstrap has no adjacent receipt. Resolve installed command links
+    // before finding the immutable build's identity record.
+    let executable = env::current_exe()?.canonicalize()?;
+    if let Some(parent) = executable.parent()
+        && parent.join("build.json").try_exists()?
+    {
+        let own = build_identity::check(parent, None);
+        if !own.management_allowed || (require_runtime && !own.runtime_allowed) {
+            return Err(io::Error::other(own.action));
+        }
+        if parent.join("codex-harness.exe").canonicalize()? != executable {
+            return Err(io::Error::other(
+                "this manager is not the recorded native executable",
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn run() -> io::Result<i32> {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    if args.len() == 2 && args[0] == "dependency-stage-worker-v1" {
+        verify_manager()?;
+        let report = harness_core::dependency_stage::worker(&PathBuf::from(&args[1]))?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(0);
+    }
+    #[cfg(windows)]
+    if args.len() == 2 && args[0] == "dependency-audit-worker-v1" {
+        verify_manager()?;
+        let report = harness_core::dependency_audit::worker(&PathBuf::from(&args[1]))?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(0);
+    }
+    #[cfg(windows)]
+    if env::args_os().next().is_some_and(|arg| {
+        PathBuf::from(arg)
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("codex-harness-check.exe"))
+    }) {
+        verify_manager()?;
+        return source_diagnostics::run(&args);
+    }
     if args.is_empty() || args[0] == "--help" {
+        println!("codex-harness mcp codebase-memory --help (explicit native stdio connection)");
+        println!(
+            "codex-harness diagnose [--project DIRECTORY] [--codex-home DIRECTORY] [--source CHECKOUT]"
+        );
+        println!("codex-harness check --diagnose [DIAGNOSE_OPTIONS]");
+        println!(
+            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY]"
+        );
+        println!("codex-harness dependencies audit --package-root DIRECTORY");
+        println!(
+            "codex-harness dependencies probe --executable FILE --kind codebase-memory|nuphus --sha256 DIGEST"
+        );
+        println!(
+            "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
+        );
+        println!(
+            "codex-harness check --core-only --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY] [--timeout-seconds SECONDS]"
+        );
+        println!(
+            "codex-harness disconnect --core-only --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY] [--preview]"
+        );
+        println!(
+            "codex-harness recover --core-only [--preview] --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY]"
+        );
+        println!(
+            "codex-harness install|update --core-only --source CHECKOUT --build DIRECTORY --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
+        );
+        println!("codex-harness outcome-prepare --case CASE [--observer ABSOLUTE_EXE]");
+        println!("codex-harness outcome-oracle --request PATH");
         println!("codex-harness outcome-arm --request PATH");
         println!("codex-harness outcome-discover --request PATH");
         println!("codex-harness outcome-run --request PATH --run-model-probes");
@@ -23,8 +121,63 @@ fn run() -> io::Result<i32> {
         println!("codex-harness {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
+    #[cfg(windows)]
+    if args[0] == "mcp" {
+        verify_runtime()?;
+        return mcp_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "dependencies" {
+        verify_manager()?;
+        return dependency_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "diagnose" {
+        verify_manager()?;
+        return source_diagnostics::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "check"
+        && let Some(index) = args[1..].iter().position(|arg| arg == "--diagnose")
+    {
+        verify_manager()?;
+        let mut options = args[1..].to_vec();
+        options.remove(index);
+        return source_diagnostics::run(&options);
+    }
+    #[cfg(windows)]
+    if args[0] == "check" && args[1..].iter().any(|arg| arg == "--core-only") {
+        verify_manager()?;
+        return install_cli::check(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "disconnect" {
+        verify_manager()?;
+        return install_cli::disconnect(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "install" || args[0] == "update" {
+        verify_manager()?;
+        return install_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "recover" {
+        verify_manager()?;
+        return install_cli::recover(&args[1..]);
+    }
     if args[0] == "outcome-report" {
         return outcome_report_cli::run(&args[1..]);
+    }
+    if args[0] == "outcome-prepare" {
+        return outcome_prepare::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "outcome-oracle" {
+        return outcome_oracle::run(&args[1..]);
+    }
+    if args[0] == "--outcome-case" {
+        outcome_case_fixture::run()?;
+        return Ok(0);
     }
     if args[0] == "outcome-run" {
         return outcome_run::run(&args[1..]);
@@ -101,7 +254,8 @@ fn run() -> io::Result<i32> {
         let dependency_user = options
             .get(&OsString::from("--dependency-user-home"))
             .unwrap_or(user);
-        let _lock = harness_core::installation_lock::InstallationLock::acquire(user)?;
+        let _locks =
+            harness_core::installation_lock::InstallationLocks::acquire(user, dependency_user)?;
         let installation = harness_core::installation_state::LegacyInstallation::read(
             codex_home,
             user,
@@ -163,18 +317,7 @@ fn run() -> io::Result<i32> {
     };
     let source = options.get(&OsString::from("--source")).map(PathBuf::from);
     if building || activating || recovering {
-        // Cargo bootstrap has no adjacent receipt. Installed managers require
-        // verified integrity even when source freshness differs.
-        let executable = env::current_exe()?;
-        if let Some(parent) = executable
-            .parent()
-            .filter(|p| p.join("build.json").exists())
-        {
-            let own = build_identity::check(parent, None);
-            if !own.management_allowed {
-                return Err(io::Error::other(own.action));
-            }
-        }
+        verify_manager()?;
     }
     if activating || recovering {
         let state = required("--state")?;

@@ -74,6 +74,10 @@ pub struct LinkChange {
 }
 
 impl LinkChange {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn replace(path: &Path, expected_target: &Path, next_target: &Path) -> io::Result<Self> {
         let mut change = Self::remove(path, expected_target)?;
         let next = exact_source(next_target)?;

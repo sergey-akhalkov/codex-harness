@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -20,7 +20,10 @@ fn audit(root: &Path, file: &str, row: &Value) -> io::Result<()> {
 }
 
 fn version(root: &Path, name: &str) -> io::Result<(Vec<u8>, u64)> {
-    let bytes = fs::read(root.join(name))?;
+    let mut bytes = Vec::new();
+    fs::File::open(root.join(name))?
+        .take(1025)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > 1024 {
         return Err(io::Error::other("owned version input too large"));
     }
@@ -33,7 +36,8 @@ fn version(root: &Path, name: &str) -> io::Result<(Vec<u8>, u64)> {
 
 pub fn run() -> io::Result<()> {
     let args: Vec<_> = env::args_os().skip(2).collect();
-    if args.len() != 1 {
+    let independent = args.len() == 2 && args[0] == "cli" && args[1] == "--independent-oracle";
+    if args.len() != 1 && !independent {
         return Err(io::Error::other("expected one outcome case mode"));
     }
     let exe = env::current_exe()?;
@@ -50,6 +54,10 @@ pub fn run() -> io::Result<()> {
     let mode = args[0]
         .to_str()
         .ok_or_else(|| io::Error::other("invalid case mode"))?;
+    if mode == "sentinel" {
+        std::thread::sleep(Duration::from_secs(120));
+        return Ok(());
+    }
     if mode == "build" || mode == "cli" {
         let (bytes, number) = version(
             &root,
@@ -62,11 +70,11 @@ pub fn run() -> io::Result<()> {
         if mode == "build" {
             fs::write(root.join("built.json"), bytes)?;
         }
-        audit(
-            &root,
-            "execution-audit.jsonl",
-            &json!({"entrypoint":mode,"version":number}),
-        )?;
+        let mut event = json!({"entrypoint":mode,"version":number});
+        if independent {
+            event["origin"] = json!("independent-oracle");
+        }
+        audit(&root, "execution-audit.jsonl", &event)?;
         if mode == "cli" {
             println!("{number}");
         }

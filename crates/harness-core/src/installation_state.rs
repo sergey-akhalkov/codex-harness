@@ -29,10 +29,31 @@ struct State {
     versions: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize, Debug)]
+#[derive(Clone, Copy, Serialize, Debug, PartialEq, Eq)]
 pub enum PathScope {
     User,
     Process,
+}
+
+impl PathScope {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("User") {
+            Some(Self::User)
+        } else if value.eq_ignore_ascii_case("Process") {
+            Some(Self::Process)
+        } else {
+            None
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PathScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // PowerShell ValidateSet accepts and preserves mixed-case spelling in
+        // old metadata. Serialization of new native records remains canonical.
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| serde::de::Error::custom("unsupported PATH scope"))
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -100,6 +121,33 @@ pub(crate) fn portable_name(name: &str) -> bool {
 }
 
 impl LegacyInstallation {
+    pub(crate) fn snapshot(&self) -> &ConfigSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn native_settings(&self) -> crate::installation_metadata::Settings {
+        crate::installation_metadata::Settings {
+            source_root: self.state.source_root.clone(),
+            codex_home: self.state.codex_home.clone(),
+            user_home: self.state.user_home.clone(),
+            dependency_user_home: self
+                .state
+                .dependency_user_home
+                .clone()
+                .unwrap_or_else(|| self.state.user_home.clone()),
+            codex_command: self.state.codex_command.clone(),
+            path_scope: self.state.path_scope,
+            path_added: self.state.path_added,
+            versions: self.state.versions.clone(),
+        }
+    }
+
+    pub(crate) fn metadata_destination(
+        &self,
+    ) -> io::Result<crate::registration::metadata::MetadataDestination> {
+        crate::registration::metadata::MetadataDestination::existing(&self.snapshot)
+    }
+
     pub(crate) fn metadata_fingerprint(
         &self,
     ) -> (crate::registration_native::LinkIdentity, String) {
@@ -174,7 +222,11 @@ impl LegacyInstallation {
                 "agents" => codex_home.join("agents/codex-harness"),
                 "hooks" => codex_home.join("hooks.json"),
                 "hook-launcher" => codex_home.join("harness/bin/hook.ps1"),
-                "skill" => user_home.join(".agents/skills").join(&link.name),
+                // The old inventory registered the directory name; the skill's
+                // declared capability name is independent of that directory.
+                "skill" => user_home
+                    .join(".agents/skills")
+                    .join(link.source.file_name().ok_or_else(invalid)?),
                 _ => return Err(invalid()),
             };
             let destination = key(&link.destination)?;

@@ -64,19 +64,30 @@ pub fn run() -> io::Result<()> {
     if mode == "conflicting-thread" {
         emit(json!({"type":"thread.started","thread_id":child}))?;
     }
-    emit(json!({"type":"item.completed","item":{"type":"agent_message","text":"Tests passed"}}))?;
     emit(
-        json!({"type":"item.started","item":{"type":"command_execution","exit_code":0,"command":"native verify"}}),
+        json!({"type":"item.completed","item":{"type":"agent_message","id":"message","text":"Tests passed"}}),
     )?;
     emit(
-        json!({"type":"item.completed","item":{"type":"command_execution","exit_code":null,"command":"native verify"}}),
+        json!({"type":"item.started","item":{"type":"command_execution","id":"starting","status":"in_progress","aggregated_output":"","exit_code":0,"command":"native verify"}}),
     )?;
     emit(
-        json!({"type":"item.completed","item":{"type":"command_execution","id":"read","exit_code":0,"command":"pwd"}}),
+        json!({"type":"item.completed","item":{"type":"command_execution","id":"unknown","status":"completed","aggregated_output":"","exit_code":null,"command":"native verify"}}),
     )?;
     emit(
-        json!({"type":"item.completed","item":{"type":"command_execution","id":"check","exit_code":0,"command":"native verify"}}),
+        json!({"type":"item.completed","item":{"type":"command_execution","id":"read","status":"completed","aggregated_output":"","exit_code":0,"command":"pwd"}}),
     )?;
+    emit(
+        json!({"type":"item.completed","item":{"type":"command_execution","id":"check","status":"completed","aggregated_output":"","exit_code":0,"command":"native verify"}}),
+    )?;
+    if mode == "oracle"
+        && let Ok(skill) = env::var("HARNESS_OUTCOME_ORACLE_SKILL")
+    {
+        emit(
+            json!({"type":"item.completed","item":{"type":"command_execution","id":"skill",
+            "status":"completed","aggregated_output":"owned fixture signal",
+            "exit_code":0,"command":format!("Get-Content C:/owned/skills/{skill}/SKILL.md")}}),
+        )?;
+    }
     if mode == "children" {
         emit(
             json!({"type":"item.completed","item":{"type":"collab_tool_call","receiver_thread_ids":[child,child]}}),

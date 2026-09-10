@@ -1,8 +1,7 @@
 //! Native reproduce-regression process observer. Fixture roles are compiled
 //! into this executable so tests never spawn Python or PowerShell helpers.
 
-#[path = "../regression.rs"]
-mod regression;
+use codex_harness::regression;
 
 use std::fs;
 use std::io::{self, Read, Write};

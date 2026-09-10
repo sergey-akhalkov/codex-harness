@@ -9,7 +9,7 @@ mod windows {
     use super::*;
     use std::{
         cell::RefCell,
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         marker::PhantomData,
         os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
         rc::Rc,
@@ -117,6 +117,32 @@ mod windows {
         }
     }
 
+    /// Connection and shared dependency owners, acquired without waiting in a
+    /// deterministic order. Aliases of the same legacy mutex are acquired once.
+    /// A failed acquisition drops every earlier guard before returning.
+    pub struct InstallationLocks {
+        locks: Vec<InstallationLock>,
+    }
+
+    impl InstallationLocks {
+        pub fn acquire(user_home: &Path, dependency_user_home: &Path) -> io::Result<Self> {
+            let mut owners = BTreeMap::new();
+            for home in [user_home, dependency_user_home] {
+                owners.insert(name(home)?, home);
+            }
+            let locks = owners
+                .values()
+                .map(|home| InstallationLock::acquire(home))
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok(Self { locks })
+        }
+
+        /// Observation only: recovery must inspect both owners' relevant state.
+        pub fn was_abandoned(&self) -> bool {
+            self.locks.iter().any(InstallationLock::was_abandoned)
+        }
+    }
+
     fn busy() -> io::Error {
         io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -181,11 +207,72 @@ mod windows {
             InstallationLock::acquire(&home).unwrap();
             assert!(!home.exists());
         }
+
+        #[test]
+        fn owner_pair_deduplicates_aliases_and_holds_distinct_owners_in_stable_order() {
+            let root = tempfile::tempdir().unwrap();
+            let connection = root.path().join("Connection Юникод");
+            let alias = std::path::PathBuf::from(connection.to_str().unwrap().to_uppercase());
+            let one = InstallationLocks::acquire(&connection, &alias).unwrap();
+            assert_eq!(one.locks.len(), 1);
+            assert!(!one.was_abandoned());
+            assert_eq!(
+                InstallationLock::acquire(&connection).err().unwrap().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(one);
+            let dependency = root.path().join("Shared dependency");
+            let forward = InstallationLocks::acquire(&connection, &dependency).unwrap();
+            let names: Vec<_> = forward.locks.iter().map(|lock| lock.name.clone()).collect();
+            assert_eq!(names.len(), 2);
+            assert!(names[0] < names[1]);
+            assert_eq!(
+                InstallationLock::acquire(&dependency).err().unwrap().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(forward);
+            let reversed = InstallationLocks::acquire(&dependency, &connection).unwrap();
+            assert_eq!(
+                reversed
+                    .locks
+                    .iter()
+                    .map(|lock| lock.name.clone())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            assert!(!connection.exists());
+            assert!(!dependency.exists());
+        }
+
+        #[test]
+        fn failed_second_owner_releases_the_first_without_releasing_the_foreign_guard() {
+            let root = tempfile::tempdir().unwrap();
+            let mut owners = [root.path().join("a"), root.path().join("b")];
+            owners.sort_by_key(|home| name(home).unwrap());
+            let foreign = InstallationLock::acquire(&owners[1]).unwrap();
+            assert_eq!(
+                InstallationLocks::acquire(&owners[1], &owners[0])
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let released = InstallationLock::acquire(&owners[0]).unwrap();
+            assert_eq!(
+                InstallationLock::acquire(&owners[1]).err().unwrap().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(released);
+            drop(foreign);
+            InstallationLocks::acquire(&owners[0], &owners[1]).unwrap();
+            assert!(!owners[0].exists());
+            assert!(!owners[1].exists());
+        }
     }
 }
 
 #[cfg(windows)]
-pub use windows::InstallationLock;
+pub use windows::{InstallationLock, InstallationLocks};
 
 #[cfg(not(windows))]
 pub struct InstallationLock;

@@ -1,4 +1,4 @@
-//! Fixed initialize/skills/config protocol inside one owned Windows job.
+//! Fixed model-free app-server reads inside one owned Windows job.
 use crate::outcome_run::{create, write_new};
 use harness_core::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
 use serde_json::{Value, json};
@@ -17,6 +17,36 @@ use std::{
 
 const RECORD_LIMIT: usize = 8 * 1024 * 1024;
 const REQUEST_LIMIT: usize = 32 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Protocol {
+    Outcome,
+    Sources,
+    Profile,
+}
+
+impl Protocol {
+    fn response_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Outcome => &["native", "listed", "config"],
+            Self::Sources => &["native", "config", "requirements", "listed"],
+            Self::Profile => &["native", "config"],
+        }
+    }
+}
+
+pub(crate) struct Request<'a> {
+    pub upstream: &'a Path,
+    pub case: &'a Path,
+    pub working_directory: &'a Path,
+    pub home: &'a Path,
+    pub extra: &'a [String],
+    pub root: &'a Path,
+    pub timeout: Duration,
+    pub output_limit: u64,
+    pub protocol: Protocol,
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
@@ -109,9 +139,19 @@ impl Channel {
                 .ok_or_else(|| invalid("native RPC response lacks result"));
         }
     }
-    fn discover(mut self, case: &Path, home: &Path, root: &Path) -> io::Result<Value> {
+    fn discover(
+        mut self,
+        case: &Path,
+        home: &Path,
+        root: &Path,
+        protocol: Protocol,
+    ) -> io::Result<Value> {
         let result = (|| {
-            let native = self.request(1,"initialize",json!({"clientInfo":{"name":"outcome-discovery","version":"1"},"capabilities":{"experimentalApi":true}}))?;
+            let client = match protocol {
+                Protocol::Outcome => "outcome-discovery",
+                _ => "codex-harness-source-check",
+            };
+            let native = self.request(1,"initialize",json!({"clientInfo":{"name":client,"version":"1"},"capabilities":{"experimentalApi":true}}))?;
             write_new(&root.join("initialize.json"), &native)?;
             let observed_home = native["codexHome"]
                 .as_str()
@@ -128,10 +168,27 @@ impl Channel {
                 ));
             }
             self.send(&json!({"method":"initialized"}))?;
-            let listed =
-                self.request(2, "skills/list", json!({"cwds":[case],"forceReload":true}))?;
-            let config = self.request(3, "config/read", json!({"cwd":case}))?;
-            let response = json!({"native":native,"listed":listed,"config":config});
+            let response = match protocol {
+                Protocol::Outcome => {
+                    let listed =
+                        self.request(2, "skills/list", json!({"cwds":[case],"forceReload":true}))?;
+                    let config = self.request(3, "config/read", json!({"cwd":case}))?;
+                    json!({"native":native,"listed":listed,"config":config})
+                }
+                Protocol::Sources => {
+                    let config =
+                        self.request(2, "config/read", json!({"cwd":case,"includeLayers":true}))?;
+                    let requirements = self.request(3, "configRequirements/read", json!({}))?;
+                    let listed =
+                        self.request(4, "skills/list", json!({"cwds":[case],"forceReload":true}))?;
+                    json!({"native":native,"config":config,"requirements":requirements,"listed":listed})
+                }
+                Protocol::Profile => {
+                    let config =
+                        self.request(2, "config/read", json!({"cwd":case,"includeLayers":true}))?;
+                    json!({"native":native,"config":config})
+                }
+            };
             write_new(&root.join("response.json"), &response)?;
             Ok(response)
         })();
@@ -143,16 +200,23 @@ impl Channel {
     }
 }
 
-pub(super) fn exchange(
-    request: &super::Request,
-    case: &Path,
-    home: &Path,
-    extra: &[String],
-    root: &Path,
-    report: &mut Value,
-) -> io::Result<Value> {
-    let upstream = &request.upstream;
-    let (timeout, output_limit) = (request.timeout, request.output_limit);
+pub(crate) fn exchange(request: Request<'_>, report: &mut Value) -> io::Result<Value> {
+    let Request {
+        upstream,
+        case,
+        working_directory,
+        home,
+        extra,
+        root,
+        timeout,
+        output_limit,
+        protocol,
+    } = request;
+    let recorded_seconds = if timeout.subsec_nanos() == 0 {
+        json!(timeout.as_secs())
+    } else {
+        json!(timeout.as_secs_f64())
+    };
     let stdout = root.join("rpc.jsonl");
     let stderr = root.join("stderr.txt");
     let (input, writer) = pipe()?;
@@ -162,7 +226,7 @@ pub(super) fn exchange(
         .map(OsString::from)
         .chain(extra.iter().map(OsString::from))
         .collect();
-    command.current_dir = Some(case.to_owned());
+    command.current_dir = Some(working_directory.to_owned());
     command
         .env
         .insert("CODEX_HOME".into(), Some(home.as_os_str().into()));
@@ -171,11 +235,11 @@ pub(super) fn exchange(
     command.stderr = Some(create(&stderr)?);
     write_new(
         &root.join("request.json"),
-        &json!({"executable":upstream,"arguments":command.args.iter().map(|s|s.to_string_lossy()).collect::<Vec<_>>(),"cwd":case,"codex_home":home,
-        "memory_limit_bytes":512*1024*1024_u64,"timeout_seconds":timeout,"output_limit":output_limit}),
+        &json!({"executable":upstream,"arguments":command.args.iter().map(|s|s.to_string_lossy()).collect::<Vec<_>>(),"cwd":working_directory,"codex_home":home,
+        "memory_limit_bytes":512*1024*1024_u64,"timeout_seconds":recorded_seconds,"output_limit":output_limit}),
     )?;
     let cancellation = Cancellation::default();
-    let deadline = Deadline::after(Duration::from_secs(timeout))?;
+    let deadline = Deadline::after(timeout)?;
     let channel = Channel {
         input: writer,
         output: BufReader::new(File::open(&stdout)?),
@@ -203,7 +267,7 @@ pub(super) fn exchange(
         let case = case.to_owned();
         let home = home.to_owned();
         let root = root.to_owned();
-        std::thread::spawn(move || channel.discover(&case, &home, &root))
+        std::thread::spawn(move || channel.discover(&case, &home, &root, protocol))
     };
     let stop = Arc::new(AtomicBool::new(false));
     let over_limit = Arc::new(AtomicBool::new(false));
@@ -227,14 +291,14 @@ pub(super) fn exchange(
     stop.store(true, Ordering::Relaxed);
     cancellation.cancel();
     let _ = monitor.join();
-    let protocol = worker.join().map_err(|_| invalid("RPC worker panicked"));
+    let protocol_result = worker.join().map_err(|_| invalid("RPC worker panicked"));
     let outcome = outcome?;
     let output_exceeded =
         over_limit.load(Ordering::Relaxed) || exceeded(&[stdout, stderr], output_limit);
     let receipt = json!({"outcome":outcome,"assigned_before_resume":true,"process_id":identity.pid,"output_limit_reached":output_exceeded});
     write_new(&root.join("process.json"), &receipt)?;
     report["process"] = receipt;
-    let response = protocol??;
+    let response = protocol_result??;
     if output_exceeded {
         return Err(invalid("native discovery output limit"));
     }
@@ -243,17 +307,23 @@ pub(super) fn exchange(
             "native discovery process did not exit successfully",
         ));
     }
-    verify_complete_transcript(&root.join("rpc.jsonl"), &response, output_limit)?;
+    verify_complete_transcript(&root.join("rpc.jsonl"), &response, output_limit, protocol)?;
     Ok(response)
 }
 
 /// The last wanted reply may already be buffered when a contradictory response
 /// or unsupported server request follows it. Inspect the complete retained
 /// stream after owned shutdown, including records after config/read.
-fn verify_complete_transcript(path: &Path, response: &Value, limit: u64) -> io::Result<()> {
+fn verify_complete_transcript(
+    path: &Path,
+    response: &Value,
+    limit: u64,
+    protocol: Protocol,
+) -> io::Result<()> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut total = 0_u64;
     let mut seen = 0_usize;
+    let keys = protocol.response_keys();
     loop {
         let mut bytes = Vec::new();
         let count = Read::by_ref(&mut reader)
@@ -276,11 +346,11 @@ fn verify_complete_transcript(path: &Path, response: &Value, limit: u64) -> io::
         {
             continue;
         }
-        if seen >= 3
+        if seen >= keys.len()
             || row["id"] != (seen as u64 + 1)
             || row.get("method").is_some()
             || row.get("error").is_some()
-            || row.get("result") != Some(&response[["native", "listed", "config"][seen]])
+            || row.get("result") != Some(&response[keys[seen]])
         {
             return Err(invalid(
                 "contradictory or unexpected completed RPC response",
@@ -288,7 +358,7 @@ fn verify_complete_transcript(path: &Path, response: &Value, limit: u64) -> io::
         }
         seen += 1;
     }
-    if seen != 3 {
+    if seen != keys.len() {
         return Err(invalid("incomplete completed RPC transcript"));
     }
     Ok(())

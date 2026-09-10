@@ -100,6 +100,12 @@ impl Fixture {
         )
         .unwrap();
     }
+    fn register_immutable(&self) {
+        fs::write(self.home.join("harness/native-launch.json"),serde_json::to_vec(&json!({
+            "schema":2,"build":self.launcher.parent().unwrap(),
+            "upstream":{"executable":self.upstream,"sha256":build_identity::hash_file(&self.upstream).unwrap(),"package":null}
+        })).unwrap()).unwrap();
+    }
     fn command(&self) -> Command {
         let mut c = Command::new(&self.launcher);
         c.current_dir(self.root.path())
@@ -118,6 +124,169 @@ impl Fixture {
             .insert("HARNESS_LAUNCH_FIXTURE_MODE".into(), Some(mode.into()));
         ConsoleSession::spawn(ConsoleSpec::new(c)).unwrap()
     }
+}
+
+#[test]
+fn immutable_registration_is_independent_of_build_tool_selection_and_rejects_ambiguous_binding() {
+    let fixture = Fixture::new();
+    fixture.register_immutable();
+    let original = fs::read(fixture.home.join("harness/native-launch.json")).unwrap();
+    let other = fixture.state.join("builds/other");
+    fs::create_dir(&other).unwrap();
+    for entry in fs::read_dir(fixture.launcher.parent().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), other.join(entry.file_name())).unwrap();
+    }
+    build_selection::activate(&fixture.state, &other).unwrap();
+    let accepted = fixture.command().stdin(Stdio::null()).output().unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert_eq!(
+        fs::read(fixture.home.join("harness/native-launch.json")).unwrap(),
+        original
+    );
+    let mut ambiguous: Value = serde_json::from_slice(&original).unwrap();
+    ambiguous["state"] = json!(fixture.state);
+    fs::write(
+        fixture.home.join("harness/native-launch.json"),
+        serde_json::to_vec(&ambiguous).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !fixture
+            .command()
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    ambiguous.as_object_mut().unwrap().remove("state");
+    ambiguous["build"] = json!(other);
+    fs::write(
+        fixture.home.join("harness/native-launch.json"),
+        serde_json::to_vec(&ambiguous).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !fixture
+            .command()
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::write(fixture.home.join("harness/native-launch.json"), original).unwrap();
+    fs::write(
+        fixture.source.join("crates/one/src/lib.rs"),
+        "changed source",
+    )
+    .unwrap();
+    let stale = fixture.command().stdin(Stdio::null()).output().unwrap();
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("registered native build is stale"));
+}
+
+#[test]
+fn core_check_cli_refuses_missing_legacy_and_pending_without_creating_or_rewriting_state() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("uninstalled-home");
+    let user = root.path().join("user");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .args(["check", "--core-only", "--codex-home"])
+            .arg(&home)
+            .arg("--user-home")
+            .arg(&user)
+            .current_dir(root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let missing = run();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not connected"));
+    assert!(!home.exists());
+    assert!(!user.exists());
+    fs::create_dir_all(home.join("harness")).unwrap();
+    let metadata = home.join("harness/installation.json");
+    let legacy = br#"{"schemaVersion":1}"#;
+    fs::write(&metadata, legacy).unwrap();
+    let old = run();
+    assert!(!old.status.success());
+    assert!(String::from_utf8_lossy(&old.stderr).contains("legacy"));
+    assert_eq!(fs::read(&metadata).unwrap(), legacy);
+    let pending = home.join("harness/pending.json");
+    fs::write(&pending, b"PRIVATE_PENDING_SENTINEL").unwrap();
+    let blocked = run();
+    assert!(!blocked.status.success());
+    let error = String::from_utf8_lossy(&blocked.stderr);
+    assert!(error.contains("pending"));
+    assert!(!error.contains("PRIVATE_PENDING_SENTINEL"));
+    assert_eq!(fs::read(&pending).unwrap(), b"PRIVATE_PENDING_SENTINEL");
+    assert_eq!(fs::read(&metadata).unwrap(), legacy);
+    assert!(!user.exists());
+}
+
+#[test]
+fn installed_manager_link_enforces_integrity_and_allows_source_stale_recovery() {
+    use std::os::windows::fs::symlink_file;
+    let fixture = Fixture::new();
+    let build = fixture.launcher.parent().unwrap();
+    let manager = build.join("codex-harness.exe");
+    fs::copy(env!("CARGO_BIN_EXE_codex-harness"), &manager).unwrap();
+    let mut record = build_identity::read_record(build).unwrap();
+    record.binaries.insert(
+        "codex-harness.exe".into(),
+        build_identity::hash_file(&manager).unwrap(),
+    );
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let bin = fixture.home.join("harness/bin");
+    fs::create_dir(&bin).unwrap();
+    let link = bin.join("codex-harness.exe");
+    symlink_file(&manager, &link).unwrap();
+    let target = fixture.root.path().join("uninstalled-home");
+    let user = fixture.root.path().join("uninstalled-user");
+    let run = |command: &Path| {
+        Command::new(command)
+            .args(["recover", "--core-only", "--codex-home"])
+            .arg(&target)
+            .arg("--user-home")
+            .arg(&user)
+            .current_dir(fixture.root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&link).status.success());
+    fs::write(
+        fixture.source.join("crates/one/src/lib.rs"),
+        b"source changed",
+    )
+    .unwrap();
+    assert!(run(&link).status.success());
+    let unrecorded = build.join("unrecorded-manager.exe");
+    fs::copy(&manager, &unrecorded).unwrap();
+    assert!(!run(&unrecorded).status.success());
+    fs::write(build.join("harness-observe.exe"), b"altered artifact").unwrap();
+    assert!(run(&link).status.success());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&manager)
+        .unwrap()
+        .write_all(b"altered manager overlay")
+        .unwrap();
+    assert!(!run(&link).status.success());
+    assert!(!target.exists());
+    assert!(!user.exists());
 }
 
 #[test]

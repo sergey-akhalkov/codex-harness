@@ -138,3 +138,44 @@ fn actual_inventory_entrypoint_refuses_concurrent_installation_before_reading_so
     assert!(!String::from_utf8_lossy(&free.stderr).contains("another harness operation is active"));
     assert!(free.stdout.is_empty());
 }
+
+#[test]
+fn actual_inspection_serializes_a_distinct_shared_dependency_owner() {
+    let root = root();
+    let connection = root.join("Independent connection");
+    let dependency = root.join("User Юникод");
+    let codex_home = root.join("Uncreated codex home");
+    let mut child = fixture(&root);
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .args(["inspect-installation", "--codex-home"])
+            .arg(&codex_home)
+            .arg("--user-home")
+            .arg(&connection)
+            .arg("--dependency-user-home")
+            .arg(&dependency)
+            .current_dir(&root)
+            .output()
+            .unwrap()
+    };
+    let blocked = invoke();
+    assert_eq!(blocked.status.code(), Some(2));
+    assert!(blocked.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("another harness operation is active")
+    );
+    assert!(!connection.exists());
+    assert!(!codex_home.exists());
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let free = invoke();
+    assert!(
+        free.status.success(),
+        "{}",
+        String::from_utf8_lossy(&free.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&free.stdout).trim(), "null");
+    assert!(!connection.exists());
+    assert!(!dependency.exists());
+    assert!(!codex_home.exists());
+}

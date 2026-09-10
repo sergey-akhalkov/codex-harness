@@ -525,11 +525,36 @@ fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules
     let source = root.join("source");
     let state = root.join("state");
     fixture(&source);
+    // Exercise the real manager and its current dependencies, while retaining
+    // the fixture's inert auxiliary binaries and deliberate four/five split.
+    let manager = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for entry in fs::read_dir(manager.join("src")).unwrap() {
+        let entry = entry.unwrap();
+        assert!(!entry.file_type().unwrap().is_symlink());
+        if entry.file_name() != "bin" {
+            let destination = source.join("crates/manager/src").join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_source_tree(&entry.path(), &destination);
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
+    }
     fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
-        source.join("crates/manager/src/main.rs"),
+        manager.join("Cargo.toml"),
+        source.join("crates/manager/Cargo.toml"),
     )
     .unwrap();
+    let lock = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&source)
+        .output()
+        .unwrap();
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
     let identity_path = source.join("crates/harness-core/src/build_identity.rs");
     let current_identity = fs::read_to_string(&identity_path).unwrap();
     assert!(current_identity.contains("    \"harness-observe.exe\",\n"));

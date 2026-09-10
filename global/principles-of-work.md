@@ -2,6 +2,12 @@
 
 Deliver the complete agreed result in the target project. Quality, especially preventing P0/P1 incidents and bugs, defines acceptance. Optimize the time to that verified result, including necessary validation and corrections.
 
+## Language and shell defaults
+
+- In every project, always use Rust as the default programming language for new code and implementations. This is the user's deliberate preference for resource and energy efficiency, motivated by caring for the environment.
+- For shell work in every project, use PowerShell by default for commands, scripts, automation and shell examples. This reflects the user's preference for its convenience and capabilities, especially on Windows. Use PowerShell syntax and select PowerShell explicitly when the execution tool requires a shell choice.
+- Apply these defaults to the main agent and delegated work across all projects. Use another language or shell only when explicitly requested by the user or required by a concrete task, integration or platform constraint; explain such constraints. A default does not authorize unrelated rewrites or migration of existing projects.
+
 ## Mandatory skill use
 
 - Before choosing a workflow, check available skill names and descriptions against the actual task and context; reconsider when the task changes. If a skill matches the task and its invocation conditions, you MUST read its `SKILL.md` and use the applicable workflow. Familiarity with the task, having ordinary tools, or expecting a quick result does not justify skipping it.

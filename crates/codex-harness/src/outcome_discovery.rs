@@ -1,7 +1,6 @@
 //! Fixed, model-free native app-server observation for outcome comparisons.
 #[cfg(windows)]
-#[path = "outcome_discovery_rpc.rs"]
-mod rpc;
+use crate::native_read_rpc as rpc;
 
 use crate::outcome_run::{bounded_read, config_arguments, isolated, repository, write_new};
 use harness_core::{
@@ -221,7 +220,20 @@ fn observe(request: &Request, root: &Path, report: &mut Value) -> io::Result<()>
     )?;
     report["upstream_sha256"] = json!(upstream_hash);
     report["phase"] = json!("protocol");
-    let response = rpc::exchange(request, &case, &home, &args, root, report)?;
+    let response = rpc::exchange(
+        rpc::Request {
+            upstream: &request.upstream,
+            case: &case,
+            working_directory: &case,
+            home: &home,
+            extra: &args,
+            root,
+            timeout: std::time::Duration::from_secs(request.timeout),
+            output_limit: request.output_limit,
+            protocol: rpc::Protocol::Outcome,
+        },
+        report,
+    )?;
     report["phase"] = json!("response");
     let rows = response["listed"]["data"]
         .as_array()

@@ -70,8 +70,21 @@ pub struct ExclusiveFileLock {
 
 impl ExclusiveFileLock {
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        Self::acquire_file(path, true)
+    }
+
+    /// Locks an existing object without creating or writing a file.
+    pub(crate) fn try_acquire_existing(path: &Path) -> io::Result<Option<Self>> {
+        Self::acquire_file(path, false)
+    }
+
+    fn acquire_file(path: &Path, create: bool) -> io::Result<Option<Self>> {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(create)
+            .create(create)
+            .truncate(false);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;

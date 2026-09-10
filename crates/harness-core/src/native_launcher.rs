@@ -23,7 +23,10 @@ const MANAGERS: &[&str] = &[
 #[serde(deny_unknown_fields)]
 pub struct Registration {
     pub schema: u32,
-    pub state: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<PathBuf>,
     pub upstream: Upstream,
 }
 
@@ -87,10 +90,22 @@ pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<
     }
     let registration: Registration = serde_json::from_slice(&bytes)
         .map_err(|_| fail("invalid native launch registration; explicit repair is required"))?;
-    if registration.schema != 1 || !registration.state.is_absolute() {
-        return Err(fail("unsupported native launch registration"));
-    }
-    let selected = build_selection::selected(&registration.state)?;
+    let selected = match (registration.schema, registration.state, registration.build) {
+        (1, Some(state), None) if state.is_absolute() => build_selection::selected(&state)?,
+        (2, None, Some(build)) if build.is_absolute() => {
+            // Installation selects this immutable artifact in the same link
+            // journal as its launch registration. Later build-tool selections
+            // cannot silently move the installed runtime to another artifact.
+            let check = build_identity::check(&build, None);
+            if !check.runtime_allowed {
+                return Err(fail(
+                    "registered native build is stale, missing or altered; explicit update required",
+                ));
+            }
+            build.canonicalize()?
+        }
+        _ => return Err(fail("unsupported native launch registration")),
+    };
     let executable = executable.canonicalize()?;
     if selected.join("codex.exe").canonicalize()? != executable {
         return Err(fail("this launcher is not the selected native build"));

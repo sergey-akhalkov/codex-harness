@@ -30,7 +30,7 @@ pub struct Manifest {
     pub token_hooks: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Connection {
     Missing,
@@ -38,7 +38,7 @@ pub enum Connection {
     Conflict,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Link {
     pub kind: String,
     pub name: String,

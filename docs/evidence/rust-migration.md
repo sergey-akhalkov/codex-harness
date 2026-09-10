@@ -6,10 +6,48 @@ unimplemented lifecycle or foreign-integration requirements.
 
 ## Selected inputs and ownership
 
+The [focused native source report and diagnostic alias](rust-source-diagnostics.md)
+complete task 4.5's implementation and owned-consumer acceptance, including the
+legacy diagnostic registration upgrade and original CLI observations. The full
+installation and global activation in section 9 remain unfinished.
+
+[Native dependency discovery and release planning](rust-dependency-discovery.md)
+complete task 5.1's port and actual CLI acceptance for the six selected
+dependencies. Plans preserve uncertain/modified shared installations and retain
+the project Rust toolchain. [Audited staging](rust-dependency-archives.md) and
+[retained candidate validation/selection/rollback](rust-dependency-selection.md)
+now pass their bounded native acceptance. Complete provisioning, registration,
+the remaining task 5.2 lifecycle and global activation remain unfinished.
+
+The [native CBM runtime increment](rust-cbm-runtime.md) has focused fixture
+evidence for configuration inspection, account admission and bounded indexing.
+Actual owned indexing and isolated catalogue retrieval pass. The [native stdio
+increment](rust-mcp-stdio.md) exercises protocol, queue/cancellation and actual
+Windows pipes; query integration and the complete installed runtime remain open.
+
+[Empty Python environment preparation](rust-python-staging.md) now has an
+explicit native CLI consumer. Complete runtime/wheel provenance and provisioning
+remain unfinished; the candidate is not eligible for activation.
+
+The [Serena external-interface investigation](rust-serena-boundary.md) establishes
+a configuration-isolation path and reproduces the current HTTP listener/session
+limitations. Native per-client prompt sessions share the active project and the
+shipped listener accepts unauthenticated initialization. Task 3.2 stays open
+pending a verified private session boundary and actual semantic/no-acquisition
+acceptance; the installed Python adapter is preserved.
+
 The [native PATH primitive and atomic receipts](rust-environment-path.md) have
 owned-key publication, rollback/conflict and killed-process evidence, including
-one KTM transaction for the registry write and confirming file. Installer
-journal orchestration and global activation remain open.
+one KTM transaction for the registry write and confirming file. The
+[native core connection](rust-core-installation.md) now integrates PATH with
+schema-11 registration intent, Process/User scope, metadata retirement and actual CLI acceptance. Full lifecycle/component
+orchestration and global activation remain open.
+
+[Installation ownership](rust-installation-metadata.md#missing-owned-destination-repair)
+now supports guarded repair of absent owned links with new identities, while
+preserving foreign replacements and omitted ownership records. The actual native
+inspection consumer also [serializes both connection and dependency owners](rust-installation-lock.md#separate-connection-and-dependency-owners).
+These are accepted lifecycle prerequisites; the complete installer remains unfinished.
 
 The [native outcome report](rust-outcome-report.md) now preserves attempts,
 verification/retry timing and comparison exclusions through an explicit local
@@ -20,7 +58,11 @@ evidence. [Native discovery](rust-outcome-discovery.md) now verifies the selecte
 home, skill/config responses and unchanged inputs through installed CLI 0.153.4.
 [Arm preparation](rust-outcome-arm.md) now consumes schema 1/2 installation link
 checks and exact configuration publication, verified against both native modes.
-Task 7.3 still requires suite/oracle migration and the remaining integrations.
+[Controlled case preparation](rust-outcome-cases.md) now creates fresh Rust
+targets and instructions for the five local cases without running models.
+[Controlled oracles](rust-outcome-oracle.md) now verify those five cases through
+real native targets and separate process evidence. Task 7.3 still requires the
+external consumer cases, full suite migration and remaining integrations.
 
 The input receipt at
 `%LOCALAPPDATA%/codex-harness-evidence/rust-inputs-62dc5d72165947b88d7e400181e180fa/inputs.json`
@@ -222,10 +264,11 @@ immediate reconnection checks. [Existing-link replacement/removal](rust-link-cha
 then adds original-object rollback, including interrupted publication and an
 unavailable old checkout. [Finish](rust-registration-finish.md) adds
 irreversible commitment and restartable cleanup with an explicit old-reader
-version boundary. The current [schema 8 metadata builder](rust-registration-metadata.md)
+version boundary. The [metadata builder introduced in schema 8](rust-registration-metadata.md)
 also persists reused IDs and feeds the [stable ownership document](rust-installation-metadata.md),
-including a verified isolated legacy conversion. Complete installer orchestration
-and PATH journal integration remain open.
+including a verified isolated legacy conversion. The [native core consumer](rust-core-installation.md)
+now integrates PATH and metadata retirement in schema-10 intent and checks actual CLI startup; complete
+installer/component orchestration and global activation remain open.
 
 The combined checkpoint after the launcher/inventory increments passed
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --offline

@@ -26,6 +26,11 @@ const TRANSACTION_TIMEOUT_MS: u32 = 5000;
 #[path = "environment_path_receipt.rs"]
 pub(crate) mod receipt;
 
+#[cfg(test)]
+pub(crate) fn with_test_registry<T>(run: impl FnOnce() -> T) -> T {
+    tests::with_registration_registry(run)
+}
+
 #[link(name = "ntdll")]
 unsafe extern "system" {
     fn NtQueryKey(
@@ -137,6 +142,10 @@ impl UserPathSnapshot {
         Self::read_at(ENVIRONMENT)
     }
 
+    pub(crate) fn for_registration() -> io::Result<Self> {
+        Self::read_at(&receipt::registration_subkey())
+    }
+
     fn read_at(subkey: &str) -> io::Result<Self> {
         let value = match Key::open(subkey, None, false)? {
             Some(key) => key.read()?,
@@ -150,6 +159,42 @@ impl UserPathSnapshot {
     /// Returns stored text, without expanding REG_EXPAND_SZ variables.
     pub fn text(&self) -> io::Result<Option<String>> {
         self.value.as_ref().map(Value::text).transpose()
+    }
+
+    /// Legacy Environment.GetEnvironmentVariable(User) expanded REG_EXPAND_SZ;
+    /// SetEnvironmentVariable(User) wrote REG_SZ. Its journal retained only the
+    /// resulting strings, not the original registry type or unexpanded bytes.
+    pub(crate) fn legacy_restore(
+        &self,
+        before: &Option<String>,
+        after: &Option<String>,
+    ) -> io::Result<UserPathChange> {
+        let current = self
+            .value
+            .as_ref()
+            .map(|value| {
+                let text = value.text()?;
+                if value.kind == REG_EXPAND_SZ {
+                    expand_legacy(&text)
+                } else {
+                    Ok(text)
+                }
+            })
+            .transpose()?;
+        let next = if &current == before {
+            self.value.clone()
+        } else if &current == after {
+            before
+                .as_ref()
+                .map(|text| Value::from_text(REG_SZ, text))
+                .transpose()?
+        } else {
+            return Err(invalid("legacy user PATH changed; preserving it"));
+        };
+        Ok(UserPathChange {
+            before: self.value.clone(),
+            after: next,
+        })
     }
 
     pub fn prepend(&self, bin: &Path) -> io::Result<(UserPathChange, bool)> {
@@ -197,9 +242,26 @@ impl UserPathSnapshot {
     }
 }
 
+fn expand_legacy(value: &str) -> io::Result<String> {
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let input = wide(value);
+    let mut output = vec![0_u16; MAX_BYTES / 2];
+    let written = unsafe {
+        ExpandEnvironmentStringsW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32)
+    };
+    if written == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written as usize > output.len() {
+        return Err(invalid("expanded legacy PATH exceeds its bound"));
+    }
+    String::from_utf16(&output[..written as usize - 1])
+        .map_err(|_| invalid("expanded legacy PATH is not valid Unicode"))
+}
+
 /// Serializable private values for future installer intent, validated on use.
 /// Equality proves exact type/bytes, not the identity or history of a writer.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserPathChange {
     before: Option<Value>,
@@ -207,12 +269,33 @@ pub struct UserPathChange {
 }
 
 impl UserPathChange {
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        for value in [&self.before, &self.after].into_iter().flatten() {
+            value.text()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_published(&self) -> io::Result<()> {
+        self.validate()?;
+        if UserPathSnapshot::read_at(&receipt::registration_subkey())?.value != self.after {
+            return Err(invalid(
+                "PATH changed after registration; preserving recovery state",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn is_noop(&self) -> bool {
         self.before == self.after
     }
 
     pub fn publish(&self) -> io::Result<bool> {
         self.exchange(ENVIRONMENT, false, || Ok(()))
+    }
+
+    pub(crate) fn publish_legacy(&self) -> io::Result<bool> {
+        self.exchange(&receipt::registration_subkey(), false, || Ok(()))
     }
 
     pub fn rollback(&self) -> io::Result<bool> {
@@ -309,6 +392,12 @@ impl UserPathChange {
         // causes commit to fail. There is no nontransactional write fallback.
         drop(key);
         Ok(changed)
+    }
+}
+
+impl std::fmt::Debug for UserPathChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserPathChange").finish_non_exhaustive()
     }
 }
 
@@ -545,6 +634,413 @@ mod tests {
     struct Fixture {
         subkey: String,
         logs: PathBuf,
+    }
+
+    struct RegistrationKey;
+
+    #[test]
+    fn legacy_path_expands_registry_reads_preserves_already_restored_bytes_and_refuses_foreign_edits()
+     {
+        let fixture = Fixture::new();
+        let _key = RegistrationKey::set(&fixture);
+        let raw = value(REG_EXPAND_SZ, "%SystemRoot%\\legacy-test");
+        fixture.raw(Some(&raw)).unwrap();
+        let expanded = Some(format!(
+            "{}\\legacy-test",
+            std::env::var("SystemRoot").unwrap()
+        ));
+        let restored = Some("C:\\restored;%literal%;C:\\проба".to_string());
+        let change = fixture
+            .snapshot()
+            .legacy_restore(&expanded, &Some("other".into()))
+            .unwrap();
+        assert!(change.is_noop());
+        assert!(!change.publish_legacy().unwrap());
+        assert!(fixture.snapshot().value == Some(raw));
+        let change = fixture
+            .snapshot()
+            .legacy_restore(&restored, &expanded)
+            .unwrap();
+        assert!(change.publish_legacy().unwrap());
+        assert!(fixture.snapshot().value == Some(value(REG_SZ, restored.as_deref().unwrap())));
+        let stale = fixture.snapshot().legacy_restore(&None, &restored).unwrap();
+        let foreign = value(REG_SZ, "C:\\foreign");
+        fixture.raw(Some(&foreign)).unwrap();
+        assert!(stale.publish_legacy().is_err());
+        assert!(fixture.snapshot().legacy_restore(&None, &restored).is_err());
+        assert!(fixture.snapshot().value == Some(foreign));
+        for desired in [None, Some(String::new()), Some("C:\\restored".into())] {
+            let before = fixture.snapshot();
+            let plan = before
+                .legacy_restore(&desired, &before.text().unwrap())
+                .unwrap();
+            plan.publish_legacy().unwrap();
+            assert!(fixture.snapshot().text().unwrap() == desired);
+        }
+    }
+    pub(super) fn with_registration_registry<T>(run: impl FnOnce() -> T) -> T {
+        let fixture = Fixture::new();
+        fixture
+            .raw(Some(&value(REG_SZ, "C:\\owned-test-original")))
+            .unwrap();
+        let _key = RegistrationKey::set(&fixture);
+        run()
+    }
+    impl RegistrationKey {
+        fn set(fixture: &Fixture) -> Self {
+            receipt::REGISTRATION_TEST_KEY.with(|key| {
+                assert!(key.borrow().is_none());
+                *key.borrow_mut() = Some(fixture.subkey.clone());
+            });
+            Self
+        }
+    }
+    impl Drop for RegistrationKey {
+        fn drop(&mut self) {
+            receipt::REGISTRATION_TEST_KEY.with(|key| *key.borrow_mut() = None);
+        }
+    }
+
+    fn registration_case(
+        fixture: &Fixture,
+        verify: impl FnOnce() -> io::Result<()>,
+    ) -> (
+        crate::registration::Registration,
+        io::Result<crate::registration::ApplyReport>,
+    ) {
+        use crate::{
+            inventory::{Connection, Link},
+            registration::{Registration, metadata::MetadataDestination},
+        };
+        let reg = Registration::open(&fixture.logs.join("registration")).unwrap();
+        fs::write(fixture.logs.join("source.md"), b"source").unwrap();
+        let links = [Link {
+            kind: "instructions".into(),
+            name: "AGENTS".into(),
+            source: fixture.logs.join("source.md"),
+            destination: fixture.logs.join("home/AGENTS.md"),
+            connection: Connection::Missing,
+        }];
+        let result = reg.apply_installation(
+            &links,
+            &[],
+            &[],
+            &[],
+            MetadataDestination::absent(&fixture.logs.join("home/installation.json")).unwrap(),
+            |_| Ok(b"accepted metadata".to_vec()),
+            Some(fixture.change().into()),
+            verify,
+        );
+        (reg, result)
+    }
+
+    #[test]
+    fn registration_activation_runtime_failure_recovers_path_links_and_metadata() {
+        let fixture = Fixture::new();
+        let initial = value(REG_SZ, "C:\\original");
+        fixture.raw(Some(&initial)).unwrap();
+        let _key = RegistrationKey::set(&fixture);
+        let (reg, result) = registration_case(&fixture, || {
+            assert!(fixture.snapshot().value != Some(initial.clone()));
+            assert_eq!(fs::read(fixture.logs.join("home/AGENTS.md"))?, b"source");
+            Err(io::Error::other("owned runtime rejection"))
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("owned runtime rejection")
+        );
+        assert!(!reg.state().join("complete.json").exists());
+        reg.recover().unwrap();
+        assert!(fixture.snapshot().value == Some(initial));
+        assert!(!fixture.logs.join("home/AGENTS.md").exists());
+        assert!(!fixture.logs.join("home/installation.json").exists());
+        assert!(!reg.journal_path().exists());
+        assert_eq!(fs::read(fixture.logs.join("source.md")).unwrap(), b"source");
+    }
+
+    #[test]
+    fn disconnection_path_and_metadata_retirement_share_recovery_outcome() {
+        use crate::{config_file::ConfigSnapshot, registration::LinkChange};
+        for phase in ["partial", "completed", "decision", "backup", "foreign-path"] {
+            let fixture = Fixture::new();
+            let initial = value(REG_EXPAND_SZ, "%SystemRoot%\\system32;C:\\foreign-bin");
+            fixture.raw(Some(&initial)).unwrap();
+            let _key = RegistrationKey::set(&fixture);
+            let (reg, result) = registration_case(&fixture, || Ok(()));
+            result.unwrap();
+            let metadata = fixture.logs.join("home/installation.json");
+            let link = fixture.logs.join("home/AGENTS.md");
+            reg.finish(&metadata).unwrap();
+            let installed_path = fixture.snapshot().value;
+            let baseline = ConfigSnapshot::read(&metadata).unwrap();
+            let change = fixture
+                .snapshot()
+                .remove(Path::new("C:\\harness-owned-test\\bin"), true)
+                .unwrap();
+            let applied = reg.apply_disconnection(
+                &[LinkChange::remove(&link, &fixture.logs.join("source.md")).unwrap()],
+                &baseline,
+                |_| Ok(baseline.contents().to_vec()),
+                Some(change.into()),
+                || {
+                    if phase == "partial" {
+                        Err(io::Error::other("owned validation stop"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(applied.is_ok(), phase != "partial");
+            assert!(fixture.snapshot().value == Some(initial.clone()));
+            if ["decision", "backup"].contains(&phase) {
+                assert!(
+                    reg.test_finish(&metadata, |at, index| if at == phase && index == 0 {
+                        Err(io::Error::other("owned cleanup stop"))
+                    } else {
+                        Ok(())
+                    })
+                    .is_err()
+                );
+            }
+            if phase == "foreign-path" {
+                let foreign = value(REG_SZ, "C:\\concurrent-foreign");
+                fixture.raw(Some(&foreign)).unwrap();
+                let journal = fs::read(reg.journal_path()).unwrap();
+                assert!(reg.recover_installation(&metadata).is_err());
+                assert!(fixture.snapshot().value == Some(foreign));
+                assert_eq!(fs::read(reg.journal_path()).unwrap(), journal);
+                assert_eq!(fs::read(&metadata).unwrap(), baseline.contents());
+                fixture.raw(Some(&initial)).unwrap();
+            }
+            let report = reg.recover_installation(&metadata).unwrap();
+            if phase == "partial" {
+                assert!(!report.committed);
+                assert!(fixture.snapshot().value == installed_path);
+                assert!(link.is_symlink());
+                assert_eq!(fs::read(&metadata).unwrap(), baseline.contents());
+            } else {
+                assert!(report.committed);
+                assert!(fixture.snapshot().value == Some(initial));
+                assert!(fs::symlink_metadata(&link).is_err());
+                assert!(!metadata.exists());
+            }
+            assert!(!reg.journal_path().exists());
+            assert_eq!(fs::read(fixture.logs.join("source.md")).unwrap(), b"source");
+        }
+    }
+
+    #[test]
+    fn registration_activation_commit_keeps_path_and_allows_next_operation() {
+        use crate::{
+            config_file::ConfigSnapshot,
+            inventory::{Connection, Link},
+            registration::metadata::MetadataDestination,
+        };
+        let fixture = Fixture::new();
+        fixture
+            .raw(Some(&value(REG_EXPAND_SZ, "%SystemRoot%\\system32")))
+            .unwrap();
+        let _key = RegistrationKey::set(&fixture);
+        let (reg, result) = registration_case(&fixture, || Ok(()));
+        result.unwrap();
+        let accepted = fixture.snapshot().value;
+        let metadata = fixture.logs.join("home/installation.json");
+        reg.finish(&metadata).unwrap();
+        assert!(fixture.snapshot().value == accepted);
+        assert!(!reg.journal_path().exists());
+        let baseline = ConfigSnapshot::read(&metadata).unwrap();
+        let link = Link {
+            kind: "instructions".into(),
+            name: "AGENTS".into(),
+            source: fixture.logs.join("source.md"),
+            destination: fixture.logs.join("home/AGENTS.md"),
+            connection: Connection::Linked,
+        };
+        reg.apply_installation(
+            &[link],
+            &[],
+            &[],
+            &[],
+            MetadataDestination::existing(&baseline).unwrap(),
+            |_| Ok(b"updated metadata".to_vec()),
+            Some(fixture.change().into()),
+            || Ok(()),
+        )
+        .unwrap();
+        reg.finish(&metadata).unwrap();
+        assert!(fixture.snapshot().value == accepted);
+        assert_eq!(fs::read(metadata).unwrap(), b"updated metadata");
+    }
+
+    #[test]
+    fn registration_activation_foreign_path_preserves_all_recovery_state() {
+        let fixture = Fixture::new();
+        fixture.raw(Some(&value(REG_SZ, "C:\\original"))).unwrap();
+        let expected = fixture.change().after;
+        let foreign = value(REG_SZ, "C:\\foreign");
+        let _key = RegistrationKey::set(&fixture);
+        let (reg, result) = registration_case(&fixture, || {
+            fixture.raw(Some(&foreign))?;
+            Err(io::Error::other("owned runtime rejection"))
+        });
+        assert!(result.is_err());
+        let bytes = fs::read(reg.journal_path()).unwrap();
+        assert!(reg.recover().is_err());
+        assert!(fixture.snapshot().value == Some(foreign));
+        assert_eq!(fs::read(reg.journal_path()).unwrap(), bytes);
+        assert!(fixture.logs.join("home/AGENTS.md").is_file());
+        assert!(fixture.logs.join("home/installation.json").is_file());
+        fixture.raw(expected.as_ref()).unwrap();
+        reg.recover().unwrap();
+    }
+
+    #[test]
+    fn registration_activation_success_is_rechecked_after_runtime_and_before_commit() {
+        let fixture = Fixture::new();
+        fixture.raw(Some(&value(REG_SZ, "C:\\original"))).unwrap();
+        let _key = RegistrationKey::set(&fixture);
+        let (reg, result) = registration_case(&fixture, || Ok(()));
+        result.unwrap();
+        let accepted = fixture.snapshot().value;
+        fixture.raw(Some(&value(REG_SZ, "C:\\foreign"))).unwrap();
+        assert!(
+            reg.finish(&fixture.logs.join("home/installation.json"))
+                .is_err()
+        );
+        assert!(reg.journal_path().is_file());
+        assert!(!reg.state().join("commit.json").exists());
+        fixture.raw(accepted.as_ref()).unwrap();
+        reg.finish(&fixture.logs.join("home/installation.json"))
+            .unwrap();
+    }
+
+    #[test]
+    fn registration_activation_receipt_and_commit_hold_the_same_journal_object() {
+        let fixture = Fixture::new();
+        fixture.raw(Some(&value(REG_SZ, "C:\\original"))).unwrap();
+        let _key = RegistrationKey::set(&fixture);
+        let (reg, result) = registration_case(&fixture, || Ok(()));
+        result.unwrap();
+        let bytes = fs::read(reg.journal_path()).unwrap();
+        let away = fixture.logs.join("original-journal-away");
+        let mut attempted = false;
+        let mut replaced = false;
+        reg.test_finish(&fixture.logs.join("home/installation.json"), |phase, _| {
+            if phase == "path-validated" {
+                attempted = true;
+                if fs::rename(reg.journal_path(), &away).is_ok() {
+                    fs::write(reg.journal_path(), &bytes)?;
+                    replaced = true;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(attempted);
+        assert!(
+            !replaced,
+            "finish adopted a foreign identical-byte journal after receipt validation"
+        );
+        assert!(!away.exists());
+        assert!(!reg.journal_path().exists());
+        assert!(fixture.logs.join("home/installation.json").is_file());
+    }
+
+    #[test]
+    #[ignore = "exact owned child of killed_registration_activation_recovers_from_durable_phase"]
+    fn registration_activation_process_fixture() {
+        let subkey = std::env::var("HARNESS_ACTIVATION_KEY").unwrap();
+        assert!(subkey.starts_with(TEST_ROOT));
+        let fixture = std::mem::ManuallyDrop::new(Fixture {
+            subkey,
+            logs: std::env::var_os("HARNESS_ACTIVATION_LOGS").unwrap().into(),
+        });
+        let _key = RegistrationKey::set(&fixture);
+        let phase = std::env::var("HARNESS_ACTIVATION_PHASE").unwrap();
+        let ready = || -> io::Result<()> {
+            fs::write(fixture.logs.join("activation-ready"), phase.as_bytes())?;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
+        let (_reg, result) = registration_case(&fixture, || {
+            if phase == "runtime" {
+                ready()?;
+            }
+            Ok(())
+        });
+        result.unwrap();
+        assert_eq!(phase, "completed");
+        ready().unwrap();
+    }
+
+    #[test]
+    fn killed_registration_activation_recovers_from_durable_phase() {
+        use std::{
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        for phase in ["runtime", "completed"] {
+            let fixture = Fixture::new();
+            let initial = value(REG_SZ, "C:\\original");
+            fixture.raw(Some(&initial)).unwrap();
+            let accepted = fixture.change().after;
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "environment_path::tests::registration_activation_process_fixture",
+                    "--nocapture",
+                ])
+                .env("HARNESS_ACTIVATION_KEY", &fixture.subkey)
+                .env("HARNESS_ACTIVATION_LOGS", &fixture.logs)
+                .env("HARNESS_ACTIVATION_PHASE", phase)
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(fixture.logs.join("activation-child.stdout")).unwrap())
+                .stderr(fs::File::create(fixture.logs.join("activation-child.stderr")).unwrap())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !fixture.logs.join("activation-ready").exists() && Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let ready = fs::read(fixture.logs.join("activation-ready")).ok();
+            let _ = child.kill();
+            child.wait().unwrap();
+            assert_eq!(
+                ready.as_deref(),
+                Some(phase.as_bytes()),
+                "child evidence: {}",
+                fixture.logs.display()
+            );
+            assert!(fixture.snapshot().value == accepted);
+            let _key = RegistrationKey::set(&fixture);
+            let reg = crate::registration::Registration::open(&fixture.logs.join("registration"))
+                .unwrap();
+            let metadata = fixture.logs.join("home/installation.json");
+            let report = reg.recover_installation(&metadata).unwrap();
+            assert_eq!(report.committed, phase == "completed");
+            assert_eq!(metadata.exists(), phase == "completed");
+            assert_eq!(
+                fixture.logs.join("home/AGENTS.md").exists(),
+                phase == "completed"
+            );
+            assert!(
+                fixture.snapshot().value
+                    == if phase == "completed" {
+                        accepted
+                    } else {
+                        Some(initial)
+                    }
+            );
+            assert!(!reg.journal_path().exists());
+            println!("killed activation {phase}: {}", fixture.logs.display());
+        }
     }
 
     impl Fixture {

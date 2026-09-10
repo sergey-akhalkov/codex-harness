@@ -1,10 +1,12 @@
 //! Owned native upstream double. No model or network use.
-#[path = "../outcome_fixture.rs"]
-mod outcome_fixture;
 #[path = "../discovery_fixture.rs"]
 mod discovery_fixture;
 #[path = "../outcome_case_fixture.rs"]
 mod outcome_case_fixture;
+#[path = "../outcome_fixture.rs"]
+mod outcome_fixture;
+#[path = "../outcome_process_checker_fixture.rs"]
+mod outcome_process_checker_fixture;
 use serde_json::json;
 use std::{
     env,
@@ -14,13 +16,42 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
-    if env::args_os().nth(1).is_some_and(|arg| arg == "--outcome-case") {
+    if let Some(path) = env::var_os("HARNESS_LAUNCH_FIXTURE_STARTED") {
+        std::fs::write(path, std::process::id().to_string())?;
+    }
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--outcome-case")
+    {
         return outcome_case_fixture::run();
     }
     let mode = env::var("HARNESS_LAUNCH_FIXTURE_MODE").unwrap_or_else(|_| "report".into());
     match mode.as_str() {
+        "dependency-version" => {
+            if let Some(marker) = env::var_os("HARNESS_LAUNCH_FIXTURE_MARKER") {
+                std::fs::write(
+                    marker,
+                    serde_json::to_vec(&json!({
+                        "cwd":env::current_dir()?,"args":env::args().skip(1).collect::<Vec<_>>(),
+                        "rustup_home":env::var("RUSTUP_HOME").ok(),"cargo_home":env::var("CARGO_HOME").ok(),
+                        "auto_install":env::var("RUSTUP_AUTO_INSTALL").ok()
+                    }))?,
+                )?;
+            }
+            match env::var("HARNESS_DEPENDENCY_VERSION_FIXTURE").as_deref() {
+                Ok("timeout") => std::thread::sleep(Duration::from_secs(20)),
+                Ok("private-error") => {
+                    println!("private version stdout sentinel");
+                    eprintln!("private version stderr sentinel");
+                    std::process::exit(23);
+                }
+                _ => println!("rust-analyzer 1.97.1 (owned fixture)"),
+            }
+            return Ok(());
+        }
         "outcome" => return outcome_fixture::run(),
         "discovery" => return discovery_fixture::run(),
+        "outcome-process-checker" => return outcome_process_checker_fixture::run(),
         "background" => {
             let child = Command::new(env::current_exe()?)
                 .env("HARNESS_LAUNCH_FIXTURE_MODE", "delayed")

@@ -1,5 +1,5 @@
-//! One temporary, self-contained decision embedding the schema-8 undo intent.
-//! Schema 8 also binds reused link identities across the irreversible decision.
+//! One temporary, self-contained decision embedding the schema-8/9/10 undo intent.
+//! Both formats bind reused link identities across the irreversible decision.
 //! Publication is irreversible. Its last deletion retires all recovery state.
 
 use super::*;
@@ -85,7 +85,7 @@ impl Commitment {
     }
 
     fn verify(&self) -> io::Result<Journal> {
-        if self.schema != SCHEMA
+        if ![8, 9, 10, SCHEMA].contains(&self.schema)
             || self.journal.len() as u64 > MAX_JOURNAL
             || self.completion.len() > 4096
             || self.checksum != self.checksum()?
@@ -97,9 +97,16 @@ impl Commitment {
         journal.verify()?;
         let completion: Completion =
             serde_json::from_str(&self.completion).map_err(|_| conflict())?;
-        if completion.schema != SCHEMA
+        if completion.schema != journal.schema
             || completion.journal_sha256 != self.journal_sha256
             || self.metadata != MetadataWitness::new(&journal, &self.metadata.path)?
+        {
+            return Err(conflict());
+        }
+        if journal
+            .retire_configuration
+            .as_ref()
+            .is_some_and(|path| path != &self.metadata.path)
         {
             return Err(conflict());
         }
@@ -114,6 +121,7 @@ struct FinishGuards {
     backups: Vec<FileGuard>,
     journal: Option<FileGuard>,
     completion: Option<FileGuard>,
+    receipts: Vec<FileGuard>,
 }
 
 pub(super) fn require_absent(path: &Path) -> io::Result<()> {
@@ -168,7 +176,16 @@ fn hold_candidates(
         published.push(guard);
     }
     for config in &journal.configurations {
-        published.push(config.hold_published()?);
+        if journal.retire_configuration.as_ref() == Some(&config.path) {
+            backups.extend(optional_regular(
+                &config.path,
+                config.published_bytes(),
+                config.published_identity(),
+                committed,
+            )?);
+        } else {
+            published.push(config.hold_published()?);
+        }
         paths.push(&config.path);
     }
     for config in &journal.creations {
@@ -244,17 +261,48 @@ fn preflight_committed(
         true,
     )?;
     let (published, backups) = hold_candidates(reg, journal, true)?;
+    if let Some(change) = &journal.process_path {
+        change.verify_published()?;
+    }
+    if let Some(change) = &journal.path_change {
+        // The durable commitment proves prior publication. After journal
+        // cleanup begins, this is a read-only check; never replay a PATH write.
+        change.verify_published()?;
+    }
+    let receipts = committed_receipts(reg, commitment, journal)?;
     Ok(FinishGuards {
         _published: published,
         backups,
         journal: original,
         completion,
+        receipts,
     })
+}
+
+fn committed_receipts(
+    reg: &Registration,
+    commitment: &Commitment,
+    journal: &Journal,
+) -> io::Result<Vec<FileGuard>> {
+    journal
+        .path_change
+        .as_ref()
+        .map(|change| {
+            crate::environment_path::receipt::committed_registration_receipts(
+                &reg.journal_path(),
+                commitment.journal.as_bytes(),
+                &commitment.journal_identity,
+                change,
+            )
+        })
+        .transpose()
+        .map(|receipts| receipts.unwrap_or_default())
 }
 
 fn clean(
     guards: FinishGuards,
     commit: FileGuard,
+    owner: &FileGuard,
     checkpoint: &mut impl FnMut(&'static str, usize) -> io::Result<()>,
 ) -> io::Result<UndoReport> {
     for (index, backup) in guards.backups.into_iter().enumerate() {
@@ -269,7 +317,9 @@ fn clean(
         journal.remove()?;
         checkpoint("journal", 0)?;
     }
-    commit.remove()?;
+    let mut cleanup = guards.receipts;
+    cleanup.push(commit);
+    owner.remove_siblings(cleanup, |_, _| Ok(()))?;
     checkpoint("retired", 0)?;
     Ok(UndoReport {
         removed: Vec::new(),
@@ -278,15 +328,88 @@ fn clean(
     })
 }
 
-pub(super) fn resume(reg: &Registration) -> io::Result<Option<UndoReport>> {
+pub(super) fn resume(reg: &Registration, owner: &FileGuard) -> io::Result<Option<UndoReport>> {
+    resume_checked(reg, owner, |_| Ok(()))
+}
+
+pub(super) fn resume_checked(
+    reg: &Registration,
+    owner: &FileGuard,
+    validate: impl FnOnce(&Journal) -> io::Result<()>,
+) -> io::Result<Option<UndoReport>> {
     let Some((commitment, journal, commit)) = load_commit(reg)? else {
         return Ok(None);
     };
+    validate(&journal)?;
     let guards = preflight_committed(reg, &commitment, &journal)?;
-    clean(guards, commit, &mut |_, _| Ok(())).map(Some)
+    clean(guards, commit, owner, &mut |_, _| Ok(())).map(Some)
 }
 
 impl Registration {
+    /// Inspect the same recovery decision and ownership checks without staging
+    /// a commitment, changing PATH, or removing any recovery evidence.
+    pub(crate) fn preview_owned_installation(
+        &self,
+        owners: &crate::installation_metadata::InstallationOwners,
+    ) -> io::Result<Option<bool>> {
+        let _owner = FileGuard::open_regular(&self.state.join("owner"), OWNER)?;
+        if let Some((commitment, journal, _commit)) = load_commit(self)? {
+            metadata::validate_owners(&journal, owners)?;
+            let _guards = preflight_committed(self, &commitment, &journal)?;
+            return Ok(Some(true));
+        }
+        let Some(snapshot) = self.load_journal()? else {
+            return Ok(None);
+        };
+        metadata::validate_owners(&snapshot.journal, owners)?;
+        if let Some(completion) = &snapshot.completion {
+            let original = FileGuard::open_regular(&self.journal_path(), &snapshot.bytes)?;
+            let _completed = FileGuard::open_regular(&self.state.join(COMPLETION), completion)?;
+            if let Some(change) = &snapshot.journal.path_change {
+                crate::environment_path::receipt::PathReceipts::held_registration(
+                    &self.journal_path(),
+                    &snapshot.bytes,
+                    &original,
+                    change,
+                )
+                .observe_registration(true)?;
+            }
+            if let Some(change) = &snapshot.journal.process_path {
+                change.verify_published()?;
+            }
+            let path = owners.metadata_path();
+            let _witness = MetadataWitness::new(&snapshot.journal, &path)?;
+            if snapshot
+                .journal
+                .retire_configuration
+                .as_ref()
+                .is_some_and(|p| p != &path)
+            {
+                return Err(conflict());
+            }
+            let _guards = hold_candidates(self, &snapshot.journal, false)?;
+            Ok(Some(true))
+        } else {
+            self.undo_checked(snapshot, true, &_owner)?;
+            Ok(Some(false))
+        }
+    }
+
+    pub(crate) fn finish_owned_installation(
+        &self,
+        owners: &crate::installation_metadata::InstallationOwners,
+    ) -> io::Result<UndoReport> {
+        self.finish_checked(&owners.metadata_path(), &mut |_, _| Ok(()), Some(owners))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_finish(
+        &self,
+        metadata: &Path,
+        mut checkpoint: impl FnMut(&'static str, usize) -> io::Result<()>,
+    ) -> io::Result<UndoReport> {
+        self.finish_inner(metadata, &mut checkpoint)
+    }
+
     /// Irreversibly accept a completed operation and retire its rollback data.
     /// `metadata` must exactly nominate a configuration record in that intent;
     /// the installer is responsible for the metadata's installation semantics
@@ -302,13 +425,25 @@ impl Registration {
         metadata: &Path,
         checkpoint: &mut impl FnMut(&'static str, usize) -> io::Result<()>,
     ) -> io::Result<UndoReport> {
+        self.finish_checked(metadata, checkpoint, None)
+    }
+
+    fn finish_checked(
+        &self,
+        metadata: &Path,
+        checkpoint: &mut impl FnMut(&'static str, usize) -> io::Result<()>,
+        owners: Option<&crate::installation_metadata::InstallationOwners>,
+    ) -> io::Result<UndoReport> {
         let _owner = FileGuard::open_regular(&self.state.join("owner"), OWNER)?;
         if let Some((commitment, journal, commit)) = load_commit(self)? {
             if commitment.metadata.path != metadata {
                 return Err(conflict());
             }
+            if let Some(owners) = owners {
+                metadata::validate_owners(&journal, owners)?;
+            }
             let guards = preflight_committed(self, &commitment, &journal)?;
-            return clean(guards, commit, checkpoint);
+            return clean(guards, commit, &_owner, checkpoint);
         }
         let Some(snapshot) = self.load_journal()? else {
             return Ok(UndoReport {
@@ -320,8 +455,32 @@ impl Registration {
         let completion = snapshot
             .completion
             .ok_or_else(|| invalid("finish requires completed publication"))?;
-        let witness = MetadataWitness::new(&snapshot.journal, metadata)?;
         let original = FileGuard::open_regular(&self.journal_path(), &snapshot.bytes)?;
+        if let Some(owners) = owners {
+            metadata::validate_owners(&snapshot.journal, owners)?;
+        }
+        if let Some(change) = &snapshot.journal.path_change {
+            crate::environment_path::receipt::PathReceipts::held_registration(
+                &self.journal_path(),
+                &snapshot.bytes,
+                &original,
+                change,
+            )
+            .observe_registration(true)?;
+            checkpoint("path-validated", 0)?;
+        }
+        let witness = MetadataWitness::new(&snapshot.journal, metadata)?;
+        if let Some(change) = &snapshot.journal.process_path {
+            change.verify_published()?;
+        }
+        if snapshot
+            .journal
+            .retire_configuration
+            .as_ref()
+            .is_some_and(|path| path != metadata)
+        {
+            return Err(conflict());
+        }
         let completed = FileGuard::open_regular(&self.state.join(COMPLETION), &completion)?;
         let (published, backups) = hold_candidates(self, &snapshot.journal, false)?;
         let mut staged_commit = StagedFile::create(&self.state.join(COMMIT), &[])?;
@@ -344,11 +503,12 @@ impl Registration {
             return Err(invalid("commitment exceeds its recovery bound"));
         }
         staged_commit.set_bytes(&bytes)?;
-        let guards = FinishGuards {
+        let mut guards = FinishGuards {
             _published: published,
             backups,
             journal: Some(original),
             completion: Some(completed),
+            receipts: Vec::new(),
         };
         checkpoint("before", 0)?;
         // Any error here may follow publication. Never infer permission to undo
@@ -360,7 +520,8 @@ impl Registration {
             return Err(conflict());
         }
         checkpoint("committed", 0)?;
-        clean(guards, commit, checkpoint)
+        guards.receipts = committed_receipts(self, &commitment, &snapshot.journal)?;
+        clean(guards, commit, &_owner, checkpoint)
     }
 }
 

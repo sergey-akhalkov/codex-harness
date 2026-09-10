@@ -4,7 +4,7 @@ The harness maintains Python, PowerShell, JavaScript, C# and Rust across its run
 
 ## What Changes
 
-- Establish a repository-local Rust policy covering maintained runtime code, installation and recovery tools, tests, executable fixtures, build helpers and skill helpers. This policy applies to `codex-harness`, not to language choices in other projects where the kit is used.
+- Complete the harness Rust migration covering maintained runtime code, installation and recovery tools, tests, executable fixtures, build helpers and skill helpers. This full migration commitment applies to `codex-harness`; the separately confirmed global Rust programming and PowerShell shell defaults apply in other projects without requiring unrelated rewrites.
 - Consolidate active first-party functionality into a Cargo workspace, reusing the existing RTK adapter and exposing native CLI entry points with shared ownership, process and configuration primitives.
 - **BREAKING**: Replace `install.ps1`, PowerShell launch/check entry points and script-based helper commands with documented native executable commands. Migrate existing installations transactionally; retain ordinary `codex` usage, accepted capabilities, explicit overrides and recoverability.
 - Preserve MCP tools, subscription routing, source diagnostics, bounded resource ownership, explicit dependency provisioning, RTK and skill workflows. Replace integrations with foreign language internals through verified external interfaces; generating scripts or moving harness-owned code into a nominal dependency does not satisfy the migration.

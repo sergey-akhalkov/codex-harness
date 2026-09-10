@@ -44,3 +44,29 @@ Logs, source identities and the legacy interoperability receipt are under
 This supplies a lock consumer and migration compatibility evidence. Native
 install/update/recover/disconnect still need to consume it and validate their
 metadata before the installer migration can close.
+
+## Separate connection and dependency owners
+
+`InstallationLocks::acquire(user_home, dependency_user_home)` now acquires the
+two legacy mutex identities in deterministic order, deduplicating aliases before
+acquisition. Failure releases earlier guards while preserving the competing
+owner. The guard remains bound to its acquiring thread. Its abandonment flag is
+an observation requiring state inspection, not authority to recover or discard it.
+
+The actual `inspect-installation --dependency-user-home ...` consumer now holds
+both owners. A Rust child holding only the separate dependency owner caused a
+bounded busy refusal before metadata access; after that child was reaped, the
+same command returned the absent-installation result without creating any homes.
+Four core tests and six CLI/process/legacy-state tests passed (one standalone
+child fixture remains intentionally ignored). Clippy, Rustfmt and explicit Serena
+diagnostics passed. Earlier single-owner and killed-owner checks were reused in
+that run. No global files or services changed.
+
+```text
+cargo test -p harness-core --lib --offline --locked --jobs 1 --target-dir <owned-check-target> installation_lock -- --nocapture --test-threads=1
+cargo test -p codex-harness --test installation_lock --test installation_state --offline --locked --jobs 1 --target-dir <owned-check-target> -- --nocapture --test-threads=1
+```
+
+Current logs and hashes are retained under
+`%LOCALAPPDATA%/codex-harness-evidence/installation-owners-dcacb55d550f44638add4c56410444e3/`.
+Full install/update/recovery orchestration remains unfinished.

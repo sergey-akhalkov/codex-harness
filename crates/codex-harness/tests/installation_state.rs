@@ -86,7 +86,10 @@ fn actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation() 
     );
     assert!(!f.home.exists());
     assert!(!f.user.exists());
-    let bytes = f.write(&f.metadata());
+    let mut aliased = f.metadata();
+    aliased["links"][1]["name"] = "different-descriptor-name".into();
+    aliased["pathScope"] = "pRoCeSs".into();
+    let bytes = f.write(&aliased);
     let output = f.run();
     assert!(
         output.status.success(),
@@ -104,6 +107,7 @@ fn actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation() 
         .unwrap();
     assert!(!state.links()[0].owned);
     assert!(state.links()[1].owned);
+    assert_eq!(state.links()[1].name, "different-descriptor-name");
     assert!(!format!("{state:?}").contains("private version sentinel"));
     state.verify_unchanged().unwrap();
     assert_eq!(fs::read(&f.state).unwrap(), bytes);

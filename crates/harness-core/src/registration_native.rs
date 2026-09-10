@@ -131,6 +131,22 @@ pub(super) struct StagedFile {
 }
 
 impl StagedFile {
+    /// Stream a bounded dependency payload into a newly created, uncommitted
+    /// object. Configuration callers retain their existing 16 MiB byte API.
+    pub(super) fn from_reader(path: &Path, reader: &mut dyn Read, length: u64) -> io::Result<Self> {
+        if length > 512 * 1024 * 1024 {
+            return Err(invalid("dependency payload exceeds 512 MiB"));
+        }
+        let mut staged = Self::create(path, &[])?;
+        let file = staged.guard.file.as_mut().expect("open staged file");
+        let copied = io::copy(&mut reader.take(length + 1), file)?;
+        if copied != length {
+            return Err(conflict("dependency payload length changed"));
+        }
+        file.sync_all()?;
+        Ok(staged)
+    }
+
     /// Fill an uncommitted regular object after its identity is known (for a
     /// self-identifying commit decision). No bytes become visible before commit.
     pub(super) fn set_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -594,10 +610,20 @@ impl FileGuard {
     }
 
     fn open_with_write(path: &Path, write: bool) -> io::Result<Self> {
-        let parents = ParentGuard::open(path)?;
         // No timer: expiring a live guard would silently drop its protection.
         // Last transaction-handle closure rolls back; it is never distributed.
-        let transaction = new_transaction()?;
+        Self::open_in(path, write, new_transaction()?)
+    }
+
+    fn open_in(path: &Path, write: bool, transaction: OwnedHandle) -> io::Result<Self> {
+        Self::open_from_parents(ParentGuard::open(path)?, write, transaction)
+    }
+
+    fn open_from_parents(
+        parents: ParentGuard,
+        write: bool,
+        transaction: OwnedHandle,
+    ) -> io::Result<Self> {
         let name = wide(parents.full.as_os_str());
         // DELETE is modify intent for TxF, excluding even preexisting attribute
         // writers. No read/write/delete sharing excludes data readers/writers and
@@ -664,6 +690,11 @@ impl FileGuard {
     }
 
     pub(super) fn remove(self) -> io::Result<()> {
+        self.stage_removal()?;
+        self.commit()
+    }
+
+    fn stage_removal(&self) -> io::Result<()> {
         // TxF stages this exact handle's deletion. It pins the namespace through
         // commit, including the interval after the transacted file handle closes.
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -678,7 +709,76 @@ impl FileGuard {
         {
             return Err(io::Error::last_os_error());
         }
-        self.commit()
+        Ok(())
+    }
+
+    /// Atomically remove exact regular siblings while this separate retained
+    /// anchor pins their ordinary parent. No file is removed on abort/crash.
+    pub(super) fn remove_siblings(
+        &self,
+        mut guards: Vec<Self>,
+        mut checkpoint: impl FnMut(&'static str, usize) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if guards.is_empty() {
+            return Ok(());
+        }
+        if guards.len() > 16 {
+            return Err(conflict("registration cleanup exceeds its bound"));
+        }
+        let mut claims = Vec::new();
+        for guard in &mut guards {
+            if guard._parents.full.parent() != self._parents.full.parent()
+                || guard._parents.full == self._parents.full
+            {
+                return Err(conflict(
+                    "registration cleanup requires retained sibling ownership",
+                ));
+            }
+            claims.push((
+                guard.object_identity()?,
+                crate::build_identity::hash_bytes(&guard.regular_bytes()?),
+            ));
+        }
+        // The retained anchor prevents a parent rename/reparse change during
+        // this handoff. Reacquisition verifies each exact ID and byte hash.
+        let claims = guards
+            .into_iter()
+            .zip(claims)
+            .map(|(guard, (identity, sha256))| {
+                let Self {
+                    file,
+                    _parents,
+                    transaction,
+                } = guard;
+                drop(file);
+                drop(transaction);
+                (_parents, identity, sha256)
+            })
+            .collect::<Vec<_>>();
+        checkpoint("released", 0)?;
+        let transaction = new_transaction()?;
+        let mut enlisted = Vec::new();
+        for (index, (parents, identity, sha256)) in claims.into_iter().enumerate() {
+            let mut guard = Self::open_from_parents(parents, false, transaction.try_clone()?)?;
+            if guard.object_identity()? != identity
+                || crate::build_identity::hash_bytes(&guard.regular_bytes()?) != sha256
+            {
+                return Err(conflict(
+                    "registration cleanup ownership changed; preserving files",
+                ));
+            }
+            guard.stage_removal()?;
+            enlisted.push(guard);
+            checkpoint("staged", index)?;
+        }
+        for guard in &mut enlisted {
+            drop(guard.file.take());
+        }
+        checkpoint("before-commit", 0)?;
+        if unsafe { CommitTransaction(transaction.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        checkpoint("committed", 0)
     }
 
     fn commit(mut self) -> io::Result<()> {
@@ -695,6 +795,10 @@ struct ParentGuard {
     full: std::path::PathBuf,
     leaf: OsString,
 }
+
+#[cfg(test)]
+#[path = "../tests/registration_native/atomic_cleanup.rs"]
+mod atomic_cleanup_tests;
 
 impl ParentGuard {
     fn open(path: &Path) -> io::Result<Self> {
@@ -859,6 +963,15 @@ fn ordinary(handle: HANDLE) -> io::Result<()> {
 }
 
 fn relative_open(parent: HANDLE, name: &OsStr, sharing: u32) -> io::Result<OwnedHandle> {
+    relative_open_access(parent, name, sharing, FILE_READ_ATTRIBUTES)
+}
+
+fn relative_open_access(
+    parent: HANDLE,
+    name: &OsStr,
+    sharing: u32,
+    access: u32,
+) -> io::Result<OwnedHandle> {
     let mut text: Vec<u16> = name.encode_wide().collect();
     let length = u16::try_from(text.len() * 2).map_err(|_| invalid("component too long"))?;
     let name = UNICODE_STRING {
@@ -881,7 +994,7 @@ fn relative_open(parent: HANDLE, name: &OsStr, sharing: u32) -> io::Result<Owned
     let result = unsafe {
         NtOpenFile(
             &mut handle,
-            FILE_READ_ATTRIBUTES | 0x0010_0000,
+            access | 0x0010_0000,
             &attributes,
             &mut status,
             sharing,
@@ -894,6 +1007,55 @@ fn relative_open(parent: HANDLE, name: &OsStr, sharing: u32) -> io::Result<Owned
         ));
     }
     owned(handle)
+}
+
+/// Read-only package observation with the same root-relative, nontraversing
+/// namespace protection as registration. Unlike FileGuard, this is not a TxF
+/// snapshot or mutation authority: a preexisting writable mapping may still
+/// change bytes. Consumers must describe hashes as observations, not activation
+/// evidence, and must use FileGuard for protected publication/removal.
+pub(crate) struct ReadGuard {
+    pub(crate) file: File,
+    _parents: ParentGuard,
+}
+
+impl ReadGuard {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::from_parents(ParentGuard::open(path)?)
+    }
+
+    /// SQLite read transactions must coexist with its WAL writer. This pins
+    /// the ordinary namespace but intentionally permits data writers; callers
+    /// must use SQLite's snapshot protocol and verify its opened file identity.
+    pub(crate) fn open_shared(path: &Path) -> io::Result<Self> {
+        Self::from_parents_with_share(ParentGuard::open(path)?, FILE_SHARE_READ | FILE_SHARE_WRITE)
+    }
+
+    fn from_parents(parents: ParentGuard) -> io::Result<Self> {
+        Self::from_parents_with_share(parents, FILE_SHARE_READ)
+    }
+
+    fn from_parents_with_share(parents: ParentGuard, share: u32) -> io::Result<Self> {
+        let handle = relative_open_access(
+            parents.handle(),
+            &parents.leaf,
+            share,
+            FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+        )?;
+        let metadata = info(handle.as_raw_handle())?;
+        if metadata.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+            != 0
+        {
+            return Err(conflict("package observation requires an ordinary file"));
+        }
+        // The opened leaf pins a nonempty parent. Recheck after that pin, so a
+        // preceding attribute-only reparse change fails without target traversal.
+        ordinary(parents.handle())?;
+        Ok(Self {
+            file: File::from(handle),
+            _parents: parents,
+        })
+    }
 }
 
 fn volume_root(handle: HANDLE) -> io::Result<std::path::PathBuf> {
@@ -1226,16 +1388,21 @@ mod tests {
 
     #[test]
     fn uncommitted_child_blocks_empty_parent_redirect_and_rename() {
-        let root = fixture();
-        let parent = root.path().join("empty");
-        fs::create_dir(&parent).unwrap();
-        let target = root.path().join("missing");
-        let staged = StagedLink::create(&parent.join("stage"), &target, false).unwrap();
-        assert!(junction(&parent, root.path()).is_err());
-        sharing_error(fs::rename(&parent, root.path().join("moved")).unwrap_err());
-        drop(staged);
-        junction(&parent, root.path()).unwrap(); // Positive control: now really empty.
-        fs::remove_dir(&parent).unwrap();
+        for regular in [false, true] {
+            let root = fixture();
+            let parent = root.path().join("empty");
+            fs::create_dir(&parent).unwrap();
+            let target = root.path().join("missing");
+            let file = regular.then(|| StagedFile::create(&parent.join("stage"), &[]).unwrap());
+            let link = (!regular)
+                .then(|| StagedLink::create(&parent.join("stage"), &target, false).unwrap());
+            assert!(junction(&parent, root.path()).is_err());
+            sharing_error(fs::rename(&parent, root.path().join("moved")).unwrap_err());
+            drop((file, link));
+            assert!(!parent.join("stage").exists());
+            junction(&parent, root.path()).unwrap(); // Positive control: now really empty.
+            fs::remove_dir(&parent).unwrap();
+        }
     }
 
     #[test]
@@ -1272,6 +1439,24 @@ mod tests {
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"foreign");
         drop(held);
         fs::remove_dir(&parent).unwrap();
+    }
+
+    #[test]
+    fn read_guard_refuses_a_parent_redirected_after_its_capture() {
+        let root = fixture();
+        let parent = root.path().join("empty");
+        let target = root.path().join("foreign");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"foreign content must not be read").unwrap();
+        let held = ParentGuard::open(&parent.join("keep")).unwrap();
+        junction(&parent, &target).unwrap();
+        assert!(ReadGuard::from_parents(held).is_err());
+        fs::remove_dir(&parent).unwrap();
+        assert_eq!(
+            fs::read(target.join("keep")).unwrap(),
+            b"foreign content must not be read"
+        );
     }
 
     #[test]

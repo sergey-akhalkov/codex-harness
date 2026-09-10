@@ -9,6 +9,57 @@ implementations and supported runtimes.
 
 ## Current entry points
 
+The explicit native core `install` / `update` / `check` / `recover` / `disconnect --core-only` increment and its
+remaining lifecycle work are recorded in [core installation acceptance](evidence/rust-core-installation.md).
+
+`codex-harness.exe diagnose` and the native core installation's
+`codex-harness-check.exe` alias provide read-only source reports. The port,
+process/privacy boundaries and checks are recorded in
+[native source diagnostics](evidence/rust-source-diagnostics.md). Global cutover
+has not yet replaced the current script diagnostic alias.
+
+The native `dependencies discover --source CHECKOUT` and explicit
+`dependencies plan --source CHECKOUT` commands and their
+read-only/package-version boundaries are recorded in
+[dependency observation evidence](evidence/rust-dependency-discovery.md).
+`dependencies audit --package-root DIRECTORY` compares selected npm package
+files with their exact official archive in a bounded worker;
+[archive/audit evidence](evidence/rust-dependency-archives.md) records its scope
+and the remaining provisioning/transaction work. Explicit
+`dependencies stage --package NAME --version VERSION --state DIRECTORY` prepares
+an owned candidate without activation. `dependencies probe --executable FILE
+--kind codebase-memory|nuphus --sha256 DIGEST` checks an explicitly selected,
+digest-pinned native MCP: Codebase Memory uses an owned inert source sample;
+Nuphus lists its protocol/tool contract without desktop or browser actions.
+The caller must establish the executable and companion DLL provenance first.
+
+`dependencies validate`, `select`, `selected`, `recover-selection` and
+`rollback-selection` connect retained candidates to explicit runtime validation
+and journaled local selection. Run each command with `--help` for required
+stage/digest/state/slot options. BasedPyright requires an explicit Node path and
+digest. [Selection acceptance](evidence/rust-dependency-selection.md) records
+actual package runs, conflict/rollback checks and the remaining global connection.
+
+`dependencies resource-check --cache DIRECTORY` reads persisted CBM policy.
+`dependencies cbm-index --help` describes explicit audited indexing into a
+selected cache. [Native CBM evidence](evidence/rust-cbm-runtime.md) records the
+current checks, compatibility limits and unfinished adapter acceptance.
+`dependencies cbm-catalogue --help` describes isolated catalogue retrieval under
+account admission. [Native stdio evidence](evidence/rust-mcp-stdio.md) separates
+the protocol/session increment from the remaining installed proxy migration.
+`dependencies cbm-tool --help` describes explicit non-index tool calls on a
+selected cache. A cache held by another daemon is refused before launch;
+shared broker clients remain unfinished. Missing CBM UI JSON is treated as
+enabled for the audited embedded-UI binary, regardless of SQLite settings.
+`mcp codebase-memory --help` connects the explicit CBM paths and a saved
+catalogue report to a bounded native stdio connection. Its handshake is local;
+tool calls verify the executable and resource policy. See the
+[stdio integration record](evidence/rust-mcp-stdio.md).
+
+`dependencies stage-python --help` describes creation of an empty offline UV
+environment using explicit trusted executable hashes. [Python staging evidence](evidence/rust-python-staging.md)
+separates this unactivated candidate from full runtime and package provisioning.
+
 The migration is in progress. Global installation still uses the existing
 script lifecycle. The native commands below prepare/check isolated candidates;
 they do not yet replace the global launcher or installer.
@@ -82,6 +133,16 @@ evidence and process acceptance](evidence/rust-outcome-run.md) keep execution
 status separate from correctness; the command defaults to a model-free skip.
 Full suite preparation and independent outcome oracles still require migration.
 
+`codex-harness.exe outcome-prepare --case <controlled-case> [--observer <exe>]`
+creates fresh owned temporary inputs and instructions without models or builds.
+[Controlled case acceptance](evidence/rust-outcome-cases.md) records the five
+supported cases, copied executable identities and native consumer checks.
+
+`codex-harness.exe outcome-oracle --request <private-json>` checks those five
+cases using host-frozen preparation and native execution evidence.
+[Oracle acceptance](evidence/rust-outcome-oracle.md) records the actual targets,
+failure cases, evidence bounds and unfinished external/suite integration.
+
 `codex-harness.exe outcome-discover --request PATH` performs model-free native
 skill/config discovery in an isolated temporary case/home. Its [protocol and
 acceptance](evidence/rust-outcome-discovery.md) cover input identity, bounded
@@ -97,6 +158,33 @@ TxR publication/rollback and atomic file receipts with owned-key and killed-proc
 acceptance. Native installer journal orchestration remains unfinished; the real
 user PATH has not been changed by this acceptance.
 
+Native core `install`/`update --core-only` default to User PATH. Optional
+`--path-scope User|Process` selects a new connection's scope; an existing
+installation keeps its recorded scope, and an explicit differing scope requires
+disconnection first. Process PATH belongs to the current manager command and its
+descendants and cannot change the calling PowerShell environment. Owner identity
+is PID plus creation time: same-owner exact before/after restore, live foreign
+owner refused, dead or reused owner a read-only no-op. Mutation uses the Process
+PATH module mutex, not an arbitrary external PATH CAS. Journal schema 11 carries
+mutually exclusive `path_change`/`process_path` actions and remains
+read-compatible with schema 8/9/10, including schema-10 metadata retirement.
+The User PATH receipt format is unchanged. Check, recover and disconnect derive that
+recorded scope. Evidence and remaining lifecycle work are in
+[core installation acceptance](evidence/rust-core-installation.md).
+
+Native `recover --core-only --preview` reports rollback, finish or no pending
+operation after inspecting the selected core journal and owner state. It opens
+only existing registration files, creates no target homes or recovery files,
+and makes no PATH changes. An actual recovery rechecks the state before writing;
+preview is not a commitment to the observed plan. Combined component recovery
+remains separate unfinished work.
+
+Current native PATH receipts retire atomically with their terminating recovery
+record after a successful rollback or committed finish. Historical files without
+a live intent/commit are preserved. The
+[cleanup acceptance](evidence/rust-core-installation.md#atomic-retirement-of-current-path-receipts)
+includes owned registry checks, interrupted processes and foreign-receipt refusal.
+
 The [native registration foundation](evidence/rust-registration.md) adds
 journaled source links with object identity, protected publication/deletion and
 actual interrupted-process recovery. It currently requires local NTFS with TxF
@@ -105,7 +193,7 @@ and is not yet connected to the global installer.
 [Existing-link changes](evidence/rust-link-changes.md) preserve original objects
 for rollback during replacement/removal. The [finish protocol](evidence/rust-registration-finish.md)
 commits a journaled metadata witness and safely retires rollback objects. The
-current [schema 8 builder](evidence/rust-registration-metadata.md) supplies actual
+builder [introduced in schema 8](evidence/rust-registration-metadata.md) supplies actual
 object IDs to [stable installation metadata](evidence/rust-installation-metadata.md).
 Full lifecycle integration remains unfinished.
 
@@ -151,9 +239,12 @@ manager binaries require explicit Cargo bootstrap. An integrity-verified manager
 can prepare repairs even with stale source or an altered dependent binary.
 
 Custom compiler wrappers and ambient Rust build overrides are currently rejected
-before creating build state. Global activation, update/recover/disconnect,
-ordinary launch and complete migrated acceptance remain implementation work;
-these initial commands do not establish delivery of that larger contract.
+before creating build state. Core connection and schema-2 recovery/disconnection
+now have [native acceptance](evidence/rust-core-installation.md); complete component
+orchestration, global activation and the full migrated acceptance remain unfinished.
+Standalone PowerShell `pending.json` also has a native rollback consumer, including
+an actual old-installer/new-manager recovery case. Combined component journals and
+recovery preview remain separate unfinished work in that acceptance record.
 
 Compiler dep-info is compared with the captured input inventory before accepting
 a candidate. Executable text resources belong under the crate's `src` directory;

@@ -101,3 +101,18 @@ The global instructions SHALL require main agents and tool-capable subagents to 
 #### Scenario: Ordinary session starts in another project
 - **WHEN** a new session loads the linked global AGENTS.md outside the harness
 - **THEN** the mandatory skill-use rule is present alongside the applicable local project instructions and covers child agents
+
+### Requirement: Global language and shell defaults
+The portable principles SHALL establish Rust as the default programming language and PowerShell as the default shell language in every project, covering the main agent and delegated work. They SHALL record the user's environmental motivation for resource and energy efficiency and preference for PowerShell's convenience and capabilities, especially on Windows. Explicit user choices and concrete task, integration or platform constraints SHALL remain respected without authorizing unrelated migrations.
+
+#### Scenario: New implementation outside the harness
+- **WHEN** an agent chooses a language for new code in any project without an explicit alternative or a concrete language constraint
+- **THEN** it defaults to Rust, including when assigning the implementation to a child agent
+
+#### Scenario: Shell work in any project
+- **WHEN** an agent prepares shell commands, scripts, automation or shell examples without an explicit alternative or a concrete shell constraint
+- **THEN** it uses PowerShell syntax and selects PowerShell explicitly when the execution tool requires a shell choice
+
+#### Scenario: Existing integration constrains the language
+- **WHEN** a task requires another language or shell to preserve a concrete integration or platform contract
+- **THEN** the agent explains the constraint and preserves the required contract without starting an unrelated migration

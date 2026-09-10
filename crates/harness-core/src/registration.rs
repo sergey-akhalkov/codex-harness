@@ -1,8 +1,8 @@
 //! Direct source links and existing configuration changes with an owned,
 //! exact-content journal and guarded rollback.
 //!
-//! This is a bounded primitive for tasks 4.1/4.3: it does not install, change
-//! PATH, mutate the kit manifest, or activate a global layout.
+//! Installer activation can journal PATH and verify the runtime before
+//! completion. Selection of components and ownership belongs to its caller.
 #![cfg(windows)]
 
 use crate::{
@@ -32,11 +32,111 @@ pub use finish::COMMIT;
 pub(crate) mod metadata;
 
 pub const JOURNAL: &str = "journal.json";
-// Schema 7 readers do not bind reused link identities at finish/undo. They
-// must reject identity-bearing intent before applying their older semantics.
-pub const SCHEMA: u32 = 8;
+// Schema 11 distinguishes process-owned PATH from registry PATH. Older readers
+// must refuse it rather than attempt the wrong environment's inverse.
+pub const SCHEMA: u32 = 11;
 pub const COMPLETION: &str = "complete.json";
 const MAX_JOURNAL: u64 = 4 * 1024 * 1024;
+
+#[cfg(test)]
+mod schema_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn schema8_9_10_can_recover_and_finish_but_cannot_smuggle_new_actions() {
+        for schema in [8, 9, 10] {
+            for completed in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let reg = Registration::open(&root.path().join("state")).unwrap();
+                let metadata = root.path().join("metadata");
+                reg.apply_with_files(
+                    &[],
+                    &[],
+                    &[ConfigCreation::new(&metadata, b"metadata").unwrap()],
+                )
+                .unwrap();
+                let mut journal: Journal =
+                    serde_json::from_slice(&fs::read(reg.journal_path()).unwrap()).unwrap();
+                journal.schema = schema;
+                journal.checksum = journal.calculate_checksum().unwrap();
+                let bytes = serde_json::to_vec(&journal).unwrap();
+                fs::write(reg.journal_path(), &bytes).unwrap();
+                if completed {
+                    fs::write(
+                        reg.state.join(COMPLETION),
+                        serde_json::to_vec(&Completion {
+                            schema,
+                            journal_sha256: build_identity::hash_bytes(&bytes),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(reg.recover_installation(&metadata).unwrap().committed);
+                    assert_eq!(fs::read(&metadata).unwrap(), b"metadata");
+                } else {
+                    fs::remove_file(reg.state.join(COMPLETION)).unwrap();
+                    assert!(!reg.recover_installation(&metadata).unwrap().committed);
+                    assert!(!metadata.exists());
+                }
+                assert!(!reg.journal_path().exists());
+                if schema == 8 {
+                    journal.path_change =
+                        Some(serde_json::from_str(r#"{"before":null,"after":null}"#).unwrap());
+                    journal.checksum = journal.calculate_checksum().unwrap();
+                    assert!(journal.verify().is_err());
+                    journal.path_change = None;
+                }
+                journal.retire_configuration = Some(metadata);
+                journal.checksum = journal.calculate_checksum().unwrap();
+                assert!(journal.verify().is_err());
+                journal.retire_configuration = None;
+                journal.process_path = Some(
+                    crate::process_path::ProcessPathSnapshot::read()
+                        .unwrap()
+                        .prepend(Path::new("C:\\owned-process-compatibility\\bin"))
+                        .unwrap()
+                        .0,
+                );
+                journal.checksum = journal.calculate_checksum().unwrap();
+                assert!(journal.verify().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn schema10_metadata_retirement_remains_recoverable() {
+        let root = tempfile::tempdir().unwrap();
+        let metadata = root.path().join("metadata");
+        fs::write(&metadata, b"owner witness").unwrap();
+        let snapshot = crate::config_file::ConfigSnapshot::read(&metadata).unwrap();
+        let reg = Registration::open(&root.path().join("state")).unwrap();
+        reg.apply_disconnection(
+            &[],
+            &snapshot,
+            |_| Ok(snapshot.contents().to_vec()),
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        let mut journal: Journal =
+            serde_json::from_slice(&fs::read(reg.journal_path()).unwrap()).unwrap();
+        journal.schema = 10;
+        journal.checksum = journal.calculate_checksum().unwrap();
+        let bytes = serde_json::to_vec(&journal).unwrap();
+        fs::write(reg.journal_path(), &bytes).unwrap();
+        fs::write(
+            reg.state.join(COMPLETION),
+            serde_json::to_vec(&Completion {
+                schema: 10,
+                journal_sha256: build_identity::hash_bytes(&bytes),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(reg.recover_installation(&metadata).unwrap().committed);
+        assert!(!metadata.exists());
+    }
+}
 const OWNER: &[u8] = b"codex-harness-registration-v1\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,6 +225,12 @@ pub struct Journal {
     configurations: Vec<ConfigRecord>,
     creations: Vec<CreatedConfig>,
     link_changes: Vec<ChangeRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_change: Option<crate::environment_path::UserPathChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retire_configuration: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_path: Option<crate::process_path::ProcessPathChange>,
     pub checksum: String,
 }
 
@@ -135,39 +241,93 @@ impl Journal {
         creations: Vec<CreatedConfig>,
         link_changes: Vec<ChangeRecord>,
     ) -> io::Result<Self> {
-        let checksum = build_identity::hash_bytes(&serde_json::to_vec(&(
-            SCHEMA,
-            &records,
-            &configurations,
-            &creations,
-            &link_changes,
-        ))?);
-        Ok(Self {
+        let mut journal = Self {
             schema: SCHEMA,
             records,
             configurations,
             creations,
             link_changes,
-            checksum,
-        })
+            path_change: None,
+            retire_configuration: None,
+            process_path: None,
+            checksum: String::new(),
+        };
+        journal.checksum = journal.calculate_checksum()?;
+        Ok(journal)
     }
 
-    fn verify(&self) -> io::Result<()> {
-        if self.schema != SCHEMA {
-            return Err(invalid("unsupported registration journal; preserving it"));
-        }
-        if self.checksum
-            != build_identity::hash_bytes(&serde_json::to_vec(&(
+    fn calculate_checksum(&self) -> io::Result<String> {
+        let bytes = if self.schema == 8 && self.path_change.is_none() {
+            serde_json::to_vec(&(
                 self.schema,
                 &self.records,
                 &self.configurations,
                 &self.creations,
                 &self.link_changes,
-            ))?)
+            ))?
+        } else if self.schema == 9 {
+            serde_json::to_vec(&(
+                self.schema,
+                &self.records,
+                &self.configurations,
+                &self.creations,
+                &self.link_changes,
+                &self.path_change,
+            ))?
+        } else if self.schema == 10 {
+            serde_json::to_vec(&(
+                self.schema,
+                &self.records,
+                &self.configurations,
+                &self.creations,
+                &self.link_changes,
+                &self.path_change,
+                &self.retire_configuration,
+            ))?
+        } else {
+            serde_json::to_vec(&(
+                self.schema,
+                &self.records,
+                &self.configurations,
+                &self.creations,
+                &self.link_changes,
+                &self.path_change,
+                &self.retire_configuration,
+                &self.process_path,
+            ))?
+        };
+        Ok(build_identity::hash_bytes(&bytes))
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        if ![8, 9, 10, SCHEMA].contains(&self.schema)
+            || self.schema == 8 && self.path_change.is_some()
+            || self.schema < 10 && self.retire_configuration.is_some()
+            || self.schema < 11 && self.process_path.is_some()
+            || self.path_change.is_some() && self.process_path.is_some()
         {
+            return Err(invalid("unsupported registration journal; preserving it"));
+        }
+        if self.checksum != self.calculate_checksum()? {
             return Err(invalid(
                 "registration journal ownership changed; preserving it",
             ));
+        }
+        if let Some(change) = &self.path_change {
+            change.validate()?;
+        }
+        if let Some(change) = &self.process_path {
+            change.validate()?;
+        }
+        if let Some(path) = &self.retire_configuration
+            && self
+                .configurations
+                .iter()
+                .filter(|c| &c.path == path)
+                .count()
+                != 1
+        {
+            return Err(invalid("retirement must bind one existing configuration"));
         }
         let mut seen = BTreeSet::new();
         for record in &self.records {
@@ -296,6 +456,25 @@ impl Registration {
         Ok(Self { state, _lock: lock })
     }
 
+    /// Read-only entry for preview. Neither an owner marker nor a lock file is
+    /// created; an incomplete/foreign state remains available for explicit repair.
+    pub(crate) fn open_existing(state: &Path) -> io::Result<Option<Self>> {
+        let state = resolve_state(state)?;
+        match fs::symlink_metadata(&state) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let _owner = FileGuard::open_regular(&state.join("owner"), OWNER)?;
+        let lock_path = state.join("registration.lock");
+        inventory::ordinary_parents(&lock_path)?;
+        build_identity::ordinary(&lock_path)?;
+        let lock = ExclusiveFileLock::try_acquire_existing(&lock_path)?.ok_or_else(|| {
+            invalid("Another native registration operation owns this state; wait for it to finish.")
+        })?;
+        Ok(Some(Self { state, _lock: lock }))
+    }
+
     pub fn state(&self) -> &Path {
         &self.state
     }
@@ -356,10 +535,12 @@ impl Registration {
             creations,
             link_changes,
             None,
+            None,
             checkpoint,
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Typed publication categories share one producer.
     fn apply_prepared(
         &self,
         links: &[Link],
@@ -367,6 +548,7 @@ impl Registration {
         creations: &[ConfigCreation],
         link_changes: &[LinkChange],
         metadata: Option<metadata::Builder<'_>>,
+        activation: Option<metadata::Activation<'_>>,
         mut checkpoint: impl FnMut() -> io::Result<()>,
     ) -> io::Result<ApplyReport> {
         let _owner_guard = FileGuard::open_regular(&self.state.join("owner"), OWNER)?;
@@ -504,7 +686,8 @@ impl Registration {
             None if planned.is_empty()
                 && configurations.is_empty()
                 && creations.is_empty()
-                && link_changes.is_empty() =>
+                && link_changes.is_empty()
+                && activation.is_none() =>
             {
                 return Ok(ApplyReport {
                     links: Vec::new(),
@@ -714,7 +897,14 @@ impl Registration {
                 }
             }
         }
-        let journal = Journal::new(planned, configurations, created_configs, change_records)?;
+        let mut journal = Journal::new(planned, configurations, created_configs, change_records)?;
+        journal.path_change = activation.as_ref().and_then(|a| a.path_change.clone());
+        journal.retire_configuration = activation
+            .as_ref()
+            .and_then(|a| a.retire_configuration.clone());
+        journal.process_path = activation.as_ref().and_then(|a| a.process_path.clone());
+        journal.checksum = journal.calculate_checksum()?;
+        journal.verify()?;
         let bytes = encode(&journal)?;
         write_bytes(&self.journal_path(), &bytes)?;
         let _journal_guard = FileGuard::open_regular(&self.journal_path(), &bytes)?;
@@ -755,6 +945,21 @@ impl Registration {
             change.publish(&mut checkpoint)?;
             checkpoint()?;
         }
+        if let Some(change) = &journal.path_change {
+            crate::environment_path::receipt::PathReceipts::held_registration(
+                &self.journal_path(),
+                &bytes,
+                &_journal_guard,
+                change,
+            )
+            .apply_registration()?;
+        }
+        if let Some(activation) = activation {
+            if let Some(change) = &journal.process_path {
+                change.publish()?;
+            }
+            (activation.verify)()?;
+        }
         live_matches(&journal.records)?;
         for config in &journal.configurations {
             config.check_published()?;
@@ -764,6 +969,12 @@ impl Registration {
         }
         for change in &journal.link_changes {
             change.check_published()?;
+        }
+        if let Some(change) = &journal.path_change {
+            change.verify_published()?;
+        }
+        if let Some(change) = &journal.process_path {
+            change.verify_published()?;
         }
         let completion = Completion {
             schema: SCHEMA,
@@ -778,7 +989,7 @@ impl Registration {
 
     pub fn recover(&self) -> io::Result<UndoReport> {
         let _owner_guard = FileGuard::open_regular(&self.state.join("owner"), OWNER)?;
-        if let Some(report) = finish::resume(self)? {
+        if let Some(report) = finish::resume(self, &_owner_guard)? {
             return Ok(report);
         }
         match self.load_journal()? {
@@ -790,13 +1001,13 @@ impl Registration {
             Some(snapshot) if snapshot.completion.is_some() => Err(invalid(
                 "No interrupted registration; disconnect owned links explicitly.",
             )),
-            Some(snapshot) => self.undo(snapshot),
+            Some(snapshot) => self.undo_checked(snapshot, false, &_owner_guard),
         }
     }
 
     pub fn disconnect(&self) -> io::Result<UndoReport> {
         let _owner_guard = FileGuard::open_regular(&self.state.join("owner"), OWNER)?;
-        if let Some(report) = finish::resume(self)? {
+        if let Some(report) = finish::resume(self, &_owner_guard)? {
             return Ok(report);
         }
         match self.load_journal()? {
@@ -808,7 +1019,7 @@ impl Registration {
             Some(snapshot) if snapshot.completion.is_none() => Err(invalid(
                 "An interrupted registration needs recovery before disconnect.",
             )),
-            Some(snapshot) => self.undo(snapshot),
+            Some(snapshot) => self.undo_checked(snapshot, false, &_owner_guard),
         }
     }
 
@@ -842,7 +1053,7 @@ impl Registration {
                 let marker: Completion = serde_json::from_slice(&raw).map_err(|_| {
                     invalid("registration completion ownership changed; preserving it")
                 })?;
-                if marker.schema != SCHEMA
+                if marker.schema != journal.schema
                     || marker.journal_sha256 != build_identity::hash_bytes(&bytes)
                 {
                     return Err(invalid(
@@ -859,7 +1070,12 @@ impl Registration {
         }))
     }
 
-    fn undo(&self, snapshot: Snapshot) -> io::Result<UndoReport> {
+    fn undo_checked(
+        &self,
+        snapshot: Snapshot,
+        preview: bool,
+        owner: &FileGuard,
+    ) -> io::Result<UndoReport> {
         let journal_guard = FileGuard::open_regular(&self.journal_path(), &snapshot.bytes)?;
         let completion_guard = snapshot
             .completion
@@ -926,6 +1142,37 @@ impl Registration {
         for change in &snapshot.journal.link_changes {
             change.check_undo()?;
         }
+        if preview {
+            if let Some(change) = &snapshot.journal.path_change {
+                crate::environment_path::receipt::PathReceipts::held_registration(
+                    &self.journal_path(),
+                    &snapshot.bytes,
+                    &journal_guard,
+                    change,
+                )
+                .observe_undo_registration()?;
+            }
+            if let Some(change) = &snapshot.journal.process_path {
+                change.check_undo()?;
+            }
+            return Ok(UndoReport {
+                removed: Vec::new(),
+                restored: Vec::new(),
+                committed: false,
+            });
+        }
+        if let Some(change) = &snapshot.journal.path_change {
+            crate::environment_path::receipt::PathReceipts::held_registration(
+                &self.journal_path(),
+                &snapshot.bytes,
+                &journal_guard,
+                change,
+            )
+            .undo_registration()?;
+        }
+        if let Some(change) = &snapshot.journal.process_path {
+            change.rollback()?;
+        }
         let mut removed_configs = Vec::new();
         for config in snapshot.journal.creations.iter().rev() {
             if config.undo()? {
@@ -951,10 +1198,20 @@ impl Registration {
                 &record.staged.as_ref().expect("verified staging").identity,
             )?;
         }
-        if let Some(guard) = completion_guard {
-            guard.remove()?;
-        }
-        journal_guard.remove()?;
+        let mut cleanup = if let Some(change) = &snapshot.journal.path_change {
+            crate::environment_path::receipt::PathReceipts::held_registration(
+                &self.journal_path(),
+                &snapshot.bytes,
+                &journal_guard,
+                change,
+            )
+            .cleanup_undo_registration()?
+        } else {
+            Vec::new()
+        };
+        cleanup.extend(completion_guard);
+        cleanup.push(journal_guard);
+        owner.remove_siblings(cleanup, |_, _| Ok(()))?;
         Ok(UndoReport {
             restored,
             committed: false,
@@ -975,7 +1232,7 @@ enum Presence {
     Foreign,
 }
 
-fn plan(links: &[Link]) -> io::Result<Vec<Record>> {
+pub(crate) fn plan(links: &[Link]) -> io::Result<Vec<Record>> {
     let mut seen = BTreeSet::new();
     let mut records: Vec<Record> = Vec::new();
     let mut names = Vec::new();
@@ -1050,7 +1307,7 @@ fn validate_staged_destinations(
     Ok(names)
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> io::Result<bool> {
+pub(crate) fn paths_overlap(left: &Path, right: &Path) -> io::Result<bool> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
     fn spelling(path: &Path) -> Vec<u16> {

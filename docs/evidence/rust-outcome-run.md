@@ -6,8 +6,10 @@ returns `skipped` without reading the request or starting discovery or a model.
 The [Rust executor](../../crates/codex-harness/src/outcome_run.rs) and
 [incremental event observer](../../crates/codex-harness/src/outcome_events.rs)
 replace the execution/observation part of the old outcome runner. Comparison
-preparation, skill discovery/treatment, the suite and independent correctness
-oracles remain unfinished; task 7.3 stays open.
+preparation now has separate [discovery](rust-outcome-discovery.md),
+[arm](rust-outcome-arm.md), [controlled-case](rust-outcome-cases.md) and
+[controlled-oracle](rust-outcome-oracle.md) acceptance. External cases and the
+full suite remain unfinished; task 7.3 stays open.
 
 The request is JSON with required `case_root`, `codex_home`, `launcher` and
 `prompt` fields. Case and home must be separate existing directories beneath
@@ -99,14 +101,16 @@ checks. Live native launcher/home integration remains part of migration delivery
 ## Controlled outcome case targets
 
 The [Rust case fixture](../../crates/codex-harness/src/outcome_case_fixture.rs)
-adds `--outcome-case build|cli|flood|fail|no-ready|hang` to the existing test
-executable. It must first be copied into an owned temporary case. Build/CLI
+adds `--outcome-case build|cli|flood|fail|no-ready|hang` to the manager and existing
+test executable. It must first be copied into an owned temporary case. Build/CLI
 resolve inputs relative to that executable, preserving the old distinction
 between source version 2 and stale generated version 1, and record real
 executions in `execution-audit.jsonl`. Process targets preserve concurrent
 2 MiB stdout/stderr, natural exit 7, absent readiness and a delayed descendant.
-The suite preparer, model-facing case instructions and independent outcome
-oracles still require integration; these targets alone do not complete task 7.3.
+[Controlled preparation](rust-outcome-cases.md) now copies these targets and
+provides the model-facing case instructions. [Controlled oracles](rust-outcome-oracle.md)
+now independently verify these cases. The full suite still requires integration;
+these targets do not complete task 7.3.
 
 Two [actual Rust integration tests](../../crates/codex-harness/tests/outcome_case_fixture.rs)
 passed, including a different invocation cwd, build/CLI audit order and bounded
