@@ -31,10 +31,9 @@ Explicit expansion requires a missing fact; a single response stays within
 16 KiB. Until enforced by a managed adapter, retain bulky raw responses in Code
 Mode and return selected evidence plus errors, coverage and detail access.
 The [portable recipes](../.agents/skills/token-efficient-workflow/references/code-retrieval.md)
-own the detailed limits and traps. [CodeGraph calibration](../openspec/changes/replace-cbm-with-codegraph/design.md#calibration)
-records actual comparisons and pending replacement acceptance. Automatic
-CodeGraph refresh is accepted within the resource policy, but the replacement
-has not changed the live CBM registration.
+own the detailed limits and traps. [CodeGraph calibration](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/design.md#calibration)
+records actual comparisons and the accepted replacement. CodeGraph is the live
+graph registration, with automatic refresh inside the resource policy.
 
 For a new task the launcher accepts `--harness-effort routine|standard|demanding`
 as the first argument, mapping to native `low|high|xhigh`. An explicit native
@@ -46,7 +45,12 @@ a savings percentage. Grok middle, Astra backup and escalation bounds remain.
 Installation uses RTK 0.48.0 for Windows x64 with pinned archive and exe
 SHA-256. Building the small adapter needs Cargo/Rust; sources are in
 `tools/rtk-adapter`, build-identity artifacts stay outside Git under
-`CODEX_HOME/harness/rtk`. Binary and hook-definition connection uses links.
+`CODEX_HOME/harness/rtk`. Native `--token-workflow-only` Install reuses or
+acquires that pinned archive and a bounded adapter build, then links only
+`harness/bin/rtk.exe` and `harness/bin/harness-rtk.exe`. When the recorded
+original CLI is present, first connect enables Code Mode and hooks on an
+ordinary base config; Disconnect restores recorded Code Mode and leaves
+hooks off. Binary and hook-definition connection uses links.
 Native trust is bound to the actual definition; there is no global trust bypass.
 
 For first trust, launch the original CLI from `codexCommand` in
@@ -91,3 +95,4 @@ Runtime contracts: [RTK 0.48.0](https://github.com/rtk-ai/rtk/releases/tag/v0.48
 [Codex configuration](https://learn.chatgpt.com/docs/config-file/config-reference).
 RTK claims of 60–90% apply to supported output. `rtk gain` estimates tokens
 from text volume; it is not an observation of whole-session or weekly spend.
+

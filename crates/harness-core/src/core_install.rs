@@ -267,6 +267,27 @@ fn plain(path: &Path) -> io::Result<PathBuf> {
     normal(Path::new(text.strip_prefix("\\\\?\\").unwrap_or(text)))
 }
 
+fn inherit_recorded_hooks(
+    old: &[(Link, bool)],
+    previous_source: &Path,
+    next_source: &Path,
+    desired: &mut Vec<Link>,
+) -> io::Result<()> {
+    for (link, _) in old
+        .iter()
+        .filter(|(l, _)| matches!(l.kind.as_str(), "hooks" | "hook-launcher"))
+    {
+        let relative = link
+            .source
+            .strip_prefix(previous_source)
+            .map_err(|_| conflict())?;
+        let mut next = link.clone();
+        next.source = next_source.join(relative);
+        desired.push(next);
+    }
+    Ok(())
+}
+
 struct Plan {
     prior: Prior,
     settings: Settings,
@@ -403,18 +424,8 @@ impl Plan {
         }
         // A core update inherits recorded hook connections until their owning
         // component migrates them. Fresh core connections do not add hooks.
-        for (link, _) in old
-            .iter()
-            .filter(|(l, _)| matches!(l.kind.as_str(), "hooks" | "hook-launcher"))
-        {
-            let source_root = &previous.as_ref().ok_or_else(conflict)?.source_root;
-            let relative = link
-                .source
-                .strip_prefix(source_root)
-                .map_err(|_| conflict())?;
-            let mut next = link.clone();
-            next.source = request.source.join(relative);
-            desired.push(next);
+        if let Some(previous) = &previous {
+            inherit_recorded_hooks(&old, &previous.source_root, &request.source, &mut desired)?;
         }
         for binary in build_identity::BINARIES {
             desired.push(Link {
@@ -426,6 +437,7 @@ impl Plan {
             });
         }
         let launch_bytes = serde_json::to_vec_pretty(&native_launcher::Registration {
+            task_control: false,
             schema: 2,
             state: None,
             build: Some(request.build.clone()),
@@ -853,6 +865,889 @@ mod tests {
                 b"foreign"
             );
             assert!(!fixture.request.codex_home.join("harness").exists());
+        });
+    }
+
+    #[test]
+    fn checksum_mismatch_is_rejected_without_creating_homes() {
+        crate::environment_path::with_test_registry(|| {
+            let fixture = Fixture::new();
+            fs::write(fixture.request.build.join("codex-harness.exe"), b"altered").unwrap();
+            assert!(connect(&fixture.request, true).is_err());
+            assert!(!fixture.request.codex_home.exists());
+            assert!(!fixture.request.user_home.exists());
+        });
+    }
+
+    #[test]
+    fn preview_core_only_leaves_unrelated_component_records_untouched() {
+        crate::environment_path::with_test_registry(|| {
+            let fixture = Fixture::new();
+            let home = &fixture.request.codex_home;
+            fs::create_dir_all(home.join("harness")).unwrap();
+            let token = home.join("harness/token-workflow.json");
+            let subscriptions = home.join("harness/subscription-routing.json");
+            fs::write(&token, b"{\"enabled\":true}").unwrap();
+            fs::write(
+                &subscriptions,
+                b"{\"owner\":\"codex-harness-subscriptions\"}",
+            )
+            .unwrap();
+            let token_before = fs::read(&token).unwrap();
+            let subscriptions_before = fs::read(&subscriptions).unwrap();
+            let report = connect(&fixture.request, true).unwrap();
+            assert_eq!(report.status, "preview");
+            assert_eq!(fs::read(&token).unwrap(), token_before);
+            assert_eq!(fs::read(&subscriptions).unwrap(), subscriptions_before);
+        });
+    }
+
+    fn rustc() -> PathBuf {
+        let output = std::process::Command::new("where.exe")
+            .arg("rustc.exe")
+            .output()
+            .unwrap();
+        PathBuf::from(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+    }
+
+    fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {
+        let stem = name.trim_end_matches(".exe");
+        let output = std::path::absolute(root).unwrap().join(name);
+        fs::write(root.join(format!("{stem}.rs")), source).unwrap();
+        let mut command = crate::process::CommandSpec::new(rustc());
+        command.args = vec![
+            root.join(format!("{stem}.rs")).into_os_string(),
+            "--edition=2024".into(),
+            "-o".into(),
+            output.as_os_str().to_owned(),
+        ];
+        let log = fs::File::create(root.join(format!("{name}.compile.log"))).unwrap();
+        command.stdout = Some(log.try_clone().unwrap());
+        command.stderr = Some(log);
+        let job = crate::process::Job::new(crate::process::Limits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            cpu_percent: Some(50.0),
+        })
+        .unwrap();
+        let child = job.spawn(&command).unwrap();
+        let outcome = job
+            .wait(
+                &child,
+                crate::process::Deadline::after(Duration::from_secs(30)).unwrap(),
+                &crate::process::Cancellation::default(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            (outcome.reason, outcome.exit_code),
+            (crate::process::StopReason::Exited, 0),
+            "{name} compile evidence: {}",
+            root.display()
+        );
+        output
+    }
+
+    #[test]
+    fn inherit_recorded_hooks_follow_a_relocated_checkout_without_opening_old_source() {
+        let old_source = PathBuf::from(r"D:\missing-old-checkout");
+        let new_source = PathBuf::from(r"D:\relocated-source");
+        let old = vec![
+            (
+                Link {
+                    kind: "hooks".into(),
+                    name: "code-tools".into(),
+                    source: old_source.join("global/hooks.json"),
+                    destination: PathBuf::from(r"D:\codex\hooks.json"),
+                    connection: Connection::Linked,
+                },
+                true,
+            ),
+            (
+                Link {
+                    kind: "instructions".into(),
+                    name: "AGENTS".into(),
+                    source: old_source.join("global/instructions.md"),
+                    destination: PathBuf::from(r"D:\codex\AGENTS.md"),
+                    connection: Connection::Linked,
+                },
+                true,
+            ),
+        ];
+        let mut desired = Vec::new();
+        inherit_recorded_hooks(&old, &old_source, &new_source, &mut desired).unwrap();
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].kind, "hooks");
+        assert_eq!(desired[0].source, new_source.join("global/hooks.json"));
+        assert_eq!(
+            desired[0].destination,
+            PathBuf::from(r"D:\codex\hooks.json")
+        );
+        assert!(!old_source.exists());
+    }
+
+    #[test]
+    fn connect_retargets_recorded_links_after_a_relocated_checkout() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            let upstream = compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_features.rs"),
+            );
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fixture.request.upstream = Some(upstream);
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            let first = connect(&fixture.request, false).unwrap();
+            assert_eq!(first.status, "connected");
+            assert!(first.runtime.unwrap().passed);
+            let old_source = fixture.request.source.clone();
+            let relocated = fixture.root.join("relocated источник");
+            fs::rename(&old_source, &relocated).unwrap();
+            fixture.request.source = relocated.clone();
+            fixture.record();
+            let preview = connect(&fixture.request, true).unwrap();
+            assert!(preview.changed_links > 0);
+            assert_eq!(
+                fs::read_link(fixture.request.codex_home.join("AGENTS.md")).unwrap(),
+                old_source.join("global/instructions.md")
+            );
+            let report = connect(&fixture.request, false).unwrap();
+            assert_eq!(report.status, "connected");
+            assert!(report.runtime.unwrap().passed);
+            assert_eq!(
+                fs::read_link(fixture.request.codex_home.join("AGENTS.md")).unwrap(),
+                relocated.join("global/instructions.md")
+            );
+            assert_eq!(
+                fs::read_link(fixture.request.user_home.join(".agents/skills/one")).unwrap(),
+                relocated.join("skills/one")
+            );
+            let metadata = InstallationMetadata::read(
+                &fixture.request.codex_home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(metadata.settings().source_root, relocated);
+            assert!(!old_source.exists());
+            assert_eq!(
+                fs::read(relocated.join("skills/one/SKILL.md")).unwrap(),
+                b"---\nname: one\ndescription: Owned acceptance skill.\n---\nPreserve foreign data.\n"
+            );
+        });
+    }
+
+    #[test]
+    fn relocated_connect_preserves_a_foreign_retargeted_link() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            let upstream = compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_features.rs"),
+            );
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fixture.request.upstream = Some(upstream);
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            connect(&fixture.request, false).unwrap();
+            let old_source = fixture.request.source.clone();
+            let relocated = fixture.root.join("relocated источник");
+            fs::rename(&old_source, &relocated).unwrap();
+            fixture.request.source = relocated.clone();
+            fixture.record();
+            let instructions = fixture.request.codex_home.join("AGENTS.md");
+            let foreign = fixture.root.join("foreign.md");
+            fs::write(&foreign, b"keep foreign instructions").unwrap();
+            fs::remove_file(&instructions).unwrap();
+            std::os::windows::fs::symlink_file(&foreign, &instructions).unwrap();
+            let metadata = fixture.request.codex_home.join("harness/installation.json");
+            let before = fs::read(&metadata).unwrap();
+            for preview in [true, false] {
+                assert!(connect(&fixture.request, preview).is_err());
+                assert_eq!(fs::read(&metadata).unwrap(), before);
+                assert_eq!(fs::read_link(&instructions).unwrap(), foreign);
+                assert_eq!(fs::read(&foreign).unwrap(), b"keep foreign instructions");
+            }
+            assert!(!old_source.exists());
+            assert_eq!(
+                fs::read(relocated.join("skills/one/SKILL.md")).unwrap(),
+                b"---\nname: one\ndescription: Owned acceptance skill.\n---\nPreserve foreign data.\n"
+            );
+        });
+    }
+
+    #[test]
+    fn preview_relocated_old_layout_does_not_open_old_source_or_write() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let home = fixture.request.codex_home.clone();
+            fs::create_dir_all(home.join("harness/bin")).unwrap();
+            for name in [
+                "legacy-launcher.fixture",
+                "legacy-hook.fixture",
+                "legacy-diagnostic.fixture",
+            ] {
+                fs::write(
+                    fixture.request.source.join(name),
+                    b"inert legacy source; never executed",
+                )
+                .unwrap();
+            }
+            let entries = [
+                (
+                    "instructions",
+                    "AGENTS",
+                    "global/instructions.md",
+                    "AGENTS.md",
+                ),
+                (
+                    "launcher",
+                    "codex",
+                    "legacy-launcher.fixture",
+                    "harness/bin/codex.ps1",
+                ),
+                ("hooks", "hooks", "global/hooks.json", "hooks.json"),
+                (
+                    "diagnostic-launcher",
+                    "codex-harness-check",
+                    "legacy-diagnostic.fixture",
+                    "harness/bin/codex-harness-check.ps1",
+                ),
+                (
+                    "hook-launcher",
+                    "hook",
+                    "legacy-hook.fixture",
+                    "harness/bin/hook.ps1",
+                ),
+            ];
+            let mut links = Vec::new();
+            for (kind, name, source, destination) in entries {
+                std::os::windows::fs::symlink_file(
+                    fixture.request.source.join(source),
+                    home.join(destination),
+                )
+                .unwrap();
+                links.push(json!({
+                    "kind": kind,
+                    "name": name,
+                    "source": fixture.request.source.join(source),
+                    "destination": home.join(destination),
+                    "owned": true
+                }));
+            }
+            let metadata = home.join("harness/installation.json");
+            fs::write(
+                &metadata,
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 1,
+                    "sourceRoot": fixture.request.source,
+                    "codexHome": home,
+                    "userHome": fixture.request.user_home,
+                    "dependencyUserHome": fixture.request.dependency_user_home,
+                    "codexCommand": fixture.request.upstream,
+                    "profileName": "harness",
+                    "links": links,
+                    "pathScope": "Process",
+                    "pathAdded": false,
+                    "versions": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let before = fs::read(&metadata).unwrap();
+            let old_source = fixture.request.source.clone();
+            let relocated = fixture.root.join("relocated источник");
+            fs::rename(&old_source, &relocated).unwrap();
+            fixture.request.source = relocated.clone();
+            fixture.record();
+            let report = connect(&fixture.request, true).unwrap();
+            assert_eq!(report.status, "preview");
+            assert!(report.changed_links > 0);
+            assert_eq!(fs::read(&metadata).unwrap(), before);
+            assert!(!home.join("harness/native-registration").exists());
+            assert!(!old_source.exists());
+            assert_eq!(
+                fs::read_link(home.join("AGENTS.md")).unwrap(),
+                old_source.join("global/instructions.md")
+            );
+            assert_eq!(
+                fs::read_link(home.join("hooks.json")).unwrap(),
+                old_source.join("global/hooks.json")
+            );
+            assert_eq!(
+                fs::read(relocated.join("global/instructions.md")).unwrap(),
+                b"Owned native core acceptance. Preserve foreign data.\n"
+            );
+        });
+    }
+
+    #[test]
+    fn connect_upgrades_relocated_old_layout_without_opening_old_source() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            let upstream = compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_features.rs"),
+            );
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fixture.request.upstream = Some(upstream);
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            let home = fixture.request.codex_home.clone();
+            fs::create_dir_all(home.join("harness/bin")).unwrap();
+            for name in [
+                "legacy-launcher.fixture",
+                "legacy-hook.fixture",
+                "legacy-diagnostic.fixture",
+            ] {
+                fs::write(
+                    fixture.request.source.join(name),
+                    b"inert legacy source; never executed",
+                )
+                .unwrap();
+            }
+            let entries = [
+                (
+                    "instructions",
+                    "AGENTS",
+                    "global/instructions.md",
+                    "AGENTS.md",
+                    true,
+                ),
+                (
+                    "profile",
+                    "harness",
+                    "global/profile.toml",
+                    "harness.config.toml",
+                    false,
+                ),
+                (
+                    "launcher",
+                    "codex",
+                    "legacy-launcher.fixture",
+                    "harness/bin/codex.ps1",
+                    true,
+                ),
+                ("hooks", "hooks", "global/hooks.json", "hooks.json", true),
+                (
+                    "diagnostic-launcher",
+                    "codex-harness-check",
+                    "legacy-diagnostic.fixture",
+                    "harness/bin/codex-harness-check.ps1",
+                    true,
+                ),
+                (
+                    "hook-launcher",
+                    "hook",
+                    "legacy-hook.fixture",
+                    "harness/bin/hook.ps1",
+                    true,
+                ),
+            ];
+            let mut links = Vec::new();
+            for (kind, name, source, destination, owned) in entries {
+                std::os::windows::fs::symlink_file(
+                    fixture.request.source.join(source),
+                    home.join(destination),
+                )
+                .unwrap();
+                links.push(json!({
+                    "kind": kind,
+                    "name": name,
+                    "source": fixture.request.source.join(source),
+                    "destination": home.join(destination),
+                    "owned": owned
+                }));
+            }
+            let metadata = home.join("harness/installation.json");
+            fs::write(
+                &metadata,
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 1,
+                    "sourceRoot": fixture.request.source,
+                    "codexHome": home,
+                    "userHome": fixture.request.user_home,
+                    "dependencyUserHome": fixture.request.dependency_user_home,
+                    "codexCommand": fixture.request.upstream,
+                    "profileName": "harness",
+                    "links": links,
+                    "pathScope": "Process",
+                    "pathAdded": false,
+                    "versions": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let adopted = FileGuard::capture_link(&home.join("harness.config.toml"))
+                .unwrap()
+                .object_identity()
+                .unwrap();
+            let old_source = fixture.request.source.clone();
+            let relocated = fixture.root.join("relocated источник");
+            fs::rename(&old_source, &relocated).unwrap();
+            fixture.request.source = relocated.clone();
+            fixture.record();
+            let report = connect(&fixture.request, false).unwrap();
+            assert_eq!(report.status, "connected");
+            assert!(report.runtime.unwrap().passed);
+            assert!(!home.join("harness/bin/codex.ps1").exists());
+            assert!(!home.join("harness/bin/codex-harness-check.ps1").exists());
+            assert!(relocated.join("legacy-diagnostic.fixture").exists());
+            assert_eq!(
+                fs::read_link(home.join("AGENTS.md")).unwrap(),
+                relocated.join("global/instructions.md")
+            );
+            assert_eq!(
+                fs::read_link(home.join("hooks.json")).unwrap(),
+                relocated.join("global/hooks.json")
+            );
+            assert_eq!(
+                fs::read_link(home.join("harness/bin/hook.ps1")).unwrap(),
+                relocated.join("legacy-hook.fixture")
+            );
+            assert_eq!(
+                fs::read_link(home.join("harness/bin/codex-harness-check.exe")).unwrap(),
+                fixture.request.build.join("codex-harness.exe")
+            );
+            let current = InstallationMetadata::read(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(current.settings().source_root, relocated);
+            let profile = current
+                .links()
+                .iter()
+                .find(|l| l.kind == "profile")
+                .unwrap();
+            assert!(!profile.owned);
+            assert_eq!(profile.object.identity, adopted);
+            fs::remove_file(home.join("hooks.json")).unwrap();
+            assert!(
+                connect(&fixture.request, false)
+                    .unwrap()
+                    .runtime
+                    .unwrap()
+                    .passed
+            );
+            assert_eq!(
+                fs::read_link(home.join("hooks.json")).unwrap(),
+                relocated.join("global/hooks.json")
+            );
+            let before = fs::read(&metadata).unwrap();
+            fs::remove_file(home.join("harness/bin/hook.ps1")).unwrap();
+            fs::write(home.join("harness/bin/hook.ps1"), b"foreign replacement").unwrap();
+            for preview in [true, false] {
+                assert!(connect(&fixture.request, preview).is_err());
+            }
+            assert_eq!(fs::read(&metadata).unwrap(), before);
+            assert_eq!(
+                fs::read(home.join("harness/bin/hook.ps1")).unwrap(),
+                b"foreign replacement"
+            );
+            assert!(!old_source.exists());
+        });
+    }
+
+    #[test]
+    #[ignore = "owned child of interrupted_relocated_old_layout_connect_recovers_without_opening_old_source"]
+    fn relocated_old_layout_connect_process_fixture() {
+        let root = PathBuf::from(std::env::var_os("HARNESS_CORE_INTERRUPT_ROOT").unwrap());
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("request.json")).unwrap()).unwrap();
+        let path = |key: &str| PathBuf::from(value[key].as_str().expect(key));
+        let request = Request {
+            source: path("source"),
+            build: path("build"),
+            codex_home: path("codex_home"),
+            user_home: path("user_home"),
+            dependency_user_home: path("dependency_user_home"),
+            upstream: value["upstream"].as_str().map(PathBuf::from),
+            timeout: Duration::from_millis(value["timeout_ms"].as_u64().unwrap()),
+            path_scope: Some(PathScope::Process),
+        };
+        connect(&request, false).expect("owned connect should hang in runtime verification");
+        panic!("runtime interruption was not reached");
+    }
+
+    #[test]
+    fn interrupted_relocated_old_layout_connect_recovers_without_opening_old_source() {
+        use std::time::{Duration, Instant};
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            let upstream = compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_interrupt.rs"),
+            );
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fixture.request.upstream = Some(upstream);
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            let home = fixture.request.codex_home.clone();
+            fs::create_dir_all(home.join("harness/bin")).unwrap();
+            for name in [
+                "legacy-launcher.fixture",
+                "legacy-hook.fixture",
+                "legacy-diagnostic.fixture",
+            ] {
+                fs::write(
+                    fixture.request.source.join(name),
+                    b"inert legacy source; never executed",
+                )
+                .unwrap();
+            }
+            let entries = [
+                (
+                    "instructions",
+                    "AGENTS",
+                    "global/instructions.md",
+                    "AGENTS.md",
+                    true,
+                ),
+                (
+                    "profile",
+                    "harness",
+                    "global/profile.toml",
+                    "harness.config.toml",
+                    false,
+                ),
+                (
+                    "launcher",
+                    "codex",
+                    "legacy-launcher.fixture",
+                    "harness/bin/codex.ps1",
+                    true,
+                ),
+                ("hooks", "hooks", "global/hooks.json", "hooks.json", true),
+                (
+                    "diagnostic-launcher",
+                    "codex-harness-check",
+                    "legacy-diagnostic.fixture",
+                    "harness/bin/codex-harness-check.ps1",
+                    true,
+                ),
+                (
+                    "hook-launcher",
+                    "hook",
+                    "legacy-hook.fixture",
+                    "harness/bin/hook.ps1",
+                    true,
+                ),
+            ];
+            let mut links = Vec::new();
+            for (kind, name, source, destination, owned) in entries {
+                std::os::windows::fs::symlink_file(
+                    fixture.request.source.join(source),
+                    home.join(destination),
+                )
+                .unwrap();
+                links.push(json!({
+                    "kind": kind,
+                    "name": name,
+                    "source": fixture.request.source.join(source),
+                    "destination": home.join(destination),
+                    "owned": owned
+                }));
+            }
+            let metadata = home.join("harness/installation.json");
+            fs::write(
+                &metadata,
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 1,
+                    "sourceRoot": fixture.request.source,
+                    "codexHome": home,
+                    "userHome": fixture.request.user_home,
+                    "dependencyUserHome": fixture.request.dependency_user_home,
+                    "codexCommand": fixture.request.upstream,
+                    "profileName": "harness",
+                    "links": links,
+                    "pathScope": "Process",
+                    "pathAdded": false,
+                    "versions": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let adopted = FileGuard::capture_link(&home.join("harness.config.toml"))
+                .unwrap()
+                .object_identity()
+                .unwrap();
+            let old_source = fixture.request.source.clone();
+            let relocated = fixture.root.join("relocated источник");
+            fs::rename(&old_source, &relocated).unwrap();
+            fixture.request.source = relocated.clone();
+            fixture.record();
+            let before = fs::read(&metadata).unwrap();
+            fs::write(
+                fixture.root.join("request.json"),
+                serde_json::to_vec(&json!({
+                    "source": fixture.request.source,
+                    "build": fixture.request.build,
+                    "codex_home": fixture.request.codex_home,
+                    "user_home": fixture.request.user_home,
+                    "dependency_user_home": fixture.request.dependency_user_home,
+                    "upstream": fixture.request.upstream,
+                    "timeout_ms": fixture.request.timeout.as_millis() as u64,
+                    "path_scope": "Process"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let mut command = crate::process::CommandSpec::new(exe);
+            command.args = vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "core_install::tests::relocated_old_layout_connect_process_fixture".into(),
+                "--nocapture".into(),
+            ];
+            command.env.insert(
+                "HARNESS_CORE_INTERRUPT_ROOT".into(),
+                Some(fixture.root.clone().into()),
+            );
+            let stdout = fs::File::create(fixture.root.join("child.stdout")).unwrap();
+            let stderr = fs::File::create(fixture.root.join("child.stderr")).unwrap();
+            command.stdout = Some(stdout);
+            command.stderr = Some(stderr);
+            let job = crate::process::Job::new(crate::process::Limits {
+                memory_bytes: Some(512 * 1024 * 1024),
+                cpu_percent: Some(50.0),
+            })
+            .unwrap();
+            let child = job.spawn(&command).unwrap();
+            let until = Instant::now() + Duration::from_secs(45);
+            let paused = fixture.root.join("paused-version");
+            let journal = home.join("harness/native-registration/journal.json");
+            while Instant::now() < until {
+                if paused.exists() && journal.exists() {
+                    break;
+                }
+                if !child.is_running().unwrap() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let observed = paused.exists() && journal.exists();
+            let outcome = job
+                .terminate(1, Duration::from_secs(5))
+                .expect("owned interrupted connect job");
+            assert!(
+                observed,
+                "runtime interruption was not observed: {}",
+                fixture.root.display()
+            );
+            assert_eq!(outcome.active_processes, 0);
+            assert!(
+                !home
+                    .join("harness/native-registration/complete.json")
+                    .exists()
+            );
+            assert!(journal.exists());
+            assert!(!home.join("harness/bin/codex.ps1").exists());
+            assert_eq!(
+                fs::read_link(home.join("harness/bin/codex.exe")).unwrap(),
+                fixture.request.build.join("codex.exe")
+            );
+            let preview = preview_recovery(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap();
+            assert_eq!(preview.status, "preview");
+            assert_eq!(preview.action, "rollback");
+            assert_eq!(preview.journal, Some("native"));
+            assert_ne!(fs::read(&metadata).unwrap(), before);
+            let report = recover(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap();
+            assert_eq!(report.status, "recovered");
+            assert!(!report.committed);
+            assert_eq!(fs::read(&metadata).unwrap(), before);
+            assert!(!journal.exists());
+            assert!(
+                !home
+                    .join("harness/native-registration/complete.json")
+                    .exists()
+            );
+            assert!(!home.join("harness/bin/codex.exe").exists());
+            assert_eq!(
+                fs::read_link(home.join("harness/bin/codex.ps1")).unwrap(),
+                old_source.join("legacy-launcher.fixture")
+            );
+            assert_eq!(
+                fs::read_link(home.join("harness/bin/codex-harness-check.ps1")).unwrap(),
+                old_source.join("legacy-diagnostic.fixture")
+            );
+            assert_eq!(
+                fs::read_link(home.join("hooks.json")).unwrap(),
+                old_source.join("global/hooks.json")
+            );
+            assert_eq!(
+                fs::read_link(home.join("harness/bin/hook.ps1")).unwrap(),
+                old_source.join("legacy-hook.fixture")
+            );
+            assert_eq!(
+                fs::read_link(home.join("AGENTS.md")).unwrap(),
+                old_source.join("global/instructions.md")
+            );
+            let profile = FileGuard::capture_link(&home.join("harness.config.toml"))
+                .unwrap()
+                .object_identity()
+                .unwrap();
+            assert_eq!(profile, adopted);
+            assert_eq!(
+                fs::read(relocated.join("global/instructions.md")).unwrap(),
+                b"Owned native core acceptance. Preserve foreign data.\n"
+            );
+            assert_eq!(
+                fs::read(relocated.join("legacy-hook.fixture")).unwrap(),
+                b"inert legacy source; never executed"
+            );
+            assert!(!old_source.exists());
+            let idle_preview = preview_recovery(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap();
+            assert_eq!(idle_preview.action, "none");
+            let idle = recover(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap();
+            assert_eq!(idle.status, "recovered");
+            assert!(!idle.committed);
+        });
+    }
+
+    #[test]
+    fn process_scope_connect_check_repeat_and_disconnect_preserve_unrelated_records() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            let upstream = compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_features.rs"),
+            );
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fixture.request.upstream = Some(upstream);
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            let home = fixture.request.codex_home.clone();
+            fs::create_dir_all(home.join("harness")).unwrap();
+            let token = home.join("harness/token-workflow.json");
+            let subscriptions = home.join("harness/subscription-routing.json");
+            fs::write(&token, b"{\"enabled\":true}").unwrap();
+            fs::write(
+                &subscriptions,
+                b"{\"owner\":\"codex-harness-subscriptions\"}",
+            )
+            .unwrap();
+            let token_before = fs::read(&token).unwrap();
+            let subscriptions_before = fs::read(&subscriptions).unwrap();
+            let preview = connect(&fixture.request, true).unwrap();
+            assert_eq!(preview.status, "preview");
+            assert_eq!(fs::read(&token).unwrap(), token_before);
+            assert_eq!(fs::read(&subscriptions).unwrap(), subscriptions_before);
+            let first = connect(&fixture.request, false).unwrap();
+            assert_eq!(first.status, "connected");
+            assert!(first.runtime.unwrap().passed);
+            let second = connect(&fixture.request, false).unwrap();
+            assert_eq!(second.status, "connected");
+            assert!(second.runtime.unwrap().passed);
+            let checked = crate::core_check::check(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+                Duration::from_secs(45),
+            )
+            .unwrap();
+            assert_eq!(checked.status, "connected");
+            assert!(checked.runtime.passed);
+            let preview_disconnect = crate::core_disconnect::disconnect(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+                true,
+            )
+            .unwrap();
+            assert_eq!(preview_disconnect.status, "preview");
+            assert!(home.join("harness/bin/codex.exe").exists());
+            let disconnected = crate::core_disconnect::disconnect(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+                false,
+            )
+            .unwrap();
+            assert_eq!(disconnected.status, "disconnected");
+            assert!(!home.join("harness/bin/codex.exe").exists());
+            assert!(!home.join("AGENTS.md").exists());
+            assert_eq!(fs::read(&token).unwrap(), token_before);
+            assert_eq!(fs::read(&subscriptions).unwrap(), subscriptions_before);
+            let idle = crate::core_disconnect::disconnect(
+                &home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+                false,
+            )
+            .unwrap();
+            assert_eq!(idle.status, "not-connected");
         });
     }
 

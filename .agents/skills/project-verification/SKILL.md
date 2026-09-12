@@ -17,7 +17,15 @@ Reuse the project's runtime and commands, including cwd, setup, flags and suppor
 
 Identify the actual source entrypoint or resolved executable, runtime version, build configuration and relevant generated/bundled assets. Trace launch wrappers far enough to know which artifact they execute. A global binary on PATH or cached bundle may differ from edited source. Rebuild through the native preparation path when needed, then record the selected artifact and relevant inputs. Do not replace the intended binary or weaken expected behavior to obtain a pass.
 
+Establish a coherent prepared path, including the test driver and its required support artifacts. A pin on one product artifact does not justify suppressing preparation of other required dependencies. Follow the current native dependency boundary, refresh affected outputs and reuse still-valid ones before running the consuming check; do not discover each stale prerequisite through another full run.
+
 When recording commands or resuming saved work, read [command records](references/command-records.md). Use the consuming project's existing documentation home; create a small local validation document only if useful knowledge has no existing home. Keep detailed or sensitive logs in appropriate local evidence storage.
+
+## Choose the feedback boundary
+
+After a failure, establish whether preparation, the test driver, the product, or observation failed, and whether the intended product action occurred. A driver failure before that action leaves the product untested. When full runs repeatedly discover small unknowns in one layer, isolate that layer's question and meaningful check before another dependent full run, even if every error is different. One informative failure can expose enough unknowns to justify extraction.
+
+Give the smaller task explicit inputs, necessary state and a result the parent path can consume. Preserve the original trigger, timing and integration conditions; reject a passing reduction that removed them. Correct an understood preparation mismatch through its existing refresh path; use `reproduce-regression` when a current intended artifact exhibits a CLI/MCP/process regression within that skill's scope. For unfamiliar interactions, verify the needed transitions and return paths in an owned prepared environment, then exercise the reusable mechanism through the actual parent entry point. An exploratory recipe is not product acceptance. Keep the required full check when no smaller scenario can answer the question; a cheap understood correction needs no new helper or worker.
 
 ## Execute and finish
 

@@ -27,6 +27,8 @@ pub struct Registration {
     pub state: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<PathBuf>,
+    #[serde(default)]
+    pub task_control: bool,
     pub upstream: Upstream,
 }
 
@@ -162,7 +164,11 @@ pub fn codex_home() -> io::Result<PathBuf> {
 
 /// Registration is produced by explicit installation. Ordinary launch performs
 /// no discovery, compilation, package acquisition or registration mutation.
-pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
+fn prepared_command(
+    executable: &Path,
+    home: &Path,
+    args: &[OsString],
+) -> io::Result<(Command, bool)> {
     let mut bytes = Vec::new();
     File::open(home.join("harness/native-launch.json"))?
         .take(REGISTRATION_LIMIT + 1)
@@ -255,7 +261,11 @@ pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<
         command.env("CODEX_MANAGED_PACKAGE_ROOT", root);
         command.env(package.manager.variable(), "1");
     }
-    Ok(command)
+    Ok((command, registration.task_control))
+}
+
+pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
+    prepared_command(executable, home, args).map(|(command, _)| command)
 }
 
 #[cfg(windows)]
@@ -294,9 +304,23 @@ impl Drop for ConsoleHandler {
 }
 
 pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32> {
-    let mut command = command(executable, home, args)?;
+    let (mut command, task_control) = prepared_command(executable, home, args)?;
     #[cfg(windows)]
     let _console = ConsoleHandler::install()?;
+    #[cfg(windows)]
+    if task_control
+        && let Some(code) = crate::task_runtime::run(
+            &command,
+            &executable
+                .canonicalize()?
+                .parent()
+                .ok_or_else(|| fail("launcher has no build directory"))?
+                .join("codex-harness.exe"),
+            home,
+        )?
+    {
+        return Ok(code);
+    }
     // Unlike bounded helper jobs, ordinary upstream sessions may deliberately
     // leave managed background processes alive. Inherit streams and the console
     // directly and do not impose a kill-on-wrapper-close job on the CLI.
@@ -304,4 +328,312 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     status
         .code()
         .ok_or_else(|| fail("upstream terminated without an exit code"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::{
+        build_identity,
+        process::{CommandSpec, Deadline, Job, Limits, StopReason},
+    };
+    use serde_json::json;
+    use std::{
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+        process::Stdio,
+        time::Duration,
+    };
+
+    fn rustc() -> PathBuf {
+        let output = std::process::Command::new("where.exe")
+            .arg("rustc.exe")
+            .output()
+            .unwrap();
+        PathBuf::from(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+    }
+
+    fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {
+        let stem = name.trim_end_matches(".exe");
+        let output = std::path::absolute(root).unwrap().join(name);
+        fs::write(root.join(format!("{stem}.rs")), source).unwrap();
+        let mut command = CommandSpec::new(rustc());
+        command.args = vec![
+            root.join(format!("{stem}.rs")).into_os_string(),
+            "--edition=2024".into(),
+            "-o".into(),
+            output.as_os_str().to_owned(),
+        ];
+        let log = fs::File::create(root.join(format!("{name}.compile.log"))).unwrap();
+        command.stdout = Some(log.try_clone().unwrap());
+        command.stderr = Some(log);
+        let job = Job::new(Limits {
+            memory_bytes: Some(512 * 1024 * 1024),
+            cpu_percent: Some(50.0),
+        })
+        .unwrap();
+        let child = job.spawn(&command).unwrap();
+        let outcome = job
+            .wait(
+                &child,
+                Deadline::after(Duration::from_secs(30)).unwrap(),
+                &crate::process::Cancellation::default(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            (outcome.reason, outcome.exit_code),
+            (StopReason::Exited, 0),
+            "{name} compile evidence: {}",
+            root.display()
+        );
+        output
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        home: PathBuf,
+        launcher: PathBuf,
+        upstream: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("native-launch проба-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let source = root.join("source");
+            let build = root.join("build");
+            let home = root.join("codex");
+            for dir in [
+                source.join("global/agents"),
+                source.join("skills/one"),
+                source.join("crates/one/src"),
+                source.join("tools/rtk-adapter/src"),
+                source
+                    .join(build_identity::INSPECTION_SCHEMA)
+                    .parent()
+                    .unwrap()
+                    .to_owned(),
+                build.clone(),
+                home.join("harness"),
+            ] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            for file in [
+                "Cargo.toml",
+                "Cargo.lock",
+                "crates/one/src/lib.rs",
+                build_identity::INSPECTION_SCHEMA,
+            ] {
+                fs::write(source.join(file), b"fixture").unwrap();
+            }
+            fs::write(
+                source.join("global/profile.toml"),
+                "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\n",
+            )
+            .unwrap();
+            fs::write(
+                source.join("global/kit.json"),
+                serde_json::to_vec(&json!({
+                    "schema":1,
+                    "profile_name":"harness",
+                    "profile":"global/profile.toml",
+                    "instructions":"global/instructions.md",
+                    "skills":"skills",
+                    "agents":"global/agents",
+                    "hooks":"global/hooks.json",
+                    "token_hooks":"global/token-hooks.json"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let compile = root.join("compile");
+            fs::create_dir_all(&compile).unwrap();
+            let launcher = compile_fixture(
+                &compile,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            let upstream = compile_fixture(
+                &compile,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_launch_target.rs"),
+            );
+            fs::copy(&launcher, build.join("codex.exe")).unwrap();
+            for binary in build_identity::BINARIES
+                .iter()
+                .filter(|name| **name != "codex.exe")
+            {
+                fs::write(build.join(binary), binary.as_bytes()).unwrap();
+            }
+            let record = build_identity::BuildRecord {
+                schema: build_identity::SCHEMA,
+                source_root: source.clone(),
+                source: build_identity::source_identity(&source).unwrap(),
+                rustc: "fixture".into(),
+                cargo: "fixture".into(),
+                target: "x86_64-pc-windows-msvc".into(),
+                profile: "release".into(),
+                binaries: build_identity::BINARIES
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.to_string(),
+                            build_identity::hash_file(&build.join(name)).unwrap(),
+                        )
+                    })
+                    .collect(),
+            };
+            fs::write(
+                build.join("build.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                home.join("harness/native-launch.json"),
+                serde_json::to_vec_pretty(&Registration {
+                    schema: 2,
+                    state: None,
+                    build: Some(build.clone()),
+                    task_control: false,
+                    upstream: Upstream {
+                        executable: upstream.clone(),
+                        sha256: build_identity::hash_file(&upstream).unwrap(),
+                        package: None,
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            Self {
+                root,
+                home,
+                launcher: build.join("codex.exe"),
+                upstream,
+            }
+        }
+    }
+
+    #[test]
+    fn command_refuses_self_recursion_and_wrong_upstream() {
+        let fixture = Fixture::new();
+        let mut registration: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.home.join("harness/native-launch.json")).unwrap(),
+        )
+        .unwrap();
+        registration["upstream"]["executable"] = json!(fixture.launcher);
+        registration["upstream"]["sha256"] =
+            json!(build_identity::hash_file(&fixture.launcher).unwrap());
+        fs::write(
+            fixture.home.join("harness/native-launch.json"),
+            serde_json::to_vec_pretty(&registration).unwrap(),
+        )
+        .unwrap();
+        let error = command(&fixture.launcher, &fixture.home, &[]).unwrap_err();
+        assert!(error.to_string().contains("harness launcher"), "{}", error);
+
+        let foreign = fixture.root.join("foreign.exe");
+        fs::write(&foreign, b"not-the-registered-upstream").unwrap();
+        registration["upstream"]["executable"] = json!(foreign);
+        fs::write(
+            fixture.home.join("harness/native-launch.json"),
+            serde_json::to_vec_pretty(&registration).unwrap(),
+        )
+        .unwrap();
+        let error = command(&fixture.launcher, &fixture.home, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("upstream executable changed"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn command_refuses_a_different_selected_launcher() {
+        let fixture = Fixture::new();
+        let other = fixture.root.join("other-codex.exe");
+        fs::copy(&fixture.launcher, &other).unwrap();
+        let error = command(&other, &fixture.home, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("not the selected native build"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn isolated_launch_forwards_unicode_argv_stdin_streams_and_exit() {
+        let fixture = Fixture::new();
+        let mut prepared = command(
+            &fixture.launcher,
+            &fixture.home,
+            &[
+                "exec".into(),
+                "путь с пробелами".into(),
+                "quote\"inside".into(),
+            ],
+        )
+        .unwrap();
+        prepared
+            .env("HARNESS_UPSTREAM_EXIT", "7")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = prepared.spawn().unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all("Кириллица\nsecond line".as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("exec\u{1f}путь с пробелами\u{1f}quote\"inside"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("approval_policy=\"never\""), "{stdout}");
+        assert!(stdout.contains("STDIN:Кириллица\nsecond line"), "{stdout}");
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), "ERR:ok");
+        assert!(fixture.upstream.exists());
+    }
+
+    #[test]
+    fn task_effort_is_applied_before_the_registered_upstream() {
+        let fixture = Fixture::new();
+        let mut prepared = command(
+            &fixture.launcher,
+            &fixture.home,
+            &[
+                "--harness-effort".into(),
+                "routine".into(),
+                "exec".into(),
+                "hello".into(),
+            ],
+        )
+        .unwrap();
+        prepared.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = prepared.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("exec\u{1f}hello"), "{stdout}");
+        assert!(stdout.contains("approval_policy=\"never\""), "{stdout}");
+        assert!(stdout.contains("exec\u{1f}hello"), "{stdout}");
+        assert!(
+            stdout.contains("model_reasoning_effort=\"low\""),
+            "{stdout}"
+        );
+    }
 }

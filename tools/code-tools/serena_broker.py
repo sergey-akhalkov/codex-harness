@@ -343,6 +343,14 @@ class ProjectPool:
         return created
 
     def dispatch(self, operation: str, payload: dict[str, Any], deadline: float) -> Any:
+        if operation == "status":
+            # Endpoint liveness must remain readable while a worker starts or
+            # executes a long tool. Snapshot membership before inspecting the
+            # immutable route/PID fields; provider work stays serialized below.
+            workers = tuple(self.workers.items())
+            return {"clients": len(self.clients), "workers": [
+                {"pid": item.process.pid, "project": item.route["project"], "key": key}
+                for key, item in workers]}
         remaining = max(0, deadline - time.time())
         if not self.lock.acquire(timeout=remaining):
             raise TimeoutError("Serena shared operation is busy")
@@ -350,10 +358,6 @@ class ProjectPool:
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise TimeoutError("Serena request expired before admission")
-            if operation == "status":
-                return {"clients": len(self.clients), "workers": [
-                    {"pid": item.process.pid, "project": item.route["project"], "key": key}
-                    for key, item in self.workers.items()]}
             if operation != "disconnect":
                 assert_activation_ready()
             self.used = time.monotonic()

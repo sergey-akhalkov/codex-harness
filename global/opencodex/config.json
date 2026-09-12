@@ -4,6 +4,20 @@
   "appOwnedMemoryBudgetMb": 256,
   "hostname": "127.0.0.1",
   "providers": {
+    "zai": {
+      "adapter": "openai-chat",
+      "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+      "authMode": "key",
+      "apiKey": "${ZAI_API_KEY}",
+      "defaultModel": "glm-5.3",
+      "models": [
+        "glm-5.3"
+      ],
+      "selectedModels": [
+        "glm-5.3"
+      ],
+      "liveModels": false
+    },
     "openai": {
       "adapter": "openai-responses",
       "baseUrl": "https://chatgpt.com/backend-api/codex",
@@ -28,6 +42,9 @@
         "grok-4.20-0309-non-reasoning",
         "grok-build-0.1",
         "grok-composer-2.5-fast"
+      ],
+      "selectedModels": [
+        "grok-4.6"
       ],
       "modelContextWindows": {
         "grok-4.6": 500000,
@@ -64,15 +81,6 @@
           "image"
         ]
       },
-      "noReasoningModels": [
-        "grok-4.20-0309-non-reasoning",
-        "grok-build-0.1",
-        "grok-composer-2.5-fast"
-      ],
-      "noVisionModels": [
-        "grok-build-0.1",
-        "grok-composer-2.5-fast"
-      ],
       "modelReasoningEfforts": {
         "grok-4.6": [
           "low",
@@ -98,11 +106,21 @@
         "grok-4.3",
         "grok-4.20-0309-reasoning"
       ],
-      "liveModels": true
+      "liveModels": true,
+      "noReasoningModels": [
+        "grok-4.20-0309-non-reasoning",
+        "grok-build-0.1",
+        "grok-composer-2.5-fast"
+      ],
+      "noVisionModels": [
+        "grok-build-0.1",
+        "grok-composer-2.5-fast"
+      ]
     }
   },
   "defaultProvider": "openai",
-  "fastRows": true,
+  "fastRows": false,
+  "emptyCompletionRetry": true,
   "openaiProviderTierVersion": 2,
   "subagentModelsVersion": 1,
   "subagentModels": [
@@ -116,6 +134,18 @@
   "multiAgentGuidanceEnabled": false,
   "syncCodexSubagentDefaults": false,
   "codexShimAutoRestore": false,
+  "disabledModels": [
+    "gpt-5.2",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest"
+  ],
   "multiAgentMode": "v1",
   "claudeCode": {
     "enabled": false,
@@ -135,5 +165,27 @@
     "backend": "openai",
     "model": "gpt-6-astra"
   },
-  "emptyCompletionRetry": true
+  "modelDiscovery": {
+    "knownModels": {
+      "openai": {
+        "ids": [],
+        "removed": [],
+        "updatedAt": "2026-09-11T17:43:08.330Z"
+      },
+      "xai": {
+        "ids": [
+          "grok-4.20-0309-non-reasoning",
+          "grok-4.20-0309-reasoning",
+          "grok-4.20-multi-agent-0309",
+          "grok-4.3",
+          "grok-4.5",
+          "grok-4.6",
+          "grok-build-0.1",
+          "grok-composer-2.5-fast"
+        ],
+        "removed": [],
+        "updatedAt": "2026-09-11T17:43:08.330Z"
+      }
+    }
+  }
 }

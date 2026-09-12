@@ -430,8 +430,10 @@ function Invoke-HarnessCodeTools {
     }
     if (-not $packageRoot) { $packageRoot = $CodeGraphPackageRoot }
     $selectedCodeGraph = $ownedCodeGraph -or ($nativeProjection -and $nativeProjection.ContainsKey('registrations') -and $nativeProjection.registrations -and $nativeProjection.registrations.ContainsKey('codegraph'))
+    $nativeResources = $null
     if ($selectedCodeGraph) {
         if (-not $manager) { throw 'Selected CodeGraph activation requires a native manager; existing connections are preserved.' }
+        $nativeResources = if ($nativeProjection -and $nativeProjection.ContainsKey('resources')) { $nativeProjection.resources } else { @{ status = 'degraded'; reason = 'Native resource projection is unavailable; update the owned manager.' } }
         $planProjection = @{}
         if ($nativeProjection) { foreach ($key in @($nativeProjection.Keys)) { $planProjection[$key] = $nativeProjection[$key] } }
         if (-not $planProjection.ContainsKey('registrations') -or $null -eq $planProjection.registrations) { $planProjection['registrations'] = @{} }
@@ -450,13 +452,13 @@ function Invoke-HarnessCodeTools {
         # They do not select the retired, separately owned harness LSP backend.
         $lsp = @{ schema_version = 1; servers = @{} }
         Write-CodeToolsRegistries $CodexHome $inventory $lsp $Checkpoint
-        $resourceHealth = if ($selectedCodeGraph) { $nativeProjection.resources } else { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode apply -DeferCommit:$DeferCommit -TransactionId $TransactionId }
+        $resourceHealth = if ($selectedCodeGraph) { $nativeResources } else { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode apply -DeferCommit:$DeferCommit -TransactionId $TransactionId }
         if ($Checkpoint) { & $Checkpoint 'resources' }
         if (-not $DeferCommit) { Remove-CodeToolsFile (Join-Path $CodexHome 'harness/code-tools-files-pending.json') }
     }
     $health = $null
     if (-not $Preview -and $Mode -eq 'Check' -and (Test-Path -LiteralPath $runtime.registry)) {
-        try { $resourceHealth = if ($selectedCodeGraph) { $nativeProjection.resources } else { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode check } }
+        try { $resourceHealth = if ($selectedCodeGraph) { $nativeResources } else { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode check } }
         catch { $resourceHealth = @{ status = 'degraded'; reason = $_.Exception.Message } }
         $health = Invoke-CodeToolsPythonJson $runtime.python @((Join-Path $SourceRoot 'tools/code-tools/check.py'), '--registry', $runtime.registry, '--codex-home', $CodexHome)
     }

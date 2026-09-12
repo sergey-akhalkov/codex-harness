@@ -1237,7 +1237,6 @@ pub(crate) fn plan(links: &[Link]) -> io::Result<Vec<Record>> {
     let mut records: Vec<Record> = Vec::new();
     let mut names = Vec::new();
     for link in links {
-        let source = exact_source(&link.source)?;
         let destination = exact_destination(&link.destination)?;
         if !seen.insert(destination.clone()) {
             return Err(invalid("duplicate registration destination"));
@@ -1250,17 +1249,33 @@ pub(crate) fn plan(links: &[Link]) -> io::Result<Vec<Record>> {
         let name = native::destination_name(&destination)?;
         reject_destination_overlap(&names, &name)?;
         names.push(name);
-        let link_type = source_type(&source)?;
         match inspect(&destination)? {
+            Presence::Owned(existing_type, target)
+                if native::targets_match(&target, &link.source)? =>
+            {
+                // Reuse the live destination without opening its recorded
+                // source. Relocation can leave that name dangling.
+                let source = recorded_source(&link.source)?;
+                records.push(Record::new(destination, existing_type, source, false)?);
+            }
             Presence::Missing => {
+                let source = exact_source(&link.source)?;
+                let link_type = source_type(&source)?;
                 records.push(Record::new(destination, link_type, source, true)?);
             }
-            Presence::Owned(existing_type, target)
-                if existing_type == link_type && same_target(&target, &source) =>
-            {
-                records.push(Record::new(destination, link_type, source, false)?);
+            Presence::Owned(existing_type, target) => {
+                let source = exact_source(&link.source)?;
+                let link_type = source_type(&source)?;
+                if existing_type == link_type && same_target(&target, &source) {
+                    records.push(Record::new(destination, link_type, source, false)?);
+                } else {
+                    return Err(invalid(&format!(
+                        "Foreign destination exists; preserving it: {}",
+                        destination.display()
+                    )));
+                }
             }
-            Presence::Owned(_, _) | Presence::Foreign => {
+            Presence::Foreign => {
                 return Err(invalid(&format!(
                     "Foreign destination exists; preserving it: {}",
                     destination.display()
@@ -1478,11 +1493,16 @@ fn source_type(source: &Path) -> io::Result<LinkType> {
     }
 }
 
-fn exact_source(path: &Path) -> io::Result<PathBuf> {
+fn recorded_source(path: &Path) -> io::Result<PathBuf> {
     refuse_escape(path)?;
     inventory::ordinary_parents(path)?;
-    build_identity::ordinary(path)?;
     std::path::absolute(path)
+}
+
+fn exact_source(path: &Path) -> io::Result<PathBuf> {
+    let path = recorded_source(path)?;
+    build_identity::ordinary(&path)?;
+    Ok(path)
 }
 
 fn exact_destination(path: &Path) -> io::Result<PathBuf> {
@@ -1697,6 +1717,27 @@ mod destination_tests {
         );
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         assert_eq!(fs::read(source).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn plan_reuses_a_dangling_recorded_source_without_opening_it() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("link");
+        let missing = root.path().join("old-source.txt");
+        std::os::windows::fs::symlink_file(&missing, &destination).unwrap();
+        let planned = plan(&[Link {
+            kind: "profile".into(),
+            name: "harness".into(),
+            source: missing.clone(),
+            destination: destination.clone(),
+            connection: crate::inventory::Connection::Linked,
+        }])
+        .unwrap();
+        assert_eq!(planned.len(), 1);
+        assert!(!planned[0].created);
+        assert_eq!(planned[0].target, std::path::absolute(&missing).unwrap());
+        assert_eq!(fs::read_link(&destination).unwrap(), missing);
+        assert!(!missing.exists());
     }
 }
 

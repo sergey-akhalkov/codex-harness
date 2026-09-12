@@ -31,7 +31,7 @@ function Get-BoundedPlainPath([string]$Value, [string]$Kind, [switch]$MayBeAbsen
 if (-not $IsWindows) { throw 'The bounded OpenCodex runner requires Windows.' }
 $RequestPath = Get-BoundedPlainPath $RequestPath 'Request file'
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json -AsHashtable
-$allowed = @('executable','arguments','workingDirectory','stdoutPath','stderrPath','environment','memoryLimitMiB','timeoutSeconds','startedPath')
+$allowed = @('executable','arguments','workingDirectory','stdoutPath','stderrPath','environment','secretFiles','memoryLimitMiB','timeoutSeconds','startedPath')
 foreach ($key in $request.Keys) { if ($key -cnotin $allowed) { throw "Unknown bounded process request field: $key" } }
 foreach ($key in @('executable','workingDirectory','stdoutPath','stderrPath')) {
     if (-not $request.ContainsKey($key) -or $request[$key] -isnot [string]) { throw "Bounded process request needs string field $key." }
@@ -68,6 +68,26 @@ if ($request.ContainsKey('arguments')) {
 }
 $environment = if ($request.ContainsKey('environment')) { $request.environment } else { @{} }
 if ($environment -isnot [Collections.IDictionary]) { throw 'Environment must be an object.' }
+if ($request.ContainsKey('secretFiles')) {
+    if ($request.secretFiles -isnot [Collections.IDictionary]) { throw 'secretFiles must be an object of environment names to file paths.' }
+    $injected = [ordered]@{}
+    foreach ($name in @($request.secretFiles.Keys)) {
+        if ($name -cnotmatch '^[A-Z][A-Z0-9_]*$') { throw 'Secret environment names must be uppercase identifiers.' }
+        if ($environment.Contains($name)) { throw "Request environment must not include secret name $name." }
+        $secretPath = $request.secretFiles[$name]
+        if ($secretPath -isnot [string]) { throw "Secret file for $name must be a string path." }
+        $secretPath = Get-BoundedPlainPath $secretPath 'Secret file'
+        if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) { throw "Secret file for $name does not exist." }
+        $info = Get-Item -LiteralPath $secretPath -Force
+        if ($info.Length -le 0 -or $info.Length -gt 8192) { throw "Secret file for $name must be between 1 and 8192 bytes." }
+        $bytes = [IO.File]::ReadAllBytes($secretPath)
+        if ($bytes.IndexOf([byte]0) -ge 0) { throw "Secret file for $name must not contain NUL." }
+        $value = [Text.UTF8Encoding]::new($false).GetString($bytes).Trim()
+        if (-not $value -or $value -match '[\r\n]') { throw "Secret file for $name must be a single non-empty line." }
+        $injected[$name] = $value
+    }
+    foreach ($name in $injected.Keys) { $environment[$name] = $injected[$name] }
+}
 $memoryMiB = if ($request.ContainsKey('memoryLimitMiB')) { $request.memoryLimitMiB } else { 768 }
 $timeoutSeconds = if ($request.ContainsKey('timeoutSeconds')) { $request.timeoutSeconds } else { 300 }
 if ($memoryMiB -isnot [long] -and $memoryMiB -isnot [int]) { throw 'memoryLimitMiB must be an integer.' }

@@ -46,7 +46,7 @@ const fs = require('node:fs');
 const {spawn} = require('node:child_process');
 const [mode, ...args] = process.argv.slice(2);
 if (mode === 'normal') {
-  console.log(JSON.stringify({argv: args, env: process.env.CODEX_BOUNDED_TEST, stdin: fs.readFileSync(0, 'utf8')}));
+  console.log(JSON.stringify({argv: args, env: process.env.CODEX_BOUNDED_TEST, zai: process.env.ZAI_API_KEY || null, stdin: fs.readFileSync(0, 'utf8')}));
   console.error('fixture stderr');
   process.exitCode = 7;
 } else if (mode === 'linger') {
@@ -91,6 +91,24 @@ try {
     Assert-True (-not ([IO.File]::ReadAllText($normal.Result).Contains('private-environment-sentinel'))) 'Result exposed environment values.'
     Assert-True ($result.PeakJobMemoryBytes -gt 0 -and $result.PeakJobMemoryBytes -le $result.MemoryLimitBytes) 'Normal job memory accounting failed.'
     $passed++; Write-Output 'PASS normal exit, argv, private environment, redirected stdio, memory accounting'
+
+    $secretPath = Join-Path $fixtureRoot 'zai-key.txt'
+    [IO.File]::WriteAllText($secretPath, 'synthetic-zai-secret-must-not-print')
+    $secretRequest = New-Request secret @('normal') -Environment @{ CODEX_BOUNDED_TEST = 'private-environment-sentinel' }
+    $secretJson = Get-Content -LiteralPath $secretRequest.Path -Raw | ConvertFrom-Json -AsHashtable
+    $secretJson.secretFiles = @{ ZAI_API_KEY = $secretPath }
+    [IO.File]::WriteAllText($secretRequest.Path, ($secretJson | ConvertTo-Json -Depth 8))
+    $secretResult = & $runner -RequestPath $secretRequest.Path -ResultPath $secretRequest.Result -PassThru
+    Assert-True ($secretResult.Status -eq 'exited' -and $secretResult.AssignedBeforeResume) 'Secret injection did not run the fixture.'
+    $secretOut = Get-Content -LiteralPath $secretRequest.Data.stdoutPath -Raw
+    $secretPayload = $secretOut | ConvertFrom-Json
+    Assert-True ($secretPayload.env -eq 'private-environment-sentinel' -and $secretPayload.zai -eq 'synthetic-zai-secret-must-not-print') 'Secret was not injected into child env.'
+    Assert-True (-not $secretOut.Contains('zai-key.txt') -or $secretPayload.zai -eq 'synthetic-zai-secret-must-not-print') 'Secret injection stdout contract failed.'
+    $requestText = [IO.File]::ReadAllText($secretRequest.Path)
+    $resultText = [IO.File]::ReadAllText($secretRequest.Result)
+    Assert-True ($requestText.Contains('secretFiles') -and -not $requestText.Contains('synthetic-zai-secret-must-not-print')) 'Secret value leaked into the request JSON.'
+    Assert-True (-not $resultText.Contains('synthetic-zai-secret-must-not-print')) 'Secret value leaked into the result JSON.'
+    $passed++; Write-Output 'PASS secretFiles injects child env without writing the secret into request JSON'
 
     $before = [IO.File]::ReadAllText($normal.Data.stdoutPath)
     $rejected = $false
@@ -165,3 +183,4 @@ finally {
     if ((Split-Path $resolvedRoot) -ine $expectedParent -or (Split-Path $resolvedRoot -Leaf) -notlike 'codex-subscription-process-*') { throw 'Refusing fixture cleanup outside the explicit temporary workspace.' }
     Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
 }
+

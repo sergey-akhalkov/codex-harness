@@ -5,7 +5,9 @@ launcher and pinned [OpenCodex](https://github.com/lidge-jun/opencodex) **2.44.0
 source commit `07b48da8fd63881e848d26e0bd50087864f5573e`. OpenCodex accepts
 requests on `127.0.0.1:10100` and forwards them to the selected provider. The
 main model remains GPT-6 Astra. The [middle](../global/opencodex/agents/middle.toml)
-role selects `xai/grok-4.6` and reasoning `xhigh`. See
+role selects `xai/grok-4.6` and reasoning `xhigh`. Ordinary `/model` lists
+only `gpt-6-astra`, `xai/grok-4.6`, and `zai/glm-5.3` after the
+host-private Z.AI key is stored. See
 [subscription-model-routing](../openspec/specs/subscription-model-routing/spec.md)
 and [project decisions](project-decisions.md#subscriptions).
 
@@ -17,6 +19,7 @@ From the pack checkout:
 ./install.ps1 -WhatIf
 ./install.ps1
 ./tools/opencodex-login.ps1
+./tools/opencodex-zai-login.ps1
 ./install.ps1 -Mode Check
 ```
 
@@ -43,6 +46,19 @@ paste it into that local form; do not send the code in chat. Login is limited
 to six minutes and a separate 768 MiB job. Use separate OAuth; do not copy
 OpenCode tokens. Do not use ordinary `ocx login` in a process without
 interactive stdin: the pinned version reproduced a closed-stdin retry defect.
+
+Z.AI uses the same kit helper family, not stock `ocx login zai` or
+`ocx provider add --api-key`. Paste the Coding Plan key into
+`./tools/opencodex-zai-login.ps1` (stdin or `-KeyFile`). The helper writes an
+ACL-hardened file under `CODEX_HOME/harness/subscriptions/` and never copies
+the local `codex --profile zai` files. Linked OpenCodex source keeps only the
+`ZAI_API_KEY` environment reference. Check reports `glmReady` only after that
+private store exists and the running proxy request lists that store in
+`secretFiles`. A key written after process start is not enough: the live
+proxy still has an empty `ZAI_API_KEY` until it is restarted. Disconnect
+leaves the store and local profile in place. Run Z.AI login before Install,
+or follow login with `./install.ps1 -SubscriptionsOnly` from an independent
+terminal after sessions that use the proxy have finished.
 
 OAuth stays in `~/.opencodex/auth.json`; logs and installation state stay on
 the machine, outside the repository. After moving the pack to another computer,
@@ -86,11 +102,26 @@ configured. An unavailable assigned model should produce a visible error.
 
 ## Models, subscription and other providers
 
-An authorized `/v1/models` listing returned `grok-4.6` and `grok-4.5`. A
-verified `grok-4.6` request received a server name `grok-4.6-build`. That name
-came from xAI; OpenCodex did not choose a different model. The static OpenCodex
-catalogue contains other Grok IDs, so a menu string alone does not prove account
-availability.
+Ordinary `/model` and authorized `/v1/models` list only `gpt-6-astra`,
+`xai/grok-4.6`, and `zai/glm-5.3`. Other native GPT ids, other Grok ids,
+other GLM family ids, and synthetic `--fast` rows are hidden. A verified
+`grok-4.6` request received a server name `grok-4.6-build`. That name came
+from xAI; OpenCodex did not choose a different model. A menu string still does
+not prove account availability for a hidden id.
+An already running proxy keeps its startup roster for live `GET /v1/models`
+until that process is restarted from an independent terminal; `ocx sync`
+updates the on-disk catalogue that ordinary `/model` reads.
+The linked `config.json` is also runtime state for the pinned proxy: every
+start reconciles OAuth provider `models` presets and persists `modelDiscovery`
+there. The picker contract is therefore enforced by per-provider
+`selectedModels` plus `disabledModels` for native ids; source validation
+accepts the runtime-maintained roster and only requires the routed `grok-4.6`
+id. An exact-roster assertion breaks the scheduled task after the first proxy
+start and restores the native GPT-only catalogue.
+Routed `zai/glm-5.3` advertises Code Mode like other routed rows
+(`tool_mode: "code_mode_only"`); a `codexToolMode: "shell"` opt-out removes
+that advertisement and makes Codex warn on every GLM switch, so it is not
+used. Global Code Mode stays enabled for Astra and Grok.
 
 With `authMode: "oauth"` the pinned
 [xAI transport](https://github.com/lidge-jun/opencodex/blob/07b48da8fd63881e848d26e0bd50087864f5573e/src/providers/xai-transport.ts)
@@ -105,7 +136,11 @@ and select `provider/model-id` as the main model or a role. For each new
 provider, check whether the specific subscription supports OAuth, which models
 the authorized catalogue returns, and which address serves the request. An API
 adapter does not prove consumer-subscription support. Only xAI is confirmed
-here. The pack's browser-only helper is currently implemented for xAI.
+here as OAuth. Z.AI GLM Coding Plan is the second verified provider: it uses a
+host-private API key and the Chat endpoint `https://api.z.ai/api/coding/paas/v4`.
+The local file profile `codex --profile zai` remains an independent Responses
+route on `https://api.z.ai/api/v1` and is not the OpenCodex catalogue path.
+The pack's browser-only helper remains xAI-only; Z.AI uses the key helper.
 
 Adapter search is explicitly set to Grok 4.6 through xAI OAuth; the automatic
 vision helper is off. All assigned OpenAI models belong to the Astra family.
@@ -123,12 +158,17 @@ the running process:
 ./install.ps1 -SubscriptionsOnly -Mode ConfigureRestart -WhatIf
 ./install.ps1 -SubscriptionsOnly -Mode ConfigureRestart
 ./install.ps1 -SubscriptionsOnly -Mode Check
+codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY --preview
+codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY
 ```
 
 The mode changes only restart parameters of the owned task and its owner
 record. Repeat calls are idempotent. If the update is interrupted,
-`./install.ps1 -SubscriptionsOnly -Mode Recover` rolls it back from a separate
-journal without stopping the proxy. Foreign edits are preserved and require
+`./install.ps1 -SubscriptionsOnly -Mode Recover` or
+`codex-harness recover --subscriptions-only` rolls it back from a separate
+journal without stopping the proxy. Native configure-restart updates the owned
+Task Scheduler definition in place and does not start or stop the live proxy.
+Foreign edits are preserved and require
 conflict resolution. New `Install`/`Update` create the task with the same
 policy.
 

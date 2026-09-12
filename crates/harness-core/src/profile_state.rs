@@ -17,10 +17,19 @@ pub fn migrate(shared: &Path, home: &Path) -> io::Result<usize> {
         Ok(metadata) if !metadata.file_type().is_symlink() => return Ok(0),
         Ok(_) => {}
     }
-    if legacy.canonicalize()? != shared.canonicalize()? {
-        return Err(io::Error::other(
-            "Legacy profile belongs to another source; preserve it and resolve ownership.",
-        ));
+    let stored = fs::read_link(&legacy)?;
+    if !same_recorded_target(&stored, shared)? {
+        // A relocated checkout leaves a dangling recorded target. Compare the
+        // stored name without following it, then read the new shared file.
+        match fs::symlink_metadata(&stored) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "Legacy profile belongs to another source; preserve it and resolve ownership.",
+                ));
+            }
+        }
     }
     let shared_bytes = fs::read(shared)?;
     let mut incoming = parse(&shared_bytes)?;
@@ -110,4 +119,67 @@ fn parse(bytes: &[u8]) -> io::Result<toml::Table> {
         .ok_or_else(|| {
             io::Error::other("Invalid native configuration TOML; existing data preserved.")
         })
+}
+
+fn same_recorded_target(left: &Path, right: &Path) -> io::Result<bool> {
+    fn name(path: &Path) -> io::Result<String> {
+        let text = path
+            .to_str()
+            .ok_or_else(|| io::Error::other("profile path is not UTF-8"))?;
+        let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+        Ok(std::path::absolute(Path::new(text))?
+            .to_string_lossy()
+            .to_ascii_lowercase())
+    }
+    Ok(name(left)? == name(right)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn relocated_dangling_profile_uses_new_shared_without_opening_old_target() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        let old = root.path().join(r"old\global\profile.toml");
+        let shared = root.path().join(r"new\global\profile.toml");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&shared, "model = 'gpt-6-astra'\nextra = 1\n").unwrap();
+        std::os::windows::fs::symlink_file(&old, home.join("harness.config.toml")).unwrap();
+        assert!(!old.exists());
+        assert_eq!(migrate(&shared, &home).unwrap(), 0);
+        assert!(
+            fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("extra = 1")
+        );
+        assert_eq!(
+            fs::read_link(home.join("harness.config.toml")).unwrap(),
+            old
+        );
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn live_foreign_profile_target_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        let foreign = root.path().join("foreign-profile.toml");
+        let shared = root.path().join(r"new\global\profile.toml");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&foreign, "secret = 1\n").unwrap();
+        fs::write(&shared, "model = 'gpt-6-astra'\n").unwrap();
+        std::os::windows::fs::symlink_file(&foreign, home.join("harness.config.toml")).unwrap();
+        assert!(migrate(&shared, &home).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"secret = 1\n");
+        assert_eq!(
+            fs::read_link(home.join("harness.config.toml")).unwrap(),
+            foreign
+        );
+        assert!(!home.join("config.toml").exists());
+    }
 }

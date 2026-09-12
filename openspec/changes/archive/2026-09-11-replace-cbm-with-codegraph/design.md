@@ -100,7 +100,7 @@ the earlier single-project comparison for concurrent runtime acceptance. Two
 source oracles in each root remain absent upstream for ambiguous/common-name
 follow-ups; their absence is preserved and does not establish missing source.
 Current behavior is documented in the
-[candidate guide](../../../docs/code-tools.md#native-codegraph-candidate).
+[provider guide](../../../../docs/code-tools.md#native-codegraph-provider).
 
 The native concurrent entry-point check now exercises three owned indexed Rust
 projects plus another client in the first project, each with a distinct Codex
@@ -137,7 +137,53 @@ admission for another active root, avoids automatic retries and recovers after
 deliberate reconnect. The actual deadline check passed in 605.37 seconds. A
 source edit during a query produces explicit pending freshness and current-source
 fallback. Concurrent large-project acceptance and global installation/consumer
-checks remain open.
+checks passed; see the activation record below.
+
+### Activation and installed consumers
+
+Recorded on Windows on 2026-09-11. Activation ran through the existing
+recoverable lifecycle rather than direct writes: the transitional
+`install.ps1 -CodeToolsOnly -Mode Install` rebuilt the native manager from the
+current source, adopted the verified package and committed the CodeGraph
+registration while retiring only the owned CBM entry; the core component
+repointed the launcher configuration bridge. Live `-Mode Check` then reported
+the connection protocol-ready with no failures. A semantic before/after config
+comparison showed exactly one change: the owned `mcp_servers.codegraph.command`
+build path. CBM's shared package and existing indexes stayed in place, and the
+isolated journal suite reran green for interrupted activation, Recover back to
+CBM's manual policy, preserved user edits and Disconnect removing only the
+owned block.
+
+Two restart boundaries are now explicit. First, an already running Codex
+session keeps its previous MCP catalogue until restart. Second, the build
+receipt gate rejects runtime commands after native source changes, and a
+front-end from a new build does not adopt an account broker left running from
+an older build; running `mcp retire-codegraph` once from the current build
+cleared the stale broker and let new consumers connect. Consumer-process
+jobs deliberately impose no aggregate memory/CPU cap: each installed provider
+keeps its own limits, matching an ordinary CLI session instead of the
+acceptance harness.
+
+Installed consumer checks all passed outside the checkout through the real
+installed home: three indexed projects with simultaneous clients plus another
+client of the first root (automatic add/change-burst/rename/delete, shared
+worker identity, last-client retirement, offline-root stop, reopen catch-up;
+49.9 seconds); a fresh interactive TUI smoke through the installed launcher
+(readiness and clean `/quit`; its console-job bound rose from 512 MiB to
+1 GiB because the activated four-server set legitimately exceeds the old
+cap); resume and fork of a saved CLI thread; and retained Serena
+navigation/reference/edit-restore, Graphify saved-graph query with the graph
+file preserved, and Nuphus desktop/browser reads plus an owned browser
+mutation. The explicit model probe ran one exec parent and one named middle
+child that each performed a real `codegraph_search` for the same symbol with
+the expected canonical root and a bounded result; the default model is Astra,
+and this recorded run used the separately authorized xAI/Grok route while the
+Astra account quota was unavailable. Test hardening added during acceptance:
+status stays readable while a worker is busy, Codex's own trust records for
+owned run roots are permitted in the config comparison, fork parameters match
+the installed protocol, and success requires an actual completed CodeGraph
+tool call rather than a marker substring that honest failure reports also
+contain.
 
 ## Goals / Non-Goals
 
@@ -151,7 +197,7 @@ checks remain open.
 
 Adopt the pinned Windows release through dependency discovery and checksum validation. Use its bundled Node and published MCP/index/sync entry points, telemetry off, one parse worker and one resolution worker. Keep `CODEGRAPH_NO_DAEMON=1` when the native broker owns direct-mode processes; an independent detached upstream daemon must not escape the resource boundary. Explicitly remove conflicting inherited watch/debug/worker settings from the owned child environment; preserve unrelated user settings outside it.
 
-Reuse the existing Rust MCP, Job, admission and broker primitives. This change owns the CodeGraph adapter, supervision and executable acceptance tests in Rust; the published CodeGraph implementation and bundled Node stay third-party. Rust migration task 5.4 adopts this implementation and evidence under the [shared ownership/order map](../migrate-harness-to-rust/design.md#graph-provider-ownership-and-order), without developing another CBM or CodeGraph adapter or waiting for complete native installer migration.
+Reuse the existing Rust MCP, Job, admission and broker primitives. This change owns the CodeGraph adapter, supervision and executable acceptance tests in Rust; the published CodeGraph implementation and bundled Node stay third-party. Rust migration task 5.4 adopts this implementation and evidence under the [shared ownership/order map](../../migrate-harness-to-rust/design.md#graph-provider-ownership-and-order), without developing another CBM or CodeGraph adapter or waiting for complete native installer migration.
 
 Separate project observation from expensive indexing admission. The account-wide native owner tracks connected clients by canonical project root, including across Codex homes, and keeps one observation/state owner for each active indexed root. Admission covers an individual bounded work episode, not a project's entire open session. Coalesce pending source changes per project and serve pending projects fairly; a continuous burst in one project must not repeatedly jump ahead of another. Queued/pending state remains visible until the corresponding update completes. Keep event storage bounded; overflow requires a bounded catch-up scan, not silent loss of changes. Index creation remains explicit, but connecting to an already indexed root registers its observation and catch-up without waiting for the first graph query.
 
@@ -161,7 +207,7 @@ Client disconnect releases only that client's reference. Keep a project's observ
 
 The [Rust ownership requirement](specs/global-code-tools/spec.md#requirement-rust-owned-codegraph-integration) also covers refresh coordination, resource/storage enforcement, catalogue/response shaping and new provider dependency/registration/recovery logic. Existing transitional lifecycle entry points may dispatch to native commands; they must not acquire new CodeGraph-specific logic in another language. Inspect generated/embedded programs and the actual process chain during acceptance so a Rust launcher around an owned script cannot satisfy this requirement. Declarative manifests and inert analysis samples remain data.
 
-The 2026-09-11 implementation review verifies native ownership through the actual manager → Job-owned bundled Node → published CodeGraph 1.6.0 process chain. Native dependency discovery accepts the selected catalogue without duplicate providers; ten default discovery tests pass, including retained CBM compatibility. The [Rust ownership evidence](../../../docs/evidence/rust-migration.md#codegraph-ownership-review-replacement-26--41) records the native command/test owners and allowed transitional dispatch. Rust task 5.4 adopts that owner and remains open for its broader native lifecycle work.
+The 2026-09-11 implementation review verifies native ownership through the actual manager → Job-owned bundled Node → published CodeGraph 1.6.0 process chain. Native dependency discovery accepts the selected catalogue without duplicate providers; ten default discovery tests pass, including retained CBM compatibility. The [Rust ownership evidence](../../../../docs/evidence/rust-migration.md#codegraph-ownership-review-replacement-26--41) records the native command/test owners and allowed transitional dispatch. Rust task 5.4 adopts that owner and remains open for its broader native lifecycle work.
 
 A 600-second limit applies to an individual indexing episode, including automatic work; ordinary reads use a 30-second deadline and deliberate exploration at most 60 seconds. Prefer published finite sync processes with explicit completion, or verified pending/start/completion signals if reusing a resident backend. A finite process lease may bound ownership, but healthy retirement/replacement must be automatic and preserve queued changes, observation and continued service. Session age alone must not latch a failed state or require manual renewal. Never extend an in-flight operation's deadline on each new file event. Actual memory/time failures retire the affected work, preserve that project's committed generation and stop its automatic restart loop while releasing admission for other projects. A new deliberate request or verified changed condition can resume failed work.
 
@@ -197,7 +243,7 @@ The published 1.6.0 extraction implementation deletes prior file data before sto
 
 ### Use source coverage and question-specific oracles
 
-The canonical recipes live in [code retrieval](../../../.agents/skills/token-efficient-workflow/references/code-retrieval.md). Global principles and the installed skill now route there and distinguish planned CodeGraph behavior from live CBM configuration. Auto-refresh does not justify repeated status/sync calls when a completed relevant update is already established. During debounce, failed refresh or unsupported coverage, use scoped current source.
+The canonical recipes live in [code retrieval](../../../../.agents/skills/token-efficient-workflow/references/code-retrieval.md). Global principles and the installed skill now route there and distinguish planned CodeGraph behavior from live CBM configuration. Auto-refresh does not justify repeated status/sync calls when a completed relevant update is already established. During debounce, failed refresh or unsupported coverage, use scoped current source.
 
 Compare exact-location/body tasks, direct calls, impact candidates and full language references as different questions. Do not certify a graph edge from name matching alone. For an exhaustive or edit-sensitive conclusion, include necessary source/Serena follow-ups in the cost and correctness check. Status file counts and successful CLI exit are insufficient coverage oracles.
 

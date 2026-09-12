@@ -23,6 +23,12 @@ For code, first verify the MCP project root. Start with Serena for known-file sy
 
 Prefer native `apply_patch` for bounded text edits. Use semantic edits or deterministic generators when they handle the actual change better. Reuse the same inspected context and completed check while its relevant source/config/runtime inputs remain unchanged. Changes, failures and unresolved concerns invalidate the affected evidence. Record accepted results once; avoid duplicate worker investigations and status-only polling.
 
+## Repeated preparation and sessions
+
+When repeated setup or feedback dominates the task, first isolate the uncertainty into a smaller verifiable result. Then compare the cost of reusing preparation, an owned session or an existing helper against the remaining repetitions, including integration, verification and recovery. Separate preparation from replay where that helps: learn the required interactions and their return paths in the same valid session, and promote repeatable actions into their existing owner. Do not build a general automation layer for a short one-off task.
+
+Reuse requires current relevant inputs and runtime conditions. After interruption, a changed build/configuration/input or an ended session, re-establish affected preconditions and checks while preserving unaffected knowledge. Keep commands, validity conditions and useful findings in the project's existing memory home, with private state and evidence outside shared sources. Fewer full runs or smaller output alone do not prove faster completion; count preparation, worker coordination, waiting, integration and rework, and count overlapping elapsed time once. A local helper pass leaves parent acceptance pending until its result is consumed and checked.
+
 ## Reasoning at task boundaries
 
 The installed CLI cannot change the effort of an already running model turn through an agent tool. Brevity instructions do not change that effort. Preserve current task continuity; do not restart a task just to chase a cheaper setting.
@@ -37,4 +43,4 @@ codex --harness-effort demanding 'A complex or high-risk task'
 
 These select native `low`, `high`, and `xhigh` respectively. The default remains conservative `xhigh`. Explicit native effort/profile settings take precedence. Select routine only with clear inputs, low risk and a reliable check; use more effort when uncertainty or failures warrant it. For a supported external app-server client, `turn/start.effort` is a turn-boundary setting, not an in-turn model tool.
 
-Keep preferred Grok middle and the installed Astra reserve/senior/principal assignments. This selector is not a reason to bypass Grok, add recursive model calls or change billing. A small task is often cheapest to finish directly. Validate effective effort from native turn/config evidence when measuring it; do not claim quota savings from effort names.
+Follow the user's current model, provider and conversation-visibility policy; keep selection in its existing owner instead of maintaining another preset list here. This selector does not authorize recursive model calls or a billing change. A small task is often cheapest to finish directly. Validate effective effort from native turn/config evidence when measuring it; do not claim quota savings from effort names.

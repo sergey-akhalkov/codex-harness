@@ -102,7 +102,7 @@ function Save-ProbeReport { Write-ProbeJson (Join-Path $fixture 'lifecycle.json'
 function Assert-Native {
     Assert-Probe ((Get-FileHash -LiteralPath $paths.config).Hash -ceq $nativeHash) 'Native Codex config restored byte for byte'
     Assert-Probe ((Get-Item -LiteralPath $nativeAgentsLink).LinkType -eq 'SymbolicLink') 'Permanent native agent link survives subscription restoration'
-    foreach($level in @('middle_backup','senior','principal')) {
+    foreach($level in $nativeAgentHashes.Keys) {
         Assert-Probe ((Get-FileHash -LiteralPath (Join-Path $nativeAgentsLink "$level.toml")).Hash -ceq $nativeAgentHashes[$level]) "Permanent Astra level remains intact: $level"
     }
 }
@@ -163,9 +163,12 @@ try {
     foreach($role in Get-ChildItem -LiteralPath (Join-Path $repository 'global/opencodex/agents') -Filter '*.toml'){Copy-Item -LiteralPath $role.FullName -Destination $paths.roleSource}
     $nativeAgentsLink=Join-Path $paths.codex 'agents/codex-harness'
     [void][IO.Directory]::CreateDirectory((Split-Path $nativeAgentsLink))
-    $null=New-Item -ItemType SymbolicLink -Path $nativeAgentsLink -Target (Join-Path $repository 'global/agents')
+    $nativeAgentSource=Join-Path $paths.user 'owned-agent-source'
+    [void][IO.Directory]::CreateDirectory($nativeAgentSource)
+    [IO.File]::WriteAllText((Join-Path $nativeAgentSource 'native_sentinel.toml'), "name = `"native_sentinel`"`r`ndescription = `"Owned preservation fixture`"`r`nmodel = `"gpt-6-astra`"`r`n")
+    $null=New-Item -ItemType SymbolicLink -Path $nativeAgentsLink -Target $nativeAgentSource
     $nativeAgentHashes=@{}
-    foreach($level in @('middle_backup','senior','principal')){$nativeAgentHashes[$level]=(Get-FileHash -LiteralPath (Join-Path $nativeAgentsLink "$level.toml")).Hash}
+    foreach($level in @('native_sentinel')){$nativeAgentHashes[$level]=(Get-FileHash -LiteralPath (Join-Path $nativeAgentsLink "$level.toml")).Hash}
     [IO.File]::WriteAllText($paths.config,"# isolated native sentinel`r`nmodel = `"gpt-6-astra`"`r`nmodel_reasoning_effort = `"high`"`r`n")
     $nativeHash=(Get-FileHash -LiteralPath $paths.config).Hash
     $isolation=@{USERPROFILE=$paths.user;HOME=$paths.user;HOMEDRIVE=([IO.Path]::GetPathRoot($paths.user).TrimEnd('\'));HOMEPATH=$paths.user.Substring(2);APPDATA=(Join-Path $paths.user 'AppData/Roaming');LOCALAPPDATA=(Join-Path $paths.user 'AppData/Local');XDG_CONFIG_HOME=(Join-Path $paths.user '.config');XDG_DATA_HOME=(Join-Path $paths.user '.local/share');CODEX_HOME=$paths.codex;CODEX_SQLITE_HOME=$paths.codex;OPENCODEX_HOME=$paths.opencodex;CLAUDE_CONFIG_DIR=(Join-Path $paths.user '.claude')}

@@ -201,11 +201,12 @@ portable global instruction text has one authoritative home under `global/`.
 
 The initial skills include the six OpenSpec workflow skills plus later globally
 linked skills such as project-memory, isolated-worktree, structured-codex-run,
-project-verification and reproduce-regression. The agent source folder currently
-contains the Astra senior, principal and middle_backup definitions. Grok middle
-is connected through OpenCodex. A namespaced directory link lets Codex
-discover them live. On CLI 0.153.4, a symlink to an individual agent TOML was
-skipped; a namespaced directory link was consumed by an actual custom agent.
+project-verification and reproduce-regression. Fixed Astra presets have been
+retired in favor of direct model/effort selection; the compatible agent source
+directory and its link remain without agent TOMLs. Subscription-owned Grok
+preset retirement remains part of the orchestration lifecycle work. See
+[agent selection](agent-delegation.md) for migration and current visibility limits.
+User-owned agents and skill directories are preserved.
 
 Shared keys are declared in `global/kit.psd1`. The initial profile preserves the
 existing model/reasoning preference (`gpt-6-astra`, `xhigh`), Full Access

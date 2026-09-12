@@ -109,7 +109,7 @@ try {
     Write-Host "Consumer: $version; PowerShell $($PSVersionTable.PSVersion); probe $probe"
     $prompt = Invoke-ConsumerCli @('--profile','harness','debug','prompt-input','bounded fixture')
     Assert-Consumer ($prompt.Contains('danger-full-access') -and $prompt.Contains('Approval policy is currently never')) 'linked repository profile supplies Full Access'
-    Assert-Consumer ($prompt.Contains('Use capability levels') -and -not $prompt.Contains('HARNESS_LOCAL_BASE_MARKER')) 'selected harness profile supplies its managed delegation instructions'
+    Assert-Consumer ($prompt.Contains('Choose models and supported reasoning effort per assignment') -and $prompt.Contains('Every active model conversation must be simultaneously visible') -and -not $prompt.Contains('HARNESS_LOCAL_BASE_MARKER')) 'selected harness profile supplies direct selection and visible conversation instructions'
     $basePrompt = Invoke-ConsumerCli @('debug','prompt-input','base instruction fixture')
     Assert-Consumer ($basePrompt.Contains('HARNESS_LOCAL_BASE_MARKER') -and (Get-Content -LiteralPath "$codexHome/config.toml" -Raw).Contains('HARNESS_LOCAL_BASE_MARKER')) 'base instructions remain intact and apply without the harness profile'
     Assert-Consumer ($prompt.Contains('Working principles') -and $prompt.Contains('Protect correctness, data integrity')) 'full repository global instructions are in actual initial context'

@@ -538,7 +538,10 @@ fn actual_global_cli_tui_smoke_ready_then_quit() {
         .env
         .insert("PATH".into(), Some(env::join_paths(child_path).unwrap()));
     let mut spec = ConsoleSpec::new(command);
-    spec.limits.memory_bytes = Some(512 * 1024 * 1024);
+    // The activated global home serves four managed MCP frontends alongside
+    // the TUI itself. The prior 512 MiB cap rejected that ordinary set while
+    // shutting down; keep a bounded runaway check without failing delivery.
+    spec.limits.memory_bytes = Some(1024 * 1024 * 1024);
     let session = ConsoleSession::spawn(spec).unwrap();
     wait_ready(&session, &evidence, 40);
     send_line(&session, "/quit").unwrap();

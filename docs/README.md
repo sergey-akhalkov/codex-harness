@@ -20,16 +20,16 @@ current source, the installed CLI and the relevant local inputs.
 | Install, update, disconnect and recovery | [Installation](installation.md) |
 | MCP, language tools and resource policy | [Code tools](code-tools.md) |
 | Subscription routing and Grok | [Subscription models](subscription-models.md) |
-| Named agent levels and model routing | [Agent delegation](agent-delegation.md) |
+| Direct agent selection, visible conversations and model routing | [Agent delegation](agent-delegation.md) |
 | RTK exception, Code Mode and task effort | [Token workflow](token-workflow.md) |
 | Source/link diagnostics | [Source diagnostics](source-diagnostics.md) |
 | Native Rust commands and unfinished cutover | [Rust native](rust-native.md) |
 | Current migration map and remaining work | [Rust migration](evidence/rust-migration.md) |
 | Project memory index | [docs/memory](memory/README.md) |
 
+Archived [CodeGraph replacement](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/proposal.md)
+recorded the accepted bounded automatic refresh and measured retrieval policy.
 Active OpenSpec work remains authoritative until its own tasks close:
-
-- [replace-cbm-with-codegraph](../openspec/changes/replace-cbm-with-codegraph/proposal.md) — replacement planned; bounded automatic refresh and measured retrieval policy
 
 - [migrate-harness-to-rust](../openspec/changes/migrate-harness-to-rust/proposal.md)
 - [improve-installed-tool-workflows](../openspec/changes/improve-installed-tool-workflows/proposal.md)

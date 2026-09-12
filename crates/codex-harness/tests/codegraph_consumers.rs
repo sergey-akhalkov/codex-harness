@@ -4,7 +4,7 @@
 #![cfg(windows)]
 use harness_core::{
     broker_endpoint::{self, Observation},
-    broker_rpc,
+    broker_http,
     broker_state::BrokerRoot,
     cancellable_pipe::{CancellablePipe, anonymous_pipe},
     codegraph_generation::{GenerationStore, StorageLimits},
@@ -26,7 +26,7 @@ fn input(name: &str) -> PathBuf {
     local_path(&PathBuf::from(std::env::var_os(name).expect(name))).unwrap()
 }
 
-fn settled_broker(projects: &[PathBuf], clients: usize) -> Value {
+fn broker_status() -> Value {
     let path = harness_core::codegraph_account::existing_root()
         .unwrap()
         .unwrap();
@@ -34,20 +34,34 @@ fn settled_broker(projects: &[PathBuf], clients: usize) -> Value {
     let Observation::Ready { endpoint, .. } = broker_endpoint::observe(&root).unwrap() else {
         panic!("Installed account broker must be ready");
     };
+    broker_http::exchange(
+        endpoint.port,
+        endpoint.token(),
+        "status",
+        &json!({}),
+        deadline(5),
+        &Cancellation::default(),
+    )
+    .unwrap()
+}
+
+fn settled_broker(projects: &[PathBuf], clients: usize) -> Value {
     let until = deadline(60);
     loop {
-        let status = broker_rpc::invoke(
-            &endpoint,
-            "status",
-            &json!({}),
-            deadline(5),
-            &Cancellation::default(),
-        )
-        .unwrap();
+        let status = broker_status();
         let backend = &status["backend"];
         let active = backend["projects"].as_array().unwrap();
         assert_eq!(backend["clients"], clients, "{status}");
-        assert_eq!(active.len(), projects.len(), "{status}");
+        assert_eq!(
+            active
+                .iter()
+                .filter(|entry| projects
+                    .iter()
+                    .any(|project| entry["root"] == json!(project)))
+                .count(),
+            projects.len(),
+            "{status}"
+        );
         if backend["queued"] == 0
             && projects.iter().all(|project| {
                 active.iter().any(|entry| {
@@ -67,6 +81,28 @@ fn settled_broker(projects: &[PathBuf], clients: usize) -> Value {
             "Installed broker did not settle: {status}"
         );
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn closed_project(project: &Path, clients: usize) -> Value {
+    let until = deadline(15);
+    loop {
+        let status = broker_status();
+        let backend = &status["backend"];
+        if backend["clients"] == clients
+            && backend["projects"].as_array().unwrap().iter().any(|entry| {
+                entry["root"] == json!(project)
+                    && entry["observing"] == false
+                    && entry["runtime"]["busy"] != true
+            })
+        {
+            return status;
+        }
+        assert!(
+            !until.expired(),
+            "Last client did not retire observation: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -93,9 +129,12 @@ impl Consumer {
         command.stdin = Some(stdin);
         command.stdout = Some(stdout);
         command.stderr = Some(fs::File::create(evidence.join("stderr.txt")).unwrap());
+        // Own cleanup of the whole Codex consumer. Each installed provider
+        // keeps its own limits; capping Codex plus every retained MCP here
+        // would impose a different environment from an ordinary CLI session.
         let job = Job::new(Limits {
-            memory_bytes: Some(2 << 30),
-            cpu_percent: Some(25.0),
+            memory_bytes: None,
+            cpu_percent: None,
         })
         .unwrap();
         let child = job.spawn(&command).unwrap();
@@ -279,6 +318,7 @@ fn installed_three_project_consumers_refresh_and_share() {
         .unwrap()
         .keep();
     let before_config = fs::read(home.join("config.toml")).unwrap();
+    fs::write(run.join("before-config.toml"), &before_config).unwrap();
     let before_instructions = fs::read(home.join("AGENTS.md")).unwrap();
     assert!(String::from_utf8_lossy(&before_instructions).contains("CodeGraph"));
     let mut projects = Vec::new();
@@ -341,6 +381,8 @@ fn installed_three_project_consumers_refresh_and_share() {
         &run.join("client-duplicate"),
     );
     duplicate.open_thread(&projects[0]);
+    // App-server starts this thread's MCP clients on its first actual call.
+    duplicate.query(&projects[0], "installed_target", Some("src/lib.rs"));
     // Retained language tools can create Cargo.lock during initialization.
     // Let automatic refresh in all roots finish before comparing a reusable
     // backend: fair root switching deliberately retires the previous worker.
@@ -422,6 +464,19 @@ fn installed_three_project_consumers_refresh_and_share() {
     }
     duplicate.query(&projects[0], "installed_target", Some("src/lib.rs"));
     duplicate.finish();
+    let closed = closed_project(&projects[0], 2);
+    fs::write(
+        run.join("closed-project.json"),
+        serde_json::to_vec_pretty(&closed).unwrap(),
+    )
+    .unwrap();
+    generations[0] = GenerationStore::open(&projects[0], StorageLimits::default())
+        .unwrap()
+        .committed_handle()
+        .unwrap()
+        .unwrap()
+        .generation
+        .unwrap();
     fs::write(
         projects[0].join("src/offline.rs"),
         "pub fn installed_offline() {}\n",
@@ -455,6 +510,22 @@ fn installed_three_project_consumers_refresh_and_share() {
         &run.join("client-reopened"),
     );
     reopened.open_thread(&projects[0]);
+    let catalogue = reopened.request(
+        "mcpServerStatus/list",
+        json!({"threadId":reopened.thread,"limit":100,"detail":"toolsAndAuthOnly"}),
+        90,
+    );
+    assert!(
+        catalogue["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server["name"] == "codegraph"
+                && server["tools"]
+                    .as_object()
+                    .is_some_and(|tools| !tools.is_empty())),
+        "{catalogue}"
+    );
     generations[0] = committed(
         &projects[0],
         generations[0],
@@ -466,13 +537,67 @@ fn installed_three_project_consumers_refresh_and_share() {
     for client in clients.into_iter().flatten() {
         client.finish();
     }
-    assert_eq!(fs::read(home.join("config.toml")).unwrap(), before_config);
+    let after_config = fs::read(home.join("config.toml")).unwrap();
+    fs::write(run.join("after-config.toml"), &after_config).unwrap();
+    let parse_config = |bytes: &[u8]| {
+        toml::from_str::<Value>(
+            std::str::from_utf8(bytes)
+                .unwrap()
+                .trim_start_matches('\u{feff}'),
+        )
+        .unwrap()
+    };
+    let mut before_values = parse_config(&before_config);
+    let mut after_values = parse_config(&after_config);
+    // Codex itself records trust for each newly opened root. That ordinary
+    // consumer bookkeeping is allowed only for this run's owned projects;
+    // every other configuration value must stay semantically unchanged.
+    let before_projects = before_values
+        .as_object_mut()
+        .unwrap()
+        .remove("projects")
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let after_projects = after_values
+        .as_object_mut()
+        .unwrap()
+        .remove("projects")
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    assert_eq!(
+        after_values,
+        before_values,
+        "Native Codex changed configuration values; see private before/after files in {}",
+        run.display()
+    );
+    for (key, value) in before_projects.as_object().unwrap() {
+        assert_eq!(
+            after_projects.get(key),
+            Some(value),
+            "existing project trust changed for {key}"
+        );
+    }
+    for (key, value) in after_projects.as_object().unwrap() {
+        if before_projects.as_object().unwrap().contains_key(key) {
+            continue;
+        }
+        let run_text = run.to_string_lossy().to_lowercase();
+        let owned_root = key
+            .to_lowercase()
+            .strip_prefix(&run_text)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/'));
+        assert!(owned_root, "unexpected new trust record {key} = {value}");
+        assert_eq!(
+            value,
+            &json!({"trust_level": "trusted"}),
+            "unexpected trust value for new owned root {key}"
+        );
+    }
     assert_eq!(
         fs::read(home.join("AGENTS.md")).unwrap(),
         before_instructions
     );
     fs::write(run.join("report.json"), serde_json::to_vec_pretty(&json!({"passed":true,"model_calls":0,
         "projects":projects,"generations":generations,"same_root_worker":shared["structuredContent"]["worker"],
+        "config_values_preserved":true,"config_reformatted":before_config != after_config,
         "global_config_preserved":true,"automatic_before_queries":true})).unwrap()).unwrap();
     println!("Private installed-consumer evidence: {}", run.display());
 }
@@ -505,8 +630,7 @@ fn installed_saved_thread_resumes_and_forks_with_codegraph() {
     assert!(first.to_string().contains(&symbol));
     let forked = client.request(
         "thread/fork",
-        json!({"threadId":thread,"cwd":project,"model":"gpt-6-astra",
-        "ephemeral":true,"deferGoalContinuation":true}),
+        json!({"threadId":thread,"cwd":project,"model":"gpt-6-astra"}),
         90,
     );
     client.thread = forked["thread"]["id"].as_str().unwrap().into();
@@ -538,6 +662,11 @@ fn installed_exec_and_tool_capable_child_use_global_codegraph() {
     let project = input("CODEGRAPH_CONSUMER_RESUME_PROJECT");
     let output = input("CODEGRAPH_CONSUMER_OUTPUT");
     let symbol = std::env::var("CODEGRAPH_CONSUMER_RESUME_SYMBOL").expect("explicit owned symbol");
+    // The accepted default is the Astra parent; an explicit model allows the
+    // same bounded probe when that account quota is unavailable (for example
+    // the separately authorized xAI/Grok route).
+    let model =
+        std::env::var("CODEGRAPH_CONSUMER_EXEC_MODEL").unwrap_or_else(|_| "gpt-6-astra".into());
     let run = tempfile::Builder::new()
         .prefix("model-consumers-")
         .tempdir_in(&output)
@@ -564,7 +693,7 @@ fn installed_exec_and_tool_capable_child_use_global_codegraph() {
         "--json".into(),
         "--skip-git-repo-check".into(),
         "-m".into(),
-        "gpt-6-astra".into(),
+        model.clone().into(),
         prompt.into(),
     ];
     command.current_dir = Some(project.clone());
@@ -572,8 +701,8 @@ fn installed_exec_and_tool_capable_child_use_global_codegraph() {
     command.stdout = Some(fs::File::create(run.join("events.jsonl")).unwrap());
     command.stderr = Some(fs::File::create(run.join("stderr.txt")).unwrap());
     let job = Job::new(Limits {
-        memory_bytes: Some(3 << 30),
-        cpu_percent: Some(25.0),
+        memory_bytes: None,
+        cpu_percent: None,
     })
     .unwrap();
     let child = job.spawn(&command).unwrap();
@@ -615,13 +744,34 @@ fn installed_exec_and_tool_capable_child_use_global_codegraph() {
         "{final_message}; see {}",
         run.display()
     );
+    // The marker also appears in an honest failure report ("is not
+    // reported"). A passing probe must not report failure and must show an
+    // actual CodeGraph tool call from the parent or the child in the same
+    // structured event log.
+    assert!(
+        !final_message.to_lowercase().contains("is not reported"),
+        "probe reported failure: {final_message}; see {}",
+        run.display()
+    );
+    let codegraph_calls = rows
+        .iter()
+        .filter(|row| row["type"] == "item.completed")
+        .filter(|row| {
+            row["item"]["type"] == "mcp_tool_call" && row["item"]["server"] == "codegraph"
+        })
+        .count();
+    assert!(
+        codegraph_calls > 0,
+        "no completed CodeGraph tool call in events; see {}",
+        run.display()
+    );
     // Keep structured native events for inspection of parent/child tool calls;
     // the model's marker alone is not the final acceptance decision.
     fs::write(
         run.join("report.json"),
         serde_json::to_vec_pretty(&json!({
             "model_reported_success":true,"requires_tool_event_review":true,"thread":thread,
-            "project":project,"symbol":symbol,"exit_code":outcome.exit_code
+            "model":model,"project":project,"symbol":symbol,"exit_code":outcome.exit_code
         }))
         .unwrap(),
     )
@@ -671,13 +821,19 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
         90,
     );
     let servers = inventory["data"].as_array().unwrap();
+    fs::write(
+        run.join("consumer-job.json"),
+        serde_json::to_vec_pretty(&client.job.as_ref().unwrap().snapshot().unwrap()).unwrap(),
+    )
+    .unwrap();
     for name in ["codegraph", "serena", "graphify", "nuphus"] {
         assert!(
             servers.iter().any(|server| server["name"] == name
                 && server["tools"]
                     .as_object()
                     .is_some_and(|tools| !tools.is_empty())),
-            "missing {name}: {inventory}"
+            "missing {name}; see private catalogue response in {}",
+            run.display()
         );
     }
     assert!(!servers.iter().any(|server| matches!(
@@ -709,7 +865,13 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
     let graph_before = fs::read(graph.join("graphify-out/graph.json")).unwrap();
     client.server_tool("graphify", "graph_stats", json!({"project_path":graph}));
     let queried = client.server_tool("graphify", "query_graph", json!({"project_path":graph,"question":graph_query,"depth":1,"mode":"bfs","token_budget":500}));
-    assert!(queried.to_string().contains(&graph_query), "{queried}");
+    assert!(
+        queried
+            .to_string()
+            .contains(&format!("NODE {graph_query} ")),
+        "Expected saved node label; see private response in {}",
+        run.display()
+    );
     assert_eq!(
         fs::read(graph.join("graphify-out/graph.json")).unwrap(),
         graph_before
@@ -724,7 +886,7 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
         "browser_click",
         json!({"selector":"a[href='#confirmed']","confirm":true}),
     );
-    let effect = client.server_tool("nuphus", "browser_evaluate", json!({"script":"if(document.title!=='Harness retained acceptance' || location.hash!=='#confirmed') throw new Error('owned browser effect missing'); 'HARNESS_BROWSER_EFFECT_CONFIRMED'"}));
+    let effect = client.server_tool("nuphus", "browser_evaluate", json!({"confirm":true,"script":"if(document.title!=='Harness retained acceptance' || location.hash!=='#confirmed') throw new Error('owned browser effect missing'); 'HARNESS_BROWSER_EFFECT_CONFIRMED'"}));
     assert!(
         effect
             .to_string()

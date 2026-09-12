@@ -442,6 +442,20 @@ impl Worker {
         Ok(result["result"].clone())
     }
 
+    pub fn notify(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Deadline,
+        cancel: &Cancellation,
+    ) -> io::Result<()> {
+        self.send(
+            json!({"jsonrpc":"2.0","method":method,"params":params}),
+            deadline,
+            cancel,
+        )
+    }
+
     fn send(&mut self, value: Value, deadline: Deadline, cancel: &Cancellation) -> io::Result<()> {
         if self.lease.expired() {
             return Err(io::Error::new(

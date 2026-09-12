@@ -63,6 +63,133 @@ fn counts(database: &Path) -> (u64, u64, u64) {
 }
 
 #[test]
+fn committed_refresh_waits_for_transient_windows_reader() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = fixture();
+    let store = store(&root);
+    let active = store.startup_active().unwrap();
+    write_graph(&active.database, 1, 1, 0);
+    store.commit_quiescent(GenerationRole::Active).unwrap();
+    let checkpoint = store.committed_handle().unwrap().unwrap();
+    // Match SQLite's Windows read/write sharing: an open reader does not
+    // permit deletion or renaming of its database's containing directory.
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001 | 0x0000_0002)
+        .open(&checkpoint.database)
+        .unwrap();
+    write_graph(&active.database, 2, 3, 1);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(reader);
+        });
+        store.commit_bounded(
+            GenerationRole::Active,
+            Deadline::after(Duration::from_secs(5)).unwrap(),
+            &Cancellation::default(),
+        )
+    });
+    result.expect("a transient reader must not disable checkpoint refresh");
+    assert_eq!(
+        counts(&store.committed_handle().unwrap().unwrap().database),
+        (2, 3, 1)
+    );
+}
+
+#[test]
+fn checkpoint_rotation_preserves_saved_data_on_deadline_or_cancellation() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    for cancelled in [false, true] {
+        let root = fixture();
+        let store = store(&root);
+        let active = store.startup_active().unwrap();
+        write_graph(&active.database, 1, 1, 0);
+        store.commit_quiescent(GenerationRole::Active).unwrap();
+        let checkpoint = store.committed_handle().unwrap().unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&checkpoint.database)
+            .unwrap();
+        write_graph(&active.database, 2, 3, 1);
+        let cancel = Cancellation::default();
+        let began = std::time::Instant::now();
+        let error = std::thread::scope(|scope| {
+            if cancelled {
+                let stop = cancel.clone();
+                scope.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    stop.cancel();
+                });
+            }
+            store
+                .commit_bounded(
+                    GenerationRole::Active,
+                    Deadline::after(if cancelled {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(100)
+                    })
+                    .unwrap(),
+                    &cancel,
+                )
+                .unwrap_err()
+        });
+        assert!(began.elapsed() < Duration::from_secs(2), "{error}");
+        assert_eq!(
+            error.kind(),
+            if cancelled {
+                std::io::ErrorKind::Interrupted
+            } else {
+                std::io::ErrorKind::TimedOut
+            },
+            "{error}"
+        );
+        assert_eq!(
+            store.committed_handle().unwrap().unwrap().generation,
+            checkpoint.generation
+        );
+        assert_eq!(counts(&checkpoint.database), (1, 1, 0));
+        drop(reader);
+        let restored = store.startup_active().unwrap();
+        assert_eq!(counts(&restored.database), (1, 1, 0));
+        assert!(store.layout().committed.join(OWNERSHIP_FILE_NAME).is_file());
+    }
+}
+
+#[test]
+fn checkpoint_rotation_does_not_wait_indefinitely_for_a_reader() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = fixture();
+    let store = store(&root);
+    let active = store.startup_active().unwrap();
+    write_graph(&active.database, 1, 1, 0);
+    store.commit_quiescent(GenerationRole::Active).unwrap();
+    let checkpoint = store.committed_handle().unwrap().unwrap();
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001 | 0x0000_0002)
+        .open(&checkpoint.database)
+        .unwrap();
+    write_graph(&active.database, 2, 3, 1);
+    let began = std::time::Instant::now();
+    let error = store
+        .commit_bounded(
+            GenerationRole::Active,
+            Deadline::after(Duration::from_secs(10)).unwrap(),
+            &Cancellation::default(),
+        )
+        .unwrap_err();
+    assert!(began.elapsed() < Duration::from_secs(4), "{error}");
+    assert!(error.to_string().contains("checkpoint rotation failed"));
+    assert_eq!(counts(&checkpoint.database), (1, 1, 0));
+}
+
+#[test]
 fn committed_index_survives_failed_stage_and_partial_active_write() {
     let root = fixture();
     let store = store(&root);

@@ -23,7 +23,10 @@ function New-Fixture {
     $root = Join-Path $suite $Name
     $fixture = @{ SourceRoot = Join-Path $root 'source'; UserHome = Join-Path $root 'user'; CodexHome = Join-Path $root 'codex'; CodexCommand = 'C:\fixture\codex.ps1' }
     [void][IO.Directory]::CreateDirectory((Join-Path $fixture.SourceRoot 'global/opencodex/agents'))
-    Write-CodeToolsJson (Join-Path $fixture.SourceRoot 'global/opencodex/config.json') @{ hostname='127.0.0.1';port=10100;codexAutoStart=$false;codexShimAutoRestore=$false }
+    Write-CodeToolsJson (Join-Path $fixture.SourceRoot 'global/opencodex/config.json') @{
+        hostname='127.0.0.1';port=10100;codexAutoStart=$false;codexShimAutoRestore=$false
+        providers=@{ zai=@{ adapter='openai-chat'; baseUrl='https://api.z.ai/api/coding/paas/v4'; authMode='key'; apiKey=('$' + '{ZAI_API_KEY}'); defaultModel='glm-5.3'; models=@('glm-5.3'); selectedModels=@('glm-5.3'); liveModels=$false } }
+    }
     Write-CodeToolsBytes (Join-Path $fixture.CodexHome 'config.toml') ([Text.Encoding]::UTF8.GetBytes("# foreign original`r`nmodel = `"gpt-6-astra`"`r`n"))
     Write-CodeToolsJson (Join-Path $fixture.UserHome '.opencodex/auth.json') @{ fixture = 'private-auth-preserved' }
     $fixture
@@ -120,6 +123,35 @@ try {
     Assert-True (-not (Test-Path (Join-Path $fixture.CodexHome 'agents/codex-harness-subscriptions'))) 'Role remained active after disconnect.'
     Assert-True ((Read-CodeToolsJson (Join-Path $fixture.UserHome '.opencodex/auth.json')).fixture -eq 'private-auth-preserved') 'Authentication was changed.'
     Write-Output 'PASS install/repeat/disconnect preserve exact native bytes and auth; source links are direct'
+
+    $profiled = New-Fixture zai-profile
+    $profilePath = Join-Path $profiled.CodexHome 'zai.config.toml'
+    $catalogPath = Join-Path $profiled.CodexHome 'zai.models.json'
+    $keyPath = Join-Path $profiled.CodexHome 'harness/subscriptions/zai-key.txt'
+    [IO.File]::WriteAllText($profilePath, "model = 'glm-5.3'`nmodel_provider = 'ZAI'`n")
+    [IO.File]::WriteAllText($catalogPath, '{"models":[{"slug":"glm-5.3"}]}')
+    $beforeProfile = Get-FileHash -LiteralPath $profilePath
+    $beforeCatalog = Get-FileHash -LiteralPath $catalogPath
+    Invoke-HarnessSubscriptionRouting @profiled -Mode Install | Out-Null
+    $check = Invoke-HarnessSubscriptionRouting @profiled -Mode Check
+    Assert-True ($check.status -eq 'ready' -and $check.zaiAuthorized -eq $false -and $check.glmReady -eq $false) 'Check claimed GLM ready without a private key.'
+    [void][IO.Directory]::CreateDirectory((Split-Path $keyPath))
+    [IO.File]::WriteAllText($keyPath, 'synthetic-zai-key-must-not-print')
+    $authorized = Invoke-HarnessSubscriptionRouting @profiled -Mode Check
+    Assert-True ($authorized.zaiAuthorized -eq $true -and $authorized.zaiRuntimeKey -eq $false -and $authorized.glmReady -eq $false) 'Check claimed GLM ready before the running proxy request injected the key.'
+    $runtime = Join-Path $profiled.CodexHome 'harness/subscriptions/runs'
+    [void][IO.Directory]::CreateDirectory($runtime)
+    $prefix = Join-Path $runtime 'fixture-zai'
+    Write-CodeToolsJson ($prefix + '.started.json') @{ processId = 42; assignedBeforeResume = $true }
+    Write-CodeToolsJson ($prefix + '.request.json') @{ secretFiles = @{ ZAI_API_KEY = $keyPath } }
+    Write-CodeToolsJson (Join-Path $runtime 'active-run.json') @{ started = ($prefix + '.started.json') }
+    $injected = Invoke-HarnessSubscriptionRouting @profiled -Mode Check
+    Assert-True ($injected.zaiAuthorized -eq $true -and $injected.zaiRuntimeKey -eq $true -and $injected.glmReady -eq $true) 'Injected Z.AI key was not reported as GLM ready.'
+    Invoke-HarnessSubscriptionRouting @profiled -Mode Disconnect | Out-Null
+    Assert-True (Test-Path -LiteralPath $keyPath) 'Disconnect deleted the private Z.AI key store.'
+    Assert-True ((Get-FileHash -LiteralPath $profilePath).Hash -ceq $beforeProfile.Hash) 'Disconnect changed zai.config.toml.'
+    Assert-True ((Get-FileHash -LiteralPath $catalogPath).Hash -ceq $beforeCatalog.Hash) 'Disconnect changed zai.models.json.'
+    Write-Output 'PASS local zai profile and private key survive install/check/disconnect; GLM is not ready without authorization'
 
     $failed = New-Fixture startupFailure; $before = Snapshot $failed
     & $module { $script:failReady = $true }
@@ -639,3 +671,4 @@ foreach ($name in @('runtime-port.json','ocx.pid')) {
         Remove-Item -LiteralPath $full -Recurse -Force
     }
 }
+

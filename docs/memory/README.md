@@ -10,8 +10,8 @@ do not certify that historical checks apply to current source or dirty changes.
 | Installation | Setup, update, disconnection, local TUI writes and recovery | [Installation](../installation.md) |
 | Source diagnostics | Effective configuration and discovery checks | [Source diagnostics](../source-diagnostics.md) |
 | Code tools | MCP, language selection, resources and large-repo indexing | [Code tools](../code-tools.md) |
-| Subscriptions | OpenCodex routing, OAuth and proxy stop isolation | [Subscription models](../subscription-models.md) |
-| Delegation | Named levels, Grok preference and usage limits | [Agent delegation](../agent-delegation.md) |
+| Subscriptions | OpenCodex routing, xAI OAuth, Z.AI key login and proxy stop isolation | [Subscription models](../subscription-models.md) |
+| Delegation | Direct model/effort selection, visible conversations, preset migration and usage limits | [Agent delegation](../agent-delegation.md) |
 | Token workflow | RTK exception, Code Mode, raw recovery and task effort | [Token workflow](../token-workflow.md) |
 | Native commands | Current Rust CLI, provenance and unfinished cutover | [Rust native](../rust-native.md) |
 | Rust migration | Ownership map, remaining tasks and current limitations | [Rust migration](../evidence/rust-migration.md) |

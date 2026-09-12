@@ -122,7 +122,7 @@ pub struct Limits {
     pub cpu_percent: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub creation_time: u64,
@@ -138,6 +138,9 @@ pub struct CommandSpec {
     pub env: std::collections::BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>>,
     /// Inherit the parent's console when used for an interactive foreground CLI.
     pub inherit_console: bool,
+    /// Create a separate visible interactive console with this initial title.
+    /// Its standard devices cannot be combined with redirected streams or ConPTY.
+    pub new_console: Option<std::ffi::OsString>,
     /// None selects NUL. Clones of one File may be used for a combined log.
     pub stdin: Option<File>,
     pub stdout: Option<File>,
@@ -152,6 +155,7 @@ impl CommandSpec {
             current_dir: None,
             env: Default::default(),
             inherit_console: false,
+            new_console: None,
             stdin: None,
             stdout: None,
             stderr: None,
@@ -676,6 +680,22 @@ mod windows {
                 return Err(invalid("executable must be an absolute path"));
             }
             let application = wide(command.program.as_os_str())?;
+            let mut console_title = command
+                .new_console
+                .as_ref()
+                .map(|title| wide(title))
+                .transpose()?;
+            if console_title.is_some()
+                && (command.inherit_console
+                    || pseudoconsole.is_some()
+                    || command.stdin.is_some()
+                    || command.stdout.is_some()
+                    || command.stderr.is_some())
+            {
+                return Err(invalid(
+                    "a new visible console requires its own standard devices",
+                ));
+            }
             let directory = command
                 .current_dir
                 .as_ref()
@@ -715,7 +735,7 @@ mod windows {
             // A pseudoconsole supplies its own console standard handles. Even
             // without STARTF_USESTDHANDLES, inheriting our NUL handles can replace
             // them. Only the ordinary redirected process path has HANDLE_LIST.
-            let streams = if pseudoconsole.is_none() {
+            let streams = if pseudoconsole.is_none() && console_title.is_none() {
                 let nul = OpenOptions::new().read(true).write(true).open("NUL")?;
                 Some([
                     inherited_copy(command.stdin.as_ref().unwrap_or(&nul))?,
@@ -758,7 +778,14 @@ mod windows {
             // Explicit null handles on ConPTY prevent the parent's redirected
             // streams from replacing the pseudoconsole's standard devices.
             // Same contract as the retained real C# console acceptance oracle.
-            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.dwFlags = if console_title.is_some() {
+                0
+            } else {
+                STARTF_USESTDHANDLES
+            };
+            if let Some(title) = &mut console_title {
+                startup.StartupInfo.lpTitle = title.as_mut_ptr();
+            }
             if let Some(inherited) = inherited {
                 startup.StartupInfo.hStdInput = inherited[0];
                 startup.StartupInfo.hStdOutput = inherited[1];
@@ -773,10 +800,12 @@ mod windows {
                     line.as_mut_ptr(),
                     null(),
                     null(),
-                    i32::from(pseudoconsole.is_none()),
+                    i32::from(streams.is_some()),
                     CREATE_SUSPENDED
                         | EXTENDED_STARTUPINFO_PRESENT
-                        | if command.inherit_console || pseudoconsole.is_some() {
+                        | if console_title.is_some() {
+                            CREATE_NEW_CONSOLE
+                        } else if command.inherit_console || pseudoconsole.is_some() {
                             0
                         } else {
                             CREATE_NO_WINDOW

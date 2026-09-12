@@ -15,7 +15,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const STORE_DIR_NAME: &str = ".codegraph-harness-store";
@@ -471,6 +471,43 @@ fn replace_owned_dir(from: &Path, to: &Path, project: &Path, expected_to: &str) 
     Ok(())
 }
 
+fn rotate_checkpoint(
+    from: &Path,
+    to: &Path,
+    deadline: Deadline,
+    cancel: &Cancellation,
+) -> io::Result<()> {
+    // SQLite readers on Windows do not share deletion. A short read must not
+    // permanently disable automatic refresh; an ACL denial must stay bounded.
+    let until = Deadline::after(deadline.remaining().min(Duration::from_secs(2)))?;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "CodeGraph checkpoint rotation cancelled",
+            ));
+        }
+        if deadline.expired() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "CodeGraph checkpoint rotation deadline expired",
+            ));
+        }
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) && !until.expired() => {
+                std::thread::sleep(until.remaining().min(Duration::from_millis(10)));
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("CodeGraph checkpoint rotation failed: {error}"),
+                ));
+            }
+        }
+    }
+}
+
 fn seed_empty_database(directory: &Path) -> io::Result<()> {
     let database = directory.join(DATABASE_FILE_NAME);
     if database.exists() {
@@ -776,7 +813,7 @@ impl GenerationStore {
             return Err(storage("checkpoint publication cancelled or expired"));
         }
         let previous = layout.store.join(PREVIOUS_COMMIT);
-        fs::rename(&layout.committed, &previous)?;
+        rotate_checkpoint(&layout.committed, &previous, deadline, cancel)?;
         // Failure here retains the previous checkpoint. Recovery performs the
         // reverse rename; no delete-before-replace window exists.
         fs::rename(&pending, &layout.committed)?;

@@ -203,6 +203,9 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         );
         return Ok(if active { 0 } else { 1 });
     }
+    if let Some(result) = crate::dependency_apply_cli::run(args) {
+        return result;
+    }
     if let Some(result) = crate::dependency_selection_cli::run(args) {
         return result;
     }
@@ -311,6 +314,9 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         );
         println!(
             "codex-harness dependencies <validate|select|selected|recover-selection|rollback-selection> --help (retained native candidates)"
+        );
+        println!(
+            "codex-harness dependencies apply|update --source CHECKOUT --user-home DIRECTORY --state DIRECTORY [--preview|--check] [--node FILE --node-sha256 DIGEST]"
         );
         println!(
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"

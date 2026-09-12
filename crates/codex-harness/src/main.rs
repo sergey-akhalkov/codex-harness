@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, env, ffi::OsString, io, path::PathBuf};
 
 mod delegation_usage;
 #[cfg(windows)]
+mod dependency_apply_cli;
+#[cfg(windows)]
 mod dependency_cli;
 #[cfg(windows)]
 mod dependency_selection_cli;
@@ -132,6 +134,9 @@ fn run() -> io::Result<i32> {
         let expected = args[4].to_str().ok_or_else(invalid)?;
         let encoded = args[5].to_str().ok_or_else(invalid)?;
         match args[3].to_str() {
+            Some("task-control") if encoded == "{}" => {
+                harness_core::task_runtime::serve(guard, expected)?
+            }
             Some("codebase-memory") => harness_core::cbm_broker::serve(
                 guard,
                 expected,
@@ -178,6 +183,9 @@ fn run() -> io::Result<i32> {
         println!(
             "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY]"
         );
+        println!(
+            "codex-harness dependencies apply|update --source CHECKOUT --user-home DIRECTORY --state DIRECTORY [--preview|--check] [--node FILE --node-sha256 DIGEST]"
+        );
         println!("codex-harness dependencies audit --package-root DIRECTORY");
         println!(
             "codex-harness dependencies probe --executable FILE --kind codebase-memory|nuphus --sha256 DIGEST"
@@ -186,7 +194,7 @@ fn run() -> io::Result<i32> {
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
         );
         println!(
-            "codex-harness check --core-only --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY] [--timeout-seconds SECONDS]"
+            "codex-harness check --core-only|--code-tools-only|--subscriptions-only|--token-workflow-only --codex-home DIRECTORY --user-home DIRECTORY [--source CHECKOUT] [--dependency-user-home DIRECTORY] [--timeout-seconds SECONDS] [--preview]"
         );
         println!(
             "codex-harness disconnect --core-only --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY] [--preview]"
@@ -195,7 +203,19 @@ fn run() -> io::Result<i32> {
             "codex-harness recover --core-only [--preview] --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY]"
         );
         println!(
-            "codex-harness install|update --core-only --source CHECKOUT --build DIRECTORY --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
+            "codex-harness disconnect|recover --code-tools-only|--subscriptions-only|--token-workflow-only --codex-home DIRECTORY --user-home DIRECTORY --source CHECKOUT [--dependency-user-home DIRECTORY] [--preview]"
+        );
+        println!(
+            "codex-harness install|update --core-only|--code-tools-only --source CHECKOUT [--build DIRECTORY] --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
+        );
+        println!(
+            "codex-harness install --token-workflow-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
+        );
+        println!(
+            "codex-harness install|update --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
+        );
+        println!(
+            "codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
         );
         println!("codex-harness outcome-prepare --case CASE [--observer ABSOLUTE_EXE]");
         println!("codex-harness outcome-oracle --request PATH");
@@ -245,7 +265,19 @@ fn run() -> io::Result<i32> {
         return source_diagnostics::run(&options);
     }
     #[cfg(windows)]
-    if args[0] == "check" && args[1..].iter().any(|arg| arg == "--core-only") {
+    if args[0] == "check"
+        && args[1..].iter().any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some(
+                    "--core-only"
+                        | "--code-tools-only"
+                        | "--subscriptions-only"
+                        | "--token-workflow-only"
+                )
+            )
+        })
+    {
         verify_manager()?;
         return install_cli::check(&args[1..]);
     }
@@ -257,12 +289,22 @@ fn run() -> io::Result<i32> {
     #[cfg(windows)]
     if args[0] == "install" || args[0] == "update" {
         verify_manager()?;
-        return install_cli::run(&args[1..]);
+        return install_cli::run(
+            args[0]
+                .to_str()
+                .ok_or_else(|| io::Error::other("command is not UTF-8"))?,
+            &args[1..],
+        );
     }
     #[cfg(windows)]
     if args[0] == "recover" {
         verify_manager()?;
         return install_cli::recover(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "configure-restart" {
+        verify_manager()?;
+        return install_cli::configure_restart(&args[1..]);
     }
     if args[0] == "outcome-report" {
         return outcome_report_cli::run(&args[1..]);

@@ -53,7 +53,7 @@ try {
   report.health = { status: health.status, pid: health.pid, version: health.version };
   if (failureProbe) {
     report.failures = [];
-    for (const model of ['xai/grok-4.6', 'unavailable_fixture/grok-4.6']) {
+    for (const model of ['xai/grok-4.6', 'unavailable_fixture/grok-4.6', 'zai/glm-5.3']) {
       const response = await fetch('http://127.0.0.1:10101/v1/responses', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(10000),
         body: JSON.stringify({ model, input: 'Reply OK.', max_output_tokens: 16, stream: false }),

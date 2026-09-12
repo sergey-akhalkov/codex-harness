@@ -387,6 +387,7 @@ mod tests {
             fs::write(
                 &launch_source,
                 serde_json::to_vec_pretty(&native_launcher::Registration {
+                    task_control: false,
                     schema: 2,
                     state: None,
                     build: Some(build.clone()),

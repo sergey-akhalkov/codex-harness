@@ -14,7 +14,10 @@ function Get-SubscriptionPaths {
         service = Join-Path $CodexHome 'harness/subscriptions/service.json'; runtime = Join-Path $CodexHome 'harness/subscriptions/runs'
         config = Join-Path $CodexHome 'config.toml'; configLink = Join-Path $UserHome '.opencodex/config.json'
         configSource = Join-Path $SourceRoot 'global/opencodex/config.json'; roleLink = Join-Path $CodexHome 'agents/codex-harness-subscriptions'
-        roleSource = Join-Path $SourceRoot 'global/opencodex/agents'; task = 'codex-harness-subscriptions-' + $identity }
+        roleSource = Join-Path $SourceRoot 'global/opencodex/agents'; task = 'codex-harness-subscriptions-' + $identity
+        zaiKey = Join-Path $CodexHome 'harness/subscriptions/zai-key.txt'
+        zaiProfile = Join-Path $CodexHome 'zai.config.toml'
+        zaiCatalog = Join-Path $CodexHome 'zai.models.json' }
 }
 function Get-SubscriptionLink([string]$Path) {
     Assert-CodeToolsPlain (Split-Path $Path)
@@ -22,6 +25,60 @@ function Get-SubscriptionLink([string]$Path) {
     if (-not $item) { return $null }
     if ($item.LinkType -ne 'SymbolicLink' -or -not $item.LinkTarget) { throw "Foreign connection preserved: $Path" }
     [IO.Path]::GetFullPath($item.LinkTarget, (Split-Path $Path))
+}
+function Get-SubscriptionFileFingerprint([string]$Path) {
+    Assert-CodeToolsPlain $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    @{ exists = $true; length = (Get-Item -LiteralPath $Path -Force).Length; hash = Get-CodeToolsHash (Get-CodeToolsBytes $Path) }
+}
+function Get-SubscriptionLocalZaiProfileState($Paths) {
+    @{ profile = Get-SubscriptionFileFingerprint $Paths.zaiProfile; catalog = Get-SubscriptionFileFingerprint $Paths.zaiCatalog }
+}
+function Assert-SubscriptionLocalZaiProfilePreserved($Paths, $Before) {
+    $after = Get-SubscriptionLocalZaiProfileState $Paths
+    foreach ($name in @('profile','catalog')) {
+        $expected = $Before[$name]; $actual = $after[$name]
+        if ($null -eq $expected -and $null -eq $actual) { continue }
+        if ($null -eq $expected -or $null -eq $actual) { throw "Local zai profile files were created or deleted: $name" }
+        if ($expected.hash -cne $actual.hash -or $expected.length -ne $actual.length) { throw "Local zai profile files were modified: $name" }
+    }
+}
+function Test-SubscriptionZaiKeyAuthorized($Paths) {
+    Test-Path -LiteralPath $Paths.zaiKey -PathType Leaf
+}
+function Get-SubscriptionSecretFiles($Paths) {
+    $files = [ordered]@{}
+    if (Test-SubscriptionZaiKeyAuthorized $Paths) { $files['ZAI_API_KEY'] = $Paths.zaiKey }
+    $files
+}
+function Test-SubscriptionZaiRuntimeKeyInjected($Paths) {
+    if (-not (Test-SubscriptionZaiKeyAuthorized $Paths)) { return $false }
+    $active = Read-CodeToolsJson (Join-Path $Paths.runtime 'active-run.json')
+    if (-not $active -or -not $active.started) { return $false }
+    $startedPath = [IO.Path]::GetFullPath($active.started)
+    if ((Split-Path $startedPath) -ne [IO.Path]::GetFullPath($Paths.runtime)) { throw 'Foreign subscription process receipt path preserved.' }
+    if (-not $startedPath.EndsWith('.started.json', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $requestPath = $startedPath.Substring(0, $startedPath.Length - '.started.json'.Length) + '.request.json'
+    $request = Read-CodeToolsJson $requestPath
+    if (-not $request -or -not $request.ContainsKey('secretFiles') -or -not $request.secretFiles) { return $false }
+    $secrets = $request.secretFiles
+    if ($secrets -isnot [Collections.IDictionary] -or -not $secrets.Contains('ZAI_API_KEY')) { return $false }
+    $injected = $secrets['ZAI_API_KEY']
+    if ($injected -isnot [string] -or -not $injected) { return $false }
+    [IO.Path]::GetFullPath($injected) -eq [IO.Path]::GetFullPath($Paths.zaiKey)
+}
+function Assert-SubscriptionZaiSource($Paths) {
+    $config = Read-CodeToolsJson $Paths.configSource
+    $zai = $null
+    if ($config -and $config.providers) { $zai = $config.providers['zai'] }
+    if (-not $zai) { throw 'Subscription source must declare the zai Coding Plan provider.' }
+    if ($zai.adapter -cne 'openai-chat' -or $zai.baseUrl -cne 'https://api.z.ai/api/coding/paas/v4' -or $zai.authMode -cne 'key') {
+        throw 'Z.AI provider must use the Coding Plan Chat route.'
+    }
+    $expected = '$' + '{ZAI_API_KEY}'
+    if ($zai.apiKey -cne $expected) { throw 'Z.AI source must use an environment reference, not a plaintext key.' }
+    $selected = @($zai.selectedModels)
+    if ($selected.Count -ne 1 -or $selected[0] -cne 'glm-5.3') { throw 'Z.AI selected models must be exactly glm-5.3.' }
 }
 function Set-SubscriptionLink {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Private journaled write checks the expected target; the owning lifecycle operation already handles Preview.')]
@@ -268,6 +325,8 @@ function Invoke-SubscriptionBounded($Paths, [string]$Executable, [string[]]$Argu
     $prefix = Join-Path $Paths.runtime ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmss') + '-' + [guid]::NewGuid().ToString('N'))
     $request = @{ executable = $Executable; arguments = $Arguments; workingDirectory = $Paths.source
         stdoutPath = $prefix + '.stdout'; stderrPath = $prefix + '.stderr'; environment = $Environment; memoryLimitMiB = 768; timeoutSeconds = $Timeout }
+    $secretFiles = Get-SubscriptionSecretFiles $Paths
+    if ($secretFiles.Count) { $request.secretFiles = $secretFiles }
     if ($ServiceRun) {
         # Real long-context traffic exhausted 768 MiB twice. Keep containment,
         # with headroom for concurrent requests and response-state serialization.
@@ -305,6 +364,7 @@ function Restore-SubscriptionNative($Paths, $Dependency) {
     Invoke-SubscriptionBounded -Paths $Paths -Executable $Dependency.bun -Arguments @('--no-env-file',(Join-Path $Paths.source 'tools/opencodex-native-restore.mjs'), $Dependency.root) -Environment $environment | Out-Null
 }
 function Assert-SubscriptionConfiguration($Paths, $Dependency) {
+    Assert-SubscriptionZaiSource $Paths
     $environment = @{ CODEX_HOME = $Paths.codex; OPENCODEX_HOME = $Paths.opencodex }
     Invoke-SubscriptionBounded -Paths $Paths -Executable $Dependency.bun -Arguments @('--no-env-file',(Join-Path $Paths.source 'tools/opencodex-config-check.mjs'), $Dependency.root, $Paths.source) -Environment $environment | Out-Null
 }
@@ -593,11 +653,17 @@ function Invoke-HarnessSubscriptionRouting {
     if (-not $config -or $config.hostname -ne '127.0.0.1' -or $config.port -lt 1024 -or $config.port -gt 65535 -or $config.codexAutoStart -ne $false -or $config.codexShimAutoRestore -ne $false) { throw 'Subscription source must select loopback and preserve the ordinary Codex launcher.' }
     if ($Preview) { return @{ status = 'preview-subscriptions'; mode = $Mode; dependency = if ($dependency) { 'reused' } else { 'install-private-pinned' }; task = $paths.task; port = $config.port } }
     if ($Mode -eq 'Check') {
+        $profileBefore = Get-SubscriptionLocalZaiProfileState $paths
+        if ($state) { Assert-SubscriptionZaiSource $paths }
         $ready = $state -and $dependency -and $task -and $task.running -and $links.configLink -eq $paths.configSource -and $links.roleLink -eq $paths.roleSource -and (Test-SubscriptionReady $paths $config.port)
-        return @{ status = if ($ready) { 'ready' } elseif ($state) { 'degraded' } else { 'disconnected' }; task = $paths.task; port = $config.port; dependency = [bool]$dependency }
+        Assert-SubscriptionLocalZaiProfilePreserved $paths $profileBefore
+        $zaiAuthorized = [bool](Test-SubscriptionZaiKeyAuthorized $paths)
+        $zaiRuntimeKey = [bool](Test-SubscriptionZaiRuntimeKeyInjected $paths)
+        return @{ status = if ($ready) { 'ready' } elseif ($state) { 'degraded' } else { 'disconnected' }; task = $paths.task; port = $config.port; dependency = [bool]$dependency; zaiAuthorized = $zaiAuthorized; zaiRuntimeKey = $zaiRuntimeKey; glmReady = [bool]($ready -and $zaiAuthorized -and $zaiRuntimeKey) }
     }
     if ($Mode -eq 'Disconnect' -and -not $state) { return @{ status = 'disconnected' } }
     if ($Mode -in @('Install','Update') -and -not (Test-Path -LiteralPath $paths.roleSource -PathType Container)) { throw 'Subscription role source is absent.' }
+    $profileBefore = Get-SubscriptionLocalZaiProfileState $paths
     $pending = @{ schema_version = 1; owner = 'codex-harness-subscriptions'; source = $paths.source; user = $paths.user; codex = $paths.codex; task = $paths.task
         state_before = Get-SubscriptionSnapshot $paths.state; state_after = Get-SubscriptionSnapshot $paths.state
         service_before = Get-SubscriptionSnapshot $paths.service; service_after = Get-SubscriptionSnapshot $paths.service
@@ -642,7 +708,10 @@ function Invoke-HarnessSubscriptionRouting {
         }
         if ($Checkpoint) { & $Checkpoint 'subscriptions' }
         if (-not $DeferCommit) { Complete-HarnessSubscriptionRouting $CodexHome }
-        @{ status = if ($Mode -eq 'Disconnect') { 'disconnected' } else { 'ready' }; task = $paths.task; port = $config.port }
+        Assert-SubscriptionLocalZaiProfilePreserved $paths $profileBefore
+        $zaiAuthorized = [bool](Test-SubscriptionZaiKeyAuthorized $paths)
+        $zaiRuntimeKey = [bool](($Mode -ne 'Disconnect') -and (Test-SubscriptionZaiRuntimeKeyInjected $paths))
+        @{ status = if ($Mode -eq 'Disconnect') { 'disconnected' } else { 'ready' }; task = $paths.task; port = $config.port; zaiAuthorized = $zaiAuthorized; zaiRuntimeKey = $zaiRuntimeKey; glmReady = [bool](($Mode -ne 'Disconnect') -and $zaiAuthorized -and $zaiRuntimeKey) }
     } catch {
         $cause = $_.Exception.Message
         # The outer coordinator restores MCP/core after routing. Do not restart
@@ -653,4 +722,4 @@ function Invoke-HarnessSubscriptionRouting {
         throw "Subscription activation failed and prior state restored: $cause"
     }
 }
-Export-ModuleMember -Function Invoke-HarnessSubscriptionRouting, Restore-HarnessSubscriptionRouting, Resume-HarnessSubscriptionRouting, Complete-HarnessSubscriptionRouting, Invoke-SubscriptionServiceHost
+Export-ModuleMember -Function Invoke-HarnessSubscriptionRouting, Restore-HarnessSubscriptionRouting, Resume-HarnessSubscriptionRouting, Complete-HarnessSubscriptionRouting, Invoke-SubscriptionServiceHost, Get-SubscriptionPaths, Get-SubscriptionSecretFiles, Test-SubscriptionZaiKeyAuthorized, Assert-SubscriptionZaiSource, Get-SubscriptionLocalZaiProfileState, Assert-SubscriptionLocalZaiProfilePreserved

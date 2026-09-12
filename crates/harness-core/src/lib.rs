@@ -22,6 +22,8 @@ pub mod cbm_catalogue;
 pub mod cbm_configuration;
 pub mod cbm_index;
 pub mod cbm_stdio;
+#[cfg(windows)]
+pub mod code_tools_lifecycle;
 pub mod codegraph_account;
 pub mod codegraph_broker;
 pub mod codegraph_catalogue;
@@ -42,6 +44,7 @@ pub mod core_check;
 pub mod core_disconnect;
 pub mod core_install;
 pub mod core_runtime;
+pub mod dependency_apply;
 pub mod dependency_archive;
 mod dependency_assets;
 pub mod dependency_audit;
@@ -69,6 +72,8 @@ pub mod inventory;
 pub mod launcher;
 mod legacy_pending;
 mod legacy_pending_format;
+#[cfg(windows)]
+pub mod lifecycle;
 pub mod mcp_protocol;
 pub mod mcp_session;
 pub mod mcp_stdio;
@@ -87,5 +92,25 @@ pub mod profile_state;
 pub mod registration;
 mod registration_native;
 pub mod resource_admission;
+#[cfg(windows)]
+pub mod serena;
 pub mod source_observation;
+#[cfg(windows)]
+pub mod subscription_lifecycle;
+#[cfg(windows)]
+pub mod task_arguments;
+pub mod task_control;
+pub mod task_failure;
+#[cfg(windows)]
+mod task_handoff;
+#[cfg(windows)]
+mod task_observer;
+#[cfg(windows)]
+pub mod task_runtime;
+#[cfg(windows)]
+pub mod task_scheduler;
+#[cfg(windows)]
+pub mod task_view;
+#[cfg(windows)]
+pub mod token_workflow_lifecycle;
 mod wheel_record;

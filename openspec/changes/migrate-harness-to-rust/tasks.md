@@ -1,10 +1,10 @@
-The graph-provider target is CodeGraph, owned by [replace-cbm-with-codegraph](../replace-cbm-with-codegraph/tasks.md). Follow the [ownership and dependency map](design.md#graph-provider-ownership-and-order) before tasks 5.2–5.4, 8 or 9. Do not resume a separate CBM migration because its existing files or historical checks appear in the inventory. These dependencies do not mark implementation or global acceptance complete.
+The graph-provider target is CodeGraph, owned by [replace-cbm-with-codegraph](../archive/2026-09-11-replace-cbm-with-codegraph/tasks.md). Follow the [ownership and dependency map](design.md#graph-provider-ownership-and-order) before tasks 5.2–5.4, 8 or 9. Do not resume a separate CBM migration because its existing files or historical checks appear in the inventory. These dependencies do not mark implementation or global acceptance complete.
 
 ## 1. Fix migration inputs and preserve acceptance
 
 - [x] 1.1 Record the selected source/dirty-input and installed dependency identities, map first-party executables (including embedded/generated fixtures and skill resources) to replacement/retirement ownership, and link existing requirements to acceptance checks; verify coverage against current source, manifests and installed registrations rather than the exploration counts.
 - [x] 1.2 Reconcile affected concurrent changes before edits, especially the shared Source updates requirement in autonomous-skill-evolution, RTK's accepted exception and bounded-resource work; verify the compatibility record preserves landed requirements and leaves unrelated implementation tasks untouched.
-- [ ] 1.3 Capture representative current launch, Check, MCP, process/console, subscription and RTK behavior on owned targets, plus matched model-free timing/resource baselines; verify source/runtime identity, meaningful failure oracles and a comparison/noise method recorded before candidate results.
+ - [x] 1.3 Capture representative current launch, Check, MCP, process/console, subscription and RTK behavior on owned targets, plus matched model-free timing/resource baselines; verify source/runtime identity, meaningful failure oracles and a comparison/noise method recorded before candidate results.
 
 ## 2. Native workspace and execution foundation
 
@@ -17,7 +17,7 @@ The graph-provider target is CodeGraph, owned by [replace-cbm-with-codegraph](..
 ## 3. Prove replacement of foreign internal integrations
 
 - [ ] 3.1 Map the currently used OpenCodex native restoration, candidate validation, browser-only OAuth and guard operations to verified upstream interfaces or bounded Rust behavior; deliver Rust probes against the intended package version covering successful login/restoration, closed input, deadlines/cancellation and private failure output, keeping the path unfinished if equivalent protections cannot be proven.
-- [ ] 3.2 Prove a Rust-controlled Serena startup/worker boundary retaining provisioning suppression, selected provider configuration and project isolation; verify real semantic operations for separate owned contexts, no runtime package acquisition and representative missing/incompatible dependency failures before replacing the Python internal seam.
+- [x] 3.2 Prove a Rust-controlled Serena startup/worker boundary retaining provisioning suppression, selected provider configuration and project isolation; verify real semantic operations for separate owned contexts, no runtime package acquisition and representative missing/incompatible dependency failures before replacing the Python internal seam.
 
 ## 4. Native installation, launcher and diagnostics
 

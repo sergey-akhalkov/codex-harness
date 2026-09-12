@@ -178,7 +178,7 @@ fn tool_version(tool: &OsStr, args: &[&str], source: &Path) -> io::Result<String
     fs::read_to_string(output_path).map(|s| s.trim().to_owned())
 }
 
-fn resolve_tool(tool: &OsStr) -> io::Result<PathBuf> {
+pub(crate) fn resolve_tool(tool: &OsStr) -> io::Result<PathBuf> {
     let requested = Path::new(tool);
     if requested.is_absolute() || requested.components().count() > 1 {
         // rustup dispatches by argv[0]: resolving rustc.exe/cargo.exe symlinks
