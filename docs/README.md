@@ -67,4 +67,5 @@ Documentation and the binary can diverge.
 - Whether two-consumer quantitative speed comparison remains required after
   withdrawing ongoing source-kit support; remaining
   [accelerate-verified-delivery](../openspec/changes/accelerate-verified-delivery/proposal.md)
-  benefit tasks stay open
+  benefit tasks 5.4 and 6.4 stay open. Controlled hooks-off Astra pairs for
+  the remaining local cases already ran; they do not prove benefit.

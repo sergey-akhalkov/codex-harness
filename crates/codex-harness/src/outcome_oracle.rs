@@ -237,10 +237,7 @@ fn verify(
         "result_record".into(),
         report.is_object()
             && report.get("command").is_some_and(nonempty)
-            && report
-                .get("scope")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.trim().is_empty()),
+            && report.get("scope").is_some_and(nonempty),
     );
     checks.insert(
         "accurate_status".into(),
@@ -392,10 +389,14 @@ fn pattern(text: &str) -> Regex {
 fn nonempty(value: &Value) -> bool {
     match value {
         Value::String(s) => !s.trim().is_empty(),
-        Value::Array(a) => {
-            !a.is_empty()
-                && a.iter()
-                    .all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+        Value::Array(a) => !a.is_empty() && a.iter().all(nonempty),
+        Value::Object(map) => {
+            !map.is_empty()
+                && map.values().any(|value| match value {
+                    Value::String(s) => !s.trim().is_empty(),
+                    Value::Array(_) | Value::Object(_) => nonempty(value),
+                    _ => false,
+                })
         }
         _ => false,
     }

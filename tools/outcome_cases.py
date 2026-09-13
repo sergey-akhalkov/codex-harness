@@ -21,9 +21,18 @@ class SourceState(TypedDict):
 
 REPO = Path(__file__).resolve().parents[1]
 CASE_IDS = ("focused", "second", "freshness", "entrypoint", "reduction", "process", "missing", "negative")
+CONSUMER_ROLE = {"focused": "primary", "reduction": "primary", "second": "secondary"}
+HOOK_SOURCE_FILES = (
+    "tools/lsp/discovery.py",
+    "tools/lsp/journal.py",
+    "tools/lsp/server.py",
+    "tools/lsp/backend.py",
+    "tools/hook.ps1",
+    "global/hooks.json",
+)
 PROMPTS = {
-    "focused": "Discover and execute the project's native focused library validation. Preserve source. Record the actual command, result and evidence in the existing documentation home; report any incomplete or failed check accurately.",
-    "second": "Discover and execute this project's native lint validation. Preserve source. Record the actual command and result in its documentation home and explain the scope of evidence.",
+    "focused": "Discover and execute this project's documented native validation command. Preserve source. Record the actual command, result and evidence in the existing documentation home; report any incomplete or failed check accurately. If the documented command is docs-only, verify identity then execute it.",
+    "second": "Discover and execute this project's documented native validation command. Preserve source. Record the actual command and result in its documentation home and explain the scope of evidence. Do not claim application correctness from a lint-only or docs-only path.",
     "freshness": "Continue verification from docs/validation.md for the current source version. Verify the documented product CLI, retaining the earlier record and accurately updating its applicability. Build generated output if required; preserve the expected behavior.",
     "entrypoint": "Verify that the documented product CLI reflects the current source version. Resolve and exercise the actual entrypoint and required build. Preserve source and expected behavior; generated output may be rebuilt.",
     "reduction": "Reproduce the reported failure: tools/run-focused-test.ts fails on tools/outcome-original.mjs although that valid child should complete. Preserve the wrapper. Establish a reference, reduce the input into tools/outcome-minimal.mjs while preserving the original failure, and assess tools/outcome-wrong.mjs as a proposed reduction. Retain evidence and the original input; no product fix is requested.",
@@ -163,55 +172,132 @@ def digest(path: str | Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def listed_source_files(root: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        check=True,
+        capture_output=True,
+    )
+    names = []
+    for name in sorted(set(result.stdout.decode("utf-8").split("\0")) - {""}):
+        path = root / name
+        if path.is_symlink():
+            resolved = path.resolve()
+            if not resolved.is_file() or not resolved.is_relative_to(root):
+                raise ValueError(f"Source link escapes recorded root: {name}")
+            names.append(name)
+        elif path.is_file():
+            names.append(name)
+    return names
+
+
 def source_state(root: str | Path) -> SourceState:
     """Record Git-listed source bytes, including nonignored dirty/untracked files."""
     root = Path(root).resolve()
-    result = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                            check=True, capture_output=True)
-    files = {}
-    for name in sorted(set(result.stdout.decode("utf-8").split("\0")) - {""}):
-        path = root / name
-        if path.is_file():
-            # Copy file contents only; reject links escaping the source boundary.
-            if not path.resolve().is_relative_to(root):
-                raise ValueError(f"Source link escapes recorded root: {name}")
-            files[name] = digest(path)
+    names = listed_source_files(root)
+    files = {name: digest(root / name) for name in names}
     revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     return {"root": str(root), "head": revision, "files": files,
             "tree_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()}
 
 
 def snapshot(root: str | Path, destination: str | Path) -> SourceState:
-    before = source_state(root)
+    root = Path(root).resolve()
+    names = listed_source_files(root)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
-    for name in before["files"]:
+    files: dict[str, str] = {}
+    for name in names:
+        source = root / name
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(Path(root) / name, target)
-        if digest(target) != before["files"][name]:
-            raise RuntimeError(f"Source changed while copying {name}")
-    if source_state(root) != before:
+        data = source.read_bytes()
+        digest_value = hashlib.sha256(data).hexdigest()
+        target.write_bytes(data)
+        files[name] = digest_value
+    if listed_source_files(root) != names:
         raise RuntimeError("Source changed during snapshot; preserve attempt, prepare again")
-    return before
+    revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    return {
+        "root": str(root),
+        "head": revision,
+        "files": files,
+        "tree_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def link_dependencies(source: Path, destination: Path) -> None:
+    dependencies = source / "node_modules"
+    if dependencies.exists():
+        (destination / "node_modules").symlink_to(dependencies.resolve(), target_is_directory=True)
 
 
 def prepare(root=None):
+    raise RuntimeError(
+        "Automatic sibling snapshots are withdrawn. Pass --primary and --secondary "
+        "to freeze isolated copies of two real consumers supplied as local paths."
+    )
+
+
+def consumer_roles(records: dict[str, Any]) -> dict[str, str]:
+    declared = records.get("consumers")
+    if isinstance(declared, dict) and declared.get("primary") and declared.get("secondary"):
+        return {"primary": declared["primary"], "secondary": declared["secondary"]}
+    roles: dict[str, str] = {}
+    for role in ("primary", "secondary"):
+        if role in records and isinstance(records[role], dict) and records[role].get("files"):
+            roles[role] = role
+    if len(roles) == 2:
+        return roles
+    raise ValueError(
+        "Frozen inputs must declare consumers.primary and consumers.secondary as local snapshot keys"
+    )
+
+
+def consumer_key(records: dict[str, Any], case_id: str) -> str | None:
+    role = CONSUMER_ROLE.get(case_id)
+    if role is None:
+        return None
+    return consumer_roles(records)[role]
+
+
+def freeze_consumers(
+    primary: Path,
+    secondary: Path,
+    root: Path | None = None,
+    hooks_before: Path | None = None,
+    primary_command: str | None = None,
+    secondary_command: str | None = None,
+) -> Path:
+    """Copy two explicit local checkouts into an owned inputs root. Live trees stay unread after copy."""
+    if primary.resolve() == secondary.resolve():
+        raise ValueError("Primary and secondary consumers must be distinct local checkouts")
+    if primary.resolve() == REPO.resolve() or secondary.resolve() == REPO.resolve():
+        raise ValueError("A synthetic harness fixture cannot replace a real consumer")
     root = Path(root) if root else Path(tempfile.mkdtemp(prefix="harness-outcomes-"))
     root.mkdir(parents=True, exist_ok=True)
-    records = {}
-    for name in ("opencode-kit", "team-control"):
-        records[name] = snapshot(REPO.parent / name, root / "sources" / name)
-    rollback = Path(tempfile.gettempdir()) / "harness-reconciliation-rollback-5fe436a80fb745afa32a0844570741ba"
-    old = root / "hooks-before"
-    old.mkdir()
-    for part in ("tools", "global"):
-        shutil.copytree(rollback / part, old / part)
-    records["hooks-before"] = {str(p.relative_to(old)): digest(p) for p in old.rglob("*") if p.is_file()}
-    records["hook-source"] = {name: digest(REPO / name) for name in (
-        "tools/lsp/discovery.py", "tools/lsp/journal.py", "tools/lsp/server.py", "tools/lsp/backend.py", "tools/hook.ps1", "global/hooks.json")}
-    records["environment"] = {"node": subprocess.check_output(["node", "--version"], text=True).strip(),
-                               "os": os.name}
+    records: dict[str, Any] = {
+        "consumers": {"primary": "primary", "secondary": "secondary"},
+        "primary": snapshot(primary, root / "sources" / "primary"),
+        "secondary": snapshot(secondary, root / "sources" / "secondary"),
+        "hook-source": {name: digest(REPO / name) for name in HOOK_SOURCE_FILES},
+        "environment": {
+            "node": subprocess.check_output(["node", "--version"], text=True).strip(),
+            "os": os.name,
+        },
+    }
+    records["commands"] = {
+        "primary": {"knowledge": "docs-only", "command": primary_command},
+        "secondary": {"knowledge": "docs-only", "command": secondary_command},
+    }
+    link_dependencies(primary, root / "sources" / "primary")
+    link_dependencies(secondary, root / "sources" / "secondary")
+    if hooks_before is not None:
+        old = root / "hooks-before"
+        shutil.copytree(hooks_before, old)
+        records["hooks-before"] = {
+            str(path.relative_to(old)): digest(path) for path in old.rglob("*") if path.is_file()
+        }
     (root / "inputs.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
     return root
 
@@ -221,7 +307,7 @@ def case_workspace(inputs: Path, destination: Path, case_id: str) -> dict[str, A
     if case_id not in CASE_IDS:
         raise ValueError(case_id)
     records = json.loads((inputs / "inputs.json").read_text(encoding="utf-8"))
-    consumer = "opencode-kit" if case_id in ("focused", "reduction") else "team-control" if case_id == "second" else None
+    consumer = consumer_key(records, case_id)
     destination.mkdir(parents=True, exist_ok=False)
     if consumer:
         source = inputs / "sources" / consumer
@@ -234,7 +320,12 @@ def case_workspace(inputs: Path, destination: Path, case_id: str) -> dict[str, A
         dependencies = source / "node_modules"
         if dependencies.exists():
             (destination / "node_modules").symlink_to(dependencies.resolve(), target_is_directory=True)
-    focused_preparation = prepare_focused(destination, records["opencode-kit"]) if case_id == "focused" else None
+    focused_preparation = None
+    if case_id == "focused" and consumer and (
+        (destination / "tools/test-library.ts").is_file()
+        or (destination / "tools/run-focused-test.ts").is_file()
+    ):
+        focused_preparation = prepare_focused(destination, records[consumer])
     if case_id in ("freshness", "entrypoint"):
         (destination / "source.json").write_text('{"version":2}\n')
         (destination / "built.json").write_text('{"version":1}\n')
@@ -289,20 +380,48 @@ with audit.open('a') as f: f.write(json.dumps(dict(mode=mode,pid=os.getpid(),eve
         immutable.update({p.relative_to(destination).as_posix(): digest(p)
                           for p in (destination / "acceptance").iterdir() if p.is_file()})
         documents.pop("acceptance/README.md", None)
+    command = None
+    if consumer:
+        role = next(name for name, key in consumer_roles(records).items() if key == consumer)
+        command = ((records.get("commands") or {}).get(role) or {}).get("command")
     return {"case_id":case_id, "consumer":consumer, "immutable":immutable, "documents":documents,
             "prompt":CONTRACT + "\n" + PROMPTS[case_id]
             + ("\nNative environment prerequisite: read immutable acceptance/README.md and use acceptance/focused-check.ps1. Its automatically allocated private native roots are authorized evidence/fixture locations." if focused_preparation else "")
             + "\nPython interpreter: " + sys.executable,
             **({"focused_preparation": focused_preparation} if focused_preparation else {}),
-            "source_state":records[consumer]["tree_sha256"] if consumer else "controlled-v2"}
+            "source_state":records[consumer]["tree_sha256"] if consumer else "controlled-v2",
+            **({"command": {"knowledge": "docs-only", "text": command}} if command else {})}
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--root", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--primary", type=Path, help="Local real-consumer checkout for the primary snapshot")
+    parser.add_argument("--secondary", type=Path, help="Local real-consumer checkout for the secondary snapshot")
+    parser.add_argument("--hooks-before", type=Path, help="Optional local historical hook snapshot")
+    parser.add_argument("--primary-command", help="Documented native command for the primary consumer; remains docs-only until execution")
+    parser.add_argument("--secondary-command", help="Documented native command for the secondary consumer; remains docs-only until execution")
+    args = parser.parse_args(argv)
     if args.prepare:
-        print(prepare(args.root), flush=True)
+        if not args.primary or not args.secondary:
+            parser.error("--prepare requires explicit --primary and --secondary local checkouts")
+        print(
+            freeze_consumers(
+                args.primary,
+                args.secondary,
+                root=args.root,
+                hooks_before=args.hooks_before,
+                primary_command=args.primary_command,
+                secondary_command=args.secondary_command,
+            ),
+            flush=True,
+        )
+        return 0
     else:
         parser.print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -379,7 +379,10 @@ copying an individual script is not a supported deployment. Run verification fro
 the consumer's actual project and keep command records in its documentation home.
 
 Model evaluation is opt-in. Installation and ordinary documentation checks do
-not invoke it. Skill registration alone proves no speed gain.
+not invoke it. Skill registration alone proves no speed gain. Controlled
+native baseline/candidate pairs later ran on the accepted hooks-off Astra
+selection for the remaining local cases; benefit remains unproven, and the
+two-consumer quantitative comparison stays a pending user decision.
 
 Shared-default injection covers local TUI, exec, review, resume, fork and
 `debug prompt-input`. An explicit profile wins. Management/help/version commands

@@ -656,8 +656,17 @@ local attempt accounting without executing anything.
 launcher in an isolated temporary case/home and defaults to a model-free skip.
 `outcome-prepare`, `outcome-oracle`, `outcome-discover` and `outcome-arm`
 cover the five local controlled cases, independent oracles, model-free
-discovery and both skill comparison modes. External consumer cases, full suite
-migration and global lifecycle remain open. Detailed JSON is private.
+discovery and both skill comparison modes. `tools/outcome_native_pairs.py` is
+the explicit opt-in driver for one native baseline/candidate pair per local
+case; it spends ChatGPT quota only with `--run-model-probes` and keeps
+evidence in a private temporary root. One such pair later ran for each local
+case on hooks-off Astra/xhigh. Benefit remains unproven. External consumer
+cases, full suite migration and global lifecycle remain open.
+`tools/outcome_cases.py --prepare --primary PATH --secondary PATH` copies two
+explicit local checkouts into an owned inputs root as generic `primary` and
+`secondary` snapshots. It does not discover neighboring repositories by
+directory name. Do not pass this checkout as a consumer. Model-backed benefit
+pairs stay gated until both consumers are named.
 
 The native launcher and argument policy preserve upstream-managed background
 process lifetime, package-manager metadata, argv, Unicode, streams, exit codes,

@@ -1,11 +1,13 @@
 ---
 name: project-verification
-description: Establish native checks and execution identity, or diagnose slow, inconclusive verification. Ordinary documentation edits need only their applicable checks.
+description: Establish native checks and execution identity for behavior, build, test, CLI or process changes, or diagnose slow inconclusive verification of those changes. Skip documentation-only edits, link/syntax/factual checks, and unrelated tasks.
 ---
 
 # Project verification
 
 Establish what the current change actually exercises, obtain a useful first signal, then complete the checks required by the agreed outcome.
+
+Skip this skill for documentation-only work. A spelling, link or factual edit uses the project's ordinary documentation checks and does not need this workflow, application suites, delegation or model-backed evaluation.
 
 ## Find the verification path
 
@@ -23,7 +25,7 @@ When recording commands or resuming saved work, read [command records](reference
 
 ## Choose the feedback boundary
 
-For slow, inconclusive or failed checks, read [feedback and recovery](references/feedback.md). Identify the failed phase and the smallest observation preserving the original trigger before repeating expensive preparation. Keep primary failure and pending restoration separate; complete required integration after a useful focused check.
+For slow, inconclusive or failed checks, including successive different errors in the same stage, read [feedback and recovery](references/feedback.md). Choose the observation that changes the next action before repeating expensive preparation; reconsider while a run is pending when useful evidence is available. Keep primary failure and pending restoration separate and complete required integration after the focused check.
 
 ## Execute and finish
 

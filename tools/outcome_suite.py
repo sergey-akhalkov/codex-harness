@@ -1,6 +1,6 @@
 """Explicit paired native outcomes; case preparation/oracles remain separately owned.
 
-python tools/outcome_suite.py --inputs PRIVATE/inputs.json --cases focused second
+python tools/outcome_suite.py --inputs PRIVATE/inputs.json --cases second
     --run-model-probes --repetitions 2
 Use --discovery-only instead for bounded native configuration checks without
 model calls. No flags means no work. Detailed evidence stays in a new temp root.
@@ -26,6 +26,21 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 
 
+def desktop_pwsh() -> str:
+    """Packaged WindowsApps PowerShell is blocked; use installed desktop pwsh."""
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PowerShell" / "7" / "pwsh.exe",
+        Path(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+    ]
+    which = shutil.which("pwsh")
+    if which:
+        candidates.append(Path(which))
+    for path in candidates:
+        if path.is_file() and "WindowsApps" not in str(path):
+            return str(path)
+    raise ValueError("Desktop PowerShell 7 is required; packaged WindowsApps pwsh is blocked")
+
+
 def module(name: str) -> Any:
     spec = importlib.util.spec_from_file_location(name, REPO / "tools" / (name + ".py"))
     if spec is None or spec.loader is None:
@@ -47,8 +62,8 @@ def signal_pattern(case_id: str) -> str:
     focused_script = r"(?:[^\s\"']*[\\/])?acceptance[/\\]+focused-check\.ps1(?:[\"']|\s|$)"
     pwsh = r"(?:[^\s\"']*[\\/])?(?:pwsh|powershell)(?:\.exe)?[\"']?\s+(?:(?:-NoLogo|-NoProfile|-NonInteractive)\s+)*-File\s+[\"']?"
     commands = {
-        "focused": r"(?:npm(?:\.cmd)?\s+run\s+test:focused:library\b|" + node + r"tools[/\\]+run-focused-test\.ts\s+tools[/\\]+test-library\.ts\b|" + pwsh + focused_script + "|" + focused_script + ")",
-        "second": r"(?:npm(?:\.cmd)?\s+run\s+lint\b|(?:npx\s+)?eslint\s)",
+        "focused": r"(?:npm(?:\.cmd)?\s+run\s+test:focused:library\b|" + node + r"tools[/\\]+run-focused-test\.ts\s+tools[/\\]+test-library\.ts\b|" + pwsh + focused_script + "|" + focused_script + r"|cargo\s+test\s+--workspace\s+--locked\b)",
+        "second": r"(?:npm(?:\.cmd)?\s+run\s+lint\b|(?:npx\s+)?eslint\s|" + r"cargo\s+fmt\s+--all\s+--\s+--check\b)",
         "freshness": python + r"(?:\.\s*[/\\])?(?:build|cli)\.py\b",
         "entrypoint": python + r"(?:\.\s*[/\\])?(?:build|cli)\.py\b",
         "reduction": node + r"(?:tools[/\\]run-focused-test\.ts\s+)?tools[/\\]outcome-(?:original|minimal|wrong)\.mjs\b",
@@ -214,14 +229,12 @@ def prepare_home(base_home: Path, attempt_root: Path, workspace: Path) -> Path:
             if Path(entry["path"]).name != "SKILL.md" or Path(entry["path"]).parent.name not in runner.CANDIDATES]
         if not skill_settings["config"]:
             del skill_settings["config"]  # Native empty default; allow [[skills.config]] treatment.
-    pwsh = shutil.which("pwsh")
-    if not pwsh:
-        raise ValueError("PowerShell unavailable")
+    pwsh = desktop_pwsh()
     with (attempt_root / "installation.log").open("w", encoding="utf-8") as log:
         subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-File", str(REPO / "install.ps1"), "-Mode", "Install",
             "-CoreOnly", "-PathScope", "Process", "-CodexHome", str(home), "-UserHome", str(user),
             "-CodexCommand", state["codexCommand"]], stdout=log, stderr=subprocess.STDOUT,
-            check=True, timeout=90, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            check=True, timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     config = home / "config.toml"
     if config.is_symlink():
         raise ValueError("Owned config must be a regular file")
@@ -242,7 +255,10 @@ def prepare_home(base_home: Path, attempt_root: Path, workspace: Path) -> Path:
         target = home / catalog.relative_to(base_home)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(catalog)
-    registry = runner.read_json(base_home / "harness/code-tools.json")
+    registry_path = base_home / "harness/code-tools.json"
+    if not registry_path.is_file():
+        runner.write_json(registry_path, {"schema_version": 1, "mcp": [], "core_only": True})
+    registry = runner.read_json(registry_path)
     reject_credentials(registry)
     registry = normalize(registry, {str(base_home): str(home), str(origin): str(REPO)})
     runner.write_json(home / "harness/code-tools.json", registry)
@@ -473,7 +489,8 @@ def run_suite(inputs: Path, base_home: Path, cases: list[str], *, run_model_prob
         if "focused" in cases and run_model_probes:
             if focused_calibration is None:
                 raise ValueError("Focused model cases require --focused-calibration from an actual passing execution")
-            source_state = runner.read_json(inputs)["opencode-kit"]["tree_sha256"]
+            records = runner.read_json(inputs)
+            source_state = records[catalogue.consumer_key(records, "focused")]["tree_sha256"]
             calibration = calibration_record(focused_calibration.resolve(), source_state)
             frozen["files"].update({calibration["record"]: calibration["record_sha256"], calibration["evidence"]: calibration["evidence_sha256"]})
         runner.write_json(root / "frozen.json", frozen)

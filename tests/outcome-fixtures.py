@@ -77,7 +77,8 @@ def focused_preparation(inputs: Path, evidence: Path) -> dict[str, Any]:
     workspace = evidence / "focused-copy"
     setup = case_workspace(inputs, workspace, "focused")
     (evidence / "focused-setup.json").write_text(json.dumps(setup, indent=2), encoding="utf-8")
-    state = json.loads((inputs / "inputs.json").read_text(encoding="utf-8"))["opencode-kit"]
+    records = json.loads((inputs / "inputs.json").read_text(encoding="utf-8"))
+    state = records[cases.consumer_key(records, "focused")]
     acceptance = workspace / "acceptance"
     assert "acceptance/README.md" in setup["immutable"]
     assert "acceptance/README.md" not in setup["documents"]

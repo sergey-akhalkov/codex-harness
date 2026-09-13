@@ -23,7 +23,7 @@ Prefer native `apply_patch` for bounded text edits. Use semantic edits or determ
 
 ## Repeated preparation and sessions
 
-When setup, repeated work or waits dominate, read [prepared-session reuse](references/session-reuse.md). Reuse only valid owned state and complete the parent acceptance. The project-verification skill owns check selection and failure attribution; no general helper is needed merely because a task has several steps.
+When setup, repeated work or waits dominate, including during a running task, read [prepared-session reuse](references/session-reuse.md). Compare valid reuse, reset and restart by remaining completion cost, and use targeted delegation only when its result advances the parent. The project-verification skill owns check selection and failure attribution; complete parent acceptance without adding a general helper merely because a task has several steps.
 
 ## Reasoning at task boundaries
 

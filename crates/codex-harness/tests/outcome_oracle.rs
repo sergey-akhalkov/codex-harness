@@ -176,6 +176,21 @@ fn real_entrypoint_freshness_missing_and_narrow_document_cases_pass_with_scoped_
 }
 
 #[test]
+fn object_and_array_scope_records_count_as_nonempty_result_records() {
+    let case = Case::new("missing", "baseline");
+    write(
+        &case.root.join("outcome.json"),
+        &json!({
+            "status":"blocked",
+            "command":["unavailable-checker.exe","--verify"],
+            "scope":{"project_root":"owned disposable copy","task":"required verification remains blocked"}
+        }),
+    );
+    let result = case.check(true);
+    assert!(check(&result, "result_record"));
+}
+
+#[test]
 fn independent_cli_probe_cannot_supply_missing_candidate_execution_even_when_repeated() {
     let case = Case::new("entrypoint", "candidate");
     case.report(false);

@@ -21,15 +21,15 @@ already running session must be started again to guarantee an updated initial
 context. Creating a child agent from an already open parent does not reload the
 parent's initial instructions.
 
-The feedback policy uses the same link. Before an expensive repeat, it selects
-the unresolved fact and smallest check preserving its conditions. Unfamiliar
-interactions can be explored through individual observed actions in a valid
-owned session, then promoted into the existing automation and full acceptance.
-The installed `project-verification` skill owns check selection, failure
-attribution and early error observation; `token-efficient-workflow` owns reuse
-and the cost of preparation and waiting. Known primary failure and pending
-restoration remain separate facts; a missing intermediate observation is a
-reported limitation, not a reason to infer success or safe recovery.
+The feedback policy uses the same link. During sustained work it reconsiders
+successive different failures in one expensive stage and acts on the next
+distinguishing observation, including while an operation is pending. The
+installed `project-verification` skill owns check selection, failure attribution
+and observed exploration; `token-efficient-workflow` owns prepared replay,
+reset/restart comparisons, proportionate measurement and useful delegation.
+Routine in-scope improvements need no separate specification. Full acceptance,
+resource ownership and recovery remain required. These are prompt instructions,
+not a scheduler enforcing future compliance or a guaranteed speed increase.
 
 Verify instruction loading separately from successful task behavior; loading
 alone does not establish an efficiency gain. A currently correct link also
@@ -83,10 +83,22 @@ and recovery evidence remain in their private owning storage.
 
 | Adoption | Observed result and practical limit |
 | --- | --- |
+| Execution adaptation, 2026-09-13 | Fresh external prompt inspection and the native CLI 0.154.0 Astra/high session contained the revised global text; both skills were discovered and their final references were read in the evaluation. The owned OpenSpec task repaired two delta blocks and a README label using source evidence before one final whole-project validation. Independent checks preserved both requirements, all five scenarios, three main specs and the protected input; all four validation items passed. Ten synthetic continuation cases preserved live-state, reset/restart, cold-start, observer, recovery, held-artifact and delegation boundaries. They are decision evidence, not executed UI/service behavior. |
 | Language defaults and early delivery | Model-free outside-checkout inspection found the global source once, followed by local instructions where present. A fresh parent/child check received the rules. This established loading, not later product builds or unfinished Rust work. |
 | [Engineering judgment](../openspec/changes/archive/2026-09-12-prefer-simple-effective-solutions/design.md), 2026-09-12 | Codex CLI 0.154.0 Astra/high parent and child had separate visible consoles. The parent corrected a document and ran all 103 integration tests in an owned checkout of an existing external codec package. Source, manifests and lockfile were unchanged. Synthetic review preserved durable acknowledgement, concurrent retry, recovery and offline exports; a mistaken evidence-to-file mapping was rejected and corrected in the same child. No hardware, transport, exhaustive-input, deployment or performance claim follows. |
 | [Actionable feedback](../openspec/changes/archive/2026-09-13-make-feedback-workflow-actionable/design.md), 2026-09-13 | A fresh external CLI 0.154.0 Astra/high task loaded global and local instructions, discovered both revised skills and read the verification skill. It repaired and integrated OpenSpec changes in an owned consumer. Parent comparison preserved 30 requirements, ten delta blocks and 21 unrelated files; all 19 main specs passed strict validation. A line-ending defect was corrected; three startup-generated Serena files were retained privately and removed from the consumer. Synthetic cold-start, action/observer, supervisor and invalidated-state cases remain decision evidence rather than executed application behavior. |
 | [Adaptive workflow](../openspec/changes/archive/2026-09-12-adapt-workflow-through-decomposition/design.md) | Native tasks corrected a saved driver route and completed parent integration; rejected a reduction that lost the line-ending trigger; kept a small edit direct; and recovered an interrupted handoff without treating old reports as new acceptance. A bounded research answer was consumed without unrelated implementation. These cases do not establish compatibility with an untested interactive application. |
+
+Execution-adaptation native work took 102.7 seconds and its synthetic continuation
+73.2 seconds. Consumer preparation through independent parent checks and console
+restoration took 509.5 seconds; source/specification work before consumer setup is
+additional. The first skill-validator invocation found an unavailable Python
+alias; the existing project virtual environment ran both validators successfully.
+No dependency was installed. The launcher used the existing local fallback for
+unavailable shared defaults; revised global instructions and skill loading were
+verified independently. The owned evaluator exited, the parent window layout was
+restored, and the other active task's window was unchanged. No comparative speed
+gain, universal future adherence or live HMI result is established.
 
 Engineering-judgment acceptance used cached dependencies, Rust/Cargo 1.96.0,
 offline locked Cargo, one build job and an owned target directory. An unavailable

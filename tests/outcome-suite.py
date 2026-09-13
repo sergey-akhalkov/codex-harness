@@ -6,6 +6,7 @@ import importlib.util
 import json
 import re
 from pathlib import Path
+import subprocess
 import tempfile
 import time
 import tomllib
@@ -33,6 +34,8 @@ class Suite(unittest.TestCase):
             self.assertIsNotNone(re.search(pattern, command, re.I), case)
             for irrelevant in ("pwd", "Get-Content README.md", "Get-Content tools/test-library.ts", "echo '" + command + "'"):
                 self.assertIsNone(re.search(pattern, irrelevant, re.I), (case, irrelevant))
+        self.assertIsNotNone(re.search(suite.signal_pattern("focused"), "cargo test --workspace --locked", re.I))
+        self.assertIsNotNone(re.search(suite.signal_pattern("second"), "cargo fmt --all -- --check", re.I))
 
     def test_focused_powershell_execution_signal(self):
         pattern = suite.signal_pattern("focused")
@@ -285,6 +288,40 @@ class Suite(unittest.TestCase):
                 record.write_text(json.dumps({**value, key: replacement}))
                 with self.assertRaises(ValueError):
                     suite.calibration_record(record, "snapshot")
+
+
+class ConsumerFreeze(unittest.TestCase):
+    def test_prepare_requires_explicit_local_consumers_and_generic_keys(self):
+        cases = suite.module("outcome_cases")
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            primary = root / "one"
+            secondary = root / "two"
+            for path in (primary, secondary):
+                path.mkdir()
+                (path / "README.md").write_text(path.name)
+                subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+                subprocess.run(["git", "add", "README.md"], cwd=path, check=True, capture_output=True)
+                subprocess.run(["git", "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "seed"], cwd=path, check=True, capture_output=True)
+            with self.assertRaises(RuntimeError):
+                cases.prepare()
+            with self.assertRaises(SystemExit):
+                cases.main(["--prepare", "--root", str(root / "inputs")])
+            owned = cases.freeze_consumers(
+                primary,
+                secondary,
+                root=root / "inputs",
+                secondary_command="npm run lint",
+            )
+            records = json.loads((owned / "inputs.json").read_text(encoding="utf-8"))
+            self.assertEqual(records["consumers"], {"primary": "primary", "secondary": "secondary"})
+            self.assertEqual(cases.consumer_key(records, "second"), "secondary")
+            self.assertIsNone(cases.consumer_key(records, "freshness"))
+            self.assertEqual(records["commands"]["secondary"]["knowledge"], "docs-only")
+            setup = cases.case_workspace(owned, root / "second-copy", "second")
+            self.assertEqual(setup["command"], {"knowledge": "docs-only", "text": "npm run lint"})
+            with self.assertRaises(ValueError):
+                cases.freeze_consumers(primary, primary, root=root / "same")
 
 
 if __name__ == "__main__":

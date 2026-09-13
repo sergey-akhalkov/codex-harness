@@ -84,6 +84,14 @@ Other consuming projects are not reconfigured by that local language addition.
 
 ## Outcome, quality and speed
 
+**2026-09-13, confirmed:** during sustained work, improve the execution method
+as well as the product. Act on repeated expensive stages without waiting for
+the user to intervene. Invest incrementally in shorter feedback, valid prepared
+state and useful parallel investigation when the remaining task can repay the
+cost. Routine in-scope workflow improvements need no separate specification;
+short tasks need no optimization ceremony. Preserve full acceptance, authority
+and recovery. The canonical details remain in the portable principles below.
+
 Deliver a quality, verified end-to-end MVP through real components as early as
 possible, then complete the whole agreed result. Small transparent operating
 restrictions are allowed; they do not authorize simplifying promised product
@@ -359,7 +367,10 @@ an already installed desktop PowerShell. Parent and global PATH stay unchanged.
 A neighboring source kit was an idea source and isolated experimental consumer,
 not a runtime dependency. Further runs against it have stopped. Remaining
 quantitative two-consumer comparison in `accelerate-verified-delivery` is an
-open user decision; those tasks stay open and must not resume that research.
+open user decision; tasks 5.4 and 6.4 stay open and must not resume that
+research or spend further model-backed runs until a second consumer is chosen.
+Controlled native pairs for the remaining local cases already ran on hooks-off
+Astra; they do not prove benefit.
 
 ## Recording further decisions
 

@@ -132,17 +132,35 @@ def verify_case(case_id: str, workspace: Path, setup: dict[str, Any], result: di
                 checks["current_record_distinct"] = bool(re.search(r"(?:version|верси\w*)\s*[:=]?\s*2|stdout\s*[:=]?\s*2", record, re.I))
                 checks["historical_limit"] = bool(re.search(r"historic|earlier|previous|outdated|устар|истори|предыдущ", record, re.I))
         elif case_id in ("focused", "second"):
-            node = shutil.which("node")
-            if not node:
-                raise RuntimeError("Node prerequisite absent during acceptance")
-            if case_id == "focused":
+            documented = str(((setup.get("command") or {}).get("text") or "")).strip()
+            if case_id == "focused" and "cargo test --workspace --locked" in documented:
+                pattern = r"cargo\s+test\s+--workspace\s+--locked\b"
+                checks["native_command_executed"] = successful_command(items, pattern)
+                checks["evidence_in_documentation"] = bool(re.search(pattern, updated_docs, re.I))
+                independent = run(["cargo", "test", "--workspace", "--locked"], 600)
+                checks["independent_command"] = independent["status"] == "exited" and independent["exit_code"] == 0
+            elif case_id == "focused":
+                node = shutil.which("node")
+                if not node:
+                    raise RuntimeError("Node prerequisite absent during acceptance")
                 pattern = r"test:focused:library|run-focused-test\.ts[^\r\n]*test-library\.ts|acceptance[/\\]+focused-check\.ps1"
                 checks["native_command_executed"] = successful_command(items, pattern, r"(?m)^OK: library tests=183\r?$")
                 checks["evidence_in_documentation"] = bool(re.search(pattern, updated_docs, re.I))
                 # Full invocation is independently calibrated before native attempts;
                 # immutable source plus actual completed native command is reused here.
                 checks["calibrated_command"] = setup.get("focused_calibration_passed") is True
+            elif "cargo fmt --all -- --check" in documented:
+                pattern = r"cargo\s+fmt\s+--all\s+--\s+--check\b"
+                checks["native_command_executed"] = successful_command(items, pattern)
+                independent = run(["cargo", "fmt", "--all", "--", "--check"], 180)
+                checks["independent_fmt"] = independent["status"] == "exited" and independent["exit_code"] == 0
+                scope = str(report.get("scope", ""))
+                checks["lint_only_scope"] = bool(re.search(r"fmt|format|lint", scope, re.I)) and bool(re.search(r"only|not|no |не |только|лишь", scope, re.I))
+                checks["evidence_in_documentation"] = bool(re.search(pattern, updated_docs, re.I))
             else:
+                node = shutil.which("node")
+                if not node:
+                    raise RuntimeError("Node prerequisite absent during acceptance")
                 checks["native_command_executed"] = successful_command(items, r"npm(?:\.cmd)?\s+(?:run\s+)?lint\b|eslint[^\r\n]+(?:src|\.ts)")
                 lint = run([node, str(workspace / "node_modules/eslint/bin/eslint.js"), "--ext", ".ts", "src"], 90)
                 checks["independent_lint"] = lint["status"] == "exited" and lint["exit_code"] == 0

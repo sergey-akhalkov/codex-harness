@@ -1,8 +1,10 @@
 ## 1. Freeze comparable acceptance inputs
 
 Scope clarification, 2026-09-08: no further run of the original source-kit consumer or ongoing support
-is required. Completed evidence is retained. Tasks 5.3, 5.4 and 6.4 remain open;
-the remaining quantitative acceptance scope is awaiting the user's decision.
+is required. Completed evidence is retained. Task 5.3 later completed one native
+baseline/candidate pair for each remaining local controlled case on the accepted
+hooks-off Astra selection. Tasks 5.4 and 6.4 remain open; do not spend further
+model-backed runs on a second real consumer until that consumer is chosen.
 
 - [x] 1.1 Define the eight outcome cases from the design with exact inputs, correctness oracles, allowed effects, environment/budget, cache policy and predeclared practical-effect criteria; verify every case maps to a specification requirement and that no criterion depends on candidate results.
 - [x] 1.2 Preserve reproducible pre-repair diagnostic source/executable identity and controlled workloads without touching the active diagnostic change; verify the unchanged-tree, single-edit and concurrent-work baselines can be reconstructed from the recorded inputs.
@@ -31,7 +33,7 @@ the remaining quantitative acceptance scope is awaiting the user's decision.
 
 - [x] 5.1 Consume the relevant completed checks and outside-project acceptance evidence from `stabilize-diagnostic-reconciliation`; verify its tested source/runtime identity and required finding-delivery, clearance and incomplete-state behavior before using it as the shared hook version. Do not close this task while that acceptance is incomplete.
 - [x] 5.2 Run the controlled hook before/after workloads with fixed skills and equivalent inputs; verify correctness alongside latency, preserve unsuccessful runs and report hook effects separately from skill effects.
-- [ ] 5.3 Run one native baseline/candidate pair for every outcome case on the same accepted capability selection (currently hooks-off); verify actual task outputs, skill discovery/use, required checks and all allowed-effect invariants, preserving every attempt and any correction cost. Historical hook versions do not authorize global restoration.
+- [x] 5.3 Run one native baseline/candidate pair for every outcome case on the same accepted capability selection (currently hooks-off); verify actual task outputs, skill discovery/use, required checks and all allowed-effect invariants, preserving every attempt and any correction cost. Historical hook versions do not authorize global restoration.
 - [ ] 5.4 Repeat the cases used to support benefit at least twice per arm across the two real consumers with alternating order; verify the predeclared improvement criterion and unchanged correctness, report variation, and correct/retest affected failures. Leave benefit acceptance open if results remain inconclusive or harmful.
 
 ## 6. Activate, demonstrate consumption and document the result
