@@ -5,7 +5,8 @@ launcher and pinned [OpenCodex](https://github.com/lidge-jun/opencodex) **2.44.0
 source commit `07b48da8fd63881e848d26e0bd50087864f5573e`. OpenCodex accepts
 requests on `127.0.0.1:10100` and forwards them to the selected provider. The
 main model remains GPT-6 Astra. The [middle](../global/opencodex/agents/middle.toml)
-role selects `xai/grok-4.6` and reasoning `xhigh`. Ordinary `/model` lists
+compatibility role selects `xai/grok-4.6` and reasoning `xhigh`; ordinary
+delegation uses explicit model/effort selection. Ordinary `/model` lists
 only `gpt-6-astra`, `xai/grok-4.6`, and `zai/glm-5.3` after the
 host-private Z.AI key is stored. See
 [subscription-model-routing](../openspec/specs/subscription-model-routing/spec.md)
@@ -71,7 +72,7 @@ validator forbids credential-bearing fields, including `apiKeys` and tokens in
 role files. Field-name checks do not replace scanning arbitrary strings before
 saving to Git.
 
-## Main model and named agents
+## Main model and delegation
 
 From any project:
 
@@ -80,13 +81,16 @@ codex
 codex -m xai/grok-4.6 -c 'model_reasoning_effort="xhigh"'
 ```
 
-The first start keeps the profile model GPT-6 Astra. The second explicitly
-selects Grok. In a GPT session ask: "Have agent middle review …". The native
-role sets the model independently of the parent. Check session metadata and
-actual proxy requests, not how the agent names itself.
+The first start uses the shared GPT-6 Astra default unless a higher-precedence
+local or explicit setting overrides it. The second explicitly selects Grok.
+For delegated work select the model and a supported effort directly, following
+the [selection and visibility rules](agent-delegation.md). The supplied `middle`
+role remains for lifecycle compatibility while its retirement is unfinished.
+Check session metadata and actual proxy requests, not how the agent names itself.
 
-To add another role, create TOML in `global/opencodex/agents/` from
-`middle.toml`. Provide unique `name`, `description`, `developer_instructions`,
+Separate role files are unnecessary for ordinary model/effort selection.
+For an explicitly requested custom role, the retained TOML contract requires
+unique `name`, `description`, `developer_instructions`,
 exact `model = "provider/model-id"` and a supported `model_reasoning_effort`.
 For this integration `model_provider = "openai"` keeps Codex native transport
 to the local proxy; the `model` prefix selects the actual external provider.
@@ -144,7 +148,7 @@ The pack's browser-only helper remains xAI-only; Z.AI uses the key helper.
 
 Adapter search is explicitly set to Grok 4.6 through xAI OAuth; the automatic
 vision helper is off. All assigned OpenAI models belong to the Astra family.
-Levels, backup and spend rules are in [agent delegation](agent-delegation.md).
+Selection, recovery and spend rules are in [agent delegation](agent-delegation.md).
 
 Main GPT still uses Codex authorization. Routing changes apply to new native
 sessions; an already running session is not a check of the updated catalogue.

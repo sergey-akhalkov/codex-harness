@@ -2,7 +2,7 @@
 
 - [x] 1.1 Establish the installed Codex control contract in owned isolated state: verify exact CLI/schema identity, two-client event delivery, native TUI visibility, task-scoped correlation, child survival and reconnect; retain a concise contract receipt and original failures before dependent implementation.
 - [x] 1.2 Implement the smallest Rust control connection using the verified native path and existing process/lifecycle conventions; verify initialization, exact model binding, one tool-using assignment and final-result delivery through the ordinary installed entry point without manual secondary startup.
-- [ ] 1.3 Extend that path to a deterministic GPT quota refusal before a fallback instruction; verify a fresh Z.AI lead obtains the saved task and performs the next accepted step without another GPT response. Keep the implementation incomplete if only policy guidance works.
+- [x] 1.3 Extend that path to a deterministic GPT quota refusal before a fallback instruction; verify a fresh Z.AI lead obtains the saved task and performs the next accepted step without another GPT response. Keep the implementation incomplete if only policy guidance works.
 - [ ] 1.4 Establish automatic simultaneous visible windows/panes for every active leader, executor and model-backed helper before live dispatch; verify streaming conversation/tool activity, model/effort/status, explicit lead handoff, retained history and no hidden new requests when a view fails or closes. A list with chat switching and the previous single-TUI proof do not satisfy this check.
 
 ## 2. Preserve task state and ownership

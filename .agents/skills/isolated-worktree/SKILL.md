@@ -1,6 +1,6 @@
 ---
 name: isolated-worktree
-description: Run independent edits or experiments in a Git worktree when isolation justifies preparation and integration cost. Carry explicit base and dirty inputs, verify tool checkout identity, then integrate and check the combined result.
+description: Isolate independent edits, experiments or reviews in a Git worktree when isolation outweighs setup and integration cost.
 ---
 
 # Isolated worktree

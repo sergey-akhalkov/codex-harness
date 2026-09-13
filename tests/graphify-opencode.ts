@@ -1,5 +1,5 @@
 // Read-only compatibility check through the installed source kit's real validators.
-// bun tests/graphify-opencode.ts ../opencode-kit/tools/windows/opencode-shared-tools.ts <manifest>
+// bun tests/graphify-opencode.ts <installed-source-module> <manifest>
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';

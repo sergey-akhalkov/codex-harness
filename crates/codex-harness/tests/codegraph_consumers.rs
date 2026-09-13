@@ -19,6 +19,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/installed_tool_workflows.rs"]
+mod installed_tool_workflows;
+
 fn deadline(seconds: u64) -> Deadline {
     Deadline::after(Duration::from_secs(seconds)).unwrap()
 }
@@ -176,6 +179,11 @@ impl Consumer {
             .unwrap();
     }
     fn request(&mut self, method: &str, params: Value, seconds: u64) -> Value {
+        let value = self.request_envelope(method, params, seconds);
+        assert!(value.get("error").is_none(), "{method}: {value}");
+        value["result"].clone()
+    }
+    fn request_envelope(&mut self, method: &str, params: Value, seconds: u64) -> Value {
         self.id += 1;
         self.send(json!({"id":self.id,"method":method,"params":params}));
         let until = deadline(seconds);
@@ -191,8 +199,7 @@ impl Consumer {
                     serde_json::to_vec_pretty(&value).unwrap(),
                 )
                 .unwrap();
-                assert!(value.get("error").is_none(), "{method}: {value}");
-                return value["result"].clone();
+                return value;
             }
             let next = self.output.read(4096, until, &self.cancel).unwrap();
             assert!(

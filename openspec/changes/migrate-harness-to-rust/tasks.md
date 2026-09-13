@@ -45,7 +45,7 @@ The graph-provider target is CodeGraph, owned by [replace-cbm-with-codegraph](..
 
 - [ ] 7.1 Complete Rust RTK lifecycle integration and port its acceptance helpers; verify the retained executable/explicit hook contract, single execution, bypass/raw recovery, output bounds, malformed input, filter failure and continued silence of ordinary diagnostic/Stop hooks.
 - [ ] 7.2 Port structured-codex-run and reproduce-regression executable helpers and update their linked skill invocation contracts; verify structured output, distinct process/event evidence, argument/stdin/cancellation behavior and use from an owned project outside the checkout.
-- [ ] 7.3 Port delegation usage, outcome runner/report/oracle tools and their live executable fixtures; verify existing command/report schemas, privacy and attribution limits, deterministic default tests and explicit separation of opt-in model-backed cases without replaying excluded opencode-kit evaluations.
+- [ ] 7.3 Port delegation usage, outcome runner/report/oracle tools and their live executable fixtures; verify existing command/report schemas, privacy and attribution limits, deterministic default tests and explicit separation of opt-in model-backed cases without replaying excluded evaluations of the original source-kit consumer.
 - [ ] 7.4 Migrate remaining supported test suites and executable doubles to Rust, retaining equivalent failure oracles; verify the requirement-to-check map has no missing accepted behavior and that inert external-language analysis samples cannot execute as harness helpers.
 
 ## 8. Retire old paths and prepare cutover

@@ -34,7 +34,7 @@ The kit SHALL document the observed availability and state restrictions of `/btw
 
 ### Requirement: Compatible side-question workflow
 
-The delivered guidance SHALL describe the supported native side-question route, its parent-conversation prerequisite, restrictions and return controls, with the limits of local testing stated. Changes MUST preserve the accepted Astra-only OpenAI assignments, Grok middle routing and running shared services. An ordinary fork MUST NOT be described as filesystem isolation or as equivalent to ephemeral native side chat.
+The delivered guidance SHALL describe the supported native side-question route, its parent-conversation prerequisite, restrictions and return controls, with the limits of local testing stated. Changes MUST preserve the accepted Astra-only OpenAI assignments, the model-selection and recovery contract owned by [agent delegation](../agent-delegation/spec.md#requirements), and running shared services. An ordinary fork MUST NOT be described as filesystem isolation or as equivalent to ephemeral native side chat.
 
 #### Scenario: User follows the native route
 - **WHEN** the user consults the side-question guide

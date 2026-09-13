@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-11**.
+Last updated: **2026-09-13**.
 
 ## Public pack
 
@@ -101,20 +101,23 @@ Fix concrete friction, including recurring manual workarounds, within the
 authorized task. Preparation stays proportional and reusable while the
 environment is unchanged.
 
-Adaptive work uses independently verifiable results to separate costly unknowns
-and coupled corrections. Reassess the method at expensive repetition or an
-informative failure, including sequences of different errors in the same layer.
-Prefer reducing the problem before optimizing the remaining cycle, then consume
-the result in the actual parent path with all required checks intact. Direct
-work and necessary full integration remain valid choices.
+Adaptive work selects an unresolved fact, discriminating observation and smallest
+valid operation before an expensive repeat. Different errors in the same
+unlearned layer or an added diagnostic do not alone justify another full cycle.
+Use direct observed actions for unfamiliar required interactions, then consume
+the understood route in the existing automation and unchanged parent acceptance.
+Keep primary failure evidence separate from pending restoration. Direct cheap
+work and necessary full integration retain their appropriate checks.
 
 Reuse prepared sessions and project-owned mechanisms only while their relevant
 conditions hold; preserve valid partial knowledge across interruption. Runtime
 resources require real ownership or isolation. Evaluate complete elapsed cost,
 including coordination, integration and recovery. These additions use the
 existing principles and skills, with no new orchestrator, mandatory worker or
-reflection schedule. The accepted scope and its verification are in
+reflection schedule. Original adoption is recorded in
 [adaptive workflow](../openspec/changes/archive/2026-09-12-adapt-workflow-through-decomposition/proposal.md).
+The strengthened operating contract and its acceptance are owned by
+[actionable feedback](../openspec/changes/archive/2026-09-13-make-feedback-workflow-actionable/proposal.md).
 
 Result, quality and speed are all required:
 
@@ -240,6 +243,15 @@ Ordinary diagnostic and Stop hooks stay off. The separate `harness-lsp`
 registration is retired. Explicit Serena Python operations are retained; other
 historical language candidates are not mandatory installations. A common Codex
 app-server is excluded; independent CLI applications remain.
+
+Compared optional interfaces for installed-tool workflows: keep the native Git
+Markdown memory route (`retain-native`). Serena 1.7.0 reads work, but memory
+edits and rename were rejected under the durable `approval_policy=never`
+contract. Keep current-source inspection for Graphify mixed-source questions;
+its deterministic extraction omitted configuration and the documented rule.
+Keep the existing Serena broker for cross-project queries; a separate Project
+Server is not selected. Native comparisons did not show a repeating speed or
+output benefit beyond variation, so the verified baseline routes stay selected.
 
 CodeGraph is the live graph after replacement acceptance (2026-09-11): one
 account-wide indexing slot, one parse and one resolve worker, a 2 GiB Windows

@@ -176,6 +176,10 @@ pub(crate) struct Client {
 }
 
 impl Client {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
     pub(crate) fn new() -> Result<Self> {
         let mut buffer = vec![0u16; 32768];
         let size =

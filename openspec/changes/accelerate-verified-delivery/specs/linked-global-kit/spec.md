@@ -2,7 +2,7 @@
 
 ### Requirement: Deliver verification workflows through the global lifecycle
 
-The installed skills and their resources MUST work without the opencode-kit
+The installed skills and their resources MUST work without the original source-kit consumer
 checkout. Previously recorded use of that project is historical acceptance
 evidence, not a requirement for ongoing compatibility or additional test runs.
 

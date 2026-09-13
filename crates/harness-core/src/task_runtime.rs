@@ -37,6 +37,8 @@ struct Launch {
     arguments: Vec<String>,
     #[serde(default)]
     new_session: bool,
+    #[serde(default)]
+    initial_input: Option<crate::task_arguments::InitialInput>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,7 +135,11 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             return Ok(None);
         }
     };
-    let placements = crate::task_view::three_windows()?;
+    let mut placements = crate::task_view::three_windows()?.to_vec();
+    let mut replacement = placements[0];
+    replacement.y += replacement.height / 2;
+    replacement.height -= replacement.height / 2;
+    placements.push(replacement);
     let root = BrokerRoot::prepare()?.keep();
     let launch = Launch {
         schema: 1,
@@ -146,6 +152,7 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             .map(|value| unicode(value))
             .collect::<io::Result<_>>()?,
         new_session: plan.new_session,
+        initial_input: plan.initial_input.clone(),
     };
     let launch_path = root.path().join("launch.json");
     save(&launch_path, &serde_json::to_value(&launch)?)?;
@@ -214,17 +221,26 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
     ];
     if let Some(id) = &endpoint.thread_id {
         tui.args.extend(["resume".into(), id.into()]);
-        tui.args.extend(plan.attachment);
+        tui.args.extend(if plan.initial_input.is_some() {
+            plan.waiting_attachment
+        } else {
+            plan.attachment
+        });
     } else {
         tui.args.extend(plan.tui);
     }
     tui.current_dir = Some(env::current_dir()?);
-    tui.new_console = Some("Codex task".into());
+    tui.new_console = Some("Opening Codex task".into());
     eprintln!(
         "codex-harness: task control state: {}",
         root.path().display()
     );
-    let view = match crate::task_view::View::spawn(&tui, placements[0], STARTUP) {
+    let view = match crate::task_view::View::spawn(&tui, placements[0], STARTUP).and_then(|view| {
+        if endpoint.thread_id.is_some() {
+            view.wait_for_title("Codex task", STARTUP)?;
+        }
+        Ok(view)
+    }) {
         Ok(view) => view,
         Err(error) => {
             request_stop(root.path())?;
@@ -235,6 +251,12 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
         &root.path().join("view.json"),
         &json!({"schema":1,"threadId":endpoint.thread_id,"window":view.snapshot()?}),
     )?;
+    if let Some(input) = plan.initial_input
+        && let Err(error) = submit_initial(&root, &endpoint, &view, &launch.executable, input)
+    {
+        request_stop(root.path())?;
+        return Err(error);
+    }
     let mut visible = None;
     let mut additional = BTreeMap::<String, crate::task_view::View>::new();
     let mut snapshots = BTreeMap::<String, crate::task_view::Snapshot>::new();
@@ -244,64 +266,78 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                 "task controller exited while its conversation was open",
             ));
         }
+        let mut requests = Vec::new();
         match read_json::<crate::task_view::Request>(&root.path().join("view-request.json")) {
-            Ok(request) => {
-                if request.schema != 1
-                    || request.slot == 0
-                    || request.slot >= placements.len()
-                    || request.thread_id.is_empty()
-                    || endpoint.thread_id.as_ref() == Some(&request.thread_id)
-                {
-                    request_stop(root.path())?;
-                    return Err(io::Error::other(
-                        "invalid additional conversation view request",
-                    ));
-                }
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    additional.entry(request.thread_id.clone())
-                {
-                    let mut next = CommandSpec::new(command.get_program());
-                    next.env.clone_from(&tui.env);
-                    next.current_dir = Some(launch.cwd.clone());
-                    next.args = vec![
-                        "--remote".into(),
-                        format!("ws://127.0.0.1:{}", endpoint.port).into(),
-                        "--remote-auth-token-env".into(),
-                        TOKEN_ENV.into(),
-                        "resume".into(),
-                        request.thread_id.clone().into(),
-                        "--no-alt-screen".into(),
-                    ];
-                    next.new_console = Some(format!("Opening {}", request.title).into());
-                    let next = match crate::task_view::View::spawn(
-                        &next,
-                        placements[request.slot],
-                        STARTUP,
-                    )
-                    .and_then(|view| {
-                        view.wait_for_title(&request.title, STARTUP)?;
-                        Ok(view)
-                    }) {
-                        Ok(view) => view,
-                        Err(error) => {
-                            save(
-                                &root.path().join("view-error.json"),
-                                &json!({"schema":1,"threadId":request.thread_id,"error":error.to_string()}),
-                            )?;
-                            request_stop(root.path())?;
-                            return Err(error);
-                        }
-                    };
-                    snapshots.insert(request.thread_id.clone(), next.snapshot()?);
-                    entry.insert(next);
-                    save(
-                        &root.path().join("additional-views.json"),
-                        &json!({"schema":1,"threads":snapshots}),
-                    )?;
-                }
-            }
+            Ok(request) => requests.push(request),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error),
+        }
+        match read_json::<BTreeMap<String, crate::task_view::Request>>(
+            &root.path().join("child-view-requests.json"),
+        ) {
+            Ok(children) => requests.extend(children.into_values()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+        for request in requests {
+            if request.schema != 1
+                || request.slot == 0
+                || request.slot >= placements.len()
+                || request.thread_id.is_empty()
+                || endpoint.thread_id.as_ref() == Some(&request.thread_id)
+            {
+                request_stop(root.path())?;
+                return Err(io::Error::other(
+                    "invalid additional conversation view request",
+                ));
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                additional.entry(request.thread_id.clone())
+            {
+                if request.slot == 3 {
+                    let mut previous = placements[0];
+                    previous.height /= 2;
+                    view.place(previous)?;
+                }
+                let mut next = CommandSpec::new(command.get_program());
+                next.env.clone_from(&tui.env);
+                next.current_dir = Some(launch.cwd.clone());
+                next.args = vec![
+                    "--remote".into(),
+                    format!("ws://127.0.0.1:{}", endpoint.port).into(),
+                    "--remote-auth-token-env".into(),
+                    TOKEN_ENV.into(),
+                    "resume".into(),
+                    request.thread_id.clone().into(),
+                    "--no-alt-screen".into(),
+                ];
+                next.new_console = Some(format!("Opening {}", request.title).into());
+                let next = match crate::task_view::View::spawn(
+                    &next,
+                    placements[request.slot],
+                    STARTUP,
+                )
+                .and_then(|view| {
+                    view.wait_for_title(&request.title, STARTUP)?;
+                    Ok(view)
+                }) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        save(
+                            &root.path().join("view-error.json"),
+                            &json!({"schema":1,"threadId":request.thread_id,"error":error.to_string()}),
+                        )?;
+                        request_stop(root.path())?;
+                        return Err(error);
+                    }
+                };
+                snapshots.insert(request.thread_id.clone(), next.snapshot()?);
+                entry.insert(next);
+                save(
+                    &root.path().join("additional-views.json"),
+                    &json!({"schema":1,"threads":snapshots}),
+                )?;
+            }
         }
         if !view.is_running()?
             && !additional
@@ -338,6 +374,95 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
         &json!({"schema":1,"exitCode":exit_code}),
     )?;
     Ok(Some(exit_code as i32))
+}
+
+fn submit_initial(
+    root: &crate::broker_state::BrokerRoot,
+    endpoint: &Endpoint,
+    view: &crate::task_view::View,
+    executable: &Path,
+    input: crate::task_arguments::InitialInput,
+) -> io::Result<()> {
+    let thread = endpoint
+        .thread_id
+        .as_ref()
+        .ok_or_else(|| io::Error::other("initial input requires a named native thread"))?;
+    let mut parts = vec![json!({"type":"text","text":input.text})];
+    parts.extend(
+        input
+            .images
+            .into_iter()
+            .map(|path| json!({"type":"localImage","path":path})),
+    );
+    // Save before sending. A lost acknowledgement must never replay the input.
+    save(
+        &root.path().join("initial-dispatch.json"),
+        &json!({"schema":1,"threadId":thread,"status":"prepared","input":parts}),
+    )?;
+    let mut connection = ControlConnection::connect(endpoint.port, &endpoint.token, STARTUP)?;
+    let mut events = VecDeque::new();
+    startup_request(
+        root,
+        &mut connection,
+        &mut events,
+        "initial-initialize",
+        "initialize",
+        json!({"clientInfo":{"name":"harness-initial-input","version":"1"},"capabilities":{"experimentalApi":true}}),
+    )?;
+    connection.send(&json!({"method":"initialized"}), STARTUP)?;
+    let user = process_service::current_user()?;
+    let saved: Value = read_json(&root.path().join("view.json"))?;
+    let snapshot = serde_json::from_value(saved["window"].clone())?;
+    let watch = crate::task_view::Watch::open(&snapshot, executable, &user)?
+        .ok_or_else(|| io::Error::other("initial conversation process is unavailable"))?;
+    loop {
+        if root.path().join("stop.json").try_exists()? || !view.is_running()? {
+            return Err(io::Error::other(
+                "initial input retained: conversation stopped before dispatch",
+            ));
+        }
+        if !watch.visible()? {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let state = startup_request(
+            root,
+            &mut connection,
+            &mut events,
+            "initial-read",
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )?;
+        if state["thread"]["id"] != *thread
+            || state["thread"]["turns"]
+                .as_array()
+                .is_none_or(|turns| !turns.is_empty())
+        {
+            save(
+                &root.path().join("initial-dispatch.json"),
+                &json!({"schema":1,"threadId":thread,"status":"needsReconciliation","input":parts,"reason":"native thread already has work"}),
+            )?;
+            eprintln!(
+                "codex-harness: initial input retained for reconciliation because this conversation already has work"
+            );
+            return Ok(());
+        }
+        if !watch.visible()? {
+            continue;
+        }
+        let started = startup_request(
+            root,
+            &mut connection,
+            &mut events,
+            "initial-turn",
+            "turn/start",
+            json!({"threadId":thread,"input":parts}),
+        )?;
+        return save(
+            &root.path().join("initial-dispatch.json"),
+            &json!({"schema":1,"threadId":thread,"status":"accepted","input":parts,"native":started}),
+        );
+    }
 }
 
 pub fn serve(mut guard: ServiceGuard, expected: &str) -> io::Result<()> {
@@ -407,6 +532,48 @@ pub fn serve(mut guard: ServiceGuard, expected: &str) -> io::Result<()> {
     }
     connection.send(&json!({"method":"initialized"}), STARTUP)?;
     let mut initial_events = VecDeque::new();
+    let effective = startup_request(
+        &root,
+        &mut connection,
+        &mut initial_events,
+        "startup-config",
+        "config/read",
+        json!({"cwd":launch.cwd,"includeLayers":false}),
+    )?;
+    let config = &effective["config"];
+    let provider = config["model_provider"].as_str().unwrap_or("openai");
+    if !launch.new_session {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "task ingress resume/fork routing has not been verified",
+        ));
+    }
+    let (key, upstream) = if provider == "openai" {
+        (
+            "openai_base_url".to_owned(),
+            config["openai_base_url"].as_str(),
+        )
+    } else {
+        if !provider
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            return Err(io::Error::other("task provider key is unsupported"));
+        }
+        (
+            format!("model_providers.{provider}.base_url"),
+            config["model_providers"][provider]["base_url"].as_str(),
+        )
+    };
+    let upstream = upstream.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "task ingress needs a verified explicit native provider base URL",
+        )
+    })?;
+    let mut gateway = crate::task_gateway::Gateway::start(&root, &launch.executable, upstream)?;
+    let route_config = json!({key:gateway.base_url()});
+    save(&root.path().join("route-config.json"), &route_config)?;
     let thread_id = if launch.new_session {
         let started = startup_request(
             &root,
@@ -414,7 +581,7 @@ pub fn serve(mut guard: ServiceGuard, expected: &str) -> io::Result<()> {
             &mut initial_events,
             "startup-thread",
             "thread/start",
-            json!({"cwd":launch.cwd,"allowProviderModelFallback":false}),
+            json!({"cwd":launch.cwd,"allowProviderModelFallback":false,"config":route_config}),
         )?;
         let id = started["thread"]["id"]
             .as_str()
@@ -464,8 +631,10 @@ pub fn serve(mut guard: ServiceGuard, expected: &str) -> io::Result<()> {
         })?,
     )?;
     guard.mark_ready()?;
-    let result =
+    let observed =
         crate::task_observer::observe(&root, &mut connection, initial_events, &launch.executable);
+    let stopped = gateway.finish();
+    let result = observed.and(stopped);
     if let Err(error) = &result {
         let _ = save(
             &root.path().join("controller-error.json"),

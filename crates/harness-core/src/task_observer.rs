@@ -31,6 +31,7 @@ pub(crate) fn observe(
     let user = crate::process_service::current_user()?;
     let mut visibility = Visibility::default();
     let mut handoff = crate::task_handoff::Handoff::load(root)?;
+    let mut child_views = crate::task_child_views::ChildViews::load(root)?;
     loop {
         if root.path().join("stop.json").try_exists()? {
             save(
@@ -44,7 +45,7 @@ pub(crate) fn observe(
             None => connection.receive(POLL)?,
         };
         if let Some(value) = value {
-            let mut request = None;
+            let mut request = child_views.event(root, &value)?.map(|id| (id, true));
             let mut changed = false;
             if value.get("method").is_none()
                 && let Some(id) = value["id"].as_u64()
@@ -61,6 +62,12 @@ pub(crate) fn observe(
                             return Err(io::Error::other(
                                 "native thread response identity differs",
                             ));
+                        }
+                        if tasks
+                            .get(&thread)
+                            .is_some_and(|task| task["pendingNativeRead"] == true)
+                        {
+                            visibility.seed_child(root, &value["result"]["thread"])?;
                         }
                         tasks.insert(thread.clone(), value["result"]["thread"].clone());
                         if resumed {
@@ -96,6 +103,12 @@ pub(crate) fn observe(
                         }
                     }
                     Some("item/completed") => {
+                        if let Some((child, parent)) = discovered_child(params, &tasks) {
+                            tasks.entry(child).or_insert_with(|| json!({
+                                "pendingNativeRead":true,"discoveredParent":parent,"status":{"type":"unknown"}
+                            }));
+                            changed = true;
+                        }
                         if let Some(thread) = params["threadId"].as_str()
                             && tasks.contains_key(thread)
                             && let Some(id) = params["item"]["id"].as_str()
@@ -171,7 +184,8 @@ pub(crate) fn observe(
                 subscribed.insert(id.into());
             }
         }
-        visibility.tick(root, connection, executable, &user, &tasks)?;
+        child_views.tick(root, connection, &tasks)?;
+        visibility.tick(root, connection, executable, &user, &tasks, &child_views)?;
         let settled = tasks
             .iter()
             .filter(|(id, thread)| {
@@ -204,6 +218,28 @@ pub(crate) fn observe(
     }
 }
 
+fn discovered_child(params: &Value, tasks: &BTreeMap<String, Value>) -> Option<(String, String)> {
+    let parent = params["threadId"].as_str()?;
+    let item = &params["item"];
+    let child = match item["type"].as_str()? {
+        "subAgentActivity" if item["kind"] == "started" => item["agentThreadId"].as_str()?,
+        "collabAgentToolCall"
+            if item["tool"] == "spawnAgent"
+                && item["status"] == "completed"
+                && item["senderThreadId"] == parent =>
+        {
+            let receivers = item["receiverThreadIds"].as_array()?;
+            if receivers.len() != 1 {
+                return None;
+            }
+            receivers[0].as_str()?
+        }
+        _ => return None,
+    };
+    (tasks.contains_key(parent) && !child.is_empty() && child.len() <= 256 && child != parent)
+        .then(|| (child.to_owned(), parent.to_owned()))
+}
+
 fn thread_settled(thread: &Value, failure: Option<&Value>) -> bool {
     match thread["status"]["type"].as_str() {
         Some("idle" | "notLoaded") => true,
@@ -223,8 +259,60 @@ fn thread_settled(thread: &Value, failure: Option<&Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Visibility, thread_settled};
+    use super::{BTreeMap, BrokerRoot, Visibility, discovered_child, thread_settled};
     use serde_json::json;
+
+    #[test]
+    fn v1_spawn_discovery_requires_completed_tool_and_matching_known_parent() {
+        let tasks = BTreeMap::from([("lead".into(), json!({"id":"lead"}))]);
+        let params = json!({"threadId":"lead","item":{"type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"lead","receiverThreadIds":["child"]}});
+        assert_eq!(
+            discovered_child(&params, &tasks),
+            Some(("child".into(), "lead".into()))
+        );
+        for (key, value) in [
+            ("senderThreadId", json!("other")),
+            ("status", json!("failed")),
+            ("tool", json!("sendInput")),
+            ("receiverThreadIds", json!(["child", "other"])),
+        ] {
+            let mut invalid = params.clone();
+            invalid["item"][key] = value;
+            assert_eq!(discovered_child(&invalid, &tasks), None);
+        }
+        assert_eq!(discovered_child(&params, &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn native_parent_spawn_and_initial_read_recover_missed_child_start() {
+        let tasks = BTreeMap::from([("lead".into(), json!({"id":"lead"}))]);
+        let mut params = json!({"threadId":"lead","item":{"type":"subAgentActivity","kind":"started","agentThreadId":"child"}});
+        assert_eq!(
+            discovered_child(&params, &tasks),
+            Some(("child".into(), "lead".into()))
+        );
+        params["threadId"] = json!("unknown");
+        assert!(discovered_child(&params, &tasks).is_none());
+        params["threadId"] = json!("lead");
+        params["item"]["kind"] = json!("completed");
+        assert!(discovered_child(&params, &tasks).is_none());
+        let owned = BrokerRoot::prepare().unwrap();
+        let mut visibility = Visibility::default();
+        let mut native = json!({"id":"child","status":{"type":"active"},"turns":[{"id":"current","status":"inProgress"}]});
+        visibility.seed_child(owned.root(), &native).unwrap();
+        assert_eq!(
+            visibility.active.get("child").map(String::as_str),
+            Some("current")
+        );
+        assert!(
+            !visibility.visible_for("child"),
+            "a native read is not a window receipt"
+        );
+        native["turns"][0]["status"] = json!("completed");
+        let mut finished = Visibility::default();
+        finished.seed_child(owned.root(), &native).unwrap();
+        assert!(finished.active.is_empty());
+    }
 
     #[test]
     fn terminal_error_can_settle_after_observation_but_stale_failure_cannot() {
@@ -288,6 +376,22 @@ struct Visibility {
 }
 
 impl Visibility {
+    fn seed_child(&mut self, root: &BrokerRoot, thread: &Value) -> io::Result<()> {
+        if thread["status"]["type"] == "active"
+            && let (Some(id), Some(turn)) = (
+                thread["id"].as_str(),
+                thread["turns"].as_array().and_then(|turns| turns.last()),
+            )
+            && turn["status"] == "inProgress"
+            && let Some(turn_id) = turn["id"].as_str()
+        {
+            self.active
+                .entry(id.to_owned())
+                .or_insert_with(|| turn_id.to_owned());
+            self.save(root)?;
+        }
+        Ok(())
+    }
     fn save(&self, root: &BrokerRoot) -> io::Result<()> {
         save(
             &root.path().join("visibility.json"),
@@ -415,6 +519,7 @@ impl Visibility {
         executable: &Path,
         user: &str,
         tasks: &BTreeMap<String, Value>,
+        child_views: &crate::task_child_views::ChildViews,
     ) -> io::Result<()> {
         let mut snapshots = BTreeMap::new();
         match read_json::<Value>(&root.path().join("view.json")) {
@@ -484,6 +589,14 @@ impl Visibility {
             self.save(root)?;
         }
         for (thread, turn) in self.active.clone() {
+            // The inherited ingress route holds the first request until the
+            // child's window exists. Interrupting it here would race creation.
+            if !self.snapshots.contains_key(&thread)
+                && child_views.awaiting_first_view(&thread)
+                && root.path().join("route-config.json").try_exists()?
+            {
+                continue;
+            }
             if self.visible_for(&thread) || self.stopping.get(&thread) == Some(&turn) {
                 continue;
             }

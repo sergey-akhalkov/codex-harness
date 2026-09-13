@@ -202,11 +202,238 @@ The wrapper waits for the native TUI's named-thread caption before reporting the
 new view ready. At `native-entry-result-ready.json`, inspect `view` for the Z.AI
 result and `previousView` for the original failure/history, then supply the final
 observation receipt and `/quit` in both windows. This native check passed: one GPT
-refusal, two `zai/glm-5.3` requests at advertised `high` effort, one tool effect,
-visible final result, retained previous chat and natural controller exit. It used
+refusal, two `zai/glm-5.3` requests at advertised `high` effort, one tool effect
+through the catalog's Code Mode interface, successful tool output consumed by the
+successor, visible final result, retained previous chat and natural controller exit. It used
 owned synthetic Responses and the explicit local model metadata input, not live
 subscription capacity. Global activation, concurrent executors, restart and
 leadership return remain open.
+
+For an ordinary new session with an initial prompt, the wrapper now opens the
+named empty native chat without submitting that prompt through TUI arguments.
+It preserves the initial input privately, waits for the native chat caption and
+process/window visibility, checks that the thread still has no work, then submits
+the input through `turn/start` without replaying a lost acknowledgement. The
+ordinary-entry and quota-handoff checks passed with the synthetic provider
+independently checking the first request's visible thread and controller dispatch
+record. Both checks also verified visible tool results and owned process exit.
+The 26 argument tests include deferred multiline text, image paths, working
+directory and option separation. The ignored
+`native_deferred_image_input_reaches_provider` contract check also passed on CLI
+0.154.0: an owned PNG with spaces and Unicode in its filename reached the
+synthetic provider as image data alongside unchanged multiline text, followed by
+one successful tool effect. That check uses the parsed deferred input and native
+`turn/start`; image input through the complete window launcher still needs its
+own acceptance. This is initial-prompt acceptance only;
+later interactive requests, resume/fork prompts, executor/helper dispatch and
+window recovery remain part of unfinished task 1.4.
+
+The native request-correlation check uses `client_metadata.thread_id`,
+`session_id` and `turn_id`, requiring agreement with the nested
+`x-codex-turn-metadata`. A fresh CLI 0.154.0 parent/child contract run confirmed
+that both conversations can share `prompt_cache_key` while retaining different
+thread identities. The cache key is therefore unsuitable for choosing a visible
+conversation. `task_request` rejects missing or conflicting correlation; the
+synthetic provider's visibility checks consume that identity. This is correlation
+evidence, not dispatch authorization or a delivered transport gate. The inspected
+native hook events do not establish a before-every-model-request barrier;
+subsequent native requests still need authoritative visibility control.
+
+`task_forward` provides the pending gate's one-request streaming transport using
+the existing system-curl identity check and cancellable pipe/Job owners. The
+[curl option contract](https://curl.se/docs/manpage.html) supports configuration
+through stdin and raw streamed HTTP/1.1 output, avoiding another TLS dependency.
+Owned loopback tests with system curl 8.21.0 verified unchanged request body and
+test authorization, response delivery before completion, preserved HTTP 429,
+HTTP 302 without redirect following, and cancellation closing the upstream and
+removing the temporary request body. The streaming check also verifies unchanged
+chunk framing and trailers, with delivery of the first chunk before the upstream
+produces the second. Proxy CONNECT headers are suppressed using curl's dedicated
+option; an actual HTTPS proxy compatibility check remains outstanding.
+Credentials stay out of process arguments;
+the body file lives in the private task root. The primitive accepts HTTPS or
+literal loopback HTTP and caps a buffered request at 64 MiB. It does not itself
+authorize dispatch and is not yet connected to the production native provider
+configuration. HTTPS/native authentication compatibility and integrated
+no-hidden-request acceptance remain open; chunked framing currently has owned
+transport evidence, not a native provider integration receipt.
+
+`task_admission` connects request correlation to the observed native session and
+active turn, then checks the exact conversation's registered process identity and
+visible window before forwarding. A parent's window cannot cover a child;
+interrupted turns wait and stopped tasks reject dispatch. Focused checks verify
+that missing child visibility produces no upstream connection. Only ordinary
+turn requests currently have this admission path; other request kinds are
+rejected pending explicit visibility support.
+
+The release ordinary-entry and quota-handoff checks passed with CLI 0.154.0
+through this gate and `task_forward` into an owned synthetic upstream. They
+verified two and three admitted requests respectively, unchanged request bytes
+and test authorization, native tool execution, visible final results and process
+cleanup after `/quit`. Both predecessor and successor windows were inspected
+simultaneously during handoff. These checks establish the fixture integration;
+they do not establish production routing, live subscription compatibility or
+complete worker/helper visibility. Private receipts retain the concrete runs.
+
+The next integration adds `task_gateway`, an owned loopback listener using this
+gate and transport. Native startup reads effective configuration and passes its
+local route through `thread/start.config`; handoff copies that route into the
+successor configuration. Focused ingress checks verify rejection without any
+upstream connection and joined shutdown during an incomplete HTTP read. The
+integrated ordinary release entry check passed with native tool execution,
+visible final result, saved local route configuration and process cleanup.
+An earlier handoff observation exposed a gap: window-presence checks reported
+conversations obscured by another application as visible.
+`task_view::Watch` now also checks the client rectangle against windows above it
+and rejects cloaked conversations. An owned Windows-window test passed for
+partial/full coverage, moving the cover away and hiding it; all windows were
+destroyed by their test owner. The bounded traversal treats changing or unknown
+composition state conservatively. It uses window rectangles, so transparent or
+irregular overlays can also suspend admission. This follows the documented
+[IsWindowVisible limitation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible)
+and [window ordering contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow).
+The integrated ordinary, quota-handoff and minimize/restore release checks passed
+with this change and CLI 0.154.0. The handoff windows were observed simultaneously;
+all three checks showed the final result and verified process cleanup. Complete
+worker/helper simultaneous-visibility acceptance remains open.
+This implementation currently requires an explicit provider base URL and a new
+session; resume/fork and implicit built-in routing return an explicit unsupported
+error. It is not globally activated. Ingress accepts bounded HTTP/1.1 POST bodies
+with a single Content-Length, retains up to sixteen connections, and has no
+automatic request replay. Complete disconnect recovery, helper routing and
+production compatibility remain required before activation.
+
+Two additional CLI 0.154.0 route contracts identify the integration point.
+`native_provider_address_override_preserves_binding` verifies that an app-server
+CLI override of a custom provider's `base_url` retains its configured credential
+environment key, wire API, authentication requirement and native model/provider
+binding without modifying the home config. It starts no model turn.
+`native_thread_route_override_reaches_only_selected_upstream` verifies the dotted
+`model_providers.<id>.base_url` override in `thread/start.config`: both synthetic
+Responses requests reach the selected owned upstream, the original upstream sees
+none, and the native tool effect occurs once. The home config stays unchanged.
+The contract now includes naming the empty thread and `thread/resume` before
+dispatch; both requests still reach the selected upstream. Resuming an unnamed
+empty thread failed with `no rollout found`, matching the need for the existing
+startup naming step. This covers attachment to the running named thread, not
+recovery after process restart or a fork.
+This allows route setup after native configuration discovery without restarting
+the server. Resume/fork and child inheritance still need separate checks, as do
+the built-in OpenAI route and live subscription authentication. The
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+describes `chatgpt_base_url` as a login-flow setting; these checks do not repurpose
+it as a universal model-request route.
+
+The ingress writes private `gateway-exchange-<sequence>.json` receipts containing
+completion, whether response delivery began, and an error-kind classification;
+they contain no headers or body. The ordinary entry tests require one successful
+receipt for each expected provider exchange. A successful fixture response alone
+cannot satisfy this check. Release validation passed with two exchanges for an
+ordinary task and three each for quota handoff and minimize/restore. The latter
+verified no new request while minimized, retention of the unfinished tool after
+restoration, continuation after that tool settled and no duplicate side effect.
+These checks used synthetic Responses, not live subscription model calls.
+
+The native two-client child/reconnect contract also passed with a per-parent
+provider address override: both parent and child reached the selected owned
+upstream, and neither reached the original one. The child preserved its native
+identity across reconnect and performed its tool effect once.
+`task_child_views` now names observed non-ephemeral children of known native
+threads and queues separate windows. Out-of-order naming replies retain distinct
+slots in an owned WebSocket test. While a child's first window is pending, the
+inherited ingress holds its request instead of racing an immediate interruption.
+The two right-side slots belong to executors; a replacement lead uses the lower
+left, with the predecessor reduced to the upper left. Integrated child-window
+acceptance and handoff with this layout passed on CLI 0.154.0. Slot reuse after completed
+assignments is not implemented; additional children require reconciliation, so
+this increment does not satisfy the full long-running orchestration requirement.
+When both slots are occupied, further children now remain behind request
+admission instead of terminating the observer and its existing workers. The
+private `child-view-capacity.json` records waiting identities; repeated polls
+preserve both assignments without sending extra native naming requests. The
+owned WebSocket test covers continued control traffic, persisted waiting state
+and removal of a vanished waiting identity. Automatic slot release and visible
+presentation of this waiting reason remain unfinished.
+`ordinary_launcher_opens_executor_before_its_first_request` passed through the
+release entry point: parent and child were observed simultaneously, all four
+ingress exchanges succeeded, the tool effect occurred once, and the native
+child's final result and parent completion notice were visible. Closing both
+owned chats also passed the controller cleanup check.
+Like the native child/reconnect fixture, it pauses only the synthetic parent's
+native goal scheduler; the canned responses cannot close that goal themselves.
+This does not test autonomous completion of a real model-backed parent goal.
+Its first integrated run found that the observer received the child's identity
+in the parent's `subAgentActivity` start item without a separate child
+`thread/started` notification. Discovery now follows that native item, queues
+naming, and reads the child after the name is acknowledged. The provisional
+record cannot authorize a request: admission waits for the native identity and
+active-turn snapshot. Focused tests cover known-parent discovery and an already
+running turn whose original start event preceded subscription. Named busy TUI
+captions accept the observed native braille spinner so window readiness does not
+wait for the held model request to finish. These corrections passed focused
+checks and the integrated child-window acceptance.
+The same release build passed the quota-handoff check with the stacked leader
+windows: the predecessor's quota refusal and the successor's tool result were
+visible together, three ingress exchanges succeeded, the effect occurred once,
+and closing both chats completed cleanup. A preceding observation attempt
+expired without its desktop receipt and was not counted as a pass; its owned
+processes stopped before the verified rerun. These fixture checks do not cover
+two concurrent executors, slot reuse, model-backed helpers or subscribed work.
+The new `ordinary_launcher_opens_two_distinct_executor_conversations` fixture
+selects Z.AI and Grok explicitly and requires both owned tools to observe their
+peer's separate effect before completion. The release entry point passed with
+all three native chats observed simultaneously, Z.AI/Grok `high` shown in their
+separate views, and both tool results visible. The leader now uses native
+`multi_agent_v1.wait_agent` calls with the returned child identities, receives
+both completed results, and emits its own distinct final in its visible chat.
+The strengthened acceptance passed with nine successful ingress exchanges,
+exactly one effect per child, and owned process cleanup after closing all chats.
+The selected model must also receive its matching assignment text. The parent
+goal remains paused only for this synthetic fixture; native result delivery is
+verified, but these passes do not establish subscribed provider work, goal
+completion by an actual model or complete orchestration acceptance.
+With the installed catalogue, CLI 0.154.0 selects multi-agent v1:
+the [versioned native schema](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/tools/handlers/multi_agents_spec.rs)
+uses `multi_agent_v1.spawn_agent`; neither the v2 `collaboration` call nor an
+unnamespaced call is accepted. Correcting that fixture exposed an observer gap:
+native v1 reports completed `collabAgentToolCall` spawn items, while the observer
+only recognized v2 `subAgentActivity`. The observer now discovers a single v1
+receiver only from a completed spawn with a matching known sender; failed,
+ambiguous and unrelated items cannot authorize discovery. Native identity and
+first-view admission remain separate requirements. A subsequent native run
+opened both executor windows and produced both separate effects, exposing a
+fixture mismatch with Code Mode's structured successful shell result; the
+fixture now accepts that native result shape while still requiring exit code
+zero and the exact expected output. A remaining intermittent failure is open: an earlier run
+failed the parent's ingress exchange with `InvalidData` before its second
+assignment. Gateway receipts now retain a bounded error detail and its stage
+to distinguish request parsing, private-root opening and admission/forwarding.
+The focused ingress test verifies that malformed/unowned requests preserve this
+diagnostic without recording their synthetic Authorization value. The original
+ingress failure did not recur in the subsequent passing runs; its cause remains
+unresolved, so those passes do not prove it fixed.
+
+The controller binds quota transfer to the exact latest failed native turn.
+A newer turn invalidates a prepared transfer; a late catalog response cannot
+restart it. Focused `task_handoff::tests` exercise stale history, native start
+events and late responses over an owned local WebSocket, checking that ownership
+stays with the previous leader and no successor request is sent.
+
+`native_background_terminal_outlives_completed_turn` in `task_control_contract`
+passed against CLI 0.154.0 with synthetic Responses: a yielded PowerShell command
+remained in `thread/backgroundTerminals/list` after the native turn completed,
+then left the inventory after its owned release signal. Inventory reads made no
+model calls. Run this ignored check with an explicit `HARNESS_CONTROL_CODEX_EXE`;
+it retains native schema, events and before/after inventory in its private root.
+The handoff controller now waits for an empty, complete terminal inventory before
+dispatching the successor. A focused local WebSocket test checks waiting,
+unchanged ownership and dispatch after the inventory clears. The rebuilt release
+also passed the ordinary-entry visible quota handoff with this gate: empty native
+inventory, two simultaneous identified chats, consumed Code Mode tool result and
+natural controller exit. This entry case does not yet exercise quota refusal
+while a background terminal remains active. These checks do not prove an atomic
+dispatch boundary against concurrent native clients or reconciliation of effects
+outside the native terminal inventory.
 
 Original failures are retained privately: daemon startup refused an elevated
 terminal; the Unix listener rejected its directory's privacy; a new thread had
@@ -256,6 +483,12 @@ belong under crate `src`; source-owned skill/configuration data remains live
 filesystem input and must not be embedded in a deployed binary. Source
 subdirectories named `tests` or `examples` are included. Root documentation
 and noncompiled Markdown outside `src` do not require recompilation.
+
+The source fingerprint includes non-Markdown files throughout `crates/`,
+including integration tests and their support modules. Freeze those inputs as
+well as runtime code during an explicit native build. A successful compilation
+is rejected if that fingerprint changed before finalization; finish source/test
+edits and their focused checks before starting another immutable candidate.
 
 Native core `install` / `update` / `check` / `recover` / `disconnect --core-only`
 exist. A model-free Process PATH cycle connects, repeats, checks and disconnects
@@ -392,6 +625,29 @@ explicit trusted executable hashes. That unactivated candidate is not eligible
 for activation.
 
 ## Outcome, usage and helpers
+
+Installed tool-workflow qualification reuses the `codegraph_consumers` Rust
+consumer. Set `CODEGRAPH_CONSUMER_CODEX_EXE` to the exact native Codex executable,
+`CODEGRAPH_CONSUMER_HOME` to the installed home and `CODEGRAPH_CONSUMER_OUTPUT`
+to an owned evidence directory outside this checkout. The ignored
+`installed_tool_workflows::installed_code_and_memory_operations` case creates
+an external Rust project, exercises the real CLI oracle through Serena edits,
+and checks protected/ignored memory and partial-rename recovery without model
+turns. Run it with the ordinary Cargo test selector and `--ignored --exact
+--nocapture --test-threads=1`; its printed directory retains all tool responses.
+
+`installed_readonly_boundary_on_prepared_project` reuses its completed project
+through explicit `TOOL_WORKFLOW_PREPARED_PROJECT`, then checks a fresh read-only
+consumer, negative writes and two-root symbol identity. The separate
+`installed_graph_routes_on_prepared_project` uses the same input and deliberately
+indexes it through the installed CodeGraph, then checks scoped relationships
+and completed watcher updates. Establish a current global manager before that
+case; these operation checks do not replace the change's pending native model
+comparisons or parent/child instruction-consumption checks.
+
+The unignored `memory_text_survives_clone_and_conflicting_worktrees` case uses
+only owned temporary Git repositories. It verifies actual tracked clone
+contents, excluded runtime cache and preserved conflicting versions.
 
 `codex-harness.exe outcome-report --input <private-json> [--markdown]` formats
 local attempt accounting without executing anything.

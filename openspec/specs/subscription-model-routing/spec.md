@@ -6,6 +6,12 @@ Make subscription-backed external models available in the official Codex CLI acr
 
 ## Requirements
 
+Named-role requirements below describe the compatibility baseline. The accepted
+transition is owned by the active
+[exact model/effort delta](../../changes/orchestrate-subscription-agents/specs/subscription-model-routing/spec.md)
+and [delegation contract](../agent-delegation/spec.md#requirements).
+Its pending migration and acceptance are not established by retaining this baseline.
+
 ### Requirement: Subscription-backed Grok access
 
 The kit SHALL provide xAI subscription authentication for the user's SuperGrok Heavy account and expose models actually available through that account. A Grok request SHALL use the subscription route without requiring an xAI pay-as-you-go API key. Credentials MUST remain outside tracked reusable artifacts and MUST NOT be printed in diagnostics.

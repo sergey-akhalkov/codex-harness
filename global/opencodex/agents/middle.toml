@@ -1,5 +1,5 @@
 name = "middle"
-description = "Preferred universal middle level on the Grok subscription for worthwhile bounded work of any kind."
+description = "Compatibility role for bounded Grok subscription probes; ordinary delegation selects model and effort explicitly."
 model = "xai/grok-4.6"
 model_provider = "openai"
 model_reasoning_effort = "xhigh"

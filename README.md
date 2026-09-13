@@ -10,6 +10,10 @@ files through filesystem links. Machine-specific TUI settings, authentication,
 session history, caches and recovery copies stay on the local machine. Shared
 defaults continue to be read live from this repository.
 
+The [instruction adaptation record](docs/principles-port.md) explains how official
+Astra guidance applies to this pack. Externally maintained OpenSpec instructions
+remain unchanged; project-owned specifications track unfinished acceptance.
+
 On Windows, with PowerShell 7.4+, Codex CLI and OpenSpec installed:
 
 ```powershell

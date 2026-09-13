@@ -56,7 +56,7 @@ tracked source.
    bare slug.
 
 3. **Reusable provider row, secret by reference only.** Add `providers.zai`
-   to [global/opencodex/config.json](../../../global/opencodex/config.json)
+   to [global/opencodex/config.json](../../../../global/opencodex/config.json)
    from the registry seed: `authMode: "key"`, Coding Plan base URL, Chat
    adapter, default `glm-5.3`, `selectedModels: ["glm-5.3"]`. Put
    `apiKey` as an environment reference only (`"${ZAI_API_KEY}"` in JSON).

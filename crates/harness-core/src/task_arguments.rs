@@ -46,6 +46,10 @@ use std::path::{Path, PathBuf};
 /// Arguments for one harness-managed interactive session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedArguments {
+    /// Initial input submitted by the controller after the conversation is visible.
+    pub initial_input: Option<InitialInput>,
+    /// Attachment options with the initial text and images removed.
+    pub waiting_attachment: Vec<OsString>,
     /// Arguments to pass after the "app-server" subcommand: the user's
     /// "-c/--config", "--enable", "--disable" and "--strict-config" entries
     /// in encounter order, followed by the mapped overrides for the native
@@ -67,6 +71,12 @@ pub struct ManagedArguments {
     pub cwd: PathBuf,
     /// Ordinary new interaction; resume/fork keep their native selection flow.
     pub new_session: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InitialInput {
+    pub text: String,
+    pub images: Vec<PathBuf>,
 }
 
 /// First positional tokens that dispatch noninteractive native subcommands.
@@ -132,6 +142,9 @@ struct Session {
 struct Parser<'a> {
     args: &'a [OsString],
     attachment: Vec<OsString>,
+    waiting_attachment: Vec<OsString>,
+    prompt: Option<String>,
+    images: Vec<OsString>,
     session: Session,
     kind: Option<SessionKind>,
     positionals: usize,
@@ -150,6 +163,9 @@ pub fn plan(args: &[OsString], cwd: &Path) -> io::Result<Option<ManagedArguments
     let mut parser = Parser {
         args,
         attachment: Vec::new(),
+        waiting_attachment: Vec::new(),
+        prompt: None,
+        images: Vec::new(),
         session: Session::default(),
         kind: None,
         positionals: 0,
@@ -165,12 +181,27 @@ pub fn plan(args: &[OsString], cwd: &Path) -> io::Result<Option<ManagedArguments
             "native remote resume rejects permission overrides; preserve the ordinary native resume path",
         ));
     }
+    let new_session = !matches!(parser.kind, Some(SessionKind::Resume | SessionKind::Fork));
+    let initial_input = if new_session {
+        parser.prompt.map(|text| InitialInput {
+            text,
+            images: parser
+                .images
+                .iter()
+                .map(|path| directory.join(path))
+                .collect(),
+        })
+    } else {
+        None
+    };
     Ok(Some(ManagedArguments {
+        initial_input,
+        waiting_attachment: parser.waiting_attachment,
         backend,
         tui: args.to_vec(),
         attachment: parser.attachment,
         cwd: directory,
-        new_session: !matches!(parser.kind, Some(SessionKind::Resume | SessionKind::Fork)),
+        new_session,
     }))
 }
 
@@ -257,6 +288,17 @@ impl Parser<'_> {
             }
         }
         self.attachment.extend_from_slice(options);
+        let first = options[0].to_string_lossy();
+        if first == "--image" || first == "-i" {
+            self.images.extend_from_slice(&options[1..]);
+        } else if let Some(value) = first.strip_prefix("--image=") {
+            self.images.push(value.into());
+        } else if let Some(value) = first.strip_prefix("-i") {
+            self.images
+                .push(value.strip_prefix('=').unwrap_or(value).into());
+        } else {
+            self.waiting_attachment.extend_from_slice(options);
+        }
     }
 
     fn record_positional(&mut self, text: &str, allow_command: bool) -> io::Result<bool> {
@@ -284,6 +326,9 @@ impl Parser<'_> {
             return Err(invalid(format!(
                 "the native CLI rejects this argv: unexpected argument '{text}'"
             )));
+        }
+        if self.kind == Some(SessionKind::Prompt) {
+            self.prompt = Some(text.into());
         }
         Ok(true)
     }
@@ -791,6 +836,50 @@ mod tests {
     #[test]
     fn second_prompt_word_is_rejected_like_the_native_cli() {
         assert_eq!(error_kind(&["hello", "world"]), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn deferred_input_preserves_text_images_and_separates_window_options() {
+        let planned = plan_managed(&[
+            "-C",
+            "project",
+            "-a",
+            "never",
+            "--no-alt-screen",
+            "-i",
+            "one.png",
+            "two.png",
+            "--",
+            "--read-only\nInspect both images.",
+        ]);
+        let input = planned.initial_input.unwrap();
+        assert_eq!(input.text, "--read-only\nInspect both images.");
+        assert_eq!(
+            input.images,
+            vec![
+                Path::new("D:/base/project").join("one.png"),
+                Path::new("D:/base/project").join("two.png")
+            ]
+        );
+        assert_eq!(
+            planned.waiting_attachment,
+            argv(&["-C", "project", "--no-alt-screen"])
+        );
+        for option in ["--image=one.png", "-ione.png", "-i=one.png"] {
+            let planned = plan_managed(&[option, "inspect"]);
+            assert_eq!(
+                planned.initial_input.unwrap().images,
+                vec![Path::new("D:/base").join("one.png")]
+            );
+            assert!(planned.waiting_attachment.is_empty());
+        }
+        assert!(plan_managed(&[]).initial_input.is_none());
+        assert!(
+            plan_managed(&["resume", "saved-id", "continue"])
+                .initial_input
+                .is_none()
+        );
+        assert!(plan_managed(&["-i", "one.png"]).initial_input.is_none());
     }
 
     #[test]

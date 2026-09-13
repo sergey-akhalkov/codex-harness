@@ -1,11 +1,13 @@
 ---
 name: project-memory
-description: Retrieve and maintain durable project knowledge in Git when starting substantive work, recovering context, or recording confirmed decisions and reusable verified findings. Reuse existing project records and read only relevant topics.
+description: Retrieve Git-backed project context at substantive task start or recovery, and maintain confirmed decisions or reusable findings in existing records.
 ---
 
 # Project memory
 
 Establish the actual Git checkout root, including linked worktrees. Follow its instruction route to the short memory index at the start of substantive work and after a context reset. Read only entries relevant to the task; an index link is not a request to load every body.
+
+When considering Serena as an interface to these records, read [memory interface](references/memory-interface.md). The compared selection is `retain-native`: ordinary Git Markdown remains the authoritative route. An available memory tool does not authorize a second store or migration.
 
 When adopting memory, discover existing decision, context and verification records first. Reuse the declared entry point. If none exists, adapt [the index template](assets/index.md) as `docs/memory/README.md` and add a short relative route in the project's `AGENTS.md`. Existing records remain authoritative; the index links to them without copying their contents. Create a topic file with [the entry template](assets/entry.md) only for useful knowledge that has no existing home.
 

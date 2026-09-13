@@ -23,7 +23,7 @@ None.
 
 ## Impact
 
-The implementation owner is [global/principles-of-work.md](../../../global/principles-of-work.md), with concise decision and operation updates in [project decisions](../../../docs/project-decisions.md) and [global instructions](../../../docs/global-instructions.md). Review the existing pack-owned verification, token-workflow, memory and delegation guidance for actual conflicts; change only conflicting clauses and necessary references rather than copying the philosophy into every file.
+The implementation owner is [global/principles-of-work.md](../../../../global/principles-of-work.md), with concise decision and operation updates in [project decisions](../../../../docs/project-decisions.md) and [global instructions](../../../../docs/global-instructions.md). Review the existing pack-owned verification, token-workflow, memory and delegation guidance for actual conflicts; change only conflicting clauses and necessary references rather than copying the philosophy into every file.
 
 The supported delivery remains Windows Codex through the linked global `AGENTS.md`, covering main and delegated work across projects. Externally maintained OpenSpec skills, schemas, templates and workflow configuration remain outside the edit scope. Existing product requirements, permission boundaries and unfinished changes remain authoritative.
 

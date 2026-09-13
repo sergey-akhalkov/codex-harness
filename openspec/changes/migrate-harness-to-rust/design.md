@@ -26,7 +26,7 @@ Confirmed user decisions: this migration targets Rust for all maintained first-p
 
 - Rewriting upstream Codex, OpenSpec, OpenCodex, Serena, Graphify, Codebase Memory, CodeGraph, Nuphus, RTK or external language servers; continuing a CBM-specific port or indexer optimization after its replacement was selected.
 - Changing provider/model assignments, billing, accepted hook selection, credentials, or the language of projects using the kit.
-- Adding platform support beyond the currently accepted native Windows environment, reviving retired diagnostics, or replaying previously excluded `opencode-kit` evaluations.
+- Adding platform support beyond the currently accepted native Windows environment, reviving retired diagnostics, or replaying previously excluded evaluations of the original source-kit consumer.
 - Implementing functionality from unrelated unfinished changes or treating their historical task counts as completion evidence for this migration.
 
 ## Decisions

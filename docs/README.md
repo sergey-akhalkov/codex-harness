@@ -16,6 +16,7 @@ current source, the installed CLI and the relevant local inputs.
 | --- | --- |
 | Confirmed product decisions and completion rules | [Project decisions](project-decisions.md) |
 | Portable working principles | [global/principles-of-work.md](../global/principles-of-work.md) |
+| Astra guidance applicability and preserved principles | [Instruction adaptations](principles-port.md) |
 | Global instruction connection, update and rollback | [Global instructions](global-instructions.md) |
 | Install, update, disconnect and recovery | [Installation](installation.md) |
 | MCP, language tools and resource policy | [Code tools](code-tools.md) |

@@ -52,6 +52,23 @@ Extension presence does not prove a compatible language server.
 
 ## Source and local state
 
+Optional workflow selection keeps the existing broker/activation route for
+cross-project Serena queries. The qualified 1.7.0 LSP `query_project` path needs
+a separate Project Server, whose loaded language managers are outside the kit's
+three-worker/idle-expiry lifecycle. Two owned native consumers returned distinct
+values for the same Rust symbol name under the current broker and completed
+their owned process cleanup; no additional Project Server is selected.
+
+For Graphify 0.9.55, `update --no-cluster` can construct and refresh code and
+Markdown structure without a model. The owned mixed-source check did not include
+the price configuration or connect its documented rule to the Rust reader,
+despite reflecting a changed Markdown heading. Keep current-source inspection
+for such implicit relationships. A relevant saved graph remains usable with an
+explicit project identity; this evaluation does not enable semantic model
+extraction or claim a measured workflow speedup. The compared selection is
+`retain-current` for mixed-source Graphify questions and the existing broker
+for Serena cross-project queries.
+
 The kit adds MCP path registrations and one owned readiness setting to the
 existing user config. The native Codex TOML editor renders these registrations
 in a disposable empty config; an exact owned block is then inserted into the

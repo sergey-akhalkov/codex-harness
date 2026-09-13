@@ -36,6 +36,18 @@ fn ordinary_launcher_starts_control_and_delivers_tool_result() {
 }
 
 #[test]
+#[ignore = "requires native CLI and parent/child desktop observations; synthetic Responses only"]
+fn ordinary_launcher_opens_executor_before_its_first_request() {
+    native_entry(EntryCase::Child);
+}
+
+#[test]
+#[ignore = "requires native CLI, model catalog and three desktop observations; synthetic Responses only"]
+fn ordinary_launcher_opens_two_distinct_executor_conversations() {
+    native_entry(EntryCase::TwoChildren);
+}
+
+#[test]
 #[ignore = "requires explicit native CLI and scoped minimize/restore/final desktop observations; synthetic responses only"]
 fn ordinary_launcher_suspends_and_recovers_visible_conversation() {
     native_entry(EntryCase::ViewLoss);
@@ -56,12 +68,16 @@ fn ordinary_launcher_hands_quota_refusal_to_visible_zai_lead() {
 #[derive(Clone, Copy)]
 enum EntryCase {
     Normal,
+    Child,
+    TwoChildren,
     ViewLoss,
     QuotaRefusal,
     QuotaHandoff,
 }
 
 fn native_entry(case: EntryCase) {
+    let pair = matches!(case, EntryCase::TwoChildren);
+    let child = matches!(case, EntryCase::Child | EntryCase::TwoChildren);
     let view_loss = matches!(case, EntryCase::ViewLoss);
     let quota_refusal = matches!(case, EntryCase::QuotaRefusal);
     let quota_handoff = matches!(case, EntryCase::QuotaHandoff);
@@ -79,7 +95,15 @@ fn native_entry(case: EntryCase) {
     );
     let owned = BrokerRoot::prepare().unwrap().keep();
     let root = owned.path();
+    fs::write(
+        root.join("require-initial-view"),
+        "verify before first provider response",
+    )
+    .unwrap();
     eprintln!("ordinary control evidence: {}", root.display());
+    if pair {
+        fs::write(root.join("two-executors"), "owned concurrent assignments").unwrap();
+    }
     let home = root.join("home");
     let workspace = root.join("workspace");
     let build = root.join("build");
@@ -154,9 +178,12 @@ fn native_entry(case: EntryCase) {
         EntryCase::QuotaRefusal => control_responses::Responses::with_quota_refusal(root.into()),
         EntryCase::QuotaHandoff => control_responses::Responses::with_quota_handoff(root.into()),
         EntryCase::Normal => control_responses::Responses::start(root.into(), true),
+        EntryCase::Child | EntryCase::TwoChildren => {
+            control_responses::Responses::start(root.into(), false)
+        }
     };
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
-    let catalog_config = if quota_handoff {
+    let catalog_config = if quota_handoff || pair {
         let source = PathBuf::from(
             std::env::var_os("HARNESS_CONTROL_MODEL_CATALOG")
                 .expect("explicit model metadata, without credentials"),
@@ -194,6 +221,8 @@ supports_websockets = false
 code_mode = false
 shell_snapshot = false
 hooks = false
+multi_agent = true
+multi_agent_v2 = false
 [analytics]
 enabled = false
 [projects.{trusted}]
@@ -225,7 +254,13 @@ trust_level = "trusted"
     command.env.insert("PATH".into(), Some(path));
     command.args = vec![
         "--no-alt-screen".into(),
-        "Perform the owned proof command and return its consumed result.".into(),
+        if pair {
+            "Delegate two independent owned proof tasks to Z.AI and Grok.".into()
+        } else if child {
+            "Delegate the owned proof to one native child.".into()
+        } else {
+            "Perform the owned proof command and return its consumed result.".into()
+        },
     ];
     let mut console = ConsoleSpec::new(command);
     console.size.columns = 180;
@@ -257,7 +292,12 @@ trust_level = "trusted"
     if view_loss {
         exercise_view_loss(root, &state, &workspace);
     }
-    let marker = if quota_refusal {
+    if child {
+        pause_synthetic_parent_goal(&state);
+    }
+    let marker = if pair {
+        control_responses::PARENT_FINAL.to_owned()
+    } else if quota_refusal {
         quota_refusal_result(root, &state, &workspace)
     } else {
         control_responses::FINAL.to_owned()
@@ -277,8 +317,12 @@ trust_level = "trusted"
             "native conversation closed before its result; inspect client-closed.json"
         );
         if state.join("view.json").is_file()
-            && fs::read_to_string(state.join("task.json"))
-                .is_ok_and(|saved| saved.contains(&marker))
+            && fs::read_to_string(state.join("task.json")).is_ok_and(|saved| {
+                saved.contains(&marker)
+                    && (!pair
+                        || saved.contains("CONTROL_TOOL_RESULT_CONSUMED_ONE")
+                            && saved.contains("CONTROL_TOOL_RESULT_CONSUMED_TWO"))
+            })
         {
             break;
         }
@@ -296,9 +340,44 @@ trust_level = "trusted"
             "one"
         );
     }
+    if pair {
+        let saved = fs::read_to_string(state.join("task.json")).unwrap();
+        assert!(
+            saved.contains("CONTROL_TOOL_RESULT_CONSUMED_ONE")
+                && saved.contains("CONTROL_TOOL_RESULT_CONSUMED_TWO")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("proof-two.txt")).unwrap(),
+            "one"
+        );
+    }
     let initial_view: Value =
         serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
-    let view = if quota_handoff {
+    if pair {
+        let saved: Value =
+            serde_json::from_slice(&fs::read(state.join("task.json")).unwrap()).unwrap();
+        assert!(
+            saved["threads"][initial_view["threadId"].as_str().unwrap()]["turns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|turn| turn["items"].as_array().is_some_and(|items| items
+                    .iter()
+                    .any(|item| item["type"] == "agentMessage"
+                        && item["text"] == control_responses::PARENT_FINAL))),
+            "the leader's own native final must consume both children"
+        );
+    }
+    let view = if child {
+        let views: Value =
+            serde_json::from_slice(&fs::read(state.join("additional-views.json")).unwrap())
+                .unwrap();
+        let children = views["threads"].as_object().unwrap();
+        assert_eq!(children.len(), if pair { 2 } else { 1 });
+        let (id, window) = children.iter().next().unwrap();
+        assert_ne!(id, initial_view["threadId"].as_str().unwrap());
+        json!({"schema":1,"threadId":id,"window":window,"allExecutors":children})
+    } else if quota_handoff {
         let leader: Value =
             serde_json::from_slice(&fs::read(state.join("leader.json")).unwrap()).unwrap();
         let views: Value =
@@ -313,7 +392,7 @@ trust_level = "trusted"
     };
     fs::write(
         root.join("native-entry-result-ready.json"),
-        serde_json::to_vec_pretty(&json!({"state":state,"view":view,"previousView":quota_handoff.then_some(initial_view),"marker":marker})).unwrap(),
+        serde_json::to_vec_pretty(&json!({"state":state,"view":view,"previousView":(quota_handoff || child).then_some(initial_view),"marker":marker})).unwrap(),
     )
     .unwrap();
     eprintln!(
@@ -384,10 +463,27 @@ trust_level = "trusted"
     assert_eq!(provider["reasoning"]["effort"], "low");
     let expected_requests = match case {
         EntryCase::Normal => 2,
+        EntryCase::Child => 4,
+        EntryCase::TwoChildren => 9,
         EntryCase::ViewLoss => 3,
         EntryCase::QuotaRefusal => 1,
         EntryCase::QuotaHandoff => 3,
     };
+    for sequence in 1..=expected_requests {
+        let exchange: Value = serde_json::from_slice(
+            &fs::read(state.join(format!("gateway-exchange-{sequence}.json")))
+                .expect("every native provider request must pass the installed task ingress"),
+        )
+        .unwrap();
+        assert_eq!(exchange["completed"], true);
+        assert_eq!(exchange["responseStarted"], true);
+        assert!(exchange["errorKind"].is_null());
+    }
+    assert!(
+        !state
+            .join(format!("gateway-exchange-{}.json", expected_requests + 1))
+            .exists()
+    );
     assert!(
         root.join(format!("provider-{expected_requests}.json"))
             .is_file()
@@ -399,6 +495,67 @@ trust_level = "trusted"
         "named conversation must not issue an auxiliary model request"
     );
     fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"zai/glm-5.3"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
+}
+
+fn pause_synthetic_parent_goal(state: &Path) {
+    // The canned final cannot complete a native goal. Disable that fixture-only
+    // scheduling loop, as in the native child/reconnect contract, while the
+    // actual child continues through its own tool/result path.
+    let until = Instant::now() + WAIT;
+    while !state.join("child-view-requests.json").is_file() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        state.join("child-view-requests.json").is_file(),
+        "native child must request its own window"
+    );
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(state.join("endpoint.json")).unwrap()).unwrap();
+    let mut connection = harness_core::task_control::ControlConnection::connect(
+        endpoint["port"].as_u64().unwrap() as u16,
+        endpoint["token"].as_str().unwrap(),
+        WAIT,
+    )
+    .unwrap();
+    for (id, method, params) in [
+        (
+            1,
+            "initialize",
+            json!({"clientInfo":{"name":"owned-child-fixture","version":"1"},"capabilities":{"experimentalApi":true}}),
+        ),
+        (
+            2,
+            "thread/resume",
+            json!({"threadId":endpoint["thread_id"]}),
+        ),
+        (
+            3,
+            "thread/goal/set",
+            json!({"threadId":endpoint["thread_id"],"objective":"Preserve the owned proof and consume the child result","status":"paused"}),
+        ),
+    ] {
+        connection
+            .send(&json!({"id":id,"method":method,"params":params}), WAIT)
+            .unwrap();
+        let until = Instant::now() + WAIT;
+        loop {
+            assert!(
+                Instant::now() < until,
+                "native fixture control reply deadline"
+            );
+            if let Some(value) = connection.receive(Duration::from_millis(100)).unwrap()
+                && value["id"] == id
+            {
+                assert!(value.get("error").is_none(), "{method}: {value}");
+                break;
+            }
+        }
+        if id == 1 {
+            connection
+                .send(&json!({"method":"initialized"}), WAIT)
+                .unwrap();
+        }
+    }
 }
 
 fn quota_refusal_result(root: &Path, state: &Path, workspace: &Path) -> String {

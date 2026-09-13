@@ -6,6 +6,12 @@ Reduce avoidable subscription use while preserving complete accepted outcomes, c
 
 ## Requirements
 
+The active [routing and efficiency delta](../../changes/orchestrate-subscription-agents/specs/subscription-efficiency/spec.md)
+owns the accepted transition from the earlier Grok-middle preference below.
+Current selection and migration status follow the
+[delegation contract](../agent-delegation/spec.md#requirements); this baseline
+does not certify the active change's unfinished benefit or orchestration checks.
+
 ### Requirement: Attributable usage evidence
 
 The kit SHALL provide a bounded report from existing local evidence that separates model/provider, parent and child work, cached and uncached input, output including reasoning, hook context, repeated delivery, continuation and elapsed time. Model responses SHALL be deduplicated by stable response identity; cumulative totals MUST NOT be added as independent usage. Missing records, cross-session concurrency and incomparable quota-reset windows SHALL be explicit. Raw tokens or character counts MUST NOT be presented as exact weekly quota percentages. Source transcripts and credentials SHALL remain outside tracked reports.
@@ -132,7 +138,7 @@ paths; their automatic coverage or deliberate explicit verification SHALL be sta
 
 ### Requirement: Bounded optimization experiments
 
-Existing logs, checks and comparable evidence SHALL be reused before new model-backed experiments. Each new comparison SHALL define its task, acceptance oracle, identities, maximum attempts and stopping rule before execution. Deterministic checks SHALL precede model-backed checks. The comparison SHALL stop after sufficient evidence or when repeated attempts add no information; inconclusive results SHALL NOT require unbounded reruns. No further opencode-kit runs SHALL be required.
+Existing logs, checks and comparable evidence SHALL be reused before new model-backed experiments. Each new comparison SHALL define its task, acceptance oracle, identities, maximum attempts and stopping rule before execution. Deterministic checks SHALL precede model-backed checks. The comparison SHALL stop after sufficient evidence or when repeated attempts add no information; inconclusive results SHALL NOT require unbounded reruns. No further runs of the original source-kit consumer SHALL be required.
 
 #### Scenario: Comparable evidence already exists
 - **WHEN** an existing outcome or delegation run covers the same current inputs and contract

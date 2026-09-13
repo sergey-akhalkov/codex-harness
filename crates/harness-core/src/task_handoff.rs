@@ -26,6 +26,7 @@ enum Phase {
     Name,
     Attach,
     AwaitView,
+    Resources,
     Dispatch,
     Running,
     Blocked,
@@ -43,6 +44,9 @@ pub(crate) struct Handoff {
     sequence: u64,
     cursors: BTreeSet<String>,
     error: Value,
+    resources_clear: bool,
+    #[serde(skip)]
+    resource_poll_after: Option<Instant>,
     #[serde(skip)]
     requested_at: Option<Instant>,
 }
@@ -65,6 +69,8 @@ impl Handoff {
             sequence: 0,
             cursors: BTreeSet::new(),
             error: Value::Null,
+            resources_clear: false,
+            resource_poll_after: None,
             requested_at: None,
         })
     }
@@ -135,9 +141,11 @@ impl Handoff {
         if self.phase == Phase::Waiting
             && self.previous["model"] == "gpt-6-astra"
             && settled.contains(previous)
-            && failures
-                .get(previous)
-                .is_some_and(|value| value["failure"]["cause"] == "quota")
+            && failures.get(previous).is_some_and(|value| {
+                tasks.get(previous).is_some_and(|thread| {
+                    current_quota_failure(previous, thread, &value["failure"])
+                })
+            })
         {
             let Some(thread) = tasks.get(previous) else {
                 return Ok(());
@@ -170,7 +178,28 @@ impl Handoff {
                 .as_str()
                 .ok_or_else(|| io::Error::other("successor identity missing"))?;
             if !visible.contains(id) || !settled.contains(previous) {
+                self.resources_clear = false;
                 return Ok(());
+            }
+            if tasks.get(previous).is_none_or(|thread| {
+                !current_quota_failure(previous, thread, &self.context["failure"])
+            }) {
+                return self.block(root, json!({"reason":"previous leader advanced after the saved quota failure; reconcile before transfer"}));
+            }
+            if !self.resources_clear {
+                if self
+                    .resource_poll_after
+                    .is_some_and(|after| Instant::now() < after)
+                {
+                    return Ok(());
+                }
+                return self.send(
+                    root,
+                    connection,
+                    Phase::Resources,
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId":previous,"limit":1}),
+                );
             }
             // Publish the new owner before dispatch. The previous turn and its
             // tools must have settled, and this exact successor must be visible.
@@ -201,6 +230,14 @@ impl Handoff {
         connection: &mut ControlConnection,
         event: &Value,
     ) -> io::Result<()> {
+        if self.superseded_by(event) {
+            return self.block(root, json!({"reason":"previous leader started another turn during handoff preparation; reconcile before transfer","event":event}));
+        }
+        if event["method"] == "item/started"
+            && event["params"]["threadId"] == self.previous["threadId"]
+        {
+            self.resources_clear = false;
+        }
         if event.get("method").is_some()
             || event["id"].as_str() != self.pending.as_deref()
             || self.pending.is_none()
@@ -214,6 +251,22 @@ impl Handoff {
         }
         let result = &event["result"];
         match self.phase {
+            Phase::Resources => {
+                let Some(terminals) = result["data"].as_array() else {
+                    return self.block(root, json!({"reason":"native background terminal inventory is unavailable","result":result}));
+                };
+                if terminals.is_empty() && !result["nextCursor"].is_null() {
+                    return self.block(root, json!({"reason":"native background terminal inventory is incomplete","result":result}));
+                }
+                self.resources_clear = terminals.is_empty();
+                self.resource_poll_after = Some(Instant::now() + Duration::from_millis(500));
+                save(
+                    &root.path().join("handoff-resources.json"),
+                    &json!({"schema":1,"threadId":self.previous["threadId"],"clear":self.resources_clear,"native":result}),
+                )?;
+                self.phase = Phase::AwaitView;
+                self.save(root)?;
+            }
             Phase::Catalog => {
                 if let Some(model) = result["data"]
                     .as_array()
@@ -246,9 +299,20 @@ impl Handoff {
                 }
             }
             Phase::Rename => {
+                let mut config: Value =
+                    match crate::task_runtime::read_json(&root.path().join("route-config.json")) {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+                        Err(error) => return Err(error),
+                    };
+                if !config.is_object() {
+                    return Err(io::Error::other("invalid native route configuration"));
+                }
+                config["model_reasoning_effort"] = json!(self.effort);
+                config["agents.enabled"] = json!(false);
                 self.send(root, connection, Phase::Create, "thread/start", json!({
                     "cwd":self.previous["native"]["cwd"],"model":SUCCESSOR,"modelProvider":self.previous["modelProvider"],
-                    "allowProviderModelFallback":false,"config":{"model_reasoning_effort":self.effort,"agents.enabled":false}}))?;
+                    "allowProviderModelFallback":false,"config":config}))?;
             }
             Phase::Create => {
                 if result["model"] != SUCCESSOR
@@ -289,7 +353,7 @@ impl Handoff {
                 }
                 save(
                     &root.path().join("view-request.json"),
-                    &json!({"schema":1,"threadId":self.successor["thread"]["id"],"title":"Z.AI temporary lead","slot":1}),
+                    &json!({"schema":1,"threadId":self.successor["thread"]["id"],"title":"Z.AI temporary lead","slot":3}),
                 )?;
                 self.phase = Phase::AwaitView;
                 self.attached = true;
@@ -309,6 +373,34 @@ impl Handoff {
         }
         Ok(())
     }
+
+    fn superseded_by(&self, event: &Value) -> bool {
+        matches!(
+            self.phase,
+            Phase::Catalog
+                | Phase::Rename
+                | Phase::Create
+                | Phase::Name
+                | Phase::Attach
+                | Phase::AwaitView
+                | Phase::Resources
+        ) && event["method"] == "turn/started"
+            && event["params"]["threadId"]
+                .as_str()
+                .is_some_and(|id| self.previous["threadId"].as_str() == Some(id))
+    }
+}
+
+fn current_quota_failure(thread_id: &str, thread: &Value, failure: &Value) -> bool {
+    let Some(turn) = thread["turns"].as_array().and_then(|turns| turns.last()) else {
+        return false;
+    };
+    failure["cause"] == "quota"
+        && failure["threadId"].as_str() == Some(thread_id)
+        && turn["status"] == "failed"
+        && turn["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && failure["turnId"].as_str() == Some(id))
 }
 
 fn same_permissions(before: &Value, after: &Value) -> bool {
@@ -407,6 +499,162 @@ fn visible_history(thread: &Value) -> Result<Vec<Value>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_quota_cannot_replace_a_newer_or_unidentified_turn() {
+        let failure = json!({"threadId":"lead","turnId":"refused","cause":"quota"});
+        let mut thread = json!({"turns":[{"id":"refused","status":"failed"}]});
+        assert!(current_quota_failure("lead", &thread, &failure));
+        assert!(!current_quota_failure("other", &thread, &failure));
+        for status in ["inProgress", "completed", "interrupted", "failed"] {
+            thread["turns"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id":"later","status":status}));
+            assert!(!current_quota_failure("lead", &thread, &failure));
+            thread["turns"].as_array_mut().unwrap().pop();
+        }
+        assert!(!current_quota_failure(
+            "lead",
+            &json!({"turns":[{"status":"failed"}]}),
+            &json!({"threadId":"lead","cause":"quota"})
+        ));
+    }
+
+    #[test]
+    fn a_new_lead_turn_blocks_prepared_handoff_and_ignores_late_catalog_reply() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let prepared = BrokerRoot::prepare().unwrap();
+        let root = prepared.root();
+        save(
+            &root.path().join("leader.json"),
+            &json!({"threadId":"lead","model":"gpt-6-astra","native":{"cwd":"owned"}}),
+        )
+        .unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            std::thread::spawn(move || tungstenite::accept(listener.accept().unwrap().0).unwrap());
+        let mut connection =
+            ControlConnection::connect(port, &"a".repeat(32), Duration::from_secs(2)).unwrap();
+        let mut server = server.join().unwrap();
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut handoff = Handoff::load(root).unwrap();
+        let tasks = BTreeMap::from([(
+            "lead".into(),
+            json!({"turns":[{"id":"refused","status":"failed","items":[{"type":"userMessage","content":[{"type":"text","text":"Inspect only"}]}]}]}),
+        )]);
+        let failures = BTreeMap::from([(
+            "lead".into(),
+            json!({"failure":{"threadId":"lead","turnId":"refused","cause":"quota"}}),
+        )]);
+        let settled = BTreeSet::from(["lead".into()]);
+        let mut continued_tasks = tasks.clone();
+        continued_tasks.get_mut("lead").unwrap()["turns"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"later","status":"completed","items":[]}));
+        handoff
+            .tick(
+                root,
+                &mut connection,
+                &continued_tasks,
+                &failures,
+                &settled,
+                &settled,
+            )
+            .unwrap();
+        assert!(handoff.phase == Phase::Waiting);
+        handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &settled)
+            .unwrap();
+        let request: Value =
+            serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(request["method"], "model/list");
+        handoff.event(root, &mut connection, &json!({"method":"turn/started","params":{"threadId":"worker","turn":{"id":"unrelated"}}})).unwrap();
+        assert!(handoff.phase == Phase::Catalog);
+        handoff
+            .event(
+                root,
+                &mut connection,
+                &json!({"method":"turn/started","params":{"threadId":"lead","turn":{"id":"new"}}}),
+            )
+            .unwrap();
+        handoff.event(root, &mut connection, &json!({"id":request["id"],"result":{"data":[{"model":SUCCESSOR,"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})).unwrap();
+        assert!(handoff.phase == Phase::Blocked);
+        assert!(handoff.pending.is_none());
+        let saved: Value = read_json(&root.path().join("handoff.json")).unwrap();
+        assert_eq!(saved["transfer"]["phase"], "blocked");
+        let owner: Value = read_json(&root.path().join("leader.json")).unwrap();
+        assert_eq!(owner["threadId"], "lead");
+        // A newer native history snapshot also invalidates the saved context
+        // immediately before dispatch, even if its start event was not seen.
+        let mut prepared_handoff = Handoff::load(root).unwrap();
+        prepared_handoff.phase = Phase::AwaitView;
+        prepared_handoff.context = handoff.context.clone();
+        prepared_handoff.successor = json!({"thread":{"id":"successor"}});
+        prepared_handoff
+            .tick(
+                root,
+                &mut connection,
+                &continued_tasks,
+                &failures,
+                &settled,
+                &BTreeSet::from(["successor".into()]),
+            )
+            .unwrap();
+        assert!(prepared_handoff.phase == Phase::Blocked);
+        let owner: Value = read_json(&root.path().join("leader.json")).unwrap();
+        assert_eq!(owner["threadId"], "lead");
+        // Completed turns can retain native terminal processes. Ownership must
+        // stay unchanged until the native inventory is conclusively empty.
+        prepared_handoff.phase = Phase::AwaitView;
+        let visible = BTreeSet::from(["successor".into()]);
+        prepared_handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &visible)
+            .unwrap();
+        let inventory: Value =
+            serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(inventory["method"], "thread/backgroundTerminals/list");
+        prepared_handoff.event(root, &mut connection, &json!({"id":inventory["id"],"result":{"data":[{"processId":"owned-terminal"}],"nextCursor":null}})).unwrap();
+        prepared_handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &visible)
+            .unwrap();
+        assert!(prepared_handoff.phase == Phase::AwaitView);
+        let owner: Value = read_json(&root.path().join("leader.json")).unwrap();
+        assert_eq!(owner["threadId"], "lead");
+        prepared_handoff.resource_poll_after = None;
+        prepared_handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &visible)
+            .unwrap();
+        let inventory: Value =
+            serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(inventory["method"], "thread/backgroundTerminals/list");
+        prepared_handoff
+            .event(
+                root,
+                &mut connection,
+                &json!({"id":inventory["id"],"result":{"data":[],"nextCursor":null}}),
+            )
+            .unwrap();
+        prepared_handoff
+            .tick(root, &mut connection, &tasks, &failures, &settled, &visible)
+            .unwrap();
+        let dispatch: Value =
+            serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(dispatch["method"], "turn/start");
+        assert_eq!(dispatch["params"]["threadId"], "successor");
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(
+            matches!(server.read(), Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+    }
+
     #[test]
     fn handoff_preserves_visible_authorization_and_effects_without_opaque_reasoning() {
         let thread = json!({"turns":[{"items":[{"type":"userMessage","content":[{"type":"text","text":"Read only. Inspect the existing result."}]},

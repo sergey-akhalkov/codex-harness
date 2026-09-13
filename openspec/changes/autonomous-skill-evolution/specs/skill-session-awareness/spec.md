@@ -20,6 +20,20 @@ The system SHALL derive a compact catalogue from effective active skill sources 
 - **WHEN** the active set cannot fit the compact delivery budget
 - **THEN** the session receives an explicit incomplete-list indication and a usable route to discover the remaining relevant entries without loading every skill body
 
+### Requirement: Measured catalogue admission budget
+
+The workflow SHALL declare and measure a catalogue budget for its owned active skills in a stated scope and unit. Admission SHALL account for the complete effective metadata of those skills before presentation truncation, including names, descriptions, paths and required delivery overhead; body/reference loading SHALL be accounted for separately when it occurs. Duplicate source entries SHALL not inflate the count, and external or protected skills SHALL remain visible as outside the editable allocation. Automatic shortening, omitted entries or moving metadata into a second always-loaded list MUST NOT be used to hide growth. Changes to applicability or descriptions SHALL pass behavioral evaluation.
+
+An addition or growth of the managed active catalogue SHALL require room in the budget or an evaluated replacement/consolidation that makes room. Catalogue pressure alone SHALL NOT authorize retirement, loss of required discovery or rewriting protected skills. If an existing baseline already exceeds the allocation, the workflow SHALL report overflow, preserve usable discovery through the bounded route, block further managed growth and permit evaluated changes that reduce the excess. Missing measurement or unsupported discovery control SHALL remain explicit and SHALL NOT count as successful bounded admission. Numeric settings SHALL be calibrated against actual delivery and task selection before automatic admission is enabled.
+
+#### Scenario: A useful candidate does not fit
+- **WHEN** a candidate passes behavioral evaluation but would grow the owned catalogue beyond its allowance
+- **THEN** activation remains pending until an evaluated change creates capacity; the budget is not raised automatically and another skill is not silently removed
+
+#### Scenario: A preexisting library exceeds the allocation
+- **WHEN** the measured owned baseline is already over budget
+- **THEN** normal skill access remains usable with explicit overflow, further growth is blocked, and only evaluated reductions can reduce the excess without destructive automatic pruning
+
 ### Requirement: Activation within the current session
 
 After an accepted creation, update, consolidation or retirement, the workflow SHALL refresh the relevant catalogue and deliver the change to the current agent before its next applicable action. The agent SHALL read the accepted skill instructions before using them and observe the current revision after updates or rollback. Both an immediate continuation in the same turn and the next matching user task SHALL work without a user-supplied skill name or restarting the session. A file write, catalogue refresh or announcement alone SHALL not count as verified activation.
@@ -35,6 +49,11 @@ After an accepted creation, update, consolidation or retirement, the workflow SH
 #### Scenario: Similar task is outside the skill's scope
 - **WHEN** a new request resembles the skill's description but falls outside its declared use
 - **THEN** the skill does not displace the applicable workflow merely because it was recently created
+
+#### Scenario: Retirement takes effect in the current session
+- **WHEN** an accepted retirement removes a skill previously loaded by a running agent
+- **THEN** before the next relevant action the agent receives the retirement and uses the evaluated remaining workflow without reading retired resources or reviving the skill from remembered metadata
+- **AND** a complete retirement claim requires observed future behavior as well as registration change; it does not claim that already loaded tokens were erased or refunded
 
 ### Requirement: Recovery after compaction and resume
 
@@ -61,6 +80,10 @@ Delegated work SHALL receive enough relevant skill identity and location informa
 #### Scenario: Child is running during an update
 - **WHEN** an affected skill changes while a child is active
 - **THEN** the child checks or receives the new revision before its next use, and any earlier result remains attributed to the revision actually used
+
+#### Scenario: A retired skill remains in a child's old context
+- **WHEN** the parent retires a skill while an affected child is still running
+- **THEN** the child reconciles the retirement before its next use and continues with the evaluated remaining workflow; prior results keep their original attribution
 
 ### Requirement: Bounded delivery and honest compatibility
 

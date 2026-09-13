@@ -7,7 +7,7 @@ Observed integration points:
 - The kit already links `.agents/skills/` through the lifecycle defined by [linked-global-kit](../../specs/linked-global-kit/spec.md) and `global/kit.psd1`. Skill resources must follow the same authoritative-source model.
 - `tests/agent-delegation.py` and `tools/delegation-usage.py` provide native execution/evidence machinery. The [delegation guide](../../../docs/agent-delegation.md) preserves verification commands and the limits of provider accounting. Include coordination overhead when comparing small tasks; do not assume delegation always saves time.
 - Automatic hooks in this research session repeatedly reported roughly 25 seconds of diagnostic work per tool. This is an observation of a bottleneck, not a controlled before/after measurement. [stabilize-diagnostic-reconciliation](../../specs/automatic-lsp-diagnostics/spec.md) already owns the repair and its correctness cases.
-- The sibling `opencode-kit` has useful command knowledge states in `docs/adapters.md` and `templates/project/validation.md`, focused script tests, and a read-only Git snapshot helper. Its dirty checkout must be preserved. The snapshot helper needs its own exit-status and UTF-8 byte-limit review before reuse.
+- The original source-kit consumer has useful command knowledge states in `docs/adapters.md` and `templates/project/validation.md`, focused script tests, and a read-only Git snapshot helper. Its dirty checkout must be preserved. The snapshot helper needs its own exit-status and UTF-8 byte-limit review before reuse.
 - Browser automation is already available through Nuphus. A new browser integration needs evidence of additional value; availability of Playwright alone is insufficient.
 
 ### Evidence informing the selection
@@ -52,7 +52,7 @@ Create `.agents/skills/project-verification/SKILL.md` and `.agents/skills/reprod
 
 Command records carry command, cwd, preparation/runtime/build identity, provenance, knowledge state, last execution and evidence scope. `confirmed` means previously exercised under recorded conditions; it is not proof of the present change. Relevant manifest, lockfile, runtime or generated-input changes invalidate assumptions. A cheap relevant fingerprint is sufficient; hashing every file before every tool would recreate the observed bottleneck. Instructions in a discovered document do not authorize destructive or external effects.
 
-Alternative rejected: always append a long verification checklist to global instructions. It creates irrelevant context and duplicates each project's contract. The local `opencode-kit` state vocabulary is reused as a concept, without importing its entire template system.
+Alternative rejected: always append a long verification checklist to global instructions. It creates irrelevant context and duplicates each project's contract. The command-state vocabulary from the original source-kit consumer is reused as a concept, without importing its entire template system.
 
 ### 2. Preserve the failure and own the test resources
 
@@ -70,17 +70,17 @@ Each attempt records case/revision, arm, actual discovered skills, model/effort/
 
 Both arms start from equivalent isolated project state. Baseline does not see candidate skill registrations or validation records produced by candidate runs. Candidate receives the skills through source links in the normal lifecycle, not injected file paths in the prompt. Other existing project instructions and skills stay equivalent. Separate cold discovery from reuse of a previously confirmed record; do not mix cache policies within a comparison.
 
-OpenAI assignments use the Astra family under current policy; the named middle remains the preferred Grok subscription when bounded delegation helps. Availability failures remain visible. No model substitution or paid fallback is part of the experiment. All relevant attempts and children contribute to the accepted-result account, but overlapping durations are not summed as elapsed time. Missing usage is unknown; tokens do not measure exact weekly quota savings.
+OpenAI assignments use the Astra family under current policy; delegated assignments follow the current [selection and visibility rules](../../../docs/agent-delegation.md), with comparable model/effort bindings held explicit across experiment arms. Availability failures remain visible. No model substitution or paid fallback is part of the experiment. All relevant attempts and children contribute to the accepted-result account, but overlapping durations are not summed as elapsed time. Missing usage is unknown; tokens do not measure exact weekly quota savings.
 
 ### 4. Fixed small case catalogue and practical benefit criterion
 
-The eight cases below record the original experiment. On 2026-09-08 the user withdrew ongoing opencode-kit support and further spending on it; case 1 and its completed runs are historical, with no further opencode-kit run required. This overrides the original consumer selection and repetition plan below. Whether to retain the two-consumer quantitative benchmark using another project is awaiting the user's decision; the practical threshold has not been lowered and benefit remains unproven.
+The eight cases below record the original experiment. On 2026-09-08 the user withdrew ongoing support for the original source-kit consumer and further spending on it; case 1 and its completed runs are historical, with no further run of the original source-kit consumer required. This overrides the original consumer selection and repetition plan below. Whether to retain the two-consumer quantitative benchmark using another project is awaiting the user's decision; the practical threshold has not been lowered and benefit remains unproven.
 
-Native positive/negative activation is part of the case evidence, but the acceptance oracle checks real outputs and behavior. Supporting deterministic fixture tests do not substitute for native outcome cases. The delivered skills and their resources use this harness without a dependency on the sibling opencode-kit checkout.
+Native positive/negative activation is part of the case evidence, but the acceptance oracle checks real outputs and behavior. Supporting deterministic fixture tests do not substitute for native outcome cases. The delivered skills and their resources use this harness without a dependency on the original source-kit consumer checkout.
 
 | Case | Task and correctness oracle | Evidence purpose |
 | --- | --- | --- |
-| 1. Native focused command | In isolated `opencode-kit`, discover and exercise its focused library validation entry, preserving documented prerequisites and a known expected result. | Real project discovery and first useful signal. |
+| 1. Native focused command | In an isolated copy of the original source-kit consumer, discover and exercise its focused library validation entry, preserving documented prerequisites and a known expected result. | Real project discovery and first useful signal. |
 | 2. Second project command | In a second real project, discover and exercise its native validation command with an intentionally bounded task. | Portability; a lint-only path supports only lint claims. |
 | 3. Freshness | Change a relevant command/build input after a prior confirmed record; correctly invalidate and revalidate. | Avoid stale command knowledge. |
 | 4. Actual entry point | A controlled fixture has source and generated/executable state that disagree; the agent identifies and exercises the intended state. | Catch false passing verification. |
@@ -89,7 +89,7 @@ Native positive/negative activation is part of the case evidence, but the accept
 | 7. Missing prerequisite | A required tool or reference is unavailable in controlled case state. | Explicit blocked evidence and no invented success. |
 | 8. Negative activation | A trivial documentation task with ordinary link/syntax validation. | No automatic expensive workflow or model-evaluation recursion. |
 
-The first consumer candidate is the sibling `opencode-kit`; `npm run test:focused:library` was identified in its package metadata, not executed during planning. Its dirty source is a reason for isolation, not for reset/cleanup. The second candidate is `team-control` through its native lint entry. Its role is deliberately limited to validation-command portability until an actual behavioral check is demonstrated. `time-report-generator` was not selected by the bounded feasibility inspection. Consumer commands remain docs-only until execution confirms them.
+The first consumer candidate is the original source-kit consumer; `npm run test:focused:library` was identified in its package metadata, not executed during planning. Its dirty source is a reason for isolation, not for reset/cleanup. The second real consumer uses its native lint entry. Its role is deliberately limited to validation-command portability until an actual behavioral check is demonstrated. Consumer commands remain docs-only until execution confirms them.
 
 At implementation start, freeze exact project snapshots, each case's expected result, environment/budget and meaningful-effect threshold before seeing candidate results. A measured baseline determines a sensible absolute floor and relative threshold; record the rationale and never lower it after seeing results. This is calibration of the experiment, not deferral of scope or permission to drop difficult cases. If a proposed consumer is unavailable, select another existing project satisfying the same acceptance; a synthetic fixture cannot replace the two real consumers.
 
@@ -105,7 +105,7 @@ Before/after hook measurements pin the same project workload, skill configuratio
 
 Skill comparisons run on the same accepted capability selection in both arms: the durable hooks-off default now owned by `reduce-subscription-waste`. Completed stabilized-hook comparisons remain historical evidence, not a restoration prerequisite. Any future candidate hook comparison is isolated and cannot reactivate the global configuration. A report must not attribute combined gains entirely to skills. Applicable consuming-task checks remain required; silence does not establish diagnostic correctness.
 
-The accepted capability selection also keeps Fast off, native memories off, CBM automatic index/watch off, and OpenAI assignments Astra-only. The remaining quantitative decision is whether to retain a two-consumer benefit benchmark after opencode-kit support was withdrawn; that decision is pending and does not authorize further opencode-kit runs.
+The accepted capability selection also keeps Fast off, native memories off, CBM automatic index/watch off, and OpenAI assignments Astra-only. The remaining quantitative decision is whether to retain a two-consumer benefit benchmark after support for the original source-kit consumer was withdrawn; that decision is pending and does not authorize further runs of the original source-kit consumer.
 
 ### 6. Global delivery is an actual consumer test
 
@@ -118,7 +118,7 @@ Then start fresh ordinary native Codex sessions outside the harness in recorded 
 | Candidate | Evidence needed before a separate proposal | Why it is outside this delivery |
 | --- | --- | --- |
 | [Playwright CLI and skills](https://github.com/microsoft/playwright-cli) | Repeated web tasks where CLI snapshots, traces or CI reproduction improve total verified outcome over the installed browser capability. | Nuphus already provides browser access; no local comparative bottleneck was established. |
-| `opencode-kit` Git snapshot helper | Repeated measured Git context-gathering overhead, correct failure handling and actual UTF-8 output bounds, followed by an outcome comparison. | Useful candidate, but directly copying the current helper would import unverified edge cases. |
+| Git snapshot helper from the original source-kit consumer | Repeated measured Git context-gathering overhead, correct failure handling and actual UTF-8 output bounds, followed by an outcome comparison. | Useful candidate, but directly copying the current helper would import unverified edge cases. |
 | More domain skills / a compact versioned docs index | A recurring task cluster, observed knowledge or activation failures, and outcome cases showing a focused intervention helps. | The current evidence does not support a large universal catalogue. |
 | Property testing or deterministic simulation infrastructure | Repeated state/interleaving defects that smaller deterministic or differential cases cannot economically expose. | The focused fixtures and regression workflow provide a smaller current path. |
 

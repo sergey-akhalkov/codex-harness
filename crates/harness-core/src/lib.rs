@@ -98,13 +98,22 @@ pub mod source_observation;
 #[cfg(windows)]
 pub mod subscription_lifecycle;
 #[cfg(windows)]
+pub mod task_admission;
+#[cfg(windows)]
 pub mod task_arguments;
+#[cfg(windows)]
+mod task_child_views;
 pub mod task_control;
 pub mod task_failure;
+#[cfg(windows)]
+pub mod task_forward;
+#[cfg(windows)]
+pub mod task_gateway;
 #[cfg(windows)]
 mod task_handoff;
 #[cfg(windows)]
 mod task_observer;
+pub mod task_request;
 #[cfg(windows)]
 pub mod task_runtime;
 #[cfg(windows)]

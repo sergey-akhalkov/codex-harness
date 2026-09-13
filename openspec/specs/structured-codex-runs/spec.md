@@ -32,7 +32,7 @@ A run SHALL be accepted only when it terminates naturally with a successful proc
 
 ### Requirement: Deliberate model routing
 
-OpenAI assignments SHALL use the Astra family only. The workflow SHALL preserve Grok as the preferred middle for suitable delegated work, but MUST NOT assume a route supports native schema enforcement without evidence. An unsupported route SHALL be reported; reassignment SHALL follow the established capability policy with visible model and subscription identity and no silent billing fallback.
+OpenAI assignments SHALL use the Astra family only. The workflow SHALL follow the model-selection and recovery contract owned by [agent delegation](../agent-delegation/spec.md#requirements), but MUST NOT assume a route supports native schema enforcement without evidence. An unsupported route SHALL be reported; reassignment SHALL follow the established capability policy with visible model and subscription identity and no silent billing fallback.
 
 #### Scenario: External route does not honor the output contract
 - **WHEN** the chosen external route rejects or ignores the schema contract

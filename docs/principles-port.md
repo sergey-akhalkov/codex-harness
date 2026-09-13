@@ -33,6 +33,37 @@ Official alignment used [model guidance](https://developers.openai.com/api/docs/
 [subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents).
 Detailed source-kit process labels were not copied into the standing text.
 
+## Astra instruction adaptation
+
+The 2026-09-13 adaptation uses [Astra guidance](https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra),
+[skill and prompt guidance](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra)
+and [skill discovery](https://learn.chatgpt.com/docs/build-skills). The
+[owning change](../openspec/changes/archive/2026-09-13-align-instructions-with-astra-guidance/design.md)
+records the broader source audit and observed behavioral acceptance. These
+edits do not establish perfect obedience or a measured efficiency improvement.
+
+| Standing principle owner | Disposition and preserved constraint |
+| --- | --- |
+| Opening delivery principle; Outcome and completion | Retained: an early usable result does not close unfinished requirements. |
+| Language and shell defaults | Consolidated: Rust and PowerShell remain defaults for main and delegated work; concrete exceptions require explanation and do not authorize migration. |
+| Mandatory skill use | Consolidated: every applicable nonredundant skill remains required, including named skills within scope; metadata routes selection and supporting detail loads only when needed. |
+| MCP tool selection | Retained: actual tool context, source coverage, bounded retrieval, current evidence and fallback constraints remain necessary. |
+| Everyday use and design discovery | Retained: establish ordinary use, distinguish requirements from mechanisms and resolve consequential unknowns without questionnaires for routine decisions. |
+| Quality and evidence | Adapted: preserve required checks and real execution evidence; additional tests and review follow concrete risk, with no new test merely mirroring a minor wording edit. |
+| Autonomy and authority | Adapted: action requests lead to completion, steering preserves unfinished work and pending clarification permits independent progress. Existing authority and external workflow boundaries remain binding. |
+| Simplicity and reuse | Adapted: research remains required for substantive decisions; example tools, languages, approvals and test counts apply only under their documented conditions. Reuse, dependency trust and supported behavior remain binding. |
+| Working environment before implementation | Adapted: verify setup before dependent code work; a documentation correction does not require unrelated language or graph preparation. Restore relevant broken setup and reuse valid checks. |
+| Speed, feedback, and recovery | Retained: investigate the original failure, preserve recovery and complete parent acceptance; no arbitrary retry count or inferred performance gain. |
+| Publication boundaries and documentation | Retained: public portability, one authoritative home and preservation of necessary unresolved evidence. |
+| Context and collaboration | Adapted communication only: plain outcome-led prose and useful lists. Existing scoped retrieval, delegation ownership, durable memory, untrusted-input and evidence obligations remain. |
+
+The repository's `AGENTS.md` routes documentation corrections to their applicable
+checks and uses the documentation map only when route discovery is needed.
+Externally maintained OpenSpec instructions are protected, including their
+confirmation rules; this adaptation does not override them. Installed provider
+routing and simultaneous conversation visibility remain separate binding
+configuration contracts in the [delegation guide](agent-delegation.md).
+
 ## Completeness
 
 All 38 named source principles were accounted for in the working text:

@@ -1,6 +1,6 @@
 ---
 name: token-efficient-workflow
-description: Use the installed RTK and Code Mode workflow when verbose tool output, repeated retrieval or task-effort selection is a meaningful cost in coding work. Covers raw recovery and native task boundaries; ordinary short edits need no extra workflow.
+description: Use installed RTK and Code Mode when bulky results, repeated retrieval, preparation or waits materially impede coding work. Skip ordinary short edits.
 ---
 
 # Token-efficient workflow
@@ -9,15 +9,13 @@ Optimize the total time and context needed for the accepted result, including ch
 
 ## Shell output
 
-For verbose native commands, use `harness-rtk.exe exec git log -n 80` (or `git status --short`, `rg -n`, `pytest`, `python -m pytest`, `uv run pytest`, `cargo test` with supported human-output options). The accepted hook changes only this entry mode to `compact`; the adapter filters eligible stdout after executing the native program once. It forwards actual arguments, cwd, environment, stdin, stderr and exit status. It intentionally selects a native executable, so use ordinary shell calls for shell functions/aliases. Codex omits the chosen shell from hook input; ordinary commands are therefore unchanged. Never retry to satisfy a hook. Automatic diagnostics and Stop hooks remain inactive.
-
-A compressed result includes an `rtk raw` file locator. Inspect retained stdout when omitted details matter, without executing the command again. Storage keeps up to 32 captures of at most 4 MiB each; larger output passes raw. A locator is local evidence, not a durable report. For exact source, a final review diff, machine output or an exhaustive search, use the original command without the prefix. `HARNESS_RTK_DISABLE=1` bypasses compression; an already explicit `compact` call is never rewritten. Interactive output and unsupported actual arguments pass raw. Do not infer complete coverage from a shortened list. A filter failure leaves raw output usable with a diagnostic.
-
-Use RTK's broader explicit commands only when their runner/format behavior fits the task. In particular, keep the selected Python/uv environment. `rtk gain` uses estimates; it is not a measure of session or subscription savings.
+For verbose supported commands, read [RTK execution and raw recovery](references/shell-output.md). Use ordinary native commands for exact source, final diffs and exhaustive/machine output. Preserve process errors and raw detail; compression does not establish subscription savings.
 
 ## Code Mode and source work
 
 Use the available `functions.exec` host to orchestrate worthwhile independent calls and select relevant data before returning it to model context. Discover only the needed tool contracts. Await independent calls with `Promise.allSettled`, inspect each outcome and return failures/incomplete coverage with useful detail locators. Keep dependent reads, mutations and approvals sequential. Preserve `isError` and nonzero process exits even in fulfilled promises; do not rely on output truncation as a filter. Store large intermediate results inside Code Mode only when a later step needs them; return images using their image helper.
+
+For mixed or oversized answers, use [result handling](references/tool-results.md): choose one representation, keep failure and coverage information, and retrieve retained details without repeating effects. For browser sequences or connected resources, use [browser and App routes](references/browser-and-apps.md); inspect the intended target and stop a batch at the next decision point.
 
 For code, first verify the MCP project root. Start with Serena for known-file symbols, exact references and suitable edits; use the selected graph provider for compact discovery and relationships when that saves several reads. A task does not require both tools. Reuse verified unchanged results; CBM still needs explicit refresh, while a selected CodeGraph may use a completed bounded watcher/catch-up update. Pending, failed or partial coverage requires current semantic/source evidence. See [code retrieval](references/code-retrieval.md) for measured starting limits, CodeGraph output traps and detail recovery; load it when choosing between these tools or handling a bulky result.
 
@@ -25,9 +23,7 @@ Prefer native `apply_patch` for bounded text edits. Use semantic edits or determ
 
 ## Repeated preparation and sessions
 
-When repeated setup or feedback dominates the task, first isolate the uncertainty into a smaller verifiable result. Then compare the cost of reusing preparation, an owned session or an existing helper against the remaining repetitions, including integration, verification and recovery. Separate preparation from replay where that helps: learn the required interactions and their return paths in the same valid session, and promote repeatable actions into their existing owner. Do not build a general automation layer for a short one-off task.
-
-Reuse requires current relevant inputs and runtime conditions. After interruption, a changed build/configuration/input or an ended session, re-establish affected preconditions and checks while preserving unaffected knowledge. Keep commands, validity conditions and useful findings in the project's existing memory home, with private state and evidence outside shared sources. Fewer full runs or smaller output alone do not prove faster completion; count preparation, worker coordination, waiting, integration and rework, and count overlapping elapsed time once. A local helper pass leaves parent acceptance pending until its result is consumed and checked.
+When setup, repeated work or waits dominate, read [prepared-session reuse](references/session-reuse.md). Reuse only valid owned state and complete the parent acceptance. The project-verification skill owns check selection and failure attribution; no general helper is needed merely because a task has several steps.
 
 ## Reasoning at task boundaries
 

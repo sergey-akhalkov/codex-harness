@@ -1,12 +1,12 @@
 ## 1. Freeze comparable acceptance inputs
 
-Scope clarification, 2026-09-08: no further opencode-kit run or ongoing support
+Scope clarification, 2026-09-08: no further run of the original source-kit consumer or ongoing support
 is required. Completed evidence is retained. Tasks 5.3, 5.4 and 6.4 remain open;
 the remaining quantitative acceptance scope is awaiting the user's decision.
 
 - [x] 1.1 Define the eight outcome cases from the design with exact inputs, correctness oracles, allowed effects, environment/budget, cache policy and predeclared practical-effect criteria; verify every case maps to a specification requirement and that no criterion depends on candidate results.
 - [x] 1.2 Preserve reproducible pre-repair diagnostic source/executable identity and controlled workloads without touching the active diagnostic change; verify the unchanged-tree, single-edit and concurrent-work baselines can be reconstructed from the recorded inputs.
-- [x] 1.3 Prepare isolated recorded states of `opencode-kit` and the second real consumer, confirm their native command prerequisites and select the concrete external process regression; verify source checkouts and live services remain unchanged, commands have explicit knowledge states, and the regression has a fixed original failure condition.
+- [x] 1.3 Prepare isolated recorded states of the original source-kit consumer and the second real consumer, confirm their native command prerequisites and select the concrete external process regression; verify source checkouts and live services remain unchanged, commands have explicit knowledge states, and the regression has a fixed original failure condition.
 
 ## 2. Deliver the focused skill sources
 

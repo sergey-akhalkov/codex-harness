@@ -1,0 +1,202 @@
+//! Name native child conversations and queue their own windows before admission.
+use crate::{
+    broker_state::BrokerRoot,
+    task_control::ControlConnection,
+    task_runtime::{read_json, save},
+};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    time::Duration,
+};
+
+#[derive(Default)]
+pub(crate) struct ChildViews {
+    pending: BTreeMap<String, Value>,
+    requested: BTreeMap<String, Value>,
+    waiting: BTreeSet<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn out_of_order_names_keep_two_distinct_owned_windows_and_ignore_helpers() {
+        let owned = BrokerRoot::prepare().unwrap();
+        let root = owned.root();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            std::thread::spawn(move || tungstenite::accept(listener.accept().unwrap().0).unwrap());
+        let mut connection =
+            ControlConnection::connect(port, &"a".repeat(64), Duration::from_secs(2)).unwrap();
+        let mut server = server.join().unwrap();
+        server
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let tasks = BTreeMap::from([
+            ("lead".into(), json!({"ephemeral":false})),
+            (
+                "a".into(),
+                json!({"ephemeral":false,"parentThreadId":"lead"}),
+            ),
+            (
+                "b".into(),
+                json!({"ephemeral":false,"parentThreadId":"lead"}),
+            ),
+            (
+                "helper".into(),
+                json!({"ephemeral":true,"parentThreadId":"lead"}),
+            ),
+            (
+                "orphan".into(),
+                json!({"ephemeral":false,"parentThreadId":"unknown"}),
+            ),
+        ]);
+        let mut views = ChildViews::load(root).unwrap();
+        views.tick(root, &mut connection, &tasks).unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let request: Value =
+                serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "thread/name/set");
+            replies.push(json!({"id":request["id"],"result":{}}));
+        }
+        assert!(!root.path().join("child-view-requests.json").exists());
+        for reply in replies.into_iter().rev() {
+            views.event(root, &reply).unwrap();
+        }
+        let reloaded = ChildViews::load(root).unwrap();
+        assert_eq!(reloaded.requested.len(), 2);
+        assert_eq!(reloaded.requested["a"]["slot"], 1);
+        assert_eq!(reloaded.requested["b"]["slot"], 2);
+        assert!(!reloaded.awaiting_first_view("helper"));
+        let mut over_capacity = tasks;
+        over_capacity.insert(
+            "c".into(),
+            json!({"ephemeral":false,"parentThreadId":"lead"}),
+        );
+        views.tick(root, &mut connection, &over_capacity).unwrap();
+        views.tick(root, &mut connection, &over_capacity).unwrap();
+        assert!(views.awaiting_first_view("c"));
+        assert_eq!(views.requested, reloaded.requested);
+        assert!(views.pending.is_empty());
+        let capacity: Value = read_json(&root.path().join("child-view-capacity.json")).unwrap();
+        assert_eq!(capacity["waiting"], json!(["c"]));
+        assert!(ChildViews::load(root).unwrap().awaiting_first_view("c"));
+        // No third naming request was sent; existing native control remains usable.
+        connection
+            .send(
+                &json!({"id":"still-connected","method":"owned/probe"}),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        let next: Value = serde_json::from_str(server.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(next["id"], "still-connected");
+        over_capacity.remove("c");
+        views.tick(root, &mut connection, &over_capacity).unwrap();
+        assert!(!views.awaiting_first_view("c"));
+        let capacity: Value = read_json(&root.path().join("child-view-capacity.json")).unwrap();
+        assert_eq!(capacity["waiting"], json!([]));
+    }
+}
+
+impl ChildViews {
+    pub(crate) fn load(root: &BrokerRoot) -> io::Result<Self> {
+        let requested = match read_json(&root.path().join("child-view-requests.json")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error),
+        };
+        let waiting = match read_json::<Value>(&root.path().join("child-view-capacity.json")) {
+            Ok(value) => serde_json::from_value(value["waiting"].clone())?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            requested,
+            pending: BTreeMap::new(),
+            waiting,
+        })
+    }
+
+    pub(crate) fn event(&mut self, root: &BrokerRoot, event: &Value) -> io::Result<Option<String>> {
+        let Some(id) = event["id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("child-view:"))
+        else {
+            return Ok(None);
+        };
+        let Some(request) = self.pending.remove(id) else {
+            return Ok(None);
+        };
+        if event.get("error").is_some() {
+            save(&root.path().join("child-view-error.json"), event)?;
+            return Err(io::Error::other(
+                "native executor conversation could not be named",
+            ));
+        }
+        self.requested.insert(id.to_owned(), request);
+        save(
+            &root.path().join("child-view-requests.json"),
+            &json!(self.requested),
+        )?;
+        Ok(Some(id.to_owned()))
+    }
+
+    pub(crate) fn tick(
+        &mut self,
+        root: &BrokerRoot,
+        connection: &mut ControlConnection,
+        tasks: &BTreeMap<String, Value>,
+    ) -> io::Result<()> {
+        let mut waiting = BTreeSet::new();
+        for (id, task) in tasks {
+            let parent = if task["pendingNativeRead"] == true {
+                task["discoveredParent"].as_str()
+            } else if task["ephemeral"] == false {
+                task["parentThreadId"].as_str()
+            } else {
+                None
+            };
+            if self.requested.contains_key(id)
+                || self.pending.contains_key(id)
+                || !parent.is_some_and(|parent| tasks.contains_key(parent))
+            {
+                continue;
+            }
+            let used: BTreeSet<u64> = self
+                .requested
+                .values()
+                .chain(self.pending.values())
+                .filter_map(|value| value["slot"].as_u64())
+                .collect();
+            let Some(slot) = (1..=2).find(|slot| !used.contains(slot)) else {
+                waiting.insert(id.clone());
+                continue;
+            };
+            let title = format!("Executor {slot}");
+            connection.send(&json!({"id":format!("child-view:{id}"),"method":"thread/name/set","params":{"threadId":id,"name":title}}), Duration::from_secs(5))?;
+            self.pending.insert(
+                id.clone(),
+                json!({"schema":1,"threadId":id,"title":title,"slot":slot}),
+            );
+        }
+        if waiting != self.waiting {
+            save(
+                &root.path().join("child-view-capacity.json"),
+                &json!({"schema":1,"waiting":waiting,"reason":"executor view capacity requires reconciliation"}),
+            )?;
+            self.waiting = waiting;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn awaiting_first_view(&self, id: &str) -> bool {
+        self.pending.contains_key(id)
+            || self.requested.contains_key(id)
+            || self.waiting.contains(id)
+    }
+}

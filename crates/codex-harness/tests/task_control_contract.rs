@@ -153,9 +153,13 @@ fn native_two_clients_reconnect_tool_result_and_tui() {
         server,
     } = native_fixture(false);
     let root = owned_root.path();
+    let routed = root.join("routed");
+    fs::create_dir(&routed).unwrap();
+    let routed_responses = control_responses::Responses::start(routed.clone(), false);
     let mut first = Client::connect(port, &token, root, "first");
     let mut observer = Client::connect(port, &token, root, "observer");
-    let started = first.request("thread/start", json!({"cwd":workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access"}));
+    let started = first.request("thread/start", json!({"cwd":workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access",
+        "config":{"model_providers.control_fixture.base_url":format!("http://127.0.0.1:{}/v1", routed_responses.port)}}));
     assert_eq!(started["model"], "gpt-6-astra");
     assert_eq!(started["modelProvider"], "control_fixture");
     let parent = started["thread"]["id"].as_str().unwrap();
@@ -237,6 +241,27 @@ fn native_two_clients_reconnect_tool_result_and_tui() {
         json!({"threadId":thread,"includeTurns":true}),
     );
     assert!(saved.to_string().contains(control_responses::FINAL));
+    let mut routed_threads = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(&routed).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("provider-") {
+            let request: Value = serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
+            routed_threads.insert(
+                harness_core::task_request::RequestIdentity::from_request(&request)
+                    .unwrap()
+                    .thread,
+            );
+        }
+    }
+    assert!(routed_threads.contains(parent));
+    assert!(
+        routed_threads.contains(thread),
+        "native child must inherit its parent's route override"
+    );
+    assert!(
+        !root.join("provider-1.json").exists(),
+        "parent or child bypassed the selected route"
+    );
     assert_eq!(
         third.request("thread/goal/get", json!({"threadId":parent}))["goal"]["status"],
         "paused"
@@ -475,7 +500,242 @@ fn native_visible_chats_before_model_dispatch() {
     drop(native_views);
 }
 
+#[test]
+#[ignore = "requires explicit native CLI; synthetic Responses and owned background command"]
+fn native_background_terminal_outlives_completed_turn() {
+    let fixture = native_fixture_with_background(true, true);
+    let root = fixture.root.path();
+    let mut owner = Client::connect(fixture.port, &fixture.token, root, "background-owner");
+    let started = owner.request("thread/start", json!({"cwd":fixture.workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access"}));
+    let id = started["thread"]["id"].as_str().unwrap();
+    owner.request(
+        "thread/name/set",
+        json!({"threadId":id,"name":"Owned background terminal contract"}),
+    );
+    owner.request("turn/start", json!({"threadId":id,"input":[{"type":"text","text":"Perform the owned proof command and return its consumed result."}]}));
+    let completed = owner
+        .event(|event| event["method"] == "turn/completed" && event["params"]["threadId"] == id);
+    assert_eq!(completed["params"]["turn"]["status"], "completed");
+    let running = owner.request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId":id,"limit":5}),
+    );
+    fs::write(
+        root.join("background-running.json"),
+        serde_json::to_vec_pretty(&running).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        running["data"].as_array().unwrap().len(),
+        1,
+        "completed turn must not hide its running terminal: {running}"
+    );
+    assert!(running["nextCursor"].is_null());
+    assert!(
+        running["data"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("finish-tool")
+    );
+    assert!(running["data"][0]["processId"].is_string());
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    fs::write(
+        fixture.workspace.join("finish-tool"),
+        "release owned command",
+    )
+    .unwrap();
+    let until = Instant::now() + WAIT;
+    let finished = loop {
+        let snapshot = owner.request(
+            "thread/backgroundTerminals/list",
+            json!({"threadId":id,"limit":5}),
+        );
+        if snapshot["data"].as_array().unwrap().is_empty() && snapshot["nextCursor"].is_null() {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < until,
+            "owned terminal did not leave native inventory: {snapshot}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        !root.join("provider-3.json").exists(),
+        "terminal inventory must not call a model"
+    );
+    fs::write(root.join("background-terminal-result.json"), serde_json::to_vec_pretty(&json!({"threadId":id,"completedTurnStillOwnedTerminal":true,"finished":finished,"providerRequests":2})).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "requires explicit native CLI; owned image and synthetic Responses"]
+fn native_deferred_image_input_reaches_provider() {
+    let fixture = native_fixture(true);
+    let root = fixture.root.path();
+    // Owned 2x2 RGBA fixture, generated from four solid colors. No image package
+    // or external asset is needed to exercise the native localImage contract.
+    let png: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
+        0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 1, 115, 82, 71, 66, 0, 174, 206, 28, 233, 0, 0, 0, 4,
+        103, 65, 77, 65, 0, 0, 177, 143, 11, 252, 97, 5, 0, 0, 0, 9, 112, 72, 89, 115, 0, 0, 14,
+        195, 0, 0, 14, 195, 1, 199, 111, 168, 100, 0, 0, 0, 23, 73, 68, 65, 84, 24, 87, 99, 248,
+        207, 192, 240, 159, 161, 129, 225, 63, 3, 3, 195, 127, 48, 0, 0, 67, 212, 9, 120, 78, 84,
+        157, 149, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let image_name = "owned image контроль.png";
+    fs::write(fixture.workspace.join(image_name), png).unwrap();
+    let text = "Inspect the attached owned image.\nPerform the owned proof command and return its consumed result.";
+    let arguments = ["-i", image_name, "--", text].map(Into::into);
+    let planned = harness_core::task_arguments::plan(&arguments, &fixture.workspace)
+        .unwrap()
+        .unwrap();
+    assert!(planned.waiting_attachment.is_empty());
+    let input = planned.initial_input.unwrap();
+    let mut parts = vec![json!({"type":"text","text":input.text})];
+    parts.extend(
+        input
+            .images
+            .into_iter()
+            .map(|path| json!({"type":"localImage","path":path})),
+    );
+    let mut owner = Client::connect(fixture.port, &fixture.token, root, "image-owner");
+    let started = owner.request("thread/start", json!({"cwd":fixture.workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access"}));
+    let id = started["thread"]["id"].as_str().unwrap();
+    owner.request(
+        "thread/name/set",
+        json!({"threadId":id,"name":"Owned image input contract"}),
+    );
+    owner.request("turn/start", json!({"threadId":id,"input":parts}));
+    let completed = owner
+        .event(|event| event["method"] == "turn/completed" && event["params"]["threadId"] == id);
+    assert_eq!(completed["params"]["turn"]["status"], "completed");
+    let request: Value =
+        serde_json::from_slice(&fs::read(root.join("provider-1.json")).unwrap()).unwrap();
+    let content: Vec<_> = request["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .collect();
+    assert!(
+        content
+            .iter()
+            .any(|part| part["type"] == "input_text" && part["text"] == text)
+    );
+    assert!(
+        content.iter().any(|part| part["type"] == "input_image"
+            && part["image_url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,") && url.len() > 30)),
+        "image bytes must reach the provider, not only a local path"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    assert!(!root.join("provider-3.json").exists());
+    fs::write(root.join("image-input-result.json"), serde_json::to_vec_pretty(&json!({"threadId":id,"multilineTextPreserved":true,"localImageDelivered":true,"providerRequests":2,"toolEffect":"one"})).unwrap()).unwrap();
+}
+
 fn native_fixture(direct: bool) -> NativeFixture {
+    native_fixture_with_background(direct, false)
+}
+
+fn native_fixture_with_background(direct: bool, background: bool) -> NativeFixture {
+    native_fixture_with_arguments(direct, background, &[])
+}
+
+#[test]
+#[ignore = "requires explicit native Codex executable; owned state only"]
+fn native_provider_address_override_preserves_binding() {
+    let fixture = native_fixture_with_arguments(
+        true,
+        false,
+        &[
+            "-c",
+            "model_providers.control_fixture.base_url=\"http://127.0.0.1:9/gated/v1\"",
+        ],
+    );
+    let root = fixture.root.path();
+    let original = fs::read(fixture.home.join("config.toml")).unwrap();
+    let mut client = Client::connect(fixture.port, &fixture.token, root, "route-config");
+    let config = client.request("config/read", json!({"includeLayers":true}));
+    fs::write(
+        root.join("route-config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let provider = &config["config"]["model_providers"]["control_fixture"];
+    assert_eq!(provider["base_url"], "http://127.0.0.1:9/gated/v1");
+    assert_eq!(provider["env_key"], "HARNESS_CONTROL_FIXTURE_KEY");
+    assert_eq!(provider["requires_openai_auth"], false);
+    assert_eq!(provider["wire_api"], "responses");
+    assert_eq!(config["config"]["model_provider"], "control_fixture");
+    let thread = client.request(
+        "thread/start",
+        json!({"cwd":fixture.workspace,"allowProviderModelFallback":false}),
+    );
+    assert_eq!(thread["modelProvider"], "control_fixture");
+    assert_eq!(thread["model"], "gpt-6-astra");
+    assert_eq!(
+        fs::read(fixture.home.join("config.toml")).unwrap(),
+        original
+    );
+    assert!(!root.join("provider-1.json").exists());
+    fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+#[ignore = "requires explicit native Codex executable; synthetic Responses only"]
+fn native_thread_route_override_reaches_only_selected_upstream() {
+    let fixture = native_fixture(true);
+    let root = fixture.root.path();
+    let routed = root.join("routed");
+    fs::create_dir(&routed).unwrap();
+    let upstream = control_responses::Responses::start(routed.clone(), true);
+    let original = fs::read(fixture.home.join("config.toml")).unwrap();
+    let mut client = Client::connect(fixture.port, &fixture.token, root, "thread-route");
+    let started = client.request("thread/start", json!({
+        "cwd":fixture.workspace,
+        "allowProviderModelFallback":false,
+        "config":{"model_providers.control_fixture.base_url":format!("http://127.0.0.1:{}/v1", upstream.port)}
+    }));
+    assert_eq!(started["modelProvider"], "control_fixture");
+    assert_eq!(started["model"], "gpt-6-astra");
+    let id = started["thread"]["id"].as_str().unwrap();
+    client.request(
+        "thread/name/set",
+        json!({"threadId":id,"name":"Owned route attachment contract"}),
+    );
+    let attached = client.request("thread/resume", json!({"threadId":id}));
+    assert_eq!(attached["thread"]["id"], id);
+    assert_eq!(attached["modelProvider"], started["modelProvider"]);
+    client.request("turn/start", json!({"threadId":id,"input":[{"type":"text","text":"Perform the owned proof command and return its consumed result."}]}));
+    let completed = client
+        .event(|event| event["method"] == "turn/completed" && event["params"]["threadId"] == id);
+    assert_eq!(completed["params"]["turn"]["status"], "completed");
+    assert!(routed.join("provider-1.json").exists());
+    assert!(routed.join("provider-2.json").exists());
+    assert!(!routed.join("provider-3.json").exists());
+    assert!(!root.join("provider-1.json").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        fs::read(fixture.home.join("config.toml")).unwrap(),
+        original
+    );
+}
+
+fn native_fixture_with_arguments(
+    direct: bool,
+    background: bool,
+    arguments: &[&str],
+) -> NativeFixture {
     let exe = PathBuf::from(
         std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
     );
@@ -503,7 +763,11 @@ fn native_fixture(direct: bool) -> NativeFixture {
         ],
         "schema",
     );
-    let responses = control_responses::Responses::start(root.into(), direct);
+    let responses = if background {
+        control_responses::Responses::with_background_terminal(root.into())
+    } else {
+        control_responses::Responses::start(root.into(), direct)
+    };
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
     fs::write(
         home.join("config.toml"),
@@ -554,6 +818,7 @@ trust_level = "trusted"
         "--ws-token-file".into(),
         root.join("ws-token").into_os_string(),
     ];
+    spec.args.extend(arguments.iter().map(Into::into));
     spec.stdout = Some(fs::File::create(root.join("server-stdout.txt")).unwrap());
     spec.stderr = Some(fs::File::create(root.join("server-stderr.txt")).unwrap());
     let job = Job::new(Limits {

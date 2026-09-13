@@ -40,7 +40,7 @@ An explicit kit install/update operation SHALL check official release or package
 
 ### Requirement: Reproducible provisioning of missing dependencies
 
-The kit SHALL declare the acquisition source, version policy, runtime prerequisites, language mapping and verification method for every selected dependency. Missing MCPs and required language servers SHALL be provisionable through the kit lifecycle on the supported environment. Already satisfied prerequisites SHALL be reused. User-owned licensed SDKs or unavailable runtimes SHALL be reported as specific prerequisites rather than replaced, downloaded from an unofficial source or treated as successful support. A new host MUST NOT require an undeclared file or neighboring opencode-kit checkout from the development machine.
+The kit SHALL declare the acquisition source, version policy, runtime prerequisites, language mapping and verification method for every selected dependency. Missing MCPs and required language servers SHALL be provisionable through the kit lifecycle on the supported environment. Already satisfied prerequisites SHALL be reused. User-owned licensed SDKs or unavailable runtimes SHALL be reported as specific prerequisites rather than replaced, downloaded from an unofficial source or treated as successful support. A new host MUST NOT require an undeclared file or neighboring source-kit checkout from the development machine.
 
 #### Scenario: A clean host has only the documented bootstrap prerequisites
 - **WHEN** the kit provisions its selected tools from a fresh checkout

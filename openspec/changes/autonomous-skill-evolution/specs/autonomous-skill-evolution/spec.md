@@ -1,6 +1,6 @@
 ## Purpose
 
-Turn verified task experience into maintained reusable agent skills across repositories, without requiring the user to curate each change or accumulating unsupported instructions.
+Maintain a reusable skill library whose accepted changes improve verified work within declared context and learning budgets, without requiring the user to curate each change or accumulating unsupported instructions.
 
 ## ADDED Requirements
 
@@ -22,7 +22,7 @@ During authorized mutable project work, the agent SHALL consider verified non-ob
 
 ### Requirement: Autonomous bounded maintenance
 
-The installed workflow SHALL create, update, consolidate and retire owned skills within the configured project and kit ownership boundaries without asking the user to review each ordinary change. Changes SHALL have a stated purpose and expected observable effect. Semantic changes SHALL pass the skill-evaluation contract before activation. A failed, inconclusive or unavailable check SHALL retain the usable previous version and a concise candidate status; it MUST NOT cause repeated approval requests, unbounded improvement loops or unconditional extra model calls on every task.
+The installed workflow SHALL create, update, consolidate and retire owned skills within the configured project and kit ownership boundaries without asking the user to review each ordinary change. Each candidate SHALL identify the current library, the proposed library change, its applicable tasks and expected observable benefit. Shortening, narrowing applicability, consolidation and retirement SHALL be eligible improvements alongside creation. Semantic changes SHALL pass the same skill-evaluation contract and context admission rules before activation. A failed, inconclusive or unavailable check SHALL retain the usable previous version and a concise candidate status; it MUST NOT cause repeated approval requests, unbounded improvement loops or unconditional extra model calls on every task. Candidates SHALL remain outside discovery until accepted; candidate count SHALL NOT be a success metric.
 
 #### Scenario: Existing skill misses a case
 - **WHEN** verified use exposes a missing case in an owned skill
@@ -86,7 +86,7 @@ A project-derived skill SHALL become global only after removing project-only ass
 
 ### Requirement: Consolidation and retirement with retained behavior
 
-The workflow SHALL consolidate overlapping skills only when the replacement preserves the applicable scenarios and selection behavior. It SHALL retire owned obsolete or harmful skills based on verified replacement, retired workflow, dependency invalidation or measured lack of benefit, preserving recovery and traceability. Lack of recent use alone SHALL not prove obsolescence. Supported static references and known consumers SHALL be checked; unresolved dynamic consumer scope SHALL prevent automatic destructive removal.
+The workflow SHALL consolidate overlapping skills only when the replacement preserves the applicable scenarios and selection behavior. It SHALL evaluate retirement of owned obsolete or harmful skills based on verified replacement, retired workflow, dependency invalidation or measured lack of benefit. An accepted retirement SHALL first remove the skill from effective discovery and future selection reversibly, preserve its package and necessary recovery evidence outside discovery, and satisfy current-session awareness. Physical deletion SHALL be a separate ownership- and consumer-checked operation. Supported references and known consumers SHALL be checked before changing their supported behavior; unresolved dynamic consumer scope SHALL prevent automatic destructive removal. Lack of recent use, elapsed time, absence of a statistically detected difference or catalogue pressure alone SHALL NOT prove obsolescence or authorize disabling a required capability. Rare but important scenarios SHALL remain protected by their applicable acceptance checks.
 
 #### Scenario: Two overlapping skills are consolidated
 - **WHEN** a replacement passes both original behavior suites and coexistence checks
@@ -95,3 +95,27 @@ The workflow SHALL consolidate overlapping skills only when the replacement pres
 #### Scenario: Infrequently used skill has unknown consumers
 - **WHEN** maintenance observes low usage but cannot establish that the skill is obsolete or safely replaced
 - **THEN** it retains the skill and records the uncertainty instead of deleting it
+
+#### Scenario: Removing a redundant skill improves the library
+- **WHEN** a library-without-skill comparison satisfies unchanged protected scenarios and confirms its declared benefit
+- **THEN** the workflow retires only the owned skill reversibly, reconciles its references and session visibility, and retains a recoverable prior revision outside discovery
+
+#### Scenario: Retirement evidence is inconclusive
+- **WHEN** both variants pass a small sample but the declared comparison cannot establish the removal claim
+- **THEN** the active library remains unchanged and the removal candidate stays inactive with an inconclusive result
+
+### Requirement: Event-driven library review
+
+Maintenance SHALL consume relevant signals from authorized active work: observed failures, inappropriate selection, repeated retrieval or execution overhead, overlap with an accepted replacement, workflow or dependency retirement, changed model/runtime assumptions, and catalogue admission pressure. It SHALL consider amendment or removal as well as addition, deduplicate an unchanged signal for the same applicable revisions, and select bounded reviews using expected benefit, concrete risk and the remaining learning budget. Review SHALL NOT require a model call after every task or background scans of inactive repositories. Ordinary observations SHALL distinguish eligible task opportunities, actual selection and demonstrated application; no eligible observations SHALL remain unknown usefulness, not zero usefulness. Changed assumptions SHALL invalidate affected evidence without silently deleting the skill or claiming previous measurements remain current.
+
+#### Scenario: A description repeatedly attracts unrelated requests
+- **WHEN** observed use shows inappropriate selection under the same skill revision
+- **THEN** maintenance considers narrowing, consolidation or retirement against the current library and includes those unrelated requests in the comparison
+
+#### Scenario: A model update changes the evaluation context
+- **WHEN** a model or runtime change invalidates a skill's recorded benefit assumptions
+- **THEN** the workflow marks that benefit as needing reassessment and schedules only a justified bounded review; it does not claim automatic continued savings or disable the skill solely because evidence is old
+
+#### Scenario: An unchanged failed idea is submitted again
+- **WHEN** a new name or another task repeats the same failed candidate without new relevant evidence
+- **THEN** the existing decision and expenditure are reused instead of creating another model-backed evaluation episode

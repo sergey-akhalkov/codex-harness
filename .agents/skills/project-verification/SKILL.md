@@ -1,6 +1,6 @@
 ---
 name: project-verification
-description: Discover and reuse project-native checks when verification commands, build identity, or saved validation evidence need establishing for a change. Use for stale-build doubts or resuming incomplete verification; ordinary documentation edits need only their applicable checks.
+description: Establish native checks and execution identity, or diagnose slow, inconclusive verification. Ordinary documentation edits need only their applicable checks.
 ---
 
 # Project verification
@@ -23,9 +23,7 @@ When recording commands or resuming saved work, read [command records](reference
 
 ## Choose the feedback boundary
 
-After a failure, establish whether preparation, the test driver, the product, or observation failed, and whether the intended product action occurred. A driver failure before that action leaves the product untested. When full runs repeatedly discover small unknowns in one layer, isolate that layer's question and meaningful check before another dependent full run, even if every error is different. One informative failure can expose enough unknowns to justify extraction.
-
-Give the smaller task explicit inputs, necessary state and a result the parent path can consume. Preserve the original trigger, timing and integration conditions; reject a passing reduction that removed them. Correct an understood preparation mismatch through its existing refresh path; use `reproduce-regression` when a current intended artifact exhibits a CLI/MCP/process regression within that skill's scope. For unfamiliar interactions, verify the needed transitions and return paths in an owned prepared environment, then exercise the reusable mechanism through the actual parent entry point. An exploratory recipe is not product acceptance. Keep the required full check when no smaller scenario can answer the question; a cheap understood correction needs no new helper or worker.
+For slow, inconclusive or failed checks, read [feedback and recovery](references/feedback.md). Identify the failed phase and the smallest observation preserving the original trigger before repeating expensive preparation. Keep primary failure and pending restoration separate; complete required integration after a useful focused check.
 
 ## Execute and finish
 

@@ -1,6 +1,6 @@
 ## Context
 
-See [proposal](proposal.md) for the outcome. The current [delegation guide](../../../docs/agent-delegation.md) and `global/harness.config.toml` give Grok middle priority, retain Astra reserves and allow parent completion after certain incomplete worker responses. Z.AI already has a subscription route, but no senior worker assignment in that policy. The two-executor limit, concise handoffs, explicit model identities and existing billing boundaries are useful foundations.
+See [proposal](proposal.md) for the outcome. At proposal time the delegation policy gave Grok middle priority, retained Astra reserves and allowed parent completion after certain incomplete worker responses; Z.AI had a subscription route without a senior worker assignment. The current [delegation guide](../../../docs/agent-delegation.md) and `global/harness.config.toml` now express direct model/effort selection and the accepted GPT/Z.AI/Grok responsibilities. That instruction update does not establish the unfinished controller, simultaneous-view, recovery or benefit acceptance. The two-executor limit, concise handoffs, explicit model identities and existing billing boundaries remain useful foundations.
 
 Read-only inspection found these concrete extension points:
 

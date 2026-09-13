@@ -1,6 +1,6 @@
 ---
 name: reproduce-regression
-description: Reproduce and reduce CLI, MCP, or subprocess regressions with controlled identities and failure-preserving checks. Use for a reported crash, hang, protocol failure, or intermittent process defect; routine verification without a concrete regression does not need this workflow.
+description: Reproduce and reduce a reported CLI, MCP or subprocess crash, hang, protocol failure or intermittent defect. Skip routine verification.
 ---
 
 # Reproduce a regression

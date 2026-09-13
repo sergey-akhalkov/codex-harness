@@ -4,11 +4,11 @@ See [proposal.md](proposal.md) for motivation and the two delta specifications f
 
 The current pack already has most execution mechanisms needed here:
 
-- [Portable principles](../../../global/principles-of-work.md) require early useful results, targeted checks, evidence-based retries and proportionate delegation. They do not explicitly recognize a sequence of different failures as evidence that the method of acquiring knowledge needs decomposition.
-- [Project verification](../../../.agents/skills/project-verification/SKILL.md) establishes execution identity and a focused-to-required validation path. [Regression reproduction](../../../.agents/skills/reproduce-regression/SKILL.md) already requires failure-preserving reduction for its narrower CLI/MCP/process scope.
-- [Token workflow](../../../.agents/skills/token-efficient-workflow/SKILL.md) covers reuse of unchanged evidence and full-cost reasoning. [Worktree isolation](../../../.agents/skills/isolated-worktree/SKILL.md) already distinguishes checkout isolation from shared runtime resources.
-- [Delegation guidance](../../../docs/agent-delegation.md) uses ordinary named agents, bounded concurrency and total coordination cost. The existing native probes can run outside the checkout; their current scenarios do not establish adaptive behavior on the cases below.
-- [Global instruction delivery](../../../docs/global-instructions.md) uses live source links read by new sessions. [Project decisions](../../../docs/project-decisions.md#openspec-and-completion) exclude edits to externally maintained OpenSpec workflows.
+- [Portable principles](../../../../global/principles-of-work.md) require early useful results, targeted checks, evidence-based retries and proportionate delegation. They do not explicitly recognize a sequence of different failures as evidence that the method of acquiring knowledge needs decomposition.
+- [Project verification](../../../../.agents/skills/project-verification/SKILL.md) establishes execution identity and a focused-to-required validation path. [Regression reproduction](../../../../.agents/skills/reproduce-regression/SKILL.md) already requires failure-preserving reduction for its narrower CLI/MCP/process scope.
+- [Token workflow](../../../../.agents/skills/token-efficient-workflow/SKILL.md) covers reuse of unchanged evidence and full-cost reasoning. [Worktree isolation](../../../../.agents/skills/isolated-worktree/SKILL.md) already distinguishes checkout isolation from shared runtime resources.
+- [Delegation guidance](../../../../docs/agent-delegation.md) uses ordinary named agents, bounded concurrency and total coordination cost. The existing native probes can run outside the checkout; their current scenarios do not establish adaptive behavior on the cases below.
+- [Global instruction delivery](../../../../docs/global-instructions.md) uses live source links read by new sessions. [Project decisions](../../../../docs/project-decisions.md#openspec-and-completion) exclude edits to externally maintained OpenSpec workflows.
 
 These mechanisms and their current limits were inspected during planning. This is a cross-cutting behavioral change, so a design is needed despite no planned product runtime or dependency addition. The exploration established the problem pattern; it did not measure the proposed policy's effectiveness.
 

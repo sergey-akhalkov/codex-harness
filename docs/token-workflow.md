@@ -18,10 +18,20 @@ definition lives separately in `global/rtk-hooks.json`.
 
 Detailed use is in the portable
 [token-efficient-workflow skill](../.agents/skills/token-efficient-workflow/SKILL.md).
-It loads for substantial output, repeated reads or effort selection. Code Mode
+It loads when bulky results, repeated retrieval, preparation or waits materially
+impede the work. Code Mode
 can process intermediate results before they enter context; it does not justify
 dropping errors, skipping coverage or reindexing unchanged code. Small edits
 still use the ordinary short path.
+
+For mixed tool outcomes, the skill's
+[result handling](../.agents/skills/token-efficient-workflow/references/tool-results.md)
+keeps errors and retained details without duplicate payloads. Its
+[browser and App routes](../.agents/skills/token-efficient-workflow/references/browser-and-apps.md)
+cover awaited browser steps, partial-effect recovery and connected-resource
+identity. These instructions guide tool use. Native comparison retained the
+verified baseline routes: no repeating speed or output benefit beyond variation
+was shown, and `approval_policy=never` still rejects some MCP mutations.
 
 For symbols in a known file, start with Serena. Use the selected graph for
 compact discovery and relationships when it avoids several reads; do not call
@@ -40,7 +50,9 @@ as the first argument, mapping to native `low|high|xhigh`. An explicit native
 effort or profile wins; ordinary start keeps `xhigh`. Changing effort inside an
 already running turn of the current CLI is unsupported. An external app-server
 client may set `turn/start.effort` for the next turn. Effort names do not prove
-a savings percentage. Grok middle, Astra backup and escalation bounds remain.
+a savings percentage. Apply the current
+[model selection and recovery rules](agent-delegation.md#how-selection-works);
+former named levels are migration context, not required dispatch presets.
 
 Installation uses RTK 0.48.0 for Windows x64 with pinned archive and exe
 SHA-256. Building the small adapter needs Cargo/Rust; sources are in

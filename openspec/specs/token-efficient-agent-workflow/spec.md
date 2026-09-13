@@ -97,7 +97,7 @@ Agents SHALL reuse inspected context and completed checks while their relevant i
 
 ### Requirement: Actual task-appropriate reasoning
 
-The kit SHALL expose and use actual native reasoning settings for bounded task complexity and risk, with an explicit conservative default and escalation on demonstrated uncertainty. Selection MUST preserve Astra-only OpenAI assignments, preferred Grok middle, reserve policy and existing subscription routes. Instructions requesting brevity alone SHALL NOT count as lowering reasoning effort. Unsupported in-turn switching MUST be reported accurately; explicit user model and effort overrides MUST be respected.
+The kit SHALL expose and use actual native reasoning settings for bounded task complexity and risk, with an explicit conservative default and escalation on demonstrated uncertainty. Selection MUST preserve Astra-only OpenAI assignments, the model-selection and recovery contract owned by [agent delegation](../agent-delegation/spec.md#requirements), and existing subscription routes. Instructions requesting brevity alone SHALL NOT count as lowering reasoning effort. Unsupported in-turn switching MUST be reported accurately; explicit user model and effort overrides MUST be respected.
 
 #### Scenario: Routine bounded task
 - **WHEN** a task has clear inputs, low risk and a deterministic acceptance check

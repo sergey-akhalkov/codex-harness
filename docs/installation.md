@@ -208,18 +208,18 @@ preset retirement remains part of the orchestration lifecycle work. See
 [agent selection](agent-delegation.md) for migration and current visibility limits.
 User-owned agents and skill directories are preserved.
 
-Shared keys are declared in `global/kit.psd1`. The initial profile preserves the
+Shared keys are declared in `global/kit.psd1`. The shared source preserves the
 existing model/reasoning preference (`gpt-6-astra`, `xhigh`), Full Access
 (`approval_policy = "never"`, `sandbox_mode = "danger-full-access"`), the user
 approval reviewer and reusable notice/pet preferences. This is a preserved
 configuration choice; model access still depends on the account and CLI.
 
-The base `<CODEX_HOME>/config.toml` stays local. Native profiles layer shared
-defaults above it, with project settings and explicit CLI overrides taking
-priority. Authentication, history, caches and installer state stay on the host.
+The base `<CODEX_HOME>/config.toml` stays local. The launcher supplies shared
+defaults as described in [shared defaults and local TUI writes](#shared-defaults-and-local-tui-writes),
+preserving local model/reasoning/UI preferences and explicit invocation choices.
+Authentication, history, caches and installer state stay on the host.
 Installation metadata stores paths/ownership and versions, not copies of source
-bodies. Installation preserves the existing base file without migrating its
-contents into the profile.
+bodies; local settings are not migrated into shared source.
 
 Full installation also registers MCP references to the current source launcher
 and the native root scalar `mcp_optional_startup_grace_ms = 0`.
@@ -241,7 +241,12 @@ config and ownership metadata; it never guesses ownership after concurrent edits
 
 ## Consumer discovery
 
-Isolated and global consumer checks on CLI 0.153.4 established:
+Earlier isolated and global consumer checks on CLI 0.153.4 established the
+following results under the former file-profile layout. The explicit
+`--profile harness` command below records that historical check; the current
+launcher uses the shared-default bridge and no longer installs that file profile.
+Use ordinary `codex debug prompt-input` to inspect a fresh current consumer,
+and heed any fallback notice when the bridge is unavailable.
 
 - `--profile harness debug prompt-input` reads the shared defaults, reports
   Full Access, and still includes a marker from the local base file.
@@ -376,7 +381,7 @@ the consumer's actual project and keep command records in its documentation home
 Model evaluation is opt-in. Installation and ordinary documentation checks do
 not invoke it. Skill registration alone proves no speed gain.
 
-Automatic profile selection covers local TUI, exec, review, resume, fork and
+Shared-default injection covers local TUI, exec, review, resume, fork and
 `debug prompt-input`. An explicit profile wins. Management/help/version commands
 keep their native invocation; remote sessions and app-server are not given an
 unsupported local profile flag. The original CLI executable remains available
