@@ -32,6 +32,10 @@ The controller's simultaneous views and automatic quota recovery are still
 [under development](../openspec/changes/orchestrate-subscription-agents/tasks.md).
 Until verified views are available, keep execution in the visible main conversation;
 the previous single-TUI test is not simultaneous-view acceptance.
+Missing simultaneous views are a controller/UI gap. Do not capture Codex or sibling
+agent windows with Nuphus screenshots, and do not poll window pixels for status.
+Identify non-Codex windows with list, title, bounds and state; keep screenshots for
+genuine visual questions about owned UI.
 
 ## How selection works
 

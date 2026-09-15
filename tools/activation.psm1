@@ -165,6 +165,7 @@ function Invoke-BootstrapUv($Runtime, [string[]]$Arguments) {
 
 function Initialize-CodeToolsRuntime([string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [ValidateSet('serena','graphify')][string]$Tool = 'serena') {
     $runtime = Get-HarnessCodeToolsRuntime $UserHome $CodexHome $CodexCommand
+    if ($Tool -eq 'graphify') { throw 'Graphify is retired from the managed selection and is not bootstrapped.' }
     $definition = if ($Tool -eq 'serena') { @{ package = 'serena-agent'; requirement = 'serena-agent==1.7.0'; wrappers = @('serena.exe','serena-agent.exe','serena-hooks.exe'); journal = 'bootstrap-pending.json'; installed = $runtime.python } } else { @{ package = 'graphifyy'; requirement = 'graphifyy[mcp]==0.9.55'; wrappers = @('graphify.exe','graphify-mcp.exe'); journal = 'bootstrap-graphify-pending.json'; installed = $runtime.graphify_python } }
     if ($definition.installed) { return $runtime }
     if (-not $runtime.uv -or -not $runtime.lifecycle_python) { $runtime = Initialize-BootstrapBase -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand }
@@ -314,7 +315,6 @@ function Restore-HarnessActivation {
             }
         }
     }
-    try { Restore-CodeToolsBootstrap -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Preview:$Preview -Tool graphify } catch { $errors.Add($_.Exception.Message) }
     try { Restore-CodeToolsBootstrap -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Preview:$Preview } catch { $errors.Add($_.Exception.Message) }
     # Base Python/uv may be removed only after the dependent Serena tool is gone.
     if (-not $errors.Count -and -not (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/bootstrap-pending.json')) -and -not (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/bootstrap-graphify-pending.json'))) {
@@ -412,7 +412,6 @@ function Invoke-HarnessActivation {
         Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand
         if ($Mode -in @('Install','Update')) {
             Initialize-CodeToolsRuntime -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand | Out-Null
-            Initialize-CodeToolsRuntime -UserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -Tool graphify | Out-Null
         }
         $result = Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -IncludeCodeTools -DeferCommit
         if ($Checkpoint) { & $Checkpoint 'core' }

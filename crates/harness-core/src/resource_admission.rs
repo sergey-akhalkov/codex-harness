@@ -16,6 +16,7 @@ pub enum Resource {
     CodebaseCatalogue,
     BrokerStartup,
     BrokerInstance,
+    Desktop,
 }
 
 impl Resource {
@@ -25,6 +26,7 @@ impl Resource {
             Self::CodebaseCatalogue => "cbm-catalogue.lock",
             Self::BrokerStartup => "startup.lock",
             Self::BrokerInstance => "instance.lock",
+            Self::Desktop => "desktop.lock",
         }
     }
 }

@@ -149,6 +149,148 @@ pub fn task_arguments(args: &[OsString]) -> io::Result<Vec<OsString>> {
     Ok(result)
 }
 
+fn model_config(arg: &str) -> bool {
+    arg.trim_start()
+        .strip_prefix("model")
+        .is_some_and(|s| s.trim_start().starts_with('='))
+}
+
+fn config_model_value(arg: &str) -> Option<String> {
+    let rest = arg.trim_start().strip_prefix("model")?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let trimmed = rest.trim();
+    let value = trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn default_effort(model: &str) -> Option<&'static str> {
+    if model.contains("glm-5.3") {
+        Some("max")
+    } else if model.contains("grok-4.6") || model.contains("astra") {
+        Some("xhigh")
+    } else {
+        None
+    }
+}
+
+fn session_command(args: &[OsString]) -> bool {
+    let mut command = None;
+    let mut positional = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if VALUES.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if image(arg) {
+            skip_images(args, &mut i);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            i += 1;
+            continue;
+        }
+        if !positional {
+            positional = true;
+            command = Some(arg);
+        }
+        i += 1;
+    }
+    matches!(
+        command,
+        None | Some("exec" | "e" | "review" | "resume" | "fork")
+    )
+}
+
+/// Apply the per-model default effort to a session start without an explicit
+/// effort selection. Explicit arguments, profiles, remote routes and the
+/// harness effort selector always keep precedence.
+pub fn per_model_effort(args: &[OsString], configured_model: Option<&str>) -> Vec<OsString> {
+    if args
+        .first()
+        .and_then(|s| s.to_str())
+        .is_some_and(|first| option(first, "--harness-effort"))
+        || !session_command(args)
+    {
+        return args.to_vec();
+    }
+    let mut model = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if option(arg, "--profile") || arg.starts_with("-p") || option(arg, "--remote") {
+            return args.to_vec();
+        }
+        if matches!(arg, "-c" | "--config") {
+            let Some(value) = args.get(i + 1).and_then(|s| s.to_str()) else {
+                break;
+            };
+            if effort_config(OsStr::new(value)) {
+                return args.to_vec();
+            }
+            if model_config(value) {
+                model = config_model_value(value);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = arg
+            .strip_prefix("--config=")
+            .or_else(|| arg.strip_prefix("-c"))
+        {
+            if effort_config(OsStr::new(rest)) {
+                return args.to_vec();
+            }
+            if model_config(rest) {
+                model = config_model_value(rest);
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(arg, "-m" | "--model") {
+            if let Some(value) = args.get(i + 1).and_then(|s| s.to_str()) {
+                model = Some(value.to_string());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--model=") {
+            model = Some(value.to_string());
+            i += 1;
+            continue;
+        }
+        if VALUES.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if image(arg) {
+            skip_images(args, &mut i);
+        }
+        i += 1;
+    }
+    let model = model.or_else(|| configured_model.map(|value| value.to_string()));
+    let Some(effort) = model.as_deref().and_then(default_effort) else {
+        return args.to_vec();
+    };
+    let mut result = vec![
+        "-c".into(),
+        format!("model_reasoning_effort=\"{effort}\"").into(),
+    ];
+    result.extend_from_slice(args);
+    result
+}
+
 pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
     let mut command = None;
     let mut debug = None;

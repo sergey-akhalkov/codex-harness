@@ -1485,6 +1485,9 @@ def apply_selected(user_home, state_dir, codex_home=None):
             elif identifier == "rust" and item["action"] == "stage-compatible-update":
                 result = {"state": "retained-compatible", "id": identifier, "version": item["installed_version"], "available_cohort": item["release"]["version"],
                           "update_state": "held-toolchain-policy", "reason": "The adopted rustup component belongs to the installed compiler cohort. Updating that toolchain as a side effect would change project/compiler behavior; preserve it. Official component metadata itself uses placeholder 0.0.0."}
+            elif identifier == "python" and item["action"] == "stage-compatible-update":
+                result = {"state": "retained-compatible", "id": identifier, "version": item["installed_version"], "available_version": item["release"]["version"],
+                          "update_state": "held-backend-staging", "reason": "BasedPyright updates need the native dependency staging path that the Rust migration has not delivered; retain the verified backend instead of blocking every install on registry drift."}
             elif identifier == "nuphus" and item["action"] == "preserve-and-audit":
                 record = next(x for x in inventory["mcp"] if x["id"] == "nuphus")
                 original = record["paths"].get("original_native_executable")
@@ -1532,14 +1535,6 @@ def apply_selected(user_home, state_dir, codex_home=None):
                 result = promote_codebase(Path(staged["stage"]) / "stage.json", user_home, state_dir)
             elif identifier in ("typescript", "javascript") and item["action"] == "stage-compatible-update":
                 result = update_typescript(user_home, state_dir, item["release"]["version"])
-            elif identifier == "graphify" and item["action"] == "stage-compatible-update":
-                spec = importlib.util.spec_from_file_location("harness_graphify_update", Path(__file__).with_name("graphify_update.py"))
-                updater = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(updater)
-                updater.lifecycle.TRANSACTION_ID = TRANSACTION_ID
-                staged = updater.stage(user_home, state_dir, item["release"]["version"], codex_home=codex_home)
-                prepared = updater.prepare_manifest(staged["stage_manifest"])
-                result = updater.promote(user_home, state_dir, staged["stage_manifest"], discovery.read_json(prepared["auxiliary_files"]))
             else:
                 result = {"state": "pending", "id": identifier, "reason": item.get("reason") or "Required backend-specific provisioning/update and compatibility proof is not yet implemented.", "plan": item}
         except Exception as error:

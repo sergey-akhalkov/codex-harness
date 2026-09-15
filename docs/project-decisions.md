@@ -357,6 +357,10 @@ is Git-owned text. Fast mode is excluded. Experimental context management for
 Astra is an accepted reversible trial through the shared profile, with an
 explicit false override and profile-table rollback. Side questions `/btw` and
 `/side` work after a main conversation has started; they do not isolate files.
+Ordinary sessions receive that trial only through live shared-default injection.
+Source-stale native identity still admits `config-overrides` on a management-healthy
+manager; fallback without developer instructions or experimental context management
+is a degraded session, reported by Check as `shared-defaults-missing`.
 
 Windows sandbox must not launch packaged PowerShell from WindowsApps. Filter
 child PATH entries matching `(?i)\\WindowsApps(?:\\|$)` so native Codex selects
@@ -371,6 +375,28 @@ open user decision; tasks 5.4 and 6.4 stay open and must not resume that
 research or spend further model-backed runs until a second consumer is chosen.
 Controlled native pairs for the remaining local cases already ran on hooks-off
 Astra; they do not prove benefit.
+
+## Token-burn reduction (2026-09-14)
+
+Confirmed with the user after measured rollout evidence (about 1.95 billion
+tokens over three days, marathon threads dominating): Graphify retired from the
+managed MCP selection like Codebase Memory; the CodeGraph MCP surface is
+bounded to search plus detail with deliberate index/sync/status moved to the
+native codegraph-control CLI; the Serena proxy filters memory, onboarding and
+introspection tools with HARNESS_SERENA_UNFILTERED=1 as the escape hatch;
+portable defaults disable the Apps feature while machine-local values win;
+per-model default effort is max for zai/glm-5.3 and xhigh for
+xai/grok-4.6 and Astra when no explicit effort is selected; the portable
+principles stay at most 24 KiB with every normative rule preserved (measured
+22,928 bytes from 31,442). Removing the locally installed GitHub plugin is a
+machine-local action, not a kit requirement. Screenshot policy was already
+fixed separately and stays unchanged.
+
+Operational notes from the 2026-09-15 activation: the transitional dependency
+layer cannot stage BasedPyright updates, so registry drift now resolves as
+`held-backend-staging` retention instead of blocking every install; the stale
+OpenCode `clangd` cache symlink was removed once (versioned directory
+preserved) because the dependency guard refuses reparse points in that cache.
 
 ## Recording further decisions
 

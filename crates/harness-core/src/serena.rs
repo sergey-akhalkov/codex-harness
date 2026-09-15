@@ -37,19 +37,27 @@ pub struct Session {
     cancel: Cancellation,
     next_id: u64,
     stderr: PathBuf,
+    shared_initialized: Option<Value>,
 }
 
 fn ordinary(path: &Path) -> io::Result<PathBuf> {
     crate::dependency_discovery::local_path(path)
 }
 
-pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
+/// Launch inputs that passed adoption and path validation.
+pub struct Validated {
+    pub python: PathBuf,
+    pub entry: PathBuf,
+    pub registry: PathBuf,
+    pub home: PathBuf,
+}
+
+pub fn validated(launch: &Launch) -> io::Result<Validated> {
     let python = ordinary(&launch.python)?;
     let entry = ordinary(&launch.entry)?;
     let registry = ordinary(&launch.registry)?;
-    let project = ordinary(&launch.project)?;
     let home = ordinary(&launch.home)?;
-    if !python.is_file() || !entry.is_file() || !registry.is_file() || !project.is_dir() {
+    if !python.is_file() || !entry.is_file() || !registry.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "Serena launch inputs are missing",
@@ -77,6 +85,63 @@ pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
     }
     fs::create_dir_all(home.join("harness/runtime/serena"))?;
     fs::create_dir_all(home.join("serena-home"))?;
+    Ok(Validated {
+        python,
+        entry,
+        registry,
+        home,
+    })
+}
+
+fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path) {
+    for key in [
+        "PIP_REQUIRE_VIRTUALENV",
+        "UV_NO_CACHE",
+        "HARNESS_CODE_TOOLS_REGISTRY",
+        "CODEX_HOME",
+        "SERENA_HOME",
+        "PYTHONUTF8",
+        "PYTHONDONTWRITEBYTECODE",
+        "HARNESS_SERENA_SHARED_WORKER",
+    ] {
+        command.env.insert(key.into(), None);
+    }
+    command.env.insert(
+        "HARNESS_CODE_TOOLS_REGISTRY".into(),
+        Some(registry.as_os_str().to_os_string()),
+    );
+    command.env.insert(
+        "CODEX_HOME".into(),
+        Some(home.to_path_buf().into_os_string()),
+    );
+    command.env.insert(
+        "SERENA_HOME".into(),
+        Some(home.join("serena-home").into_os_string()),
+    );
+    command.env.insert("PYTHONUTF8".into(), Some("1".into()));
+    command
+        .env
+        .insert("PYTHONDONTWRITEBYTECODE".into(), Some("1".into()));
+    command
+        .env
+        .insert("PIP_REQUIRE_VIRTUALENV".into(), Some("1".into()));
+    command.env.insert("UV_NO_CACHE".into(), Some("1".into()));
+}
+
+pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
+    let Validated {
+        python,
+        entry,
+        registry,
+        home,
+    } = validated(launch)?;
+    let project = ordinary(&launch.project)?;
+    if !project.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Serena launch inputs are missing",
+        ));
+    }
     let mut command = CommandSpec::new(python);
     command.current_dir = Some(project.clone());
     command.args = vec![
@@ -93,37 +158,56 @@ pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
         "--enable-gui-log-window".into(),
         "false".into(),
     ];
-    for key in [
-        "PIP_REQUIRE_VIRTUALENV",
-        "UV_NO_CACHE",
-        "HARNESS_CODE_TOOLS_REGISTRY",
-        "CODEX_HOME",
-        "SERENA_HOME",
-        "PYTHONUTF8",
-        "PYTHONDONTWRITEBYTECODE",
-        "HARNESS_SERENA_SHARED_WORKER",
-    ] {
-        command.env.insert(key.into(), None);
+    base_environment(&mut command, &registry, &home);
+    Ok(command)
+}
+
+/// The shared-worker command for a resolved client route. Forwarded native
+/// options keep their order; the resolved project is appended explicitly and
+/// the shared-worker marker plus removed-project list are set for the entry.
+pub fn shared_command(
+    launch: &Launch,
+    route: &crate::serena_route::Route,
+    removed_projects: &[String],
+    serena_home: &Path,
+) -> io::Result<CommandSpec> {
+    let Validated {
+        python,
+        entry,
+        registry,
+        home,
+    } = validated(launch)?;
+    let cwd = route.project.clone().unwrap_or_else(|| route.cwd.clone());
+    if !cwd.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Serena launch inputs are missing",
+        ));
     }
-    command.env.insert(
-        "HARNESS_CODE_TOOLS_REGISTRY".into(),
-        Some(registry.into_os_string()),
-    );
+    let mut command = CommandSpec::new(python);
+    command.current_dir = Some(cwd);
+    command.args = vec!["-B".into(), "-u".into(), entry.into_os_string()];
+    command.args.extend(route.arguments.iter().cloned());
+    if let Some(project) = &route.project {
+        command.args.push("--project".into());
+        command.args.push(project.clone().into_os_string());
+    }
+    base_environment(&mut command, &registry, &home);
     command
         .env
-        .insert("CODEX_HOME".into(), Some(home.clone().into_os_string()));
+        .insert("HARNESS_SERENA_SHARED_WORKER".into(), Some("1".into()));
+    command.env.insert(
+        "HARNESS_SERENA_REMOVED_PROJECTS".into(),
+        Some(
+            serde_json::to_string(removed_projects)
+                .unwrap_or_else(|_| "[]".into())
+                .into(),
+        ),
+    );
     command.env.insert(
         "SERENA_HOME".into(),
-        Some(home.join("serena-home").into_os_string()),
+        Some(serena_home.as_os_str().to_os_string()),
     );
-    command.env.insert("PYTHONUTF8".into(), Some("1".into()));
-    command
-        .env
-        .insert("PYTHONDONTWRITEBYTECODE".into(), Some("1".into()));
-    command
-        .env
-        .insert("PIP_REQUIRE_VIRTUALENV".into(), Some("1".into()));
-    command.env.insert("UV_NO_CACHE".into(), Some("1".into()));
     Ok(command)
 }
 
@@ -135,9 +219,29 @@ impl Session {
                 "Serena start cancelled",
             ));
         }
-        let mut command = command(launch)?;
+        let command = command(launch)?;
         let home = ordinary(&launch.home)?;
         let stderr = home.join("harness/runtime/serena/stderr.txt");
+        Self::spawn(command, stderr, cancel)
+    }
+
+    /// Start a worker from a fully selected shared command with its own
+    /// stderr sink. The command is never discovered or modified here.
+    pub fn start_shared(
+        command: CommandSpec,
+        stderr: PathBuf,
+        cancel: &Cancellation,
+    ) -> io::Result<Self> {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Serena start cancelled",
+            ));
+        }
+        Self::spawn(command, stderr, cancel)
+    }
+
+    fn spawn(mut command: CommandSpec, stderr: PathBuf, cancel: &Cancellation) -> io::Result<Self> {
         fs::create_dir_all(stderr.parent().unwrap())?;
         let (stdin, write) = anonymous_pipe(4096)?;
         let (read, stdout) = anonymous_pipe(4096)?;
@@ -159,11 +263,19 @@ impl Session {
             cancel: cancel.clone(),
             next_id: 0,
             stderr,
+            shared_initialized: None,
         })
     }
 
     pub fn identity(&self) -> crate::process::ProcessIdentity {
         self.child.identity()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.child
+            .exit_code()
+            .map(|code| code.is_none())
+            .unwrap_or(false)
     }
 
     pub fn stderr_path(&self) -> &Path {
@@ -252,6 +364,30 @@ impl Session {
         Ok(result["result"].clone())
     }
 
+    /// Initialize a shared worker with the connecting client's parameters.
+    /// Capabilities are forced empty: the shared transport exposes no client
+    /// callbacks to the worker, exactly like the seam's broker.
+    pub fn initialize_shared(&mut self, params: Value, deadline: Deadline) -> io::Result<Value> {
+        let mut params = params;
+        if !params.is_object() {
+            return Err(io::Error::other("Serena initialization failed"));
+        }
+        params["capabilities"] = json!({});
+        let response = self.request("initialize", params, deadline)?;
+        let result = &response;
+        if result.get("error").is_some() || result["result"]["serverInfo"]["name"] != "Serena" {
+            return Err(io::Error::other("Serena initialization failed"));
+        }
+        self.notify("notifications/initialized", json!({}), deadline)?;
+        self.shared_initialized = Some(response.clone());
+        Ok(response["result"].clone())
+    }
+
+    /// The cached shared initialize response for later clients of this worker.
+    pub fn initialized_result(&self) -> Value {
+        self.shared_initialized.clone().unwrap_or(Value::Null)
+    }
+
     pub fn tool(&mut self, name: &str, arguments: Value, deadline: Deadline) -> io::Result<Value> {
         let result = self.request(
             "tools/call",
@@ -308,15 +444,15 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(input) = self.input.take() {
-            if let Ok(deadline) = Deadline::after(CLEANUP) {
-                let _ = input.close(deadline);
-            }
+        if let Some(input) = self.input.take()
+            && let Ok(deadline) = Deadline::after(CLEANUP)
+        {
+            let _ = input.close(deadline);
         }
-        if let Some(job) = self.job.take() {
-            if let Ok(deadline) = Deadline::after(Duration::from_secs(8)) {
-                let _ = job.wait(&self.child, deadline, &self.cancel, CLEANUP);
-            }
+        if let Some(job) = self.job.take()
+            && let Ok(deadline) = Deadline::after(Duration::from_secs(8))
+        {
+            let _ = job.wait(&self.child, deadline, &self.cancel, CLEANUP);
         }
     }
 }

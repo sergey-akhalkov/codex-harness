@@ -97,6 +97,26 @@ fn public_restore_json_cleans_owned_injection_and_writes_desired_state() {
 
 #[test]
 #[ignore = "requires explicit HARNESS_OPENCODEX_PACKAGE for the adopted foreign package"]
+fn skip_history_restore_cleans_injection_without_desired_state() {
+    let package = package();
+    let injected = "# Auto-injected by opencodex\nopenai_base_url = \"http://127.0.0.1:10100/v1\"\nmodel = \"gpt-6-astra\"\n";
+    let (restored, evidence) =
+        harness_core::opencodex::restore_skip_history_probe(&package, Some(injected)).unwrap();
+    eprintln!("skip-history evidence: {}", evidence.display());
+    assert!(restored.success);
+    assert!(restored.history_skipped);
+    assert!(!restored.desired_state_written);
+    let config = std::fs::read_to_string(evidence.join("codex/config.toml")).unwrap();
+    assert!(!config.contains("openai_base_url"));
+    let ocx = std::fs::read_to_string(evidence.join("opencodex/config.json")).unwrap();
+    assert!(
+        !ocx.contains("clientIntegrations"),
+        "skipHistory restore must not write durable desired-state"
+    );
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_OPENCODEX_PACKAGE for the adopted foreign package"]
 fn public_login_with_closed_stdin_fails_without_echoing_secrets() {
     let package = package();
     let cancelled = Cancellation::default();

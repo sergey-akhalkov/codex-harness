@@ -54,29 +54,6 @@
       "verification": "Real-root source oracles, full index, bounded watcher/catch-up, recovery and global lifecycle acceptance."
     },
     {
-      "id": "graphify",
-      "package": "graphifyy",
-      "extras": [
-        "mcp"
-      ],
-      "manager": "uv",
-      "source": "https://github.com/Graphify-Labs/graphify",
-      "metadata": "https://pypi.org/pypi/graphifyy/json",
-      "runtime": [
-        "Python >=3.11",
-        "uv"
-      ],
-      "entrypoint": "graphify.serve",
-      "excluded_packages": [
-        "@dreamtree-org/graphify"
-      ],
-      "required_operations": [
-        "graph-query",
-        "explicit-repository-operations"
-      ],
-      "verification": "Authenticated existing endpoint or stdio using the same graph; explicit repo validation; saved graph preserved."
-    },
-    {
       "id": "nuphus",
       "package": "@nuphus/nuphus-mcp",
       "manager": "npm",

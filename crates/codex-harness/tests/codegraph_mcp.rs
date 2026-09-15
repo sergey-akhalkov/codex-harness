@@ -175,7 +175,7 @@ impl Client {
     }
     fn call(&mut self, name: &str, args: Value) -> Value {
         let reply = self.request("tools/call", json!({"name":name,"arguments":args}));
-        assert!(reply.get("error").is_none(), "{reply}");
+        assert!(reply.get("error").is_none(), "{name}: {reply}");
         reply["result"].clone()
     }
     fn finish(mut self) {
@@ -282,13 +282,14 @@ fn published_native_entry_indexes_watches_syncs_and_reconnects() {
     let root = prepared.root();
     let mut client =
         Client::start_command("", Some(cfg.clone()), Some(root.path()), Some(&package));
-    let unindexed = client.call("codegraph_status", json!({}));
+    let unindexed = comparison::deliberate(&cfg, &package, root, "codegraph_status");
     assert_eq!(
-        unindexed["structuredContent"]["freshness"], "unindexed",
+        comparison::control_field(&unindexed, "freshness"),
+        "unindexed",
         "{unindexed}"
     );
     assert!(!project.join(ACTIVE_DIR_NAME).exists());
-    let indexed = client.call("codegraph_index", json!({}));
+    let indexed = comparison::deliberate(&cfg, &package, root, "codegraph_index");
     assert_ne!(indexed["isError"], true, "{indexed}");
     let untracked = std::process::Command::new("git.exe")
         .args([
@@ -307,7 +308,7 @@ fn published_native_entry_indexes_watches_syncs_and_reconnects() {
         untracked.status.success() && untracked.stdout.is_empty(),
         "private index data was visible to git add"
     );
-    let first_generation = indexed["structuredContent"]["generation"].clone();
+    let first_generation = comparison::control_field(&indexed, "generation").clone();
     assert!(first_generation.as_u64().is_some(), "{indexed}");
     let queried = client.call("codegraph_search", json!({"query":"checkpoint_target"}));
     assert_ne!(queried["isError"], true, "{queried}");
@@ -351,33 +352,13 @@ fn published_native_entry_indexes_watches_syncs_and_reconnects() {
     }
     for (name, arguments, oracle) in [
         (
-            "codegraph_callers",
-            json!({"symbol":"checkpoint_target"}),
-            "checkpoint_caller",
+            "codegraph_search",
+            json!({"query":"checkpoint_caller"}),
+            "src/lib.rs",
         ),
         (
-            "codegraph_callees",
-            json!({"symbol":"checkpoint_caller"}),
-            "checkpoint_target",
-        ),
-        (
-            "codegraph_impact",
-            json!({"symbol":"checkpoint_target"}),
-            "checkpoint_caller",
-        ),
-        (
-            "codegraph_node",
-            json!({"symbol":"checkpoint_target","includeCode":true}),
-            "u32",
-        ),
-        (
-            "codegraph_node",
-            json!({"file":"src/lib.rs","symbolsOnly":true}),
-            "checkpoint_caller",
-        ),
-        (
-            "codegraph_explore",
-            json!({"query":"checkpoint_target checkpoint_caller","maxFiles":1}),
+            "codegraph_search",
+            json!({"query":"checkpoint_target"}),
             "checkpoint_target",
         ),
     ] {
@@ -386,11 +367,11 @@ fn published_native_entry_indexes_watches_syncs_and_reconnects() {
         assert!(serde_json::to_vec(&answer).unwrap().len() <= 4096);
         assert!(answer.to_string().contains(oracle), "{name}: {answer}");
     }
-    let mismatch = client.call(
-        "codegraph_callers",
-        json!({"symbol":"checkpoint_target","file":"src/absent.rs"}),
+    let mismatch = client.request(
+        "tools/call",
+        json!({"name":"codegraph_callers","arguments":{"symbol":"checkpoint_target","file":"src/absent.rs"}}),
     );
-    assert_eq!(mismatch["isError"], true, "{mismatch}");
+    assert!(mismatch.get("error").is_some(), "{mismatch}");
     let probe = project.join("src/watched.rs");
     fs::write(&probe, "pub fn watched_addition() -> u32 { 7 }\n").unwrap();
     let until = Deadline::after(Duration::from_secs(12)).unwrap();
@@ -407,9 +388,12 @@ fn published_native_entry_indexes_watches_syncs_and_reconnects() {
         std::thread::sleep(Duration::from_millis(150));
     }
     fs::rename(&probe, project.join("src/renamed.rs")).unwrap();
-    let synced = client.call("codegraph_sync", json!({}));
+    let synced = comparison::deliberate(&cfg, &package, root, "codegraph_sync");
     assert_ne!(synced["isError"], true, "{synced}");
-    assert_ne!(synced["structuredContent"]["generation"], first_generation);
+    assert_ne!(
+        comparison::control_field(&synced, "generation"),
+        &first_generation
+    );
     let renamed = client.call("codegraph_search", json!({"query":"watched_addition"}));
     assert!(renamed.to_string().contains("src/renamed.rs"), "{renamed}");
     assert!(!renamed.to_string().contains("src/watched.rs"), "{renamed}");
@@ -475,10 +459,10 @@ fn published_native_entry_adopts_existing_owned_index_from_cwd() {
         "only an existing owned checkpoint may be selected by this probe"
     );
     let mut client = Client::start_command("", Some(config.clone()), None, Some(&package));
-    let answer = client.call("codegraph_status", json!({}));
-    assert_ne!(answer["isError"], true, "{answer}");
+    let searched = client.call("codegraph_search", json!({"query":"lib"}));
+    assert_ne!(searched["isError"], true, "{searched}");
     assert_eq!(
-        answer["structuredContent"]["root"],
+        searched["structuredContent"]["root"],
         config.project.to_string_lossy().as_ref()
     );
     client.finish();
@@ -518,7 +502,15 @@ impl Drop for Client {
 fn managed_catalogue_defaults_errors_and_private_detail_recovery() {
     let mut client = Client::start("large", None);
     let catalogue = client.request("tools/list", json!({}));
-    assert_eq!(catalogue["result"]["tools"].as_array().unwrap().len(), 10);
+    let names: Vec<&str> = catalogue["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    // The model surface is bounded queries only; maintenance operations run
+    // through the control CLI and never appear in the catalogue.
+    assert_eq!(names, ["codegraph_search", "codegraph_detail"]);
     let bad = client.call("codegraph_search", json!({"query":"entry","limit":0}));
     assert_eq!(bad["isError"], true);
     let answer = client.call("codegraph_search", json!({"query":"entry"}));
@@ -570,14 +562,26 @@ fn managed_protocol_failures_stay_bounded_explicit_and_cleanup_confirmed() {
 }
 
 #[test]
-fn ambiguous_fanout_requires_narrowing_and_retains_the_original() {
+fn removed_tools_stay_off_the_model_surface_and_bounded_answers_survive() {
     let mut client = Client::start("fanout", None);
-    let answer = client.call("codegraph_callers", json!({"symbol":"entry"}));
-    assert_eq!(answer["isError"], true, "{answer}");
+    // Removed tools are rejected with a bounded protocol error.
+    let reply = client.request(
+        "tools/call",
+        json!({"name":"codegraph_callers","arguments":{"symbol":"entry"}}),
+    );
+    assert!(reply.get("error").is_some(), "{reply}");
+    // The same over-broad fixture answer through the exposed surface stays
+    // bounded and keeps its narrowing hint.
+    let answer = client.call("codegraph_search", json!({"query":"entry"}));
+    assert_ne!(answer["isError"], true, "{answer}");
     assert!(serde_json::to_vec(&answer).unwrap().len() <= 4096);
-    let id = answer["structuredContent"]["detail_id"].as_str().unwrap();
-    let page = client.call("codegraph_detail", json!({"id":id}));
-    assert!(page.to_string().contains("caller_c"), "{page}");
+    assert!(
+        answer["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("3 distinct definitions"),
+        "{answer}"
+    );
     client.finish();
 }
 
@@ -601,26 +605,18 @@ fn published_managed_mcp_answers_with_caps_and_filtered_handlers() {
     let mut client = Client::start("", Some(config));
     for (name, args) in [
         ("codegraph_search", json!({"query":"evaluation_target"})),
-        ("codegraph_callers", json!({"symbol":"evaluation_target"})),
-        (
-            "codegraph_node",
-            json!({"symbol":"evaluation_target","includeCode":true}),
-        ),
-        (
-            "codegraph_explore",
-            json!({"query":"evaluation_target evaluation_caller","maxFiles":1}),
-        ),
+        ("codegraph_search", json!({"query":"evaluation_caller"})),
     ] {
         let answer = client.call(name, args);
         assert_ne!(answer["isError"], true, "{answer}");
         assert!(serde_json::to_vec(&answer).unwrap().len() <= 4096);
         assert!(answer.to_string().contains("evaluation_"), "{answer}");
     }
-    let mismatched = client.call(
-        "codegraph_callers",
-        json!({"symbol":"evaluation_target","file":"src/not_present.rs"}),
+    let mismatched = client.request(
+        "tools/call",
+        json!({"name":"codegraph_callers","arguments":{"symbol":"evaluation_target","file":"src/not_present.rs"}}),
     );
-    assert_eq!(mismatched["isError"], true, "{mismatched}");
+    assert!(mismatched.get("error").is_some(), "{mismatched}");
     client.finish();
 }
 
@@ -834,15 +830,17 @@ fn published_three_projects_refresh_without_queries_and_share_clients() {
             ACTIVE_DIR_NAME.into(),
         )
         .unwrap();
-        let mut client = Client::start_command(
+        let client = Client::start_command(
             "",
             Some(configuration.clone()),
             Some(root.path()),
             Some(&package),
         );
-        let indexed = client.call("codegraph_index", json!({}));
+        let indexed = comparison::deliberate(&configuration, &package, root, "codegraph_index");
         assert_ne!(indexed["isError"], true, "{indexed}");
-        let generation = indexed["structuredContent"]["generation"].as_u64().unwrap();
+        let generation = comparison::control_field(&indexed, "generation")
+            .as_u64()
+            .unwrap_or(0);
         generations.push(wait_checkpoint(
             &configuration.project,
             generation,

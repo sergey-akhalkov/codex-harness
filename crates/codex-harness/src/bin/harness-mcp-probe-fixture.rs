@@ -487,6 +487,86 @@ mod windows {
 
 fn main() {
     #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--nuphus-session") {
+        use harness_core::{
+            mcp_session::Session,
+            mcp_stdio,
+            process::{Cancellation, Deadline},
+        };
+        use serde_json::json;
+        use std::time::Duration;
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        let result = (|| -> std::io::Result<()> {
+            let names = "desktop_screen_size desktop_screenshot desktop_windows_list desktop_window_activate desktop_window_screenshot desktop_window_move desktop_window_resize desktop_window_info desktop_vision desktop_perceive desktop_mouse desktop_mouse_drag desktop_input desktop_clipboard_clean desktop_clipboard_write browser_navigate browser_snapshot browser_exec browser_click browser_type browser_press browser_scroll browser_extract browser_screenshot browser_close browser_evaluate browser_back browser_forward browser_wait_for browser_cookies_get browser_cookies_set browser_import_cookies browser_upload browser_drag_files browser_list_downloads browser_new_tab browser_list_tabs browser_switch_tab";
+            let tools = names
+                .split_whitespace()
+                .map(|name| {
+                    let mut value = json!({"name":name,"description":"fixture","inputSchema":{"type":"object","properties":{}}});
+                    if ["browser_click", "browser_type", "browser_drag_files"].contains(&name) {
+                        let mut properties = json!({"selector":{"type":"string","minLength":1},"ref":{"type":"string","minLength":1}});
+                        let required = match name {
+                            "browser_type" => {
+                                properties["text"] = json!({"type":"string"});
+                                json!(["text"])
+                            }
+                            "browser_drag_files" => {
+                                properties["file_paths"] = json!({"type":"array","items":{"type":"string"},"minItems":1});
+                                json!(["file_paths"])
+                            }
+                            _ => json!([]),
+                        };
+                        value["inputSchema"] = json!({"type":"object","properties":properties,"required":required,"anyOf":[{"required":["selector"]},{"required":["ref"]}]});
+                    }
+                    value
+                })
+                .collect();
+            let session = Session::new("nuphus-mcp", tools)?;
+            let (input, output) = mcp_stdio::standard_files()?;
+            mcp_stdio::serve_fallible(
+                session,
+                input,
+                output,
+                &Cancellation::default(),
+                Deadline::after(Duration::from_secs(30))?,
+                move |operation| match operation.name.as_str() {
+                    "desktop_window_screenshot" => {
+                        if let Some(path) = operation.arguments["path"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                        {
+                            std::fs::write(path, b"owned-path-screenshot")?;
+                            return Ok(
+                                json!({"content":[{"type":"text","text":format!("saved {path}")}]}),
+                            );
+                        }
+                        Ok(json!({"content":[{"type":"text","text":png}]}))
+                    }
+                    "browser_snapshot" => Ok(
+                        json!({"content":[{"type":"text","text":"@1 [button] Apply\n@2 [textbox] Value"}]}),
+                    ),
+                    "browser_click" => {
+                        let reference = operation.arguments["ref"].as_str().unwrap_or_default();
+                        Ok(
+                            json!({"content":[{"type":"text","text":format!("clicked {reference}")}]}),
+                        )
+                    }
+                    "browser_navigate" | "browser_close" => {
+                        Ok(json!({"content":[{"type":"text","text":operation.name}]}))
+                    }
+                    "desktop_screen_size" => {
+                        Ok(json!({"content":[{"type":"text","text":"1920x1080"}]}))
+                    }
+                    _ => Ok(json!({"content":[{"type":"text","text":operation.name}]})),
+                },
+            )
+        })();
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(91);
+        }
+        return;
+    }
+    #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--stdio-session") {
         use harness_core::{
             mcp_session::Session,

@@ -531,6 +531,9 @@ Recover can restore an interrupted restart-policy journal in place without
 stopping the live proxy. `configure-restart --subscriptions-only` updates the
 owned Task Scheduler restart count/interval in place without starting or
 stopping the live proxy.
+The scheduled action is `codex-harness subscription-service --state FILE`.
+Isolated fixtures cover readiness, 2048 MiB job assignment, shutdown cleanup
+and runtime retry without targeting the live global proxy.
 Token-workflow Install reuses or acquires the pinned RTK archive into
 `harness/rtk/packages/<version>/rtk.exe` and a bounded adapter build under
 `harness/rtk/build/<identity>/harness-rtk.exe`, then links only those two
@@ -569,9 +572,18 @@ and journaled local selection. BasedPyright requires an explicit Node path and
 digest. `dependencies apply|update` dispatches explicit plan actions. Check
 and preview stay read-only and do not stage, select, acquire packages or
 stop shared OpenCode consumers. Apply stages and selects native CodeGraph and, with an explicit Node path and
-digest, BasedPyright. nuphus, codebase-memory, Serena, Graphify and remaining
-backends stay pending for Python apply_selected. Complete provisioning and global
-connection remain open.
+digest, BasedPyright. Missing codebase-memory and nuphus packages install into
+the shared user npm tree through a native journaled create-directory
+transaction: audited official archives only, staged and installed executables
+probed, provenance marker recorded, and any post-activation failure rolls the
+activation back to prior absence. Existing installations, a shared npm
+lockfile and foreign markers are preserved without mutation. Serena, Graphify,
+shared-tree replacement updates and the remaining language backends stay
+pending for their owning tasks. Complete provisioning and global connection
+remain open.
+`dependencies recover-npm --state DIRECTORY [--rollback-committed]` finishes or
+rolls back interrupted shared-npm activation journals; committed installations
+stay in place unless the explicit rollback flag is supplied.
 
 `dependencies resource-check --cache DIRECTORY` reads persisted CBM policy.
 `dependencies cbm-index`, `cbm-catalogue` and `cbm-tool` are explicit audited
@@ -619,6 +631,17 @@ acceptance and global CodeGraph activation are complete; see the
 [provider contract](code-tools.md#native-codegraph-provider). After a native
 rebuild, retire an account broker from the older build before new consumers
 connect.
+
+`mcp nuphus` serves the audited original Nuphus binary through a native stdio
+adapter. Handshake and tools/list stay local when the account catalogue cache
+matches that digest. Browser tools start a private Chrome/Edge/Chromium CDP
+endpoint; desktop tools take the account-wide admission lock. Path screenshots
+stay path-only; no-path desktop screenshots become one native image block.
+Live global registration remains a later lifecycle task.
+
+```powershell
+codex-harness.exe mcp nuphus --executable <nuphus-mcp.exe> --expected-digest <sha256> --codex-home <directory> --account <directory> --source-root <checkout> --connection-seconds 86400
+```
 
 `dependencies stage-python --help` creates an empty offline UV environment from
 explicit trusted executable hashes. That unactivated candidate is not eligible

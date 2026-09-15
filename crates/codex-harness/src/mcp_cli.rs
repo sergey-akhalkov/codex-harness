@@ -51,10 +51,19 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args.first().is_some_and(|arg| arg == "codegraph") {
         return codegraph(&args[1..]);
     }
+    if args.first().is_some_and(|arg| arg == "codegraph-control") {
+        return codegraph_control(&args[1..]);
+    }
     if args == ["broker-prepare"] {
         let root = harness_core::broker_state::BrokerRoot::prepare()?.keep();
         println!("{}", serde_json::json!({"broker_root":root.path()}));
         return Ok(0);
+    }
+    if args.first().is_some_and(|arg| arg == "serena") {
+        return serena(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "nuphus") {
+        return nuphus(&args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "broker-retire") {
         if args.len() != 3 || args[1] != "--root" {
@@ -81,8 +90,9 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     if args == ["codebase-memory", "--help"] || args == ["--help"] {
         println!(
-            "codex-harness mcp broker-prepare\ncodex-harness mcp broker-retire --root DIRECTORY"
+            "codex-harness mcp broker-prepare\ncodex-harness mcp broker-retire --root DIRECTORY\ncodex-harness mcp serena --help"
         );
+        println!("codex-harness mcp nuphus --help");
         println!(
             "codex-harness mcp codebase-memory --executable FILE --cache DIRECTORY --runtime DIRECTORY --account DIRECTORY --catalogue-file JSON --connection-seconds SECONDS [--broker-root DIRECTORY]\nServe one bounded MCP stdio connection using a saved cbm-catalogue report. Initialize and tools/list stay local. Tool calls may change the selected graph. Infrastructure failure closes the connection. Optional shared mode requires a fresh private root from 'codex-harness mcp broker-prepare'; share that root across clients during one broker lifetime. After its exit, prepare a new root. Global registration and automatic root/log lifecycle are separate."
         );
@@ -146,10 +156,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     Ok(0)
 }
 
-fn prepare_codegraph(args: &[OsString]) -> io::Result<i32> {
+fn serena(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp prepare-codegraph --mode Install|Update|Check|Recover --codex-home DIRECTORY --dependency-state DIRECTORY [--package-root DIRECTORY]\nPrepare the native provider projection for the existing installer. Check is read-only; Install/Update may explicitly acquire and probe the pinned published package. This command does not write MCP registrations."
+            "codex-harness mcp serena --python FILE --entry FILE --registry FILE --codex-home DIRECTORY --serena-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; memory and onboarding tools stay hidden unless HARNESS_SERENA_UNFILTERED=1."
         );
         return Ok(0);
     }
@@ -158,7 +168,170 @@ fn prepare_codegraph(args: &[OsString]) -> io::Result<i32> {
     while let Some(key) = rest.next() {
         if !matches!(
             key.to_str(),
-            Some("--mode" | "--codex-home" | "--dependency-state" | "--package-root")
+            Some(
+                "--python"
+                    | "--entry"
+                    | "--registry"
+                    | "--codex-home"
+                    | "--serena-home"
+                    | "--source-root"
+                    | "--connection-seconds"
+            )
+        ) {
+            return Err(invalid());
+        }
+        let value = rest.next().ok_or_else(invalid)?;
+        if options.insert(key.clone(), value.clone()).is_some() {
+            return Err(invalid());
+        }
+    }
+    let path = |name: &str| -> io::Result<_> {
+        local_path(Path::new(
+            options.get(&OsString::from(name)).ok_or_else(invalid)?,
+        ))
+    };
+    let seconds: u64 = options
+        .get(&OsString::from("--connection-seconds"))
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (1..=86400).contains(value))
+        .ok_or_else(invalid)?;
+    let source_root = path("--source-root")?;
+    let catalogue_path = source_root.join("global/code-tools.json");
+    let catalogue: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&catalogue_path)?).map_err(|_| invalid())?;
+    let arguments: Vec<OsString> = catalogue["mcp"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == "serena"))
+        .and_then(|item| item["arguments"].as_array())
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|value| value.as_str().ok_or_else(invalid).map(OsString::from))
+        .collect::<io::Result<_>>()?;
+    let configuration = harness_core::serena_broker::Configuration {
+        python: path("--python")?,
+        entry: path("--entry")?,
+        registry: path("--registry")?,
+        codex_home: path("--codex-home")?,
+        serena_home: match options.get(&OsString::from("--serena-home")) {
+            Some(value) => local_path(Path::new(value))?,
+            None => std::env::var_os("USERPROFILE")
+                .map(|home| Path::new(&home).join(".serena"))
+                .ok_or_else(invalid)?,
+        },
+        source_root,
+    };
+    let (input, output) = mcp_stdio::standard_files()?;
+    let cancellation = Cancellation::default();
+    let deadline = Deadline::after(Duration::from_secs(seconds))?;
+    harness_core::serena_stdio::serve(
+        configuration,
+        arguments,
+        input,
+        output,
+        &cancellation,
+        deadline,
+    )?;
+    Ok(0)
+}
+
+fn nuphus(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!(
+            "codex-harness mcp nuphus --executable FILE --expected-digest DIGEST --codex-home DIRECTORY --account DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS [--idle-seconds SECONDS] [--server-name NAME]\nServe one Nuphus stdio connection through the audited original binary. Handshake and tools/list stay local when the account catalogue cache matches that digest. Browser tools use a private CDP endpoint unless NUPHUS_MCP_BROWSER_CDP_URL is already set; desktop tools take the account-wide admission lock. Live global registration remains a later lifecycle task."
+        );
+        return Ok(0);
+    }
+    let mut options = BTreeMap::new();
+    let mut rest = args.iter();
+    while let Some(key) = rest.next() {
+        if !matches!(
+            key.to_str(),
+            Some(
+                "--executable"
+                    | "--expected-digest"
+                    | "--codex-home"
+                    | "--account"
+                    | "--source-root"
+                    | "--connection-seconds"
+                    | "--idle-seconds"
+                    | "--server-name"
+            )
+        ) {
+            return Err(invalid());
+        }
+        let value = rest.next().ok_or_else(invalid)?;
+        if options.insert(key.clone(), value.clone()).is_some() {
+            return Err(invalid());
+        }
+    }
+    let path = |name: &str| -> io::Result<_> {
+        local_path(Path::new(
+            options.get(&OsString::from(name)).ok_or_else(invalid)?,
+        ))
+    };
+    let seconds: u64 = options
+        .get(&OsString::from("--connection-seconds"))
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (1..=86400).contains(value))
+        .ok_or_else(invalid)?;
+    let idle = match options.get(&OsString::from("--idle-seconds")) {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| (1..=3600).contains(value))
+                .ok_or_else(invalid)?,
+        ),
+    };
+    let digest = options
+        .get(&OsString::from("--expected-digest"))
+        .and_then(|value| value.to_str())
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(invalid)?;
+    let expected_server = match options.get(&OsString::from("--server-name")) {
+        Some(value) => Some(
+            value
+                .to_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(invalid)?
+                .to_owned(),
+        ),
+        None => Some("nuphus-mcp".into()),
+    };
+    let configuration = harness_core::nuphus_stdio::Configuration {
+        executable: path("--executable")?,
+        expected_digest: digest.to_owned(),
+        codex_home: path("--codex-home")?,
+        account: path("--account")?,
+        source_root: path("--source-root")?,
+        expected_server,
+        idle: idle.map(Duration::from_secs),
+        worker_args: Vec::new(),
+        browser_cdp_url: None,
+    };
+    let (input, output) = mcp_stdio::standard_files()?;
+    let cancellation = Cancellation::default();
+    let deadline = Deadline::after(Duration::from_secs(seconds))?;
+    harness_core::nuphus_stdio::serve(configuration, input, output, &cancellation, deadline)?;
+    Ok(0)
+}
+
+fn prepare_codegraph(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!(
+            "codex-harness mcp prepare-codegraph --mode Install|Update|Check|Recover --codex-home DIRECTORY --dependency-state DIRECTORY [--package-root DIRECTORY] [--source DIRECTORY]\nPrepare the native provider projection for the existing installer. Check is read-only; Install/Update may explicitly acquire and probe the pinned published package. With an explicit source root and an adopted interpreter, the projection also switches the Serena connection to the native shared-broker proxy. This command does not write MCP registrations."
+        );
+        return Ok(0);
+    }
+    let mut options = BTreeMap::new();
+    let mut rest = args.iter();
+    while let Some(key) = rest.next() {
+        if !matches!(
+            key.to_str(),
+            Some("--mode" | "--codex-home" | "--dependency-state" | "--package-root" | "--source",)
         ) {
             return Err(invalid());
         }
@@ -177,6 +350,10 @@ fn prepare_codegraph(args: &[OsString]) -> io::Result<i32> {
         dependency_state: path("--dependency-state")?,
         package_root: options
             .get(&OsString::from("--package-root"))
+            .map(|p| local_path(Path::new(p)))
+            .transpose()?,
+        source_root: options
+            .get(&OsString::from("--source"))
             .map(|p| local_path(Path::new(p)))
             .transpose()?,
         mode: options
@@ -320,5 +497,73 @@ fn codegraph(args: &[OsString]) -> io::Result<i32> {
         &cancel,
         Deadline::after(Duration::from_secs(seconds))?,
     )?;
+    Ok(0)
+}
+
+fn codegraph_control(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!(
+            "codex-harness mcp codegraph-control --package-root DIRECTORY [--project DIRECTORY] [--broker-root DIRECTORY] --operation index|sync|status\nRun one deliberate CodeGraph maintenance operation outside a model session through the same bounded runtime and account slot. The exact current directory is the default project. With an explicit broker root the operation routes through that bounded shared worker instead of a fresh direct runtime. No package is downloaded and no model is involved."
+        );
+        return Ok(0);
+    }
+    let mut options = BTreeMap::new();
+    let mut rest = args.iter();
+    while let Some(key) = rest.next() {
+        if !matches!(
+            key.to_str(),
+            Some("--package-root" | "--project" | "--operation" | "--broker-root")
+        ) {
+            return Err(invalid());
+        }
+        let value = rest.next().ok_or_else(invalid)?;
+        if options.insert(key.clone(), value.clone()).is_some() {
+            return Err(invalid());
+        }
+    }
+    let package = options
+        .get(&OsString::from("--package-root"))
+        .ok_or_else(invalid)?;
+    let operation = options
+        .get(&OsString::from("--operation"))
+        .and_then(|value| value.to_str())
+        .ok_or_else(invalid)?;
+    let name = match operation {
+        "index" => "codegraph_index",
+        "sync" => "codegraph_sync",
+        "status" => "codegraph_status",
+        _ => return Err(invalid()),
+    };
+    let inspected = harness_core::dependency_discovery::inspect_package(Path::new(package))?;
+    let project = options
+        .get(&OsString::from("--project"))
+        .map(|value| Path::new(value).to_path_buf())
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)?;
+    let configuration = harness_core::codegraph_stdio::configuration(
+        &inspected.node,
+        &inspected.entry,
+        &project,
+        harness_core::codegraph_generation::ACTIVE_DIR_NAME.into(),
+    )?;
+    let cancel = Cancellation::default();
+    let seconds = if operation == "status" { 60 } else { 600 };
+    let deadline = Deadline::after(Duration::from_secs(seconds))?;
+    if let Some(root) = options.get(&OsString::from("--broker-root")) {
+        let root = local_path(Path::new(root))?;
+        let client = harness_core::codegraph_broker::Client::new(configuration, root)?;
+        client.connect(deadline, &cancel)?;
+        let arguments = serde_json::json!({});
+        let value = client.call(name, &arguments, deadline, &cancel)?;
+        client.disconnect()?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
+    }
+    let mut runtime = harness_core::codegraph_runtime::Runtime::new(configuration)?;
+    let called = runtime.call(name, serde_json::json!({}), deadline, &cancel);
+    let closed = runtime.close();
+    let value = called?;
+    closed?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(0)
 }

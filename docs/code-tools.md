@@ -5,22 +5,29 @@
 [Resource specification](../openspec/specs/bounded-tool-resources/spec.md)
 
 
-The live global MCP selection is Serena, CodeGraph, Graphify and Nuphus.
-Codebase Memory is retired from the managed selection; its shared package,
-indexes and native rollback commands remain installed. Start a new Codex
-session to load current registrations. Existing sessions keep previously
-loaded catalogues until restart.
+The live global MCP selection is Serena, CodeGraph and Nuphus. Codebase Memory
+and Graphify are retired from the managed selection; their shared packages,
+saved graphs, indexes and explicit local rollback commands remain installed.
+Start a new Codex session to load current registrations. Existing sessions keep
+previously loaded catalogues until restart.
 
 ## Selecting tools in everyday work
 
 The [global MCP selection rules](../global/principles-of-work.md#mcp-tool-selection)
 apply to parents and tool-capable children in every project. Serena is the first
 choice for known-file symbols, exact references and suitable edits. CodeGraph
-serves compact repository discovery and relationships. Use explicit project
-checks for validation, Graphify for a
-relevant selected graph, and Nuphus for authorized UI work. Connected Apps serve
-their matching remote resources. Literal text and narrow line edits retain
-native tools.
+serves compact repository discovery and relationships through its bounded query
+surface; deliberate indexing, catch-up and status run outside model sessions
+through the native codegraph-control CLI. Use explicit project checks for
+validation and Nuphus for authorized UI work. Connected Apps serve their
+matching remote resources when enabled locally; the portable default disables
+the Apps feature. Literal text and narrow line edits retain native tools. The
+Serena proxy hides memory, onboarding and configuration-introspection tools;
+HARNESS_SERENA_UNFILTERED=1 restores the full catalogue for debugging.
+Desktop window identity uses list, title, bounds and state. Screenshots are for
+genuine visual questions about owned non-text UI, not to prove Codex conversation
+visibility. Desktop/window captures without a path become native image blocks;
+caller-supplied owned paths stay path-only and must not include image bytes.
 
 Availability does not establish the active project, index coverage, graph
 identity, language support or an open document session. Initialize only relevant
@@ -44,8 +51,11 @@ selection, not the full capabilities of pre-existing shared packages.
 | Other historical candidates | None selected | Retired from managed discovery, including TypeScript, JavaScript, PowerShell, Delphi, C++, C#, JSON, Markdown, TOML, XML, CMake, Bash, YAML, QML, HTML and CSS |
 
 Python remains in dependency discovery because Serena's startup guard requires
-its verified backend. Retired candidates stay outside provisioning. Shared
-installations are not deleted. Native project checks remain available.
+its verified backend; BasedPyright registry updates are held
+(`held-backend-staging`) until the native dependency staging path lands, so
+ordinary upstream releases do not block installs. Retired candidates stay
+outside provisioning. Shared installations are not deleted. Native project
+checks remain available.
 
 Specialized controller or CNC source formats are not a managed language set.
 Extension presence does not prove a compatible language server.
@@ -59,15 +69,11 @@ three-worker/idle-expiry lifecycle. Two owned native consumers returned distinct
 values for the same Rust symbol name under the current broker and completed
 their owned process cleanup; no additional Project Server is selected.
 
-For Graphify 0.9.55, `update --no-cluster` can construct and refresh code and
-Markdown structure without a model. The owned mixed-source check did not include
-the price configuration or connect its documented rule to the Rust reader,
-despite reflecting a changed Markdown heading. Keep current-source inspection
-for such implicit relationships. A relevant saved graph remains usable with an
-explicit project identity; this evaluation does not enable semantic model
-extraction or claim a measured workflow speedup. The compared selection is
-`retain-current` for mixed-source Graphify questions and the existing broker
-for Serena cross-project queries.
+Graphify 0.9.55 is retired from the managed selection after measured use
+collapsed to a handful of calls while CodeGraph covers the selected graph role.
+The shared installation and saved graphs remain; the explicit local proxy and
+update sources stay available for a deliberate rollback route without a
+managed registration.
 
 The kit adds MCP path registrations and one owned readiness setting to the
 existing user config. The native Codex TOML editor renders these registrations
@@ -93,9 +99,9 @@ Machine-local records live under `CODEX_HOME/harness`: `code-tools.json` holds
 dependency discovery, `code-tools-registration.json` holds owned registrations,
 `lsp-servers.json` records an empty retired harness selection, `dependencies/`
 holds version checks and rollback/staging records, and `runtime/` holds session
-state. Optional `graphify.json` declares a graph path and local connection
-references. Credentials stay in existing protected storage or environment
-variables.
+state. A retired `graphify.json` may remain from earlier installations and is
+no longer managed. Credentials stay in existing protected storage or
+environment variables.
 
 ## Resource limits and reuse
 
@@ -106,11 +112,11 @@ introduce a shared Codex app-server.
 | Tool | Reuse and resource contract |
 | --- | --- |
 | Codebase Memory | Retired from the managed selection after replacement acceptance; not registered. Shared package, existing indexes and native `cbm-index`, `cbm-catalogue`, `cbm-tool` and `mcp codebase-memory` remain the rollback/compatibility route with explicit index/refresh only. |
-| CodeGraph | Live graph provider. One account-wide indexing slot, one parse worker, one resolve worker, a 2 GiB Windows Job and 25% CPU. Each indexing episode has a 600-second deadline. Native observation covers every active indexed root; clients of the same root share resources. Healthy worker retirement preserves queued refresh. Check is read-only; Install/Update stage the pinned published Windows x64 1.6.0 tree (940 files). Ordinary startup does not download, build or enable telemetry. |
+| CodeGraph | Live graph provider. One account-wide indexing slot, one parse worker, one resolve worker, a 2 GiB Windows Job and 25% CPU. Each indexing episode has a 600-second deadline. Native observation covers every active indexed root; clients of the same root share resources. Healthy worker retirement preserves queued refresh. The model-facing MCP surface is codegraph_search plus codegraph_detail; deliberate index/sync/status run through the native codegraph-control CLI. Check is read-only; Install/Update stage the pinned published Windows x64 1.6.0 tree (940 files). Ordinary startup does not download, build or enable telemetry. |
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
-| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers and 300-second idle expiry. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. |
-| Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. |
-| Graphify | Reuses the explicitly configured authenticated HTTP endpoint when available; that foreign service's lifetime belongs to its operator. The kit owns and reclaims only its lazy STDIO fallback. Always select the intended saved graph/project. |
+| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers and 300-second idle expiry. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. The proxy filters memory, onboarding and introspection tools from tools/list; native Git records stay authoritative. |
+| Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
+| Graphify | Retired from the managed selection; not registered. Shared package, saved graphs and explicit local proxy/update tools remain the rollback/compatibility route. |
 
 Windows ownership guards reclaim owned descendant processes on owner exit or
 crash, including language servers and private browsers. Pool eviction closes the
@@ -224,8 +230,9 @@ checks; small native MCP index, watch, rename, delete and reconnect; and a
 full real-root comparison with zero source-oracle loss on the pack and the
 locally selected large repository. Exhaustive detail recovery increases total
 bytes and extra calls, so those measurements are not a weekly-quota or overall
-savings claim. The managed catalogue is a stable ten-tool surface; a filtered
-upstream raw catalogue can be smaller.
+savings claim. The model-facing managed catalogue is the bounded query surface
+(codegraph_search plus codegraph_detail); deliberate maintenance runs through
+the native control CLI, and a filtered upstream raw catalogue can be smaller.
 
 Activation passed through the existing recoverable lifecycle: the transitional
 installer rebuilt the native manager from current source, adopted the verified
@@ -251,8 +258,12 @@ Restart boundaries: already running sessions keep their previous MCP catalogue
 until restarted. After Install/Update rebuilds native source, an account broker
 from the older build is not adopted by frontends from the new build; run
 `codex-harness.exe mcp retire-codegraph` once from the current build before
-starting new consumers. Do not continue a CBM port; retire CBM-only paths only
-with further consumer-backed evidence. Disconnect retires only owned CodeGraph
+starting new consumers. A later checkout edit does not stop an already recorded
+hash-matching CodeGraph adapter: Codex CLI can still complete MCP initialize
+from that command. Native adapter changes still need explicit Install/Update
+and a new session. Source-consuming native operations remain gated on a healthy
+source match. Do not continue a CBM port; retire CBM-only paths only with
+further consumer-backed evidence. Disconnect retires only owned CodeGraph
 workers and registrations.
 
 ## Large-repository indexing

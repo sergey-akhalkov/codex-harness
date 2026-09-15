@@ -118,6 +118,7 @@ pub fn recover(args: &[OsString]) -> io::Result<i32> {
                 codex_home: codex,
                 user_home: user,
                 preview: options.preview,
+                manager: None,
             },
         )?)?,
     };
@@ -190,6 +191,7 @@ pub fn check(args: &[OsString]) -> io::Result<i32> {
                 codex_home: required(&options.values, "--codex-home")?,
                 user_home: user,
                 preview: options.preview,
+                manager: None,
             },
         )?)?,
     };
@@ -206,6 +208,7 @@ pub fn configure_restart(args: &[OsString]) -> io::Result<i32> {
                 codex_home: required(&options.values, "--codex-home")?,
                 user_home: required(&options.values, "--user-home")?,
                 preview: options.preview,
+                manager: None,
             })?,
         )?,
         other => {
@@ -265,6 +268,7 @@ pub fn disconnect(args: &[OsString]) -> io::Result<i32> {
                 codex_home: required(&options.values, "--codex-home")?,
                 user_home: user,
                 preview: options.preview,
+                manager: None,
             },
         )?)?,
     };
@@ -360,6 +364,7 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
                 codex_home: required(&options.values, "--codex-home")?,
                 user_home: required(&options.values, "--user-home")?,
                 preview: options.preview,
+                manager: Some(env::current_exe()?),
             },
         )?)?,
     };

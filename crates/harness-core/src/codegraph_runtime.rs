@@ -142,12 +142,12 @@ impl Runtime {
         }
         if name == "codegraph_status" && self.failed.is_some() {
             return Ok(self.stamp(json!({"isError":true,"content":[{"type":"text",
-                "text":"CodeGraph worker failed. Inspect the cause, then use codegraph_sync or codegraph_index deliberately."}],
+                "text":"CodeGraph worker failed. Inspect the cause, then run 'codex-harness mcp codegraph-control --operation sync' deliberately."}],
                 "error":self.failed}), "failed"));
         }
         if self.failed.is_some() && !matches!(name, "codegraph_index" | "codegraph_sync") {
             return Ok(self.stamp(json!({"isError":true,"content":[{"type":"text",
-                "text":"CodeGraph worker failed; automatic restart is disabled. Use codegraph_sync deliberately after inspecting the failure."}],
+                "text":"CodeGraph worker failed; automatic restart is disabled. Use the codegraph-control CLI deliberately after inspecting the failure."}],
                 "error":self.failed}), "failed"));
         }
         let result = self.call_inner(
@@ -172,7 +172,7 @@ impl Runtime {
                         {
                             Ok(handle) => {
                                 let generation = handle.and_then(|h| h.generation);
-                                json!({"saved_generation":generation,"freshness":if generation.is_some() {"stale"} else {"unindexed"},"next_action":if generation.is_some() {"codegraph_sync restores the saved checkpoint and catches up"} else {"codegraph_index creates the first usable checkpoint"}})
+                                json!({"saved_generation":generation,"freshness":if generation.is_some() {"stale"} else {"unindexed"},"next_action":if generation.is_some() {"codegraph-control sync restores the saved checkpoint and catches up"} else {"codegraph-control index creates the first usable checkpoint"}})
                             }
                             Err(cause) => {
                                 json!({"error":cause.to_string(),"committed_checkpoint_preserved":true})
@@ -208,7 +208,7 @@ impl Runtime {
             && store.committed_handle()?.is_none()
         {
             return Ok(self.stamp(json!({"isError":name != "codegraph_status",
-                    "content":[{"type":"text","text":"This exact project root has no committed CodeGraph index. Run codegraph_index deliberately to create it."}]}), "unindexed"));
+                    "content":[{"type":"text","text":"This exact project root has no committed CodeGraph index. Run 'codex-harness mcp codegraph-control --operation index' to create it."}]}), "unindexed"));
         }
         if self.worker.is_none() {
             // Admission covers restoration too: another client can never
@@ -318,7 +318,7 @@ impl Runtime {
             self.admission = None;
             return Ok(self.stamp(
                 json!({"isError":true,"content":[{"type":"text",
-                "text":"No committed index exists. Run codegraph_index first."}]}),
+                "text":"No committed index exists. Run codegraph-control index first."}]}),
                 "unindexed",
             ));
         }

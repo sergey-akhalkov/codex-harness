@@ -19,7 +19,7 @@ from mcp import StdioServerParameters, types
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools/code-tools'))
 import lazy_stdio
-from nuphus_proxy import BrowserReferences
+from nuphus_proxy import BrowserReferences, ScreenshotRejected, bound_screenshot_result
 
 REAL = '--real' in sys.argv
 
@@ -40,6 +40,69 @@ class ReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'expired'):
             first.arguments({'ref': reference})
         self.assertEqual(len(first.references), 2)
+
+
+def _png_bytes():
+    import base64
+    return base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
+    )
+
+
+class ScreenshotBoundTests(unittest.TestCase):
+    def test_nested_text_png_becomes_image_block(self):
+        import base64
+        raw = _png_bytes()
+        encoded = base64.b64encode(raw).decode("ascii")
+        nested = json.dumps({"content": [{"type": "text", "text": json.dumps({"data": encoded})}]})
+        result = types.CallToolResult(content=[types.TextContent(type="text", text=nested)])
+        converted = bound_screenshot_result(result, {})
+        self.assertEqual(converted.content[0].type, "image")
+        self.assertEqual(converted.content[0].mimeType, "image/png")
+        self.assertFalse(any(getattr(item, "type", None) == "text" for item in converted.content))
+        self.assertIsNone(converted.structuredContent)
+        self.assertEqual(base64.b64decode(converted.content[0].data), raw)
+
+    def test_path_result_stays_path_only(self):
+        path = r"C:\Users\noilw\AppData\Local\Temp\owned.png"
+        result = types.CallToolResult(content=[types.TextContent(type="text", text="saved screenshot")])
+        converted = bound_screenshot_result(result, {"path": path})
+        self.assertEqual(converted.content[0].type, "text")
+        self.assertIn(path, converted.content[0].text)
+        self.assertNotIn("iVBORw0KGgo", converted.content[0].text)
+
+    def test_path_result_with_image_text_is_rejected(self):
+        import base64
+        encoded = base64.b64encode(_png_bytes()).decode("ascii")
+        result = types.CallToolResult(content=[types.TextContent(type="text", text=encoded)])
+        with self.assertRaisesRegex(ScreenshotRejected, "image bytes"):
+            bound_screenshot_result(result, {"path": r"C:\tmp\owned.png"})
+
+    def test_invalid_payload_is_bounded_rejection(self):
+        result = types.CallToolResult(content=[types.TextContent(type="text", text="not-an-image")])
+        with self.assertRaises(ScreenshotRejected) as raised:
+            bound_screenshot_result(result, {})
+        self.assertLessEqual(len(str(raised.exception)), 240)
+        self.assertNotIn("iVBORw0KGgo", str(raised.exception))
+
+    def test_oversized_payload_is_rejected_without_image_text(self):
+        import base64
+        from nuphus_proxy import MAX_SCREENSHOT_BYTES
+        huge = _png_bytes() + (b"\x00" * (MAX_SCREENSHOT_BYTES + 1))
+        encoded = base64.b64encode(huge).decode("ascii")
+        result = types.CallToolResult(content=[types.TextContent(type="text", text=encoded)])
+        with self.assertRaisesRegex(ScreenshotRejected, "exceeds") as raised:
+            bound_screenshot_result(result, {})
+        self.assertLessEqual(len(str(raised.exception)), 240)
+        self.assertNotIn("iVBORw0KGgo", str(raised.exception))
+
+    def test_browser_snapshot_is_not_screenshot_conversion(self):
+        payload = json.dumps({"snapshot": '@1 [button] "Apply"'})
+        result = types.CallToolResult(content=[types.TextContent(type="text", text=payload)])
+        transformed = BrowserReferences().snapshot(result)
+        self.assertEqual(transformed.content[0].type, "text")
+        self.assertIn("[button]", transformed.content[0].text)
+        self.assertNotEqual(transformed.content[0].type, "image")
 
 
 class LazyTests(unittest.IsolatedAsyncioTestCase):

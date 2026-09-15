@@ -10,6 +10,27 @@ from typing import Any
 from serena_broker import MAX_MESSAGE, ensure_endpoint, exchange, source_identity
 
 
+# Native Git records own project memory; onboarding and configuration
+# introspection are not part of the managed model-facing surface. Set
+# HARNESS_SERENA_UNFILTERED=1 to inspect the complete catalogue while
+# debugging a worker directly.
+HIDDEN_TOOLS = frozenset((
+    'onboarding',
+    'initial_instructions',
+    'get_current_config',
+    'list_memories',
+    'read_memory',
+    'write_memory',
+    'edit_memory',
+    'delete_memory',
+    'rename_memory',
+))
+
+
+def exposed_tools(tools):
+    return [tool for tool in tools if tool.get('name') not in HIDDEN_TOOLS]
+
+
 def main() -> None:
     expected = source_identity()
     client = secrets.token_hex(16)
@@ -66,6 +87,11 @@ def main() -> None:
                     result = response["message"]
                     if response.get("tools_changed"):
                         output({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+                if method == 'tools/list' and os.environ.get('HARNESS_SERENA_UNFILTERED') != '1':
+                    payload = result.get('result') or {}
+                    tools = payload.get('tools')
+                    if isinstance(tools, list):
+                        result = {**result, 'result': {**payload, 'tools': exposed_tools(tools)}}
                 output({**result, "jsonrpc": "2.0", "id": message["id"]})
             except Exception as error:
                 output({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32603, "message": f"{type(error).__name__}: {error}"}})

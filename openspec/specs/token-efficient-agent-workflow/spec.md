@@ -142,3 +142,124 @@ When delegation is available, authorized and useful, agents SHALL assign a bound
 #### Scenario: Parallel activity does not advance acceptance
 - **WHEN** a proposed worker would polish an unrelated component, duplicate current investigation or cost more than the remaining direct work
 - **THEN** the agent leaves that work out and continues the accepted path without manufacturing a delegation requirement
+
+### Requirement: Images stay images in Code Mode results
+
+Code Mode and other result-shaping routes SHALL return visual captures as native image content or as a local file locator. They MUST NOT stringify image bytes, base64, data URLs or nested JSON image envelopes into the ordinary text aggregate. A screenshot needed only to confirm window identity SHALL be omitted; window list, title, bounds and state are sufficient. Failed, incomplete or oversized visual calls MUST remain explicit without dumping the image payload.
+
+#### Scenario: Screenshot is part of an independent batch
+- **WHEN** Code Mode receives a successful window screenshot together with other tool results
+- **THEN** the compact result keeps the visual as an image or path, reports any sibling errors, and does not include megabyte-scale image text
+
+#### Scenario: Screenshot was taken to prove a conversation is visible
+- **WHEN** the only question is whether a Codex conversation window exists or has a title
+- **THEN** the workflow uses list/title/state evidence and does not return a screenshot payload
+
+### Requirement: Bounded tool results with accessible details
+
+Installed routes SHALL scope tool requests before retrieval and expose only decision-relevant results to model context. They SHALL avoid duplicate representations and preserve rejected calls, tool errors, nonzero exits, partial outcomes, provenance, freshness and omission information. Necessary details SHALL remain accessible without repeating an already executed operation. Silent truncation, an empty response or a successful transport MUST NOT substitute for a complete result.
+
+#### Scenario: Mixed independent batch
+- **WHEN** a batch contains successful data, a rejected call, an MCP error and a process failure
+- **THEN** the compact result preserves each outcome and its source and permits inspection of the original necessary details without rerunning the calls
+
+#### Scenario: Result exceeds the selected scope budget
+- **WHEN** even a bounded request returns more data than the selected output budget permits
+- **THEN** the response identifies its omissions and a valid continuation or detail path, retaining any errors and coverage limitations
+
+#### Scenario: Detail retention expired
+- **WHEN** a temporary detail reference is no longer available
+- **THEN** the workflow reports that absence and reassesses the need and authority for a new operation rather than presenting the earlier aggregate as complete evidence
+
+### Requirement: Predeclared full-result comparisons
+
+Workflow promotion SHALL use a predeclared task, input identity, independent oracle, allowed effects, materiality and regression tolerances, and a bounded comparison plan. Comparisons SHALL include necessary setup, execution, coordination, verification and correction cost while distinguishing cold and reused state. Quality criteria MUST NOT be traded for token savings, and tolerances MUST preserve the existing prohibition on material speed regression. Promotion on efficiency grounds or a recurring-benefit claim SHALL have repeated comparable observations beyond the observed variation; a single pair SHALL be labelled as such. Criteria MUST NOT be relaxed after observing results to manufacture a benefit.
+
+#### Scenario: Smaller output makes the complete task worse
+- **WHEN** a candidate emits fewer characters but omits a needed finding or increases complete-task cost beyond the predeclared tolerance
+- **THEN** the candidate is corrected and rechecked or rejected, and the smaller response alone is not reported as an efficiency improvement
+
+#### Scenario: Comparable native episodes
+- **WHEN** a native baseline/candidate comparison supports promotion
+- **THEN** both arms use the same substantive inputs, task, model/effort and correctness criteria, with all attempts and measured costs attributable to their respective arm
+
+#### Scenario: Evidence remains inconclusive
+- **WHEN** the bounded comparison cannot distinguish benefit from variation
+- **THEN** the workflow retains the verified baseline, records the uncertainty and does not continue unchanged runs merely to obtain a favorable result
+
+### Requirement: Scoped efficiency claims and retained selection
+
+Reports SHALL distinguish measured tokens, estimated tokens, response size, elapsed time and subscription consumption. Unavailable measurements SHALL remain unknown. Completion SHALL include delivered required routes, their correctness evidence, the declared decisions for optional candidates and applicable global checks. Optional rejection MUST NOT close an unrelated mandatory requirement or transfer historical evidence to changed inputs. The selected hooks, resources, model families, provider routes and billing SHALL remain unchanged unless separately authorized.
+
+The selected hooks remain the durable ordinary-off default with the accepted RTK exception only. CBM automatic index/watch, Fast and native memories SHALL stay disabled. OpenAI assignments SHALL remain Astra-only.
+
+#### Scenario: Only response-size evidence exists
+- **WHEN** a comparison measures output bytes but cannot observe attributable native token or subscription use
+- **THEN** the report describes the byte reduction and measurement limits without claiming a corresponding session or weekly-quota saving
+
+#### Scenario: Optional capability is rejected
+- **WHEN** a reviewed candidate is rejected under its declared conditions
+- **THEN** its decision is recorded, the verified baseline remains usable, and all required routing, failure handling and global-consumption checks remain necessary
+
+### Requirement: Per-model default reasoning effort
+
+The launcher SHALL apply a model-specific default reasoning effort to ordinary
+session starts that select no explicit effort: "max" for zai/glm-5.3 and
+"xhigh" for xai/grok-4.6 and the Astra family. An explicit effort argument, a
+profile, a remote route or the harness effort selector SHALL take precedence
+and leave the effective selection unchanged. Unknown or unmapped models SHALL
+receive no injected effort. The effective effort SHALL remain observable in
+native session evidence.
+
+#### Scenario: Grok starts without an explicit effort
+- **WHEN** a session selects xai/grok-4.6 without any effort argument
+- **THEN** the session runs at xhigh instead of inheriting an unrelated machine-level effort
+
+#### Scenario: GLM keeps its heavier default
+- **WHEN** a session selects zai/glm-5.3 without any effort argument
+- **THEN** the session runs at max
+
+#### Scenario: An explicit effort wins
+- **WHEN** arguments contain an explicit effort setting, a profile, a remote route or the harness effort selector
+- **THEN** no per-model default is injected and the explicit selection applies
+
+#### Scenario: Unmapped model
+- **WHEN** the selected model has no mapping
+- **THEN** the native effort configuration is passed through unchanged
+
+### Requirement: Session-lifecycle economy
+
+The portable workflow guidance SHALL direct agents to start a new session for a
+new topic, avoid resuming very long threads for small follow-ups, prefer forking
+with a concise handoff over continuing marathon threads, and give children
+concise briefs instead of full parent history. The guidance SHALL be advisory
+working practice grounded in measured token evidence, not a forced scheduler or
+turn limit, and SHALL NOT weaken required acceptance checks or task continuity.
+
+#### Scenario: Small follow-up after a marathon thread
+- **WHEN** a tiny question arrives long after a very large session finished
+- **THEN** the agent starts a fresh session or forks with a concise handoff instead of repaying the entire history
+
+#### Scenario: Delegating independent work
+- **WHEN** a child agent receives a bounded assignment
+- **THEN** the brief carries objective, inputs, ownership and checks without the parent's full transcript
+
+### Requirement: Lean default connector surface
+
+Portable defaults SHALL disable the native Apps connector feature. A
+machine-local true value SHALL take precedence and re-enable Apps for that
+machine. Plugin installation SHALL remain an explicit per-machine opt-in, and
+the kit SHALL NOT require any installed app or plugin for its accepted
+operation or checks.
+
+#### Scenario: Fresh consumer session
+- **WHEN** an ordinary session starts with portable defaults and no machine override
+- **THEN** Apps connector tools are absent from the session tool surface
+
+#### Scenario: Machine-local re-enable
+- **WHEN** the machine configuration explicitly enables the Apps feature
+- **THEN** the local value wins and Apps tools return without editing portable sources
+
+#### Scenario: Kit operation without connectors
+- **WHEN** installation, update or checks run with Apps disabled and no plugins installed
+- **THEN** every accepted kit operation still completes

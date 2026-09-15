@@ -45,7 +45,7 @@ impl Fixture {
         }
         fs::write(
             source.join("global/profile.toml"),
-            "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'xhigh'\n",
+            "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'xhigh'\ndeveloper_instructions = 'Owned shared default marker'\n[features.context_management]\nexperimental_mode = true\n",
         )
         .unwrap();
         fs::write(

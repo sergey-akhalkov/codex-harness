@@ -28,6 +28,7 @@ pub struct Request {
     pub codex_home: PathBuf,
     pub user_home: PathBuf,
     pub preview: bool,
+    pub manager: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,28 +222,30 @@ fn set_link(path: &Path, target: Option<&Path>, expected: Option<&Path>) -> io::
 }
 
 #[allow(dead_code)]
-struct Paths {
-    source: PathBuf,
-    user: PathBuf,
-    home: PathBuf,
-    state: PathBuf,
-    pending: PathBuf,
-    restart_pending: PathBuf,
-    service: PathBuf,
-    config: PathBuf,
-    config_link: PathBuf,
-    config_source: PathBuf,
-    role_link: PathBuf,
-    role_source: PathBuf,
-    task: String,
-    zai_key: PathBuf,
-    zai_profile: PathBuf,
-    zai_catalog: PathBuf,
+pub struct ServicePaths {
+    pub source: PathBuf,
+    pub user: PathBuf,
+    pub home: PathBuf,
+    pub state: PathBuf,
+    pub pending: PathBuf,
+    pub restart_pending: PathBuf,
+    pub service: PathBuf,
+    pub runtime: PathBuf,
+    pub opencodex: PathBuf,
+    pub config: PathBuf,
+    pub config_link: PathBuf,
+    pub config_source: PathBuf,
+    pub role_link: PathBuf,
+    pub role_source: PathBuf,
+    pub task: String,
+    pub zai_key: PathBuf,
+    pub zai_profile: PathBuf,
+    pub zai_catalog: PathBuf,
 }
 
-fn paths(source: &Path, user: &Path, home: &Path) -> io::Result<Paths> {
+pub fn service_paths(source: &Path, user: &Path, home: &Path) -> io::Result<ServicePaths> {
     let identity = build_identity::hash_bytes(path_text(home)?.to_ascii_lowercase().as_bytes());
-    Ok(Paths {
+    Ok(ServicePaths {
         source: source.to_path_buf(),
         user: user.to_path_buf(),
         home: home.to_path_buf(),
@@ -250,6 +253,8 @@ fn paths(source: &Path, user: &Path, home: &Path) -> io::Result<Paths> {
         pending: home.join("harness/subscription-routing-pending.json"),
         restart_pending: home.join("harness/subscription-restart-policy-pending.json"),
         service: home.join("harness/subscriptions/service.json"),
+        runtime: home.join("harness/subscriptions/runs"),
+        opencodex: user.join(".opencodex"),
         config: home.join("config.toml"),
         config_link: user.join(".opencodex/config.json"),
         config_source: source.join("global/opencodex/config.json"),
@@ -262,7 +267,31 @@ fn paths(source: &Path, user: &Path, home: &Path) -> io::Result<Paths> {
     })
 }
 
-fn owned(state: &Value, paths: &Paths) -> io::Result<()> {
+fn paths(source: &Path, user: &Path, home: &Path) -> io::Result<ServicePaths> {
+    service_paths(source, user, home)
+}
+
+pub fn assert_owned(state: &Value, paths: &ServicePaths) -> io::Result<()> {
+    owned(state, paths)
+}
+
+pub fn current_link_target(path: &Path) -> io::Result<Option<PathBuf>> {
+    Ok(current_link(path)?.map(|(target, _)| target))
+}
+
+pub fn set_owned_link(
+    path: &Path,
+    target: Option<&Path>,
+    expected: Option<&Path>,
+) -> io::Result<()> {
+    set_link(path, target, expected)
+}
+
+pub fn path_display(path: &Path) -> io::Result<String> {
+    path_text(path)
+}
+
+fn owned(state: &Value, paths: &ServicePaths) -> io::Result<()> {
     if state["schema_version"] != 1
         || state["owner"] != "codex-harness-subscriptions"
         || state["codex"] != path_text(&paths.home)?
@@ -277,7 +306,7 @@ fn owned(state: &Value, paths: &Paths) -> io::Result<()> {
 }
 
 fn preserved_private(
-    paths: &Paths,
+    paths: &ServicePaths,
     before_key: Option<&[u8]>,
     before_profile: Option<&[u8]>,
     before_catalog: Option<&[u8]>,
@@ -312,7 +341,7 @@ fn optional_path(value: &Value) -> io::Result<Option<PathBuf>> {
     }
 }
 
-fn source_config(paths: &Paths) -> io::Result<Value> {
+fn source_config(paths: &ServicePaths) -> io::Result<Value> {
     let Some(config) = read_json(&paths.config_source)? else {
         return Err(conflict(
             "Subscription source must select loopback and preserve the ordinary Codex launcher.",
@@ -573,13 +602,15 @@ pub fn install(request: &Request) -> io::Result<Report> {
             .as_deref()
             .or(role_current.as_ref().map(|(path, _)| path.as_path())),
     )?;
-    let powershell = task_scheduler::resolve_powershell()?;
     let desired_xml = task_scheduler::xml(
         &paths.task,
         &paths.home,
         &paths.source,
         &paths.service,
-        &powershell,
+        request
+            .manager
+            .as_deref()
+            .unwrap_or(std::env::current_exe()?.as_path()),
     )?;
     let registered_xml =
         task_scheduler::register(&paths.task, &desired_xml, task_before.as_deref())?;
@@ -642,12 +673,12 @@ pub fn check(request: &Request) -> io::Result<Report> {
     }
     let config_source = source.join("global/opencodex/config.json");
     let role_source = source.join("global/opencodex/agents");
-    if state["links"]["configLink"] != config_source.to_string_lossy().as_ref()
-        && PathBuf::from(state["links"]["configLink"].as_str().unwrap_or_default()) != config_source
+    if Path::new(state["links"]["configLink"].as_str().unwrap_or_default())
+        != config_source.as_path()
     {
         return Err(conflict("Foreign subscription source link preserved."));
     }
-    if PathBuf::from(state["links"]["roleLink"].as_str().unwrap_or_default()) != role_source {
+    if Path::new(state["links"]["roleLink"].as_str().unwrap_or_default()) != role_source.as_path() {
         return Err(conflict("Foreign subscription source link preserved."));
     }
     Ok(Report {
@@ -689,7 +720,7 @@ fn unfinished_restart_blockers(home: &Path) -> io::Result<()> {
 
 fn restore_restart_policy(
     request: &Request,
-    paths: &Paths,
+    paths: &ServicePaths,
     key: Option<&[u8]>,
     profile: Option<&[u8]>,
     catalog: Option<&[u8]>,
@@ -1139,6 +1170,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             user_home: root.path().join("user"),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "disconnected");
@@ -1160,6 +1192,7 @@ mod tests {
             codex_home: home,
             user_home: root.path().join("user"),
             preview: false,
+            manager: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("interrupted subscription"));
@@ -1171,6 +1204,7 @@ mod tests {
             codex_home: root.join("codex"),
             user_home: root.join("user"),
             preview: false,
+            manager: None,
         }
     }
 
@@ -1216,6 +1250,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user,
             preview: true,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "preview-subscription-recovery");
@@ -1264,6 +1299,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "disconnected");
@@ -1342,6 +1378,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "subscriptions-recovered");
@@ -1379,6 +1416,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "connected-files");
@@ -1420,6 +1458,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user,
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(recovered.status, "subscriptions-recovered");
@@ -1478,6 +1517,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user,
             preview: true,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "preview-subscriptions");
@@ -1514,6 +1554,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "connected-files");
@@ -1546,6 +1587,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: true,
+            manager: None,
         })
         .unwrap();
         assert_eq!(
@@ -1561,6 +1603,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user,
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(recovered.status, "subscriptions-restart-policy-recovered");
@@ -1588,6 +1631,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         };
         assert_eq!(install(&request).unwrap().status, "connected-files");
         let state_path = home.join("harness/subscription-routing.json");
@@ -1603,6 +1647,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: true,
+            manager: None,
         })
         .unwrap();
         assert_eq!(preview.status, "preview-subscription-restart-policy");
@@ -1637,6 +1682,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         };
         assert_eq!(install(&request).unwrap().status, "connected-files");
         let state_path = home.join("harness/subscription-routing.json");
@@ -1680,6 +1726,7 @@ mod tests {
             codex_home: std::path::absolute(root.path()).unwrap().join("codex"),
             user_home: std::path::absolute(root.path()).unwrap().join("user"),
             preview: true,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "preview-subscriptions");
@@ -1702,6 +1749,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(report.status, "connected-files");
@@ -1733,6 +1781,12 @@ mod tests {
         )
         .unwrap();
         assert!(state["task_xml"].as_str().is_some());
+        let xml = state["task_xml"].as_str().unwrap();
+        assert!(xml.contains("subscription-service --state"), "{xml}");
+        assert!(
+            !xml.to_ascii_lowercase().contains("opencodex-service.ps1"),
+            "{xml}"
+        );
         let observed = crate::task_scheduler::observe(state["task"].as_str().unwrap()).unwrap();
         assert!(observed.as_ref().is_some_and(|task| !task.running));
         let repeat = install(&Request {
@@ -1740,6 +1794,7 @@ mod tests {
             codex_home: home.clone(),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap();
         assert_eq!(repeat.status, "connected-files");
@@ -1765,6 +1820,7 @@ mod tests {
             codex_home: std::path::absolute(root.path()).unwrap().join("codex"),
             user_home: user.clone(),
             preview: false,
+            manager: None,
         })
         .unwrap_err();
         assert!(

@@ -86,17 +86,26 @@ fn owned_homes(prefix: &str) -> io::Result<(tempfile::TempDir, PathBuf, PathBuf)
     Ok((temporary, codex_home, ocx_home))
 }
 
+struct Homes<'a> {
+    current_dir: &'a Path,
+    codex_home: &'a Path,
+    ocx_home: &'a Path,
+}
+
 fn run_cli(
     bun: PathBuf,
     cli: PathBuf,
     args: Vec<std::ffi::OsString>,
-    current_dir: &Path,
-    codex_home: PathBuf,
-    ocx_home: PathBuf,
+    homes: Homes<'_>,
     stdin: Option<fs::File>,
     deadline: Deadline,
     cancellation: &Cancellation,
 ) -> io::Result<(Outcome, PathBuf, PathBuf, PathBuf)> {
+    let Homes {
+        current_dir,
+        codex_home,
+        ocx_home,
+    } = homes;
     let out_path = current_dir.join("stdout.json");
     let err_path = current_dir.join("stderr.txt");
     let mut command = CommandSpec::new(bun);
@@ -104,10 +113,11 @@ fn run_cli(
     command.current_dir = Some(current_dir.to_owned());
     command
         .env
-        .insert("CODEX_HOME".into(), Some(codex_home.into()));
-    command
-        .env
-        .insert("OPENCODEX_HOME".into(), Some(ocx_home.into()));
+        .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
+    command.env.insert(
+        "OPENCODEX_HOME".into(),
+        Some(ocx_home.as_os_str().to_owned()),
+    );
     command
         .env
         .insert("OPENCODEX_CODEX_SHIM_AUTO_RESTORE".into(), Some("0".into()));
@@ -206,9 +216,11 @@ pub fn validate_candidate(
             input.into(),
             "--json".into(),
         ],
-        temporary.path(),
-        codex_home,
-        ocx_home,
+        Homes {
+            current_dir: temporary.path(),
+            codex_home: &codex_home,
+            ocx_home: &ocx_home,
+        },
         None,
         deadline,
         cancellation,
@@ -268,9 +280,11 @@ pub fn restore_native(
         bun,
         cli,
         vec!["restore".into(), "--json".into()],
-        temporary.path(),
-        codex_home,
-        ocx_home,
+        Homes {
+            current_dir: temporary.path(),
+            codex_home: &codex_home,
+            ocx_home: &ocx_home,
+        },
         None,
         deadline,
         cancellation,
@@ -300,6 +314,36 @@ pub fn restore_native(
     Ok(result)
 }
 
+/// skipHistory-equivalent native restore on owned homes. Does not write
+/// durable desired-state and does not restore history.
+pub fn restore_skip_history_probe(
+    package_root: &Path,
+    injected_config: Option<&str>,
+) -> io::Result<(crate::opencodex_restore::RestoreResult, PathBuf)> {
+    let _ = adopted_runtime(package_root)?;
+    let (temporary, codex_home, ocx_home) = owned_homes("harness-ocx-skip-history-")?;
+    fs::write(
+        ocx_home.join("config.json"),
+        br#"{"codexShimAutoRestore":false}"#,
+    )?;
+    if let Some(config) = injected_config {
+        fs::write(codex_home.join("config.toml"), config)?;
+    }
+    let restored = crate::opencodex_restore::restore_skip_history(&codex_home)?;
+    let evidence = temporary.keep();
+    fs::write(
+        evidence.join("receipt.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "success": restored.success,
+            "historySkipped": restored.history_skipped,
+            "desiredStateWritten": restored.desired_state_written,
+            "configChanged": restored.config_changed,
+            "message": restored.message
+        }))?,
+    )?;
+    Ok((restored, evidence))
+}
+
 /// Public `ocx login xai` with closed stdin on owned homes. Stock login still
 /// installs a manual-code waiter; closed input is a bounded failure, not a
 /// browser-only success path.
@@ -319,9 +363,11 @@ pub fn login_xai_closed_stdin(
         bun,
         cli,
         vec!["login".into(), "xai".into()],
-        temporary.path(),
-        codex_home,
-        ocx_home,
+        Homes {
+            current_dir: temporary.path(),
+            codex_home: &codex_home,
+            ocx_home: &ocx_home,
+        },
         Some(closed),
         deadline,
         cancellation,

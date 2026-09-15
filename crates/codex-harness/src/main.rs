@@ -29,14 +29,24 @@ mod source_diagnostics;
 mod source_diagnostics_view;
 
 fn verify_manager() -> io::Result<()> {
-    verify_entrypoint(false)
+    verify_entrypoint(Admission::Management)
 }
 
 fn verify_runtime() -> io::Result<()> {
-    verify_entrypoint(true)
+    verify_entrypoint(Admission::SourceRuntime)
 }
 
-fn verify_entrypoint(require_runtime: bool) -> io::Result<()> {
+fn verify_serving() -> io::Result<()> {
+    verify_entrypoint(Admission::Serving)
+}
+
+enum Admission {
+    Management,
+    Serving,
+    SourceRuntime,
+}
+
+fn verify_entrypoint(required: Admission) -> io::Result<()> {
     // Cargo bootstrap has no adjacent receipt. Resolve installed command links
     // before finding the immutable build's identity record.
     let executable = env::current_exe()?.canonicalize()?;
@@ -44,7 +54,12 @@ fn verify_entrypoint(require_runtime: bool) -> io::Result<()> {
         && parent.join("build.json").try_exists()?
     {
         let own = build_identity::check(parent, None);
-        if !own.management_allowed || (require_runtime && !own.runtime_allowed) {
+        let admitted = match required {
+            Admission::Management => own.management_allowed,
+            Admission::Serving => own.serving_allowed,
+            Admission::SourceRuntime => own.runtime_allowed,
+        };
+        if !own.management_allowed || !admitted {
             return Err(io::Error::other(own.action));
         }
         if parent.join("codex-harness.exe").canonicalize()? != executable {
@@ -63,7 +78,10 @@ fn run() -> io::Result<i32> {
         .first()
         .is_some_and(|a| a == "config-overrides" || a == "config-localize")
     {
-        verify_runtime()?;
+        // These commands only read checkout shared defaults into native -c leaves.
+        // Source-stale identity must not drop them; general source-consuming MCP
+        // runtime stays gated on verify_runtime.
+        verify_manager()?;
         if args.len() != 5 || args[1] != "--source" || args[3] != "--codex-home" {
             return Err(io::Error::other(
                 "Expected config-overrides|config-localize --source CHECKOUT --codex-home DIRECTORY",
@@ -94,7 +112,7 @@ fn run() -> io::Result<i32> {
     }
     #[cfg(windows)]
     if args == [harness_core::process_service::CREATE_ARGUMENT] {
-        verify_runtime()?;
+        verify_serving()?;
         harness_core::process_service::create_helper_entry()
     }
     #[cfg(windows)]
@@ -127,7 +145,6 @@ fn run() -> io::Result<i32> {
                 cpu_percent: Some(25.0),
             },
         )?;
-        verify_runtime()?;
         if args.len() != 6 {
             return Err(invalid());
         }
@@ -135,18 +152,33 @@ fn run() -> io::Result<i32> {
         let encoded = args[5].to_str().ok_or_else(invalid)?;
         match args[3].to_str() {
             Some("task-control") if encoded == "{}" => {
+                verify_runtime()?;
                 harness_core::task_runtime::serve(guard, expected)?
             }
-            Some("codebase-memory") => harness_core::cbm_broker::serve(
-                guard,
-                expected,
-                serde_json::from_str(encoded).map_err(|_| invalid())?,
-            )?,
-            Some("codegraph") => harness_core::codegraph_broker::serve(
-                guard,
-                expected,
-                serde_json::from_str(encoded).map_err(|_| invalid())?,
-            )?,
+            Some("codebase-memory") => {
+                verify_runtime()?;
+                harness_core::cbm_broker::serve(
+                    guard,
+                    expected,
+                    serde_json::from_str(encoded).map_err(|_| invalid())?,
+                )?
+            }
+            Some("codegraph") => {
+                verify_serving()?;
+                harness_core::codegraph_broker::serve(
+                    guard,
+                    expected,
+                    serde_json::from_str(encoded).map_err(|_| invalid())?,
+                )?
+            }
+            Some("serena") => {
+                verify_serving()?;
+                harness_core::serena_broker::serve(
+                    guard,
+                    expected,
+                    serde_json::from_str(encoded).map_err(|_| invalid())?,
+                )?
+            }
             _ => return Err(invalid()),
         }
         return Ok(0);
@@ -177,6 +209,10 @@ fn run() -> io::Result<i32> {
     if args.is_empty() || args[0] == "--help" {
         println!("codex-harness mcp codebase-memory --help (explicit native stdio connection)");
         println!(
+            "codex-harness mcp codegraph-control --help (deliberate index/sync/status outside model sessions)"
+        );
+        println!("codex-harness mcp nuphus --help (audited original Nuphus stdio adapter)");
+        println!(
             "codex-harness diagnose [--project DIRECTORY] [--codex-home DIRECTORY] [--source CHECKOUT]"
         );
         println!("codex-harness check --diagnose [DIAGNOSE_OPTIONS]");
@@ -193,6 +229,7 @@ fn run() -> io::Result<i32> {
         println!(
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
         );
+        println!("codex-harness dependencies recover-npm --state DIRECTORY [--rollback-committed]");
         println!(
             "codex-harness check --core-only|--code-tools-only|--subscriptions-only|--token-workflow-only --codex-home DIRECTORY --user-home DIRECTORY [--source CHECKOUT] [--dependency-user-home DIRECTORY] [--timeout-seconds SECONDS] [--preview]"
         );
@@ -217,6 +254,9 @@ fn run() -> io::Result<i32> {
         println!(
             "codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
         );
+        println!(
+            "codex-harness subscription-service --state FILE (native Task Scheduler host; never starts the live global proxy from this help path)"
+        );
         println!("codex-harness outcome-prepare --case CASE [--observer ABSOLUTE_EXE]");
         println!("codex-harness outcome-oracle --request PATH");
         println!("codex-harness outcome-arm --request PATH");
@@ -236,10 +276,21 @@ fn run() -> io::Result<i32> {
         if args.get(1).is_some_and(|arg| {
             matches!(
                 arg.to_str(),
-                Some("broker-retire" | "retire-codegraph" | "prepare-codegraph")
+                Some(
+                    "broker-retire"
+                        | "retire-codegraph"
+                        | "prepare-codegraph"
+                        | "apply-codegraph-registration"
+                )
             )
         }) {
             verify_manager()?;
+        } else if args
+            .get(1)
+            .and_then(|arg| arg.to_str())
+            .is_some_and(|op| matches!(op, "codegraph" | "codegraph-control"))
+        {
+            verify_serving()?;
         } else {
             verify_runtime()?;
         }
@@ -305,6 +356,26 @@ fn run() -> io::Result<i32> {
     if args[0] == "configure-restart" {
         verify_manager()?;
         return install_cli::configure_restart(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "subscription-service" {
+        verify_serving()?;
+        if args == ["subscription-service", "--help"]
+            || args.get(1).is_some_and(|arg| arg == "--help")
+        {
+            println!(
+                "codex-harness subscription-service --state FILE\nServe the owned subscription runtime from an explicit service descriptor. Task Scheduler launches this host. Isolated fixtures never target the live global proxy."
+            );
+            return Ok(0);
+        }
+        if args.len() != 3 || args[1] != "--state" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid native subscription-service options",
+            ));
+        }
+        harness_core::subscription_service::serve(PathBuf::from(&args[2]).as_path())?;
+        return Ok(0);
     }
     if args[0] == "outcome-report" {
         return outcome_report_cli::run(&args[1..]);

@@ -205,6 +205,7 @@ fn cli_build_reuse_source_staleness_integrity_and_failed_update() {
     let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
     assert_eq!(stale["status"], "source-stale");
     assert_eq!(stale["management_allowed"], true);
+    assert_eq!(stale["serving_allowed"], true);
     assert_eq!(stale["runtime_allowed"], false);
     let failed = cli(&arguments);
     assert!(!failed.status.success());

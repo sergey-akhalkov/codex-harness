@@ -36,7 +36,10 @@ Global cutover has not replaced the current `.ps1` entry point.
 
 Checked settings: `model`, `model_reasoning_effort`, `approval_policy`,
 `sandbox_mode`, `developer_instructions`, `features.hooks`,
-`features.multi_agent`, `features.memories`. Only allowed preference values
+`features.multi_agent`, `features.memories`,
+`features.context_management.experimental_mode`. A harness profile without live
+`developer_instructions` or experimental context management reports
+`shared-defaults-missing`. Only allowed preference values
 are emitted; other values are hidden. Developer instructions report presence and
 source, not text. A missing declaration is not replaced by a guessed default.
 An intentional project override still requires attention, but is not a

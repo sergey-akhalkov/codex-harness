@@ -225,7 +225,7 @@ fn definition(
     home: &Path,
     source: &Path,
     service_state: &Path,
-    powershell: &Path,
+    host: &Path,
 ) -> io::Result<ITaskDefinition> {
     let definition = unsafe { service.NewTask(0).map_err(com)? };
     let info = unsafe { definition.RegistrationInfo().map_err(com)? };
@@ -295,12 +295,11 @@ fn definition(
     };
     let exec: IExecAction = action.cast().map_err(com)?;
     let arguments = format!(
-        "-NoLogo -NoProfile -WindowStyle Hidden -File {0:?} -StatePath {1:?}",
-        source.join("tools/opencodex-service.ps1").display(),
+        "subscription-service --state {0:?}",
         service_state.display()
     );
     unsafe {
-        exec.SetPath(&BSTR::from(powershell.to_string_lossy().as_ref()))
+        exec.SetPath(&BSTR::from(host.to_string_lossy().as_ref()))
             .map_err(com)?;
         exec.SetArguments(&BSTR::from(arguments.as_str()))
             .map_err(com)?;
@@ -315,7 +314,7 @@ pub fn xml(
     home: &Path,
     source: &Path,
     service_state: &Path,
-    powershell: &Path,
+    host: &Path,
 ) -> io::Result<String> {
     let (_apartment, service, _folder) = connect()?;
     xml_text(&definition(
@@ -324,7 +323,7 @@ pub fn xml(
         home,
         source,
         service_state,
-        powershell,
+        host,
     )?)
 }
 
@@ -442,7 +441,7 @@ pub fn with_restart_policy(xml: &str, count: i32, interval: &str) -> io::Result<
             .RestartInterval(&mut current_interval)
             .map_err(com)?;
     }
-    if current_count == count && current_interval.to_string() == interval {
+    if current_count == count && current_interval == interval {
         return Ok(xml.to_string());
     }
     unsafe {
@@ -490,13 +489,12 @@ pub fn resolve_powershell() -> io::Result<PathBuf> {
         .arg("pwsh.exe")
         .creation_flags(0x08000000)
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let path = PathBuf::from(line.trim());
-                if path.is_file() {
-                    candidates.push(path);
-                }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let path = PathBuf::from(line.trim());
+            if path.is_file() {
+                candidates.push(path);
             }
         }
     }

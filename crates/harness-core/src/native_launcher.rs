@@ -147,6 +147,20 @@ fn shared_config_args(build: &Path, home: &Path) -> io::Result<Vec<OsString>> {
     crate::portable_config::overrides(&record.source_root.join(manifest.profile), home)
 }
 
+/// Best-effort model a plain session start would use for per-model effort
+/// defaults. Read failures degrade to no injection, never a blocked launch.
+fn session_model(build: &Path, home: &Path) -> Option<String> {
+    let record = build_identity::read_record(build).ok()?;
+    let bytes = std::fs::read(record.source_root.join("global/kit.json")).ok()?;
+    let manifest: crate::inventory::Manifest = serde_json::from_slice(&bytes).ok()?;
+    crate::portable_config::effective_default_model(
+        &record.source_root.join(manifest.profile),
+        home,
+    )
+    .ok()
+    .flatten()
+}
+
 fn notice_degraded_session(task_args: &[OsString]) {
     let classified = launcher::profile_arguments(task_args);
     if classified.len() != task_args.len() {
@@ -207,6 +221,8 @@ fn prepared_command(
         ));
     }
     let task_args = launcher::task_arguments(args)?;
+    let default_model = session_model(&selected, home);
+    let task_args = launcher::per_model_effort(&task_args, default_model.as_deref());
     let roots = launcher::additional_roots(&task_args, &env::current_dir()?);
     let mut command = Command::new(target);
     let classified = launcher::profile_arguments(&task_args);

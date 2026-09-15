@@ -33,9 +33,9 @@ recorded the accepted bounded automatic refresh and measured retrieval policy.
 Active OpenSpec work remains authoritative until its own tasks close:
 
 - [migrate-harness-to-rust](../openspec/changes/migrate-harness-to-rust/proposal.md)
-- [improve-installed-tool-workflows](../openspec/changes/improve-installed-tool-workflows/proposal.md)
 - [autonomous-skill-evolution](../openspec/changes/autonomous-skill-evolution/proposal.md)
 - [accelerate-verified-delivery](../openspec/changes/accelerate-verified-delivery/proposal.md)
+- [orchestrate-subscription-agents](../openspec/changes/orchestrate-subscription-agents/proposal.md)
 
 Use `openspec list` and the owning tasks for current progress. Publication and
 retention requirements live in [public-source-hygiene](../openspec/specs/public-source-hygiene/spec.md).

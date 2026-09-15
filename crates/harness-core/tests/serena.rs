@@ -379,3 +379,159 @@ fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
         assert_eq!(hash, optional_hash(path), "{label} changed");
     }
 }
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn shared_pool_reuses_one_worker_and_isolates_projects() {
+    use harness_core::serena_route;
+    use harness_core::serena_shared::{self, Pool};
+
+    let inventory = adopted_registry();
+    let python = adopted_python(&inventory);
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("Serena shared-pool probe root: {}", root.path().display());
+    let alpha_project = crate_project(root.path(), "shared alpha", 301);
+    let beta_project = crate_project(root.path(), "shared beta", 302);
+    let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
+    let codex_home = root.path().join("codex-home");
+    let serena_home = root.path().join("serena-home");
+    fs::create_dir_all(&serena_home).unwrap();
+    fs::write(serena_home.join("serena_config.yml"), "projects: []\n").unwrap();
+    let launch = Launch {
+        python: python.clone(),
+        entry: entry(),
+        registry: registry.clone(),
+        project: root.path().to_path_buf(),
+        home: codex_home,
+    };
+    let cancel = Cancellation::default();
+    let factory = serena_shared::session_factory(launch, serena_home.clone(), cancel).unwrap();
+    let policy = serena_route::policy(&repo()).unwrap();
+    let mut pool = Pool::new(policy, serena_home, factory).unwrap();
+    let initialize = json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "shared-pool-probe", "version": "0.1.0"}
+    });
+    let managed = |project: &Path| {
+        vec![
+            "start-mcp-server".to_string(),
+            "--project".to_string(),
+            project.to_string_lossy().into_owned(),
+            "--context".to_string(),
+            "codex".to_string(),
+        ]
+    };
+    let deadline = || Deadline::after(Duration::from_secs(240)).unwrap();
+    let client_a = format!("{:032x}", 41_u64);
+    let client_b = format!("{:032x}", 42_u64);
+    let client_c = format!("{:032x}", 43_u64);
+    let args_a: Vec<std::ffi::OsString> = managed(&alpha_project)
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    let args_b: Vec<std::ffi::OsString> = managed(&alpha_project)
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    let args_c: Vec<std::ffi::OsString> = managed(&beta_project)
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    let connected_a = pool
+        .connect(
+            &client_a,
+            &args_a,
+            &alpha_project,
+            initialize.clone(),
+            deadline(),
+        )
+        .unwrap();
+    assert_eq!(
+        connected_a["message"]["result"]["serverInfo"]["name"],
+        "Serena"
+    );
+    let connected_b = pool
+        .connect(
+            &client_b,
+            &args_b,
+            &alpha_project,
+            initialize.clone(),
+            deadline(),
+        )
+        .unwrap();
+    // Two clients of one project share a single native worker.
+    assert_eq!(
+        connected_a["message"]["result"]["serverInfo"],
+        connected_b["message"]["result"]["serverInfo"],
+    );
+    assert_eq!(pool.worker_count(), 1);
+    let shared_identity = pool.status()["workers"][0]["pid"].clone();
+    let _ = pool
+        .connect(
+            &client_c,
+            &args_c,
+            &beta_project,
+            initialize.clone(),
+            deadline(),
+        )
+        .unwrap();
+    assert_eq!(pool.worker_count(), 2);
+    assert_eq!(pool.status()["workers"].as_array().unwrap().len(), 2);
+
+    let call = |pool: &mut Pool, client: &str, project: &Path| {
+        let route = serena_route::Route {
+            project: Some(project.to_path_buf()),
+            cwd: project.to_path_buf(),
+            arguments: vec![
+                "start-mcp-server".into(),
+                "--context".into(),
+                "codex".into(),
+            ],
+            removed_projects: Vec::new(),
+            mutation_owner: None,
+        };
+        let result = pool
+            .rpc(
+                client,
+                "tools/call",
+                json!({
+                    "name": "find_symbol",
+                    "arguments": {
+                        "relative_path": "src/lib.rs",
+                        "name_path_pattern": "shared",
+                        "include_body": true
+                    }
+                }),
+                route,
+                initialize.clone(),
+                deadline(),
+            )
+            .unwrap();
+        result["message"]["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<String>()
+    };
+    let alpha_a = call(&mut pool, &client_a, &alpha_project);
+    let alpha_b = call(&mut pool, &client_b, &alpha_project);
+    let beta_c = call(&mut pool, &client_c, &beta_project);
+    assert!(alpha_a.contains("301"), "{alpha_a}");
+    assert!(alpha_b.contains("301"), "{alpha_b}");
+    assert!(beta_c.contains("302"), "{beta_c}");
+    // The alpha worker still serves after the beta client used its own worker.
+    assert_eq!(pool.status()["workers"].as_array().unwrap().len(), 2);
+    // Disconnecting one client of a project keeps the shared worker.
+    assert!(pool.disconnect(&client_a));
+    let alpha_b2 = call(&mut pool, &client_b, &alpha_project);
+    assert!(alpha_b2.contains("301"), "{alpha_b2}");
+    let alpha_still_shared = pool.status()["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|worker| worker["pid"] == shared_identity);
+    assert!(alpha_still_shared);
+    pool.close().unwrap();
+}

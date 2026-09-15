@@ -379,5 +379,17 @@ class NativeTests(unittest.TestCase):
                 print("Serena native evidence: " + str(scratch / "report.json"), file=sys.stderr)
 
 
+class SerenaProxySurfaceTests(unittest.TestCase):
+    def test_memory_and_introspection_tools_hidden_by_default(self):
+        import serena_proxy
+        names = ("find_symbol", "initial_instructions", "write_memory",
+                 "get_current_config", "onboarding", "list_memories",
+                 "search_for_pattern", "read_memory", "rename_memory",
+                 "delete_memory", "edit_memory")
+        exposed = [tool["name"]
+                   for tool in serena_proxy.exposed_tools([{"name": n} for n in names])]
+        self.assertEqual(exposed, ["find_symbol", "search_for_pattern"])
+
+
 if __name__ == "__main__":
     unittest.main(argv=[item for item in sys.argv if item != "--real"], verbosity=2)

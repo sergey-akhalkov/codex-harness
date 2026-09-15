@@ -284,8 +284,8 @@ impl Discovery {
                 }
             }
         }
-        if ids.len() != 6
-            || ["serena", "graphify", "nuphus", "python", "rust"]
+        if ids.len() != 5
+            || ["serena", "nuphus", "python", "rust"]
                 .iter()
                 .any(|id| !ids.contains(id))
         {

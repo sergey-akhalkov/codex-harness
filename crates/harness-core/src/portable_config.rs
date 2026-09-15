@@ -23,6 +23,31 @@ pub fn overrides(shared_file: &Path, codex_home: &Path) -> io::Result<Vec<OsStri
     Ok(result)
 }
 
+/// Resolve the model a plain session start would use: the machine-local value
+/// first, then the portable default. Read failures surface to the caller.
+pub fn effective_default_model(
+    shared_file: &Path,
+    codex_home: &Path,
+) -> io::Result<Option<String>> {
+    let shared = read(shared_file)?;
+    let local = match fs::read_to_string(codex_home.join("config.toml")) {
+        Ok(text) => Some(parse(&text)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    Ok(local
+        .and_then(|table| {
+            table
+                .get("model")
+                .and_then(|value| value.as_str().map(|value| value.to_string()))
+        })
+        .or_else(|| {
+            shared
+                .get("model")
+                .and_then(|value| value.as_str().map(|value| value.to_string()))
+        }))
+}
+
 fn read(path: &Path) -> io::Result<toml::Table> {
     parse(&fs::read_to_string(path)?)
 }
@@ -60,7 +85,7 @@ fn leaves<'a>(
     }
     if matches!(
         keys[0],
-        "model" | "model_reasoning_effort" | "tui" | "notice"
+        "model" | "model_reasoning_effort" | "features" | "tui" | "notice"
     ) {
         let mut selected = local.get(keys[0]);
         for key in &keys[1..] {
@@ -104,10 +129,10 @@ mod tests {
         fs::create_dir(&home).unwrap();
         fs::write(
             home.join("config.toml"),
-            "model='local-fixture'\n[tui]\npet='local'\n[agents.user]\nconfig_file='keep.toml'\n",
+            "model='local-fixture'\n[features]\ncode_mode=true\n[tui]\npet='local'\n[agents.user]\nconfig_file='keep.toml'\n",
         )
         .unwrap();
-        fs::write(&shared, "approval_policy='never'\nmodel='shared-fixture'\ndeveloper_instructions='''A \"quote\"\nКириллица'''\n[projects.'C:/synthetic-consumer']\ntrust_level='trusted'\n[tui]\npet='shared'\n[agents.worker]\nconfig_file='agents/worker.toml'\n").unwrap();
+        fs::write(&shared, "approval_policy='never'\nmodel='shared-fixture'\ndeveloper_instructions='''A \"quote\"\nКириллица'''\n[features]\napps=false\n[projects.'C:/synthetic-consumer']\ntrust_level='trusted'\n[tui]\npet='shared'\n[agents.worker]\nconfig_file='agents/worker.toml'\n").unwrap();
         let args = overrides(&shared, &home).unwrap();
         let text = args
             .iter()
@@ -115,6 +140,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("approval_policy=\"never\""));
+        // A machine-local feature leaf wins over the portable default, while
+        // an absent local leaf still receives the portable value.
+        assert!(text.contains("features.apps=false"));
         assert!(
             !text.contains("projects") && !text.contains("model=") && !text.contains("tui.pet")
         );
@@ -131,6 +159,18 @@ mod tests {
                 assert_eq!(parsed["value"].as_str(), Some("A \"quote\"\nКириллица"));
             }
         }
+        fs::write(
+            home.join("config.toml"),
+            "model='local-fixture'\n[features]\ncode_mode=true\napps=true\n",
+        )
+        .unwrap();
+        let local_apps = overrides(&shared, &home)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!local_apps.contains("features.apps="));
         fs::write(&shared, "approval_policy='on-request'\n").unwrap();
         assert_eq!(
             overrides(&shared, &home).unwrap(),

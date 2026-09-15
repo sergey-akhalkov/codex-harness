@@ -3,37 +3,75 @@
 Make the accepted MCP and language capabilities usable from globally configured Codex sessions in other projects, with correct workspace context, explicit retained or retired selection, and evidence for each delivered operation.
 ## Requirements
 
-### Requirement: Four globally available MCP integrations
+### Requirement: Three globally available MCP integrations
 
-Serena, CodeGraph from `colbymchenry/codegraph`, Graphify using graphifyy, and Nuphus SHALL be the managed global capabilities after replacement acceptance passes, subject to applicable user overrides. Codebase Memory SHALL be retired from the managed selection without deleting unrelated installations or existing indexes. The accepted subscription-efficiency selection SHALL additionally be allowed to disable an LSP-bearing integration when its language functions fail the benefit gate, including Serena or harness-lsp; unrelated useful MCP functions and external installations SHALL be preserved. Retained integrations SHALL be discoverable without per-project configuration, manual startup or a special working directory in supported interactive, non-interactive, resumed/forked and subagent consumers. Desktop/IDE coverage SHALL require actual configuration-consumer evidence rather than a CLI-only claim. Existing processes needing registration reload SHALL be identified explicitly.
+Serena, CodeGraph from `colbymchenry/codegraph`, and Nuphus SHALL be the
+managed global capabilities, subject to applicable user overrides. Graphify
+SHALL be retired from the managed selection the same way Codebase Memory was:
+an update removes only the owned registration, while shared packages, saved
+graphs and explicit local rollback routes remain installed and usable without
+per-project configuration. The accepted subscription-efficiency selection SHALL
+still be allowed to disable an LSP-bearing integration when its language
+functions fail the benefit gate, including Serena; unrelated useful MCP
+functions and external installations SHALL be preserved. Retained integrations
+SHALL be discoverable without per-project configuration, manual startup or a
+special working directory in supported interactive, non-interactive,
+resumed/forked and subagent consumers. Desktop/IDE coverage SHALL require
+actual configuration-consumer evidence rather than a CLI-only claim. Existing
+processes needing registration reload SHALL be identified explicitly.
 
 #### Scenario: Codex starts in an unrelated project
-- **WHEN** Codex starts outside the checkout after replacement activation
-- **THEN** the retained MCP capabilities are available, CodeGraph selects the intended root, and retired CBM and LSP registrations do not reappear
+- **WHEN** Codex starts outside the checkout after this change is active
+- **THEN** Serena, CodeGraph and Nuphus are available, CodeGraph selects the intended root, and retired Graphify and Codebase Memory registrations do not reappear
 
 #### Scenario: Several Codex CLI projects are open together
 - **WHEN** separate Codex CLI sessions start in different indexed projects through the installed global configuration
-- **THEN** every session has usable CodeGraph operations and automatic refresh for its own root, without extra per-project setup, selecting one globally exclusive project or closing an earlier session; bounded resource contention is explicit and does not permanently disable later sessions
+- **THEN** every session has usable CodeGraph operations and automatic refresh for its own root, without extra per-project setup or selecting one globally exclusive project; bounded resource contention is explicit
 
-#### Scenario: LSP carrier is retired
-- **WHEN** all useful operations of a managed LSP carrier fail the benefit gate
-- **THEN** its Codex registration can be removed while unrelated tools, packages and other applications' settings are preserved
+#### Scenario: A retired integration is still needed locally
+- **WHEN** the user deliberately wants Graphify or Codebase Memory for a specific task
+- **THEN** the shared package and saved state remain usable through an explicit local route, and the managed selection does not silently restore the registration
 
 #### Scenario: A different session entry point is used
 - **WHEN** non-interactive, resumed/forked, tool-capable child or supported local desktop/IDE consumers load the same host settings
 - **THEN** they discover the accepted global selection with the applicable project context, preserve intentional native overrides, and do not restore retired registrations
 
-#### Scenario: Replacement acceptance fails
+#### Scenario: Activation fails
 - **WHEN** a required resource, retrieval, coverage or lifecycle check fails
-- **THEN** the previous managed configuration remains recoverable, the failed replacement is not declared active, and the missing behavior remains open
+- **THEN** the previous managed configuration remains recoverable, the failure is not declared active, and the missing behavior remains open
 
 ### Requirement: MCP operations preserve useful source capabilities
 
-Each retained integration SHALL preserve its accepted explicit source operations: suitable Serena navigation, references and semantic edits; CodeGraph deliberate full indexing and bounded automatic/manual incremental refresh, bounded symbol search, caller/callee and impact queries, and deliberate context exploration; Graphify selected-graph queries and supported repository operations; Nuphus authorized desktop/browser inspection and interaction. Diagnostic retention SHALL follow the subscription-efficiency assessment and SHALL distinguish a returned empty object from authoritative current completion. Tool filtering and unavailable operations SHALL remain explicit. Representative actual calls, rather than a tool list, SHALL establish delivered operation scope. Acceptance mutations SHALL use owned targets. CodeGraph's approximate edges SHALL be treated as candidates; required exact-reference and refactoring claims SHALL be checked with current Serena or source evidence.
+Each retained integration SHALL preserve its accepted explicit source operations
+through a bounded model-facing surface: suitable Serena navigation, references
+and semantic edits; CodeGraph bounded symbol search and retained detail reads
+with bounded automatic and manual incremental refresh; Nuphus authorized
+desktop/browser inspection and interaction. CodeGraph deliberate full indexing,
+explicit catch-up and status inspection SHALL remain available through a native
+CLI control command outside model sessions, and the CodeGraph MCP tools/list
+SHALL expose only the bounded query surface. The Serena model-facing tool list
+SHALL exclude memory, onboarding and configuration-introspection tools; native
+Git records remain the authoritative memory route, and an explicit escape hatch
+SHALL keep an unfiltered debugging view possible. Diagnostic retention SHALL
+follow the subscription-efficiency assessment and SHALL distinguish a returned
+empty object from authoritative current completion. Tool filtering and
+unavailable operations SHALL remain explicit. Representative actual calls,
+rather than a tool list, SHALL establish delivered operation scope. Acceptance
+mutations SHALL use owned targets. CodeGraph's approximate edges SHALL be
+treated as candidates; required exact-reference and refactoring claims SHALL be
+checked with current Serena or source evidence.
 
 #### Scenario: Each MCP is exercised by its consumer
 - **WHEN** acceptance performs a meaningful read and applicable bounded mutation through each retained MCP
 - **THEN** the actual result or owned-target effect and server identity are recorded, with diagnostic uncertainty preserved
+
+#### Scenario: Maintenance moves outside the model session
+- **WHEN** a root needs a deliberate full index, explicit catch-up or status inspection
+- **THEN** the native CLI control command performs it without a model session, and the MCP catalogue still exposes only the bounded query tools
+
+#### Scenario: Filtered Serena surface stays debuggable
+- **WHEN** a debugging session needs the unfiltered Serena tool list
+- **THEN** an explicit escape hatch restores it for that client without changing the default model-facing surface
 
 #### Scenario: A required MCP operation fails
 - **WHEN** discovery succeeds but an operation selected for delivery fails
@@ -153,3 +191,45 @@ Acceptance SHALL exercise the selected configuration through actual installed Co
 #### Scenario: Global delivery is declared complete
 - **WHEN** implementation is marked complete
 - **THEN** all accepted operations and lifecycle requirements have evidence, rejected capabilities remain absent, and no required task is unchecked
+
+### Requirement: CodeGraph MCP starts with Codex CLI
+Owned CodeGraph SHALL become ready during Codex CLI startup through the installed registration, together with the other retained MCP servers. The registered command MUST remain able to complete MCP initialize when its native binaries still match their recorded hashes, even if the linked checkout later differs from that build. A manager that is admitted only for integrity-checked management MUST NOT be the Codex MCP command unless it is also admitted for serving. Ordinary Codex startup MUST NOT download packages, rebuild native source, alter agent instructions, install hooks or enable telemetry. Unrelated MCP registrations, user edits, published CodeGraph/Node and existing indexes SHALL be preserved. An unavailable CodeGraph process SHALL remain explicit and MUST NOT disable Serena, Graphify or Nuphus.
+
+#### Scenario: Codex CLI starts after later source edits
+- **WHEN** a consumer starts Codex CLI through the installed launcher after the linked checkout has changed relative to the recorded native build, and the recorded CodeGraph binaries still match
+- **THEN** CodeGraph completes MCP initialize and is present in the session catalogue with the other retained MCP servers, without a rebuild or extra per-session setup
+
+#### Scenario: Interactive, non-interactive and child sessions share the same host settings
+- **WHEN** interactive, non-interactive, resumed/forked or tool-capable child consumers load the same installed host configuration
+- **THEN** each session gets a usable CodeGraph MCP connection for its current project root, or an explicit CodeGraph startup error that does not omit the other retained servers
+
+#### Scenario: Native binaries no longer match the recorded build
+- **WHEN** the registered CodeGraph command is missing, hash-mismatched or otherwise not admitted for serving
+- **THEN** Codex CLI still starts, CodeGraph is omitted with an explicit startup failure, and Serena, Graphify and Nuphus remain available
+
+### Requirement: Check reports CodeGraph serving admission
+Check SHALL inspect owned CodeGraph without installing, rebuilding or mutating configuration. Check MUST NOT report the owned CodeGraph registration as connected when the registered command cannot complete MCP initialize. A source-stale checkout whose recorded binaries still match MAY be reported as degraded for rebuild awareness while remaining callable. Interrupted registration recovery, unrelated settings and user edits SHALL stay preserved.
+
+#### Scenario: Check sees a command that cannot handshake
+- **WHEN** Check inspects an owned CodeGraph registration whose command exits before MCP initialize
+- **THEN** the result is degraded, configuration is unchanged, and the reason identifies that CodeGraph cannot serve
+
+#### Scenario: Check sees a source-stale but serving-admitted command
+- **WHEN** Check inspects an owned CodeGraph registration whose binaries match and that still completes MCP initialize after later source edits
+- **THEN** it does not report the registration as connected-without-qualification if a rebuild is needed to pick up native adapter changes, and it does not disable serving
+
+### Requirement: Bounded visual desktop captures
+
+Nuphus desktop and window screenshot operations SHALL deliver a local file path or a native image content block. They MUST NOT return image bytes, base64, data URLs or nested JSON text as model-visible text. A managed adapter MAY rewrite an upstream text-wrapped image into a native image block or a local file; it MUST NOT re-encode the same bytes as additional JSON text. Screenshot calls without an owned path SHALL still produce a bounded visual result or an explicit bounded refusal. Browser snapshots and element references remain the preferred web inspection path; desktop list, title and state operations remain the preferred window-identity path.
+
+#### Scenario: Window capture without a caller path
+- **WHEN** a consumer requests a desktop or window screenshot and omits a destination path
+- **THEN** the delivered MCP result contains a native image block or a local file reference, not PNG or base64 inside `type: text`
+
+#### Scenario: Capture is written to an owned path
+- **WHEN** a consumer supplies an owned destination path
+- **THEN** the model-visible result identifies that path and omits the image bytes
+
+#### Scenario: Upstream wraps image bytes as JSON text
+- **WHEN** the audited Nuphus executable returns a text block whose payload is image data
+- **THEN** the managed adapter converts or stores that payload before it enters model context and does not emit a second nested JSON string of the same bytes

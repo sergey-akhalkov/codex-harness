@@ -16,6 +16,36 @@ fn invalid() -> io::Error {
 }
 
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
+    if args.first().is_some_and(|arg| arg == "recover-npm") {
+        if args == ["recover-npm", "--help"] {
+            println!(
+                "codex-harness dependencies recover-npm --state DIRECTORY [--rollback-committed]\nRecover interrupted shared npm MCP activation journals. Committed installations stay in place by default; interrupted preparations roll back to prior absence. Foreign or damaged journals are reported and preserved without mutation. No package is acquired or shared consumer stopped."
+            );
+            return Ok(0);
+        }
+        let mut values = BTreeMap::new();
+        let mut rollback = false;
+        let mut options = args[1..].iter();
+        while let Some(option) = options.next() {
+            match option.to_str() {
+                Some("--rollback-committed") if !rollback => rollback = true,
+                Some("--state") => {
+                    if values
+                        .insert(option.clone(), options.next().ok_or_else(invalid)?.clone())
+                        .is_some()
+                    {
+                        return Err(invalid());
+                    }
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        let state = values.get(&OsString::from("--state")).ok_or_else(invalid)?;
+        let report =
+            harness_core::dependency_npm_install::recover_all(&PathBuf::from(state), rollback)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
+    }
     if args.first().is_some_and(|arg| arg == "cbm-tool") {
         if args == ["cbm-tool", "--help"] {
             println!(

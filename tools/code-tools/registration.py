@@ -13,7 +13,7 @@ import tempfile
 import tomllib
 
 NAMES = ('serena', 'codebase-memory', 'graphify', 'nuphus', 'harness-lsp')
-SELECTED_NAMES = NAMES[:-1]  # Keep retired names in the ownership/migration set.
+SELECTED_NAMES = ('serena', 'codebase-memory', 'nuphus')
 MARKERS = {'# BEGIN codex-harness MCP registrations', '# END codex-harness MCP registrations'}
 READINESS_KEY = 'mcp_optional_startup_grace_ms'
 READINESS_STATEMENT = READINESS_KEY + ' = 0\n'

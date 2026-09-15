@@ -135,7 +135,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
     assert_eq!(report["read_only"], true);
     assert_eq!(report["network_requested"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 5);
     for item in items {
         assert_eq!(item["release"]["state"], "unresolved");
         assert!(item["release"]["version"].is_null());
@@ -148,7 +148,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
 }
 
 #[test]
-#[ignore = "explicit public HTTPS release metadata for the six selected dependencies"]
+#[ignore = "explicit public HTTPS release metadata for the five selected dependencies"]
 fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptance() {
     let fixture = Fixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
@@ -206,15 +206,8 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
     assert_eq!(report["processes_started"], 0);
     assert_eq!(report["model_calls"], 0);
     assert_eq!(report["languages"].as_array().unwrap().len(), 2);
-    assert_eq!(report["mcp"].as_array().unwrap().len(), 4);
-    for id in [
-        "serena",
-        "graphify",
-        "codegraph",
-        "nuphus",
-        "python",
-        "rust",
-    ] {
+    assert_eq!(report["mcp"].as_array().unwrap().len(), 3);
+    for id in ["serena", "codegraph", "nuphus", "python", "rust"] {
         assert_eq!(record(&report, id)["status"], "missing", "{id}: {report}");
     }
     assert!(!fixture.home.exists());
@@ -225,7 +218,7 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
 fn discover_reports_missing_codegraph_without_mutating_or_downloading() {
     let fixture = Fixture::new();
     let report = fixture.observe(&["--no-process-environment"]);
-    assert_eq!(report["mcp"].as_array().unwrap().len(), 4);
+    assert_eq!(report["mcp"].as_array().unwrap().len(), 3);
     assert_eq!(
         report["mcp"]
             .as_array()
@@ -407,7 +400,6 @@ fn package_identity_escape_ambiguity_aliases_and_partial_failures_stay_distinct(
     fs::write(&manifest, "{ invalid private parser sentinel").unwrap();
     let report = fixture.observe(&["--include-process-environment"]);
     assert_eq!(record(&report, "python")["status"], "incomplete");
-    assert_eq!(record(&report, "graphify")["status"], "missing");
     assert!(!report.to_string().contains("private parser sentinel"));
     assert_eq!(
         fs::read_to_string(outside).unwrap(),
@@ -445,9 +437,12 @@ fn rustup_metadata_and_saved_graph_are_read_without_executing_or_leaking_credent
         false
     );
     assert_eq!(record(&report, "rust")["version"], Value::Null);
-    assert_eq!(
-        record(&report, "graphify")["shared_service"]["graph_exists"],
-        true
+    assert!(
+        report["mcp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != "graphify")
     );
     for private in [
         "private credential sentinel",

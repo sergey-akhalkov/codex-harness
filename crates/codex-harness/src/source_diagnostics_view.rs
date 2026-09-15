@@ -5,7 +5,7 @@
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeSet, io, path::Path};
 
-const SAFE_KEYS: [&str; 8] = [
+const SAFE_KEYS: [&str; 9] = [
     "model",
     "model_reasoning_effort",
     "approval_policy",
@@ -14,6 +14,11 @@ const SAFE_KEYS: [&str; 8] = [
     "features.hooks",
     "features.multi_agent",
     "features.memories",
+    "features.context_management.experimental_mode",
+];
+const SHARED_DEFAULT_KEYS: [&str; 2] = [
+    "developer_instructions",
+    "features.context_management.experimental_mode",
 ];
 
 fn invalid() -> io::Error {
@@ -327,6 +332,21 @@ pub(crate) fn summarize(
             }));
         }
     }
+    if profile_name == "harness" && !withhold {
+        for key in SHARED_DEFAULT_KEYS {
+            let present = settings
+                .iter()
+                .any(|row| row["key"] == key && !row["value"].is_null() && row["value"] != "");
+            if !present {
+                findings.push(json!({
+                    "code": "shared-defaults-missing",
+                    "key": key,
+                    "source": path_text(profile_path),
+                    "action": "Ordinary sessions are missing live shared defaults. Repair config-overrides admission or the recorded configBridge; do not treat fallback without developer instructions or experimental context management as a successful kit session."
+                }));
+            }
+        }
+    }
 
     let mut layer_rows = Vec::new();
     for (name, _, disabled) in &layers {
@@ -566,11 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn harness_profile_without_live_shared_defaults_is_a_fault() {
+        let value = view(
+            vec![layer(
+                "user",
+                r"D:\home\.codex\config.toml",
+                json!({"model": "gpt-6-astra"}),
+                None,
+            )],
+            json!({"model": "gpt-6-astra"}),
+            json!({"requirements": null}),
+            empty_skills(),
+        );
+        let codes = codes(&value);
+        assert!(codes.contains(&"shared-defaults-missing"), "{codes:?}");
+        assert!(setting(&value, "developer_instructions")["value"].is_null());
+        assert!(
+            setting(&value, "features.context_management.experimental_mode")["value"].is_null()
+        );
+    }
+
+    #[test]
     fn explicit_false_project_winner_and_disabled_layer() {
         let profile = json!({
             "model": "xai/grok-4.6",
             "model_reasoning_effort": "xhigh",
-            "features": {"hooks": true, "multi_agent": false}
+            "developer_instructions": "Owned shared default marker",
+            "features": {"hooks": true, "multi_agent": false, "context_management": {"experimental_mode": true}}
         });
         let trusted = view(
             vec![

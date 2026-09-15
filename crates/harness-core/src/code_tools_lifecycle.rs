@@ -112,7 +112,7 @@ fn python_spec(source: &Path, home: &Path, python: &Path, name: &str) -> io::Res
 
 fn retained_from_inventory(source: &Path, home: &Path, inventory: &Value) -> io::Result<Value> {
     let mut retained = Map::new();
-    for name in ["serena", "graphify", "nuphus"] {
+    for name in ["serena", "nuphus"] {
         let Some(item) = inventory["mcp"]
             .as_array()
             .and_then(|items| items.iter().find(|item| item["id"] == name))
@@ -259,27 +259,26 @@ pub fn run(request: &Request) -> io::Result<Report> {
             inventory_servers: Vec::new(),
         });
     }
-    if activating {
-        if let Some(manager) = request.manager.as_deref() {
-            let prepared = codegraph_integration::prepare(
-                &codegraph_integration::Request {
-                    codex_home: home.clone(),
-                    dependency_state: dependency.join(".cache/coding-agents-harness-codegraph"),
-                    package_root: None,
-                    mode: if request.mode == Mode::Update {
-                        "Check".into()
-                    } else {
-                        "Install".into()
-                    },
+    if activating && let Some(manager) = request.manager.as_deref() {
+        let prepared = codegraph_integration::prepare(
+            &codegraph_integration::Request {
+                codex_home: home.clone(),
+                dependency_state: dependency.join(".cache/coding-agents-harness-codegraph"),
+                package_root: None,
+                source_root: None,
+                mode: if request.mode == Mode::Update {
+                    "Check".into()
+                } else {
+                    "Install".into()
                 },
-                manager,
-            )?;
-            if let Some(graph) = prepared
-                .get("registrations")
-                .and_then(|value| value.get("codegraph"))
-            {
-                retained_for_graph["registrations"]["codegraph"] = graph.clone();
-            }
+            },
+            manager,
+        )?;
+        if let Some(graph) = prepared
+            .get("registrations")
+            .and_then(|value| value.get("codegraph"))
+        {
+            retained_for_graph["registrations"]["codegraph"] = graph.clone();
         }
     }
     let registration = codegraph_registration::apply(&RegistrationRequest {

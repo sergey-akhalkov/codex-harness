@@ -1,12 +1,14 @@
 //! Explicit plan-action dispatcher for native dependency candidates.
 //! Check and preview stay read-only. Mutation stages and selects only the
-//! native slots; remaining backends stay pending for Python apply_selected.
+//! native slots and shared npm MCP installations; remaining backends stay
+//! pending for their owning migration tasks.
 #![cfg(windows)]
 
 use crate::{
     build_identity,
     dependency_discovery::{self, Request as DiscoveryRequest, local_path},
-    dependency_plan, dependency_releases, dependency_selection, dependency_stage, inventory,
+    dependency_npm_install, dependency_plan, dependency_releases, dependency_rust_component,
+    dependency_selection, dependency_stage, inventory,
 };
 use serde_json::{Value, json};
 use std::{
@@ -16,7 +18,7 @@ use std::{
 };
 
 const NATIVE_BACKEND_PENDING: &str =
-    "Required backend-specific provisioning/update remains on Python apply_selected until ported.";
+    "Required backend-specific provisioning/update remains unfinished; no package is acquired.";
 
 pub struct Request {
     pub source: PathBuf,
@@ -189,6 +191,71 @@ fn apply_native(request: &Request, item: &Value, activating: bool) -> io::Result
                 .unwrap_or("Required backend-specific provisioning/update remains unfinished."),
             item,
         )),
+        "install-required" if matches!(id, "codebase-memory" | "nuphus") => {
+            if !activating {
+                return Ok(result_item(
+                    id,
+                    "previewed",
+                    json!({
+                        "action": action,
+                        "packages_acquired": false,
+                        "reason": "Check and preview do not stage, install or acquire packages."
+                    }),
+                ));
+            }
+            let Some(version) = item["release"]["version"].as_str() else {
+                return Ok(pending(
+                    id,
+                    "Compatible version selection is unresolved; no package is acquired.",
+                    item,
+                ));
+            };
+            let owned = dependency_npm_install::Request {
+                manager: request.manager.clone(),
+                user_home: request.user_home.clone(),
+                state: request.state.clone(),
+                node: request.node.clone(),
+            };
+            match dependency_npm_install::provision(&owned, id, version) {
+                Ok(mut value) => {
+                    value["id"] = json!(id);
+                    Ok(value)
+                }
+                Err(error) => Ok(result_item(
+                    id,
+                    "failed",
+                    json!({"reason": error.to_string(), "packages_acquired": false}),
+                )),
+            }
+        }
+        "install-required" if id == "rust" => {
+            if !activating {
+                return Ok(result_item(
+                    id,
+                    "previewed",
+                    json!({
+                        "action": action,
+                        "packages_acquired": false,
+                        "reason": "Check and preview do not stage, install or acquire packages."
+                    }),
+                ));
+            }
+            let owned = dependency_rust_component::Request {
+                user_home: request.user_home.clone(),
+                state: request.state.clone(),
+            };
+            match dependency_rust_component::provision(&owned) {
+                Ok(mut value) => {
+                    value["id"] = json!(id);
+                    Ok(value)
+                }
+                Err(error) => Ok(result_item(
+                    id,
+                    "failed",
+                    json!({"reason": error.to_string(), "packages_acquired": false}),
+                )),
+            }
+        }
         "install-required" | "stage-compatible-update" => {
             if !activating {
                 return Ok(result_item(
@@ -362,7 +429,7 @@ pub fn apply(request: &Request) -> io::Result<Value> {
         "results": results,
         "complete": complete,
         "all_updates_applied": all_updates_applied,
-        "note": "Native slots may be staged and selected; remaining backends stay pending for Python apply_selected. Installed-unverified records require real consumer checks."
+        "note": "Missing shared npm MCP packages install through the native journaled path; serena, graphify and shared-tree replacements stay pending for their owning tasks. Installed-unverified records require real consumer checks."
     }))
 }
 
@@ -432,7 +499,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(rust["state"], "pending");
+        assert_eq!(rust["state"], "prerequisite-missing");
         assert_eq!(rust["packages_acquired"], false);
         let consumers = apply_native(
             &request(Path::new("D:/unused"), false, false),
@@ -480,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn non_codegraph_backends_stay_pending_for_python() {
+    fn nuphus_routes_to_native_install_and_serena_stays_pending() {
         let result = apply_native(
             &request(Path::new("D:/unused"), false, false),
             &json!({
@@ -500,8 +567,9 @@ mod tests {
                 .unwrap()
                 .contains("explicit Node path and digest")
         );
+        let owned = tempfile::tempdir().unwrap();
         let nuphus = apply_native(
-            &request(Path::new("D:/unused"), false, false),
+            &request(owned.path(), false, false),
             &json!({
                 "id":"nuphus",
                 "action":"install-required",
@@ -511,8 +579,26 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(nuphus["state"], "pending");
+        assert_eq!(nuphus["state"], "failed");
         assert_eq!(nuphus["packages_acquired"], false);
+        assert!(
+            nuphus["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        let serena = apply_native(
+            &request(Path::new("D:/unused"), false, false),
+            &json!({
+                "id":"serena",
+                "action":"install-required",
+                "identity":"serena-agent",
+                "release":{"state":"checked","version":"1.7.0"}
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(serena["state"], "pending");
+        assert_eq!(serena["packages_acquired"], false);
     }
 
     #[test]

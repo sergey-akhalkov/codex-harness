@@ -52,12 +52,14 @@ pub mod dependency_candidate;
 pub mod dependency_discovery;
 mod dependency_fetch;
 pub mod dependency_mcp_probe;
+pub mod dependency_npm_install;
 mod dependency_package;
 pub mod dependency_plan;
 mod dependency_probe;
 pub mod dependency_process;
 pub mod dependency_python_stage;
 pub mod dependency_releases;
+pub mod dependency_rust_component;
 pub mod dependency_selection;
 pub mod dependency_stage;
 pub mod environment_path;
@@ -70,6 +72,7 @@ mod installation_path;
 pub mod installation_state;
 pub mod inventory;
 pub mod launcher;
+pub mod lazy_stdio;
 mod legacy_pending;
 mod legacy_pending_format;
 #[cfg(windows)]
@@ -80,7 +83,13 @@ pub mod mcp_stdio;
 pub mod native_build;
 pub mod native_launcher;
 pub mod native_upstream;
+pub mod nuphus_protocol;
+#[cfg(windows)]
+pub mod nuphus_stdio;
 pub mod opencodex;
+#[cfg(windows)]
+pub mod opencodex_login;
+pub mod opencodex_restore;
 pub mod outcome_report;
 pub mod path_plan;
 pub mod portable_config;
@@ -94,9 +103,15 @@ mod registration_native;
 pub mod resource_admission;
 #[cfg(windows)]
 pub mod serena;
+pub mod serena_broker;
+pub mod serena_route;
+pub mod serena_shared;
+pub mod serena_stdio;
 pub mod source_observation;
 #[cfg(windows)]
 pub mod subscription_lifecycle;
+#[cfg(windows)]
+pub mod subscription_service;
 #[cfg(windows)]
 pub mod task_admission;
 #[cfg(windows)]

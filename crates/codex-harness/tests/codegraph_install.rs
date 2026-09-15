@@ -242,7 +242,13 @@ fn install_replaces_owned_cbm_and_preserves_indexes_packages_and_unrelated_setti
     let servers = servers(&home);
     assert!(servers.get("codebase-memory").is_none(), "{servers}");
     let graph = &servers["codegraph"];
-    assert_eq!(graph["command"], env!("CARGO_BIN_EXE_codex-harness"));
+    assert!(
+        same_path(
+            graph["command"].as_str().unwrap(),
+            Path::new(env!("CARGO_BIN_EXE_codex-harness"))
+        ),
+        "{graph}"
+    );
     assert_eq!(graph["args"][0], "mcp");
     assert_eq!(graph["args"][1], "codegraph");
     assert_eq!(graph["tool_timeout_sec"], 660);
@@ -773,13 +779,145 @@ fn retained_handoff_cannot_select_codegraph_or_enable_lsp() {
         &["--retained-registrations-json", &hijack],
     );
     let servers = servers(&home);
-    assert_eq!(
-        servers["codegraph"]["command"],
-        env!("CARGO_BIN_EXE_codex-harness")
+    assert!(
+        same_path(
+            servers["codegraph"]["command"].as_str().unwrap(),
+            Path::new(env!("CARGO_BIN_EXE_codex-harness"))
+        ),
+        "{servers}"
     );
     assert_eq!(servers["codegraph"]["args"][1], "codegraph");
     assert!(servers.get("harness-lsp").is_none(), "{servers}");
     assert_eq!(servers["serena"]["command"], "C:\\python\\python.exe");
+}
+
+#[test]
+fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let package = root.path().join("shared-package");
+    fs::create_dir_all(&package).unwrap();
+    let python = root.path().join("python.exe");
+    let entry = root.path().join("serena_entry.py");
+    fs::write(&python, b"fixture interpreter").unwrap();
+    fs::write(&entry, b"fixture entry").unwrap();
+    let serena = json!({
+        "command": env!("CARGO_BIN_EXE_codex-harness"),
+        "args": [
+            "mcp",
+            "serena",
+            "--python",
+            python,
+            "--entry",
+            entry,
+            "--registry",
+            home.join("harness/code-tools.json"),
+            "--codex-home",
+            home,
+            "--source-root",
+            root.path(),
+            "--connection-seconds",
+            "86400"
+        ],
+        "env": {"CODEX_HOME": home},
+        "startup_timeout_sec": 30,
+        "tool_timeout_sec": 660
+    });
+    let nuphus = json!({
+        "command": "C:\\pwsh\\pwsh.exe",
+        "args": ["-NoLogo", "-NoProfile", "-File", "mcp.ps1", "-Server", "nuphus"],
+        "env": {"CODEX_HOME": home}
+    });
+    let connected = run_apply(
+        &home,
+        "Install",
+        Some(&package),
+        &[
+            "--retained-registrations-json",
+            &json!({
+                "serena": serena,
+                "nuphus": nuphus
+            })
+            .to_string(),
+        ],
+    );
+    assert_eq!(connected["status"], "connected", "{connected}");
+    let servers = servers(&home);
+    assert!(
+        same_path(
+            servers["serena"]["command"].as_str().unwrap(),
+            Path::new(env!("CARGO_BIN_EXE_codex-harness"))
+        ),
+        "{servers}"
+    );
+    assert_eq!(servers["serena"]["args"][1], "serena");
+    assert!(servers.get("graphify").is_none(), "{servers}");
+    assert_eq!(servers["nuphus"]["args"][5], "nuphus");
+    assert_eq!(servers["foreign"]["command"], "untouched.exe");
+    let text = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(text.contains("retain my comment"), "{text}");
+    assert!(text.contains("untouched.exe"), "{text}");
+}
+
+#[test]
+#[ignore = "requires CODEGRAPH_ACCEPTANCE_PACKAGE pointing at the pinned published tree"]
+fn native_prepare_with_source_emits_serena_proxy_for_adopted_interpreter() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let python = root.path().join("python.exe");
+    fs::write(&python, b"fixture interpreter").unwrap();
+    fs::write(
+        home.join("harness/code-tools.json"),
+        serde_json::to_vec(&json!({
+            "mcp": [{
+                "id": "serena",
+                "paths": {"python": python}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let package = PathBuf::from(
+        std::env::var_os("CODEGRAPH_ACCEPTANCE_PACKAGE").expect("explicit published package"),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args([
+            "mcp",
+            "prepare-codegraph",
+            "--mode",
+            "Check",
+            "--codex-home",
+            home.to_str().unwrap(),
+            "--dependency-state",
+            root.path().join("state").to_str().unwrap(),
+            "--package-root",
+            package.to_str().unwrap(),
+            "--source",
+            source.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", fail(&output));
+    let prepared: Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{}", fail(&output)));
+    assert_eq!(prepared["status"], "prepared", "{prepared}");
+    let serena = &prepared["registrations"]["serena"];
+    assert!(
+        same_path(
+            serena["command"].as_str().unwrap(),
+            Path::new(env!("CARGO_BIN_EXE_codex-harness"))
+        ),
+        "{serena}"
+    );
+    assert_eq!(serena["args"][1], "serena");
+    assert!(
+        same_path(serena["args"][3].as_str().unwrap(), &python),
+        "{serena}"
+    );
 }
 
 #[test]
@@ -867,4 +1005,137 @@ fn planner_handoff_from_existing_inspect_registers_retained_tools_without_mutati
     assert!(servers.get("codebase-memory").is_none(), "{servers}");
     assert!(servers.get("harness-lsp").is_none(), "{servers}");
     assert_eq!(servers["foreign"]["command"], "untouched.exe");
+}
+
+#[test]
+fn check_reports_source_stale_serving_command_as_degraded_but_callable() {
+    use harness_core::build_identity::{self, BINARIES, BuildRecord, INSPECTION_SCHEMA, SCHEMA};
+    use std::collections::BTreeMap;
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let source = root.path().join("source");
+    let build = root.path().join("build");
+    for directory in [
+        source.join("crates/one/src"),
+        source.join("tools/rtk-adapter/src"),
+        source.join(INSPECTION_SCHEMA).parent().unwrap().into(),
+        build.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    for file in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/one/src/lib.rs",
+        INSPECTION_SCHEMA,
+    ] {
+        fs::write(source.join(file), "owned identity fixture").unwrap();
+    }
+    let manager = build.join("codex-harness.exe");
+    fs::copy(env!("CARGO_BIN_EXE_codex-harness"), &manager).unwrap();
+    let mut binaries = BTreeMap::new();
+    for name in BINARIES {
+        let path = build.join(name);
+        if *name != "codex-harness.exe" {
+            fs::write(&path, name).unwrap();
+        }
+        binaries.insert(
+            (*name).to_owned(),
+            build_identity::hash_file(&path).unwrap(),
+        );
+    }
+    let record = BuildRecord {
+        schema: SCHEMA,
+        source_root: source.clone(),
+        source: build_identity::source_identity(&source).unwrap(),
+        rustc: "fixture".into(),
+        cargo: "fixture".into(),
+        target: "x86_64-pc-windows-msvc".into(),
+        profile: "release".into(),
+        binaries,
+    };
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let package = root.path().join("shared-package");
+    fs::create_dir_all(&package).unwrap();
+    let connected = {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command.args([
+            "mcp",
+            "apply-codegraph-registration",
+            "--mode",
+            "Install",
+            "--codex-home",
+            home.to_str().unwrap(),
+            "--command",
+        ]);
+        command.arg(&manager);
+        command.args(["--package-root", package.to_str().unwrap()]);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", fail(&output));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(connected["status"], "connected");
+    fs::write(source.join("crates/one/src/lib.rs"), "changed owned source").unwrap();
+    let before = fs::read(home.join("config.toml")).unwrap();
+    let checked = {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+        command.args([
+            "mcp",
+            "apply-codegraph-registration",
+            "--mode",
+            "Check",
+            "--codex-home",
+            home.to_str().unwrap(),
+            "--command",
+        ]);
+        command.arg(&manager);
+        command.args(["--package-root", package.to_str().unwrap()]);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", fail(&output));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(checked["status"], "degraded");
+    assert_eq!(checked["serving_allowed"], true);
+    assert_eq!(checked["callable"], true);
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), before);
+}
+
+#[test]
+fn check_reports_missing_codegraph_command_as_degraded_and_not_callable() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let package = root.path().join("shared-package");
+    fs::create_dir_all(&package).unwrap();
+    let missing = root.path().join("missing-manager.exe");
+    let before = fs::read(home.join("config.toml")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    command.args([
+        "mcp",
+        "apply-codegraph-registration",
+        "--mode",
+        "Check",
+        "--codex-home",
+        home.to_str().unwrap(),
+        "--command",
+    ]);
+    command.arg(&missing);
+    command.args(["--package-root", package.to_str().unwrap()]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{}", fail(&output));
+    let checked: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(checked["status"], "degraded");
+    assert_eq!(checked["serving_allowed"], false);
+    assert_eq!(checked["callable"], false);
+    assert!(
+        checked["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item.as_str().unwrap_or_default().contains("cannot serve") })
+    );
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), before);
 }

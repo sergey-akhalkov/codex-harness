@@ -36,6 +36,54 @@ fn retire(root: &BrokerRoot) {
     ));
 }
 
+/// One deliberate maintenance operation through this lane's bounded broker;
+/// the model-facing MCP catalogue exposes search/detail only.
+pub(super) fn deliberate(
+    configuration: &harness_core::codegraph_stdio::Configuration,
+    package: &Path,
+    root: &BrokerRoot,
+    name: &str,
+) -> Value {
+    // The control CLI is the real spawned client executable; routing it
+    // through the lane broker satisfies the broker's identity checks and
+    // reuses the lane's bounded worker instead of a second account slot.
+    let operation = match name {
+        "codegraph_index" => "index",
+        "codegraph_sync" => "sync",
+        "codegraph_status" => "status",
+        _ => panic!("unsupported deliberate operation {name}"),
+    };
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .arg("mcp")
+        .arg("codegraph-control")
+        .arg("--package-root")
+        .arg(package)
+        .arg("--project")
+        .arg(&configuration.project)
+        .arg("--broker-root")
+        .arg(root.path())
+        .arg("--operation")
+        .arg(operation)
+        .output()
+        .expect("control CLI spawn");
+    assert!(
+        output.status.success(),
+        "control CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Control-CLI JSON is the native runtime/broker payload, not an MCP
+/// tools/call envelope. Search/detail answers still use structuredContent.
+pub(super) fn control_field<'a>(value: &'a Value, name: &str) -> &'a Value {
+    if value.get("structuredContent").is_some() {
+        &value["structuredContent"][name]
+    } else {
+        &value[name]
+    }
+}
+
 fn inventory(project: &Path, package: &Path) -> BTreeSet<String> {
     // Read the pinned runtime's literal extension map, without executing a
     // generated foreign-language inventory helper or inferring from counts.
@@ -170,7 +218,7 @@ fn published_real_roots_compare_raw_and_managed_and_refresh() {
         let startup_ms = started.elapsed().as_millis();
         let catalogue = client.request("tools/list", json!({}));
         let indexed_at = Instant::now();
-        let indexed = client.call("codegraph_index", json!({}));
+        let indexed = deliberate(&config, &package, broker, "codegraph_index");
         let index_ms = indexed_at.elapsed().as_millis();
         let mut root_report = json!({"id":root_spec["id"],"root":project,"eligible":eligible,
             "managed_startup_ms":startup_ms,"managed_catalogue_bytes":bytes(&catalogue),
@@ -296,7 +344,7 @@ fn published_real_roots_compare_raw_and_managed_and_refresh() {
             Some(broker.path()),
             Some(&package),
         );
-        client.call("codegraph_status", json!({}));
+        deliberate(&config, &package, broker, "codegraph_status");
         fs::write(
             probe.path().join("added.rs"),
             "pub fn harness_owned_refresh_old() -> u32 { 1 }\n",
@@ -338,20 +386,24 @@ fn published_real_roots_compare_raw_and_managed_and_refresh() {
             Some(&format!("{relative}/renamed.rs")),
             Some("added.rs"),
         );
-        let synced = client.call("codegraph_sync", json!({}));
+        let synced = deliberate(&config, &package, broker, "codegraph_sync");
         assert_ne!(synced["isError"], true, "{synced}");
         client.finish();
         retire(broker);
         fs::remove_file(probe.path().join("renamed.rs")).unwrap();
-        let mut client =
-            Client::start_command("", Some(config), Some(broker.path()), Some(&package));
+        let mut client = Client::start_command(
+            "",
+            Some(config.clone()),
+            Some(broker.path()),
+            Some(&package),
+        );
         let deleted = query_until(
             &mut client,
             "harness_owned_refresh_changed",
             None,
             Some("renamed.rs"),
         );
-        let final_sync = client.call("codegraph_sync", json!({}));
+        let final_sync = deliberate(&config, &package, broker, "codegraph_sync");
         assert_ne!(final_sync["isError"], true, "{final_sync}");
         client.finish();
         retire(broker);
@@ -518,9 +570,9 @@ fn connect_live(id: &str, project: &Path, package: &Path, broker: &Path, index: 
     )
     .unwrap();
     if index {
-        let mut client =
-            Client::start_command("", Some(config.clone()), Some(broker), Some(package));
-        let indexed = client.call("codegraph_index", json!({}));
+        let client = Client::start_command("", Some(config.clone()), Some(broker), Some(package));
+        let root = BrokerRoot::open(broker).unwrap();
+        let indexed = deliberate(&config, package, &root, "codegraph_index");
         assert_ne!(indexed["isError"], true, "{indexed}");
         let generation = super::wait_checkpoint(&config.project, 0, Some("src/lib.rs"), None);
         LiveRoot {
@@ -823,7 +875,7 @@ fn concurrent_real_roots_with_owned_fixture(
             None,
             Some(&renamed),
         );
-        let synced = live.client.call("codegraph_sync", json!({}));
+        let synced = deliberate(&live.config, package, broker, "codegraph_sync");
         assert_ne!(synced["isError"], true, "{synced}");
         refresh[&live.id]["deleted"] = deleted;
         refresh[&live.id]["manual"] = synced;

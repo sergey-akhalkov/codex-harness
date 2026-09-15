@@ -2,7 +2,7 @@
 use serde_json::{Map, Value, json};
 use std::{io, time::Duration};
 
-pub const INSTRUCTIONS: &str = "CodeGraph 1.6.0 managed adapter. Select the exact project root in the connection. Use codegraph_index deliberately for an initial/full index and codegraph_sync for an explicit incremental checkpoint. Shared connections observe every active indexed project and fairly queue automatic catch-up under one account indexing slot. Each episode is limited to 600 seconds; healthy worker retirement preserves observation. After an actual failure inspect the cause and sync deliberately. Prefer Serena for known-file symbols, exact references and edits. Graph edges are candidates. Pending, failed or unverified coverage requires current source. Five matches, depth one and 4096 serialized bytes by default; explore requires an explicit question and one or two files. Details are private to this client and expire; retrieving them never repeats a query.";
+pub const INSTRUCTIONS: &str = "CodeGraph 1.6.0 managed adapter. Select the exact project root in the connection. Deliberate indexing, explicit catch-up and status inspection run outside model sessions through 'codex-harness mcp codegraph-control'. Shared connections observe every active indexed project and fairly queue automatic catch-up under one account indexing slot. Each episode is limited to 600 seconds; healthy worker retirement preserves observation. After an actual failure inspect the cause and use the control command deliberately. Prefer Serena for known-file symbols, exact references and edits. Graph edges are candidates. Pending, failed or unverified coverage requires current source. Five matches and 4096 serialized bytes by default. Details are private to this client and expire; retrieving them never repeats a query.";
 
 pub struct Request {
     pub arguments: Value,
@@ -176,6 +176,9 @@ pub fn request(name: &str, value: Value) -> io::Result<Request> {
 }
 
 pub fn tools() -> Vec<Value> {
+    // Model-facing surface: bounded queries only. Maintenance operations stay
+    // available through the native control CLI and internal catch-up.
+    const EXPOSED: &[&str] = &["codegraph_search", "codegraph_detail"];
     let s = || json!({"type":"string","minLength":1,"maxLength":1024});
     let n =
         |min, max, default| json!({"type":"integer","minimum":min,"maximum":max,"default":default});
@@ -241,7 +244,10 @@ pub fn tools() -> Vec<Value> {
             vec!["id"],
         ),
     ];
-    definitions.into_iter().map(|(name,description,mut properties,required)| {
+    definitions
+        .into_iter()
+        .filter(|entry| EXPOSED.contains(&entry.0))
+        .map(|(name,description,mut properties,required)| {
         properties["max_response_bytes"] = n(1024,16384,4096);
         json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
     }).collect()

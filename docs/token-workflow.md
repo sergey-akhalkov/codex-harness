@@ -32,6 +32,10 @@ cover awaited browser steps, partial-effect recovery and connected-resource
 identity. These instructions guide tool use. Native comparison retained the
 verified baseline routes: no repeating speed or output benefit beyond variation
 was shown, and `approval_policy=never` still rejects some MCP mutations.
+Desktop and window screenshots that arrive as nested JSON/base64 text are converted
+to native image blocks or owned path-only results before model context. Conversation
+visibility is a controller/UI obligation, not a Nuphus screenshot loop. Character
+counts and thread `tokens_used` are not weekly-quota percentages.
 
 For symbols in a known file, start with Serena. Use the selected graph for
 compact discovery and relationships when it avoids several reads; do not call
@@ -47,12 +51,23 @@ graph registration, with automatic refresh inside the resource policy.
 
 For a new task the launcher accepts `--harness-effort routine|standard|demanding`
 as the first argument, mapping to native `low|high|xhigh`. An explicit native
-effort or profile wins; ordinary start keeps `xhigh`. Changing effort inside an
+effort or profile wins. Without an explicit selection the launcher applies
+per-model defaults: `zai/glm-5.3` runs at `max`, while `xai/grok-4.6` and
+the Astra family run at `xhigh`; unmapped models keep the native
+configuration. Changing effort inside an
 already running turn of the current CLI is unsupported. An external app-server
 client may set `turn/start.effort` for the next turn. Effort names do not prove
 a savings percentage. Apply the current
 [model selection and recovery rules](agent-delegation.md#how-selection-works);
 former named levels are migration context, not required dispatch presets.
+
+Treat sessions as consumable context, guided by measured usage: a few marathon
+threads repay their whole history every turn (single sessions measured at
+hundreds of millions of input tokens), while the fixed instruction floor is
+about 19-28k input tokens per session start. Start a new session for a new
+topic, answer small follow-ups in a fresh or forked session with a concise
+handoff, and hand children concise briefs instead of parent history. This is
+advisory practice, not a scheduler.
 
 Installation uses RTK 0.48.0 for Windows x64 with pinned archive and exe
 SHA-256. Building the small adapter needs Cargo/Rust; sources are in

@@ -227,7 +227,7 @@ function Invoke-HarnessSourceDiagnostics {
         }
         if (-not $inserted) { throw 'missing-native-user-layer' }
         $settings = [Collections.Generic.List[object]]::new()
-        $safeKeys=@('model','model_reasoning_effort','approval_policy','sandbox_mode','developer_instructions','features.hooks','features.multi_agent','features.memories')
+        $safeKeys=@('model','model_reasoning_effort','approval_policy','sandbox_mode','developer_instructions','features.hooks','features.multi_agent','features.memories','features.context_management.experimental_mode')
         foreach ($key in $safeKeys) {
             $declarations = @($layers | Where-Object { $null -ne (Get-DiagnosticValue $_.config $key) } | ForEach-Object {
                 @{source=(Get-DiagnosticSource $_.name);active=(-not $_['disabledReason']);value=(Get-DiagnosticPreference $key (Get-DiagnosticValue $_.config $key))}
@@ -238,6 +238,14 @@ function Invoke-HarnessSourceDiagnostics {
             $overridden = $profileLayer.Count -gt 0 -and $null -ne $origin -and (-not $origin.Contains('profile') -or $origin.profile -ne $ProfileName)
             $settings.Add(@{key=$key;value=$(if ($origin) {$winner[0].value} else {$null});origin=$origin;declarations=$declarations;overridden=$overridden;evidence='inferred-from-native-layers';runtimeDefault='not-inferred'})
             if ($overridden) { $findings.Add(@{code='setting-overridden';key=$key;source=$origin;action='Review the winning source; retain an intentional override or edit it explicitly to use the profile.'}) }
+        }
+        if ($sharedConsumer -and -not $contextChanged -and $null -eq $requirements.requirements) {
+            foreach ($key in @('developer_instructions','features.context_management.experimental_mode')) {
+                $row = @($settings | Where-Object key -eq $key | Select-Object -First 1)
+                if (-not $row -or $null -eq $row.value -or $row.value -eq '') {
+                    $findings.Add(@{code='shared-defaults-missing';key=$key;source=$profilePath;action='Ordinary sessions are missing live shared defaults. Repair config-overrides admission or the recorded configBridge; do not treat fallback without developer instructions or experimental context management as a successful kit session.'})
+                }
+            }
         }
         $report.settings=$settings.ToArray()
         $report.layers=@($layers | ForEach-Object { @{source=(Get-DiagnosticSource $_.name);status=$(if ($_['disabledReason']) {'disabled'} else {'active'})} })
@@ -255,7 +263,11 @@ function Invoke-HarnessSourceDiagnostics {
         $report.native=@{status='observed';executable=$native;protocol='config/read + configRequirements/read + skills/list';version=$nativeVersion;profileSelection=$(if ($sharedConsumer) {'live shared CLI overrides; native base persistence'} else {'reconstructed; app-server does not accept file profiles'});skillsScope='native base consumer'}
     } catch {
         $category = if ($_.Exception -is [TimeoutException]) {'native-timeout'} else {'native-unavailable-or-incompatible'}
+        if ("$($_.Exception.Message)" -eq 'shared-config-unavailable' -or "$($_)" -eq 'shared-config-unavailable') {
+            $findings.Add(@{code='shared-defaults-missing';source=(Join-Path $CodexHome 'harness/installation.json');action='config-overrides failed. Ordinary sessions are missing live shared defaults; repair the recorded configBridge. Native error text is withheld.'})
+        } else {
         $findings.Add(@{code=$category;source=$CodexCommand;action='Check the installed CLI, selected profile, project path and TOML locally; native error text is withheld.'})
+        }
     } finally {
         Stop-DiagnosticConsumer $server
     }

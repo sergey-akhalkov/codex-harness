@@ -22,6 +22,7 @@ use std::{
 const BEGIN: &str = "# BEGIN codex-harness MCP registrations\n";
 const END: &str = "# END codex-harness MCP registrations\n";
 const CBM: &str = "codebase-memory";
+const GRAPHIFY: &str = "graphify";
 const GRAPH: &str = "codegraph";
 const LSP: &str = "harness-lsp";
 const READINESS: &str = "mcp_optional_startup_grace_ms";
@@ -90,11 +91,18 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
         ops.push(operation.clone());
     }
     if request.mode == "Check" {
+        let serving = serving_status(graph.as_ref(), &desired)?;
+        let connected = ops.is_empty() && serving.admitted && serving.reason.is_none();
+        let mut operations = ops;
+        if let Some(reason) = serving.reason {
+            operations.push(Value::String(reason));
+        }
         return Ok(json!({
-            "status": if ops.is_empty() { "connected" } else { "degraded" },
-            "callable": Value::Null,
-            "operations": ops,
-            "note": "This checks registrations; real MCP calls are separate acceptance evidence.",
+            "status": if connected { "connected" } else { "degraded" },
+            "callable": serving.callable,
+            "serving_allowed": serving.admitted,
+            "operations": operations,
+            "note": serving.note,
             "model_calls": 0
         }));
     }
@@ -162,7 +170,7 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
             "status": if request.mode == "Disconnect" { "disconnected" } else { "connected" },
             "servers": desired.keys().cloned().collect::<Vec<_>>(),
             "callable": Value::Null,
-            "retired": if request.mode == "Disconnect" { Value::Array(vec![]) } else { json!([CBM]) },
+            "retired": if request.mode == "Disconnect" { Value::Array(vec![]) } else { json!([CBM, GRAPHIFY]) },
             "model_calls": 0
         }))
     })();
@@ -358,6 +366,78 @@ fn matching_after_state(actual_state: &[u8], pending: &Value) -> io::Result<Valu
         ));
     }
     serde_json::from_slice(actual_state).map_err(|error| invalid(&error.to_string()))
+}
+
+fn serving_status(
+    graph: Option<&Value>,
+    desired: &BTreeMap<String, Value>,
+) -> io::Result<ServingStatus> {
+    let Some(spec) = graph.or_else(|| desired.get(GRAPH)) else {
+        return Ok(ServingStatus {
+            admitted: false,
+            callable: Value::Bool(false),
+            reason: None,
+            note: "This checks registrations; real MCP calls are separate acceptance evidence."
+                .into(),
+        });
+    };
+    let command = spec["command"]
+        .as_str()
+        .ok_or_else(|| invalid("CodeGraph registration command is missing"))?;
+    let path = PathBuf::from(command);
+    let parent = path.parent();
+    if parent.is_some_and(|parent| parent.join("build.json").is_file()) {
+        let check = build_identity::check(parent.unwrap(), None);
+        if !check.serving_allowed {
+            return Ok(ServingStatus {
+                admitted: false,
+                callable: Value::Bool(false),
+                reason: Some(format!("CodeGraph command cannot serve: {}", check.action)),
+                note: "Owned CodeGraph command is not admitted for serving; configuration was not changed.".into(),
+            });
+        }
+        if !check.runtime_allowed {
+            return Ok(ServingStatus {
+                admitted: true,
+                callable: Value::Bool(true),
+                reason: Some(format!(
+                    "CodeGraph serving remains available; rebuild to pick up native adapter changes: {}",
+                    check.action
+                )),
+                note: "Owned CodeGraph remains callable after later source edits; source-consuming runtime still requires a healthy build.".into(),
+            });
+        }
+        return Ok(ServingStatus {
+            admitted: true,
+            callable: Value::Bool(true),
+            reason: None,
+            note: "This checks registrations; real MCP calls are separate acceptance evidence."
+                .into(),
+        });
+    }
+    if path.is_file() {
+        return Ok(ServingStatus {
+            admitted: true,
+            callable: Value::Null,
+            reason: None,
+            note: "This checks registrations; real MCP calls are separate acceptance evidence."
+                .into(),
+        });
+    }
+    Ok(ServingStatus {
+        admitted: false,
+        callable: Value::Bool(false),
+        reason: Some("CodeGraph command cannot serve: registered executable is missing.".into()),
+        note: "Owned CodeGraph command is not admitted for serving; configuration was not changed."
+            .into(),
+    })
+}
+
+struct ServingStatus {
+    admitted: bool,
+    callable: Value,
+    reason: Option<String>,
+    note: String,
 }
 
 fn codegraph_spec(request: &RegistrationRequest, home: &Path) -> io::Result<Option<Value>> {

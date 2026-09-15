@@ -23,7 +23,12 @@ live through the Rust configuration bridge; it creates no deployed configuration
 If harness preparation fails, ordinary `codex` falls back to the original CLI
 with the supplied native arguments and local settings. Missing or stale shared
 builds do not trigger compilation or block that fallback. A short stderr notice
-identifies unavailable shared defaults; Check continues to report harness health.
+identifies unavailable shared defaults. That fallback is a degraded session
+without live developer instructions or experimental context management; Check
+reports `shared-defaults-missing` rather than treating it as a healthy kit
+consumer. Source-stale identity still admits `config-overrides` on a
+management-healthy manager so ordinary sessions can receive live shared defaults
+without opening general source-consuming runtime.
 The installed command bootstrap has a local owned copy so an unavailable
 checkout cannot remove the command entry itself.
 

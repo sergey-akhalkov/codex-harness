@@ -61,21 +61,19 @@ def resolve_launch(server: str, inventory: Inventory, catalogue: Catalogue) -> t
         # wrapper/binary stay untouched. Schema compatibility lives in our source.
         command = [records['serena']['paths']['python'], '-u', str(SOURCE_ROOT / 'tools/code-tools/nuphus_proxy.py')]
         environment['NUPHUS_MCP_CONFIRM_WRITE'] = '0'
-    elif server == 'graphify':
-        command = [records['serena']['paths']['python'], '-u', str(SOURCE_ROOT / 'tools/code-tools/graphify_proxy.py')]
     else:
         raise ValueError('Unknown repository MCP')
     if not Path(command[0]).is_file():
         raise FileNotFoundError(f"{server}: resolved executable is missing")
     # Missing source is a broken installation, never a reason to download or search PATH.
-    if server in ('serena', 'harness-lsp', 'graphify', 'nuphus', 'codebase-memory') and not Path(command[2]).is_file():
+    if server in ('serena', 'harness-lsp', 'nuphus', 'codebase-memory') and not Path(command[2]).is_file():
         raise FileNotFoundError(f"{server}: repository entry point is missing")
     return command, environment
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('server', choices=['serena', 'codebase-memory', 'graphify', 'nuphus', 'harness-lsp'])
+    _ = parser.add_argument('server', choices=['serena', 'codebase-memory', 'nuphus', 'harness-lsp'])
     _ = parser.add_argument('--registry', required=True)
     args = Arguments()
     _ = parser.parse_args(namespace=args)

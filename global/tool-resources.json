@@ -13,6 +13,5 @@
     "configuration": {"auto_index": "false", "auto_watch": "false", "ui_enabled": "false"}
   },
   "serena": {"max_projects": 3, "idle_seconds": 300},
-  "graphify": {"max_contexts": 2},
   "nuphus": {"idle_seconds": 300}
 }

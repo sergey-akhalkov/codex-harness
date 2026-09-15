@@ -1,5 +1,7 @@
 //! Accepted script-launcher dispatch cases, ported as argument-vector oracles.
-use harness_core::launcher::{additional_roots, profile_arguments, task_arguments};
+use harness_core::launcher::{
+    additional_roots, per_model_effort, profile_arguments, task_arguments,
+};
 use std::ffi::OsString;
 
 fn argv(values: &[&str]) -> Vec<OsString> {
@@ -150,6 +152,61 @@ fn task_effort_does_not_interpret_prompts_or_override_native_settings() {
         &task_arguments(&input).unwrap()[..2],
         argv(&["-c", "model_reasoning_effort=\"low\""])
     );
+}
+
+#[test]
+fn per_model_effort_defaults_without_explicit_selection() {
+    for (model, effort) in [
+        ("xai/grok-4.6", "xhigh"),
+        ("gpt-6-astra", "xhigh"),
+        ("zai/glm-5.3", "max"),
+    ] {
+        let input = argv(&["-m", model, "exec", "hello"]);
+        let mut expected = argv(&["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
+        expected.extend(input.clone());
+        assert_eq!(per_model_effort(&input, None), expected);
+    }
+    let plain = argv(&["exec", "hello"]);
+    let mut expected = argv(&["-c", "model_reasoning_effort=\"max\""]);
+    expected.extend(plain.clone());
+    assert_eq!(per_model_effort(&plain, Some("zai/glm-5.3")), expected);
+    assert_eq!(
+        per_model_effort(&argv(&["-m", "other/model", "exec"]), None),
+        argv(&["-m", "other/model", "exec"])
+    );
+    assert_eq!(
+        per_model_effort(&argv(&["mcp", "list"]), Some("zai/glm-5.3")),
+        argv(&["mcp", "list"])
+    );
+}
+
+#[test]
+fn per_model_effort_respects_explicit_selections() {
+    for rest in [
+        argv(&[
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "-m",
+            "zai/glm-5.3",
+            "exec",
+        ]),
+        argv(&[
+            "--config=model_reasoning_effort=\"low\"",
+            "-m",
+            "zai/glm-5.3",
+        ]),
+        argv(&["-cmodel_reasoning_effort=\"low\"", "-m", "zai/glm-5.3"]),
+        argv(&["--model=zai/glm-5.3", "--profile", "personal", "exec"]),
+        argv(&["--remote=ws://localhost:9999", "-m", "zai/glm-5.3"]),
+    ] {
+        assert_eq!(per_model_effort(&rest, Some("xai/grok-4.6")), rest);
+    }
+    let input = argv(&["--harness-effort=routine", "-m", "zai/glm-5.3"]);
+    assert_eq!(per_model_effort(&input, None), input);
+    let input = argv(&["-c", "model=\"xai/grok-4.6\"", "exec"]);
+    let mut expected = argv(&["-c", "model_reasoning_effort=\"xhigh\""]);
+    expected.extend(input.clone());
+    assert_eq!(per_model_effort(&input, None), expected);
 }
 
 #[test]

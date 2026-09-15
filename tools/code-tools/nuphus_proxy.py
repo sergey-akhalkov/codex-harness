@@ -32,6 +32,10 @@ from process_ownership import JobGuard
 # checked independently. The locally patched binary is preserved and not run.
 AUDITED_ORIGINALS = {"0.2.2": "9a07112f17a964d9c0b1a54653af95559d7de33cce1cb3dffd60dfc4c85ccfb0"}
 SCHEMA_TOOLS = {"browser_click", "browser_type", "browser_drag_files"}
+SCREENSHOT_TOOLS = {"desktop_screenshot", "desktop_window_screenshot"}
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
+MAX_DIAGNOSTIC = 240
 
 
 def adapt_schema(tool):
@@ -45,6 +49,107 @@ def adapt_schema(tool):
                 raise ValueError(f"Unreviewed Nuphus alternative schema: {tool.name}")
             branch["type"] = "object"
     return tool
+
+
+class ScreenshotRejected(ValueError):
+    """A bounded screenshot refusal: original image bytes stay out of the MCP result."""
+
+
+def _bounded_detail(detail):
+    text = str(detail or "unknown screenshot conversion failure")
+    return text[:MAX_DIAGNOSTIC]
+
+
+def _decode_base64(payload):
+    import base64
+    compact = "".join(str(payload).split())
+    if compact.startswith("data:"):
+        header, _, compact = compact.partition(",")
+        if ";base64" not in header.lower() or not compact:
+            raise ScreenshotRejected("Screenshot data URL is not a bounded base64 image")
+    padding = (-len(compact)) % 4
+    try:
+        return base64.b64decode(compact + ("=" * padding), validate=True)
+    except Exception as error:
+        raise ScreenshotRejected("Screenshot payload is not valid base64") from error
+
+
+def _image_bytes(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return _image_bytes(json.loads(stripped))
+            except json.JSONDecodeError:
+                pass
+        return _decode_base64(stripped)
+    if isinstance(value, dict):
+        if "data" in value:
+            return _image_bytes(value["data"])
+        content = value.get("content")
+        if isinstance(content, list) and content:
+            return _image_bytes(content[0])
+        if "text" in value:
+            return _image_bytes(value["text"])
+        raise ScreenshotRejected("Screenshot object has no image data")
+    if isinstance(value, list) and value:
+        return _image_bytes(value[0])
+    raise ScreenshotRejected("Screenshot payload is not an image")
+
+
+def _png_mime(raw):
+    if not raw.startswith(PNG_SIGNATURE):
+        raise ScreenshotRejected("Screenshot payload is not a PNG image")
+    return "image/png"
+
+
+def _text_contains_image(text):
+    compact = "".join(text.split())
+    return "iVBORw0KGgo" in compact or compact.startswith("data:image/")
+
+
+def bound_screenshot_result(result, arguments=None, types_module=None):
+    from mcp import types as mcp_types
+    types_module = types_module or mcp_types
+    arguments = arguments or {}
+    path = arguments.get("path")
+    if isinstance(path, str) and path.strip():
+        if result.isError:
+            return result
+        text = "\n".join(item.text for item in result.content if getattr(item, "type", None) == "text")
+        if _text_contains_image(text):
+            raise ScreenshotRejected("Path screenshot result still contains image bytes")
+        if path not in text:
+            text = ((text + "\n") if text else "") + path
+        return result.model_copy(update={"content": [types_module.TextContent(type="text", text=text)]})
+    try:
+        raw = None
+        if result.structuredContent is not None:
+            try:
+                raw = _image_bytes(result.structuredContent)
+            except ScreenshotRejected:
+                raw = None
+        if raw is None:
+            texts = [item.text for item in result.content if getattr(item, "type", None) == "text"]
+            if not texts:
+                raise ScreenshotRejected("Screenshot result has no image payload")
+            raw = _image_bytes("\n".join(texts))
+        if len(raw) > MAX_SCREENSHOT_BYTES:
+            raise ScreenshotRejected(f"Screenshot exceeds {MAX_SCREENSHOT_BYTES} bytes")
+        mime = _png_mime(raw)
+        import base64
+        encoded = base64.b64encode(raw).decode("ascii")
+        return result.model_copy(update={
+            "content": [types_module.ImageContent(type="image", data=encoded, mimeType=mime)],
+            "structuredContent": None,
+            "isError": False,
+        })
+    except ScreenshotRejected:
+        raise
+    except Exception as error:
+        raise ScreenshotRejected(_bounded_detail(error)) from error
 
 
 def find_browser():
@@ -263,6 +368,15 @@ async def main():
             return references.snapshot(result)
         if method == 'call_tool' and arguments[0] in ('browser_navigate', 'browser_close'):
             references.expire()
+        if method == 'call_tool' and arguments[0] in SCREENSHOT_TOOLS:
+            from mcp import types
+            try:
+                return bound_screenshot_result(result, arguments[1], types)
+            except ScreenshotRejected as error:
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=_bounded_detail(error))],
+                    isError=True,
+                )
         return result
     def desktop_lease(method, arguments):
         return admission('desktop', 10) if method == 'call_tool' and not arguments[0].startswith('browser_') else None
@@ -284,7 +398,13 @@ async def main():
 
                 @server.call_tool()
                 async def call_tool(name, arguments):
-                    return await remote.call_tool(name, arguments)
+                    try:
+                        return await remote.call_tool(name, arguments)
+                    except ScreenshotRejected as error:
+                        return types.CallToolResult(
+                            content=[types.TextContent(type="text", text=_bounded_detail(error))],
+                            isError=True,
+                        )
 
                 async with stdio_server() as client:
                     await server.run(*client, server.create_initialization_options())

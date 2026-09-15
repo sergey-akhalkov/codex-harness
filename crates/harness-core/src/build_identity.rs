@@ -56,6 +56,7 @@ pub struct BuildCheck {
     pub status: Health,
     pub management_allowed: bool,
     pub runtime_allowed: bool,
+    pub serving_allowed: bool,
     pub action: String,
 }
 
@@ -174,6 +175,10 @@ pub fn source_identity(source: &Path) -> io::Result<SourceIdentity> {
 fn result(status: Health, management: bool, action: &str) -> BuildCheck {
     BuildCheck {
         runtime_allowed: status == Health::Healthy,
+        serving_allowed: matches!(
+            status,
+            Health::Healthy | Health::SourceStale | Health::SourceUnavailable
+        ),
         status,
         management_allowed: management,
         action: action.into(),
@@ -311,12 +316,12 @@ pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
         Ok(_) => result(
             Health::SourceStale,
             true,
-            "Run explicit native build/update. Integrity-verified management remains available; ordinary runtime is disabled.",
+            "Run explicit native build/update to pick up native adapter changes. Integrity-verified management and CodeGraph serving remain available; source-consuming runtime is disabled.",
         ),
         Err(_) => result(
             Health::SourceUnavailable,
             true,
-            "Select the accessible checkout for explicit recovery; ordinary runtime is disabled.",
+            "Select the accessible checkout for explicit recovery. Integrity-verified management and CodeGraph serving remain available; source-consuming runtime is disabled.",
         ),
     }
 }
@@ -415,6 +420,7 @@ mod tests {
         let stale = check(&build, None);
         assert_eq!(stale.status, Health::SourceStale);
         assert!(stale.management_allowed);
+        assert!(stale.serving_allowed);
         assert!(!stale.runtime_allowed);
         fs::write(build.join("codex-harness.exe"), "altered").unwrap();
         let altered = check(&build, None);

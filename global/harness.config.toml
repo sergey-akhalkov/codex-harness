@@ -69,6 +69,10 @@ model work, including auxiliary calls, and make leadership changes explicit.
 If that capability is unavailable, report it and keep work in the visible main
 conversation instead of starting hidden model processes. If required views close,
 suspend new model dispatch, preserve in-flight work and restore visibility first.
+Simultaneous views are a native UI or controller obligation. Do not screenshot
+Codex or other agent windows, send those images to a model, or poll window pixels
+for status. Identify non-Codex windows with list, title, bounds and state;
+reserve desktop screenshots for a genuine visual question about owned UI.
 Do not create recursive delegation trees or mandatory task paperwork. Ignore unrelated
 automatic diagnostics when they do not affect the assignment. Judge efficiency by
 total accepted-result cost/time including coordination, all children and rework;
@@ -77,6 +81,9 @@ never equate token counts or delegation counts with exact weekly quota savings.
 
 [agents]
 max_concurrent_threads_per_session = 2
+
+[features]
+apps = false
 
 [features.context_management]
 experimental_mode = true

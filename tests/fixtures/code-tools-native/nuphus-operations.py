@@ -99,6 +99,19 @@ try:
     resized = tool("desktop_window_resize", {"hwnd": metadata["hwnd"], "width": 420, "height": 240, "confirm": True})
     after = tool("desktop_window_info", {"hwnd": metadata["hwnd"]})
     check(before != after and "420" in after and "240" in after, "bounded native desktop resize changes only the owned window")
+    if mcp is None:
+        raise RuntimeError("Owned MCP client has not been started")
+    path_shot = probe / "owned-window.png"
+    path_result = mcp.call("tools/call", {"name": "desktop_window_screenshot", "arguments": {"hwnd": metadata["hwnd"], "path": str(path_shot)}}, timeout=45)
+    path_text = "\n".join(string_value(item.get("text", "")) for item in object_array(path_result.get("content", [])))
+    path_types = [string_value(item.get("type", "")) for item in object_array(path_result.get("content", []))]
+    check(not path_result.get("isError") and path_shot.is_file() and path_shot.stat().st_size > 100, "path screenshot writes owned file")
+    check("text" in path_types and "image" not in path_types and "iVBORw0KGgo" not in path_text and str(path_shot) in path_text, "path screenshot stays path-only without image bytes")
+    visual = mcp.call("tools/call", {"name": "desktop_window_screenshot", "arguments": {"hwnd": metadata["hwnd"]}}, timeout=45)
+    visual_items = object_array(visual.get("content", []))
+    visual_types = [string_value(item.get("type", "")) for item in visual_items]
+    visual_text = "\n".join(string_value(item.get("text", "")) for item in visual_items)
+    check(not visual.get("isError") and "image" in visual_types and "text" not in visual_types and "iVBORw0KGgo" not in visual_text, "no-path screenshot is a native image block without text-wrapped PNG")
     page = probe / "page.html"
     _ = page.write_text('<!doctype html><title>Harness owned page</title><h1>HARNESS OWNED PAGE</h1><label>Harness input<input id="entry"></label><button id="apply" onclick="document.getElementById(\'status\').textContent=document.getElementById(\'entry\').value">Apply owned change</button><p id="status">Before</p>', encoding="utf-8")
     class FixtureHandler(BaseHTTPRequestHandler):

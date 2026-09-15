@@ -72,6 +72,12 @@ verified relevant skill use, completion, steering and independent progress durin
 clarification. The installed launcher used its local fallback: AGENTS and skill
 loading passed, but shared developer-prompt loading was not established. See the
 [owning evidence and limits](../openspec/changes/archive/2026-09-13-align-instructions-with-astra-guidance/design.md#current-acceptance-evidence).
+After the 2026-09-14 shared-default repair, an ordinary local `debug prompt-input`
+from an owned outside consumer loaded live developer instructions, including the
+screenshot-visibility policy, without the shared-defaults fallback notice.
+Experimental context management is injected as `features.context_management.experimental_mode=true`;
+native prompt-input does not print that key as text, so effective activation still
+needs a new Astra session rather than the dump alone.
 Earlier adoption results below apply to their tested revisions and conditions;
 they do not validate every subsequent edit.
 

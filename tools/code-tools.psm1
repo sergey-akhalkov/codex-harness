@@ -310,9 +310,10 @@ function Invoke-CodeGraphNativeJson([string]$Manager, [string[]]$Arguments) {
     @{ raw = $text; value = ($text | ConvertFrom-Json -AsHashtable) }
 }
 
-function Invoke-CodeGraphPrepare([string]$Manager, [string]$Mode, [string]$CodexHome, [string]$UserHome, [string]$PackageRoot) {
+function Invoke-CodeGraphPrepare([string]$Manager, [string]$Mode, [string]$CodexHome, [string]$UserHome, [string]$PackageRoot, [string]$SourceRoot) {
     $arguments = @('mcp', 'prepare-codegraph', '--mode', $Mode, '--codex-home', $CodexHome, '--dependency-state', (Get-CodeGraphDependencyState $UserHome))
     if ($PackageRoot) { $arguments += @('--package-root', $PackageRoot) }
+    if ($SourceRoot) { $arguments += @('--source', $SourceRoot) }
     Invoke-CodeGraphNativeJson $Manager $arguments
 }
 
@@ -410,7 +411,7 @@ function Invoke-HarnessCodeTools {
     $ownedCodeGraph = Test-OwnedCodeGraphRegistration $CodexHome
     if ($manager) {
         $prepareMode = if ($Preview -and $Mode -in @('Install','Update')) { 'Check' } else { $Mode }
-        $prepared = Invoke-CodeGraphPrepare $manager $prepareMode $CodexHome $DependencyUserHome $CodeGraphPackageRoot
+        $prepared = Invoke-CodeGraphPrepare $manager $prepareMode $CodexHome $DependencyUserHome $CodeGraphPackageRoot $SourceRoot
         $nativeProjection = $prepared.value
         if ($Mode -eq 'Check' -and $nativeProjection.status -eq 'missing' -and $ownedCodeGraph) {
             return @{ status = 'degraded'; reason = 'Owned CodeGraph registration is present, but the native package projection is missing. Current configuration is preserved.'; callable = $false; inventory = $inventory; projection = $nativeProjection }
