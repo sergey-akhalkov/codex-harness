@@ -329,20 +329,19 @@ fn native_nuphus_owned_browser_on_actual_tool() {
                 .any(|entry| entry.path().is_dir()),
         "catalogue must not start an owned browser profile"
     );
-    let window_script = repo().join("tests/fixtures/code-tools-native/nuphus-window.ps1");
     let state = root.path().join("window.json");
     let stop = root.path().join("window.stop");
-    let mut window = Command::new("pwsh")
-        .args(["-NoLogo", "-NoProfile", "-File"])
-        .arg(&window_script)
-        .arg("-StatePath")
-        .arg(&state)
-        .arg("-StopPath")
-        .arg(&stop)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut window = KillOnDrop(Some(
+        Command::new(env!("CARGO_BIN_EXE_harness-window-fixture"))
+            .arg("--state")
+            .arg(&state)
+            .arg("--stop")
+            .arg(&stop)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
     for _ in 0..100 {
         if state.is_file() {
             break;
@@ -464,5 +463,81 @@ fn native_nuphus_owned_browser_on_actual_tool() {
             leftover.is_empty(),
             "owned browser profiles remain: {leftover:?}"
         );
+    }
+}
+
+#[test]
+fn window_fixture_publishes_state_and_stops_cleanly() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("window.json");
+    let stop = root.path().join("window.stop");
+    let mut window = KillOnDrop(Some(
+        Command::new(env!("CARGO_BIN_EXE_harness-window-fixture"))
+            .arg("--state")
+            .arg(&state)
+            .arg("--stop")
+            .arg(&stop)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    for _ in 0..100 {
+        if state.is_file() {
+            break;
+        }
+        assert!(
+            window.try_wait().unwrap().is_none(),
+            "window fixture exited before publishing state"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let metadata: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    let pid = metadata["pid"].as_u64().unwrap();
+    let hwnd = metadata["hwnd"].as_i64().unwrap();
+    assert!(pid > 0 && hwnd != 0, "{metadata}");
+    assert!(
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd as *mut _) } != 0,
+        "published hwnd must reference a live window"
+    );
+    fs::write(&stop, b"stop").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while matches!(window.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        matches!(window.try_wait(), Ok(Some(_))),
+        "window fixture did not stop after the stop file"
+    );
+    let status = window.take().wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd as *mut _) } == 0,
+        "fixture window must be destroyed before exit"
+    );
+}
+
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.as_mut().unwrap().try_wait()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.as_mut().unwrap().wait()
+    }
+
+    fn take(mut self) -> std::process::Child {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

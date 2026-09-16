@@ -4,21 +4,49 @@ use harness_core::{
     process::{Cancellation, CommandSpec, Deadline, StopReason},
 };
 use serde_json::json;
-use std::{io, time::Duration};
+use std::{io, path::Path, time::Duration};
 
-fn start(mode: &str, lease: Duration) -> Worker {
-    let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
-    command.args.push(mode.into());
-    Worker::start(command, lease, &Cancellation::default()).unwrap()
+/// The account slot is one machine-wide CodeGraph resource. A live Codex
+/// session may hold it while a brokered runtime is active; its idle retirement
+/// is bounded, so default checks wait for the shared slot instead of failing
+/// spuriously. Single-slot semantics stay asserted by the deliberate
+/// contender check below, which must fail immediately.
+const SLOT_WAIT: Duration = Duration::from_secs(180);
+
+/// Fixture workers write owned markers relative to their working directory.
+/// Default checks keep them inside this disposable project.
+fn owned_project() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("codegraph-transport-")
+        .tempdir()
+        .unwrap()
 }
+
+fn start(project: &Path, mode: &str, lease: Duration) -> Worker {
+    let deadline = Deadline::after(SLOT_WAIT).unwrap();
+    loop {
+        let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
+        command.args.push(mode.into());
+        command.current_dir = Some(project.to_path_buf());
+        match Worker::start(command, lease, &Cancellation::default()) {
+            Ok(worker) => return worker,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && !deadline.expired() => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => panic!("CodeGraph fixture worker start failed: {error}"),
+        }
+    }
+}
+
 fn deadline() -> Deadline {
     Deadline::after(Duration::from_secs(5)).unwrap()
 }
 
 #[test]
 fn real_pipe_round_trip_retains_errors_and_reclaims_descendants() {
+    let project = owned_project();
     for mode in ["normal", "descendant", "error"] {
-        let mut worker = start(mode, Duration::from_secs(30));
+        let mut worker = start(project.path(), mode, Duration::from_secs(30));
         worker
             .initialize(deadline(), &Cancellation::default())
             .unwrap();
@@ -44,8 +72,9 @@ fn real_pipe_round_trip_retains_errors_and_reclaims_descendants() {
 
 #[test]
 fn failed_and_oversized_frames_are_explicit_and_slot_is_reusable_after_cleanup() {
+    let project = owned_project();
     for mode in ["malformed", "oversized", "duplicate-key", "wrong-id"] {
-        let mut worker = start(mode, Duration::from_secs(30));
+        let mut worker = start(project.path(), mode, Duration::from_secs(30));
         worker
             .initialize(deadline(), &Cancellation::default())
             .unwrap();
@@ -66,12 +95,15 @@ fn failed_and_oversized_frames_are_explicit_and_slot_is_reusable_after_cleanup()
 
 #[test]
 fn admission_cancellation_and_nonrenewable_lease_bound_work() {
-    let mut worker = start("hang", Duration::from_secs(30));
+    let project = owned_project();
+    let mut worker = start(project.path(), "hang", Duration::from_secs(30));
     worker
         .initialize(deadline(), &Cancellation::default())
         .unwrap();
+    let mut contender_command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
+    contender_command.current_dir = Some(project.path().to_path_buf());
     let contender = Worker::start(
-        CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture")),
+        contender_command,
         Duration::from_secs(30),
         &Cancellation::default(),
     );
@@ -90,7 +122,7 @@ fn admission_cancellation_and_nonrenewable_lease_bound_work() {
     cancel_thread.join().unwrap();
     assert_eq!(worker.close().unwrap().unwrap().job.active_processes, 0);
 
-    let mut worker = start("hang", Duration::from_secs(1));
+    let mut worker = start(project.path(), "hang", Duration::from_secs(1));
     worker
         .initialize(deadline(), &Cancellation::default())
         .unwrap();
@@ -118,7 +150,8 @@ fn asynchronous_refresh_failure_and_storage_pressure_stop_idle_workers() {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    let mut worker = start("watch-failure", Duration::from_secs(30));
+    let project = owned_project();
+    let mut worker = start(project.path(), "watch-failure", Duration::from_secs(30));
     worker
         .initialize(deadline(), &Cancellation::default())
         .unwrap();
@@ -136,21 +169,31 @@ fn asynchronous_refresh_failure_and_storage_pressure_stop_idle_workers() {
 
     let pressure = Arc::new(AtomicBool::new(false));
     let probe = pressure.clone();
-    let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
-    command.args.push("normal".into());
-    let mut worker = Worker::start_monitored(
-        command,
-        Duration::from_secs(30),
-        &Cancellation::default(),
-        Some(Arc::new(move || {
-            if probe.load(Ordering::SeqCst) {
-                Err(io::Error::other("owned allowance reached"))
-            } else {
-                Ok(())
+    let deadline_wait = Deadline::after(SLOT_WAIT).unwrap();
+    let monitor: harness_core::codegraph_transport::Monitor = Arc::new(move || {
+        if probe.load(Ordering::SeqCst) {
+            Err(io::Error::other("owned allowance reached"))
+        } else {
+            Ok(())
+        }
+    });
+    let mut worker = loop {
+        let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
+        command.args.push("normal".into());
+        command.current_dir = Some(project.path().to_path_buf());
+        match Worker::start_monitored(
+            command,
+            Duration::from_secs(30),
+            &Cancellation::default(),
+            Some(monitor.clone()),
+        ) {
+            Ok(worker) => break worker,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && !deadline_wait.expired() => {
+                std::thread::sleep(Duration::from_millis(500));
             }
-        })),
-    )
-    .unwrap();
+            Err(error) => panic!("CodeGraph monitored worker start failed: {error}"),
+        }
+    };
     worker
         .initialize(deadline(), &Cancellation::default())
         .unwrap();
@@ -170,16 +213,28 @@ fn asynchronous_refresh_failure_and_storage_pressure_stop_idle_workers() {
 
 #[test]
 fn deliberate_commands_preserve_exit_and_output_under_the_same_job_policy() {
+    let project = owned_project();
     for (mode, exit_code) in [("cli-success", 0), ("cli-failure", 7), ("--linger", 124)] {
-        let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
-        command.args.push(mode.into());
-        let result = harness_core::codegraph_transport::run_command(
-            command,
-            Deadline::after(Duration::from_secs(1)).unwrap(),
-            &Cancellation::default(),
-            None,
-        )
-        .unwrap();
+        let slot_deadline = Deadline::after(SLOT_WAIT).unwrap();
+        let result = loop {
+            let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-codegraph-fixture"));
+            command.args.push(mode.into());
+            command.current_dir = Some(project.path().to_path_buf());
+            match harness_core::codegraph_transport::run_command(
+                command,
+                Deadline::after(Duration::from_secs(1)).unwrap(),
+                &Cancellation::default(),
+                None,
+            ) {
+                Ok(result) => break result,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && !slot_deadline.expired() =>
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(error) => panic!("deliberate CodeGraph command start failed: {error}"),
+            }
+        };
         assert_eq!(result.outcome.exit_code, exit_code, "{mode}");
         assert_eq!(result.outcome.job.active_processes, 0);
         assert_eq!(

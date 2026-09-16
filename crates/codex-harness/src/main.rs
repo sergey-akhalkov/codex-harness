@@ -23,6 +23,7 @@ mod outcome_oracle;
 mod outcome_prepare;
 mod outcome_report_cli;
 mod outcome_run;
+mod ownership_check_cli;
 #[cfg(windows)]
 mod source_diagnostics;
 #[cfg(windows)]
@@ -219,6 +220,7 @@ fn run() -> io::Result<i32> {
         println!(
             "codex-harness mcp codegraph-control --help (deliberate index/sync/status outside model sessions)"
         );
+        println!("codex-harness mcp serena --help (shared native Serena stdio client)");
         println!("codex-harness mcp nuphus --help (audited original Nuphus stdio adapter)");
         println!(
             "codex-harness diagnose [--project DIRECTORY] [--codex-home DIRECTORY] [--source CHECKOUT]"
@@ -236,6 +238,9 @@ fn run() -> io::Result<i32> {
         );
         println!(
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
+        );
+        println!(
+            "codex-harness ownership-check --source CHECKOUT [--classification PATH] [--json]"
         );
         println!("codex-harness dependencies recover-npm --state DIRECTORY [--rollback-committed]");
         println!(
@@ -448,6 +453,9 @@ fn run() -> io::Result<i32> {
         harness_core::agent_config::check(required("--codex-home")?, &report.agents)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(0);
+    }
+    if args[0] == "ownership-check" {
+        return ownership_check_cli::run(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "inspect-installation" {

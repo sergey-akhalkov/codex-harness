@@ -160,8 +160,8 @@ launcher as a consumer, not as provider logic.
 CBM-only native commands and tests remain consumer-backed compatibility and
 rollback: `cbm-index`, `cbm-catalogue`,
 `cbm-tool`, `mcp codebase-memory`, `cbm_*` crate tests,
-`fake_cbm_worker` and transitional `tools/code-tools/cbm_proxy.py`. They are
-not queued for another CBM port. Broader agent-workflow comparisons keep their
+`fake_cbm_worker` (the transitional Python proxy was deleted 2026-09-16).
+They are not queued for another CBM port. Broader agent-workflow comparisons keep their
 existing change owner. Deletion requires separate consumer-backed retirement.
 Generic Job, pipe, broker and cancellation checks cover retained compatibility
 and the replacement. Current measurements belong in the replacement design.
@@ -735,8 +735,8 @@ Token-workflow Install/Recover/Disconnect remain native. `harness-rtk` now has
 Rust acceptance covering exec-once identity, hook rewrite of literal
 `harness-rtk.exe exec`, silence for malformed/Stop/Write/shell-control input,
 disable/missing-dependency bypass, and raw passthrough for filter failure and
-oversized stdout. Python `tests/rtk-adapter.py` remains transitional until
-task 8 retires first-party scripts.
+oversized stdout. The transitional Python RTK suite was deleted with the
+2026-09-16 legacy-test retirement.
 
 ## Native inspect and observe helpers (migration 7.2 progress, 2026-09-15)
 
@@ -772,6 +772,57 @@ lives in [legacy-mcp-retirement.json](legacy-mcp-retirement.json). Shared
 `tools/lsp/broker.py` remains because Serena still imports it. First-party
 Graphify/CBM/LSP adapters stay as leftover source until task 8.2 deletes
 remaining first-party Python/PowerShell/JS/C# paths after the ownership check.
+
+## Executable ownership check (migration 8.2 progress, 2026-09-16)
+
+Native `codex-harness ownership-check --source` enforces the ownership
+inventory in [executable-ownership.json](executable-ownership.json). It fails
+unclassified foreign executables across tracked and untracked source,
+embedded or generated foreign-language programs in maintained Rust source,
+first-party paths relabeled as third-party or inert data without a genuine
+Rust consumer, and stale inventory entries. Declared inert analysis samples
+keep consumer evidence, and the external `.venv` root stays distinguishable
+from first-party source. The current tree has 171 foreign executable files,
+all classified: 169 first-party-legacy open findings owned by tasks 8.2, 9.2
+or 9.5, plus the two declared inert samples. The check exits nonzero until
+those paths are removed, making it the live remaining-work gate for 8.2.
+Removal of the live script lifecycle and Python MCP chain waits for the 9.x
+cutover that re-registers the global launcher and MCP servers natively.
+
+## Legacy executable retirement, first batch (migration 8.2 progress, 2026-09-16)
+
+107 first-party non-Rust files were deleted after consumer checks: the
+transitional test suites for retired OpenCodex/CBM/Graphify/LSP behavior
+(several already referenced the deleted `global/opencodex` layout), their
+dead fixtures, `tools/code-tools/{cbm_proxy,graphify_proxy,graphify_update}.py`,
+`tools/opencodex-config-check.mjs`, `tools/opencodex-native-restore.mjs` and
+`tools/_write_check.py`. Documentation now points model-free checks and the
+usage counter at the native Cargo suites and `codex-harness delegation-usage`.
+The foreign-executable count fell from 171 to 66. Kept paths are explicitly
+owned: the live script lifecycle and Python MCP chain (9.2), the
+`opencodex-process.ps1` baseline oracle plus outcome/LSP-snapshot measurement
+drivers (9.4), the delegation model probes (8.2 after
+orchestrate-subscription-agents), the global token-workflow driver with
+`ConPty.cs` and `consumer-rpc.ps1` (9.3), the `nuphus-window.ps1` executable
+double pending a Rust port (8.2), skill helper scripts (8.2) and temporary
+verification drivers (9.5).
+
+## Native window fixture and skill-helper retirement (migration 8.2 progress,
+2026-09-16)
+
+`nuphus-window.ps1` is replaced by the Rust `harness-window-fixture` binary
+(same owned off-screen window, state/stop contract and title); an unignored
+model-free test verifies state publication, live-window identity and clean
+stop, and the opt-in Nuphus suite now launches the Rust fixture. The four
+transitional skill helper scripts (`run.py`, `stdin_bridge.py`,
+`process_case.py`, `observe.ps1`) were deleted; the linked skill contracts
+describe native `harness-inspect.exe`/`harness-observe.exe` only. Foreign
+executable files are down to 61, all classified: the remaining 8.2-owned
+paths are the two delegation model probes, which wait for
+orchestrate-subscription-agents to deliver their native successor. The kept
+legacy outcome oracle driver no longer imports the deleted skill helper: its
+bounded process runs go through native `harness-observe.exe`, verified live
+against the built binary.
 
 
 

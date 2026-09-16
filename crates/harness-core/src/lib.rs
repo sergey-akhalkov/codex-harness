@@ -64,6 +64,7 @@ pub mod dependency_rust_component;
 pub mod dependency_selection;
 pub mod dependency_stage;
 pub mod environment_path;
+pub mod executable_ownership;
 pub mod feature_edit;
 #[cfg(windows)]
 pub mod installation_links;

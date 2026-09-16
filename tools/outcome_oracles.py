@@ -6,9 +6,9 @@ Detailed records and subprocess output stay in private evidence directories.
 """
 from __future__ import annotations
 
-import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -30,16 +30,33 @@ def read_json(path: Path) -> Any:
 
 
 def process_run(argv: list[str], cwd: Path, timeout: int = 30) -> dict[str, Any]:
-    spec = importlib.util.spec_from_file_location("outcome_process_case", REPO / ".agents/skills/reproduce-regression/scripts/process_case.py")
-    assert spec and spec.loader
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
-    row = helper.run_case(argv, cwd=cwd, timeout=timeout)
-    row["exit_code"] = (row.get("native") or {}).get("ExitCode")
+    command = [str(observe_executable()), "--cwd", str(cwd),
+               "--timeout", str(min(max(int(timeout), 1), 600)),
+               "--", *[str(value) for value in argv]]
+    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+    try:
+        row = json.loads(completed.stdout)
+    except ValueError:
+        row = {"status": "infrastructure-failure",
+               "error": (completed.stdout + completed.stderr).strip()}
+    row["exit_code"] = (row.get("native") or {}).get("ProcessExitCode")
     for name in ("stdout", "stderr"):
-        path = Path(row["streams"][name]["path"])
+        path = Path(((row.get("streams") or {}).get(name) or {}).get("path", ""))
         row[name] = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     return row
+
+
+def observe_executable() -> Path:
+    override = os.environ.get("HARNESS_OBSERVE_EXE")
+    candidates = ([Path(override)] if override else []) + [
+        REPO / "target/release/harness-observe.exe",
+        REPO / "target/debug/harness-observe.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError("harness-observe.exe is required; build it with cargo build -p codex-harness --bins")
 
 
 def completed_tools(result: dict[str, Any]) -> list[dict[str, Any]]:

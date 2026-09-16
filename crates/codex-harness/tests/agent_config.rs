@@ -1,10 +1,15 @@
 #![cfg(windows)]
 
 use harness_core::{agent_config, inventory::Agent};
-use std::{fs, os::windows::fs::symlink_file, path::PathBuf, process::Command};
+use std::{
+    fs,
+    os::windows::fs::symlink_file,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[test]
-fn actual_inventory_checks_semantic_base_roles_without_executing_configuration() {
+fn actual_inventory_preserves_semantic_base_roles_without_executing_configuration() {
     let root = tempfile::Builder::new()
         .prefix("harness-agent-config-")
         .tempdir()
@@ -17,11 +22,11 @@ fn actual_inventory_checks_semantic_base_roles_without_executing_configuration()
         .canonicalize()
         .unwrap();
     let config = home.join("config.toml");
-    let run = || {
+    let run = |source: &Path| {
         Command::new(env!("CARGO_BIN_EXE_codex-harness"))
             .arg("inventory")
             .arg("--source")
-            .arg(&source)
+            .arg(source)
             .arg("--codex-home")
             .arg(&home)
             .arg("--user-home")
@@ -30,23 +35,22 @@ fn actual_inventory_checks_semantic_base_roles_without_executing_configuration()
             .output()
             .unwrap()
     };
-    // Use TOML 1.1 multiline inline tables and escaped keys, both parsed by the
-    // pinned upstream CLI's toml version. No referenced executable is invoked.
-    let collision =
-        b"agents = {\n \"princi\\u0070al\" = { config_file = 'private-sentinel', },\n}\n";
-    fs::write(&config, collision).unwrap();
-    let output = run();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    // The fixed Astra presets are retired, so the current checkout defines no
+    // owned agents: role tables in the base configuration stay ordinary data.
+    // TOML 1.1 multiline inline tables and escaped keys are parsed by the
+    // pinned upstream CLI's toml version, and no referenced executable runs.
+    let roles = b"agents = {\n \"princi\\u0070al\" = { config_file = 'private-sentinel', },\n}\n";
+    fs::write(&config, roles).unwrap();
+    let output = run(&source);
     assert!(
+        output.status.success(),
+        "{}",
         String::from_utf8_lossy(&output.stderr)
-            .contains("agent name collision in base configuration")
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-sentinel"));
-    assert_eq!(fs::read(&config).unwrap(), collision);
+    assert_eq!(fs::read(&config).unwrap(), roles);
     let unrelated = b"note = '''\n[agents.principal]\n'''\n[mcp_servers.inert]\ncommand = 'private-sentinel-never-run'\n";
     fs::write(&config, unrelated).unwrap();
-    let output = run();
+    let output = run(&source);
     assert!(
         output.status.success(),
         "{}",
@@ -55,6 +59,56 @@ fn actual_inventory_checks_semantic_base_roles_without_executing_configuration()
     assert_eq!(fs::read(&config).unwrap(), unrelated);
     assert!(!user.exists());
     assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+}
+
+#[test]
+fn actual_inventory_refuses_base_role_matching_an_owned_agent_descriptor() {
+    let root = tempfile::Builder::new()
+        .prefix("harness-agent-config-")
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("checkout");
+    fs::create_dir_all(source.join("global/agents")).unwrap();
+    fs::create_dir_all(source.join(".agents/skills")).unwrap();
+    for (path, body) in [
+        (
+            "global/kit.json",
+            r#"{"schema":1,"profile_name":"harness","profile":"global/profile.toml","instructions":"global/instructions.md","skills":".agents/skills","agents":"global/agents","hooks":"global/hooks.json","token_hooks":"global/rtk-hooks.json"}"#,
+        ),
+        ("global/profile.toml", "approval_policy = \"never\"\n"),
+        ("global/instructions.md", "# private-sentinel\n"),
+        ("global/hooks.json", "{}\n"),
+        ("global/rtk-hooks.json", "{}\n"),
+        ("global/agents/principal.toml", "name = \"principal\"\n"),
+    ] {
+        fs::write(source.join(path), body).unwrap();
+    }
+    let home = root.path().join("codex-home");
+    let user = root.path().join("absent-user");
+    fs::create_dir(&home).unwrap();
+    let config = home.join("config.toml");
+    let collision =
+        b"agents = {\n \"princi\\u0070al\" = { config_file = 'private-sentinel', },\n}\n";
+    fs::write(&config, collision).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .arg("inventory")
+        .arg("--source")
+        .arg(&source)
+        .arg("--codex-home")
+        .arg(&home)
+        .arg("--user-home")
+        .arg(&user)
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("agent name collision in base configuration")
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-sentinel"));
+    assert_eq!(fs::read(&config).unwrap(), collision);
 }
 
 #[test]

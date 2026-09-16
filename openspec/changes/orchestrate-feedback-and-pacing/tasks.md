@@ -1,0 +1,35 @@
+## 1. Verify the supporting contracts
+
+- [ ] 1.1 Verify the non-interactive `bd` operations needed by the loop on Windows in an owned isolated project: merge/relate tasks, record vote provenance, promote/archive, and report incubator state.
+- [ ] 1.2 Verify deterministic `codex resume` session selection for a profile without an interactive picker, and that the resumed process reloads current AGENTS instructions and skills; retain original evidence for any gap.
+- [ ] 1.3 Confirm the configured vote threshold and pacing knobs extend the Stage 1 orchestration configuration with the same check-time validation.
+
+## 2. Feedback intake and triage
+
+- [ ] 2.1 Implement bounded feedback tasks from lead and executors on the existing board workflow; verify no real-time inter-agent chat is required and routine triage mechanics make no model calls.
+- [ ] 2.2 Implement lead batch triage at safe boundaries with visible merge decisions and preserved provenance; verify similar feedback merges into one item with one vote per distinct episode and reporter.
+- [ ] 2.3 Verify vote integrity: same-reporter repeats and automated diagnostics do not accumulate votes, and provenance remains inspectable.
+
+## 3. Incubator promotion and hygiene
+
+- [ ] 3.1 Implement the configurable promotion threshold (default: more than two votes) moving items to the backlog with history.
+- [ ] 3.2 Implement consequence routing: small improvements to backlog tasks, behavior changes to OpenSpec, kit-concern items to the kit backlog without private consuming-project data.
+- [ ] 3.3 Implement the lead consequence override with recorded reason for material correctness, integrity or safety evidence.
+- [ ] 3.4 Implement lead-owned incubator hygiene with deterministic triggers: a sweep whenever the lead closes a stage or epic during acceptance and whenever a triage batch finds the incubator above its configured size cap; verify safe deferral when no lead session is active, archived reasons, inspectable history, restoration on fresh evidence, and no model calls for size checks.
+
+## 4. Instruction-refresh succession
+
+- [ ] 4.1 Implement successor spawning through the verified `codex resume` path at safe boundaries after in-flight tool effects, with durable context handover and predecessor process stop.
+- [ ] 4.2 Verify succession preserves partial work and authorization, does not replay uncertain external operations, and reports "succession not established" when reload verification fails.
+
+## 5. Pacing and the benefit gate
+
+- [ ] 5.1 Connect scoped observations: native lead-account limit reads where exposed, actual refusals, and bounded user-supplied dashboard snapshots; verify unknown telemetry stays unknown and no probe calls are made.
+- [ ] 5.2 Apply pacing to new assignments, concurrency, effort and feedback cadence without preempting healthy executors; verify reset-time burst avoidance across tasks sharing an account.
+- [ ] 5.3 Run the benefit-gate comparison on at least one promoted improvement before it becomes a default: matched quality and delivery-time outcomes with feedback-triage, coordination and rework included.
+
+## 6. Lifecycle, records and acceptance
+
+- [ ] 6.1 Deliver the loop through the kit lifecycle; verify fresh external sessions discover the workflow, unrelated configuration is preserved, and rollback removes the loop without losing archived evidence.
+- [ ] 6.2 Update owning delegation, efficiency, token-workflow and decision records with actual supported operation and limits; keep private evidence outside shared sources.
+- [ ] 6.3 Exercise the complete loop end to end on a real consuming task: feedback, dedup, promotion, implementation, succession and measured benefit; close only tasks supported by actual results.

@@ -76,7 +76,9 @@ work in every project, including delegated work. Rust is chosen for resource and
 energy efficiency; PowerShell is chosen for convenience, especially on Windows.
 Canonical rule: [portable principles](../global/principles-of-work.md#language-and-shell-defaults).
 The agreed migration of this pack's own executable code to Rust remains a
-separate change.
+separate change; its executable boundary is enforced by the
+[ownership check](evidence/rust-migration.md) and does not rewrite consuming
+projects.
 
 For this repository, Serena includes Rust using the existing rust-analyzer and
 the project language configuration. Ordinary diagnostic and Stop hooks stay off.

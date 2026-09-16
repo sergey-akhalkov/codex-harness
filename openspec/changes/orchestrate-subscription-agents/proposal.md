@@ -1,32 +1,50 @@
 ## Why
 
-The current delegation policy prefers Grok and sends unavailable or unfinished worker work back to GPT; the available Z.AI subscription has no assigned senior responsibility. Large tasks need productive use of all three subscriptions, patient independent execution, and automatic continuation even when the GPT leader cannot obtain another response.
+Asynchronous development needs a durable team-lead pattern: one lead session
+creates and accepts specifications, assigns complete outcomes to executor
+sessions, removes blockers, and merges accepted work while executors implement
+independently. OpenCodex and its proxy routing are retired; native Codex
+profiles such as `codex --profile zai` and `codex --profile xai` are the
+dispatch surface. This change is refocused from quota-failover leadership to
+that everyday lead/executor workflow, preserving the verified native control
+foundation and retiring obsolete routing assumptions.
 
 ## What Changes
 
-- Keep GPT as the normal lead; make Z.AI the preferred senior executor for substantial text and code work, and Grok the preferred executor for visual work and suitable routine assignments. Select the explicit model and its supported reasoning effort at dispatch, without requiring separate named agent files. Remove redundant supplied presets with a documented migration; preserve native GPT availability and user-owned configuration.
-- Show every active conversation simultaneously in a separate visible window or pane, including leaders, executors and any model-backed helpers. Show its assignment, provider/model, effort, live messages/tool activity and state; leadership changes must remain explicit. A switchable chat list or hidden background transcript alone does not meet this requirement.
-- Delegate complete, independently verifiable outcomes, including correction of defects in the assigned work. Avoid duplicate investigation, speculative races, repeated status prompts and takeover based solely on elapsed time.
-- Add a small Rust task controller that can react to provider failures without calling the failed leader. Preserve partial results and single ownership when handing work to a capable available subscription.
-- When GPT quota is exhausted, let Z.AI temporarily lead the already agreed task and coordinate the remaining executors. Return leadership to GPT at a safe boundary after recovery; retain difficult unresolved questions without blocking independent accepted work.
-- Distinguish quota exhaustion, temporary throttling, authentication/model failures, transport failures and incomplete worker output. Remember unavailable routes and reset information instead of probing them on every assignment.
-- Pace new assignments using available account limits, reset times and observed consumption; include leader coordination, worker effort and rework in comparisons. Preserve acceptance and measure elapsed time as well as GPT use.
-- Deliver through the supported global Windows Codex lifecycle, with resumable local state, explicit stop behavior, owned failure tests and real external-consumer acceptance. No new purchases, paid fallback, recursive worker trees or independent general-purpose orchestration platform.
+- Add kit-owned orchestration configuration naming the lead profile, executor profiles and the maximum concurrent executor count. The existing installation check validates it: a missing profile or invalid limit is an explicit error, never a silent substitute.
+- Spawn every executor as a native `codex --profile <id>` session in its own visible terminal window and its own Git worktree before its first model request. The controller owns worktree creation, mapping and retirement; executors never write to the shared checkout.
+- Coordinate assignments asynchronously through the consuming project's task board (`beads` / `bd` CLI): stages as epics, specifications as features, executor feedback as feedback tasks, and lead-initiated improvements as tasks or OpenSpec changes. The Rust controller stays board-agnostic; the kit delivers board availability and workflow guidance through its lifecycle.
+- Deliver lead steering through the verified controller session channel into the executor's visible conversation, with no hidden model calls and no status polling. Executors escalate blockers as board feedback tasks.
+- Make the lead accept completed assignments against their requirements and checks, return concrete defects to the original executor, and merge accepted branches itself.
+- Activate the lead role explicitly through a kit-delivered `team-lead` skill that owns the lead workflow instructions (role discovery, board setup, briefs, steering, acceptance, merge, explicit stop). Global instructions only point to the skill; ordinary sessions spawn no executors.
+- Keep the verified recovery core: durable host-private task state, cause-aware failure classification, single active lead, reassignment within the configured executor pool, and lead succession at safe boundaries without requiring a response from the failed lead.
+- Deliver through the supported global Windows lifecycle with resumable state, explicit stop behavior, owned failure tests and one real external consuming development task; public artifacts contain only synthetic examples.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `subscription-task-orchestration`: Durable task ownership, capability-aware recovery, temporary leadership, quota-aware dispatch and continuation across provider exhaustion and application restarts.
+- `lead-agent-orchestration`: Explicitly activated team-lead dispatch, isolated visible executor sessions, board-based assignment and feedback, lead acceptance and merge, durable ownership, cause-aware recovery and lead succession across restarts.
 
 ### Modified Capabilities
 
-- `agent-delegation`: Three-subscription responsibilities, patient outcome ownership, economical handoffs, explicit auxiliary use and global acceptance.
-- `subscription-model-routing`: Exact named Z.AI and Grok execution plus visible task-level reassignment while retaining explicit model selection.
-- `subscription-efficiency`: Replace Grok-only priority with capability-aware use of Z.AI and Grok, account for quota windows, and verify GPT conservation without lowering quality or hiding latency/rework.
+- `agent-delegation`: Team-lead responsibilities, configurable role routing and patient outcome ownership replace fixed three-subscription assignments; delegation guidance follows orchestration configuration.
+- `subscription-model-routing`: Exact profile-backed model/effort assignment is selected through orchestration configuration with visible effective identities and verified heterogeneous dispatch.
+- `subscription-efficiency`: Alignment only - provider preference follows orchestration configuration instead of fixed provider roles; quota pacing and token-benefit evidence move to the follow-up change.
 
 ## Impact
 
-Affected owners include `global/harness.config.toml`, retirement of redundant supplied agent definitions, subscription lifecycle and launcher code in the Rust workspace, native conversation presentation, the existing delegation/routing checks, and the owning delegation, subscription and token-workflow guides. Reuse the installed Codex protocol and pinned OpenCodex routes; exact runtime control and simultaneous-view contracts must be verified before dependent implementation. Repository `.agents/skills` are skills, not expendable agent presets.
+Affected owners include `global/harness.config.toml` role configuration, the
+Rust `task_*` controller modules in `crates/harness-core`, native conversation
+views and worktree management, the `beads` dependency assessment and lifecycle
+integration, existing delegation/routing/subscription checks, and the owning
+delegation, subscription, installation and decision records. The verified
+app-server control contract, Rust control connection, implemented lead-handoff
+seed and completed preset migration remain the foundation.
 
-Coordinate with `adapt-workflow-through-decomposition`: retain its workstream inputs, resource ownership, failure-preserving decomposition and verified integration requirements. This change supersedes conflicting Grok-only routing and parent-takeover rules, not that change's scope or acceptance. Preserve the independent proxy crash-recovery limits and the ongoing Rust migration. Implementation tasks in this proposal remain open until performed and verified.
+Feedback-cadence budgets, instruction-refresh succession through
+`codex resume`, account-limit pacing and matched token-benefit comparisons are
+deliberately excluded and owned by a separate follow-up change.
+`autonomous-skill-evolution` continues to own skill and instruction evolution;
+this change only orchestrates sessions that consume them. Private consuming
+projects, paths and evidence stay outside shared sources.

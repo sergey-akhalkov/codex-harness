@@ -1,0 +1,92 @@
+## Purpose
+
+Turn lead/executor feedback into durable, deduplicated demand signals with an
+incubator and vote promotion, refresh agent instructions through safe session
+succession, and pace orchestration spend so improvements must earn their token
+cost.
+
+## ADDED Requirements
+
+### Requirement: Feedback arrives as triage tasks
+
+Lead and executor feedback about the work, the orchestration, instructions, tools or blockers SHALL be recorded as board triage tasks with bounded context instead of real-time inter-agent chat. The lead SHALL triage accumulated feedback in batches at safe boundaries; routine triage mechanics (listing, merging, voting) SHALL NOT require model calls beyond the lead's bounded judgment. Feedback tasks SHALL preserve the concrete observation, affected scope and reporter identity without copying unbounded transcripts.
+
+#### Scenario: An executor reports friction twice
+- **WHEN** an executor records two separate friction observations during one assignment
+- **THEN** both arrive as bounded triage tasks and are processed in the lead's next batch, without interrupting the executor's session
+
+#### Scenario: The lead wants to correct course
+- **WHEN** the lead observes a repeated mistake across executors
+- **THEN** it records its own feedback task for triage rather than steering every session individually with duplicated context
+
+### Requirement: Incubator deduplicates and accumulates votes
+
+The incubator SHALL contain unique improvement items only. During triage, the lead SHALL merge similar incoming feedback into an existing incubator item and record the merge visibly; a merged item or an explicit repeated report SHALL add exactly one vote attributable to a distinct episode and reporter. Repeated votes from the same reporter for the same episode SHALL NOT accumulate, and automated diagnostics SHALL NOT inflate votes. Item identity, merge history and vote provenance SHALL remain inspectable.
+
+#### Scenario: Similar feedback arrives from two executors
+- **WHEN** triage finds that new feedback describes an existing incubator item
+- **THEN** the item gains one vote with visible provenance instead of a near-duplicate fragmenting the signal
+
+#### Scenario: One agent repeatedly votes for its own idea
+- **WHEN** the same reporter would add several votes without a new distinct episode
+- **THEN** only one vote is counted and the attempt is visible in provenance
+
+### Requirement: Vote threshold promotes to backlog
+
+A configurable vote threshold, defaulting to promotion after more than two votes, SHALL move an incubator item into the implementation backlog. Promotion SHALL route by consequence: small improvements become backlog tasks assignable to the lead or an executor; changes to accepted behavior or requirements SHALL become OpenSpec changes; items concerning kit instructions, skills or tools SHALL promote to the kit's own backlog without private consuming-project data. Promotion makes work eligible for planning; it SHALL NOT silently authorize implementation without the applicable workflow.
+
+#### Scenario: A third distinct vote promotes an item
+- **WHEN** an incubator item accumulates votes above the configured threshold from distinct episodes
+- **THEN** the item is promoted to the backlog with its history and routed according to its consequence
+
+#### Scenario: A promoted item changes behavior
+- **WHEN** a promoted improvement would alter an accepted requirement
+- **THEN** it enters the OpenSpec workflow instead of being implemented directly from the backlog
+
+### Requirement: Consequence override without votes
+
+The lead SHALL be able to promote an incubator item immediately, without waiting for votes, when evidence shows material correctness, data-integrity or safety consequences. The override SHALL record the concrete consequence and reason. Votes SHALL remain a signal of frequency; they SHALL NOT be the only path to action for material risks.
+
+#### Scenario: A rare but severe issue is reported once
+- **WHEN** a single report identifies a correctness or integrity risk with concrete evidence
+- **THEN** the lead can promote it immediately with a recorded reason instead of waiting for repeated votes
+
+### Requirement: Incubator hygiene has a deterministic owner and trigger
+
+Hygiene SHALL be owned and performed by the lead session, triggered by conditions it already observes without background schedulers or controller board parsing: whenever the lead closes a stage or epic during acceptance, and whenever a feedback triage batch finds the incubator above its configured size cap, the same lead working session SHALL perform the sweep before completing that activity. The sweep archives items whose context has become stale with the reason visible, keeps merge and vote history inspectable, and prevents unbounded growth. Size checks SHALL use the board's non-interactive reporting without model calls; archive decisions remain lead judgment. When no lead session is active, hygiene waits safely because archived items are restorable when fresh evidence reappears. Hygiene SHALL NOT delete evidence or hide vote provenance.
+
+#### Scenario: A sweep fires on its trigger
+- **WHEN** the lead closes a stage during acceptance, or a triage batch finds the incubator above its configured size cap
+- **THEN** the same lead session performs the sweep before completing that activity, archiving stale items with visible reasons
+
+#### Scenario: No lead session is active
+- **WHEN** a trigger condition holds but no lead session is running
+- **THEN** the incubator waits unchanged and the next lead triage batch begins with the sweep, without a background scheduler
+
+#### Scenario: Archived evidence becomes relevant again
+- **WHEN** fresh feedback resembles an archived item
+- **THEN** the item can be restored or re-opened with its earlier history and votes visible
+
+### Requirement: Instruction-refresh succession
+
+When accepted instruction or skill changes affect an active session, that session SHALL spawn a successor through a deterministic `codex resume` invocation of its profile that selects the exact prior session without an interactive picker, only at a safe boundary after in-flight tool effects complete. The successor SHALL be verified to reload the current instructions and skills; the predecessor SHALL hand over durable task context through the owning records and then stop its own CLI process. Succession SHALL NOT replay external operations with uncertain outcomes or lose partial work.
+
+#### Scenario: Instructions change while an executor works
+- **WHEN** an applicable instruction or skill update is accepted while an executor session is active
+- **THEN** a successor resumes that session's context under the new instructions at the next safe boundary and the predecessor process stops after the handover
+
+#### Scenario: A resumed session misses the update
+- **WHEN** verification shows a resumed session did not reload current instructions or skills
+- **THEN** succession is reported as not established and the gap is fixed before relying on refresh
+
+### Requirement: Budget-honest pacing
+
+Pacing SHALL use fresh, scoped observations: native account-limit reads where the installed contract exposes them, actual provider refusals, and bounded dashboard snapshots supplied by the user where no API exists. Missing or stale telemetry SHALL remain unknown, not zero or unlimited; local request logs SHALL NOT be treated as authoritative remainders; no model call SHALL be made solely to estimate quota. Pacing SHALL adjust new assignment allocation, concurrency, reasoning effort and feedback cadence without preempting a healthy executor, dropping accepted work or adding purchases. Feedback mechanisms themselves SHALL stay bounded so triage cost does not rival the work being improved.
+
+#### Scenario: A provider window depletes rapidly
+- **WHEN** current observations show fast depletion of an account window
+- **THEN** new work is paced or reduced without interrupting active healthy executors, and the reason is visible
+
+#### Scenario: Remainder telemetry is unavailable
+- **WHEN** no reliable reading exists for a provider
+- **THEN** pacing falls back to observed refusals and bounded backoff rather than inventing a quota percentage

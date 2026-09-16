@@ -15,6 +15,25 @@ global launcher or installer. The Rust configuration bridge is already consumed
 by the script launcher; the full native lifecycle cutover remains open. Remaining work lives in
 [Rust migration](evidence/rust-migration.md).
 
+## Supported command mapping
+
+The script lifecycle stays the live global registration until migration task
+9.2; the native equivalents below already exist and are acceptance-tested in
+isolation. Selectors, preview (`--preview` for `-WhatIf`), homes and source
+arguments are preserved.
+
+| Retiring script interface | Native equivalent |
+| --- | --- |
+| `install.ps1 -Mode Install` / `-Mode Update` | `codex-harness install` / `update`, with `--core-only`, `--code-tools-only`, `--subscriptions-only` or `--token-workflow-only` |
+| `install.ps1 -Mode Check` (`-Diagnose`) / `codex-harness-check.ps1` | `codex-harness check` / `check --diagnose` / `codex-harness diagnose` |
+| `install.ps1 -Mode Disconnect` / `-Mode Recover` | `codex-harness disconnect` / `recover` |
+| `install.ps1 -Mode ConfigureRestart -SubscriptionsOnly` | `codex-harness configure-restart --subscriptions-only` |
+| `tools/mcp.ps1 <server>` | `codex-harness mcp serena` / `nuphus` / `codegraph-control` (plus `codebase-memory` only as documented rollback) |
+| `tools/hook.ps1` | Retired no-op compatibility entry; the accepted RTK exception runs native `harness-rtk.exe` |
+| `tools/delegation-usage.py` | `codex-harness delegation-usage` |
+| `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
+| Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
+
 ## Prerequisites and checks
 
 Windows x64, Rust MSVC toolchain (minimum Rust 1.89), Cargo, the MSVC C++
@@ -28,6 +47,19 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
 cargo test --workspace --locked --jobs 1 -- --test-threads=1
 cargo run -p codex-harness --bin harness-source-check -- --root .
+```
+
+The executable ownership check compares the working tree against
+[executable-ownership.json](evidence/executable-ownership.json). Unclassified
+foreign-language executables (tracked or untracked), embedded or generated
+foreign programs in maintained Rust source, first-party paths relabeled as
+third-party or inert data without genuine consumer evidence, and stale
+inventory entries fail the check. Remaining classified first-party legacy
+paths stay explicit open findings owned by their migration task, so the
+command exits nonzero until that removal finishes:
+
+```powershell
+cargo run -p codex-harness --bin codex-harness -- ownership-check --source .
 ```
 
 Optional `--private-terms <external-file>` supplies local audit terms without
@@ -692,7 +724,10 @@ the explicit opt-in driver for one native baseline/candidate pair per local
 case; it spends ChatGPT quota only with `--run-model-probes` and keeps
 evidence in a private temporary root. One such pair later ran for each local
 case on hooks-off Astra/xhigh. Benefit remains unproven. External consumer
-cases, full suite migration and global lifecycle remain open.
+cases, full suite migration and global lifecycle remain open. Build the
+workspace binaries first (`cargo build -p codex-harness --bins`): the legacy
+pair driver's independent process oracle now runs commands through native
+`harness-observe.exe`.
 `tools/outcome_cases.py --prepare --primary PATH --secondary PATH` copies two
 explicit local checkouts into an owned inputs root as generic `primary` and
 `secondary` snapshots. It does not discover neighboring repositories by

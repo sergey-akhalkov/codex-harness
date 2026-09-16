@@ -1,0 +1,185 @@
+{
+    "schema_version":  1,
+    "executable_extensions":  [
+                                  ".py",
+                                  ".pyw",
+                                  ".ps1",
+                                  ".psm1",
+                                  ".psd1",
+                                  ".mjs",
+                                  ".cjs",
+                                  ".js",
+                                  ".cs",
+                                  ".ts",
+                                  ".tsx",
+                                  ".jsx",
+                                  ".vb",
+                                  ".bat",
+                                  ".cmd"
+                              ],
+    "generated_cache_dirs":  [
+                                 ".git",
+                                 "target",
+                                 "__pycache__",
+                                 ".pytest_cache",
+                                 ".mypy_cache",
+                                 ".ruff_cache",
+                                 ".serena",
+                                 ".codebase-memory",
+                                 ".codegraph-harness-active",
+                                 ".codegraph-harness-store"
+                             ],
+    "external_roots":  [
+                           {
+                               "path":  ".venv",
+                               "reason":  "Local Python environment owned by the external dependency lifecycle; not first-party tracked source."
+                           }
+                       ],
+    "rust_source_roots":  [
+                              "crates",
+                              "tools/rtk-adapter"
+                          ],
+    "embedded_program_markers":  [
+                                     {
+                                         "name":  "python-shebang",
+                                         "needle":  "#!/usr/bin/env"
+                                     },
+                                     {
+                                         "name":  "python-short-shebang",
+                                         "needle":  "#!python"
+                                     },
+                                     {
+                                         "name":  "powershell-shebang",
+                                         "needle":  "#!pwsh"
+                                     },
+                                     {
+                                         "name":  "powershell-requires-header",
+                                         "needle":  "#requires -Version"
+                                     },
+                                     {
+                                         "name":  "inline-csharp-compilation",
+                                         "needle":  "Add-Type -TypeDefinition"
+                                     },
+                                     {
+                                         "name":  "embedded-csharp-source",
+                                         "needle":  "using System;"
+                                     },
+                                     {
+                                         "name":  "embedded-csharp-entrypoint",
+                                         "needle":  "static void Main"
+                                     }
+                                 ],
+    "entries":  [
+                    {
+                        "classification":  "inert-data",
+                        "paths":  [
+                                      "tests/fixtures/lsp/delayed-mcp.py",
+                                      "tests/fixtures/lsp/mcp-edit.py"
+                                  ],
+                        "consumer":  "crates/harness-core/src/analysis_samples.rs",
+                        "note":  "Declared external-language analysis samples; native helpers refuse to execute them."
+                    },
+                    {
+                        "classification":  "first-party-legacy",
+                        "paths":  [
+                                                 "install.ps1",
+                                                 "global/kit.psd1",
+                                                 "tools/activation.psm1",
+                                      "tools/code-tools.psm1",
+                                      "tools/codex.ps1",
+                                      "tools/codex-harness-check.ps1",
+                                      "tools/hook.ps1",
+                                      "tools/kit.psm1",
+                                      "tools/launcher.psm1",
+                                      "tools/mcp.ps1",
+                                      "tools/source-diagnostics.psm1",
+                                      "tools/token-workflow.psm1"
+                                  ],
+                       "owner_task":  "migrate-harness-to-rust#9.2",
+                        "note":  "Live script installer/launcher/check/hook chain linked by the current global installation, including the PowerShell data manifest global/kit.psd1 read by tools/kit.psm1; retire with the native global cutover."
+                    },
+                    {
+                        "classification":  "first-party-legacy",
+                        "paths":  [
+                                      "tools/code-tools/check.py",
+                                      "tools/code-tools/dependencies.py",
+                                      "tools/code-tools/discovery.py",
+                                      "tools/code-tools/launch.py",
+                                      "tools/code-tools/lazy_stdio.py",
+                                      "tools/code-tools/lsp_provision.py",
+                                      "tools/code-tools/mcp_provision.py",
+                                      "tools/code-tools/nuphus_proxy.py",
+                                      "tools/code-tools/orphans.py",
+                                      "tools/code-tools/registration.py",
+                                      "tools/code-tools/resources.py",
+                                      "tools/code-tools/serena_broker.py",
+                                      "tools/code-tools/serena_entry.py",
+                                      "tools/code-tools/serena_proxy.py",
+                                      "tools/process_ownership.py",
+                                      "tools/lsp/broker.py"
+                                  ],
+                        "owner_task":  "migrate-harness-to-rust#9.2",
+                        "note":  "Live Python MCP chain (launch.py through the Serena broker and process ownership) still written by native registrations; retire with the native MCP cutover."
+                    },
+                    {
+                        "classification":  "first-party-legacy",
+                        "paths":  [
+                                      "tools/opencodex-process.ps1",
+                                      "tools/opencodex-process.cs",
+                                      "tools/delegation-usage.py",
+                                      "tools/outcome_cases.py",
+                                      "tools/outcome_native_pairs.py",
+                                      "tools/outcome_oracles.py",
+                                      "tools/outcome_report.py",
+                                      "tools/outcome_runner.py",
+                                      "tools/outcome_suite.py",
+                                      "tools/lsp/backend.py",
+                                      "tools/lsp/bash-windows.cjs",
+                                      "tools/lsp/delphi.py",
+                                      "tools/lsp/discovery.py",
+                                      "tools/lsp/journal.py",
+                                      "tools/lsp/markdown_client.py",
+                                      "tools/lsp/markdown-parse.cjs",
+                                      "tools/lsp/powershell-diagnostics.ps1",
+                                      "tools/lsp/registry.py",
+                                      "tools/lsp/server.py",
+                                      "tools/lsp/xml-diagnostics.ps1"
+                                  ],
+                        "owner_task":  "migrate-harness-to-rust#9.4",
+                        "note":  "Baseline and matched-comparison drivers: opencodex-process.ps1 remains the script baseline oracle; outcome drivers and the retired LSP snapshot sources serve pending measurement tasks."
+                    },
+                    {
+                        "classification":  "first-party-legacy",
+                        "paths":  [
+                                      "tests/agent-delegation.py",
+                                      "tests/subscription-consumer.Tests.ps1"
+                                  ],
+                        "owner_task":  "migrate-harness-to-rust#8.2",
+                        "note":  "Opt-in delegation model probes with no native successor yet; retire after orchestrate-subscription-agents delivers visible-view integration."
+                    },
+                    {
+                        "classification":  "first-party-legacy",
+                        "paths":  [
+                                      "tests/token-workflow-native.ps1",
+                                      "tests/consumer-rpc.ps1",
+                                      "tests/ConPty.cs"
+                                  ],
+                        "owner_task":  "migrate-harness-to-rust#9.3",
+                        "note":  "Live-global token-workflow/RTK acceptance driver and its ConPTY terminal helper; retire with a native global consumer check."
+                    },
+                    {
+                        "classification":  "first-party-legacy",
+                        "paths":  [
+                                      "tmp-acceptance-real-home.ps1",
+                                      "tmp-codemode-live-test.ps1",
+                                      "tmp-launcher-live-verify.ps1",
+                                      "tmp-mcp-live-test.ps1",
+                                      "tmp-parity-live-test.ps1",
+                                      "tmp-shim-live-verify.ps1",
+                                      "tmp-verify-xai-profile.ps1"
+                                  ],
+                        "owner_task":  "migrate-harness-to-rust#9.5",
+                        "note":  "Temporary live-verification drivers; retire when final acceptance evidence is published."
+                    }
+                ]
+}

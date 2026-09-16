@@ -18,6 +18,9 @@ pub struct Request {
     pub dependency_state: PathBuf,
     pub package_root: Option<PathBuf>,
     pub source_root: Option<PathBuf>,
+    /// Adoption inventory for the same installation when the caller already
+    /// discovered it. The CLI projection falls back to the on-disk registry.
+    pub inventory: Option<Value>,
     pub mode: String,
 }
 
@@ -41,7 +44,20 @@ fn previous_package(home: &Path) -> io::Result<Option<PathBuf>> {
 /// The native Serena registration for an adopted interpreter. The projection
 /// only switches the connection when every launch input resolves; otherwise
 /// the retained planner keeps the current seam registration.
-fn serena_registration(home: &Path, manager: &Path, source: &Path) -> io::Result<Option<Value>> {
+fn adopted<'a>(inventory: &'a Value, id: &str) -> Option<&'a Value> {
+    inventory["mcp"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|record| record["id"] == id)
+}
+
+/// Adoption evidence for one managed tool: the caller's fresh discovery when
+/// present, otherwise the registry written by the last connection.
+fn adoption(home: &Path, inventory: Option<&Value>, id: &str) -> io::Result<Option<Value>> {
+    if let Some(inventory) = inventory {
+        return Ok(adopted(inventory, id).cloned());
+    }
     let registry_path = home.join("harness/code-tools.json");
     let bytes = match FileGuard::read_regular(&registry_path) {
         Ok((_guard, bytes)) => bytes,
@@ -49,14 +65,20 @@ fn serena_registration(home: &Path, manager: &Path, source: &Path) -> io::Result
         Err(error) => return Err(error),
     };
     let registry: Value = serde_json::from_slice(&bytes)?;
-    let Some(python) = registry["mcp"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|record| record["id"] == "serena")
-        .and_then(|record| record["paths"]["python"].as_str())
-        .map(PathBuf::from)
-    else {
+    Ok(adopted(&registry, id).cloned())
+}
+
+fn serena_registration(
+    home: &Path,
+    manager: &Path,
+    source: &Path,
+    inventory: Option<&Value>,
+) -> io::Result<Option<Value>> {
+    let Some(record) = adoption(home, inventory, "serena")? else {
+        return Ok(None);
+    };
+    let registry_path = home.join("harness/code-tools.json");
+    let Some(python) = record["paths"]["python"].as_str().map(PathBuf::from) else {
         return Ok(None);
     };
     let entry = source.join("tools/code-tools/serena_entry.py");
@@ -70,6 +92,44 @@ fn serena_registration(home: &Path, manager: &Path, source: &Path) -> io::Result
             "--entry", entry,
             "--registry", registry_path,
             "--codex-home", home,
+            "--source-root", source,
+            "--connection-seconds", "86400"],
+        "env": {"CODEX_HOME": home},
+        "startup_timeout_sec": 30,
+        "tool_timeout_sec": 660,
+    })))
+}
+
+/// The native Nuphus registration for the adopted audited original binary.
+/// The projection switches the connection only when that upstream executable
+/// resolves; a locally rewritten variant keeps the current seam registration
+/// instead of pinning an unaudited binary.
+fn nuphus_registration(
+    home: &Path,
+    manager: &Path,
+    source: &Path,
+    inventory: Option<&Value>,
+) -> io::Result<Option<Value>> {
+    let Some(record) = adoption(home, inventory, "nuphus")? else {
+        return Ok(None);
+    };
+    let Some(executable) = record["paths"]["original_native_executable"]
+        .as_str()
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    if !executable.is_file() {
+        return Ok(None);
+    }
+    let digest = crate::build_identity::hash_file(&executable)?;
+    Ok(Some(json!({
+        "command": manager,
+        "args": ["mcp", "nuphus",
+            "--executable", executable,
+            "--expected-digest", digest,
+            "--codex-home", home,
+            "--account", home.join("harness/nuphus"),
             "--source-root", source,
             "--connection-seconds", "86400"],
         "env": {"CODEX_HOME": home},
@@ -147,8 +207,15 @@ pub fn prepare(request: &Request, manager: &Path) -> io::Result<Value> {
     );
     if let Some(source) = &request.source_root {
         let source = local_path(source)?;
-        if let Some(serena) = serena_registration(&home, &manager, &source)? {
+        if let Some(serena) =
+            serena_registration(&home, &manager, &source, request.inventory.as_ref())?
+        {
             registrations.insert("serena".into(), serena);
+        }
+        if let Some(nuphus) =
+            nuphus_registration(&home, &manager, &source, request.inventory.as_ref())?
+        {
+            registrations.insert("nuphus".into(), nuphus);
         }
     }
     Ok(
@@ -185,7 +252,7 @@ mod tests {
 
         // Without a registry record the projection stays with the seam.
         assert!(
-            serena_registration(&home, Path::new("D:/mgr.exe"), &source)
+            serena_registration(&home, Path::new("D:/mgr.exe"), &source, None)
                 .unwrap()
                 .is_none()
         );
@@ -201,7 +268,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let registration = serena_registration(&home, Path::new("D:/mgr.exe"), &source)
+        let registration = serena_registration(&home, Path::new("D:/mgr.exe"), &source, None)
             .unwrap()
             .expect("adopted interpreter switches the connection");
         assert_eq!(registration["command"], "D:/mgr.exe");
@@ -229,7 +296,60 @@ mod tests {
         // A missing entry or interpreter keeps the current seam registration.
         std::fs::remove_file(&entry).unwrap();
         assert!(
-            serena_registration(&home, Path::new("D:/mgr.exe"), &source)
+            serena_registration(&home, Path::new("D:/mgr.exe"), &source, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_projections_use_fresh_adoption_inventory_without_a_registry_file() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex-home");
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("tools/code-tools")).unwrap();
+        let python = root.path().join("python.exe");
+        std::fs::write(&python, b"fixture interpreter").unwrap();
+        let entry = source.join("tools/code-tools/serena_entry.py");
+        std::fs::write(&entry, b"fixture entry").unwrap();
+        let original = root.path().join("nuphus-mcp.exe");
+        std::fs::write(&original, b"fixture original").unwrap();
+        let digest = crate::build_identity::hash_file(&original).unwrap();
+        let inventory = serde_json::json!({"mcp": [
+            {"id": "serena", "status": "adopted", "paths": {"python": python}},
+            {"id": "nuphus", "status": "modified",
+             "paths": {"original_native_executable": original,
+                       "native_executable": root.path().join("nuphus-mcp-schema-fixed.exe")}},
+        ]});
+
+        // A fresh connection has no registry file yet; the inventory alone
+        // switches both connections to their native projections.
+        let serena = serena_registration(&home, Path::new("D:/mgr.exe"), &source, Some(&inventory))
+            .unwrap()
+            .expect("adopted interpreter projects from the inventory");
+        assert_eq!(serena["command"], "D:/mgr.exe");
+        assert_eq!(serena["args"][1], "serena");
+        let nuphus = nuphus_registration(&home, Path::new("D:/mgr.exe"), &source, Some(&inventory))
+            .unwrap()
+            .expect("adopted original projects from the inventory");
+        assert_eq!(nuphus["command"], "D:/mgr.exe");
+        assert_eq!(nuphus["args"][1], "nuphus");
+        assert_eq!(nuphus["args"][3], original.to_string_lossy().into_owned());
+        assert_eq!(nuphus["args"][5], digest);
+        assert_eq!(nuphus["args"][7], home.to_string_lossy().into_owned());
+        assert_eq!(
+            nuphus["args"][9],
+            home.join("harness/nuphus").to_string_lossy().into_owned()
+        );
+
+        // A locally rewritten variant without the audited original keeps the
+        // current seam instead of pinning an unaudited executable.
+        let rewritten = serde_json::json!({"mcp": [
+            {"id": "nuphus", "status": "modified",
+             "paths": {"native_executable": root.path().join("nuphus-mcp-schema-fixed.exe")}},
+        ]});
+        assert!(
+            nuphus_registration(&home, Path::new("D:/mgr.exe"), &source, Some(&rewritten))
                 .unwrap()
                 .is_none()
         );

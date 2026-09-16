@@ -15,26 +15,26 @@
     {
       "path": "tools/lsp/server.py",
       "class": "retired-owned",
-      "consumers": ["transitional tests/lsp-*.py", "tools/outcome_cases.py"],
-      "action": "removed from launch.py, mcp.ps1 and kit RequiredFiles; leftover source waits for 8.2 deletion after remaining test consumers"
+      "consumers": ["tools/outcome_cases.py", "tools/outcome_suite.py"],
+      "action": "removed from launch.py, mcp.ps1 and kit RequiredFiles; transitional LSP tests deleted 2026-09-16, source remains only as the outcome drivers' snapshot input until the 9.4 measurement tasks retire them"
     },
     {
       "path": "tools/lsp/{backend,journal,registry,delphi,discovery,markdown_client,markdown-parse.cjs,bash-windows.cjs,xml-diagnostics.ps1,powershell-diagnostics.ps1}",
       "class": "retired-owned",
-      "consumers": ["transitional LSP tests and outcome cases"],
-      "action": "removed from kit RequiredFiles; not launched; 8.2 deletes after consumer retirement"
+      "consumers": ["tools/outcome_cases.py", "tools/outcome_suite.py"],
+      "action": "removed from kit RequiredFiles; not launched; transitional tests deleted 2026-09-16, remaining files are outcome-driver snapshot inputs pending 9.4 retirement"
     },
     {
       "path": "tools/code-tools/cbm_proxy.py",
       "class": "retired-owned",
-      "consumers": ["native mcp codebase-memory rollback CLI", "tests/tool-resources.py", "tests/subscription-efficiency.py"],
-      "action": "launch and registration refuse codebase-memory; kit no longer requires the proxy; native rollback commands remain residue until 8.2"
+      "consumers": [],
+      "action": "launch and registration refuse codebase-memory; kit no longer required the proxy; transitional tests deleted and the proxy source removed 2026-09-16; native rollback commands remain residue until 8.2"
     },
     {
       "path": "tools/code-tools/graphify_proxy.py",
       "class": "retired-owned",
-      "consumers": ["tools/code-tools/graphify_update.py", "tests/graphify_*.py"],
-      "action": "not launched or registered; leftover first-party proxy/update waits for 8.2 deletion"
+      "consumers": [],
+      "action": "not launched or registered; proxy, update helper and transitional tests deleted 2026-09-16"
     },
     {
       "path": "crates/harness-core/src/cbm_*.rs",

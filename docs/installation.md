@@ -141,6 +141,9 @@ The script resolves its own source directory, independently of the caller's
 working directory. `-WhatIf` inspects sources, prerequisites and conflicts
 without writing files or persistent environment values. Actual link creation
 happens during installation; a privilege failure rolls back the changes.
+The script lifecycle remains the live global registration during the Rust
+migration; acceptance-tested native equivalents for every mode are listed in
+the [supported command mapping](rust-native.md#supported-command-mapping).
 
 Installation records the original CLI path, connects the sources and prepends
 `<CODEX_HOME>/harness/bin` to the user's PATH. It verifies command precedence in
@@ -271,9 +274,8 @@ and heed any fallback notice when the bridge is unavailable.
 - Test auth/history fixtures remain unchanged when probes use an explicit
   auth-source file and isolated homes.
 
-Executable checks live in `tests/consumer.Tests.ps1`, `tests/installer.Tests.ps1`,
-`tests/launcher.Tests.ps1`, `tests/tui.Tests.ps1` and
-`tests/global-activation.Tests.ps1`. Ordinary consumer runs make no model
+Executable checks are the native Cargo suites and the ownership check listed in
+[native Rust commands](rust-native.md). Ordinary consumer runs make no model
 requests. `-RunAgent` requires an explicit auth file. Lifecycle tests copy
 sources only to simulate an independent checkout; the installer still creates
 direct links. A ConPTY attempt to host Codex through the execution tool failed

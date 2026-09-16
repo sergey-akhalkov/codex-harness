@@ -1,7 +1,7 @@
 //! Isolated native subscription login CLI. Never targets the live global proxy.
 #![cfg(windows)]
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, process::Command};
 
 #[test]
 fn subscription_login_help_is_native() {

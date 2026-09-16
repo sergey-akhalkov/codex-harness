@@ -16,7 +16,7 @@ use crate::{
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -89,6 +89,71 @@ fn adopted(item: &Value) -> bool {
         item["status"].as_str(),
         Some("adopted" | "present" | "installed" | "ready" | "verified")
     )
+}
+
+/// The documented discovery inputs for a connection's dependency owner. The
+/// invoking environment describes the current user's adopted packages, so it
+/// is only consulted when that user owns the dependency home.
+fn discovery_request(
+    source: &Path,
+    dependency: &Path,
+) -> io::Result<dependency_discovery::Request> {
+    let current = env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|path| dependency_discovery::local_path(&path))
+        .transpose()?;
+    let include = current
+        .as_ref()
+        .is_some_and(|current| crate::dependency_package::same_path(current, dependency));
+    let selected = |variable: &str| {
+        if include {
+            env::var_os(variable).map(PathBuf::from)
+        } else {
+            None
+        }
+    };
+    Ok(dependency_discovery::Request {
+        catalogue: source.join("global/code-tools.json"),
+        user_home: dependency.to_owned(),
+        npm_prefixes: if include {
+            env::var_os("NPM_CONFIG_PREFIX")
+                .map(PathBuf::from)
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        },
+        uv_tools_dir: selected("UV_TOOL_DIR"),
+        serena_cache: None,
+        rustup_home: selected("RUSTUP_HOME"),
+        path: if include { env::var_os("PATH") } else { None },
+        graphify_manifest: None,
+        nuphus_models: selected("NUPHUS_MODELS_DIR"),
+        codegraph_roots: Vec::new(),
+        full_records: false,
+        probe_versions: false,
+        processes: false,
+    })
+}
+
+/// Registrations recorded by the last successful connection. They stay the
+/// desired selection unless a fresh native projection replaces them, so an
+/// Update never rewrites an installed native connection back to a seam.
+fn recorded_registrations(home: &Path) -> io::Result<Map<String, Value>> {
+    let path = home.join("harness/code-tools-registration.json");
+    inventory::ordinary_parents(&path)?;
+    match fs::read(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(error) => Err(error),
+        Ok(bytes) => {
+            let state: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| conflict("code-tools registration is not JSON; preserving it"))?;
+            Ok(state["registrations"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
 }
 
 fn python_spec(source: &Path, home: &Path, python: &Path, name: &str) -> io::Result<Value> {
@@ -182,20 +247,6 @@ fn preserved_opencode_cache(before: &[(PathBuf, Vec<u8>)]) -> io::Result<()> {
     Ok(())
 }
 
-fn existing_codegraph(home: &Path) -> io::Result<Option<Value>> {
-    let path = home.join("harness/code-tools-registration.json");
-    inventory::ordinary_parents(&path)?;
-    match fs::read(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-        Ok(bytes) => {
-            let state: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| conflict("code-tools registration is not JSON; preserving it"))?;
-            Ok(state["registrations"].get("codegraph").cloned())
-        }
-    }
-}
-
 pub fn run(request: &Request) -> io::Result<Report> {
     let source = local_path(&request.source)?;
     let home = local_path(&request.codex_home)?;
@@ -216,16 +267,15 @@ pub fn run(request: &Request) -> io::Result<Report> {
     if !launch.is_file() {
         return Err(conflict("code-tools launch entry is missing"));
     }
-    let inventory = dependency_discovery::discover(&dependency_discovery::Request {
-        catalogue: source.join("global/code-tools.json"),
-        user_home: dependency.clone(),
-        ..dependency_discovery::Request::default()
-    })?;
+    let inventory = dependency_discovery::discover(&discovery_request(&source, &dependency)?)?;
     let retained = retained_from_inventory(&source, &home, &inventory)?;
-    let mut retained_for_graph = json!({"registrations": retained});
-    if let Some(graph) = existing_codegraph(&home)? {
-        retained_for_graph["registrations"]["codegraph"] = graph.clone();
+    // The recorded selection stays authoritative; discovery seams only fill
+    // names it does not already own.
+    let mut desired = recorded_registrations(&home)?;
+    for (name, spec) in retained.as_object().into_iter().flatten() {
+        desired.entry(name.clone()).or_insert_with(|| spec.clone());
     }
+    let mut retained_for_graph = json!({"registrations": desired});
     let opencode = snapshot_opencode_cache(&dependency)?;
     if matches!(request.mode, Mode::Install | Mode::Update)
         && !request.preview
@@ -265,7 +315,8 @@ pub fn run(request: &Request) -> io::Result<Report> {
                 codex_home: home.clone(),
                 dependency_state: dependency.join(".cache/coding-agents-harness-codegraph"),
                 package_root: None,
-                source_root: None,
+                source_root: Some(source.clone()),
+                inventory: Some(inventory.clone()),
                 mode: if request.mode == Mode::Update {
                     "Check".into()
                 } else {
@@ -274,11 +325,15 @@ pub fn run(request: &Request) -> io::Result<Report> {
             },
             manager,
         )?;
-        if let Some(graph) = prepared
+        // Fresh native projections replace the recorded or seam connection for
+        // the same name; names without a projection keep their selection.
+        for (name, spec) in prepared
             .get("registrations")
-            .and_then(|value| value.get("codegraph"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
         {
-            retained_for_graph["registrations"]["codegraph"] = graph.clone();
+            retained_for_graph["registrations"][name] = spec.clone();
         }
     }
     let registration = codegraph_registration::apply(&RegistrationRequest {
@@ -508,5 +563,96 @@ mod tests {
         assert!(error.to_string().contains("explicit provisioning"));
         assert_eq!(fs::read(&wrapper).unwrap(), b"opencode-wrapper");
         assert!(!home.join("harness/code-tools.json").exists());
+    }
+
+    fn write_native_serena(home: &Path, spec: &Value, connection: bool) -> Vec<u8> {
+        fs::write(
+            home.join("harness/code-tools-registration.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "registrations": {"serena": spec}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = if connection {
+            format!(
+                "[mcp_servers.serena]\nargs = [\"mcp\", \"serena\", \"--python\", 'D:/python.exe', \"--entry\", 'D:/serena_entry.py']\ncommand = 'D:/mgr.exe'\nenv = {{ CODEX_HOME = '{}' }}\nstartup_timeout_sec = 30\ntool_timeout_sec = 660\n",
+                home.display()
+            )
+        } else {
+            "model = 'gpt-6-astra'\n".to_owned()
+        };
+        fs::write(home.join("config.toml"), config).unwrap();
+        fs::read(home.join("harness/code-tools-registration.json")).unwrap()
+    }
+
+    fn serena_operations(report: &Report) -> Vec<String> {
+        report.registration["operations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|operation| operation["name"] == "serena")
+            .filter_map(|operation| operation["action"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn recorded_native_connection_is_the_desired_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        let user = root.path().join("user");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        let native = json!({
+            "command": "D:/mgr.exe",
+            "args": ["mcp", "serena", "--python", "D:/python.exe", "--entry", "D:/serena_entry.py"],
+            "env": {"CODEX_HOME": home.to_string_lossy()},
+            "startup_timeout_sec": 30,
+            "tool_timeout_sec": 660,
+        });
+        write_native_serena(&home, &native, true);
+        let checked = run(&Request {
+            source: repo(),
+            codex_home: home.clone(),
+            user_home: user.clone(),
+            dependency_user_home: user.clone(),
+            mode: Mode::Check,
+            preview: false,
+            manager: None,
+        })
+        .unwrap();
+        // The recorded native connection matches the configuration: a Check
+        // must not plan to rewrite it back to the transitional seam.
+        assert!(
+            serena_operations(&checked).is_empty(),
+            "{}",
+            checked.registration
+        );
+
+        // The recorded selection is the desired state even when nothing is
+        // found on this machine: a recorded seam is still planned for the
+        // missing connection instead of silently dropping the server.
+        let seam = json!({
+            "command": "D:/python.exe",
+            "args": ["-B", "-u", "D:/launch.py", "serena", "--registry", "D:/code-tools.json"],
+            "env": {"CODEX_HOME": home.to_string_lossy()},
+        });
+        let before = write_native_serena(&home, &seam, false);
+        let checked = run(&Request {
+            source: repo(),
+            codex_home: home.clone(),
+            user_home: user.clone(),
+            dependency_user_home: user,
+            mode: Mode::Check,
+            preview: false,
+            manager: None,
+        })
+        .unwrap();
+        assert_eq!(serena_operations(&checked), vec!["register".to_owned()]);
+        assert_eq!(
+            fs::read(home.join("harness/code-tools-registration.json")).unwrap(),
+            before,
+            "Check must not mutate the recorded selection"
+        );
     }
 }

@@ -1,131 +1,211 @@
 ## Context
 
-See [proposal](proposal.md) for the outcome. At proposal time the delegation policy gave Grok middle priority, retained Astra reserves and allowed parent completion after certain incomplete worker responses; Z.AI had a subscription route without a senior worker assignment. The current [delegation guide](../../../docs/agent-delegation.md) and `global/harness.config.toml` now express direct model/effort selection and the accepted GPT/Z.AI/Grok responsibilities. That instruction update does not establish the unfinished controller, simultaneous-view, recovery or benefit acceptance. The two-executor limit, concise handoffs, explicit model identities and existing billing boundaries remain useful foundations.
+See [proposal](proposal.md) for the outcome. The original change was framed
+around three-subscription quota failover; the accepted 2026-09-16 reframe
+makes asynchronous team-lead development the everyday scenario and moves
+feedback-cadence budgets, instruction-refresh succession and quota pacing to
+a follow-up change. OpenCodex is retired: Grok runs through the native
+`codex --profile xai` provider with the kit-owned compatibility shim, Z.AI
+through `codex --profile zai`, and the lead ordinarily through the shared
+GPT-6 Astra default.
 
-Read-only inspection found these concrete extension points:
+The verified foundation stays. Installed CLI `0.154.0` passed the owned
+two-client/native-child/reconnect contract, the Rust control connection
+performs initialization, exact model binding, one tool-using assignment and a
+deterministic GPT-refusal-to-successor handoff, and redundant supplied presets
+are retired. The
+[native contract receipt](../../../docs/rust-native.md#native-task-control-contract)
+owns the tested behavior, original failure boundaries and remaining limits;
+global activation remains disabled.
 
-| Current owner | Relevant behavior |
-| --- | --- |
-| `crates/harness-core/src/launcher.rs` | `task_arguments`, `profile_arguments` and `additional_roots` preserve native `--remote` dispatch; remote/app-server commands do not receive ordinary session overrides. |
-| `crates/codex-harness/src/native_read_rpc.rs` | Bounded, one-shot model-free app-server reads in an owned Windows job; useful framing/error-handling precedent, not a persistent task controller. |
-| `crates/codex-harness/tests/codegraph_consumers.rs` | Real stdio initialization, explicit `thread/start` with provider fallback disabled and request-id-based response handling. |
-| Existing subscription lifecycle and `global/opencodex/` | Reuse the installed provider routes, role links, ownership records, update and recovery. |
-| Existing delegation usage and consumer checks | Reuse provider attribution, private evidence and fresh external-session validation. |
-
-Installed CLI `0.154.0` has passed the owned WebSocket two-client/native-child/reconnect/TUI contract check and the isolated ordinary native-entry check with automatic controller startup, a tool effect, final-result checkpoint and service exit. The shared daemon refuses this elevated environment, so the verified path is the design's owned app-server alternative. The [native contract receipt and commands](../../../docs/rust-native.md#native-task-control-contract) own the tested behavior, original failure boundaries and remaining limitations. Official app-server documentation describes model/effort selection at turn boundaries and account-limit observations, but marks this surface experimental. Global activation and quota handoff remain unfinished; current installation keeps the controller disabled.
+Confirmed user decisions (2026-09-16): steering is delivered by the
+controller into the executor session and shown in that executor's window, not
+by automating keyboard input in TUI windows; the lead merges accepted work
+itself; sessions are replaced only at safe boundaries, after an in-flight
+tool call completes; executor feedback and lead improvements flow through the
+consuming project's board; role selection is kit configuration, not hardcoded
+provider responsibilities; the lead role is activated explicitly through a
+`team-lead` skill rather than always-on global instructions.
 
 ## Goals / Non-Goals
 
-**Goals:** Keep recovery independent of a successful lead-model response; retain native Codex tools and interaction; add only task state and control needed for ownership, availability and continuation; make GPT conservation and accepted-result latency observable.
+**Goals:** One lead session that specifies, assigns, unblocks, accepts and
+merges; executor sessions that implement complete outcomes in isolated
+worktrees and visible windows; asynchronous board coordination owned by the
+agents themselves; deterministic controller state for dispatch, recovery and
+lead succession; validated role configuration; delivery through the global kit
+lifecycle with a real consuming project.
 
-**Non-Goals:** A new agent framework or general-purpose chat application, a hosted scheduler, new subscriptions, paid fallback, arbitrary cross-provider encrypted-state portability, universal hard token caps, or an unconditional guarantee of unlimited 24/7 throughput. The required simultaneous conversation windows/panes are in scope. Proxy memory and crash-restart protections remain owned by their existing capability. All accepted task requirements and mandatory checks remain in scope.
+**Non-Goals:** Feedback-cadence budgets, account-limit pacing and
+token-benefit comparisons; instruction-refresh succession and `codex resume`
+contracts; skill and instruction evolution (owned by
+`autonomous-skill-evolution`); a new agent framework, hosted scheduler,
+recursive worker trees, purchases, provider-dashboard scraping or a
+general-purpose orchestration platform.
 
 ## Decisions
 
-### 1. Separate assignment judgment from deterministic recovery
+### 1. Lead judgment with deterministic controller mechanics
 
-The active lead chooses the workstreams and acceptance boundaries. A small Rust controller owns their dispatch records, availability and recovery transitions. It does not ask another model to classify routine events, poll for progress or decide whether a known exhausted account is available.
+The active lead chooses workstreams, assignments and acceptance boundaries. A
+small Rust controller owns dispatch records, windows, worktrees, event
+correlation and recovery transitions. It does not ask another model to
+classify routine events, poll for progress or decide whether a known
+unavailable route is available. Session execution stays native Codex through
+the verified app-server path; the normal installed launcher connects the
+required control path automatically.
 
-Reuse native Codex session execution through its app-server contract. Prefer a verified connection to the local managed daemon; an owned app-server with the native TUI attached is the alternative within the same design when shared-daemon ownership cannot be established. The normal installed launcher connects the required control path automatically; users must not repeatedly launch a second terminal or re-enter the task after failure. Preserve native arguments, explicit profiles, model constraints and project settings in the actual backend session, especially because `--remote` bypasses ordinary launcher overrides.
+### 2. Profiles and role configuration
 
-Before dependent implementation, exercise an owned two-client session: event delivery, model failure, worker survival, reconnect and final-result visibility in the native TUI. The controller needs an authoritative assignment interface and task-scoped event correlation, not transcript scraping or unrelated thread enumeration. Reuse native assignment events where they provide that contract; a narrowly scoped native dynamic-tool interface can supply missing assignment/return fields. Keep that interface in the existing Rust owner, with no second orchestration framework. If the installed protocol cannot meet these requirements, preserve the failed evidence and resolve that concrete integration gap; policy-only delivery does not complete the change.
+Kit-owned reusable configuration names the lead profile, the executor
+profiles and the maximum concurrent executor count. The existing installation
+check validates presence and the positive limit and reports concrete errors
+without substitution. Explicit user profile selection retains native
+precedence over role configuration. Successor-lead selection also comes from
+this configuration; the implemented handoff seed's single hard-coded successor
+remains verified evidence, not the contract.
 
-Alternatives considered: instructions alone cannot react after GPT is refused; proxy-level model substitution lacks task ownership and can resend incompatible state; a separate general-purpose agent framework duplicates the existing execution, auth and tool lifecycle. The native client approach preserves the current user entry point and has concrete local protocol precedents.
+### 3. The `team-lead` skill activates the role
 
-### 2. Roles express capability and preserve explicit identities
+The user-facing entry point is an ordinary Codex session plus the
+kit-delivered `team-lead` skill: the user invokes it (or clearly asks for
+orchestrated asynchronous development, which the skill description matches)
+and then talks to the lead in natural language - status questions, steering
+and stop requests. The skill owns the lead workflow instructions: role
+configuration discovery, board setup, specification creation, executor briefs
+through harness commands, steering, acceptance, merge and explicit stop.
+Ordinary sessions carry none of that context, so a small direct task stays
+direct. Global instructions add only a pointer to the skill. Harness commands
+(`executor spawn`, steering delivery, `task stop`) are the agent interface;
+`task stop` and status remain directly available to the user as the emergency
+path that works without the lead.
 
-Assign `zai/glm-5.3`, `xai/grok-4.6` or `gpt-6-astra` explicitly at launch with an effort supported by that exact model. Senior execution and temporary leadership describe responsibilities, not separate agent files. The user prefers this native parameter selection over fixed presets. Retire redundant supplied `middle_backup`, `senior`, `principal` and subscription presets through their owning lifecycle; document the former model/effort mapping so saved instructions can migrate without silently changing accounts. Keep user-owned custom agents and `.agents/skills`. All OpenAI selections remain Astra.
+### 4. The board is the agents' protocol
 
-The current native spawn contract exposes independent `model` and `reasoning_effort` fields. Its advertised effort sets differ by model: a name such as `medium` or `xhigh` is not universally supported. Verify the effective binding and provider behavior, reject unsupported combinations explicitly, and do not manufacture a preset for each combination. Existing bounded Z.AI execution selected a model and effort directly; fresh installed-session acceptance remains required.
+The consuming project's task board (`beads`, the `bd` CLI) carries
+asynchronous coordination: stages as epics, specifications as features,
+executor feedback as feedback tasks, lead improvements as tasks or OpenSpec
+changes. The controller stays board-agnostic - it knows sessions, windows and
+worktrees, not board semantics - so the board remains consuming-project state
+and no second source of truth appears. The kit delivers board availability and
+workflow guidance through its installation lifecycle and verifies them from a
+fresh external session. Public kit sources use synthetic examples only. The
+`beads` dependency requires the standard proportional assessment before
+execution (identity, license, maintenance, install effects, vulnerabilities).
 
-Temporary Z.AI leadership is a task leadership transfer to a fresh, verified lead binding, not recursive delegation by a worker. The controller transfers the work ledger and allocates the same task-wide two executor slots. It must not launch a second copy of a Z.AI assignment when its worker becomes or supplies context to the new leader. Workers still cannot create their own trees. Direct explicit model selections retain their native precedence and must not be treated as blanket permission for hidden substitution.
+### 5. Executors are isolated and visible
 
-Choose compatible reasoning at supported task/turn boundaries. Test a lower-cost setting for routine lead coordination and reserve demanding settings for uncertainty and consequential decisions; adopt changed defaults only after the unchanged outcome checks pass. Do not restart an active task merely to change reasoning settings.
+Every executor runs `codex --profile <id>` in its own visible terminal window
+and its own Git worktree created from the task's base revision. The
+controller owns the worktree lifecycle: create, map to the assignment,
+preserve through interruption, retire after the lead merges or explicitly
+discards. Executors never write to the shared checkout. Views are established
+before the first model request and show assignment, role, effective
+profile/model/effort and live activity; reuse the owned native-console
+approach and view-loss behavior from the verified contract. A switchable list
+or hidden session does not qualify.
 
-### 3. Persist the minimum state needed to continue safely
+### 6. Steering through the session channel
 
-Use existing host-private harness storage and serialization conventions. A task record needs a stable task identity, canonical workspace, accepted objective/constraints/authorization, decisions, leader binding, assignments, resource owners, attempt identities, result/check references, availability observations and next action. Raw model history, screenshots, credentials and private consumer evidence stay outside shared source. Store visible handoffs and references rather than copying complete transcripts.
+Lead steering is delivered by the controller into the executor session and
+appears in that executor's window (option "b" from the exploration). Keyboard
+automation of TUI windows and hidden background sessions are rejected:
+fragile, unauditable, and invisible to the user. Waiting and routine event
+handling make no model calls; no status polling. Executor escalations travel
+as board feedback tasks with bounded context, keeping the live channel for
+steering and the board for durable asynchronous records.
 
-Persist state before dispatch and before changing ownership. Reconcile native session status and owned process liveness after restart; do not infer that a lost connection stopped a worker. Use one task owner and short local serialization of transitions, retaining the existing single-developer assumption. Multiple project tasks share account availability observations but never workspace authority or partial results. A late result is correlated to its attempt and retained for reconciliation, not blindly applied.
+### 7. The lead accepts and merges
 
-For quota exhaustion after a tool mutation, the successor receives existing files, verified effects and outstanding acceptance. Reuse checks only when their inputs remain current. Do not automatically replay an external operation with an uncertain outcome. Read-only and planning boundaries must survive leadership transfer exactly as implementation permissions do.
+The lead reviews completed assignments against requirements and applicable
+checks, returns concrete defects to the original executor, and merges accepted
+branches itself. Worktrees are retired after merge or explicit discard;
+rejected work keeps its partial result until resolved. Acceptance and merge
+are recorded in task state and reflected on the board, without claiming
+completion for integrated work whose checks have not passed.
 
-### 4. Availability is a small state machine, not a race
+### 8. Persist the minimum state needed to continue safely
+
+Use existing host-private harness storage and serialization conventions. A
+task record keeps stable identity, workspace and worktree mapping, accepted
+objective/constraints/authorization, decisions, lead binding, assignments,
+resource owners, attempt identities, result/check references and next action.
+Raw model history, credentials and private consumer evidence stay outside
+shared source. Persist before dispatch and ownership transitions; reconcile
+session status, process liveness and worktrees after restart. A late result
+is correlated to its attempt and retained, not blindly applied.
+
+### 9. Availability and succession at safe boundaries
 
 | Observation | Controller action |
 | --- | --- |
 | Healthy worker takes time | Preserve owner; wait on events without model polling. |
-| Confirmed quota exhaustion | Exclude affected account/model window, preserve work, dispatch a capable alternative. |
-| Temporary throttling | Respect usable retry guidance; pace requests/new work without assuming weekly exhaustion. |
-| Auth or exact-model rejection | Retain original cause, exclude affected route until relevant conditions change; no credentials or account changes. |
-| Transport/proxy failure | Reconcile in-flight effects and use the existing bounded runtime recovery; do not mark all provider quotas exhausted. |
-| Empty/intermediate completion | Inspect visible work and result delivery; continue or reassign with a concrete diagnosis, never automatically make GPT finish it. |
+| Confirmed quota exhaustion | Exclude affected route for a bounded window, preserve work, reassign within configured profiles. |
+| Temporary throttling | Respect usable retry guidance without assuming weekly exhaustion. |
+| Auth or exact-model rejection | Retain original cause, exclude affected route until conditions change; no credential changes. |
+| Transport failure | Reconcile in-flight effects and use bounded runtime recovery; do not mark provider quotas exhausted. |
+| Empty/intermediate completion | Inspect visible work and result delivery; continue or reassign with a concrete diagnosis. |
 
-Remember observation time, scope and provider reset/retry data. Do not manufacture reset times or treat missing telemetry as unlimited capacity. When reset data is absent, use bounded backoff and a single eligible actual request, not periodic model probes. Distribute retry eligibility across tasks sharing an account to avoid a reset-time burst. Recovery checks do not grant new authority or remove user stop state.
+Lead succession replaces the failed lead with one configured capable
+successor at a safe boundary - never mid-tool-call - preserving decisions,
+assignments and acceptance. The configured preferred lead returns at a safe
+decision boundary after verified recovery. Instruction-refresh succession via
+`codex resume` (including deterministic session selection and verification
+that a resumed process reloads current instructions and skills) is owned by
+the follow-up change.
 
-### 5. Leadership changes at safe boundaries
+### 10. Reuse current requirements and research
 
-GPT normally owns decisions and acceptance. If its request is refused for quota, the controller has sufficient saved state to start Z.AI leadership without another GPT call. Z.AI continues the agreed task and collects current worker results. Unresolved questions beyond the available models remain pending while independent work continues. If GPT and Z.AI are both unavailable, Grok can complete capable already assigned work; the controller does not invent a substitute for a hard missing decision.
+The archived decomposition requirements now live in the main
+`agent-delegation` capability; this change modifies them in place and does
+not reopen their resource-ownership, validity or restoration scenarios. The
+following current sources support the selected mechanisms; installed help and
+isolated behavior determine actual compatibility:
 
-After verified GPT recovery, return leadership at a boundary with no concurrent lead decision, retaining worker ownership. Only one lead can accept results or issue new assignments for the task. Show the successor in its own identified conversation pane/window and record the transition in the task view; retain the previous conversation for inspection. Do not alias distinct leader conversations behind a single visible chat identity.
+- [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): native agents and scoped context remain the execution basis; no second agent framework.
+- [Codex app-server](https://learn.chatgpt.com/docs/app-server): native session/turn control and local transport; experimental status requires version checks and contract tests.
+- [Beads](https://github.com/gastownhall/beads): agent-first graph tracker with a non-interactive CLI and git-friendly storage; suitability on Windows and lifecycle integration require the task-owned assessment before execution.
 
-An active managed runtime may continue across one client disconnect only while the active conversations remain visible through another attached view. If the required views disappear, suspend new model dispatch, reconcile in-flight work and restore the views before continuation; do not silently leave a model loop running. Explicit Stop, cancellation or Disconnect disables dispatch and preserves partial work. Recovery resumes only tasks recorded as active and reconciles their surviving processes first. Continuous execution requires the local machine, runtime and visible conversation views to remain available; suspension or reboot preserves state rather than guaranteeing execution while offline.
-
-### 5a. Make all active conversations simultaneously visible
-
-The confirmed everyday scenario is one leader and up to two executors working while the user sees each conversation in a separate window or pane at the same time. Automatically establish each view before its first model request. Show task/assignment, role, actual provider/model and effort, streaming messages and tool activity, waiting/error/completed state, and available usage without invented quota figures. Preserve conversation history on handoff and completion. Any auxiliary model request, including automatic title generation, must be visible and attributable or disabled. Deterministic transport, event waiting and rendering need no model calls.
-
-Reuse native terminal/chat views where verified; a list requiring chat switching is insufficient. The original single-TUI contract alone does not satisfy this acceptance. The subsequent owned three-window path demonstrates opening the views and displaying a native tool result; task 1.4 still requires integrated dispatch and recovery before live orchestration. Direct injection into a child is rejected and root history injection does not appear live in an attached TUI, so presentation must not depend on that route. View failure must be explicit, preserve in-flight effects, and prevent hidden new requests. Closing one of several clients must not accidentally stop unrelated visible tasks.
-
-For presentation, reuse native Codex in owned visible Windows consoles. The
-[native contract receipt](../../../docs/rust-native.md#native-task-control-contract)
-owns current checks and limits. Windows [console creation](https://learn.microsoft.com/en-us/windows/console/creation-of-a-console)
-provides a separate interactive window and standard devices; the existing Rust
-process owner keeps it in a dedicated Job. Window readiness is checked against
-the retained process handle and current HWND, and the initial layout places one
-lead beside two executor windows. [Windows Terminal panes](https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments)
-are an available alternative; direct console ownership avoids adding Terminal
-command routing and shared-window lifecycle to this control path. A named empty
-native thread can be created by the controller and attached before model work,
-which preserves a distinct thread identity and allows title generation to be
-avoided. Runtime integration and view-loss behavior remain acceptance work.
-
-### 6. Conserve GPT without underusing the other subscriptions
-
-Start with two executor slots shared across the task, ordinarily one Z.AI and one Grok when their work is independent. Route substantial text/code to Z.AI and visual or suitable routine work to Grok. Return ordinary corrections to the responsible executor; GPT contributes a bounded difficult decision when needed rather than redoing the workstream.
-
-Use authoritative account-limit observations when exposed by the installed service, retaining observation scope and reset windows. Use existing local usage evidence for attribution and comparisons, not an invented quota remainder. Pace new work using observed depletion and time to reset; do not invent fixed percentages of work per provider or a universal reserve percentage without workload evidence. A healthy worker is not preempted merely because account pacing changes. Unknown remainder still permits suitable work until actual evidence changes availability.
-
-For benefit acceptance, predeclare representative text implementation, visual verification and parallel integration tasks, identical inputs/checks, measured baseline and timing tolerance before model-backed runs. Include the cost of briefing, coordination, waiting, validation and rework. Required evidence is lower attributable GPT use, unchanged correctness and no material delivery-time regression beyond measurement tolerance. Fix a failed comparison rather than reducing accepted behavior; an inconclusive result remains unfinished. Exact weekly savings require comparable account evidence and must not be inferred from token counts.
-
-### 7. Reuse current requirements and research
-
-Merge the changed `Bounded collaboration and verification` requirement with the complete delta from `adapt-workflow-through-decomposition`, including runtime resource ownership, validity and restoration evidence and pending integration. Preserve its added workstream-completion requirement and all global-working-principles requirements. Its promise to preserve existing role selection does not freeze the old assignments against this separately accepted routing change. Neither change closes the other's tasks.
-
-The following current sources support the selected mechanisms; the dependency's installed help and isolated behavior determine actual compatibility:
-
-- [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): native agents and scoped context provide the execution basis; verify direct model/effort dispatch and native conversation views instead of introducing a second agent framework.
-- [Codex app-server](https://learn.chatgpt.com/docs/app-server): use native session/turn control, local transport and limit notifications; its experimental status requires version checks and actual contract tests.
-- [Codex pricing and usage](https://learn.chatgpt.com/docs/pricing): allowance accounting depends on more than prompt length, supporting measured attribution rather than token-to-weekly-quota conversion.
-- [Z.AI Coding Plan](https://docs.z.ai/devpack/overview): separate short and weekly windows require scoped availability observations; published plan tables are not a live account reading.
-- [Grok usage limits](https://docs.x.ai/grok/faq): usage and reset information concern the shared subscription; they do not by themselves establish a callable monitor for the installed OAuth route.
-
-The implemented transport uses pinned `tungstenite` 0.30.0 with only its handshake feature. Its [upstream manifest](https://github.com/snapview/tungstenite-rs/blob/v0.30.0/Cargo.toml) identifies MIT/Apache-2.0 licensing and Rust 1.85 compatibility. Reuse avoids implementing WebSocket framing or introducing a separate async runtime, TLS stack or platform-specific WinHTTP adapter for this local endpoint. The lockfile records the full dependency set. Inspection on 2026-09-12 covered all 18 added packages, their upstream/license metadata, and the two build scripts (compiler probes and generated build-output files); an OSV batch lookup returned no listed vulnerabilities for those versions. The earlier [handshake denial-of-service advisory](https://rustsec.org/advisories/RUSTSEC-2023-0065.html) is fixed in this version. Private receipts retain the query and metadata; this is scoped dependency evidence, not a security guarantee. Any further dependency still requires the same proportional assessment before execution.
+The implemented transport uses pinned `tungstenite` 0.30.0 with only its
+handshake feature. Its
+[upstream manifest](https://github.com/snapview/tungstenite-rs/blob/v0.30.0/Cargo.toml)
+identifies MIT/Apache-2.0 licensing and Rust 1.85 compatibility. Reuse avoids
+implementing WebSocket framing or introducing a separate async runtime, TLS
+stack or platform-specific WinHTTP adapter for this local endpoint. The
+lockfile records the full dependency set. Inspection on 2026-09-12 covered
+all 18 added packages, their upstream/license metadata, and the two build
+scripts; an OSV batch lookup returned no listed vulnerabilities for those
+versions. The earlier
+[handshake denial-of-service advisory](https://rustsec.org/advisories/RUSTSEC-2023-0065.html)
+is fixed in this version. Private receipts retain the query and metadata;
+this is scoped dependency evidence, not a security guarantee. Any further
+dependency, including `beads`, still requires the same proportional
+assessment before execution.
 
 ## Risks / Trade-offs
 
-- Experimental native control contract -> bind acceptance to the tested CLI/schema and exact two-client behavior; keep unsupported installations on their previous usable path with an explicit limitation.
-- Lead replacement while workers survive -> persisted attempt identities, one leader, task-wide concurrency and liveness reconciliation before reassignment.
-- A less capable available model cannot preserve quality -> route by required capabilities, retain dependent work and escalate bounded questions; acceptance is unchanged.
-- Excess coordination can consume the saved GPT allowance -> concise handoffs, event-driven waits, correction by the owner and matched end-to-end comparisons.
-- Unknown or externally consumed account quota -> report observation limits, share account availability and avoid false task attribution or fixed throughput promises.
-- Common proxy failure can affect both external providers -> retain native GPT independence and existing proxy resource/restart controls; task retries do not restart unrelated active services.
+- External `beads` dependency -> proportional assessment, supported-version pinning, lifecycle check, and explicit board-unavailable behavior instead of silent degradation.
+- Experimental native control contract -> bind acceptance to the tested CLI/schema and exact behavior; unsupported installations keep their previous usable path with an explicit limitation.
+- Worktree sprawl and stale branches -> controller-owned lifecycle, retirement after merge or discard, preservation on interruption, no shared-checkout writes.
+- Two coordination planes (board and live channel) -> the board is the durable asynchronous record, the channel is live steering; neither duplicates the other's state and the controller parses neither board content nor transcripts.
+- Parallel executors share account windows -> concurrency comes from validated configuration; budget measurement is deliberately deferred to the follow-up change, so this change makes no savings claims.
+- Publication boundary -> synthetic consuming-project examples only; private paths, identities and evidence stay in host-private storage.
 
 ## Migration Plan
 
-1. Establish the native control contract in owned isolated state and prove one useful tool-using assignment with a quota handoff. Do not accumulate account dashboards or scheduling infrastructure before this path works.
-2. Prove simultaneous native conversation views and direct model/effort dispatch, then add private task recovery through existing Rust lifecycle owners. Keep launcher names and native overrides compatible; retire redundant supplied presets with an explicit migration and preserve unrelated user agents.
-3. Replace conflicting routing/takeover guidance in the owning global config, delegation and token-workflow records. Reconcile the active decomposition delta when integrating rather than overwriting it from main specs.
-4. Exercise update/check/recover/disconnect in isolated installations, including current-source loading outside this checkout and preservation of unrelated configuration, credentials and active control channels.
-5. Validate real subscribed bindings, representative recovery paths, a real external consumer and the declared benefit comparison. Only then claim global completion; unfinished implementation and benefit tasks remain open.
-6. Rollback restores owned prior links/configuration and removes new dispatch authority without erasing private checkpoints or stopping unrelated runtimes. Explicitly stopped tasks remain stopped after reconnect.
+1. Add validated role configuration and board availability in owned isolated state; assess the `beads` dependency before execution.
+2. Prove integrated executor dispatch: own window, own worktree, configured profile, live steering through the verified control path.
+3. Add lead acceptance/merge, durable task records, cause-aware recovery and configured lead succession.
+4. Connect controller, views, configuration and board guidance through native install/update/check/recover/disconnect in isolated installations.
+5. Validate a real external consuming development task and update owning guides and decision records; only then claim completion.
+6. Rollback removes dispatch authority and owned links without erasing private checkpoints, worktrees or unrelated runtimes; explicitly stopped tasks stay stopped.
+
+## Open Questions
+
+- Exact non-interactive `bd` command contract on Windows (owned by the board
+  integration task).
+- Preferred-lead return boundaries when several executors are healthy.
+- The follow-up change owns: deterministic `codex resume` session selection
+  and instruction-reload regression checks, telemetry ingestion from provider
+  dashboards versus native limit reads, feedback cadence and token-benefit
+  acceptance.

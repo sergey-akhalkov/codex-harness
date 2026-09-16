@@ -247,7 +247,7 @@ print("PASS runtime install denial")
         .unwrap();
     assert!(
         status.success(),
-        "runtime provisioning guard failed; analog fixture tests/fixtures/code-tools-native/serena-guard-check.py still covers Pascal/PowerShell reuse when those languages are adopted"
+        "runtime provisioning guard failed; unmapped language constructors must stay denied"
     );
 }
 

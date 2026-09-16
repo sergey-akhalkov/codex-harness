@@ -414,12 +414,12 @@ pub(crate) fn adapt_request_body(body: &[u8], adaptation: &ToolAdaptation) -> Op
         .get("tools")
         .and_then(Value::as_array)
         .is_none_or(|tools| tools.is_empty());
-    if tools_empty && value.get("tool_choice").is_some() {
-        if let Some(object) = value.as_object_mut() {
-            if object.remove("tool_choice").is_some() {
-                changed = true;
-            }
-        }
+    if tools_empty
+        && value.get("tool_choice").is_some()
+        && let Some(object) = value.as_object_mut()
+        && object.remove("tool_choice").is_some()
+    {
+        changed = true;
     }
     if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools.iter_mut() {
@@ -429,22 +429,22 @@ pub(crate) fn adapt_request_body(body: &[u8], adaptation: &ToolAdaptation) -> Op
                     changed = true;
                 }
                 Some("web_search") => {
-                    if let Some(object) = tool.as_object_mut() {
-                        if object.remove("external_web_access").is_some() {
-                            changed = true;
-                        }
+                    if let Some(object) = tool.as_object_mut()
+                        && object.remove("external_web_access").is_some()
+                    {
+                        changed = true;
                     }
                 }
                 Some("namespace") => {
-                    if let Some(namespace) = tool.get("name").and_then(Value::as_str) {
-                        if let Some(subtools) = tool.get("tools").and_then(Value::as_array) {
-                            for subtool in subtools {
-                                let mut flat = subtool.clone();
-                                if let Some(subname) = subtool.get("name").and_then(Value::as_str) {
-                                    flat["name"] = Value::String(format!("{namespace}__{subname}"));
-                                }
-                                flattened.push(flat);
+                    if let Some(namespace) = tool.get("name").and_then(Value::as_str)
+                        && let Some(subtools) = tool.get("tools").and_then(Value::as_array)
+                    {
+                        for subtool in subtools {
+                            let mut flat = subtool.clone();
+                            if let Some(subname) = subtool.get("name").and_then(Value::as_str) {
+                                flat["name"] = Value::String(format!("{namespace}__{subname}"));
                             }
+                            flattened.push(flat);
                         }
                         *tool = Value::Null;
                         changed = true;
@@ -835,11 +835,9 @@ impl SseAdapter {
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
                     let is_custom = self.item_is_custom(item);
                     self.custom_indexes.insert(index, is_custom);
-                    if is_custom {
-                        if let Some(rewritten) = self.rewrite_item(item) {
-                            value["item"] = rewritten;
-                            return Some(serialize_data_line(&value));
-                        }
+                    if is_custom && let Some(rewritten) = self.rewrite_item(item) {
+                        value["item"] = rewritten;
+                        return Some(serialize_data_line(&value));
                     }
                 }
                 Some(original.to_vec())

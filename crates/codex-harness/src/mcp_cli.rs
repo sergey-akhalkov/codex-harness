@@ -356,6 +356,7 @@ fn prepare_codegraph(args: &[OsString]) -> io::Result<i32> {
             .get(&OsString::from("--source"))
             .map(|p| local_path(Path::new(p)))
             .transpose()?,
+        inventory: None,
         mode: options
             .get(&OsString::from("--mode"))
             .and_then(|v| v.to_str())

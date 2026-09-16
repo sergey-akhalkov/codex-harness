@@ -102,9 +102,9 @@ The [harness profile](../global/harness.config.toml) contains a short standing
 policy and a limit of two concurrent child threads.
 The [former Astra source directory](../global/agents/README.md) remains linked
 at `~/.codex/agents/codex-harness` for installer compatibility and contains no
-presets. The subscription [middle](../global/opencodex/agents/middle.toml) remains
-temporarily connected by its owning lifecycle. Direct native selection does not
-need these names. Do not create recursive worker trees; this remains policy until
+presets. OpenCodex routing, including its subscription middle, is retired;
+direct native selection does not need those names. Do not create recursive
+worker trees; this remains policy until
 the controller's shared task-wide ownership and concurrency checks are complete.
 
 `developer_instructions` is a scalar: the selected profile replaces the same
@@ -128,7 +128,8 @@ All assigned OpenAI models belong to Astra. Adapter search is explicitly aimed
 at Grok 4.6 through xAI OAuth; the automatic vision helper is off. Grok 4.6
 supports its own image input. If a selected model lacks a capability, that must
 become a visible limit or a separate explicit assignment, not a hidden ChatGPT
-quota borrow. Settings live in [one JSON](../global/opencodex/config.json).
+quota borrow. Routing settings are owned by the native subscription lifecycle
+described in [subscription models](subscription-models.md).
 Grok `xhigh` support is described in the
 [official reasoning contract](https://docs.x.ai/developers/model-capabilities/text/reasoning).
 
@@ -151,9 +152,9 @@ preliminary model requests before every delegation.
 
 ## Checks and replacing a model
 
-Model-free checks: `tests/consumer.Tests.ps1`,
-`tests/subscription-config.Tests.ps1`, `tests/subscription-routing.Tests.ps1`
-and `tests/delegation-usage.py`. Isolated lifecycle uses separate homes, port
+Model-free checks are native: the delegation usage, outcome and consumer
+suites under `crates/codex-harness/tests/` (see
+[native checks](rust-native.md)). Isolated lifecycle uses separate homes, port
 and Windows task. Legacy model probes are opt-in and capture private logs, but
 do not yet open all active conversations simultaneously. Do not run them as the
 new workflow's acceptance until their visible-view integration is implemented:
@@ -168,7 +169,7 @@ checks the result independently, and separately checks Astra-level bindings. One
 short max consultation in it is a configuration check, not a production
 threshold. Private evidence stays in a temporary directory.
 
-The [usage counter](../tools/delegation-usage.py) takes explicit parent and
+The native usage counter `codex-harness delegation-usage` takes explicit parent and
 child paths, keeps the last cumulative record of each thread for former
 consumers, and separately removes repeats by stable response ID. Inherited
 history can overlap cumulative sums; with incomplete data or series disagreement
@@ -180,17 +181,15 @@ were among the supplied files, not a zero remaining quota. The `partial` flag
 conservatively spreads to aggregates on warnings. A failed run keeps available
 spend data and the acceptance-failure cause.
 
-The counter is available from any directory through the global installation
-record, without copying the script into a consuming project. Pass only needed
+The counter is available from any directory through the installed native
+manager. Pass only needed
 existing rollout files; keep results and detailed logs outside Git:
 
 ```powershell
 $usageHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $usageState = Get-Content (Join-Path $usageHome 'harness/installation.json') -Raw | ConvertFrom-Json
-$usageRegistry = Get-Content (Join-Path $usageHome 'harness/code-tools.json') -Raw | ConvertFrom-Json
-$usagePython = ($usageRegistry.mcp | Where-Object id -eq 'serena').paths.python
 $rolloutPaths = @('<parent-rollout.jsonl>', '<child-rollout.jsonl>')
-& $usagePython -B (Join-Path $usageState.sourceRoot 'tools/delegation-usage.py') @rolloutPaths --format markdown --output (Join-Path $env:TEMP 'usage.md')
+& $usageState.configBridge delegation-usage @rolloutPaths --format markdown --output (Join-Path $env:TEMP 'usage.md')
 ```
 
 A previous saved model probe can also be rechecked without spending the

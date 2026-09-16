@@ -310,9 +310,13 @@ fn installed_code_and_memory_operations() {
     let servers = inventory["data"].as_array().unwrap();
     // This scenario exercises Serena. Graphify is retired from the managed selection.
     // CodeGraph qualification is independent and must not suppress these checks.
-    for name in ["serena"] {
-        assert!(servers.iter().any(|s| s["name"] == name && s["tools"].as_object().is_some_and(|t| !t.is_empty())), "missing {name}; inspect retained catalogue");
-    }
+    let name = "serena";
+    assert!(
+        servers
+            .iter()
+            .any(|s| s["name"] == name && s["tools"].as_object().is_some_and(|t| !t.is_empty())),
+        "missing {name}; inspect retained catalogue"
+    );
     client.server_tool("serena", "initial_instructions", json!({}));
     let config = client.server_tool("serena", "get_current_config", json!({}));
     assert!(config.to_string().contains("workflow-fixture"));

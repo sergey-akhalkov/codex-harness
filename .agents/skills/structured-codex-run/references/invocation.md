@@ -12,7 +12,7 @@ run. Unsupported schema extensions fail before launch; they are never silently
 ignored. Global native command registration is still pending, so do not assume
 this executable is already on PATH.
 
-`harness-inspect.exe` is the current helper. Pass a JSON array for the launch prefix: either an absolute native Codex `.exe`, or an absolute `pwsh.exe` plus `-NoProfile -File` and the installed launcher path. There is no shell-command string parsing. Resolve the original CLI through the kit installation receipt when PATH points to a wrapper; record its version with `--version` before the run. `scripts/run.py` remains a transitional caller of the same contract.
+`harness-inspect.exe` is the current helper. Pass a JSON array for the launch prefix: either an absolute native Codex `.exe`, or an absolute `pwsh.exe` plus `-NoProfile -File` and the installed launcher path. There is no shell-command string parsing. Resolve the original CLI through the kit installation receipt when PATH points to a wrapper; record its version with `--version` before the run.
 
 Example with caller-resolved paths and an already authorized route:
 
