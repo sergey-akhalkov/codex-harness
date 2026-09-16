@@ -7,37 +7,34 @@ Restore globally connected subscription agents after a runtime failure while con
 ## Requirements
 
 ### Requirement: Bounded automatic runtime recovery
-
-The connected background runtime SHALL automatically attempt recovery after an unexpected failure, with at most three restart attempts one minute apart. Every attempt MUST retain the existing 2048 MiB job limit and private failure evidence. Persistent failure MUST stop retrying and remain observable. Explicit disconnect MUST leave the integration stopped.
+Owned subscription login and token-helper failures SHALL remain observable without an infinite restart loop. The kit SHALL NOT run a background OpenCodex proxy or Task Scheduler host for Grok after the Responses spike passes. Explicit disconnect MUST leave native Grok/Z.AI profile wiring stopped or removed as documented. Stored credentials MUST remain unless the user deletes them.
 
 #### Scenario: One runtime crash
-- **WHEN** the connected managed runtime fails and its replacement can start
-- **THEN** the background host restarts the runtime automatically and republishes the Grok role only after the replacement proves readiness
+- **WHEN** a token helper or login command fails
+- **THEN** the failure is retained in private evidence, Grok is not silently rerouted through a proxy, and the next explicit login can retry
 
 #### Scenario: Repeated failure
-- **WHEN** every automatic restart also fails
-- **THEN** the configured retry budget is exhausted without an infinite restart loop and retained logs identify the failed attempts
+- **WHEN** authentication keeps failing
+- **THEN** the kit does not spawn an unmanaged restart loop and retained logs identify the failed attempts
 
 #### Scenario: Intentional disconnection
 - **WHEN** the user disconnects the subscription integration
-- **THEN** its owned task and connections are removed and automatic recovery does not reconnect them
+- **THEN** owned native profile wiring is removed, no OpenCodex task reconnects it, and stored credentials are preserved
 
 ### Requirement: Non-disruptive recovery policy activation
-
-The installer SHALL support applying the restart policy to an already installed owned task without stopping, deleting or manually starting its running process. It MUST preserve unrelated task settings, configuration, authentication and links. Ownership conflicts and unfinished lifecycle operations MUST prevent unsafe writes. Preview MUST be read-only; interrupted policy updates MUST be recoverable without stopping the runtime.
+Lifecycle updates for native Grok/Z.AI profiles SHALL be applicable without stopping unrelated Codex sessions or mutating foreign configuration. Ownership conflicts and unfinished lifecycle operations MUST prevent unsafe writes. Preview MUST be read-only; interrupted updates MUST be recoverable. The installer SHALL NOT require applying a proxy-process restart policy.
 
 #### Scenario: Apply while a session uses the proxy
-- **WHEN** the restart policy is applied to a running owned installation
-- **THEN** the same proxy process remains ready and subsequent installation checks accept the new task definition
+- **WHEN** native subscription wiring is updated while another Codex session is open
+- **THEN** that session is not forced onto a proxy, and subsequent checks accept the new native definition
 
 #### Scenario: Interrupted or conflicting activation
-- **WHEN** a policy update is interrupted or another writer changes the task or ownership state
+- **WHEN** a policy or profile update is interrupted or another writer changes ownership state
 - **THEN** recovery restores the recorded state or reports a conflict while preserving foreign changes and recovery evidence
 
 ### Requirement: Reusable and verified global recovery
-
-The policy SHALL be maintained in reusable kit sources and applied by new installation and update. Acceptance MUST exercise automatic failure recovery in owned isolated state and verify live policy settings and exact Grok delegation through a fresh global Codex session outside this checkout. It MUST NOT deliberately crash or stop the global proxy used by active sessions.
+Native Grok/Z.AI profile connection SHALL be maintained in reusable kit sources and applied by new installation and update. Acceptance MUST verify the xAI profile through a fresh global Codex session outside this checkout after OpenCodex is absent. It MUST NOT deliberately crash a live user session and MUST NOT keep a global proxy as a recovery target.
 
 #### Scenario: Global delivery
 - **WHEN** this change is declared complete
-- **THEN** the installed task has the bounded policy, the global service is ready, and an externally launched parent receives a tool-derived result from its exact Grok middle child
+- **THEN** no owned OpenCodex task is required for Grok, ordinary Codex uses native GPT, and an externally launched `codex --profile xai` session completes a tool-using Grok turn

@@ -15,11 +15,9 @@
         'tools/token-workflow.psm1', 'global/rtk-hooks.json', 'global/rtk.json',
         'Cargo.toml', 'Cargo.lock', 'tools/rtk-adapter/Cargo.toml', 'tools/rtk-adapter/src/main.rs',
         'tools/code-tools/registration.py', 'tools/code-tools/discovery.py', 'tools/code-tools/launch.py', 'tools/code-tools/check.py',
-        'global/tool-resources.json', 'tools/process_ownership.py', 'tools/code-tools/resources.py', 'tools/code-tools/cbm_proxy.py', 'tools/lsp/broker.py',
+        'global/tool-resources.json', 'tools/process_ownership.py', 'tools/code-tools/resources.py', 'tools/lsp/broker.py',
         'tools/code-tools/lazy_stdio.py', 'tools/code-tools/orphans.py', 'tools/code-tools/serena_broker.py', 'tools/code-tools/serena_proxy.py',
         'tools/code-tools/mcp_provision.py', 'tools/code-tools/lsp_provision.py', 'tools/code-tools/serena_entry.py', 'tools/code-tools/nuphus_proxy.py', 'tools/code-tools/dependencies.py',
-        'tools/lsp/server.py', 'tools/lsp/backend.py', 'tools/lsp/journal.py', 'tools/lsp/registry.py', 'tools/lsp/delphi.py',
-        'tools/lsp/markdown_client.py', 'tools/lsp/markdown-parse.cjs', 'tools/lsp/bash-windows.cjs', 'tools/lsp/xml-diagnostics.ps1', 'tools/lsp/powershell-diagnostics.ps1',
         'tools/opencodex-process.ps1', 'tools/opencodex-process.cs')
     ManagedSettings = @(
         'approval_policy', 'sandbox_mode', 'model', 'model_reasoning_effort',

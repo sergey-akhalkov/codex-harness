@@ -13,7 +13,8 @@ import tempfile
 import tomllib
 
 NAMES = ('serena', 'codebase-memory', 'graphify', 'nuphus', 'harness-lsp')
-SELECTED_NAMES = ('serena', 'codebase-memory', 'nuphus')
+SELECTED_NAMES = ('serena', 'nuphus')
+RETIRED_NAMES = ('codebase-memory', 'graphify', 'harness-lsp')
 MARKERS = {'# BEGIN codex-harness MCP registrations', '# END codex-harness MCP registrations'}
 READINESS_KEY = 'mcp_optional_startup_grace_ms'
 READINESS_STATEMENT = READINESS_KEY + ' = 0\n'
@@ -67,8 +68,6 @@ def registration(source, powershell, name, home):
                 'args': ['-B', '-u', str(source / 'tools/code-tools/launch.py'), name,
                          '--registry', str(home / 'harness/code-tools.json')],
                 'env': {'CODEX_HOME': str(home)}}
-        if name == 'codebase-memory':
-            target['tool_timeout_sec'] = 660
         return target
     return {'command': str(powershell), 'args': ['-NoLogo', '-NoProfile', '-File', str(source / 'tools/mcp.ps1'), '-Server', name],
             'env': {'CODEX_HOME': str(home)}}
@@ -274,7 +273,7 @@ def inspect(home, source, powershell, mode, native_providers=None):
     desired = {}
     native_providers = native_providers or {}
     native_targets = native_providers.get('registrations', {})
-    retired = native_providers.get('retired', [])
+    retired = tuple(dict.fromkeys((*RETIRED_NAMES, *native_providers.get('retired', []))))
     if mode != 'Disconnect' and any(name not in NAMES and name not in native_targets for name in state['registrations']):
         raise ValueError('Native provider projection is required; preserving current registrations.')
     names = tuple(dict.fromkeys((*NAMES, *state['registrations'], *native_targets)))
@@ -283,7 +282,9 @@ def inspect(home, source, powershell, mode, native_providers=None):
         actual = existing.get(name)
         target = None
         if mode != 'Disconnect':
-            if name in native_targets:
+            if name in retired:
+                target = None
+            elif name in native_targets:
                 target = native_targets[name]
             elif name in SELECTED_NAMES and name not in retired:
                 target = registration(source, powershell, name, home)

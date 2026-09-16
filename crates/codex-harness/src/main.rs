@@ -27,6 +27,14 @@ mod outcome_run;
 mod source_diagnostics;
 #[cfg(windows)]
 mod source_diagnostics_view;
+#[cfg(windows)]
+mod subscription_login_cli;
+#[cfg(windows)]
+mod xai_responses_probe_cli;
+#[cfg(windows)]
+mod xai_responses_shim_cli;
+#[cfg(windows)]
+mod xai_token_helper_cli;
 
 fn verify_manager() -> io::Result<()> {
     verify_entrypoint(Admission::Management)
@@ -255,8 +263,11 @@ fn run() -> io::Result<i32> {
             "codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
         );
         println!(
-            "codex-harness subscription-service --state FILE (native Task Scheduler host; never starts the live global proxy from this help path)"
+            "codex-harness subscription-login xai|zai --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--package-root DIRECTORY] [--key-file FILE] [--no-open-browser]"
         );
+        println!("codex-harness xai-responses-probe --user-home DIRECTORY --evidence DIRECTORY");
+        println!("codex-harness xai-responses-shim [--port N] [--upstream https://api.x.ai]");
+        println!("codex-harness xai-token --codex-home DIRECTORY");
         println!("codex-harness outcome-prepare --case CASE [--observer ABSOLUTE_EXE]");
         println!("codex-harness outcome-oracle --request PATH");
         println!("codex-harness outcome-arm --request PATH");
@@ -358,24 +369,24 @@ fn run() -> io::Result<i32> {
         return install_cli::configure_restart(&args[1..]);
     }
     #[cfg(windows)]
-    if args[0] == "subscription-service" {
+    if args[0] == "xai-token" {
         verify_serving()?;
-        if args == ["subscription-service", "--help"]
-            || args.get(1).is_some_and(|arg| arg == "--help")
-        {
-            println!(
-                "codex-harness subscription-service --state FILE\nServe the owned subscription runtime from an explicit service descriptor. Task Scheduler launches this host. Isolated fixtures never target the live global proxy."
-            );
-            return Ok(0);
-        }
-        if args.len() != 3 || args[1] != "--state" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid native subscription-service options",
-            ));
-        }
-        harness_core::subscription_service::serve(PathBuf::from(&args[2]).as_path())?;
-        return Ok(0);
+        return xai_token_helper_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "xai-responses-probe" {
+        verify_serving()?;
+        return xai_responses_probe_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "xai-responses-shim" {
+        verify_serving()?;
+        return xai_responses_shim_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "subscription-login" {
+        verify_serving()?;
+        return subscription_login_cli::run(&args[1..]);
     }
     if args[0] == "outcome-report" {
         return outcome_report_cli::run(&args[1..]);

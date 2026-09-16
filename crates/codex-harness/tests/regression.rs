@@ -444,3 +444,52 @@ fn oversized_ready_marker_is_not_readiness() {
     assert_eq!(result["status"], "readiness-timeout", "{result}");
     assert_eq!(result["ready"], false);
 }
+
+#[test]
+fn native_observe_runs_from_owned_project_outside_checkout() {
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let consumer = tempfile::Builder::new()
+        .prefix("observe-outside-checkout-")
+        .tempdir()
+        .unwrap();
+    let consumer = consumer.path().canonicalize().unwrap();
+    assert!(
+        !consumer.starts_with(&checkout),
+        "owned consumer must be outside the checkout: {} vs {}",
+        consumer.display(),
+        checkout.display()
+    );
+    let helper = consumer.join("harness-observe.exe");
+    fs::copy(observe(), &helper).unwrap();
+    let cwd = consumer.join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let output = Command::new(&helper)
+        .args([
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--timeout",
+            "8",
+            "--",
+            helper.to_str().unwrap(),
+            "--fixture",
+            "echo-args",
+            "outside-checkout",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root = PathBuf::from(result["root"].as_str().unwrap());
+    assert!(!root.starts_with(&checkout));
+    assert!(root.join("report.json").is_file());
+    assert!(root.join("observed.json").is_file());
+    let stdout = fs::read_to_string(root.join("stdout.txt")).unwrap();
+    assert!(stdout.contains("outside-checkout"), "{stdout}");
+}

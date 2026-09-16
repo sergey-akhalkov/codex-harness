@@ -7,6 +7,9 @@ and operating limits live in [native Rust commands](../rust-native.md). Per-unit
 ownership is [rust-migration-map.json](rust-migration-map.json). Generated caches
 are not migration units.
 
+The current requirement-to-check map is
+[rust-requirement-checks.json](rust-requirement-checks.json).
+
 Observed installed identities at the 2026-09-08 snapshot: Codex CLI 0.153.4,
 OpenSpec 1.12.0, OpenCodex 2.44.0, Serena 1.7.0, Codebase Memory 0.10.8,
 graphifyy 0.9.55, RTK 0.48.0, basedpyright 1.39.10 and rust-analyzer 1.97.1.
@@ -29,12 +32,12 @@ an intact upstream package.
 
 | Large-repository index | The historical CBM full index failed the retained memory policy on the current larger checkout. Current CodeGraph comparison, concurrent native MCP, resource and installed-consumer measurements live in the replacement design; this file does not keep a second copy. Rust task 5.4 is closed after the 610-second soak and large-project rerun |
 | Serena native boundary | Rust-controlled stdio session around the existing guarded Python entry is proven for two owned Rust projects. Provisioning suppression, selected provider configuration, owned `SERENA_HOME` and missing/incompatible registry failures are checked before a child starts. The Python entry remains until later lifecycle cutover. Task 5.4 integrated the native shared-broker proxy; live global registration stays on the Python seam until 9.x |
-| Outcome/usage/oracles | Local CLI consumers exist for report, usage, run, cases, oracle, discover and arm. External consumer cases, full suite migration and global lifecycle remain open |
+| Outcome/usage/oracles | Native CLI consumers exist for report, usage, run, cases, oracle, discover and arm. Deterministic default tests passed; model-backed probes stay explicit `--run-model-probes`. External consumer cases and global lifecycle remain 9.x |
 | Python staging | Empty offline UV candidate only; not eligible for activation |
 | OpenCodex | Native validation boundary exists; browser-only OAuth, restoration and remaining task 3.1 stay open |
-| Structured inspect | Bounded native helper and actual outside-checkout consumer exist; linked invocation and global lifecycle remain open |
-| Regression helper | Scoped native observer exists; global skill invocation remains open |
-| RTK | Transitional workspace member `harness-rtk`; native RTK lifecycle still needed |
+| Structured inspect | Native `harness-inspect.exe` is the skill helper; owned outside-checkout consumer and process/event evidence passed. Global registration remains 9.x |
+| Regression helper | Native `harness-observe.exe` is the skill helper; owned outside-checkout consumer, stdin, cancellation and process evidence passed. Global registration remains 9.x |
+| RTK | Native token-workflow lifecycle plus `harness-rtk` acceptance helpers exist; global cutover remains 9.x |
 
 Keep sequential `--jobs 1` builds and an explicit separate `--target-dir` for
 retained verification binaries. Custom compiler wrappers and ambient Rust build
@@ -703,6 +706,72 @@ role on exit, and retries runtime failures at most three times. Isolated
 fixtures passed readiness/cleanup, foreign-descriptor refusal and retry
 exhaustion without targeting the live global proxy. Authentication/restoration
 and in-place restart-policy recovery remain 6.2/6.3.
+
+## Native subscription authentication (migration 6.2 progress, 2026-09-15)
+
+The host restores native Codex routing through skipHistory-equivalent Rust
+cleanup instead of Bun `opencodex-native-restore.mjs`. Source policy now
+covers hostname, defaultProvider, xAI Chat/OAuth selection, hidden natives,
+Z.AI Coding Plan, sidecar rules and the middle role without echoing private
+values. Install records an already adopted 2.44.0 package identity when
+present. `codex-harness subscription-login xai|zai` owns browser-only OAuth
+and the ACL-hardened Z.AI key store. Isolated fixtures cover restore privacy,
+Z.AI success/failure and CLI login without targeting the live global proxy.
+Restart-policy recovery remains 6.3.
+
+## Native subscription restart policy (migration 6.3 progress, 2026-09-15)
+
+Native configure-restart writes RestartOnFailure Count 3 / Interval PT1M in
+place. The host default retries runtime failures three times, one minute
+apart, at 2048 MiB. Disconnect refuses a running owned task without stopping
+it. An isolated running fixture can receive an in-place policy update without
+being stopped. Interrupted restart-policy journals recover in place, and
+foreign task XML is preserved. Isolated fixtures never target the live global
+proxy.
+
+## Native RTK acceptance helpers (migration 7.1 progress, 2026-09-15)
+
+Token-workflow Install/Recover/Disconnect remain native. `harness-rtk` now has
+Rust acceptance covering exec-once identity, hook rewrite of literal
+`harness-rtk.exe exec`, silence for malformed/Stop/Write/shell-control input,
+disable/missing-dependency bypass, and raw passthrough for filter failure and
+oversized stdout. Python `tests/rtk-adapter.py` remains transitional until
+task 8 retires first-party scripts.
+
+## Native inspect and observe helpers (migration 7.2 progress, 2026-09-15)
+
+Linked skills now prefer native `harness-inspect.exe` and
+`harness-observe.exe`. Python/PowerShell skill scripts remain transitional.
+Owned outside-checkout consumers passed for inspect success evidence and
+observe stdin/process receipts without using the checkout as cwd.
+
+## Native delegation and outcome tools (migration 7.3 progress, 2026-09-15)
+
+Native `delegation-usage`, `outcome-run`, `outcome-oracle` and
+`outcome-report` suites passed: privacy/attribution limits, skipped default
+model probes, live executable fixtures and retained private evidence. Python
+outcome/delegation scripts remain transitional until task 8 retirement.
+
+## Native remaining suites and requirement map (migration 7.4, 2026-09-15)
+
+The current requirement-to-check map is
+[rust-requirement-checks.json](rust-requirement-checks.json). It covers the
+design matrix with native tests. Dated [rust-migration-map.json](rust-migration-map.json)
+remains a 2026-09-08 file inventory and is not remaining work. Native ConPTY
+answers CSI 6n/c queries. `harness-observe` and `harness-inspect` refuse
+declared analysis samples under `tests/fixtures/lsp/`. Native TUI smoke covers
+isolated ordinary `codex` resolution by default; actual /status /model /trust
+writes stay opt-in. Graphify stays retired and is not ported. First-party
+Python/PowerShell/JS/C# paths remain until tasks 8.1-8.2.
+
+## Legacy MCP retirement (migration 8.1, 2026-09-15)
+
+Live managed MCP servers are Serena, CodeGraph and Nuphus. Graphify, Codebase
+Memory and harness-lsp are retired from launch and registration. Classification
+lives in [legacy-mcp-retirement.json](legacy-mcp-retirement.json). Shared
+`tools/lsp/broker.py` remains because Serena still imports it. First-party
+Graphify/CBM/LSP adapters stay as leftover source until task 8.2 deletes
+remaining first-party Python/PowerShell/JS/C# paths after the ownership check.
 
 
 

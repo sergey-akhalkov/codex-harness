@@ -1,0 +1,48 @@
+{
+  "date": "2026-09-15",
+  "codexVersion": "0.154.0",
+  "endpoint": "https://api.x.ai/v1/responses",
+  "status": "blocked-upstream",
+  "verified": [
+    "browser-oauth token helper supplies Authorization for native sessions",
+    "first request of a tool turn is accepted (HTTP 200) after the profile constraints below",
+    "Grok executes a real function tool call and returns its output"
+  ],
+  "profileConstraintsRequired": {
+    "catalog": [
+      "apply_patch_tool_type removed: Codex 0.154 sends it as a Responses `custom` tool and api.x.ai rejects tool type `custom`",
+      "use_responses_lite removed: api.x.ai rejects the `additional_tools` input item"
+    ],
+    "config": [
+      "web_search = \"disabled\": api.x.ai rejects the web_search tool's `external_web_access` field",
+      "features.multi_agent = false: api.x.ai rejects the `namespace` tool type"
+    ]
+  },
+  "blocker": {
+    "stage": "second request of any multi-step tool turn",
+    "httpStatus": 400,
+    "error": "Could not decode the compaction blob. Ensure it is unmodified from the compact response.",
+    "cause": "Codex 0.154 echoes reasoning items with an explicit `content: null` field and without `status`; api.x.ai accepts the echoed item only in the shape it returned. The encrypted_content string is echoed byte-identical, so the payload is not corrupted.",
+    "replayMatrix": {
+      "asSentByCodex": 400,
+      "statusAdded_contentNull": 400,
+      "contentRemoved": 200,
+      "reasoningItemOmitted": 200,
+      "verbatimItemFromSse": 200
+    }
+  },
+  "nonWorkingAlternatives": [
+    "model_reasoning_effort=none: api.x.ai rejects the value for grok-4.6",
+    "catalog without supported_reasoning_levels: field is mandatory; an empty list only removes the effort parameter while reasoning items are still returned",
+    "catalog with empty supported_reasoning_levels and no reasoning summary fields: Codex still echoes the reasoning item in the follow-up request",
+    "wire_api=chat: xAI Chat Completions works with the same OAuth grant (tool call 200 and tool-result follow-up 200), but Codex 0.154 rejects the configuration (chat wire is no longer supported)",
+    "other models reachable on the plan (grok-4-fast-non-reasoning, grok-code-fast-1): still return reasoning items",
+    "tools.apply_patch.tool_type config key: unknown configuration field in 0.154",
+    "use_responses_lite: api.x.ai rejects the `additional_tools` input item"
+  ],
+  "resolutionOptions": [
+    "Codex omits `content` when serializing echoed reasoning items, or",
+    "api.x.ai tolerates `content: null` in echoed reasoning items, or",
+    "a newer Codex release fixes the echo serialization (0.154.0 was the latest @openai/codex on npm on 2026-09-15)"
+  ]
+}

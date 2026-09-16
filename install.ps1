@@ -19,7 +19,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (@($CoreOnly,$SubscriptionsOnly,$CodeToolsOnly,$TokenWorkflowOnly | Where-Object { $_ }).Count -gt 1) { throw 'Component selectors are mutually exclusive.' }
-if ($Mode -eq 'ConfigureRestart' -and -not $SubscriptionsOnly) { throw 'ConfigureRestart requires -SubscriptionsOnly.' }
+if ($Mode -eq 'ConfigureRestart') { throw 'ConfigureRestart is retired together with the OpenCodex proxy; no subscription task is managed anymore.' }
 Import-Module (Join-Path $PSScriptRoot 'tools/kit.psm1') -Force
 if (-not $CodexHome) {
     $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $UserHome '.codex' }
@@ -68,8 +68,17 @@ try {
         Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -Preview:$WhatIfPreference
     } elseif ($SubscriptionsOnly) {
         if (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/activation-pending.json')) { throw 'A combined activation is pending. Run Recover without -SubscriptionsOnly.' }
-        Import-Module (Join-Path $PSScriptRoot 'tools/subscription-routing.psm1') -Force
-        Invoke-HarnessSubscriptionRouting @common -Mode $Mode -Preview:$WhatIfPreference
+        $installationPath = Join-Path $CodexHome 'harness/installation.json'
+        if (-not (Test-Path -LiteralPath $installationPath)) { throw 'Connect the kit core first: the subscriptions lifecycle runs in the native manager.' }
+        $bridge = (Get-Content -LiteralPath $installationPath -Raw | ConvertFrom-Json).configBridge
+        if (-not $bridge -or -not (Test-Path -LiteralPath $bridge)) { throw 'Native manager build is unavailable; run install.ps1 -CoreOnly first.' }
+        $bridge = [IO.Path]::GetFullPath($bridge)
+        $verb = if ($Mode -eq 'Update') { 'install' } else { $Mode.ToLowerInvariant() }
+        $bridgeArguments = @($verb, '--source', $PSScriptRoot, '--codex-home', $CodexHome, '--user-home', $UserHome)
+        if ($WhatIfPreference) { $bridgeArguments += '--preview' }
+        $bridgeOutput = & $bridge @bridgeArguments
+        if ($LASTEXITCODE -ne 0) { throw ($bridgeOutput | Out-String).Trim() }
+        if ($bridgeOutput) { $bridgeOutput | ConvertFrom-Json }
     } else {
         Import-Module (Join-Path $PSScriptRoot 'tools/activation.psm1') -Force
         Invoke-HarnessActivation @common -Mode $Mode -PathScope $PathScope -Preview:$WhatIfPreference -CodeToolsOnly:$CodeToolsOnly

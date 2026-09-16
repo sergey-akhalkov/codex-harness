@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-13**.
+Last updated: **2026-09-15**.
 
 ## Public pack
 
@@ -246,7 +246,7 @@ does not constrain it.
 
 ## MCP, language tools and resources
 
-Four MCP servers remain live: Serena, CodeGraph, Graphify and Nuphus.
+Three MCP servers remain live: Serena, CodeGraph and Nuphus.
 Ordinary diagnostic and Stop hooks stay off. The separate `harness-lsp`
 registration is retired. Explicit Serena Python operations are retained; other
 historical language candidates are not mandatory installations. A common Codex
@@ -255,8 +255,9 @@ app-server is excluded; independent CLI applications remain.
 Compared optional interfaces for installed-tool workflows: keep the native Git
 Markdown memory route (`retain-native`). Serena 1.7.0 reads work, but memory
 edits and rename were rejected under the durable `approval_policy=never`
-contract. Keep current-source inspection for Graphify mixed-source questions;
-its deterministic extraction omitted configuration and the documented rule.
+contract. Graphify and Codebase Memory are retired from the managed selection;
+do not port or relaunch them. Mixed-source questions use current source and
+CodeGraph.
 Keep the existing Serena broker for cross-project queries; a separate Project
 Server is not selected. Native comparisons did not show a repeating speed or
 output benefit beyond variation, so the verified baseline routes stay selected.
@@ -317,24 +318,20 @@ preserves open acceptance without a circular dependency.
 
 ## Subscriptions
 
-The first external subscription is SuperGrok Heavy through pinned OpenCodex
-**2.44.0**. Existing OpenCode remains. The main model stays GPT-6 Astra. Mixed
-delegation uses v1. Stop or reconnect the proxy only from an independent
-terminal after sessions that use it have finished. A global destructive
-lifecycle probe from a Codex session that owns that proxy is forbidden.
+SuperGrok Heavy is delivered as the native `codex --profile xai` provider with
+a kit-owned compatibility shim on `127.0.0.1:56122`. The OpenCodex proxy, its
+Windows task and its runtime sources are retired. The main model stays GPT-6
+Astra. The shim adapts four wire-format mismatches between Codex 0.154 and
+api.x.ai (reasoning `content: null`, custom tool types, namespace tool
+declarations, `external_web_access`); see
+[subscription models](subscription-models.md#compatibility-shim). Remove the
+shim when Codex or xAI fixes the serialization.
 
-Z.AI GLM Coding Plan is available in ordinary `/model` as `zai/glm-5.3`
-through the same OpenCodex proxy after a host-private API-key login. The local
-`codex --profile zai` Responses profile is preserved and is not the OpenCodex
-route. Stock OpenCodex key-login that would write the secret into linked
-`config.json` is not the delivered path.
-Ordinary `/model` lists only `gpt-6-astra`, `xai/grok-4.6`, and
-`zai/glm-5.3`.
+Z.AI GLM Coding Plan keeps its local `codex --profile zai` Responses profile
+with a host-private key file. The OpenCodex proxy is no longer involved.
 
-Browser-only OAuth is required for the pinned login path; ordinary
-`ocx login` without interactive stdin reproduced a closed-stdin retry defect.
-Memory containment and observable recovery remain. Further diagnosis of a
-specific historical memory event is not a completion condition.
+Browser-only OAuth is the delivered xAI login path. Memory containment and
+observable recovery remain.
 
 ## Token workflow and hooks
 
@@ -343,6 +340,13 @@ exception is narrow RTK hooks plus Code Mode. It does not restore diagnostic or
 Stop hooks. Additional native hook dispatch of about 250–313 ms is accepted for
 that exception. RTK claims of 60–90% apply to supported command output, not
 weekly quota.
+
+**2026-09-15, confirmed:** keep global Code Mode. A same-prompt Grok retrieval
+on CLI 0.154.0 used fewer recorded input tokens with the routed Code Mode
+catalogue than with a temporary catalogue that omitted `tool_mode`. Native
+`--disable code_mode` did not drop JS `exec` while OpenCodex advertised
+`tool_mode: "code_mode_only"`. Historical session totals after 2026-09-08 also
+include RTK hooks and a later model mix, so they do not isolate this feature.
 
 On installed CLI 0.153.4, a new skill added during a turn is absent from the
 first post-compaction model request and present on the following user turn, with

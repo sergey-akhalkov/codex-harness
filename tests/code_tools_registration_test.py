@@ -38,21 +38,22 @@ class RegistrationTests(unittest.TestCase):
     def test_preview_has_no_filesystem_effect(self):
         files = list(self.home.iterdir())
         result = self.run_mode('Install', True)
-        self.assertEqual(5, len(result['operations']))
+        self.assertEqual(3, len(result['operations']))
         self.assertEqual(files, list(self.home.iterdir()))
         self.assertEqual(self.original, self.config.read_bytes())
 
-    def test_direct_interpreter_timeout_and_native_consumer(self):
+    def test_direct_interpreter_and_native_consumer(self):
         with patch.dict(os.environ, {'HARNESS_MCP_PYTHON': sys.executable}):
             self.assertEqual('connected', self.run_mode('Install')['status'])
             servers = module.tomllib.loads(self.config.read_text())['mcp_servers']
-            self.assertEqual(servers['codebase-memory']['tool_timeout_sec'], 660)
             self.assertEqual(servers['serena']['command'], sys.executable)
             self.assertIn('launch.py', servers['serena']['args'][2])
-            result = subprocess.run([str(self.native), 'mcp', 'get', 'codebase-memory', '--json'],
+            self.assertNotIn('codebase-memory', servers)
+            self.assertNotIn('graphify', servers)
+            self.assertNotIn('harness-lsp', servers)
+            result = subprocess.run([str(self.native), 'mcp', 'get', 'serena', '--json'],
                 env={**os.environ, 'CODEX_HOME': str(self.home)}, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
-            self.assertEqual(json.loads(result.stdout)['tool_timeout_sec'], 660)
             self.assertEqual('connected', self.run_mode('Check')['status'])
             self.run_mode('Disconnect')
             self.assertEqual(self.config.read_bytes(), self.original)
@@ -71,9 +72,14 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(module.tomllib.loads(self.original.decode()), module.tomllib.loads(self.config.read_text()))
 
     def test_retired_carrier_is_removed_on_upgrade_and_stays_absent(self):
-        with patch.object(module, 'SELECTED_NAMES', module.NAMES):
-            self.run_mode('Install')
-        self.assertIn('harness-lsp', module.tomllib.loads(self.config.read_text())['mcp_servers'])
+        self.config.write_bytes(self.original + b'\n[mcp_servers.harness-lsp]\ncommand = "python.exe"\nargs = ["-B", "-u", "launch.py", "harness-lsp"]\n')
+        self.home.joinpath('harness').mkdir(parents=True, exist_ok=True)
+        self.home.joinpath('harness/code-tools-registration.json').write_text(
+            json.dumps({"schema_version": 1, "registrations": {
+                "harness-lsp": {"command": "python.exe", "args": ["-B", "-u", "launch.py", "harness-lsp"]},
+            }}),
+            encoding='utf-8',
+        )
         self.run_mode('Install')
         connected = self.config.read_bytes()
         self.assertNotIn('harness-lsp', module.tomllib.loads(connected.decode())['mcp_servers'])

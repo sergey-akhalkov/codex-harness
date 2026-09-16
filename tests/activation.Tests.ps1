@@ -33,8 +33,6 @@ function Initialize-FixtureModule {
     & $code {
         param($Python, $Native, $Repository)
         $script:fixturePython = $Python; $script:fixtureNative = $Native
-        $script:fixtureGraphifyHelper = Join-Path $Repository 'tests/fixtures/code-tools-native/graphify-update-fixture.py'
-        $script:fixtureGraphifyJournal = $null
         $script:realPythonJson = (Get-Command Invoke-CodeToolsPythonJson).ScriptBlock
         function script:Get-HarnessCodeToolsRuntime {
             param($UserHome, $CodexHome, $CodexCommand)
@@ -45,9 +43,6 @@ function Initialize-FixtureModule {
             param($Python, [string[]]$Arguments)
             switch ([IO.Path]::GetFileName($Arguments[0])) {
                 'dependencies.py' {
-                    if ($Arguments[1] -eq 'recover' -and $script:fixtureGraphifyJournal) {
-                        return & $script:realPythonJson $Python @($script:fixtureGraphifyHelper, 'recover', '--journal', $script:fixtureGraphifyJournal)
-                    }
                     return @{ complete = $true; results = @(@{ id = 'fixture-packages'; state = 'reused' }) }
                 }
                 'discovery.py' { return @{ schema_version = 1; mcp = @(); languages = @(); fixture = 'new-inventory' } }
@@ -60,11 +55,9 @@ function Initialize-FixtureModule {
     $script:activation = Import-Module (Join-Path $repository 'tools/activation.psm1') -Force -PassThru
     & $activation {
         function script:Initialize-CodeToolsRuntime {}
-        # Subscription routing has its own real-link/recovery fixtures. This
-        # regression suite must never install a package or launch a live proxy.
-        function script:Invoke-HarnessSubscriptionRouting { @{ status = 'ready'; evidence = 'subscription fixture' } }
-        function script:Restore-HarnessSubscriptionRouting {}
-        function script:Resume-HarnessSubscriptionRouting {}
+        # The native subscription lifecycle has its own isolated fixtures. This
+        # regression suite must never touch the real manager build or a proxy.
+        function script:Invoke-HarnessNativeSubscriptions { @{ status = 'connected'; note = 'subscription fixture' } }
     }
 }
 function Get-Fixture([string]$Name) {
@@ -127,28 +120,12 @@ try {
     Invoke-HarnessActivation @additiveFixture -Mode Recover | Out-Null
     Assert-True (-not (Test-Path (Join-Path $additiveFixture.CodexHome 'harness/activation-pending.json'))) 'Resolved fixture recovery remained pending.'
     $cases++; Write-Output 'PASS: additive effects without an inverse remain visibly incomplete'
-    $graphifyFixture = Get-Fixture 'graphify-result-contract'
-    Initialize-FixtureState $graphifyFixture
-    $graphifyBefore = Snapshot $graphifyFixture; $graphifyPathBefore = $env:Path
-    Assert-Throw { Invoke-HarnessActivation @graphifyFixture -Mode Install -Checkpoint {
-        param($value)
-        if ($value -eq 'before-commit') {
-            $pending = Read-CodeToolsJson (Join-Path $graphifyFixture.CodexHome 'harness/activation-pending.json')
-            $promoted = & $code {
-                param($UserPath, $StatePath, $Transaction)
-                $result = & $script:realPythonJson $script:fixturePython @($script:fixtureGraphifyHelper, 'promote', '--user-home', $UserPath, '--state-dir', $StatePath, '--transaction-id', $Transaction)
-                $script:fixtureGraphifyJournal = $result.transaction_journal
-                $result
-            } $graphifyFixture.UserHome (Join-Path $graphifyFixture.CodexHome 'harness/dependencies') $pending.id
-            Write-CodeToolsJson (Join-Path $graphifyFixture.CodexHome ('harness/dependencies/result-' + $pending.id + '.json')) @{ results = @($promoted) }
-            throw 'later failure after Graphify update'
-        }
-    } } 'later failure after Graphify update'
-    Assert-Restored -Fixture $graphifyFixture -Before $graphifyBefore -BeforePath $graphifyPathBefore
-    Assert-True ((Get-Content (Join-Path $graphifyFixture.UserHome 'AppData/Roaming/uv/tools/graphifyy/version.txt') -Raw) -eq 'old') 'Graphify actual helper result did not permit directory rollback.'
-    Invoke-HarnessActivation @graphifyFixture -Mode Recover | Out-Null
-    & $code { $script:fixtureGraphifyJournal = $null }
-    $cases++; Write-Output 'PASS: actual Graphify result contract and later failure complete coordinator recovery'
+    $retiredFixture = Get-Fixture 'retired-mcp-refusal'
+    Initialize-FixtureState $retiredFixture
+    Invoke-HarnessActivation @retiredFixture -Mode Install | Out-Null
+    $servers = Get-Content (Join-Path $retiredFixture.CodexHome 'config.toml') -Raw
+    Assert-True ($servers -notmatch 'mcp_servers\.graphify' -and $servers -notmatch 'mcp_servers\.codebase-memory' -and $servers -notmatch 'mcp_servers\.harness-lsp') 'Retired Graphify, Codebase Memory or harness-lsp remained registered.'
+    $cases++; Write-Output 'PASS: managed activation does not register retired Graphify or Codebase Memory'
     $ownerFixture = Get-Fixture 'separate-dependency-owner'
     $ownerFixture.DependencyUserHome = Join-Path $suite 'explicit-shared-owner'
     Initialize-FixtureState $ownerFixture

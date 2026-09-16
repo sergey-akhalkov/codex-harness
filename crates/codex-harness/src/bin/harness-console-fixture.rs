@@ -12,6 +12,7 @@ mod fixture {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfo(
             handle: *mut std::ffi::c_void,
             info: *mut ScreenBuffer,
@@ -83,6 +84,24 @@ mod fixture {
     fn write_line(output: &mut impl Write, text: &str) -> io::Result<()> {
         writeln!(output, "{text}")?;
         output.flush()
+    }
+
+    fn enable_raw_input(input: &impl AsRawHandle) {
+        let handle = input.as_raw_handle();
+        let mut mode = 0;
+        unsafe {
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                let _ = SetConsoleMode(handle, mode & !0x0004 & !0x0002);
+            }
+        }
+    }
+
+    fn cursor_report(text: &str) -> bool {
+        text.contains('[') && text.contains('R')
+    }
+
+    fn device_attributes(text: &str) -> bool {
+        text.contains("[?") && text.contains('c')
     }
 
     pub fn run() -> io::Result<()> {
@@ -181,6 +200,33 @@ mod fixture {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 write_line(&mut output, "resized:timeout")?;
+                Ok(())
+            }
+            "query" => {
+                enable_raw_input(&input);
+                write_line(&mut output, "query-ready")?;
+                write_line(&mut output, "\u{1b}[6n")?;
+                write_line(&mut output, "\u{1b}[c")?;
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 1];
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    match std::io::Read::read(&mut input, &mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    let received = String::from_utf8_lossy(&bytes);
+                    if cursor_report(&received) && device_attributes(&received) {
+                        write_line(&mut output, "query-answered")?;
+                        return Ok(());
+                    }
+                }
+                write_line(&mut output, "query-timeout")?;
                 Ok(())
             }
             _ => Err(io::Error::other("unknown console fixture role")),

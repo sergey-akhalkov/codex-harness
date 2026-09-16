@@ -308,9 +308,9 @@ fn installed_code_and_memory_operations() {
         90,
     );
     let servers = inventory["data"].as_array().unwrap();
-    // This scenario exercises Serena and the missing-graph Graphify path.
+    // This scenario exercises Serena. Graphify is retired from the managed selection.
     // CodeGraph qualification is independent and must not suppress these checks.
-    for name in ["serena", "graphify"] {
+    for name in ["serena"] {
         assert!(servers.iter().any(|s| s["name"] == name && s["tools"].as_object().is_some_and(|t| !t.is_empty())), "missing {name}; inspect retained catalogue");
     }
     client.server_tool("serena", "initial_instructions", json!({}));
@@ -426,16 +426,6 @@ fn installed_code_and_memory_operations() {
     .unwrap();
     assert!(memory.join("move-before-failure.md").is_file());
     assert!(memory.join("reference.md").is_file());
-    let graph_missing = client.request("mcpServer/tool/call", json!({"threadId":client.thread,"server":"graphify","tool":"graph_stats","arguments":{"project_path":project}}), 90);
-    fs::write(
-        run.join("graphify-missing.json"),
-        serde_json::to_vec_pretty(&graph_missing).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        graph_missing.to_string().contains("not found"),
-        "missing graph must remain explicit: {graph_missing}"
-    );
 
     client.finish();
     fs::write(run.join("qualification.json"), serde_json::to_vec_pretty(&json!({"code_oracle":"baseline pass, introduced defect rejected, correction pass","memory":"pointer, rename formats, protected/ignored operations qualified","model_calls":0,"native_E1":"pending","global_L1":"pending","partial_write_recovery":"passed","clone_worktrees":"separate deterministic test"})).unwrap()).unwrap();

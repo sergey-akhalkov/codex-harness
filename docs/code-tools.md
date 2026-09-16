@@ -111,12 +111,12 @@ introduce a shared Codex app-server.
 
 | Tool | Reuse and resource contract |
 | --- | --- |
-| Codebase Memory | Retired from the managed selection after replacement acceptance; not registered. Shared package, existing indexes and native `cbm-index`, `cbm-catalogue`, `cbm-tool` and `mcp codebase-memory` remain the rollback/compatibility route with explicit index/refresh only. |
+| Codebase Memory | Retired from the managed selection; not registered and not launched. Existing indexes and leftover native rollback commands are compatibility residue, not a live MCP. |
 | CodeGraph | Live graph provider. One account-wide indexing slot, one parse worker, one resolve worker, a 2 GiB Windows Job and 25% CPU. Each indexing episode has a 600-second deadline. Native observation covers every active indexed root; clients of the same root share resources. Healthy worker retirement preserves queued refresh. The model-facing MCP surface is codegraph_search plus codegraph_detail; deliberate index/sync/status run through the native codegraph-control CLI. Check is read-only; Install/Update stage the pinned published Windows x64 1.6.0 tree (940 files). Ordinary startup does not download, build or enable telemetry. |
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
 | Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers and 300-second idle expiry. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. The proxy filters memory, onboarding and introspection tools from tools/list; native Git records stay authoritative. |
 | Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
-| Graphify | Retired from the managed selection; not registered. Shared package, saved graphs and explicit local proxy/update tools remain the rollback/compatibility route. |
+| Graphify | Retired from the managed selection; not registered and not launched. Saved graphs may remain on a host; first-party proxy/update tools are not a live MCP. |
 
 Windows ownership guards reclaim owned descendant processes on owner exit or
 crash, including language servers and private browsers. Pool eviction closes the

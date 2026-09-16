@@ -123,3 +123,12 @@ Runtime contracts: [RTK 0.48.0](https://github.com/rtk-ai/rtk/releases/tag/v0.48
 RTK claims of 60–90% apply to supported output. `rtk gain` estimates tokens
 from text volume; it is not an observation of whole-session or weekly spend.
 
+**2026-09-15:** keep global Code Mode. On installed CLI 0.154.0, `codex exec
+--disable code_mode` did not drop the JS `exec` tool while the routed OpenCodex
+catalogue advertised `tool_mode: "code_mode_only"`. A same-prompt Grok retrieval
+that actually used tools completed with fewer recorded input tokens on the Code
+Mode catalogue than on a temporary catalogue without `tool_mode`. Historical
+thread totals after the 2026-09-08 enablement also include RTK hooks and a later
+model mix, so they do not isolate Code Mode. Character counts and thread
+`tokens_used` remain not weekly-quota percentages.
+

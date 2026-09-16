@@ -795,9 +795,6 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
     let executable = input("CODEGRAPH_CONSUMER_CODEX");
     let home = input("CODEGRAPH_CONSUMER_HOME");
     let output = input("CODEGRAPH_CONSUMER_OUTPUT");
-    let graph = input("CODEGRAPH_CONSUMER_SAVED_GRAPH_PROJECT");
-    let graph_query =
-        std::env::var("CODEGRAPH_CONSUMER_GRAPH_QUERY").expect("explicit saved-graph oracle");
     let run = tempfile::Builder::new()
         .prefix("retained-consumers-")
         .tempdir_in(output)
@@ -833,7 +830,7 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
         serde_json::to_vec_pretty(&client.job.as_ref().unwrap().snapshot().unwrap()).unwrap(),
     )
     .unwrap();
-    for name in ["codegraph", "serena", "graphify", "nuphus"] {
+    for name in ["codegraph", "serena", "nuphus"] {
         assert!(
             servers.iter().any(|server| server["name"] == name
                 && server["tools"]
@@ -845,7 +842,7 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
     }
     assert!(!servers.iter().any(|server| matches!(
         server["name"].as_str(),
-        Some("codebase-memory" | "harness-lsp")
+        Some("codebase-memory" | "harness-lsp" | "graphify")
     )));
     client.server_tool("serena", "initial_instructions", json!({}));
     let navigation = client.server_tool("serena", "find_symbol", json!({"relative_path":"src/lib.rs","name_path_pattern":"retained_target","include_body":true,"max_matches":1,"max_answer_chars":2000}));
@@ -868,20 +865,6 @@ fn installed_retained_tools_preserve_source_graph_and_browser_operations() {
             .unwrap()
             .replace("\r\n", "\n"),
         original
-    );
-    let graph_before = fs::read(graph.join("graphify-out/graph.json")).unwrap();
-    client.server_tool("graphify", "graph_stats", json!({"project_path":graph}));
-    let queried = client.server_tool("graphify", "query_graph", json!({"project_path":graph,"question":graph_query,"depth":1,"mode":"bfs","token_budget":500}));
-    assert!(
-        queried
-            .to_string()
-            .contains(&format!("NODE {graph_query} ")),
-        "Expected saved node label; see private response in {}",
-        run.display()
-    );
-    assert_eq!(
-        fs::read(graph.join("graphify-out/graph.json")).unwrap(),
-        graph_before
     );
     client.server_tool("nuphus", "desktop_windows_list", json!({}));
     client.server_tool("nuphus", "browser_new_tab", json!({"confirm":true}));

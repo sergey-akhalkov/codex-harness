@@ -284,6 +284,27 @@ mod windows {
         }
     }
 
+    fn reply_terminal_queries(shared: &Shared, chunk: &[u8]) {
+        // Headless ConPTY has no real terminal. Answer the same device-status
+        // and primary-device-attributes queries the C# fixture answered so a
+        // native TUI does not stall waiting for cursor/DA reports.
+        let text = String::from_utf8_lossy(chunk);
+        let mut replies = Vec::new();
+        if text.contains("\u{1b}[6n") {
+            replies.extend_from_slice(b"\x1b[1;1R");
+        }
+        if text.contains("\u{1b}[c") || text.contains("\u{1b}[0c") {
+            replies.extend_from_slice(b"\x1b[?1;2c");
+        }
+        if replies.is_empty() {
+            return;
+        }
+        let mut guard = shared.input.lock().expect("console input");
+        if let Some(input) = guard.as_mut() {
+            let _ = input.write_all(&replies).and_then(|_| input.flush());
+        }
+    }
+
     fn hresult(status: i32) -> io::Result<()> {
         if status == 0 {
             Ok(())
@@ -355,11 +376,13 @@ mod windows {
                 match output.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let chunk = &buffer[..n];
+                        reply_terminal_queries(&pump_shared, chunk);
                         let mut transcript =
                             pump_shared.transcript.lock().expect("console transcript");
                         let retained =
                             n.min(spec.max_output_bytes.saturating_sub(transcript.len()));
-                        transcript.extend_from_slice(&buffer[..retained]);
+                        transcript.extend_from_slice(&chunk[..retained]);
                         if retained < n {
                             pump_shared.output_truncated.store(true, Ordering::Relaxed);
                         }

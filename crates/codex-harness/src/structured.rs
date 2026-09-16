@@ -4,6 +4,7 @@
 //! helper records separate final JSON and event JSONL evidence. A caller-selected
 //! Codex command performs the explicitly requested model call.
 
+use harness_core::analysis_samples;
 use harness_core::process::{
     Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, StopReason,
 };
@@ -604,6 +605,7 @@ fn command(value: &[String]) -> io::Result<()> {
             "Require an absolute executable and tokenized argument array",
         ));
     }
+    analysis_samples::refuse_sample_program(Path::new(&value[0]))?;
     Ok(())
 }
 

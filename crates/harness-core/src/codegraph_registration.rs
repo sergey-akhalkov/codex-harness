@@ -476,7 +476,7 @@ fn desired_registrations(
     }
     if let Some(retained) = retained {
         for (name, spec) in retained_map(retained)? {
-            if name == CBM || name == GRAPH || name == LSP {
+            if name == CBM || name == GRAPH || name == LSP || name == GRAPHIFY {
                 continue;
             }
             registration_table(spec)?;
@@ -484,7 +484,7 @@ fn desired_registrations(
         }
     } else if let Some(existing) = state["registrations"].as_object() {
         for (name, spec) in existing {
-            if name != CBM {
+            if name != CBM && name != GRAPHIFY && name != LSP {
                 desired.insert(name.clone(), spec.clone());
             }
         }

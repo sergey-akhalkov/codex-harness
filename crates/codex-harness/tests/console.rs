@@ -38,15 +38,7 @@ mod native {
     fn fixture() -> PathBuf {
         let path = std::env::var_os("HARNESS_CONSOLE_FIXTURE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_exe()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .join("harness-console-fixture.exe")
-            });
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_harness-console-fixture")));
         assert!(
             path.is_file(),
             "build the Rust fixture first: cargo build --locked -p codex-harness --bin harness-console-fixture; missing {}",
@@ -384,6 +376,25 @@ mod native {
         assert_eq!(result.outcome.reason, StopReason::Exited);
         assert!(result.transcript.contains("echo:"));
         observer.assert_dead();
+        std::fs::write(root.join("verified.json"), result.transcript.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn device_status_and_attributes_queries_are_answered() {
+        let root = root("query");
+        let command = spec("query");
+        let session = ConsoleSession::spawn(ConsoleSpec::new(command)).unwrap();
+        wait_transcript(&session, "query-ready");
+        wait_transcript(&session, "query-answered");
+        let result = session
+            .wait(
+                Deadline::after(Duration::from_secs(15)).unwrap(),
+                &Cancellation::default(),
+                CLEANUP,
+            )
+            .unwrap();
+        assert_eq!(result.outcome.reason, StopReason::Exited);
+        assert!(result.transcript.contains("query-answered"));
         std::fs::write(root.join("verified.json"), result.transcript.as_bytes()).unwrap();
     }
 

@@ -1,6 +1,6 @@
 #requires -Version 7.4
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('serena','codebase-memory','nuphus','harness-lsp')][string]$Server)
+param([Parameter(Mandatory)][ValidateSet('serena','nuphus')][string]$Server)
 $ErrorActionPreference = 'Stop'
 $hostRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
 $registryPath = if ($env:HARNESS_CODE_TOOLS_REGISTRY) { $env:HARNESS_CODE_TOOLS_REGISTRY } else { Join-Path $hostRoot 'harness/code-tools.json' }

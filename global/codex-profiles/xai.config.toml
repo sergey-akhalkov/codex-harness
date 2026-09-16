@@ -1,0 +1,28 @@
+# Start with: codex --profile xai
+# SuperGrok Heavy over native Codex provider. No pay-as-you-go key.
+model_provider = "xai"
+model = "grok-4.6"
+model_reasoning_effort = "xhigh"
+model_catalog_json = "{{CODEX_HOME}}/xai.models.json"
+# The local shim strips the unsupported `external_web_access` field.
+web_search = "live"
+
+[model_providers.xai]
+name = "xAI"
+# Local compatibility shim: it strips the Codex 0.154 `content: null` field
+# from echoed reasoning items that api.x.ai rejects; everything else is
+# forwarded unchanged to https://api.x.ai. Remove the shim when upstream
+# fixes the serialization and point this back at https://api.x.ai/v1.
+base_url = "http://127.0.0.1:56122/v1"
+wire_api = "responses"
+
+[model_providers.xai.auth]
+command = "{{HARNESS_MANAGER}}"
+args = ["xai-token", "--codex-home", "{{CODEX_HOME}}"]
+timeout_ms = 15000
+refresh_interval_ms = 300000
+
+[features]
+hooks = true
+code_mode = true
+multi_agent = true

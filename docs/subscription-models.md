@@ -1,14 +1,9 @@
 # External provider subscriptions in Codex CLI
 
-Status: globally connected. Uses official Codex CLI with the existing kit
-launcher and pinned [OpenCodex](https://github.com/lidge-jun/opencodex) **2.44.0**,
-source commit `07b48da8fd63881e848d26e0bd50087864f5573e`. OpenCodex accepts
-requests on `127.0.0.1:10100` and forwards them to the selected provider. The
-main model remains GPT-6 Astra. The [middle](../global/opencodex/agents/middle.toml)
-compatibility role selects `xai/grok-4.6` and reasoning `xhigh`; ordinary
-delegation uses explicit model/effort selection. Ordinary `/model` lists
-only `gpt-6-astra`, `xai/grok-4.6`, and `zai/glm-5.3` after the
-host-private Z.AI key is stored. See
+Status: globally connected. Grok runs through the native `codex --profile xai`
+provider with a kit-owned local compatibility shim; Z.AI keeps its existing
+`codex --profile zai` Responses profile. The OpenCodex proxy, its Windows task
+and its runtime sources are retired. See
 [subscription-model-routing](../openspec/specs/subscription-model-routing/spec.md)
 and [project decisions](project-decisions.md#subscriptions).
 
@@ -19,178 +14,78 @@ From the pack checkout:
 ```powershell
 ./install.ps1 -WhatIf
 ./install.ps1
-./tools/opencodex-login.ps1
-./tools/opencodex-zai-login.ps1
+codex-harness subscription-login xai --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY
+codex-harness subscription-login zai --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY --key-file FILE
 ./install.ps1 -Mode Check
 ```
 
-The installer reuses a verified dependency version or installs it in a separate
-user directory. `~/.opencodex/config.json` is a direct link to
-[the source JSON](../global/opencodex/config.json). Role definitions connect
-through `~/.codex/agents/codex-harness-subscriptions`. A hidden Windows task
-for the current user starts a foreground process inside a Windows Job Object
-with a 2048 MiB limit. After process failure the host retries up to three times
-at one-minute intervals. After those attempts the service stays stopped and
-errors remain in the log. Ownership and configuration errors do not retry.
+The native login writes a private OAuth store under
+`CODEX_HOME/harness/subscriptions/xai-oauth.json`. It never reads or writes
+OpenCode `auth.json`. Login opens a local page that continues to xAI; if xAI
+issues a one-time code, paste it into that local form. Do not send codes in
+chat. Login is limited to six minutes.
 
-On a machine that already has the kit, `./install.ps1 -SubscriptionsOnly` adds
-only subscriptions. This mode uses the same component, operation lock and
-recovery journal. The Windows task selects an ordinary PowerShell 7.4+
-installation, not Microsoft Store PowerShell. Interpreter selection does not
-change user PATH or running terminals. The task keeps the installer privilege
-level: `HighestAvailable` from an elevated process, otherwise `LeastPrivilege`.
-Startup readiness waits at most 90 seconds; stop waits for the owned process
-before cleaning its records.
+The Z.AI login writes an ACL-hardened key file under
+`CODEX_HOME/harness/subscriptions/zai-key.txt`. The local
+`codex --profile zai` files are preserved, not managed by the installer.
 
-Login opens a local page that continues to xAI. If xAI issues a one-time code,
-paste it into that local form; do not send the code in chat. Login is limited
-to six minutes and a separate 768 MiB job. Use separate OAuth; do not copy
-OpenCode tokens. Do not use ordinary `ocx login` in a process without
-interactive stdin: the pinned version reproduced a closed-stdin retry defect.
+The installer writes `xai.config.toml` and links `xai.models.json` into
+`CODEX_HOME`. The profile points at a local compatibility shim on
+`127.0.0.1:56122` that forwards to `https://api.x.ai/v1`. No `openai_base_url`
+is injected into the ordinary base `config.toml`; the ordinary default model
+remains GPT-6 Astra.
 
-Z.AI uses the same kit helper family, not stock `ocx login zai` or
-`ocx provider add --api-key`. Paste the Coding Plan key into
-`./tools/opencodex-zai-login.ps1` (stdin or `-KeyFile`). The helper writes an
-ACL-hardened file under `CODEX_HOME/harness/subscriptions/` and never copies
-the local `codex --profile zai` files. Linked OpenCodex source keeps only the
-`ZAI_API_KEY` environment reference. Check reports `glmReady` only after that
-private store exists and the running proxy request lists that store in
-`secretFiles`. A key written after process start is not enough: the live
-proxy still has an empty `ZAI_API_KEY` until it is restarted. Disconnect
-leaves the store and local profile in place. Run Z.AI login before Install,
-or follow login with `./install.ps1 -SubscriptionsOnly` from an independent
-terminal after sessions that use the proxy have finished.
+After moving the pack to another computer, authorize again. Do not add keys,
+access/refresh tokens or Authorization headers to JSON or TOML in the repo.
 
-OAuth stays in `~/.opencodex/auth.json`; logs and installation state stay on
-the machine, outside the repository. After moving the pack to another computer,
-authorize again. Do not add keys, access/refresh tokens or Authorization
-headers to JSON or role TOML.
-
-Local API-key generation through OpenCodex management stores `apiKeys` in its
-JSON. That operation is unsupported for the linked portable configuration: the
-validator forbids credential-bearing fields, including `apiKeys` and tokens in
-role files. Field-name checks do not replace scanning arbitrary strings before
-saving to Git.
-
-## Main model and delegation
+## Model selection
 
 From any project:
 
 ```powershell
 codex
-codex -m xai/grok-4.6 -c 'model_reasoning_effort="xhigh"'
+codex --profile xai
+codex --profile zai
 ```
 
-The first start uses the shared GPT-6 Astra default unless a higher-precedence
-local or explicit setting overrides it. The second explicitly selects Grok.
-For delegated work select the model and a supported effort directly, following
-the [selection and visibility rules](agent-delegation.md). The supplied `middle`
-role remains for lifecycle compatibility while its retirement is unfinished.
-Check session metadata and actual proxy requests, not how the agent names itself.
+Ordinary `codex` uses the shared GPT-6 Astra default. Grok is opt-in via
+`--profile xai` (model `grok-4.6`, provider `xai`, reasoning `xhigh`).
+Z.AI GLM-5.3 is opt-in via `--profile zai`. The launcher starts the shim
+only for `xai`-profile invocations; it self-exits when no `codex.exe` process
+remains.
 
-Separate role files are unnecessary for ordinary model/effort selection.
-For an explicitly requested custom role, the retained TOML contract requires
-unique `name`, `description`, `developer_instructions`,
-exact `model = "provider/model-id"` and a supported `model_reasoning_effort`.
-For this integration `model_provider = "openai"` keeps Codex native transport
-to the local proxy; the `model` prefix selects the actual external provider.
-Model fields belong in the role file, not in the main config.toml
-`[agents.role]` table. Recheck the contract against the installed
-[Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)
-version.
+For delegated work select the model and a supported effort directly. The
+delegation rules live in [agent delegation](agent-delegation.md).
 
-Mixed delegation uses v1. Passing full history and encrypted v2 tasks between
-different providers is outside the verified configuration. Automatic model
-substitution, fallback and aliases that override an exact identifier are not
-configured. An unavailable assigned model should produce a visible error.
+## Compatibility shim
 
-## Models, subscription and other providers
+Codex 0.154 and api.x.ai have wire-format mismatches that the shim adapts on
+`127.0.0.1:56122`:
 
-Ordinary `/model` and authorized `/v1/models` list only `gpt-6-astra`,
-`xai/grok-4.6`, and `zai/glm-5.3`. Other native GPT ids, other Grok ids,
-other GLM family ids, and synthetic `--fast` rows are hidden. A verified
-`grok-4.6` request received a server name `grok-4.6-build`. That name came
-from xAI; OpenCodex did not choose a different model. A menu string still does
-not prove account availability for a hidden id.
-An already running proxy keeps its startup roster for live `GET /v1/models`
-until that process is restarted from an independent terminal; `ocx sync`
-updates the on-disk catalogue that ordinary `/model` reads.
-The linked `config.json` is also runtime state for the pinned proxy: every
-start reconciles OAuth provider `models` presets and persists `modelDiscovery`
-there. The picker contract is therefore enforced by per-provider
-`selectedModels` plus `disabledModels` for native ids; source validation
-accepts the runtime-maintained roster and only requires the routed `grok-4.6`
-id. An exact-roster assertion breaks the scheduled task after the first proxy
-start and restores the native GPT-only catalogue.
-Routed `zai/glm-5.3` advertises Code Mode like other routed rows
-(`tool_mode: "code_mode_only"`); a `codexToolMode: "shell"` opt-out removes
-that advertisement and makes Codex warn on every GLM switch, so it is not
-used. Global Code Mode stays enabled for Astra and Grok.
+1. Codex echoes Responses `reasoning` items with `content: null`, which
+   api.x.ai rejects. The shim removes that field.
+2. Codex declares `custom` tool types (apply_patch, Code Mode exec) that
+   api.x.ai does not accept. The shim translates declarations to `function`
+   with the freeform contract in the description, and rewrites streamed
+   `function_call` items for those tools back into `custom_tool_call`.
+3. Codex uses `namespace` tool declarations for MCP, multi-agent and app
+   subtools. The shim flattens them into per-subtool `function` declarations
+   and rewrites calls bidirectionally.
+4. The `web_search` tool carries an `external_web_access` field that
+   api.x.ai rejects. The shim strips it.
 
-With `authMode: "oauth"` the pinned
-[xAI transport](https://github.com/lidge-jun/opencodex/blob/07b48da8fd63881e848d26e0bd50087864f5573e/src/providers/xai-transport.ts)
-sends requests to `https://cli-chat-proxy.grok.com/v1`. A paid API with a
-separate key is a different mode and is not enabled here. Server-estimated cost
-fields are not proof of a separate charge. Access is defined by the
-subscription; xAI describes subscription use in external tools in
-[Grok for Kilo Code](https://x.ai/news/grok-kilocode).
+The shim also decodes chunked HTTP response framing before SSE rewriting and
+re-encodes it for the client. It removes `tool_choice` from requests whose
+tool list is empty. It stores no credentials (Authorization passes through),
+registers no scheduled task, and exits when no `codex.exe` process remains.
+Remove the shim when Codex or xAI fixes the serialization; re-pointing the
+profile at `https://api.x.ai/v1` is the whole rollback.
 
-OpenCodex can add providers in `providers`, perform the matching authorization
-and select `provider/model-id` as the main model or a role. For each new
-provider, check whether the specific subscription supports OAuth, which models
-the authorized catalogue returns, and which address serves the request. An API
-adapter does not prove consumer-subscription support. Only xAI is confirmed
-here as OAuth. Z.AI GLM Coding Plan is the second verified provider: it uses a
-host-private API key and the Chat endpoint `https://api.z.ai/api/coding/paas/v4`.
-The local file profile `codex --profile zai` remains an independent Responses
-route on `https://api.z.ai/api/v1` and is not the OpenCodex catalogue path.
-The pack's browser-only helper remains xAI-only; Z.AI uses the key helper.
-
-Adapter search is explicitly set to Grok 4.6 through xAI OAuth; the automatic
-vision helper is off. All assigned OpenAI models belong to the Astra family.
-Selection, recovery and spend rules are in [agent delegation](agent-delegation.md).
-
-Main GPT still uses Codex authorization. Routing changes apply to new native
-sessions; an already running session is not a check of the updated catalogue.
+Each TCP connection gets its own thread with isolated adaptation state; the
+only shared state is an atomic connection counter. Multiple concurrent Grok
+sessions are safe.
 
 ## Update, stop and recovery
-
-To enable the restart policy on an already installed service without stopping
-the running process:
-
-```powershell
-./install.ps1 -SubscriptionsOnly -Mode ConfigureRestart -WhatIf
-./install.ps1 -SubscriptionsOnly -Mode ConfigureRestart
-./install.ps1 -SubscriptionsOnly -Mode Check
-codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY --preview
-codex-harness configure-restart --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY
-```
-
-The mode changes only restart parameters of the owned task and its owner
-record. Repeat calls are idempotent. If the update is interrupted,
-`./install.ps1 -SubscriptionsOnly -Mode Recover` or
-`codex-harness recover --subscriptions-only` rolls it back from a separate
-journal without stopping the proxy. Native configure-restart updates the owned
-Task Scheduler definition in place and does not start or stop the live proxy.
-Foreign edits are preserved and require
-conflict resolution. New `Install`/`Update` create the task with the same
-policy.
-
-This is a background host started at current-user logon through Task Scheduler.
-[RestartCount](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-restartcount)
-and [RestartInterval](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-restartinterval)
-cover launch failures; a native check showed that a crash of an already running
-process needs the host's own recovery loop. An already running old host needs a
-one-time reconnect through `Install` from an independent terminal to load new
-code. A current request may break on crash. Grok returns to the catalogue after
-the new process is ready; an already open session with the old catalogue needs a
-new Codex start. OAuth or request errors without process crash do not restart
-the service.
-
-After retries are exhausted, use `./install.ps1 -SubscriptionsOnly -Mode Install`
-from an independent terminal. It restarts the component, so finish sessions that
-use it first. Successful recovery does not identify the native crash cause or
-prove future crashes will not happen.
 
 ```powershell
 ./install.ps1 -Mode Update -WhatIf
@@ -200,48 +95,17 @@ prove future crashes will not happen.
 ./install.ps1 -Mode Disconnect
 ```
 
-`Update` applies pack sources and the pinned dependency. Moving to a new
-OpenCodex version requires changing [the declaration](../global/opencodex/dependency.json)
-and rechecking contracts. `Recover` handles an interrupted transaction; if
-foreign processes changed files, it keeps the journal and reports a conflict.
-After a stopped integration is recovered, `Install` connects it again.
+`Update` applies pack sources and rewrites the xAI profile. `Recover`
+completes an interrupted retirement journal or rolls it back. `Disconnect`
+removes the xAI profile, catalog link and ownership state; the Z.AI key file
+and local profile stay in place.
 
-Full `Disconnect` disconnects the kit together with its MCP and subscriptions.
-OAuth is not deleted. To disconnect only subscriptions, use
-`Invoke-HarnessSubscriptionRouting -Mode Disconnect` in
-[the module](../tools/subscription-routing.psm1) with the same SourceRoot,
-UserHome and CodexHome used at install. Disconnect removes owned links and
-returns native Codex routing.
-
-Everyday disconnect and restore of only subscriptions, keeping MCP and other
-kit capabilities:
+Everyday disconnect and restore of only subscriptions:
 
 ```powershell
 ./install.ps1 -SubscriptionsOnly -Mode Disconnect
 ./install.ps1 -SubscriptionsOnly -Mode Install
 ```
 
-If a combined installation is interrupted, `-SubscriptionsOnly` does not bypass
-its recovery: run `./install.ps1 -Mode Recover` first.
-
-Stopping the proxy breaks Codex sessions that use it. Returning the native
-route on disk applies to new launches; an already open session may keep trying
-the old address. Run stop and disconnect commands from an independent terminal
-after finishing sessions that depend on the proxy. A global lifecycle test from
-Codex is forbidden; isolated checks use separate directories, port and Windows
-task. Memory containment remains enabled.
-
-To observe an already running global service, use
-[the readiness probe](../tests/subscription-global.Tests.ps1)
-`-RunReadinessProbe -BaselinePath <path-to-previous-hashes>`. It does not change
-the installation: it checks the same process for at least two minutes, runs
-native inspection commands outside the checkout, and verifies configuration and
-authorization remain intact. The check fails if readiness is lost and stores a
-report without restarting the service.
-
-Bounded-process logs live in `~/.codex/harness/subscriptions/runs/`; results
-contain completion reason, exit code and peak memory, without tokens. Exit 124
-is timeout, 125 is the memory limit. The 2048 MiB state applies to the whole
-OpenCodex process job; it is not a limit for the entire Codex CLI, browser or
-other programs. Actual task restart and a Windows reboot are different checks;
-a reboot without execution is not claimed.
+The `ConfigureRestart` mode is retired together with the OpenCodex proxy; no
+subscription task or background process is managed.

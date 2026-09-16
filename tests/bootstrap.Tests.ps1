@@ -34,11 +34,11 @@ try {
     $again = & $module { param($UserPath,$ConfigPath,$Native) Initialize-CodeToolsRuntime $UserPath $ConfigPath $Native } $fixtureUser $fixtureCodex $state.codexCommand
     Assert-True ($again.python -eq $runtime.python -and $again.uv -eq $runtime.uv) 'Repeated bootstrap did not reuse the exact installation.'
     if ($IncludeGraphify) {
-        $withGraphify = & $module { param($UserPath,$ConfigPath,$Native) Initialize-CodeToolsRuntime $UserPath $ConfigPath $Native -Tool graphify } $fixtureUser $fixtureCodex $state.codexCommand
-        $graphifyVersion = & $withGraphify.graphify_python -B -c 'import importlib.metadata; import graphify.serve; print(importlib.metadata.version("graphifyy"))'
-        Assert-True ($LASTEXITCODE -eq 0 -and $graphifyVersion -eq '0.9.55') 'Bootstrapped Graphify MCP environment is unavailable.'
-        $reusedGraphify = & $module { param($UserPath,$ConfigPath,$Native) Initialize-CodeToolsRuntime $UserPath $ConfigPath $Native -Tool graphify } $fixtureUser $fixtureCodex $state.codexCommand
-        Assert-True ($reusedGraphify.graphify_python -eq $withGraphify.graphify_python) 'Graphify bootstrap did not reuse its exact environment.'
+        $refused = $null
+        try {
+            & $module { param($UserPath,$ConfigPath,$Native) Initialize-CodeToolsRuntime $UserPath $ConfigPath $Native -Tool graphify } $fixtureUser $fixtureCodex $state.codexCommand | Out-Null
+        } catch { $refused = $_.Exception.Message }
+        Assert-True ($refused -and ($refused.Contains('ValidateSet') -or $refused.Contains('graphify'))) 'Retired Graphify bootstrap was not refused.'
     }
     $basePending = Read-CodeToolsJson (Join-Path $fixtureCodex 'harness/bootstrap-runtime-pending.json')
     $derived = Join-Path $basePending.python.target '__pycache__/harness_fixture.pyc'
@@ -55,7 +55,6 @@ try {
     Assert-True (-not (Test-Path $runtime.uv)) 'Owned uv bootstrap did not roll back.'
     Assert-True (-not (Test-Path (Join-Path $fixtureCodex 'harness/bootstrap-pending.json'))) 'Serena rollback journal remains.'
     Assert-True (-not (Test-Path (Join-Path $fixtureCodex 'harness/bootstrap-runtime-pending.json'))) 'Base-runtime rollback journal remains.'
-    if ($IncludeGraphify) { Assert-True (-not (Test-Path $withGraphify.graphify_python)) 'Owned Graphify environment did not roll back.' }
     Write-Output "Bootstrap checks passed: $assertions assertions. Retained download/evidence root: $root"
 } catch { Write-Host "Bootstrap fixture retained: $root"; throw }
 finally { $env:Path = $priorPath }

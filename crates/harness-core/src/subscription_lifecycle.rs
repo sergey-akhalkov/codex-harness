@@ -241,6 +241,10 @@ pub struct ServicePaths {
     pub zai_key: PathBuf,
     pub zai_profile: PathBuf,
     pub zai_catalog: PathBuf,
+    pub xai_profile: PathBuf,
+    pub xai_catalog: PathBuf,
+    pub xai_profile_source: PathBuf,
+    pub xai_catalog_source: PathBuf,
 }
 
 pub fn service_paths(source: &Path, user: &Path, home: &Path) -> io::Result<ServicePaths> {
@@ -264,6 +268,10 @@ pub fn service_paths(source: &Path, user: &Path, home: &Path) -> io::Result<Serv
         zai_key: home.join("harness/subscriptions/zai-key.txt"),
         zai_profile: home.join("zai.config.toml"),
         zai_catalog: home.join("zai.models.json"),
+        xai_profile: home.join("xai.config.toml"),
+        xai_catalog: home.join("xai.models.json"),
+        xai_profile_source: source.join("global/codex-profiles/xai.config.toml"),
+        xai_catalog_source: source.join("global/codex-profiles/xai.models.json"),
     })
 }
 
@@ -292,11 +300,12 @@ pub fn path_display(path: &Path) -> io::Result<String> {
 }
 
 fn owned(state: &Value, paths: &ServicePaths) -> io::Result<()> {
-    if state["schema_version"] != 1
+    let version = state["schema_version"].as_u64();
+    if !matches!(version, Some(1) | Some(2))
         || state["owner"] != "codex-harness-subscriptions"
         || state["codex"] != path_text(&paths.home)?
         || state["user"] != path_text(&paths.user)?
-        || state["task"] != paths.task
+        || (version == Some(1) && state["task"] != paths.task)
     {
         return Err(conflict(
             "Subscription ownership record mismatch; preserving state.",
@@ -339,26 +348,6 @@ fn optional_path(value: &Value) -> io::Result<Option<PathBuf>> {
         Value::String(text) => Ok(Some(PathBuf::from(text))),
         _ => Err(conflict("subscription link is not a string")),
     }
-}
-
-fn source_config(paths: &ServicePaths) -> io::Result<Value> {
-    let Some(config) = read_json(&paths.config_source)? else {
-        return Err(conflict(
-            "Subscription source must select loopback and preserve the ordinary Codex launcher.",
-        ));
-    };
-    let hostname = config["hostname"].as_str();
-    let port = config["port"].as_u64();
-    if hostname != Some("127.0.0.1")
-        || !matches!(port, Some(value) if (1024..=65535).contains(&value))
-        || config["codexAutoStart"] != false
-        || config["codexShimAutoRestore"] != false
-    {
-        return Err(conflict(
-            "Subscription source must select loopback and preserve the ordinary Codex launcher.",
-        ));
-    }
-    Ok(config)
 }
 
 fn refuse_running(observed: Option<&task_scheduler::ObservedTask>) -> io::Result<()> {
@@ -457,6 +446,80 @@ fn assert_journaled_task_restorable(pending: &Value, name: &str) -> io::Result<(
 
 /// Write owned routing records, source links and an idle Task Scheduler
 /// definition. Does not start OpenCodex or query the live proxy.
+fn legacy_state(state: &Value) -> bool {
+    state.get("schema_version").and_then(Value::as_u64) != Some(2)
+}
+
+fn remove_legacy_opencodex(
+    paths: &ServicePaths,
+    existing: &Value,
+    pending_path: &Path,
+) -> io::Result<Value> {
+    let observed = task_scheduler::observe(&paths.task)?;
+    refuse_running(observed.as_ref())?;
+    owned_task_present(observed.as_ref(), existing["task_xml"].as_str())?;
+    let task_before = observed.as_ref().map(|task| task.xml.clone());
+    let expected_config = optional_path(&existing["links"]["configLink"])?;
+    let expected_role = optional_path(&existing["links"]["roleLink"])?;
+    let config_current = current_link(&paths.config_link)?;
+    let role_current = current_link(&paths.role_link)?;
+    match (config_current.as_ref(), expected_config.as_deref()) {
+        (None, None) => {}
+        (None, Some(_)) => {}
+        (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
+        _ => return Err(conflict("Foreign subscription source link preserved.")),
+    }
+    match (role_current.as_ref(), expected_role.as_deref()) {
+        (None, None) => {}
+        (None, Some(_)) => {}
+        (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
+        _ => return Err(conflict("Foreign subscription source link preserved.")),
+    }
+    let pending = serde_json::json!({
+        "schema_version": 1,
+        "owner": "codex-harness-subscriptions",
+        "operation": "retire-opencodex",
+        "source": path_text(&paths.source)?,
+        "user": path_text(&paths.user)?,
+        "codex": path_text(&paths.home)?,
+        "task": paths.task,
+        "task_before": task_before,
+        "task_after": Value::Null,
+        "links_before": {
+            "configLink": expected_config.as_ref().map(|path| path_text(path)).transpose()?,
+            "roleLink": expected_role.as_ref().map(|path| path_text(path)).transpose()?
+        },
+        "links_after": { "configLink": Value::Null, "roleLink": Value::Null },
+        "state_before": snapshot(&paths.state)?,
+        "state_after": Value::Null
+    });
+    write_json(pending_path, &pending)?;
+    task_scheduler::remove(&paths.task, task_before.as_deref())?;
+    if config_current.is_some() {
+        set_link(&paths.config_link, None, expected_config.as_deref())?;
+    }
+    if role_current.is_some() {
+        set_link(&paths.role_link, None, expected_role.as_deref())?;
+    }
+    Ok(pending)
+}
+
+fn subscription_state_v2(paths: &ServicePaths) -> io::Result<Value> {
+    Ok(serde_json::json!({
+        "schema_version": 2,
+        "owner": "codex-harness-subscriptions",
+        "source": path_text(&paths.source)?,
+        "user": path_text(&paths.user)?,
+        "codex": path_text(&paths.home)?
+    }))
+}
+
+/// Write the native subscription records (xAI profile and catalog) and retire
+/// any legacy OpenCodex task, links and state. OpenCodex is never started or
+/// queried here.
+/// Write the native subscription records (xAI profile and catalog) and retire
+/// any legacy OpenCodex task, links and state. OpenCodex is never started or
+/// queried here.
 pub fn install(request: &Request) -> io::Result<Report> {
     let home = normal(&request.codex_home)?;
     let user = normal(&request.user_home)?;
@@ -490,139 +553,58 @@ pub fn install(request: &Request) -> io::Result<Report> {
         return Ok(Report {
             status: "preview-subscriptions",
             model_calls: 0,
-            port: existing
-                .as_ref()
-                .and_then(|value| value["port"].as_u64())
-                .or_else(|| {
-                    read_json(&paths.config_source)
-                        .ok()
-                        .flatten()
-                        .and_then(|config| config["port"].as_u64())
-                }),
-            note: "Preview does not inspect or stop the live routing proxy.",
+            port: existing.as_ref().and_then(|value| value["port"].as_u64()),
+            note: if paths.xai_profile_source.is_file() {
+                if existing.as_ref().is_some_and(legacy_state) {
+                    "Preview: legacy OpenCodex records will be retired; the native xAI profile is written without secrets."
+                } else {
+                    "Preview: kit-owned xAI profile source is present and contains no secrets."
+                }
+            } else {
+                "Preview: native xAI profile source is absent from this checkout."
+            },
         });
     }
-    if !paths.role_source.is_dir() {
-        return Err(conflict("Subscription role source is absent."));
+    let mut pending_legacy = None;
+    if let Some(state) = existing.clone().filter(|state: &Value| legacy_state(state)) {
+        pending_legacy = Some(remove_legacy_opencodex(&paths, &state, &paths.pending)?);
     }
-    let config = source_config(&paths)?;
-    let port = config["port"].as_u64();
-    let config_current = current_link(&paths.config_link)?;
-    let role_current = current_link(&paths.role_link)?;
-    let expected_config = existing
-        .as_ref()
-        .map(|state| optional_path(&state["links"]["configLink"]))
-        .transpose()?
-        .flatten();
-    let expected_role = existing
-        .as_ref()
-        .map(|state| optional_path(&state["links"]["roleLink"]))
-        .transpose()?
-        .flatten();
-    match (config_current.as_ref(), expected_config.as_deref()) {
-        (None, None) => {}
-        (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
-        (Some((actual, _)), None) if same_target(actual, &paths.config_source)? => {}
-        _ => return Err(conflict("Foreign subscription source link preserved.")),
-    }
-    match (role_current.as_ref(), expected_role.as_deref()) {
-        (None, None) => {}
-        (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
-        (Some((actual, _)), None) if same_target(actual, &paths.role_source)? => {}
-        _ => return Err(conflict("Foreign subscription source link preserved.")),
-    }
-    let observed = task_scheduler::observe(&paths.task)?;
-    refuse_running(observed.as_ref())?;
-    owned_task_present(
-        observed.as_ref(),
-        existing
-            .as_ref()
-            .and_then(|state| state["task_xml"].as_str()),
-    )?;
-    let task_before = observed.as_ref().map(|task| task.xml.clone());
-    let descriptor = serde_json::json!({
-        "schema_version": 1,
-        "owner": "codex-harness-subscriptions",
-        "source": path_text(&paths.source)?,
-        "user": path_text(&paths.user)?,
-        "codex": path_text(&paths.home)?,
-        "task": paths.task,
-        "port": port,
-        "dependency": Value::Null,
-        "links": {
-            "configLink": path_text(&paths.config_source)?,
-            "roleLink": path_text(&paths.role_source)?
+    let result = (|| -> io::Result<()> {
+        write_xai_profile(&paths)?;
+        write_json(&paths.state, &subscription_state_v2(&paths)?)?;
+        Ok(())
+    })();
+    match (&result, pending_legacy) {
+        (Ok(()), Some(pending)) => {
+            let mut pending = pending;
+            pending["state_after"] = snapshot(&paths.state)?
+                .map(Value::String)
+                .unwrap_or(Value::Null);
+            write_json(&paths.pending, &pending)?;
+            delete_regular(&paths.pending)?;
         }
-    });
-    let pending = serde_json::json!({
-        "schema_version": 1,
-        "owner": "codex-harness-subscriptions",
-        "source": path_text(&paths.source)?,
-        "user": path_text(&paths.user)?,
-        "codex": path_text(&paths.home)?,
-        "task": paths.task,
-        "port": port,
-        "state_before": snapshot(&paths.state)?,
-        "state_after": snapshot(&paths.state)?,
-        "service_before": snapshot(&paths.service)?,
-        "service_after": snapshot(&paths.service)?,
-        "config_before": snapshot(&paths.config)?,
-        "config_after": snapshot(&paths.config)?,
-        "config_native": snapshot(&paths.config)?,
-        "task_before": task_before,
-        "task_after": task_before,
-        "links_before": {
-            "configLink": expected_config.as_ref().map(|path| path_text(path)).transpose()?,
-            "roleLink": expected_role.as_ref().map(|path| path_text(path)).transpose()?
-        },
-        "links_after": {
-            "configLink": path_text(&paths.config_source)?,
-            "roleLink": path_text(&paths.role_source)?
+        (Err(error), Some(pending)) => {
+            let _ = restore_journaled_task(&pending, &paths.task);
+            if let Some(path) = pending["links_before"]["configLink"]
+                .as_str()
+                .map(Path::new)
+            {
+                let _ = set_link(&paths.config_link, Some(path), None);
+            }
+            if let Some(path) = pending["links_before"]["roleLink"].as_str().map(Path::new) {
+                let _ = set_link(&paths.role_link, Some(path), None);
+            }
+            let _ = restore_snapshot(
+                &paths.state,
+                &pending["state_before"],
+                &Value::Null,
+                &pending["state_before"],
+            );
+            return Err(io::Error::other(error.to_string()));
         }
-    });
-    write_json(&paths.pending, &pending)?;
-    if let Some(parent) = paths.config_link.parent() {
-        fs::create_dir_all(parent)?;
+        _ => {}
     }
-    if let Some(parent) = paths.role_link.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    set_link(
-        &paths.config_link,
-        Some(&paths.config_source),
-        expected_config
-            .as_deref()
-            .or(config_current.as_ref().map(|(path, _)| path.as_path())),
-    )?;
-    write_json(&paths.service, &descriptor)?;
-    set_link(
-        &paths.role_link,
-        Some(&paths.role_source),
-        expected_role
-            .as_deref()
-            .or(role_current.as_ref().map(|(path, _)| path.as_path())),
-    )?;
-    let desired_xml = task_scheduler::xml(
-        &paths.task,
-        &paths.home,
-        &paths.source,
-        &paths.service,
-        request
-            .manager
-            .as_deref()
-            .unwrap_or(std::env::current_exe()?.as_path()),
-    )?;
-    let registered_xml =
-        task_scheduler::register(&paths.task, &desired_xml, task_before.as_deref())?;
-    let mut descriptor = descriptor;
-    descriptor["task_xml"] = serde_json::Value::String(registered_xml);
-    write_json(&paths.state, &descriptor)?;
-    let mut pending = pending;
-    pending["task_after"] = descriptor["task_xml"].clone();
-    pending["state_after"] = snapshot(&paths.state)?.into();
-    pending["service_after"] = snapshot(&paths.service)?.into();
-    write_json(&paths.pending, &pending)?;
-    delete_regular(&paths.pending)?;
+    result?;
     preserved_private(
         &paths,
         key.as_deref(),
@@ -630,10 +612,10 @@ pub fn install(request: &Request) -> io::Result<Report> {
         catalog.as_deref(),
     )?;
     Ok(Report {
-        status: "connected-files",
+        status: "connected-native",
         model_calls: 0,
-        port,
-        note: "Owned routing files, source links and Task Scheduler definition were written. The live proxy was not queried or started.",
+        port: None,
+        note: "Native xAI profile and catalog are installed. OpenCodex records were retired without starting or querying a proxy.",
     })
 }
 
@@ -652,40 +634,125 @@ pub fn check(request: &Request) -> io::Result<Report> {
             "An interrupted subscription operation needs Recover.",
         ));
     }
+    let paths = paths(&source, &user, &home)?;
     if request.preview {
         return Ok(Report {
             status: "preview-subscriptions",
             model_calls: 0,
             port: None,
-            note: "Preview does not inspect or stop the live routing proxy.",
+            note: if paths.xai_profile_source.is_file() {
+                "Preview: kit-owned xAI profile source is present and contains no secrets."
+            } else {
+                "Preview: native xAI profile source is absent from this checkout."
+            },
         });
     }
-    let Some(state) = read_json(&home.join("harness/subscription-routing.json"))? else {
+    let state = read_json(&paths.state)?;
+    let Some(state) = state else {
         return Ok(Report {
             status: "disconnected",
             model_calls: 0,
             port: None,
-            note: "No owned subscription records. Live proxy was not queried.",
+            note: "No owned subscription records.",
         });
     };
-    if state["owner"] != "codex-harness-subscriptions" {
-        return Err(conflict("Foreign subscription ownership preserved."));
-    }
-    let config_source = source.join("global/opencodex/config.json");
-    let role_source = source.join("global/opencodex/agents");
-    if Path::new(state["links"]["configLink"].as_str().unwrap_or_default())
-        != config_source.as_path()
-    {
-        return Err(conflict("Foreign subscription source link preserved."));
-    }
-    if Path::new(state["links"]["roleLink"].as_str().unwrap_or_default()) != role_source.as_path() {
-        return Err(conflict("Foreign subscription source link preserved."));
+    owned(&state, &paths)?;
+    if legacy_state(&state) {
+        return Ok(Report {
+            status: "degraded",
+            model_calls: 0,
+            port: state["port"].as_u64(),
+            note: "Legacy OpenCodex records are present; run Update to retire them and keep the native xAI profile.",
+        });
     }
     Ok(Report {
-        status: "degraded",
+        status: "connected",
         model_calls: 0,
-        port: state["port"].as_u64(),
-        note: "Owned records were checked; the live routing proxy was not queried or stopped.",
+        port: None,
+        note: xai_profile_note(&paths)?,
+    })
+}
+
+fn auth_helper(paths: &ServicePaths) -> io::Result<PathBuf> {
+    let direct = paths.home.join("harness/bin/codex-harness.exe");
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    let absent = || conflict("xAI auth helper executable is absent; connect the kit core first.");
+    let installation = paths.home.join("harness/installation.json");
+    let bytes = match fs::read(&installation) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(absent()),
+        Err(error) => return Err(error),
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| conflict("Kit installation record is not JSON."))?;
+    let bridge = value
+        .get("configBridge")
+        .and_then(Value::as_str)
+        .ok_or_else(absent)?;
+    let bridge = local_drive(Path::new(bridge))?;
+    if !bridge.is_file() {
+        return Err(conflict(
+            "Recorded kit manager executable is absent; run kit Update.",
+        ));
+    }
+    Ok(bridge)
+}
+
+fn write_xai_profile(paths: &ServicePaths) -> io::Result<()> {
+    if !paths.xai_profile_source.is_file() || !paths.xai_catalog_source.is_file() {
+        return Err(conflict("Native xAI profile source is absent."));
+    }
+    let home = path_text(&paths.home)?.replace('\\', "/");
+    let manager = path_text(&auth_helper(paths)?)?.replace('\\', "/");
+    let template = fs::read_to_string(&paths.xai_profile_source)?;
+    if template.contains("experimental_bearer_token")
+        || template.to_ascii_lowercase().contains("eyj")
+    {
+        return Err(conflict("xAI profile source must not contain secrets."));
+    }
+    let rendered = template
+        .replace("{{CODEX_HOME}}", &home)
+        .replace("{{HARNESS_MANAGER}}", &manager);
+    if rendered.contains("{{CODEX_HOME}}") || rendered.contains("{{HARNESS_MANAGER}}") {
+        return Err(conflict("xAI profile template was not fully rendered."));
+    }
+    fs::write(&paths.xai_profile, rendered)?;
+    let expected = current_link(&paths.xai_catalog)?.map(|(path, _)| path);
+    set_link(
+        &paths.xai_catalog,
+        Some(&paths.xai_catalog_source),
+        expected.as_deref(),
+    )
+}
+
+fn xai_profile_note(paths: &ServicePaths) -> io::Result<&'static str> {
+    if !paths.xai_profile.is_file() {
+        return Ok("xAI profile is not installed");
+    }
+    let text = fs::read_to_string(&paths.xai_profile)?;
+    if text.contains("experimental_bearer_token") || text.to_ascii_lowercase().contains("eyj") {
+        return Err(conflict("Installed xAI profile contains a secret."));
+    }
+    let Some(command) = installed_auth_helper(&text) else {
+        return Err(conflict("Installed xAI profile has no auth command."));
+    };
+    if !Path::new(command).is_file() {
+        return Ok("xAI auth helper executable is absent");
+    }
+    if current_link(&paths.xai_catalog)?.is_none() {
+        return Ok("xAI catalog link is absent");
+    }
+    Ok("xAI profile is kit-owned and contains no secrets")
+}
+
+fn installed_auth_helper(text: &str) -> Option<&str> {
+    text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("command = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
     })
 }
 
@@ -798,121 +865,10 @@ fn restore_restart_policy(
     })
 }
 
-pub fn configure_restart(request: &Request) -> io::Result<RestartPolicyReport> {
-    let home = normal(&request.codex_home)?;
-    let user = normal(&request.user_home)?;
-    let source = normal(&request.source)?;
-    let _locks = InstallationLocks::acquire(&user, &user)?;
-    let paths = paths(&source, &user, &home)?;
-    let key = profile_bytes(&paths.zai_key)?;
-    let profile = profile_bytes(&paths.zai_profile)?;
-    let catalog = profile_bytes(&paths.zai_catalog)?;
-    unfinished_restart_blockers(&home)?;
-    if present(&paths.restart_pending)? {
-        return Err(conflict(
-            "An interrupted restart policy update needs --subscriptions-only Recover.",
-        ));
-    }
-    let Some(mut state) = read_json(&paths.state)? else {
-        return Err(conflict(
-            "Restart policy requires a committed subscription installation.",
-        ));
-    };
-    owned(&state, &paths)?;
-    if state["source"] != path_text(&paths.source)? {
-        return Err(conflict(
-            "Subscription source changed; preserving restart policy.",
-        ));
-    }
-    let observed = task_scheduler::observe(&paths.task)?;
-    let Some(task) = observed.as_ref() else {
-        return Err(conflict("Foreign or changed subscription task preserved."));
-    };
-    owned_task_present(Some(task), state["task_xml"].as_str())?;
-    let xml = task_scheduler::with_restart_policy(&task.xml, 3, "PT1M")?;
-    if request.preview {
-        preserved_private(
-            &paths,
-            key.as_deref(),
-            profile.as_deref(),
-            catalog.as_deref(),
-        )?;
-        return Ok(RestartPolicyReport {
-            status: "preview-subscription-restart-policy",
-            model_calls: 0,
-            port: state["port"].as_u64(),
-            note: "Preview does not inspect or stop the live routing proxy.",
-            task: paths.task.clone(),
-            restart_count: 3,
-            restart_interval: "PT1M",
-            changed: xml != task.xml,
-        });
-    }
-    if xml == task.xml {
-        preserved_private(
-            &paths,
-            key.as_deref(),
-            profile.as_deref(),
-            catalog.as_deref(),
-        )?;
-        return Ok(RestartPolicyReport {
-            status: "subscriptions-restart-policy-configured",
-            model_calls: 0,
-            port: state["port"].as_u64(),
-            note: "Owned restart policy already matched; live proxy was not queried or stopped.",
-            task: paths.task.clone(),
-            restart_count: 3,
-            restart_interval: "PT1M",
-            changed: false,
-        });
-    }
-    let before = snapshot(&paths.state)?;
-    state["task_xml"] = Value::String(xml.clone());
-    let after = STANDARD.encode(json_bytes(&state)?);
-    let pending = serde_json::json!({
-        "schema_version": 1,
-        "owner": "codex-harness-subscriptions",
-        "operation": "restart-policy",
-        "source": path_text(&paths.source)?,
-        "user": path_text(&paths.user)?,
-        "codex": path_text(&paths.home)?,
-        "task": paths.task,
-        "port": state["port"],
-        "task_before": task.xml,
-        "task_after": xml,
-        "state_before": before,
-        "state_after": after
-    });
-    write_json(&paths.restart_pending, &pending)?;
-    if snapshot(&paths.state)? != before {
-        return Err(conflict(
-            "Subscription ownership state changed before policy write; preserving.",
-        ));
-    }
-    let registered = task_scheduler::update_in_place(&paths.task, &xml, &task.xml)?;
-    state["task_xml"] = Value::String(registered.clone());
-    let mut pending = pending;
-    pending["task_after"] = Value::String(registered);
-    pending["state_after"] = Value::String(STANDARD.encode(json_bytes(&state)?));
-    write_json(&paths.restart_pending, &pending)?;
-    write_json(&paths.state, &state)?;
-    delete_regular(&paths.restart_pending)?;
-    preserved_private(
-        &paths,
-        key.as_deref(),
-        profile.as_deref(),
-        catalog.as_deref(),
-    )?;
-    Ok(RestartPolicyReport {
-        status: "subscriptions-restart-policy-configured",
-        model_calls: 0,
-        port: state["port"].as_u64(),
-        note: "Owned restart policy was updated in place. Live proxy was not queried or stopped.",
-        task: paths.task,
-        restart_count: 3,
-        restart_interval: "PT1M",
-        changed: true,
-    })
+pub fn configure_restart(_request: &Request) -> io::Result<RestartPolicyReport> {
+    Err(conflict(
+        "The OpenCodex restart policy is retired: the subscription lifecycle no longer manages a task or proxy.",
+    ))
 }
 
 pub fn recover(request: &Request) -> io::Result<Report> {
@@ -934,50 +890,18 @@ pub fn recover(request: &Request) -> io::Result<Report> {
         );
     }
     let Some(pending) = read_json(&paths.pending)? else {
-        preserved_private(
-            &paths,
-            key.as_deref(),
-            profile.as_deref(),
-            catalog.as_deref(),
-        )?;
-        return Ok(Report {
-            status: "no-pending-subscriptions",
-            model_calls: 0,
-            port: None,
-            note: "No owned pending journal. Live proxy was not queried or stopped.",
-        });
+        return Err(conflict(
+            "An interrupted subscription operation needs Recover.",
+        ));
     };
     owned(&pending, &paths)?;
-    assert_journaled_task_restorable(&pending, &paths.task)?;
-    if pending.get("phase").and_then(Value::as_str) == Some("recovered") {
-        if request.preview {
-            preserved_private(
-                &paths,
-                key.as_deref(),
-                profile.as_deref(),
-                catalog.as_deref(),
-            )?;
-            return Ok(Report {
-                status: "preview-subscription-recovery",
-                model_calls: 0,
-                port: pending["port"].as_u64(),
-                note: "Preview does not inspect or stop the live routing proxy.",
-            });
-        }
-        delete_regular(&paths.pending)?;
-        preserved_private(
-            &paths,
-            key.as_deref(),
-            profile.as_deref(),
-            catalog.as_deref(),
-        )?;
-        return Ok(Report {
-            status: "subscriptions-recovered",
-            model_calls: 0,
-            port: pending["port"].as_u64(),
-            note: "File-phase recovery completed without querying or stopping the live proxy.",
-        });
+    if pending["source"] != path_text(&paths.source)? || pending["operation"] != "retire-opencodex"
+    {
+        return Err(conflict(
+            "Subscription journal ownership mismatch; preserving.",
+        ));
     }
+    assert_journaled_task_restorable(&pending, &paths.task)?;
     if request.preview {
         preserved_private(
             &paths,
@@ -988,45 +912,31 @@ pub fn recover(request: &Request) -> io::Result<Report> {
         return Ok(Report {
             status: "preview-subscription-recovery",
             model_calls: 0,
-            port: pending["port"].as_u64(),
-            note: "Preview does not inspect or stop the live routing proxy.",
+            port: None,
+            note: "Preview restores the interrupted OpenCodex retirement journal without writes.",
         });
     }
-    restore_snapshot(
-        &paths.config,
-        &pending["config_before"],
-        &pending["config_after"],
-        &pending["config_native"],
-    )?;
-    for name in ["configLink", "roleLink"] {
-        let destination = if name == "configLink" {
-            &paths.config_link
-        } else {
-            &paths.role_link
-        };
-        let expected = current_link(destination)?.map(|(target, _)| target);
+    // Complete the retirement idempotently: legacy records removed, native
+    // profile present, v2 state committed, journal consumed.
+    task_scheduler::remove(&paths.task, pending["task_before"].as_str())?;
+    if current_link(&paths.config_link)?.is_some() {
         set_link(
-            destination,
-            optional_path(&pending["links_before"][name])?.as_deref(),
-            expected.as_deref(),
+            &paths.config_link,
+            None,
+            pending["links_before"]["configLink"]
+                .as_str()
+                .map(Path::new),
         )?;
     }
-    restore_snapshot(
-        &paths.service,
-        &pending["service_before"],
-        &pending["service_after"],
-        &pending["service_before"],
-    )?;
-    restore_snapshot(
-        &paths.state,
-        &pending["state_before"],
-        &pending["state_after"],
-        &pending["state_before"],
-    )?;
-    restore_journaled_task(&pending, &paths.task)?;
-    let mut recovered = pending;
-    recovered["phase"] = Value::String("recovered".into());
-    write_json(&paths.pending, &recovered)?;
+    if current_link(&paths.role_link)?.is_some() {
+        set_link(
+            &paths.role_link,
+            None,
+            pending["links_before"]["roleLink"].as_str().map(Path::new),
+        )?;
+    }
+    write_xai_profile(&paths)?;
+    write_json(&paths.state, &subscription_state_v2(&paths)?)?;
     delete_regular(&paths.pending)?;
     preserved_private(
         &paths,
@@ -1035,10 +945,10 @@ pub fn recover(request: &Request) -> io::Result<Report> {
         catalog.as_deref(),
     )?;
     Ok(Report {
-        status: "subscriptions-recovered",
+        status: "subscriptions-recovered-native",
         model_calls: 0,
-        port: recovered["port"].as_u64(),
-        note: "Owned files, source links and idle Task Scheduler definition were restored. Live proxy was not queried or stopped.",
+        port: None,
+        note: "OpenCodex retirement completed and the native xAI profile is installed.",
     })
 }
 
@@ -1076,7 +986,7 @@ pub fn disconnect(request: &Request) -> io::Result<Report> {
             status: "preview-subscriptions",
             model_calls: 0,
             port: state.as_ref().and_then(|value| value["port"].as_u64()),
-            note: "Preview does not inspect or stop the live routing proxy.",
+            note: "Preview removes the owned native profile and any legacy OpenCodex records.",
         });
     }
     let Some(state) = state else {
@@ -1090,59 +1000,83 @@ pub fn disconnect(request: &Request) -> io::Result<Report> {
             status: "disconnected",
             model_calls: 0,
             port: None,
-            note: "No owned subscription records. Live proxy was not queried or stopped.",
+            note: "No owned subscription records.",
         });
     };
-    let config_current = current_link(&paths.config_link)?;
-    let role_current = current_link(&paths.role_link)?;
-    let expected_config = optional_path(&state["links"]["configLink"])?;
-    let expected_role = optional_path(&state["links"]["roleLink"])?;
-    match (config_current.as_ref(), expected_config.as_deref()) {
-        (None, None) => {}
-        (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
-        _ => return Err(conflict("Foreign subscription source link preserved.")),
-    }
-    match (role_current.as_ref(), expected_role.as_deref()) {
-        (None, None) => {}
-        (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
-        _ => return Err(conflict("Foreign subscription source link preserved.")),
-    }
-    let observed = task_scheduler::observe(&paths.task)?;
-    refuse_running(observed.as_ref())?;
-    owned_task_present(observed.as_ref(), state["task_xml"].as_str())?;
-    let task_before = observed.as_ref().map(|task| task.xml.clone());
-    let pending = serde_json::json!({
+    let mut pending = serde_json::json!({
         "schema_version": 1,
         "owner": "codex-harness-subscriptions",
+        "operation": "disconnect",
         "source": path_text(&paths.source)?,
         "user": path_text(&paths.user)?,
         "codex": path_text(&paths.home)?,
         "task": paths.task,
-        "port": state["port"],
-        "state_before": snapshot(&paths.state)?,
-        "state_after": Value::Null,
-        "service_before": snapshot(&paths.service)?,
-        "service_after": Value::Null,
-        "config_before": snapshot(&paths.config)?,
-        "config_after": snapshot(&paths.config)?,
-        "config_native": snapshot(&paths.config)?,
-        "task_before": task_before,
+        "task_before": Value::Null,
         "task_after": Value::Null,
-        "links_before": {
-            "configLink": expected_config.as_ref().map(|path| path_text(path)).transpose()?,
-            "roleLink": expected_role.as_ref().map(|path| path_text(path)).transpose()?
-        },
-        "links_after": {
-            "configLink": Value::Null,
-            "roleLink": Value::Null
-        }
+        "links_before": { "configLink": Value::Null, "roleLink": Value::Null },
+        "links_after": { "configLink": Value::Null, "roleLink": Value::Null },
+        "state_before": snapshot(&paths.state)?,
+        "state_after": Value::Null
     });
     write_json(&paths.pending, &pending)?;
-    set_link(&paths.config_link, None, expected_config.as_deref())?;
-    set_link(&paths.role_link, None, expected_role.as_deref())?;
-    delete_regular(&paths.service)?;
+    if legacy_state(&state) {
+        let observed = task_scheduler::observe(&paths.task)?;
+        refuse_running(observed.as_ref())?;
+        owned_task_present(observed.as_ref(), state["task_xml"].as_str())?;
+        let task_before = observed.as_ref().map(|task| task.xml.clone());
+        let expected_config = optional_path(&state["links"]["configLink"])?;
+        let expected_role = optional_path(&state["links"]["roleLink"])?;
+        let config_current = current_link(&paths.config_link)?;
+        let role_current = current_link(&paths.role_link)?;
+        match (config_current.as_ref(), expected_config.as_deref()) {
+            (None, None) => {}
+            (None, Some(_)) => {}
+            (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
+            _ => return Err(conflict("Foreign subscription source link preserved.")),
+        }
+        match (role_current.as_ref(), expected_role.as_deref()) {
+            (None, None) => {}
+            (None, Some(_)) => {}
+            (Some((actual, _)), Some(expected)) if same_target(actual, expected)? => {}
+            _ => return Err(conflict("Foreign subscription source link preserved.")),
+        }
+        pending["task_before"] = task_before.map(Value::String).unwrap_or(Value::Null);
+        pending["links_before"]["configLink"] = expected_config
+            .as_ref()
+            .map(|path| path_text(path))
+            .transpose()?
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        pending["links_before"]["roleLink"] = expected_role
+            .as_ref()
+            .map(|path| path_text(path))
+            .transpose()?
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        write_json(&paths.pending, &pending)?;
+        task_scheduler::remove(&paths.task, observed.as_ref().map(|task| task.xml.as_str()))?;
+        if config_current.is_some() {
+            set_link(&paths.config_link, None, expected_config.as_deref())?;
+        }
+        if role_current.is_some() {
+            set_link(&paths.role_link, None, expected_role.as_deref())?;
+        }
+    }
+    let expected_catalog = current_link(&paths.xai_catalog)?;
+    match expected_catalog.as_ref() {
+        None => {}
+        Some((actual, _)) if same_target(actual, &paths.xai_catalog_source)? => {}
+        _ => return Err(conflict("Foreign xAI catalog link preserved.")),
+    }
+    set_link(
+        &paths.xai_catalog,
+        None,
+        expected_catalog.as_ref().map(|(path, _)| path.as_path()),
+    )?;
+    if paths.xai_profile.is_file() {
+        delete_regular(&paths.xai_profile)?;
+    }
     delete_regular(&paths.state)?;
-    task_scheduler::remove(&paths.task, task_before.as_deref())?;
     delete_regular(&paths.pending)?;
     preserved_private(
         &paths,
@@ -1153,14 +1087,15 @@ pub fn disconnect(request: &Request) -> io::Result<Report> {
     Ok(Report {
         status: "disconnected",
         model_calls: 0,
-        port: state["port"].as_u64(),
-        note: "Owned records, source links and idle Task Scheduler definition were removed. Live proxy was not queried or stopped.",
+        port: None,
+        note: "Owned native subscription records and legacy OpenCodex leftovers were removed.",
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn missing_state_is_disconnected_without_creating_homes() {
@@ -1208,53 +1143,123 @@ mod tests {
         }
     }
 
-    fn owned_state(root: &Path) -> Value {
-        let home = std::path::absolute(root).unwrap().join("codex");
-        let user = std::path::absolute(root).unwrap().join("user");
+    fn write_source(root: &Path) {
         let source = std::path::absolute(root).unwrap().join("source");
+        let kit = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        fs::create_dir_all(source.join("global/opencodex/agents")).unwrap();
+        // Legacy retirement fixtures: the retired kit sources are gone, so the
+        // link targets only need to exist as ordinary files.
+        fs::write(
+            source.join("global/opencodex/config.json"),
+            b"{\"hostname\":\"127.0.0.1\",\"port\":10100}",
+        )
+        .unwrap();
+        fs::write(source.join("global/opencodex/agents/middle.toml"), b"role").unwrap();
+        fs::create_dir_all(source.join("global/codex-profiles")).unwrap();
+        fs::copy(
+            kit.join("global/codex-profiles/xai.config.toml"),
+            source.join("global/codex-profiles/xai.config.toml"),
+        )
+        .unwrap();
+        fs::copy(
+            kit.join("global/codex-profiles/xai.models.json"),
+            source.join("global/codex-profiles/xai.models.json"),
+        )
+        .unwrap();
+    }
+
+    fn write_manager(root: &Path) -> PathBuf {
+        let home = std::path::absolute(root).unwrap().join("codex");
+        let manager = home.join("harness/bin/codex-harness.exe");
+        fs::create_dir_all(manager.parent().unwrap()).unwrap();
+        fs::write(&manager, b"fixture-manager").unwrap();
+        manager
+    }
+
+    fn absolute_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::path::absolute(root).unwrap();
+        (base.join("codex"), base.join("user"), base.join("source"))
+    }
+
+    fn legacy_installed(root: &Path) -> (PathBuf, Value) {
+        write_source(root);
+        let manager = write_manager(root);
+        let (home, user, source) = absolute_paths(root);
+        fs::create_dir_all(home.join("harness/subscriptions")).unwrap();
+        fs::write(home.join("harness/subscriptions/zai-key.txt"), b"secret").unwrap();
+        fs::write(home.join("zai.config.toml"), b"keep-profile").unwrap();
+        fs::write(home.join("zai.models.json"), b"keep-catalog").unwrap();
         let identity =
             build_identity::hash_bytes(path_text(&home).unwrap().to_ascii_lowercase().as_bytes());
-        serde_json::json!({
+        let task = format!("codex-harness-subscriptions-{}", &identity[..16]);
+        let service = home.join("harness/subscriptions/service.json");
+        fs::write(&service, b"{}").unwrap();
+        let xml = task_scheduler::xml(&task, &home, &source, &service, &manager).unwrap();
+        let registered = task_scheduler::register(&task, &xml, None).unwrap();
+        let config_source = source.join("global/opencodex/config.json");
+        let role_source = source.join("global/opencodex/agents");
+        fs::create_dir_all(user.join(".opencodex")).unwrap();
+        fs::create_dir_all(home.join("agents")).unwrap();
+        set_link(
+            &user.join(".opencodex/config.json"),
+            Some(&config_source),
+            None,
+        )
+        .unwrap();
+        set_link(
+            &home.join("agents/codex-harness-subscriptions"),
+            Some(&role_source),
+            None,
+        )
+        .unwrap();
+        let state = serde_json::json!({
             "schema_version": 1,
             "owner": "codex-harness-subscriptions",
             "source": path_text(&source).unwrap(),
             "user": path_text(&user).unwrap(),
             "codex": path_text(&home).unwrap(),
-            "task": format!("codex-harness-subscriptions-{}", &identity[..16]),
+            "task": task,
+            "task_xml": registered,
             "port": 10100,
             "links": {
-                "configLink": path_text(&source.join("global/opencodex/config.json")).unwrap(),
-                "roleLink": path_text(&source.join("global/opencodex/agents")).unwrap()
+                "configLink": path_text(&config_source).unwrap(),
+                "roleLink": path_text(&role_source).unwrap()
             }
-        })
+        });
+        write_json(&home.join("harness/subscription-routing.json"), &state).unwrap();
+        (home.join("harness/subscription-routing.json"), state)
     }
 
     #[test]
-    fn recover_preview_preserves_pending_and_private_files() {
+    fn install_writes_native_profile_and_v2_state_without_opencodex() {
         let root = tempfile::tempdir().unwrap();
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
+        write_source(root.path());
+        write_manager(root.path());
+        let (home, user, source) = absolute_paths(root.path());
         fs::create_dir_all(home.join("harness/subscriptions")).unwrap();
-        fs::create_dir_all(source.join("global/opencodex/agents")).unwrap();
         fs::write(home.join("harness/subscriptions/zai-key.txt"), b"secret").unwrap();
-        let pending = home.join("harness/subscription-routing-pending.json");
-        fs::write(
-            &pending,
-            serde_json::to_vec(&owned_state(root.path())).unwrap(),
+        let report = install(&request(root.path())).unwrap();
+        assert_eq!(report.status, "connected-native");
+        let profile = fs::read_to_string(home.join("xai.config.toml")).unwrap();
+        assert!(profile.contains("http://127.0.0.1:56122/v1"));
+        assert!(profile.contains("xai-token"));
+        assert_eq!(
+            fs::read_link(home.join("xai.models.json")).unwrap(),
+            source.join("global/codex-profiles/xai.models.json")
+        );
+        let state: Value = serde_json::from_slice(
+            &fs::read(home.join("harness/subscription-routing.json")).unwrap(),
         )
         .unwrap();
-        let before = fs::read(&pending).unwrap();
-        let report = recover(&Request {
-            source,
-            codex_home: home.clone(),
-            user_home: user,
-            preview: true,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "preview-subscription-recovery");
-        assert_eq!(fs::read(&pending).unwrap(), before);
+        assert_eq!(state["schema_version"], 2);
+        assert!(state.get("task").is_none());
+        assert!(state.get("links").is_none());
+        let identity =
+            build_identity::hash_bytes(path_text(&home).unwrap().to_ascii_lowercase().as_bytes());
+        let task = format!("codex-harness-subscriptions-{}", &identity[..16]);
+        assert!(task_scheduler::observe(&task).unwrap().is_none());
+        assert!(!user.join(".opencodex/config.json").exists());
+        assert!(!home.join("agents/codex-harness-subscriptions").exists());
         assert_eq!(
             fs::read(home.join("harness/subscriptions/zai-key.txt")).unwrap(),
             b"secret"
@@ -1262,50 +1267,22 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_removes_owned_links_and_preserves_foreign_and_private_files() {
+    fn install_retires_legacy_opencodex_records() {
         let root = tempfile::tempdir().unwrap();
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        let config_source = source.join("global/opencodex/config.json");
-        let role_source = source.join("global/opencodex/agents");
-        fs::create_dir_all(&role_source).unwrap();
-        fs::create_dir_all(home.join("agents")).unwrap();
-        fs::create_dir_all(home.join("harness/subscriptions")).unwrap();
-        fs::create_dir_all(user.join(".opencodex")).unwrap();
-        fs::write(&config_source, br#"{"port":10100}"#).unwrap();
-        std::os::windows::fs::symlink_file(&config_source, user.join(".opencodex/config.json"))
-            .unwrap();
-        std::os::windows::fs::symlink_dir(
-            &role_source,
-            home.join("agents/codex-harness-subscriptions"),
-        )
-        .unwrap();
-        fs::write(home.join("harness/subscriptions/zai-key.txt"), b"keep-key").unwrap();
-        fs::write(home.join("zai.config.toml"), b"keep-profile").unwrap();
-        fs::write(home.join("config.toml"), b"foreign-config").unwrap();
-        fs::write(
-            home.join("harness/subscription-routing.json"),
-            serde_json::to_vec_pretty(&owned_state(root.path())).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            home.join("harness/subscriptions/service.json"),
-            b"{\"owner\":\"codex-harness-subscriptions\"}",
-        )
-        .unwrap();
-        let report = disconnect(&Request {
-            source,
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "disconnected");
+        let (state_path, state) = legacy_installed(root.path());
+        let (home, user, source) = absolute_paths(root.path());
+        let report = install(&request(root.path())).unwrap();
+        assert_eq!(report.status, "connected-native");
+        assert!(
+            task_scheduler::observe(state["task"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
         assert!(!user.join(".opencodex/config.json").exists());
         assert!(!home.join("agents/codex-harness-subscriptions").exists());
-        assert!(!home.join("harness/subscription-routing.json").exists());
+        let after: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(after["schema_version"], 2);
+        assert!(home.join("xai.config.toml").is_file());
         assert!(
             !home
                 .join("harness/subscription-routing-pending.json")
@@ -1313,530 +1290,275 @@ mod tests {
         );
         assert_eq!(
             fs::read(home.join("harness/subscriptions/zai-key.txt")).unwrap(),
-            b"keep-key"
+            b"secret"
         );
         assert_eq!(
             fs::read(home.join("zai.config.toml")).unwrap(),
             b"keep-profile"
         );
         assert_eq!(
-            fs::read(home.join("config.toml")).unwrap(),
-            b"foreign-config"
+            fs::read(home.join("zai.models.json")).unwrap(),
+            b"keep-catalog"
         );
-    }
-
-    #[test]
-    fn recover_restores_owned_files_from_pending_journal_without_touching_private_state() {
-        let root = tempfile::tempdir().unwrap();
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        let config_source = source.join("global/opencodex/config.json");
-        let role_source = source.join("global/opencodex/agents");
-        fs::create_dir_all(&role_source).unwrap();
-        fs::create_dir_all(home.join("agents")).unwrap();
-        fs::create_dir_all(home.join("harness/subscriptions")).unwrap();
-        fs::create_dir_all(user.join(".opencodex")).unwrap();
-        fs::write(&config_source, b"source-config").unwrap();
-        let previous = owned_state(root.path());
-        let previous_bytes = serde_json::to_vec_pretty(&previous).unwrap();
-        fs::write(home.join("config.toml"), b"after-config").unwrap();
-        fs::write(home.join("harness/subscriptions/zai-key.txt"), b"secret").unwrap();
-        std::os::windows::fs::symlink_file(&config_source, user.join(".opencodex/config.json"))
-            .unwrap();
-        let pending = serde_json::json!({
-            "schema_version": 1,
-            "owner": "codex-harness-subscriptions",
-            "source": previous["source"],
-            "user": previous["user"],
-            "codex": previous["codex"],
-            "task": previous["task"],
-            "port": 10100,
-            "state_before": STANDARD.encode(&previous_bytes),
-            "state_after": Value::Null,
-            "service_before": Value::Null,
-            "service_after": Value::Null,
-            "config_before": STANDARD.encode(b"before-config"),
-            "config_after": STANDARD.encode(b"after-config"),
-            "config_native": STANDARD.encode(b"after-config"),
-            "links_before": {
-                "configLink": Value::Null,
-                "roleLink": Value::Null
-            },
-            "links_after": {
-                "configLink": previous["links"]["configLink"].clone(),
-                "roleLink": previous["links"]["roleLink"].clone()
-            }
-        });
-        fs::write(
-            home.join("harness/subscription-routing-pending.json"),
-            serde_json::to_vec_pretty(&pending).unwrap(),
-        )
-        .unwrap();
-        let report = recover(&Request {
-            source,
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "subscriptions-recovered");
-        assert_eq!(
-            fs::read(home.join("config.toml")).unwrap(),
-            b"before-config"
-        );
-        assert!(!user.join(".opencodex/config.json").exists());
-        assert!(
-            !home
-                .join("harness/subscription-routing-pending.json")
-                .exists()
-        );
-        let restored: Value = serde_json::from_slice(
-            &fs::read(home.join("harness/subscription-routing.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(restored["owner"], "codex-harness-subscriptions");
-        assert_eq!(
-            fs::read(home.join("harness/subscriptions/zai-key.txt")).unwrap(),
-            b"secret"
-        );
-        let _ = role_source;
-    }
-
-    #[test]
-    fn recover_restores_idle_task_without_starting_live_proxy() {
-        let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        let report = install(&Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "connected-files");
-        let state: Value = serde_json::from_slice(
-            &fs::read(home.join("harness/subscription-routing.json")).unwrap(),
-        )
-        .unwrap();
-        let task = state["task"].as_str().unwrap().to_string();
-        let xml = state["task_xml"].as_str().unwrap().to_string();
-        crate::task_scheduler::remove(&task, Some(&xml)).unwrap();
-        assert!(crate::task_scheduler::observe(&task).unwrap().is_none());
-        let pending = serde_json::json!({
-            "schema_version": 1,
-            "owner": "codex-harness-subscriptions",
-            "source": state["source"],
-            "user": state["user"],
-            "codex": state["codex"],
-            "task": task,
-            "port": 10100,
-            "state_before": snapshot(&home.join("harness/subscription-routing.json")).unwrap(),
-            "state_after": snapshot(&home.join("harness/subscription-routing.json")).unwrap(),
-            "service_before": snapshot(&home.join("harness/subscriptions/service.json")).unwrap(),
-            "service_after": snapshot(&home.join("harness/subscriptions/service.json")).unwrap(),
-            "config_before": Value::Null,
-            "config_after": Value::Null,
-            "config_native": Value::Null,
-            "task_before": xml,
-            "task_after": Value::Null,
-            "links_before": state["links"].clone(),
-            "links_after": state["links"].clone()
-        });
-        fs::write(
-            home.join("harness/subscription-routing-pending.json"),
-            serde_json::to_vec_pretty(&pending).unwrap(),
-        )
-        .unwrap();
-        let recovered = recover(&Request {
-            source,
-            codex_home: home.clone(),
-            user_home: user,
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(recovered.status, "subscriptions-recovered");
-        let observed = crate::task_scheduler::observe(&task).unwrap();
-        assert!(observed.as_ref().is_some_and(|task| !task.running));
-        crate::task_scheduler::remove(&task, observed.as_ref().map(|task| task.xml.as_str()))
-            .unwrap();
-        assert!(crate::task_scheduler::observe(&task).unwrap().is_none());
-    }
-
-    #[test]
-    fn foreign_link_is_preserved_on_disconnect() {
-        let root = tempfile::tempdir().unwrap();
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        fs::create_dir_all(source.join("global/opencodex/agents")).unwrap();
-        fs::create_dir_all(user.join(".opencodex")).unwrap();
-        fs::create_dir_all(home.join("harness")).unwrap();
-        fs::write(user.join(".opencodex/config.json"), b"foreign").unwrap();
-        fs::write(
-            home.join("harness/subscription-routing.json"),
-            serde_json::to_vec_pretty(&owned_state(root.path())).unwrap(),
-        )
-        .unwrap();
-        let error = disconnect(&request(root.path())).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Foreign subscription source link")
-        );
-        assert_eq!(
-            fs::read(user.join(".opencodex/config.json")).unwrap(),
-            b"foreign"
-        );
-        assert!(home.join("harness/subscription-routing.json").exists());
-    }
-
-    #[test]
-    fn disconnect_preview_preserves_owned_records() {
-        let root = tempfile::tempdir().unwrap();
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        fs::create_dir_all(source.join("global/opencodex/agents")).unwrap();
-        fs::create_dir_all(home.join("harness")).unwrap();
-        let state = home.join("harness/subscription-routing.json");
-        fs::write(
-            &state,
-            serde_json::to_vec_pretty(&owned_state(root.path())).unwrap(),
-        )
-        .unwrap();
-        let before = fs::read(&state).unwrap();
-        let report = disconnect(&Request {
-            source,
-            codex_home: home.clone(),
-            user_home: user,
-            preview: true,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "preview-subscriptions");
-        assert_eq!(fs::read(&state).unwrap(), before);
-        assert!(
-            !home
-                .join("harness/subscription-routing-pending.json")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn disconnect_refuses_pending_transaction() {
-        let root = tempfile::tempdir().unwrap();
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        fs::create_dir_all(home.join("harness")).unwrap();
-        let pending = home.join("harness/subscription-routing-pending.json");
-        fs::write(&pending, b"{\"owner\":\"codex-harness-subscriptions\"}").unwrap();
-        let before = fs::read(&pending).unwrap();
-        let error = disconnect(&request(root.path())).unwrap_err();
-        assert!(error.to_string().contains("interrupted subscription"));
-        assert_eq!(fs::read(&pending).unwrap(), before);
-    }
-
-    #[test]
-    fn recover_restores_restart_policy_in_place_without_stopping_proxy() {
-        let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        let report = install(&Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "connected-files");
-        let state_path = home.join("harness/subscription-routing.json");
-        let before_bytes = fs::read(&state_path).unwrap();
-        let state: Value = serde_json::from_slice(&before_bytes).unwrap();
-        let task = state["task"].as_str().unwrap().to_string();
-        let xml = state["task_xml"].as_str().unwrap().to_string();
-        let pending = serde_json::json!({
-            "schema_version": 1,
-            "owner": "codex-harness-subscriptions",
-            "operation": "restart-policy",
-            "source": state["source"],
-            "user": state["user"],
-            "codex": state["codex"],
-            "task": task,
-            "port": 10100,
-            "task_before": xml,
-            "task_after": xml,
-            "state_before": STANDARD.encode(&before_bytes),
-            "state_after": STANDARD.encode(&before_bytes)
-        });
-        fs::write(
-            home.join("harness/subscription-restart-policy-pending.json"),
-            serde_json::to_vec_pretty(&pending).unwrap(),
-        )
-        .unwrap();
-        let preview = recover(&Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: true,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(
-            preview.status,
-            "preview-subscription-restart-policy-recovery"
-        );
-        assert!(
-            home.join("harness/subscription-restart-policy-pending.json")
-                .exists()
-        );
-        let recovered = recover(&Request {
-            source,
-            codex_home: home.clone(),
-            user_home: user,
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(recovered.status, "subscriptions-restart-policy-recovered");
-        assert!(
-            !home
-                .join("harness/subscription-restart-policy-pending.json")
-                .exists()
-        );
-        assert_eq!(fs::read(&state_path).unwrap(), before_bytes);
-        let observed = crate::task_scheduler::observe(&task).unwrap();
-        assert!(observed.as_ref().is_some_and(|task| !task.running));
-        crate::task_scheduler::remove(&task, observed.as_ref().map(|task| task.xml.as_str()))
-            .unwrap();
-    }
-
-    #[test]
-    fn configure_restart_updates_owned_policy_in_place_and_is_idempotent() {
-        let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        let request = Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        };
-        assert_eq!(install(&request).unwrap().status, "connected-files");
-        let state_path = home.join("harness/subscription-routing.json");
-        let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-        let task = state["task"].as_str().unwrap().to_string();
-        let xml = state["task_xml"].as_str().unwrap().to_string();
-        let reduced = crate::task_scheduler::with_restart_policy(&xml, 1, "PT1M").unwrap();
-        let registered = crate::task_scheduler::update_in_place(&task, &reduced, &xml).unwrap();
-        state["task_xml"] = Value::String(registered);
-        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-        let preview = configure_restart(&Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: true,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(preview.status, "preview-subscription-restart-policy");
-        assert!(preview.changed);
-        assert_eq!(preview.restart_count, 3);
-        let first = configure_restart(&request).unwrap();
-        assert_eq!(first.status, "subscriptions-restart-policy-configured");
-        assert!(first.changed);
-        let second = configure_restart(&request).unwrap();
-        assert_eq!(second.status, "subscriptions-restart-policy-configured");
-        assert!(!second.changed);
-        assert!(
-            !home
-                .join("harness/subscription-restart-policy-pending.json")
-                .exists()
-        );
-        let observed = crate::task_scheduler::observe(&task).unwrap();
-        assert!(observed.as_ref().is_some_and(|task| !task.running));
-        crate::task_scheduler::remove(&task, observed.as_ref().map(|task| task.xml.as_str()))
-            .unwrap();
-    }
-
-    #[test]
-    fn configure_restart_refuses_foreign_task_without_mutation() {
-        let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        let request = Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        };
-        assert_eq!(install(&request).unwrap().status, "connected-files");
-        let state_path = home.join("harness/subscription-routing.json");
-        let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-        let task = state["task"].as_str().unwrap().to_string();
-        let xml = state["task_xml"].as_str().unwrap().to_string();
-        state["task_xml"] = Value::String("foreign-task-xml".into());
-        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-        let before = fs::read(&state_path).unwrap();
-        let error = configure_restart(&request).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Foreign or changed subscription task")
-        );
-        assert_eq!(fs::read(&state_path).unwrap(), before);
-        assert!(
-            !home
-                .join("harness/subscription-restart-policy-pending.json")
-                .exists()
-        );
-        crate::task_scheduler::remove(&task, Some(&xml)).unwrap();
-    }
-
-    fn write_source(root: &Path) {
-        let source = std::path::absolute(root).unwrap().join("source");
-        fs::create_dir_all(source.join("global/opencodex/agents")).unwrap();
-        fs::write(
-            source.join("global/opencodex/config.json"),
-            br#"{"hostname":"127.0.0.1","port":10100,"codexAutoStart":false,"codexShimAutoRestore":false}"#,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn install_preview_does_not_create_homes_or_query_proxy() {
-        let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let report = install(&Request {
-            source: std::path::absolute(root.path()).unwrap().join("source"),
-            codex_home: std::path::absolute(root.path()).unwrap().join("codex"),
-            user_home: std::path::absolute(root.path()).unwrap().join("user"),
-            preview: true,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "preview-subscriptions");
-        assert!(!root.path().join("codex/harness").exists());
-        assert!(!root.path().join("user/.opencodex").exists());
-    }
-
-    #[test]
-    fn install_writes_owned_files_and_preserves_private_and_foreign_config() {
-        let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let home = std::path::absolute(root.path()).unwrap().join("codex");
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        let source = std::path::absolute(root.path()).unwrap().join("source");
-        fs::create_dir_all(home.join("harness/subscriptions")).unwrap();
-        fs::write(home.join("harness/subscriptions/zai-key.txt"), b"keep-key").unwrap();
-        fs::write(home.join("config.toml"), b"foreign-config").unwrap();
-        let report = install(&Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(report.status, "connected-files");
-        assert_eq!(report.port, Some(10100));
-        assert_eq!(
-            fs::read_link(user.join(".opencodex/config.json")).unwrap(),
-            source.join("global/opencodex/config.json")
-        );
-        assert_eq!(
-            fs::read_link(home.join("agents/codex-harness-subscriptions")).unwrap(),
-            source.join("global/opencodex/agents")
-        );
-        assert!(home.join("harness/subscription-routing.json").is_file());
-        assert!(
-            !home
-                .join("harness/subscription-routing-pending.json")
-                .exists()
-        );
-        assert_eq!(
-            fs::read(home.join("harness/subscriptions/zai-key.txt")).unwrap(),
-            b"keep-key"
-        );
-        assert_eq!(
-            fs::read(home.join("config.toml")).unwrap(),
-            b"foreign-config"
-        );
-        let state: Value = serde_json::from_slice(
-            &fs::read(home.join("harness/subscription-routing.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(state["task_xml"].as_str().is_some());
-        let xml = state["task_xml"].as_str().unwrap();
-        assert!(xml.contains("subscription-service --state"), "{xml}");
-        assert!(
-            !xml.to_ascii_lowercase().contains("opencodex-service.ps1"),
-            "{xml}"
-        );
-        let observed = crate::task_scheduler::observe(state["task"].as_str().unwrap()).unwrap();
-        assert!(observed.as_ref().is_some_and(|task| !task.running));
-        let repeat = install(&Request {
-            source: source.clone(),
-            codex_home: home.clone(),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap();
-        assert_eq!(repeat.status, "connected-files");
-        crate::task_scheduler::remove(state["task"].as_str().unwrap(), state["task_xml"].as_str())
-            .unwrap();
-        assert!(
-            crate::task_scheduler::observe(state["task"].as_str().unwrap())
-                .unwrap()
-                .is_none()
-        );
+        let _ = source;
     }
 
     #[test]
     fn install_preserves_foreign_config_link() {
         let root = tempfile::tempdir().unwrap();
-        write_source(root.path());
-        let user = std::path::absolute(root.path()).unwrap().join("user");
-        fs::create_dir_all(user.join(".opencodex")).unwrap();
-        fs::write(user.join(".opencodex/config.json"), b"foreign").unwrap();
-        let before = fs::read(user.join(".opencodex/config.json")).unwrap();
-        let error = install(&Request {
-            source: std::path::absolute(root.path()).unwrap().join("source"),
-            codex_home: std::path::absolute(root.path()).unwrap().join("codex"),
-            user_home: user.clone(),
-            preview: false,
-            manager: None,
-        })
-        .unwrap_err();
+        let (_, state) = legacy_installed(root.path());
+        let (_home, user, _source) = absolute_paths(root.path());
+        let foreign = std::path::absolute(root.path())
+            .unwrap()
+            .join("foreign.json");
+        fs::write(&foreign, b"{}").unwrap();
+        fs::remove_file(user.join(".opencodex/config.json")).unwrap();
+        set_link(&user.join(".opencodex/config.json"), Some(&foreign), None).unwrap();
+        let error = install(&request(root.path())).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("Foreign subscription source link")
         );
-        assert_eq!(
-            fs::read(user.join(".opencodex/config.json")).unwrap(),
-            before
-        );
+        assert!(user.join(".opencodex/config.json").exists());
         assert!(
-            !std::path::absolute(root.path())
+            task_scheduler::observe(state["task"].as_str().unwrap())
                 .unwrap()
-                .join("codex/harness/subscription-routing.json")
-                .exists()
+                .is_some()
         );
+    }
+
+    #[test]
+    fn install_refuses_xai_profile_without_any_auth_helper() {
+        let root = tempfile::tempdir().unwrap();
+        write_source(root.path());
+        let error = install(&request(root.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("xAI auth helper executable is absent")
+        );
+    }
+
+    #[test]
+    fn install_renders_recorded_bridge_when_native_helper_link_is_absent() {
+        let root = tempfile::tempdir().unwrap();
+        write_source(root.path());
+        let (home, _user, source) = absolute_paths(root.path());
+        let bridge = source.join("global/codex-profiles/bridge-fixture.exe");
+        fs::write(&bridge, b"fixture-bridge").unwrap();
+        fs::create_dir_all(home.join("harness")).unwrap();
+        fs::write(
+            home.join("harness/installation.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "configBridge": format!("\\\\?\\{}", bridge.display())
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = install(&request(root.path())).unwrap();
+        assert_eq!(report.status, "connected-native");
+        assert!(!home.join("harness/bin/codex-harness.exe").exists());
+        let profile = fs::read_to_string(home.join("xai.config.toml")).unwrap();
+        let expected = bridge.to_str().unwrap().replace('\\', "/");
+        assert!(
+            profile.contains(&format!("command = \"{expected}\"")),
+            "{profile}"
+        );
+        let observed = check(&request(root.path())).unwrap();
+        assert_eq!(observed.status, "connected");
+    }
+
+    #[test]
+    fn preview_and_check_report_kit_owned_xai_profile_without_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        write_source(root.path());
+        write_manager(root.path());
+        let (home, _user, _source) = absolute_paths(root.path());
+        let mut preview_request = request(root.path());
+        preview_request.preview = true;
+        let preview = install(&preview_request).unwrap();
+        assert_eq!(preview.status, "preview-subscriptions");
+        assert!(!home.join("xai.config.toml").exists());
+        install(&request(root.path())).unwrap();
+        let observed = check(&request(root.path())).unwrap();
+        assert_eq!(observed.status, "connected");
+        assert_eq!(
+            observed.note,
+            "xAI profile is kit-owned and contains no secrets"
+        );
+        let profile = fs::read_to_string(home.join("xai.config.toml")).unwrap();
+        assert!(profile.contains("wire_api = \"responses\""));
+        assert!(!profile.to_ascii_lowercase().contains("eyj"));
+    }
+
+    #[test]
+    fn check_reports_legacy_state_as_degraded() {
+        let root = tempfile::tempdir().unwrap();
+        legacy_installed(root.path());
+        let observed = check(&request(root.path())).unwrap();
+        assert_eq!(observed.status, "degraded");
+        assert_eq!(observed.port, Some(10100));
+        assert!(observed.note.contains("Legacy OpenCodex records"));
+    }
+
+    #[test]
+    fn recover_preview_preserves_pending_and_private_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, state) = legacy_installed(root.path());
+        let (home, _user, _source) = absolute_paths(root.path());
+        let pending_path = home.join("harness/subscription-routing-pending.json");
+        let pending = serde_json::json!({
+            "schema_version": 1,
+            "owner": "codex-harness-subscriptions",
+            "operation": "retire-opencodex",
+            "source": state["source"],
+            "user": state["user"],
+            "codex": state["codex"],
+            "task": state["task"],
+            "task_before": state["task_xml"],
+            "task_after": Value::Null,
+            "links_before": state["links"],
+            "links_after": { "configLink": Value::Null, "roleLink": Value::Null },
+            "state_before": snapshot(&home.join("harness/subscription-routing.json")).unwrap(),
+            "state_after": Value::Null
+        });
+        write_json(&pending_path, &pending).unwrap();
+        let before = fs::read(&pending_path).unwrap();
+        let mut preview_request = request(root.path());
+        preview_request.preview = true;
+        let report = recover(&preview_request).unwrap();
+        assert_eq!(report.status, "preview-subscription-recovery");
+        assert_eq!(fs::read(&pending_path).unwrap(), before);
+        assert_eq!(
+            fs::read(home.join("harness/subscriptions/zai-key.txt")).unwrap(),
+            b"secret"
+        );
+    }
+
+    #[test]
+    fn recover_completes_retirement_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, state) = legacy_installed(root.path());
+        let (home, user, _source) = absolute_paths(root.path());
+        let pending_path = home.join("harness/subscription-routing-pending.json");
+        let pending = serde_json::json!({
+            "schema_version": 1,
+            "owner": "codex-harness-subscriptions",
+            "operation": "retire-opencodex",
+            "source": state["source"],
+            "user": state["user"],
+            "codex": state["codex"],
+            "task": state["task"],
+            "task_before": state["task_xml"],
+            "task_after": Value::Null,
+            "links_before": state["links"],
+            "links_after": { "configLink": Value::Null, "roleLink": Value::Null },
+            "state_before": snapshot(&home.join("harness/subscription-routing.json")).unwrap(),
+            "state_after": Value::Null
+        });
+        write_json(&pending_path, &pending).unwrap();
+        let report = recover(&request(root.path())).unwrap();
+        assert_eq!(report.status, "subscriptions-recovered-native");
+        assert!(!pending_path.exists());
+        assert!(
+            task_scheduler::observe(state["task"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!user.join(".opencodex/config.json").exists());
+        assert!(home.join("xai.config.toml").is_file());
+        let after: Value = serde_json::from_slice(
+            &fs::read(home.join("harness/subscription-routing.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["schema_version"], 2);
+    }
+
+    #[test]
+    fn disconnect_removes_native_profile_and_legacy_records() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, state) = legacy_installed(root.path());
+        let (home, user, _source) = absolute_paths(root.path());
+        install(&request(root.path())).unwrap();
+        let report = disconnect(&request(root.path())).unwrap();
+        assert_eq!(report.status, "disconnected");
+        assert!(!home.join("xai.config.toml").exists());
+        assert!(!home.join("xai.models.json").exists());
+        assert!(!home.join("harness/subscription-routing.json").exists());
+        assert!(
+            task_scheduler::observe(state["task"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!user.join(".opencodex").join("config.json").exists());
+        assert_eq!(
+            fs::read(home.join("harness/subscriptions/zai-key.txt")).unwrap(),
+            b"secret"
+        );
+        assert_eq!(
+            fs::read(home.join("zai.config.toml")).unwrap(),
+            b"keep-profile"
+        );
+    }
+
+    #[test]
+    fn disconnect_refuses_running_owned_task_without_stopping_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, state) = legacy_installed(root.path());
+        let (home, _user, _source) = absolute_paths(root.path());
+        let task = state["task"].as_str().unwrap().to_string();
+        let xml = crate::task_scheduler::with_exec_action(
+            state["task_xml"].as_str().unwrap(),
+            r"C:\Windows\System32\ping.exe",
+            "-n 30 127.0.0.1",
+        )
+        .unwrap();
+        let registered = crate::task_scheduler::update_in_place(
+            &task,
+            &xml,
+            state["task_xml"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut state = state;
+        state["task_xml"] = Value::String(registered);
+        write_json(&home.join("harness/subscription-routing.json"), &state).unwrap();
+        crate::task_scheduler::run(&task).unwrap();
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(8) {
+            if crate::task_scheduler::observe(&task)
+                .unwrap()
+                .is_some_and(|task| task.running)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let error = disconnect(&request(root.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Owned subscription task is running; live proxy was not stopped."),
+            "{error}"
+        );
+        assert!(home.join("harness/subscription-routing.json").is_file());
+        assert!(
+            crate::task_scheduler::observe(&task)
+                .unwrap()
+                .is_some_and(|task| task.running)
+        );
+        crate::task_scheduler::stop(&task).unwrap();
+        crate::task_scheduler::remove(&task, None).unwrap();
+    }
+
+    #[test]
+    fn configure_restart_reports_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        write_source(root.path());
+        write_manager(root.path());
+        install(&request(root.path())).unwrap();
+        let error = configure_restart(&request(root.path())).unwrap_err();
+        assert!(error.to_string().contains("restart policy is retired"));
     }
 }

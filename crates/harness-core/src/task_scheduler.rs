@@ -382,6 +382,38 @@ pub fn register(name: &str, xml: &str, expected: Option<&str>) -> io::Result<Str
     Ok(unsafe { registered.Xml().map_err(com)? }.to_string())
 }
 
+/// Start an isolated owned task for restart-policy tests. Never used against
+/// the live global proxy.
+pub fn run(name: &str) -> io::Result<()> {
+    if invalid_name(name) {
+        return Err(conflict("owned task name is invalid"));
+    }
+    let (_apartment, _service, folder) = connect()?;
+    let Some(task) = get_task(&folder, name)? else {
+        return Err(conflict("owned subscription task is missing"));
+    };
+    unsafe {
+        task.Run(&VARIANT::default()).map_err(com)?;
+    }
+    Ok(())
+}
+
+/// Stop an isolated owned task started by tests. Never used against the live
+/// global proxy.
+pub fn stop(name: &str) -> io::Result<()> {
+    if invalid_name(name) {
+        return Err(conflict("owned task name is invalid"));
+    }
+    let (_apartment, _service, folder) = connect()?;
+    let Some(task) = get_task(&folder, name)? else {
+        return Ok(());
+    };
+    unsafe {
+        task.Stop(0).map_err(com)?;
+    }
+    Ok(())
+}
+
 /// Replace an existing owned definition without stopping a running instance.
 /// Registration triggers are ignored so the live proxy is not started.
 pub fn update_in_place(name: &str, xml: &str, expected: &str) -> io::Result<String> {
@@ -449,6 +481,26 @@ pub fn with_restart_policy(xml: &str, count: i32, interval: &str) -> io::Result<
         settings
             .SetRestartInterval(&BSTR::from(interval))
             .map_err(com)?;
+    }
+    xml_text(&definition)
+}
+
+#[cfg(test)]
+pub(crate) fn with_exec_action(xml: &str, command: &str, arguments: &str) -> io::Result<String> {
+    let (_apartment, service, _folder) = connect()?;
+    let definition = unsafe { service.NewTask(0).map_err(com)? };
+    unsafe { definition.SetXmlText(&BSTR::from(xml)).map_err(com)? };
+    let actions = unsafe { definition.Actions().map_err(com)? };
+    let mut count = 0i32;
+    unsafe { actions.Count(&mut count).map_err(com)? };
+    if count < 1 {
+        return Err(conflict("owned task has no actions"));
+    }
+    let action = unsafe { actions.get_Item(1).map_err(com)? };
+    let exec: IExecAction = action.cast().map_err(com)?;
+    unsafe {
+        exec.SetPath(&BSTR::from(command)).map_err(com)?;
+        exec.SetArguments(&BSTR::from(arguments)).map_err(com)?;
     }
     xml_text(&definition)
 }

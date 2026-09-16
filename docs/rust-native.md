@@ -3,7 +3,7 @@
 The [migration specification](../openspec/changes/migrate-harness-to-rust/proposal.md)
 requires Rust for all maintained harness-owned executable code, including tests
 and skill helpers. This is a rule for pack development; it does not change the
-languages of projects using the kit. External Codex, OpenCodex, Serena,
+languages of projects using the kit. External Codex, Serena,
 Codebase Memory, published CodeGraph/Node, Graphify, Nuphus and language
 servers retain their own implementations and supported runtimes. The
 first-party CodeGraph adapter is Rust and is the live global graph after
@@ -42,6 +42,9 @@ Current-path baselines for the Rust migration are captured by
 after `cargo build --locked -p harness-rtk --jobs 1`. The comparison method
 and noise tolerance live in [Rust migration](evidence/rust-migration.md).
 Detailed receipts stay in the printed private TEMP root.
+
+The current requirement-to-check map lives in
+[rust-requirement-checks.json](evidence/rust-requirement-checks.json).
 
 Keep builds and process-resource acceptance sequential. `--jobs 1` also bounds
 the native manager's compiler concurrency without increasing its 2 GiB Job
@@ -533,7 +536,12 @@ owned Task Scheduler restart count/interval in place without starting or
 stopping the live proxy.
 The scheduled action is `codex-harness subscription-service --state FILE`.
 Isolated fixtures cover readiness, 2048 MiB job assignment, shutdown cleanup
-and runtime retry without targeting the live global proxy.
+and runtime retry. `codex-harness subscription-login xai|zai` is the
+native login entry: browser-only xAI OAuth and a host-private Z.AI key store
+with an owner-only ACL. The subscription lifecycle owns the native xAI
+profile and catalog (schema-version 2); legacy OpenCodex records are retired
+behind a recovery journal. Disconnect removes the native wiring. Isolated
+fixtures never target the live account.
 Token-workflow Install reuses or acquires the pinned RTK archive into
 `harness/rtk/packages/<version>/rtk.exe` and a bounded adapter build under
 `harness/rtk/build/<identity>/harness-rtk.exe`, then links only those two
@@ -715,4 +723,6 @@ migration is not a prerequisite for replacement activation.
 
 The original RTK script lifecycle now reads the root workspace manifest/lock
 and builds only `harness-rtk`. Native RTK lifecycle and Rust acceptance-helper
-migration are still needed.
+exist. `cargo test --locked -p codex-harness --test rtk_adapter --jobs 1 -- --test-threads=1`
+covers exec-once, hook rewrite, malformed/Stop silence, disable/missing
+bypass and oversized raw passthrough after `cargo build --locked -p harness-rtk --jobs 1`.

@@ -6,6 +6,7 @@ $harnessPreviousErrorAction = $ErrorActionPreference
 # Only preparation can fall back; an upstream process is launched exactly once.
 $harnessSavedRegistration = $null
 $harnessSource = $PSCommandPath
+$harnessPrepared = $false
 if (Get-Variable -Name CodexHarnessLauncherActive -Scope Global -ValueOnly -ErrorAction SilentlyContinue) {
     [Console]::Error.WriteLine('codex-harness: Recursive launcher registration; repair the original Codex CLI path.')
     exit 1
@@ -32,6 +33,7 @@ try {
     }
     [string[]] $harnessArguments = Get-HarnessLaunchArguments -Registration $harnessRegistration -Arguments $harnessTaskArguments
     $harnessRoots = @(Get-HarnessAdditionalRoots -Arguments $harnessTaskArguments)
+    $harnessPrepared = $true
 } catch {
     $harnessCandidates = [Collections.Generic.List[string]]::new()
     if ($harnessSavedRegistration -and $harnessSavedRegistration.PSObject.Properties['codexCommand']) {
@@ -72,6 +74,17 @@ try {
     $harnessRoots = @()
 } finally {
     $ErrorActionPreference = $harnessPreviousErrorAction
+}
+
+# The xai profile routes through the local compatibility shim; without it the
+# session cannot complete a single tool turn (Codex 0.154 <-> api.x.ai echo
+# defect). Fail loudly instead of launching a session that will break later.
+if ($harnessPrepared -and (Test-HarnessXaiProfileInvocation -Arguments $harnessTaskArguments)) {
+    try { Start-HarnessXaiResponsesShim -Registration $harnessRegistration }
+    catch {
+        [Console]::Error.WriteLine("codex-harness: $($_.Exception.Message)")
+        exit 1
+    }
 }
 
 # Scope the recursion guard to this PowerShell process; an inherited environment

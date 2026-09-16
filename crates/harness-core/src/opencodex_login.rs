@@ -7,6 +7,7 @@
 use crate::{
     broker_endpoint, build_identity, native_build,
     process::{Cancellation, CommandSpec, Deadline, StopReason},
+    xai_token_helper,
 };
 use base64::Engine;
 use serde_json::{Value, json};
@@ -17,16 +18,15 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const PACKAGE_NAME: &str = "@bitkyc08/opencodex";
-const PACKAGE_VERSION: &str = "2.44.0";
 const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const CALLBACK_PORT: u16 = 56121;
 const REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
+const CALLBACK_IDLE: Duration = Duration::from_secs(5);
 const SUCCESS_HTML: &str = "<!doctype html><html><head><meta charset='utf-8'><title>opencodex</title></head><body style='font-family:system-ui,sans-serif;text-align:center;padding:4rem;color:#111'><h2>Login complete</h2><p>You can close this tab and return to opencodex.</p></body></html>";
 
 #[derive(Clone)]
@@ -92,17 +92,6 @@ fn failed(reason: &'static str) -> io::Error {
 
 fn contains_secret(haystack: &str, secret: &str) -> bool {
     !secret.is_empty() && haystack.contains(secret)
-}
-
-fn adopted_package(package_root: &Path) -> io::Result<()> {
-    let metadata: Value = serde_json::from_slice(&fs::read(package_root.join("package.json"))?)
-        .map_err(|_| invalid("Invalid OpenCodex package metadata."))?;
-    if metadata["name"] != PACKAGE_NAME || metadata["version"] != PACKAGE_VERSION {
-        return Err(invalid(
-            "Reassess the OpenCodex login contract for this package version.",
-        ));
-    }
-    Ok(())
 }
 
 fn random_bytes(length: usize) -> io::Result<Vec<u8>> {
@@ -377,8 +366,9 @@ fn read_http_request(
     stream: &mut TcpStream,
     deadline: Deadline,
     cancel: &Cancellation,
-) -> io::Result<String> {
+) -> io::Result<Option<String>> {
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let mut idle_until = Instant::now() + CALLBACK_IDLE;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
@@ -395,8 +385,9 @@ fn read_http_request(
             ));
         }
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return Ok(None),
             Ok(size) => {
+                idle_until = Instant::now() + CALLBACK_IDLE;
                 buffer.extend_from_slice(&chunk[..size]);
                 if buffer.windows(4).any(|window| window == b"\r\n\r\n") || buffer.len() > 16 * 1024
                 {
@@ -407,12 +398,17 @@ fn read_http_request(
                 if error.kind() == io::ErrorKind::WouldBlock
                     || error.kind() == io::ErrorKind::TimedOut =>
             {
+                if Instant::now() >= idle_until {
+                    return Ok(None);
+                }
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(error) => return Err(error),
+            // A per-connection failure must not consume the shared login
+            // deadline; drop this socket and keep accepting the callback.
+            Err(_) => return Ok(None),
         }
     }
-    String::from_utf8(buffer).map_err(|_| invalid("OAuth callback was not UTF-8."))
+    Ok(String::from_utf8(buffer).ok())
 }
 
 fn handle_callback(
@@ -421,7 +417,10 @@ fn handle_callback(
     deadline: Deadline,
     cancel: &Cancellation,
 ) -> io::Result<Option<String>> {
-    let head = read_http_request(&mut stream, deadline, cancel)?;
+    let head = match read_http_request(&mut stream, deadline, cancel)? {
+        Some(head) => head,
+        None => return Ok(None),
+    };
     let target = head.lines().next().unwrap_or_default();
     let path = target.split_whitespace().nth(1).unwrap_or_default();
     let code = query_param(path, "code");
@@ -440,6 +439,7 @@ fn handle_callback(
         "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    let _ = stream.set_write_timeout(Some(CALLBACK_IDLE));
     let _ = stream.write_all(response.as_bytes());
     Ok(if ok { code } else { None })
 }
@@ -552,11 +552,11 @@ fn persist_credentials(ocx_home: &Path, payload: &Value) -> io::Result<()> {
             }]
         }
     });
-    fs::create_dir_all(ocx_home)?;
-    fs::write(
-        ocx_home.join("auth.json"),
-        serde_json::to_vec_pretty(&store)?,
-    )?;
+    let path = xai_token_helper::store_path(ocx_home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&store)?)?;
     Ok(())
 }
 
@@ -622,7 +622,7 @@ pub fn login_xai_browser_only(
     deadline: Deadline,
     cancel: &Cancellation,
 ) -> io::Result<LoginProbe> {
-    adopted_package(package_root)?;
+    let _ = package_root;
     let evidence = authorization_path
         .parent()
         .ok_or_else(|| invalid("Authorization evidence path must be absolute."))?
@@ -740,11 +740,12 @@ mod tests {
         assert_eq!(status, LoginStatus::Saved);
         assert!(!authorization.exists());
         let auth: Value =
-            serde_json::from_slice(&fs::read(ocx.join("auth.json")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(xai_token_helper::store_path(&ocx)).unwrap()).unwrap();
         assert_eq!(
             auth["xai"]["accounts"][0]["credential"]["access"],
             "fixture-access"
         );
+        assert!(!ocx.join("auth.json").exists());
         drop(root);
     }
 
@@ -764,7 +765,7 @@ mod tests {
         let status = login_with(&transport, &ocx, &authorization, deadline, &cancel).unwrap();
         assert_eq!(status, LoginStatus::TimedOut);
         assert!(!authorization.exists());
-        assert!(!ocx.join("auth.json").exists());
+        assert!(!xai_token_helper::store_path(&ocx).exists());
         drop(root);
     }
 
@@ -782,5 +783,38 @@ mod tests {
         let status = login_with(&transport, &ocx, &authorization, deadline, &cancel).unwrap();
         assert_eq!(status, LoginStatus::Cancelled);
         drop(root);
+    }
+
+    #[test]
+    fn read_http_request_drops_idle_connection_before_login_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let cancel = Cancellation::default();
+        let deadline = Deadline::after(Duration::from_secs(60)).unwrap();
+        let started = Instant::now();
+        let head = read_http_request(&mut server, deadline, &cancel).unwrap();
+        assert_eq!(head, None);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        drop(client);
+    }
+
+    #[test]
+    fn read_http_request_keeps_waiting_across_split_callback_head() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let cancel = Cancellation::default();
+        let deadline = Deadline::after(Duration::from_secs(5)).unwrap();
+        let reader =
+            thread::spawn(move || read_http_request(&mut server, deadline, &cancel).unwrap());
+        client.write_all(b"GET /callback?code=split").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        client
+            .write_all(b"&state=s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let head = reader.join().unwrap().unwrap();
+        assert!(head.starts_with("GET /callback?code=split&state=s "));
+        drop(client);
     }
 }

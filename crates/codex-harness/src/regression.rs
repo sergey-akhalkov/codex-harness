@@ -3,6 +3,7 @@
 //! A fresh anonymous job is assigned before resume. Cleanup never looks up a
 //! process by name or PID. Child stdout and stderr stay in the case root.
 
+use harness_core::analysis_samples;
 use harness_core::inventory;
 use harness_core::process::{
     Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, StopReason,
@@ -120,6 +121,7 @@ fn validate(request: &CaseRequest) -> io::Result<()> {
             "Require an absolute executable and separately tokenized string arguments",
         ));
     }
+    analysis_samples::refuse_sample_program(Path::new(&request.argv[0]))?;
     if !(1..=600).contains(&request.timeout) {
         return Err(invalid(
             "Require argv, timeout 1..600 and readiness within execution deadline",

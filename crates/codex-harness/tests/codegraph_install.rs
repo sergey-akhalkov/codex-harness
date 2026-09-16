@@ -70,11 +70,6 @@ fn retained_plan(python: &str, powershell: &str, home: &Path) -> String {
             "args": ["-B", "-u", "launch.py", "serena"],
             "env": {"CODEX_HOME": home}
         },
-        "graphify": {
-            "command": python,
-            "args": ["-B", "-u", "launch.py", "graphify"],
-            "env": {"CODEX_HOME": home}
-        },
         "nuphus": {
             "command": powershell,
             "args": ["-NoLogo", "-NoProfile", "-File", "mcp.ps1", "-Server", "nuphus"],
@@ -85,7 +80,7 @@ fn retained_plan(python: &str, powershell: &str, home: &Path) -> String {
 }
 
 fn retained_names(servers: &Value) -> Vec<String> {
-    ["serena", "graphify", "nuphus"]
+    ["serena", "nuphus"]
         .into_iter()
         .filter(|name| servers.get(*name).is_some())
         .map(str::to_owned)
@@ -659,11 +654,7 @@ fn selected_codegraph_activation_is_native_and_does_not_invoke_python() {
     assert!(servers.get("codegraph").is_some());
     assert_eq!(
         retained_names(&servers),
-        vec![
-            "serena".to_string(),
-            "graphify".to_string(),
-            "nuphus".to_string()
-        ]
+        vec!["serena".to_string(), "nuphus".to_string()]
     );
     assert_eq!(fs::read(cache.join("policy.json")).unwrap(), CBM_POLICY);
     assert_eq!(fs::read(package.join("keep.txt")).unwrap(), b"shared-bytes");
@@ -689,7 +680,6 @@ fn fresh_install_registers_planned_retained_tools_and_omits_cbm_and_lsp() {
     assert!(servers.get("harness-lsp").is_none(), "{servers}");
     assert!(servers.get("codegraph").is_some(), "{servers}");
     assert_eq!(servers["serena"]["command"], "C:\\python\\python.exe");
-    assert_eq!(servers["graphify"]["args"][3], "graphify");
     assert_eq!(servers["nuphus"]["args"][5], "nuphus");
     assert_eq!(servers["foreign"]["command"], "untouched.exe");
 }
@@ -735,11 +725,7 @@ fn update_replaces_stale_owned_receipt_with_newly_planned_inventory() {
     assert_eq!(servers["serena"]["command"], "C:\\python\\python.exe");
     assert_eq!(
         retained_names(&servers),
-        vec![
-            "serena".to_string(),
-            "graphify".to_string(),
-            "nuphus".to_string()
-        ]
+        vec!["serena".to_string(), "nuphus".to_string()]
     );
     assert!(servers.get("codebase-memory").is_none());
     assert!(servers.get("harness-lsp").is_none());
@@ -982,7 +968,7 @@ fn planner_handoff_from_existing_inspect_registers_retained_tools_without_mutati
         .cloned()
         .unwrap_or(handoff.clone());
     assert!(registrations.get("serena").is_some(), "{handoff}");
-    assert!(registrations.get("graphify").is_some(), "{handoff}");
+    assert!(registrations.get("graphify").is_none(), "{handoff}");
     assert!(registrations.get("nuphus").is_some(), "{handoff}");
     assert!(registrations.get("harness-lsp").is_none(), "{handoff}");
     let connected = run_apply(
@@ -996,11 +982,7 @@ fn planner_handoff_from_existing_inspect_registers_retained_tools_without_mutati
     assert!(servers.get("codegraph").is_some(), "{servers}");
     assert_eq!(
         retained_names(&servers),
-        vec![
-            "serena".to_string(),
-            "graphify".to_string(),
-            "nuphus".to_string()
-        ]
+        vec!["serena".to_string(), "nuphus".to_string()]
     );
     assert!(servers.get("codebase-memory").is_none(), "{servers}");
     assert!(servers.get("harness-lsp").is_none(), "{servers}");

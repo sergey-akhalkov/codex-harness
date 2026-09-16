@@ -207,4 +207,57 @@ function Get-HarnessLaunchConfiguration {
     return $metadata
 }
 
-Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessTaskArguments, Get-HarnessAdditionalRoots, Get-HarnessLaunchArguments, Resolve-HarnessFile, Get-HarnessLaunchConfiguration
+function Test-HarnessXaiProfileInvocation {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments = @())
+    # Only an explicit `xai` profile selects the compatibility shim; prompt
+    # text after `--` is never interpreted as a flag.
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        if ($argument -ceq '--') { return $false }
+        if ($argument -ceq '--profile' -or $argument -ceq '-p') {
+            if ($index + 1 -lt $Arguments.Count -and $Arguments[$index + 1] -ceq 'xai') { return $true }
+            $index++
+            continue
+        }
+        if ($argument -cmatch '^--profile=xai$') { return $true }
+        if ($argument -cmatch '^-pxai$') { return $true }
+    }
+    return $false
+}
+
+function Start-HarnessXaiResponsesShim {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Registration,
+        [int]$Port = 56122,
+        [int]$TimeoutMilliseconds = 5000
+    )
+    # The shim self-exits when no codex.exe remains; the launcher only makes
+    # sure one is listening before the session sends its first request.
+    $probe = {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.ConnectAsync('127.0.0.1', $Port)
+            if ($connect.Wait(250) -and $client.Connected) { return $true }
+            return $false
+        } catch {
+            return $false
+        } finally {
+            $client.Dispose()
+        }
+    }
+    if (& $probe) { return }
+    if (-not $Registration.PSObject.Properties['configBridge']) {
+        throw 'xAI responses shim requires the shared configuration bridge.'
+    }
+    Start-Process -FilePath $Registration.configBridge -ArgumentList @('xai-responses-shim', '--port', "$Port") -WindowStyle Hidden
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (& $probe) { return }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "xAI responses shim did not become ready on 127.0.0.1:$Port."
+}
+
+Export-ModuleMember -Function Get-HarnessArguments, Get-HarnessTaskArguments, Get-HarnessAdditionalRoots, Get-HarnessLaunchArguments, Resolve-HarnessFile, Get-HarnessLaunchConfiguration, Test-HarnessXaiProfileInvocation, Start-HarnessXaiResponsesShim

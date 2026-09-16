@@ -3,7 +3,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'kit.psm1')
 Import-Module (Join-Path $PSScriptRoot 'code-tools.psm1')
-Import-Module (Join-Path $PSScriptRoot 'subscription-routing.psm1')
 
 function Get-BootstrapIdentity([string]$Directory) {
     Assert-CodeToolsPlain $Directory
@@ -163,10 +162,9 @@ function Invoke-BootstrapUv($Runtime, [string[]]$Arguments) {
     } finally { $env:UV_TOOL_DIR = $oldRoot; $env:UV_TOOL_BIN_DIR = $oldBin }
 }
 
-function Initialize-CodeToolsRuntime([string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [ValidateSet('serena','graphify')][string]$Tool = 'serena') {
+function Initialize-CodeToolsRuntime([string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [ValidateSet('serena')][string]$Tool = 'serena') {
     $runtime = Get-HarnessCodeToolsRuntime $UserHome $CodexHome $CodexCommand
-    if ($Tool -eq 'graphify') { throw 'Graphify is retired from the managed selection and is not bootstrapped.' }
-    $definition = if ($Tool -eq 'serena') { @{ package = 'serena-agent'; requirement = 'serena-agent==1.7.0'; wrappers = @('serena.exe','serena-agent.exe','serena-hooks.exe'); journal = 'bootstrap-pending.json'; installed = $runtime.python } } else { @{ package = 'graphifyy'; requirement = 'graphifyy[mcp]==0.9.55'; wrappers = @('graphify.exe','graphify-mcp.exe'); journal = 'bootstrap-graphify-pending.json'; installed = $runtime.graphify_python } }
+    $definition = @{ package = 'serena-agent'; requirement = 'serena-agent==1.7.0'; wrappers = @('serena.exe','serena-agent.exe','serena-hooks.exe'); journal = 'bootstrap-pending.json'; installed = $runtime.python }
     if ($definition.installed) { return $runtime }
     if (-not $runtime.uv -or -not $runtime.lifecycle_python) { $runtime = Initialize-BootstrapBase -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand }
     $target = Join-Path $runtime.uv_root $definition.package
@@ -190,8 +188,8 @@ function Initialize-CodeToolsRuntime([string]$UserHome, [string]$CodexHome, [str
     Get-HarnessCodeToolsRuntime $UserHome $CodexHome $CodexCommand
 }
 
-function Restore-CodeToolsBootstrap([string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [switch]$Preview, [ValidateSet('serena','graphify')][string]$Tool = 'serena') {
-    $definition = if ($Tool -eq 'serena') { @{ package = 'serena-agent'; wrappers = @('serena.exe','serena-agent.exe','serena-hooks.exe'); journal = 'bootstrap-pending.json' } } else { @{ package = 'graphifyy'; wrappers = @('graphify.exe','graphify-mcp.exe'); journal = 'bootstrap-graphify-pending.json' } }
+function Restore-CodeToolsBootstrap([string]$UserHome, [string]$CodexHome, [string]$CodexCommand, [switch]$Preview, [ValidateSet('serena')][string]$Tool = 'serena') {
+    $definition = @{ package = 'serena-agent'; wrappers = @('serena.exe','serena-agent.exe','serena-hooks.exe'); journal = 'bootstrap-pending.json' }
     $path = Join-Path $CodexHome ('harness/' + $definition.journal)
     $record = Read-CodeToolsJson $path
     if (-not $record) { return }
@@ -280,7 +278,7 @@ function Restore-HarnessActivation {
     foreach ($operation in @(
         { Stop-CodeToolsServices $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Preview:$Preview },
         { Invoke-CodeToolsResources $SourceRoot $DependencyUserHome $CodexHome $CodexCommand -Mode recover -Preview:$Preview | Out-Null },
-        { Restore-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -DependencyUserHome $DependencyUserHome -Preview:$Preview -DeferRestart | Out-Null },
+        { if (Test-Path -LiteralPath (Join-Path $CodexHome 'harness/subscription-routing-pending.json')) { Invoke-HarnessNativeSubscriptions -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -Operation recover -Tolerant | Out-Null } },
         { Restore-CodeToolsRegistries $CodexHome -Preview:$Preview },
         { Restore-CodeToolsRegistration $CodexHome -Preview:$Preview | Out-Null },
         { Invoke-HarnessInstall -SourceRoot $SourceRoot -UserHome $UserHome -DependencyUserHome $DependencyUserHome -CodexHome $CodexHome -CodexCommand $CodexCommand -PathScope $recoveryPathScope -Mode Recover -Preview:$Preview | Out-Null }
@@ -324,7 +322,6 @@ function Restore-HarnessActivation {
         if ($pending -and -not $Preview) { $pending.phase = 'incompleteUpdate'; $pending.recovery_errors = $errors.ToArray(); Write-CodeToolsJson $pendingPath $pending }
         throw ('Recovery incomplete; preserved pending journal: ' + ($errors -join '; '))
     }
-    if (-not $Preview) { Resume-HarnessSubscriptionRouting -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome }
     if (-not $Preview) { Remove-CodeToolsFile $pendingPath }
     @{ status = if ($Preview) { 'Preview recovery' } else { 'Recovered' } }
 }
@@ -386,7 +383,7 @@ function Invoke-HarnessActivation {
         }
     }
     $coreMode = if ($Mode -eq 'Update') { 'Install' } else { $Mode }
-    $subscriptionPlan = Invoke-HarnessSubscriptionRouting @common -Mode $Mode -Preview
+    $subscriptionPlan = Invoke-HarnessNativeSubscriptions -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -Operation check -Tolerant
     $codePlan = Invoke-HarnessCodeTools @common -Mode $Mode -Preview
     $corePlan = Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -IncludeCodeTools -Preview
     if ($Preview) {
@@ -397,10 +394,10 @@ function Invoke-HarnessActivation {
     if ($Mode -eq 'Check') {
         $code = Invoke-HarnessCodeTools @common -Mode Check
         $corePlan | Add-Member -NotePropertyName codeTools -NotePropertyValue $code -Force
-        $subscriptions = Invoke-HarnessSubscriptionRouting @common -Mode Check
+        $subscriptions = Invoke-HarnessNativeSubscriptions -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -Operation check -Tolerant
         $corePlan | Add-Member -NotePropertyName subscriptions -NotePropertyValue $subscriptions -Force
         if ($code.status -ne 'protocol-ready') { $corePlan.status = 'Degraded' }
-        if ($subscriptions.status -ne 'ready') { $corePlan.status = 'Degraded' }
+        if (-not $subscriptions -or $subscriptions.status -notin @('connected', 'ready')) { $corePlan.status = 'Degraded' }
         return $corePlan
     }
     $record = @{ schema_version = 1; owner = 'codex-harness-activation'; id = [guid]::NewGuid().ToString('N');
@@ -416,7 +413,8 @@ function Invoke-HarnessActivation {
         $result = Invoke-HarnessInstall @common -Mode $coreMode -PathScope $PathScope -IncludeCodeTools -DeferCommit
         if ($Checkpoint) { & $Checkpoint 'core' }
         $codeResult = Invoke-HarnessCodeTools @common -Mode $Mode -DeferCommit -TransactionId $record.id -Checkpoint $Checkpoint
-        $subscriptionResult = Invoke-HarnessSubscriptionRouting @common -Mode $Mode -DeferCommit -Checkpoint $Checkpoint
+        $subscriptionOperation = if ($Mode -in @('Install', 'Update')) { 'install' } else { $Mode.ToLowerInvariant() }
+        $subscriptionResult = Invoke-HarnessNativeSubscriptions -SourceRoot $SourceRoot -UserHome $UserHome -CodexHome $CodexHome -Operation $subscriptionOperation
         if ($Checkpoint) { & $Checkpoint 'before-commit' }
         $record.phase = 'committed'
         Write-CodeToolsJson $pendingPath $record
@@ -433,5 +431,31 @@ function Invoke-HarnessActivation {
         catch { throw "Activation failed: $original. $($_.Exception.Message)" }
         throw "Activation failed and prior connections restored: $original"
     }
+}
+
+function Invoke-HarnessNativeSubscriptions {
+    <#
+    .SYNOPSIS
+    Runs the native subscription lifecycle operation through the recorded manager build.
+    #>
+    param([string]$SourceRoot, [string]$CodexHome, [string]$UserHome, [string]$Operation, [switch]$Tolerant)
+    $installationPath = Join-Path $CodexHome 'harness/installation.json'
+    if (-not (Test-Path -LiteralPath $installationPath)) {
+        if ($Tolerant) { return $null }
+        throw 'Connect the kit core first: the subscriptions lifecycle runs in the native manager.'
+    }
+    $bridge = (Get-Content -LiteralPath $installationPath -Raw | ConvertFrom-Json).configBridge
+    if (-not $bridge -or -not (Test-Path -LiteralPath $bridge)) {
+        if ($Tolerant) { return $null }
+        throw 'Native manager build is unavailable; run install.ps1 -CoreOnly first.'
+    }
+    $bridge = [IO.Path]::GetFullPath($bridge)
+    $output = & $bridge $Operation --source $SourceRoot --codex-home $CodexHome --user-home $UserHome
+    if ($LASTEXITCODE -ne 0) {
+        $text = ($output | Out-String).Trim()
+        if ($Tolerant -and $text -match 'needs Recover|No owned subscription records') { return $null }
+        throw $text
+    }
+    if ($output) { $output | ConvertFrom-Json }
 }
 Export-ModuleMember -Function Invoke-HarnessActivation, Restore-HarnessActivation

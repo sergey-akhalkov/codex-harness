@@ -162,12 +162,9 @@ function Get-HarnessCodeToolsRuntime([string]$UserHome, [string]$CodexHome, [str
     $registryPath = Join-Path $CodexHome 'harness/code-tools.json'
     $record = Read-CodeToolsJson $registryPath
     $python = $null
-    $graphifyPython = $null
     if ($record) {
         $serena = @($record.mcp | Where-Object id -EQ 'serena')
         if ($serena.Count -eq 1 -and $serena[0].paths.ContainsKey('python')) { $python = $serena[0].paths.python }
-        $graphify = @($record.mcp | Where-Object id -EQ 'graphify')
-        if ($graphify.Count -eq 1 -and $graphify[0].paths.ContainsKey('python')) { $graphifyPython = $graphify[0].paths.python }
     }
     $sameUser = [string]::Equals([IO.Path]::GetFullPath($UserHome).TrimEnd('\'), [Environment]::GetFolderPath('UserProfile').TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
     $uvRoot = if ($env:UV_TOOL_DIR -and $sameUser) { $env:UV_TOOL_DIR } else { Join-Path $UserHome 'AppData/Roaming/uv/tools' }
@@ -175,8 +172,6 @@ function Get-HarnessCodeToolsRuntime([string]$UserHome, [string]$CodexHome, [str
     $pythonRoot = if ($env:UV_PYTHON_INSTALL_DIR -and $sameUser) { $env:UV_PYTHON_INSTALL_DIR } else { Join-Path $UserHome 'AppData/Roaming/uv/python' }
     if (-not $python -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { $python = Join-Path $uvRoot 'serena-agent/Scripts/python.exe' }
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { $python = $null }
-    if (-not $graphifyPython -or -not (Test-Path -LiteralPath $graphifyPython -PathType Leaf)) { $graphifyPython = Join-Path $uvRoot 'graphifyy/Scripts/python.exe' }
-    if (-not (Test-Path -LiteralPath $graphifyPython -PathType Leaf)) { $graphifyPython = $null }
     $uvCommand = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     $uv = if ($uvCommand) { $uvCommand.Source } else { $null }
     if (-not $uv -and (Test-Path -LiteralPath (Join-Path $UserHome '.local/bin/uv.exe') -PathType Leaf)) { $uv = Join-Path $UserHome '.local/bin/uv.exe' }
@@ -202,7 +197,7 @@ function Get-HarnessCodeToolsRuntime([string]$UserHome, [string]$CodexHome, [str
         $candidates = @(if (Test-Path -LiteralPath $vendor) { Get-ChildItem -LiteralPath $vendor -Recurse -File -Filter 'codex.exe' })
         $native = if ($candidates.Count -eq 1) { $candidates[0].FullName } else { $null }
     }
-    @{ python = $python; graphify_python = $graphifyPython; lifecycle_python = $lifecyclePython; uv = $uv; uv_root = $uvRoot; uv_bin = $uvBin; python_root = $pythonRoot; native = $native;
+    @{ python = $python; lifecycle_python = $lifecyclePython; uv = $uv; uv_root = $uvRoot; uv_bin = $uvBin; python_root = $pythonRoot; native = $native;
         powershell = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source; registry = $registryPath }
 }
 
@@ -439,7 +434,7 @@ function Invoke-HarnessCodeTools {
         if ($nativeProjection) { foreach ($key in @($nativeProjection.Keys)) { $planProjection[$key] = $nativeProjection[$key] } }
         if (-not $planProjection.ContainsKey('registrations') -or $null -eq $planProjection.registrations) { $planProjection['registrations'] = @{} }
         if (-not $planProjection.registrations.ContainsKey('codegraph')) { $planProjection.registrations['codegraph'] = @{ command = $manager } }
-        if (-not $planProjection.ContainsKey('retired') -or $null -eq $planProjection.retired) { $planProjection['retired'] = @('codebase-memory') }
+        if (-not $planProjection.ContainsKey('retired') -or $null -eq $planProjection.retired) { $planProjection['retired'] = @('codebase-memory','graphify','harness-lsp') }
         $planArgs = @($registrationArgs + @('--plan-only', '--native-providers-json', ($planProjection | ConvertTo-Json -Compress -Depth 60)))
         $planned = Invoke-CodeToolsPythonJson $runtime.lifecycle_python $planArgs
         $retainedJson = ($planned | ConvertTo-Json -Compress -Depth 60)

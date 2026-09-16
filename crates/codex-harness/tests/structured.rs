@@ -65,7 +65,12 @@ fn run_case(root: &Path, mode: &str, expected: &str, timeout: u64, output_limit:
     let before = fs::read(case.join("input.txt")).unwrap();
     let prompt = root.join(format!("{mode}-prompt.txt"));
     fs::write(&prompt, PROMPT).unwrap();
-    let inspect = inspect();
+    let inspect_bin = root.join("harness-inspect.exe");
+    let inspect = if inspect_bin.is_file() {
+        inspect_bin
+    } else {
+        inspect()
+    };
     let schema = root.join(format!("{mode}-schema.json"));
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -316,6 +321,38 @@ fn timeout_receipt_is_distinct_from_oracle_and_keeps_partial_files() {
     assert!(evidence.join("final.json").is_file());
     assert_ne!(result["status"], "oracle-failure");
     assert_ne!(result["status"], "wrong-answer");
+}
+
+#[test]
+fn native_inspect_runs_from_owned_project_outside_checkout() {
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let consumer = tempfile::Builder::new()
+        .prefix("structured-outside-checkout-")
+        .tempdir()
+        .unwrap();
+    let consumer = consumer.path().canonicalize().unwrap();
+    assert!(
+        !consumer.starts_with(&checkout),
+        "owned consumer must be outside the checkout: {} vs {}",
+        consumer.display(),
+        checkout.display()
+    );
+    let helper = consumer.join("harness-inspect.exe");
+    fs::copy(inspect(), &helper).unwrap();
+    let schema = consumer.join("inspection.schema.json");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agents/skills/structured-codex-run/assets/inspection.schema.json"),
+        &schema,
+    )
+    .unwrap();
+    let result = run_case(&consumer, "success", "success", 15, 1_048_576);
+    let evidence = PathBuf::from(result["evidence_root"].as_str().unwrap());
+    assert!(evidence.join("process.json").is_file());
+    assert!(evidence.join("events.jsonl").is_file());
+    assert!(!evidence.starts_with(&checkout));
 }
 
 const _KEEP_DURATION: Duration = Duration::from_secs(1);

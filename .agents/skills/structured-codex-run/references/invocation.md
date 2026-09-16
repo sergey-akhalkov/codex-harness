@@ -12,20 +12,20 @@ run. Unsupported schema extensions fail before launch; they are never silently
 ignored. Global native command registration is still pending, so do not assume
 this executable is already on PATH.
 
-`scripts/run.py` uses the bundled fixed inspection schema and the existing Windows process observer. Pass a JSON array for the launch prefix: either an absolute native Codex `.exe`, or an absolute `pwsh.exe` plus `-NoProfile -File` and the installed launcher path. There is no shell-command string parsing. Resolve the original CLI through the kit installation receipt when PATH points to a wrapper; record its version with `--version` before the run.
+`harness-inspect.exe` is the current helper. Pass a JSON array for the launch prefix: either an absolute native Codex `.exe`, or an absolute `pwsh.exe` plus `-NoProfile -File` and the installed launcher path. There is no shell-command string parsing. Resolve the original CLI through the kit installation receipt when PATH points to a wrapper; record its version with `--version` before the run. `scripts/run.py` remains a transitional caller of the same contract.
 
 Example with caller-resolved paths and an already authorized route:
 
 ```powershell
 $commandJson = ConvertTo-Json -Compress -InputObject @($nativeCodexExe)
 $oracleJson = ConvertTo-Json -Compress -InputObject @($pythonExe, $oracleScript)
-& $pythonExe $runScript --cwd $fixtureRoot --prompt-file $promptFile `
-    --command-json $commandJson --oracle-json $oracleJson `
+& $inspectExe --cwd $fixtureRoot --prompt-file $promptFile `
+    --schema $schemaPath --command-json $commandJson --oracle-json $oracleJson `
     --model $approvedModel --provider $approvedProvider --subscription $subscriptionLabel `
     --input src/check.py --timeout 180 --output-limit 1048576
 ```
 
-All four executable/script paths above are resolved by the caller, not literal executable names. The helper source can be found through the installed skill's `scripts/run.py`; normal directory links resolve to reusable source. `--codex-home` optionally selects an already prepared owned consumer home; it never copies authentication. Model/provider/subscription identify the requested route, not proven runtime eligibility. Supply only nonsecret labels; don't put credentials in arguments, prompts or receipts.
+The inspect executable, schema, launch prefix and oracle command are resolved by the caller, not literal names. A development binary without a build receipt needs `--schema` pointing at the installed skill asset. `--codex-home` optionally selects an already prepared owned consumer home; it never copies authentication. Model/provider/subscription identify the requested route, not proven runtime eligibility. Supply only nonsecret labels; don't put credentials in arguments, prompts or receipts.
 
 The trusted oracle command receives the absolute final JSON path as its last argument and runs with cwd set to the target. Exit 0 means its independent checks passed; exit 1 means a wrong answer; other exit codes or observer failures mean oracle failure. Keep expected answers out of the model prompt. The schema requires `run_id`, `findings` (path, integer line, description, evidence) and `unresolved_issues`. The helper appends its run identity to stdin; the model must echo that identity. Use line 1 or greater and project-relative paths in findings; the oracle checks their semantic validity and completeness.
 

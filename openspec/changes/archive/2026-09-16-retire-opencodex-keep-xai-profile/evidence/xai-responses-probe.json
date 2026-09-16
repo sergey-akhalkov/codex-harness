@@ -1,0 +1,13 @@
+{
+  "curlExit": 0,
+  "endpoint": "https://api.x.ai/v1/responses",
+  "error": null,
+  "grant": "browser-oauth",
+  "httpStatus": 200,
+  "ok": true,
+  "reportedModel": "grok-4.6",
+  "requestedModel": "grok-4.6",
+  "stderrPresent": false,
+  "streaming": false,
+  "tools": true
+}

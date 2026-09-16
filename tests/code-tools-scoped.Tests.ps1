@@ -51,7 +51,7 @@ try {
     & $activation {
         function script:Initialize-CodeToolsRuntime { throw 'Scoped activation attempted bootstrap.' }
         function script:Invoke-HarnessInstall { throw 'Scoped activation touched core state.' }
-        function script:Invoke-HarnessSubscriptionRouting { throw 'Scoped activation touched subscriptions.' }
+        function script:Invoke-HarnessNativeSubscriptions { throw 'Scoped activation touched subscriptions.' }
         function script:Restore-HarnessSubscriptionRouting { throw 'Scoped recovery touched subscriptions.' }
         function script:Restore-CodeToolsBootstrap { throw 'Scoped recovery touched packages.' }
     }

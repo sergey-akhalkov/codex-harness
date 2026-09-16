@@ -68,6 +68,45 @@ foreach ($case in $dispatchCases) {
     Assert-Arguments @(Get-HarnessArguments -Arguments $case.Arguments) $expected $case.Name
 }
 
+$xaiProfileCases = @(
+    @{ Arguments = [string[]]@('--profile', 'xai', 'exec'); Expected = $true },
+    @{ Arguments = [string[]]@('-p', 'xai'); Expected = $true },
+    @{ Arguments = [string[]]@('--profile=xai', 'exec', 'hello'); Expected = $true },
+    @{ Arguments = [string[]]@('exec', '-pxai'); Expected = $true },
+    @{ Arguments = [string[]]@('--profile', 'zai', 'exec'); Expected = $false },
+    @{ Arguments = [string[]]@('-p', 'zai'); Expected = $false },
+    @{ Arguments = [string[]]@('--profile', 'xai-extra'); Expected = $false },
+    @{ Arguments = [string[]]@('--profile'); Expected = $false },
+    @{ Arguments = [string[]]@('exec', '--', '--profile', 'xai'); Expected = $false },
+    @{ Arguments = [string[]]@(); Expected = $false }
+)
+foreach ($case in $xaiProfileCases) {
+    $actual = Test-HarnessXaiProfileInvocation -Arguments $case.Arguments
+    if ($actual -cne $case.Expected) {
+        throw "xai profile detection for [$($case.Arguments -join ' ')] expected $($case.Expected), got $actual"
+    }
+    $script:assertions++
+}
+
+# An already-listening shim needs no bridge and no new process.
+$shimListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$shimListener.Start()
+try {
+    Start-HarnessXaiResponsesShim -Registration ([pscustomobject]@{}) -Port $shimListener.LocalEndpoint.Port
+    $script:assertions++
+} finally {
+    $shimListener.Stop()
+}
+# Without a listener and without a recorded bridge the launcher must fail
+# instead of silently launching a session that cannot reach api.x.ai.
+$shimRejected = $false
+try {
+    Start-HarnessXaiResponsesShim -Registration ([pscustomobject]@{}) -Port 1 -TimeoutMilliseconds 250
+} catch {
+    $shimRejected = $true
+}
+Assert-True $shimRejected 'missing shim bridge must fail loudly'
+
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("codex-launcher проба " + [guid]::NewGuid().ToString('N'))
 $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
 $node = (Get-Command node -CommandType Application | Select-Object -First 1).Source
