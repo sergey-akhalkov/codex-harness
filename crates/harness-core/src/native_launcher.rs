@@ -280,6 +280,206 @@ fn prepared_command(
     Ok((command, registration.task_control))
 }
 
+/// Result of asking the loopback xAI shim port what it is.
+enum ShimProbe {
+    /// Nothing is listening; a shim can be started.
+    Free,
+    /// A kit shim answers and reports the executable that serves it.
+    Ours(PathBuf),
+    /// Something else holds the port (another program, or a shim build from
+    /// before identity reporting existed).
+    Unknown,
+}
+
+fn same_executable(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+/// Send one bounded loopback control request to the shim port. A connection
+/// error means the port is free; any other outcome is interpreted by the
+/// caller.
+fn shim_control_request(port: u16, method: &str, path: &str) -> io::Result<(u16, Vec<u8>)> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(200),
+    )?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.write_all(
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )?;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while raw.len() < 8192 {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(size) => raw.extend_from_slice(&chunk[..size]),
+            Err(_) => break,
+        }
+    }
+    let (head, body) = match raw.windows(4).position(|window| window == b"\r\n\r\n") {
+        Some(position) => (&raw[..position], raw[position + 4..].to_vec()),
+        None => (raw.as_slice(), Vec::new()),
+    };
+    let status = String::from_utf8_lossy(head)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok((status, body))
+}
+
+fn shim_probe(port: u16) -> ShimProbe {
+    match shim_control_request(port, "GET", crate::xai_responses_shim::IDENTITY_PATH) {
+        Err(_) => ShimProbe::Free,
+        Ok((status, body)) => {
+            let identity = (status == 200)
+                .then(|| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                .flatten()
+                .filter(|value| {
+                    value.get("harness").and_then(|v| v.as_str()) == Some("xai-responses-shim")
+                        && value.get("schema").and_then(|v| v.as_u64()) == Some(1)
+                });
+            match identity
+                .and_then(|value| value.get("exe").and_then(|v| v.as_str()).map(PathBuf::from))
+            {
+                Some(exe) => ShimProbe::Ours(exe),
+                None => ShimProbe::Unknown,
+            }
+        }
+    }
+}
+
+fn wait_for_shim_free(port: u16) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(70);
+    while std::time::Instant::now() < deadline {
+        if matches!(shim_probe(port), ShimProbe::Free) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(fail(
+        "the retired xAI compatibility shim did not release its port",
+    ))
+}
+
+/// Start the selected build's shim and confirm the port is served by exactly
+/// that executable, so a foreign or outdated listener is never mistaken for it.
+fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
+    let mut command = Command::new(manager);
+    command.args(["xai-responses-shim"]);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    // The returned handle is dropped: the shim must outlive this launcher.
+    drop(spawn_background(&mut command)?);
+    for _ in 0..250 {
+        match shim_probe(port) {
+            ShimProbe::Ours(exe) if same_executable(&exe, manager) => return Ok(()),
+            ShimProbe::Ours(_) => {
+                return Err(fail(
+                    "the xAI compatibility shim port is served by another build",
+                ));
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    Err(fail("xAI compatibility shim did not become ready"))
+}
+
+/// Spawn the resident shim without transferring the caller's stdio handles.
+/// `Stdio::null()` replaces the child's std handles but the caller's own
+/// inheritable stdout/stderr handles are still duplicated into the child on
+/// Windows, so a piped `codex` invocation would stay open until the shim
+/// exits. The shim may outlive every session, so clear the inherit flag for
+/// the duration of its creation and restore it afterwards.
+#[cfg(windows)]
+fn spawn_background(command: &mut Command) -> io::Result<std::process::Child> {
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let mut cleared = Vec::new();
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(id) };
+        if handle.is_null() {
+            continue;
+        }
+        let mut flags = 0u32;
+        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+            continue;
+        }
+        if flags & HANDLE_FLAG_INHERIT != 0
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0
+        {
+            cleared.push(handle);
+        }
+    }
+    let spawned = command.spawn();
+    for handle in cleared {
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    }
+    spawned
+}
+
+#[cfg(not(windows))]
+fn spawn_background(command: &mut Command) -> io::Result<std::process::Child> {
+    command.spawn()
+}
+
+/// Reuse a shim only when it is the selected build's shim. A shim from a
+/// superseded build is retired first, otherwise fixes in the selected build
+/// would never reach new sessions while any Codex process kept the old one
+/// alive. A listener without identity reporting (a pre-identity shim) is
+/// reused as before, with an explicit notice, because it cannot be replaced
+/// without breaking a session that may still depend on it.
+fn ensure_xai_shim(manager: &Path) -> io::Result<()> {
+    ensure_xai_shim_on(crate::xai_responses_shim::DEFAULT_PORT, manager)
+}
+
+fn ensure_xai_shim_on(port: u16, manager: &Path) -> io::Result<()> {
+    match shim_probe(port) {
+        ShimProbe::Ours(exe) if same_executable(&exe, manager) => return Ok(()),
+        ShimProbe::Ours(stale) => {
+            eprintln!(
+                "codex-harness: replacing the xAI shim from an earlier build ({}); sessions started from that build must be restarted",
+                stale.display()
+            );
+            // The response may race the shim's exit; the released port is the
+            // observable that matters.
+            let _ = shim_control_request(port, "POST", crate::xai_responses_shim::RETIRE_PATH);
+            wait_for_shim_free(port)?;
+        }
+        ShimProbe::Unknown => {
+            eprintln!(
+                "codex-harness: 127.0.0.1:{port} is held by an unidentified or pre-identity xAI shim; it is reused unchanged (restart all Codex sessions to replace it)"
+            );
+            return Ok(());
+        }
+        ShimProbe::Free => {}
+    }
+    if !manager.is_file() {
+        return Err(fail("xAI shim manager is absent from the selected build"));
+    }
+    spawn_xai_shim(port, manager)
+}
+
 pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
     prepared_command(executable, home, args).map(|(command, _)| command)
 }
@@ -320,7 +520,18 @@ impl Drop for ConsoleHandler {
 }
 
 pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32> {
+    // An unusable upstream executable must fail as an error, not as a desktop
+    // loader dialog.
+    crate::process::suppress_loader_dialogs();
     let (mut command, task_control) = prepared_command(executable, home, args)?;
+    if launcher::xai_shim_requested(args) {
+        let manager = executable
+            .canonicalize()?
+            .parent()
+            .ok_or_else(|| fail("launcher has no build directory"))?
+            .join("codex-harness.exe");
+        ensure_xai_shim(&manager)?;
+    }
     #[cfg(windows)]
     let _console = ConsoleHandler::install()?;
     #[cfg(windows)]
@@ -359,6 +570,7 @@ mod tests {
         io::Write,
         path::{Path, PathBuf},
         process::Stdio,
+        sync::{Arc, mpsc},
         time::Duration,
     };
 
@@ -374,6 +586,221 @@ mod tests {
                 .next()
                 .unwrap(),
         )
+    }
+
+    /// Loopback stand-in for a running xAI shim: answers the identity endpoint
+    /// with the file the test wants it to report and honors retirement.
+    struct ShimFixture {
+        port: u16,
+        retired: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ShimFixture {
+        fn start(exe: &str) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = Arc::clone(&retired);
+            let exe = exe.to_string();
+            let worker = std::thread::spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut buffer = [0u8; 2048];
+                            let size = stream.read(&mut buffer).unwrap_or(0);
+                            let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                            if request.starts_with("GET /__harness/xai-shim/identity") {
+                                let body = json!({
+                                    "harness": "xai-responses-shim",
+                                    "schema": 1,
+                                    "exe": exe,
+                                })
+                                .to_string();
+                                let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            );
+                            } else if request.starts_with("POST /__harness/xai-shim/retire") {
+                                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let body = "{\"retiring\":true}";
+                                let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            );
+                                return;
+                            } else {
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                                );
+                            }
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            });
+            Self {
+                port,
+                retired,
+                worker: Some(worker),
+            }
+        }
+
+        fn join(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn shim_probe_separates_identity_unknown_and_free_ports() {
+        let mut ours = ShimFixture::start(r"C:\build-a\codex-harness.exe");
+        match shim_probe(ours.port) {
+            ShimProbe::Ours(exe) => {
+                assert!(same_executable(
+                    &exe,
+                    Path::new(r"C:\build-a\codex-harness.exe")
+                ))
+            }
+            other => panic!("expected identity, got {}", probe_name(&other)),
+        }
+        let _ = shim_control_request(ours.port, "POST", crate::xai_responses_shim::RETIRE_PATH);
+        ours.join();
+
+        // A responder that is not the kit shim must classify as unknown.
+        use std::io::Write;
+        use std::net::TcpListener;
+        let foreign = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let foreign_port = foreign.local_addr().unwrap().port();
+        let foreign_worker = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = foreign.accept() {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        assert!(matches!(shim_probe(foreign_port), ShimProbe::Unknown));
+        foreign_worker.join().unwrap();
+
+        // A dropped listener leaves the port free.
+        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free_port = free.local_addr().unwrap().port();
+        drop(free);
+        assert!(matches!(shim_probe(free_port), ShimProbe::Free));
+    }
+
+    fn probe_name(probe: &ShimProbe) -> &'static str {
+        match probe {
+            ShimProbe::Free => "free",
+            ShimProbe::Ours(_) => "ours",
+            ShimProbe::Unknown => "unknown",
+        }
+    }
+
+    #[test]
+    fn matching_shim_is_reused_without_spawning() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = root.path().join("codex-harness.exe");
+        // Deliberately empty: an attempted launch of it would fail, so Ok()
+        // proves the matching shim was reused.
+        fs::write(&manager, b"").unwrap();
+        let mut fixture = ShimFixture::start(&manager.display().to_string());
+        assert!(ensure_xai_shim_on(fixture.port, &manager).is_ok());
+        assert!(!fixture.retired.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = shim_control_request(fixture.port, "POST", crate::xai_responses_shim::RETIRE_PATH);
+        fixture.join();
+    }
+
+    #[test]
+    fn shim_from_another_build_is_retired_before_start() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = root.path().join("codex-harness.exe");
+        let mut fixture = ShimFixture::start(r"C:\superseded-build\codex-harness.exe");
+        let error = ensure_xai_shim_on(fixture.port, &manager).unwrap_err();
+        assert!(
+            error.to_string().contains("absent from the selected build"),
+            "{error}"
+        );
+        assert!(fixture.retired.load(std::sync::atomic::Ordering::SeqCst));
+        fixture.join();
+        assert!(
+            matches!(shim_probe(fixture.port), ShimProbe::Free),
+            "retired shim must release the port"
+        );
+    }
+
+    #[test]
+    fn background_spawn_does_not_keep_the_caller_pipeline_open() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
+        let compile = tempfile::tempdir().unwrap();
+        let child_exe = compile_fixture(
+            compile.path(),
+            "long-lived-child.exe",
+            include_str!("../tests/fixtures/long_lived_child.rs"),
+        );
+        // A fresh pipe stands in for the pipeline a script or shell would use
+        // to capture `codex` output. Its write end becomes this process's
+        // stdout, which is inheritable exactly like the real capture pipe.
+        let (reader, writer) = crate::cancellable_pipe::anonymous_pipe(4096).unwrap();
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    writer.as_raw_handle(),
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                )
+            },
+            0
+        );
+        let previous = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        assert_ne!(
+            unsafe { SetStdHandle(STD_OUTPUT_HANDLE, writer.as_raw_handle()) },
+            0
+        );
+        let mut command = Command::new(&child_exe);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        let spawned = spawn_background(&mut command);
+        assert_ne!(unsafe { SetStdHandle(STD_OUTPUT_HANDLE, previous) }, 0);
+        let mut child = spawned.expect("fixture child must start");
+        drop(writer);
+
+        // EOF must arrive while the child is still alive: the child did not
+        // inherit the write end. A blocking read would mean the caller's
+        // pipeline stays open until the shim exits.
+        let (signal, wait) = mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut chunk = [0u8; 256];
+            loop {
+                match std::io::Read::read(&mut reader, &mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = signal.send(());
+        });
+        let closed = wait.recv_timeout(Duration::from_secs(5));
+        child.kill().ok();
+        let _ = child.wait_with_output();
+        assert!(
+            closed.is_ok(),
+            "the background child kept the caller's output pipe open"
+        );
+        reader_thread.join().unwrap();
     }
 
     fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {

@@ -1,6 +1,6 @@
 //! Accepted script-launcher dispatch cases, ported as argument-vector oracles.
 use harness_core::launcher::{
-    additional_roots, per_model_effort, profile_arguments, task_arguments,
+    additional_roots, per_model_effort, profile_arguments, task_arguments, xai_shim_requested,
 };
 use std::ffi::OsString;
 
@@ -87,6 +87,28 @@ fn native_profile_dispatch_preserves_the_accepted_commands_and_boundaries() {
             assert_eq!(profile_arguments(&input), input);
         }
     }
+}
+
+#[test]
+fn xai_shim_starts_only_for_the_explicit_xai_profile() {
+    assert!(xai_shim_requested(&argv(&["--profile", "xai"])));
+    assert!(xai_shim_requested(&argv(&[
+        "exec",
+        "--profile",
+        "xai",
+        "hi"
+    ])));
+    assert!(xai_shim_requested(&argv(&["--profile=xai"])));
+    assert!(xai_shim_requested(&argv(&["-p", "xai", "exec"])));
+    assert!(!xai_shim_requested(&argv(&[])));
+    assert!(!xai_shim_requested(&argv(&["--profile", "zai"])));
+    assert!(!xai_shim_requested(&argv(&["--profile", "harness"])));
+    assert!(!xai_shim_requested(&argv(&[
+        "exec",
+        "--",
+        "--profile",
+        "xai"
+    ])));
 }
 
 #[test]

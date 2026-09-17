@@ -22,7 +22,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -30,6 +30,11 @@ use std::{
 
 pub const DEFAULT_PORT: u16 = 56122;
 pub const DEFAULT_UPSTREAM: &str = "https://api.x.ai";
+/// Local control endpoints: the launcher verifies which build owns the port
+/// before reusing a running shim, and retires a shim from another build so the
+/// selected build (with its fixes) actually serves new sessions.
+pub const IDENTITY_PATH: &str = "/__harness/xai-shim/identity";
+pub const RETIRE_PATH: &str = "/__harness/xai-shim/retire";
 const HEAD_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 16;
@@ -38,6 +43,9 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_POLL: Duration = Duration::from_secs(10);
 const DEFAULT_GRACE: Duration = Duration::from_secs(15);
 const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
+/// A retired shim stops accepting immediately and drains in-flight streams for
+/// at most this long, so both the port and the process are released promptly.
+const RETIRE_DRAIN: Duration = Duration::from_secs(60);
 
 pub struct Options {
     pub port: u16,
@@ -80,11 +88,40 @@ pub(crate) fn serve(
     poll_interval: Duration,
     startup_grace: Duration,
 ) -> io::Result<()> {
+    serve_with_retire(
+        listener,
+        upstream,
+        keep_running,
+        poll_interval,
+        startup_grace,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+pub(crate) fn serve_with_retire(
+    listener: TcpListener,
+    upstream: &str,
+    keep_running: Arc<dyn Fn() -> bool + Send + Sync>,
+    poll_interval: Duration,
+    startup_grace: Duration,
+    retire: Arc<AtomicBool>,
+) -> io::Result<()> {
     listener.set_nonblocking(true)?;
+    let mut listener = Some(listener);
     let active = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
     let mut next_poll = started + startup_grace;
     loop {
+        if retire.load(Ordering::SeqCst) {
+            // Release the port at once so the replacing build can bind, then
+            // let in-flight streams drain within a bounded wait.
+            drop(listener.take());
+            let drain_deadline = Instant::now() + RETIRE_DRAIN;
+            while active.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            return Ok(());
+        }
         let now = Instant::now();
         if now >= next_poll {
             next_poll = now + poll_interval;
@@ -92,7 +129,10 @@ pub(crate) fn serve(
                 return Ok(());
             }
         }
-        match listener.accept() {
+        let Some(accepting) = listener.as_ref() else {
+            return Ok(());
+        };
+        match accepting.accept() {
             Ok((stream, _)) => {
                 if active.load(Ordering::SeqCst) >= MAX_ACTIVE_CONNECTIONS {
                     let mut stream = stream;
@@ -102,10 +142,11 @@ pub(crate) fn serve(
                 active.fetch_add(1, Ordering::SeqCst);
                 let upstream = upstream.to_string();
                 let active = Arc::clone(&active);
+                let retire = Arc::clone(&retire);
                 thread::Builder::new()
                     .name("xai-responses-shim".to_string())
                     .spawn(move || {
-                        handle_connection(stream, &upstream);
+                        handle_connection(stream, &upstream, &retire);
                         active.fetch_sub(1, Ordering::SeqCst);
                     })?;
             }
@@ -135,7 +176,7 @@ enum ReadOutcome {
     Drop,
 }
 
-fn handle_connection(mut stream: TcpStream, upstream: &str) {
+fn handle_connection(mut stream: TcpStream, upstream: &str, retire: &AtomicBool) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let request = match read_request(&mut stream) {
@@ -146,6 +187,19 @@ fn handle_connection(mut stream: TcpStream, upstream: &str) {
         }
         _ => return,
     };
+    // Local build-identity control plane: the launcher uses it to reuse only a
+    // shim from the selected build and to retire one from a superseded build.
+    // Handling happens before the upstream hop so it never reaches api.x.ai.
+    if request.method == "GET" && request.target == IDENTITY_PATH {
+        let _ = write_json_response(&mut stream, &identity_body());
+        return;
+    }
+    if request.method == "POST" && request.target == RETIRE_PATH {
+        retire.store(true, Ordering::SeqCst);
+        let body = serde_json::json!({"retiring": true}).to_string();
+        let _ = write_json_response(&mut stream, &body);
+        return;
+    }
     let mut body = request.body;
     let mut adaptation = ToolAdaptation::default();
     if request.method == "POST" && request.target.contains("/responses") {
@@ -165,7 +219,7 @@ fn handle_connection(mut stream: TcpStream, upstream: &str) {
     let cancel = Cancellation::default();
     let root = BrokerRoot::prepare();
     let forwarder = Forwarder::new();
-    let rewriting = !adaptation.custom_names().is_empty();
+    let rewriting = adaptation.needs_stream_rewrite();
     let headers = if rewriting {
         request
             .headers
@@ -205,8 +259,15 @@ fn handle_connection(mut stream: TcpStream, upstream: &str) {
                 wrote = true;
                 let relayed = framer.feed(bytes);
                 let outgoing = sse.feed(&relayed.body);
-                let mut framed = framer.reframe(&outgoing);
-                framed.extend_from_slice(&relayed.raw);
+                let framed = if relayed.raw.starts_with(b"HTTP/") {
+                    let mut framed = relayed.raw.clone();
+                    framed.extend_from_slice(&framer.reframe(&outgoing));
+                    framed
+                } else {
+                    let mut framed = framer.reframe(&outgoing);
+                    framed.extend_from_slice(&relayed.raw);
+                    framed
+                };
                 if let (Some(trace), false) = (trace.as_mut(), framed.is_empty()) {
                     let _ = trace.write_all(&framed);
                 }
@@ -308,16 +369,23 @@ fn find_double_crlf(buffer: &[u8]) -> Option<usize> {
 pub(crate) struct ToolAdaptation {
     custom: HashSet<String>,
     namespaces: HashMap<String, (String, String)>,
+    rewrite_stream: bool,
 }
 
 impl ToolAdaptation {
     pub(crate) fn parse(body: &[u8]) -> Self {
         let mut custom = HashSet::new();
         let mut namespaces = HashMap::new();
+        let mut rewrite_stream = false;
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
-            return Self { custom, namespaces };
+            return Self {
+                custom,
+                namespaces,
+                rewrite_stream,
+            };
         };
         if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+            rewrite_stream = !tools.is_empty();
             for tool in tools {
                 match tool.get("type").and_then(Value::as_str) {
                     Some("custom") => {
@@ -346,7 +414,11 @@ impl ToolAdaptation {
                 }
             }
         }
-        Self { custom, namespaces }
+        Self {
+            custom,
+            namespaces,
+            rewrite_stream,
+        }
     }
 
     pub(crate) fn custom_names(&self) -> HashSet<String> {
@@ -355,6 +427,10 @@ impl ToolAdaptation {
 
     pub(crate) fn namespace_names(&self) -> HashMap<String, (String, String)> {
         self.namespaces.clone()
+    }
+
+    pub(crate) fn needs_stream_rewrite(&self) -> bool {
+        self.rewrite_stream
     }
 }
 
@@ -540,7 +616,7 @@ pub(crate) fn adapt_request_body(body: &[u8], adaptation: &ToolAdaptation) -> Op
 
 fn function_call_to_custom(item: &Value) -> Value {
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-    let input = serde_json::from_str::<Value>(arguments)
+    let mut input = serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|value| {
             value
@@ -549,6 +625,11 @@ fn function_call_to_custom(item: &Value) -> Value {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| arguments.to_string());
+    if item.get("name").and_then(Value::as_str) == Some("apply_patch")
+        && let Some(normalized) = normalize_patch_markers(&input)
+    {
+        input = normalized;
+    }
     let mut rewritten = serde_json::json!({
         "type": "custom_tool_call",
         "call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
@@ -563,6 +644,44 @@ fn function_call_to_custom(item: &Value) -> Value {
     rewritten
 }
 
+/// Grok frequently decorates the patch markers (`*** Begin Patch ***`,
+/// `*** End Patch ***`, `*** End of File ***`); Codex's validator accepts only
+/// the undecorated marker lines and otherwise rejects the whole call, costing
+/// a full-context retry. Rewrite only those marker lines, keeping the patch
+/// body byte-identical; anything else is left untouched.
+fn normalize_patch_markers(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for (index, raw) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let (line, carriage) = match raw.strip_suffix('\r') {
+            Some(line) => (line, "\r"),
+            None => (raw, ""),
+        };
+        let trimmed = line.trim_end();
+        let canonical = ["*** Begin Patch", "*** End Patch", "*** End of File"]
+            .iter()
+            .find(|marker| {
+                trimmed.strip_prefix(**marker).is_some_and(|decoration| {
+                    !decoration.is_empty() && decoration.chars().all(|c| c == '*' || c == ' ')
+                })
+            });
+        match canonical {
+            Some(marker) => {
+                changed = true;
+                out.push_str(marker);
+                out.push_str(carriage);
+            }
+            None => {
+                out.push_str(raw);
+            }
+        }
+    }
+    changed.then_some(out)
+}
+
 fn serialize_data_line(value: &Value) -> Vec<u8> {
     let mut bytes = b"data: ".to_vec();
     match serde_json::to_vec(value) {
@@ -570,6 +689,71 @@ fn serialize_data_line(value: &Value) -> Vec<u8> {
         Err(_) => bytes.extend_from_slice(b"null"),
     }
     bytes
+}
+
+/// Codex 0.154 deserializes integer tool fields with serde integers, which
+/// reject JSON numbers written as `30000.0`. Grok emits that shape for
+/// timeouts, hwnd values and similar fields; coerce whole numbers so the
+/// call is executed instead of retried.
+fn coerce_whole_floats(text: &str) -> Option<String> {
+    let mut value: Value = serde_json::from_str(text).ok()?;
+    if !coerce_whole_float_value(&mut value) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn coerce_whole_float_value(value: &mut Value) -> bool {
+    match value {
+        Value::Number(number) => coerce_whole_float_number(number),
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= coerce_whole_float_value(item);
+            }
+            changed
+        }
+        Value::Object(fields) => {
+            let mut changed = false;
+            for item in fields.values_mut() {
+                changed |= coerce_whole_float_value(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn coerce_whole_float_number(number: &mut serde_json::Number) -> bool {
+    if number.as_i64().is_some() || number.as_u64().is_some() {
+        return false;
+    }
+    let Some(float) = number.as_f64() else {
+        return false;
+    };
+    if !float.is_finite() || float.fract() != 0.0 {
+        return false;
+    }
+    let coerced = if float >= 0.0 && float <= u64::MAX as f64 {
+        serde_json::Number::from(float as u64)
+    } else if (i64::MIN as f64..=i64::MAX as f64).contains(&float) {
+        serde_json::Number::from(float as i64)
+    } else {
+        return false;
+    };
+    *number = coerced;
+    true
+}
+
+fn coerce_item_arguments(item: &mut Value) -> bool {
+    let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(coerced) = coerce_whole_floats(arguments) else {
+        return false;
+    };
+    item["arguments"] = Value::String(coerced);
+    true
 }
 
 /// Decode the curl `--raw` relay just enough to rewrite event lines: response
@@ -614,6 +798,7 @@ impl ResponseFramer {
     /// stream is being rewritten).
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> FramerOutput {
         self.pending.extend_from_slice(bytes);
+        let mut raw = Vec::new();
         if !self.head_done {
             let Some(position) = find_double_crlf(&self.pending) else {
                 return FramerOutput {
@@ -633,26 +818,20 @@ impl ResponseFramer {
                     raw: drained,
                 };
             }
-            let head = self.pending[..position + 4].to_vec();
+            raw.extend_from_slice(&self.pending[..position + 4]);
             self.pending.drain(..position + 4);
-            return FramerOutput {
-                body: Vec::new(),
-                raw: head,
-            };
         }
         if self.body_passthrough {
             return FramerOutput {
                 body: std::mem::take(&mut self.pending),
-                raw: Vec::new(),
+                raw,
             };
         }
         let mut decoded = Vec::new();
         loop {
             if self.pending.is_empty() && self.chunk_started {
-                return FramerOutput {
-                    body: decoded,
-                    raw: std::mem::take(&mut self.tail),
-                };
+                raw.extend_from_slice(&std::mem::take(&mut self.tail));
+                return FramerOutput { body: decoded, raw };
             }
             if self.terminal_seen {
                 if !self.terminal_emitted {
@@ -661,17 +840,14 @@ impl ResponseFramer {
                 }
                 self.tail
                     .extend_from_slice(&std::mem::take(&mut self.pending));
-                return FramerOutput {
-                    body: decoded,
-                    raw: std::mem::take(&mut self.tail),
-                };
+                if !raw.starts_with(b"HTTP/") {
+                    raw.extend_from_slice(&std::mem::take(&mut self.tail));
+                }
+                return FramerOutput { body: decoded, raw };
             }
             if !self.chunk_started {
                 let Some(line_end) = self.pending.iter().position(|byte| *byte == b'\n') else {
-                    return FramerOutput {
-                        body: decoded,
-                        raw: Vec::new(),
-                    };
+                    return FramerOutput { body: decoded, raw };
                 };
                 let size_text = String::from_utf8_lossy(&self.pending[..line_end])
                     .trim()
@@ -684,10 +860,7 @@ impl ResponseFramer {
                     Err(_) => {
                         self.body_passthrough = true;
                         decoded.extend_from_slice(&std::mem::take(&mut self.pending));
-                        return FramerOutput {
-                            body: decoded,
-                            raw: Vec::new(),
-                        };
+                        return FramerOutput { body: decoded, raw };
                     }
                 };
                 self.chunk_remaining = size;
@@ -709,18 +882,12 @@ impl ResponseFramer {
                     if self.pending[..2] != *b"\r\n" {
                         self.body_passthrough = true;
                         decoded.extend_from_slice(&std::mem::take(&mut self.pending));
-                        return FramerOutput {
-                            body: decoded,
-                            raw: Vec::new(),
-                        };
+                        return FramerOutput { body: decoded, raw };
                     }
                     self.pending.drain(..2);
                     self.chunk_started = false;
                 } else {
-                    return FramerOutput {
-                        body: decoded,
-                        raw: Vec::new(),
-                    };
+                    return FramerOutput { body: decoded, raw };
                 }
             }
         }
@@ -821,26 +988,35 @@ impl SseAdapter {
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
-                let Some(item) = value.get("item") else {
+                let Some(item) = value.get("item").cloned() else {
                     return Some(original.to_vec());
                 };
                 let index = value
                     .get("output_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                if let Some(rewritten) = self.rewrite_namespaced(item) {
-                    value["item"] = rewritten;
-                    return Some(serialize_data_line(&value));
-                }
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let is_custom = self.item_is_custom(item);
+                let mut item = item;
+                let mut changed = false;
+                if let Some(rewritten) = self.rewrite_namespaced(&item) {
+                    item = rewritten;
+                    changed = true;
+                } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let is_custom = self.item_is_custom(&item);
                     self.custom_indexes.insert(index, is_custom);
-                    if is_custom && let Some(rewritten) = self.rewrite_item(item) {
-                        value["item"] = rewritten;
-                        return Some(serialize_data_line(&value));
+                    if is_custom && let Some(rewritten) = self.rewrite_item(&item) {
+                        item = rewritten;
+                        changed = true;
                     }
                 }
-                Some(original.to_vec())
+                if coerce_item_arguments(&mut item) {
+                    changed = true;
+                }
+                if changed {
+                    value["item"] = item;
+                    Some(serialize_data_line(&value))
+                } else {
+                    Some(original.to_vec())
+                }
             }
             "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
                 let index = value
@@ -849,6 +1025,12 @@ impl SseAdapter {
                     .unwrap_or(0);
                 if self.custom_indexes.get(&index).copied().unwrap_or(false) {
                     None
+                } else if kind == "response.function_call_arguments.done"
+                    && let Some(arguments) = value.get("arguments").and_then(Value::as_str)
+                    && let Some(coerced) = coerce_whole_floats(arguments)
+                {
+                    value["arguments"] = Value::String(coerced);
+                    Some(serialize_data_line(&value))
                 } else {
                     Some(original.to_vec())
                 }
@@ -866,6 +1048,9 @@ impl SseAdapter {
                             .or_else(|| self.rewrite_namespaced(item))
                         {
                             *item = rewritten;
+                            changed = true;
+                        }
+                        if coerce_item_arguments(item) {
                             changed = true;
                         }
                     }
@@ -939,6 +1124,33 @@ fn write_simple_response(stream: &mut TcpStream, status: &'static str) -> io::Re
     stream.write_all(
         format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
     )
+}
+
+fn write_json_response(stream: &mut TcpStream, body: &str) -> io::Result<()> {
+    stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+}
+
+/// Build identity of this shim process: the launcher compares `exe` with the
+/// manager executable of the selected build. No credentials or request data.
+fn identity_body() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    serde_json::json!({
+        "harness": "xai-responses-shim",
+        "schema": 1,
+        "pid": std::process::id(),
+        "exe": exe,
+    })
+    .to_string()
 }
 
 #[cfg(windows)]
@@ -1211,6 +1423,127 @@ mod tests {
     }
 
     #[test]
+    fn namespace_only_tools_enable_stream_rewrite() {
+        let body = json!({
+            "tools": [
+                {"type": "namespace", "name": "mcp__serena", "tools": [
+                    {"type": "function", "name": "find_symbol", "parameters": {"type": "object"}}
+                ]}
+            ]
+        })
+        .to_string();
+        let adaptation = ToolAdaptation::parse(body.as_bytes());
+        assert!(adaptation.custom_names().is_empty());
+        assert!(adaptation.needs_stream_rewrite());
+        assert!(
+            adaptation
+                .namespace_names()
+                .contains_key("mcp__serena__find_symbol")
+        );
+    }
+
+    #[test]
+    fn namespace_only_chunked_stream_rewrites_calls() {
+        let body = json!({
+            "tools": [
+                {"type": "namespace", "name": "mcp__serena", "tools": [
+                    {"type": "function", "name": "find_symbol"}
+                ]}
+            ]
+        })
+        .to_string();
+        let adaptation = ToolAdaptation::parse(body.as_bytes());
+        let mut framer = ResponseFramer::new(adaptation.needs_stream_rewrite());
+        let mut sse = SseAdapter::new(adaptation.custom_names(), adaptation.namespace_names());
+        let event = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c1\",\"name\":\"mcp__serena__find_symbol\",\"arguments\":\"{}\"}}\n\n";
+        let mut wire =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        wire.extend_from_slice(format!("{:x}\r\n", event.len()).as_bytes());
+        wire.extend_from_slice(event);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        let relayed = framer.feed(&wire);
+        let outgoing = sse.feed(&relayed.body);
+        let mut client = framer.reframe(&outgoing);
+        client.extend_from_slice(&relayed.raw);
+        client.extend_from_slice(&framer.reframe(&sse.finish()));
+        client.extend_from_slice(&framer.finish());
+        let text = String::from_utf8(client).unwrap();
+        assert!(text.contains("\"namespace\":\"mcp__serena\""));
+        assert!(text.contains("\"name\":\"find_symbol\""));
+        assert!(!text.contains("mcp__serena__find_symbol"));
+    }
+
+    #[test]
+    fn whole_number_floats_in_function_arguments_are_coerced() {
+        let mut adapter = SseAdapter::new(HashSet::new(), HashMap::new());
+        let done = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c1\",\"name\":\"exec_command\",\"arguments\":\"{\\\"yield_time_ms\\\":30000.0,\\\"hwnd\\\":78611.0,\\\"ratio\\\":1.5}\"}}\n\n";
+        let text = String::from_utf8(adapter.feed(done)).unwrap();
+        assert!(
+            text.contains("yield_time_ms") && text.contains("30000") && !text.contains("30000.0")
+        );
+        assert!(text.contains("hwnd") && text.contains("78611") && !text.contains("78611.0"));
+        assert!(text.contains("1.5"));
+
+        let mut adapter = SseAdapter::new(
+            HashSet::new(),
+            HashMap::from([(
+                "mcp__nuphus__desktop_window_activate".to_string(),
+                (
+                    "mcp__nuphus".to_string(),
+                    "desktop_window_activate".to_string(),
+                ),
+            )]),
+        );
+        let namespaced = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"c2\",\"name\":\"mcp__nuphus__desktop_window_activate\",\"arguments\":\"{\\\"hwnd\\\":50925.0}\"}}\n\n";
+        let text = String::from_utf8(adapter.feed(namespaced)).unwrap();
+        assert!(text.contains("\"namespace\":\"mcp__nuphus\""));
+        assert!(text.contains("\"name\":\"desktop_window_activate\""));
+        assert!(text.contains("50925") && !text.contains("50925.0"));
+
+        let done_args = b"event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{\\\"timeout_ms\\\":60000.0}\"}\n\n";
+        let text = String::from_utf8(adapter.feed(done_args)).unwrap();
+        assert!(text.contains("timeout_ms") && text.contains("60000") && !text.contains("60000.0"));
+    }
+
+    #[test]
+    fn decorated_patch_markers_are_normalized_and_other_lines_kept() {
+        let decorated = "*** Begin Patch ***\r\n*** Add File: a.txt\r\n+*** End Patch ***\r\n*** End Patch ***\r\n*** End of File ***";
+        let normalized = normalize_patch_markers(decorated).unwrap();
+        assert_eq!(
+            normalized,
+            "*** Begin Patch\r\n*** Add File: a.txt\r\n+*** End Patch ***\r\n*** End Patch\r\n*** End of File"
+        );
+        assert!(normalize_patch_markers("*** Begin Patch\n*** End Patch").is_none());
+        assert!(normalize_patch_markers("*** Add File: one ***\n+text").is_none());
+        assert!(
+            normalize_patch_markers("*** Begin Patch # oops\n*** End Patch").is_none(),
+            "only star/space decoration may be normalized"
+        );
+        assert!(
+            normalize_patch_markers("+*** Begin Patch ***").is_none(),
+            "patch body lines must stay untouched"
+        );
+    }
+
+    #[test]
+    fn streamed_patch_with_decorated_markers_reaches_codex_canonical() {
+        let mut adapter =
+            SseAdapter::new(HashSet::from(["apply_patch".to_string()]), HashMap::new());
+        let done = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c1\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch ***\\\\n*** Add File: a.txt\\\\n+ok\\\\n*** End Patch ***\\\"}\"}}\n\n";
+        let text = String::from_utf8(adapter.feed(done)).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("rewritten data line");
+        let value: Value = serde_json::from_str(data).unwrap();
+        let input = value["item"]["input"].as_str().unwrap();
+        assert_eq!(
+            input,
+            "*** Begin Patch\n*** Add File: a.txt\n+ok\n*** End Patch"
+        );
+    }
+
+    #[test]
     fn response_framer_decodes_and_reframes_split_chunks() {
         let mut framer = ResponseFramer::new(true);
         let mut sse = SseAdapter::new(HashSet::from(["apply_patch".to_string()]), HashMap::new());
@@ -1295,6 +1628,86 @@ mod tests {
         assert!(image_is_codex("/usr/bin/CODEX.EXE"));
         assert!(!image_is_codex(r"C:\tools\codex-code-mode-host.exe"));
         assert!(!image_is_codex("codex"));
+    }
+
+    fn control_request(port: u16, method: &str, path: &str) -> (String, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => received.extend_from_slice(&chunk[..size]),
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&received).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+        (head.to_string(), body.to_string())
+    }
+
+    #[test]
+    fn control_endpoints_identify_and_retire_without_an_upstream_hop() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let retire = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let retire = Arc::clone(&retire);
+            thread::spawn(move || {
+                serve_with_retire(
+                    listener,
+                    // An upstream that cannot answer proves control requests
+                    // never leave the local shim.
+                    "http://127.0.0.1:1",
+                    Arc::new(|| true),
+                    Duration::from_millis(20),
+                    Duration::from_secs(30),
+                    retire,
+                )
+                .unwrap();
+            })
+        };
+        let (head, body) = control_request(port, "GET", IDENTITY_PATH);
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        let identity: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(identity["harness"], "xai-responses-shim");
+        assert_eq!(identity["schema"], 1);
+        let exe = std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(identity["exe"], exe.as_str());
+        assert!(identity["pid"].as_u64().unwrap() > 0);
+
+        let (head, body) = control_request(port, "POST", RETIRE_PATH);
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(body, "{\"retiring\":true}");
+        // The listen socket must be released before the process finishes
+        // draining, so the replacing build can bind the port at once.
+        let mut released = false;
+        for _ in 0..200 {
+            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                released = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(released, "retired shim must release its port");
+        worker.join().unwrap();
+        assert!(retire.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1458,6 +1871,112 @@ mod tests {
         assert!(text.contains("\"input\":\"first-\""));
         assert!(!text.contains("response.function_call_arguments.delta"));
         assert!(text.ends_with("0\r\n\r\n"));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shim_rewrites_a_one_shot_namespaced_call_with_whole_floats() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let shim = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let shim_port = shim.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 65536);
+            }
+            let head = String::from_utf8_lossy(&request).into_owned();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap();
+            let already = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let mut body = request[already..].to_vec();
+            while body.len() < length {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                body.push(byte[0]);
+            }
+            let value: Value = serde_json::from_slice(&body[..length]).unwrap();
+            assert_eq!(value["tools"][0]["name"], "mcp__serena__find_symbol");
+            let event = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c1\",\"name\":\"mcp__serena__find_symbol\",\"arguments\":\"{\\\"hwnd\\\":50925.0}\"}}\n\n";
+            let mut wire =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            write!(wire, "{:x}\r\n", event.len()).unwrap();
+            wire.extend_from_slice(event);
+            wire.extend_from_slice(b"\r\n0\r\n\r\n");
+            stream.write_all(&wire).unwrap();
+        });
+        let _worker = thread::spawn(move || {
+            serve(
+                shim,
+                &format!("http://127.0.0.1:{upstream_port}"),
+                Arc::new(|| true),
+                Duration::from_millis(20),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        });
+        let request_body = json!({
+            "model": "grok-4.6",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__serena",
+                "tools": [{"type": "function", "name": "find_symbol", "parameters": {"type": "object"}}]
+            }],
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", shim_port)).unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    request_body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut received = Vec::new();
+        loop {
+            let mut chunk = [0; 256];
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => received.extend_from_slice(&chunk[..size]),
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(text.contains("\"namespace\":\"mcp__serena\""), "{text}");
+        assert!(text.contains("\"name\":\"find_symbol\""), "{text}");
+        assert!(!text.contains("mcp__serena__find_symbol"), "{text}");
+        assert!(
+            text.contains("50925") && !text.contains("50925.0"),
+            "{text}"
+        );
         drop(client);
         server.join().unwrap();
     }

@@ -53,6 +53,10 @@ Ordinary `codex` uses the shared GPT-6 Astra default. Grok is opt-in via
 Z.AI GLM-5.3 is opt-in via `--profile zai`. The launcher starts the shim
 only for `xai`-profile invocations; it self-exits when no `codex.exe` process
 remains.
+The started process is the selected build's `codex-harness.exe`. A leftover
+shim holding `56122` is reused only while it belongs to the selected build; a
+shim from an earlier build is replaced on the next `xai` launch (see the
+compatibility shim section). It self-exits when no `codex.exe` remains.
 
 For delegated work select the model and a supported effort directly. The
 delegation rules live in [agent delegation](agent-delegation.md).
@@ -74,10 +78,39 @@ Codex 0.154 and api.x.ai have wire-format mismatches that the shim adapts on
 4. The `web_search` tool carries an `external_web_access` field that
    api.x.ai rejects. The shim strips it.
 
-The shim also decodes chunked HTTP response framing before SSE rewriting and
-re-encodes it for the client. It removes `tool_choice` from requests whose
-tool list is empty. It stores no credentials (Authorization passes through),
-registers no scheduled task, and exits when no `codex.exe` process remains.
+5. Grok often emits whole numbers as JSON floats (`30000.0`) in tool
+   arguments. Codex 0.154 rejects those for integer fields (`u64`, `i32`,
+   `usize`), so the shim rewrites whole floats to integers before the
+   client sees the call.
+6. Grok often decorates the patch markers (`*** Begin Patch ***`,
+   `*** End Patch ***`, `*** End of File ***`). Codex's apply_patch
+   validator accepts only the undecorated marker lines and otherwise rejects
+   the whole call, so the shim rewrites just those marker lines and keeps the
+   patch body byte-identical.
+
+The shim decodes chunked HTTP response framing before SSE rewriting whenever
+the request declares tools, including namespace-only MCP turns that have no
+`custom` tools, and re-encodes the stream for the client. It removes
+`tool_choice` from requests whose tool list is empty. It stores no credentials
+(Authorization passes through), registers no scheduled task, and exits when no
+`codex.exe` process remains.
+
+A chunked Responses body that arrives in the same read as the HTTP head is
+decoded and rewritten too; otherwise a one-packet MCP `function_call` keeps
+the flattened `namespace__name` form, Codex does not route it, and the TUI
+can stay on that MCP name instead of `Working`.
+Streamed tool arguments are taken by Codex from `response.output_item.done`
+and `response.completed` (verified with a scripted upstream), which is exactly
+where the shim applies its argument rewriting.
+
+The shim reports its own build identity on
+`http://127.0.0.1:56122/__harness/xai-shim/identity` and honors a retirement
+request on `/__harness/xai-shim/retire`. The launcher reuses a running shim
+only when that identity is the selected build's `codex-harness.exe`; a shim
+left over from an earlier build is retired (in-flight streams drain first) and
+replaced, so fixes actually reach new sessions. A listener without identity
+reporting (a shim from before this check) is reused with an explicit notice
+and is replaced once all Codex sessions have exited.
 Remove the shim when Codex or xAI fixes the serialization; re-pointing the
 profile at `https://api.x.ai/v1` is the whole rollback.
 

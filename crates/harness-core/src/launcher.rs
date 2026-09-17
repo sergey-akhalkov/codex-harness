@@ -291,6 +291,29 @@ pub fn per_model_effort(args: &[OsString], configured_model: Option<&str>) -> Ve
     result
 }
 
+/// Grok through the kit profile needs the local Responses shim. Detect the
+/// explicit `xai` profile only; default/harness/zai launches must not start it.
+pub fn xai_shim_requested(args: &[OsString]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if arg == "--profile" || arg == "-p" {
+            return args
+                .get(i + 1)
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == "xai");
+        }
+        if let Some(value) = arg.strip_prefix("--profile=") {
+            return value == "xai";
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
     let mut command = None;
     let mut debug = None;
