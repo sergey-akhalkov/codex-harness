@@ -128,9 +128,10 @@ pub fn read_yaml_mapping(path: &Path) -> io::Result<YamlMapping> {
             continue;
         }
         if indented {
-            // Only indented sequence items are part of this subset; indented
-            // mappings are nested documents and fail loudly.
-            return Err(invalid("unsupported YAML line"));
+            // Nested mappings (settings blocks such as `ls_specific_settings`)
+            // are not part of a routing decision; they stay Serena's own
+            // concern and are skipped instead of failing the whole route.
+            continue;
         }
         let Some((key, value)) = split_yaml_entry(stripped) else {
             return Err(invalid("unsupported YAML line"));
@@ -913,9 +914,19 @@ mod tests {
             None
         );
 
-        fs::write(&path, "nested:\n  key: value\n").unwrap();
-        let error = read_yaml_mapping(&path).unwrap_err();
-        assert!(error.to_string().contains("unsupported YAML line"));
+        // Nested settings blocks (for example `ls_specific_settings`) are not
+        // part of a routing decision and are skipped, not rejected.
+        fs::write(
+            &path,
+            "projects:\n  - C:/one\nnested:\n  key: value\n  other:\n    - item\nflag: yes\n",
+        )
+        .unwrap();
+        let mapping = read_yaml_mapping(&path).unwrap();
+        assert_eq!(
+            mapping.sequence("projects").unwrap(),
+            &["C:/one".to_owned()]
+        );
+        assert_eq!(mapping.scalar("flag"), Some("yes"));
     }
 
     #[test]

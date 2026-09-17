@@ -824,8 +824,405 @@ legacy outcome oracle driver no longer imports the deleted skill helper: its
 bounded process runs go through native `harness-observe.exe`, verified live
 against the built binary.
 
+## Native MCP registration projection (migration 5.3/5.5 progress, 2026-09-17)
+
+The code-tools lifecycle now connects the selected tools natively end to end.
+`dependency_discovery` is invoked with the documented environment inputs when
+the selected dependency owner is the current user, so adopted packages are
+actually found; the recorded `harness/code-tools-registration.json` selection
+stays authoritative, so an Update cannot rewrite an installed native
+connection back to a transitional seam. `codegraph_integration::prepare` gained
+the adoption inventory (the CLI projection still falls back to the on-disk
+registry) and emits the native Serena broker connection plus a native Nuphus
+connection pinned to the adopted audited original executable
+(`paths.original_native_executable`) and its SHA-256; a locally rewritten
+variant keeps the transitional seam instead of pinning an unaudited binary.
+
+Component ownership was aligned with that projection: the core component links
+the four core commands and no longer creates `harness/bin/harness-rtk.exe`
+(`core_install::core_linked_binaries`, mirrored by core Check). The
+token-workflow component owns both RTK links and the Codex hook definitions
+file, adopts an identical existing hook link during a script-layout upgrade and
+records it in its state; its feature edits now read the schema-2
+`settings.codexCommand` as well as the legacy top-level field.
+
+## Staged complete native installation (migration 9.1 progress, 2026-09-17)
+
+Owned staged acceptance (private roots under `%LOCALAPPDATA%`, model-free)
+verified with immutable candidate builds of the current source:
+
+- `codex-harness build --source . --state <owned>` produced
+  `state/builds/db39b42f9f351de0-1789598016887428400-7352` (source identity
+  `db39b42f9f351de09686783b0f78f4ea1ea100b5847aced36451268655dc63b3`); the
+  earlier `f18595…`/`a2d6ba…` candidates were rejected as stale after source
+  edits, which is the documented behavior.
+- Fresh core connect into owned homes (Process PATH scope) reported 20 links
+  and a passed model-free runtime handoff to the resolved upstream
+  `codex.exe`; `check --core-only` and every later component Check reported
+  `connected`.
+- `--code-tools-only` Install registered `codegraph`, `serena` and `nuphus`
+  through the native manager (Serena with the adopted uv interpreter and the
+  guarded entry, Nuphus with the audited original executable and digest
+  `9a07112f…`) and retired `codebase-memory`/`graphify`.
+- `--token-workflow-only` Install acquired the pinned RTK 0.48.0 archive,
+  built the adapter, linked `harness/bin/{rtk.exe,harness-rtk.exe}` plus
+  `hooks.json` → `global/rtk-hooks.json`, and enabled `code_mode`/`hooks` in
+  the staged `config.toml`; Disconnect removed exactly those connections and
+  re-enabled the previous feature state while core, code-tools and
+  subscriptions stayed `connected`, and a repeat Install restored them.
+- `--subscriptions-only` Install wrote the owned native profile/routing
+  records without starting or querying a proxy.
+- Real stdio sessions against the staged registrations returned `initialize`
+  (`harness-nuphus` 0.1.0; `Serena` 1.28.1 with 14 filtered tools) and
+  `tools/list` (38 Nuphus tools) with clean exits. The staged CodeGraph
+  connection was refused by the running account broker with "broker has older
+  source/runtime", i.e. the expected state until global activation retires the
+  older broker; CodeGraph serving itself is covered by the replacement
+  acceptance.
+- Upgrade from the script layout: `install.ps1 -Mode Install -CoreOnly` into
+  owned homes, then the native core Install previewed 8 changed links and, on
+  mutation, retired the owned script links (`codex.ps1`,
+  `codex-harness-check.ps1`, `hook.ps1`), installed the four native commands
+  and the diagnostic alias, migrated the metadata to schema 2 and passed the
+  runtime handoff; code-tools, token-workflow and subscriptions then connected
+  over that upgraded layout.
+
+Two native reader defects surfaced and were fixed with regression coverage:
+the script lifecycle records `launcherSource` (unknown field) and a verbatim
+`\\?\` configuration-bridge path, and the published launcher copy legitimately
+lives under `CODEX_HOME/harness/launchers` instead of the checkout. The live
+global installation metadata now imports (`inspect-installation` reports 18
+links, 17 owned), which unblocks the global cutover task 9.2.
+
+Relocation, interruption and rollback remain covered by their default
+acceptance suites (`core_install` retarget/interruption tests,
+`installation_state` legacy adoption after relocation, `legacy_pending`,
+`registration_finish`, `native_launcher`/`native_build` integrity and
+stale-manager repair).
+
+## Test hygiene and task 8.4 progress (2026-09-17)
+
+Default checks now own their mutable targets: the agent-configuration oracle
+was updated to the retired fixed-preset reality (a synthetic kit source covers
+the collision path through the CLI), the CodeGraph transport fixtures run in
+an owned project directory instead of the crate root, and they wait a bounded
+180 seconds for the machine-wide account slot instead of failing when a live
+session holds it. Subscription fixture tasks are retired by a drop guard, and
+the nine orphaned `codex-harness-subscriptions-*` tasks left by earlier runs
+were removed; the live installation never had one. `global/kit.psd1` is now
+classified by the executable ownership check (62 executable files, 60 open
+first-party-legacy findings) instead of escaping the `.psd1` extension, and
+the checked-in `crates/codex-harness/owned-worker-started` fixture leftover was
+removed.
+
+## Global native activation (migration 9.2 progress, 2026-09-17)
+
+The live installation was upgraded to the native lifecycle with the immutable
+candidate `state/builds/b4d132c1892f6fd9-1789603446055960800-19772` (source
+identity `b4d132c1892f6fd9e0777b04eadcf11fd3779a420a47c796b6fcdea411ae29db`).
+The pre-activation metadata, `config.toml`, code-tools registration and
+token-workflow state were retained privately under the owned staging root for
+rollback.
+
+- Core Install previewed 8 changed links without writing, then connected: 22
+  links, `path_change: false` (the User PATH already contained
+  `harness/bin`), and a passed model-free runtime handoff to the resolved
+  upstream vendor `codex.exe`. The metadata migrated to schema 2; the owned
+  script launcher and diagnostic alias links were retired.
+- Code-tools Install rewrote `config.toml` to the native connections
+  (`mcp codegraph`, `mcp serena` with the adopted uv interpreter and guarded
+  entry, `mcp nuphus` with the audited original executable and digest) and
+  retired `codebase-memory`/`graphify`; the recorded selection matches.
+- Token-workflow Install adopted the script state, rewrote both RTK links to
+  the native adapter build and kept `hooks.json` → `global/rtk-hooks.json`;
+  subscription Install wrote the native profile/routing records without
+  starting or querying a proxy. All four component Checks report connected.
+- Fresh outside-checkout terminal: `codex --version` returns
+  `codex-cli 0.154.0` through the native launcher (`codex.exe`), the
+  `codex-harness-check` alias resolves to the native diagnostic, a model-free
+  `diagnose` reports `healthy`, and the source-linked `AGENTS.md`, skill and
+  agent paths still resolve into the checkout.
+- The older CodeGraph account broker was retired explicitly
+  (`mcp retire-codegraph`), after which real stdio sessions through the live
+  registrations returned initialize and tools/list: `codegraph` 0.1.0 with
+  `codegraph_search`/`codegraph_detail`, `harness-nuphus` 0.1.0 with 38 tools
+  and `Serena` 1.28.1 with 14 filtered tools, each exiting cleanly.
+
+The transitional script hook launcher (`harness/bin/hook.ps1`) is no longer
+inherited by a native connection: the native chain invokes the RTK adapter
+directly, so the owned registration retires with the script lifecycle instead
+of surviving the cutover. One acceptance flakiness was also removed: the
+interrupted-connect recovery test now retries the short window in which a
+killed child is still releasing its installation mutex and file handles
+(verified stable over six consecutive runs).
+
+## Native Serena boundary without the Python seam (migration 3.2/5.4/9.2 progress, 2026-09-17)
+
+The guarded Python entry point (`tools/code-tools/serena_entry.py`) is retired
+from the served path. The adopted package now runs from its own console entry
+point with a generated harness-owned home:
+`crates/harness-core/src/serena_configuration.rs` materializes
+`<CODEX_HOME>/harness/serena-home` (and one home per served project under
+`workers/<project-key>`) with `ls_specific_settings` that pins every adopted
+backend to an explicit `ls_base_cmd`/`ls_args` from the registry
+(`serena_id` is the single mapping owner; the retired seam's aliases such as
+`python` for `python_basedpyright` are preserved). Serena therefore never
+consults a release API or runs a package manager for an adopted backend, its
+own configuration writes stay inside the owned home instead of the user's
+shared `~/.serena/serena_config.yml`, and per-project homes keep concurrent
+workers from crossing configuration state.
+
+Provisioning suppression and validation stay native: `serena::validated`
+checks the adopted identity/version/status before a child starts, the launch
+points at the registry's console entry point, and
+`serena_configuration::ensure_supported_languages` refuses a project whose
+detected *project declaration* (for example `Cargo.toml`, `pyproject.toml`,
+`App.csproj`, `tsconfig.json`) has no verified adopted backend. Stray
+foreign-language source samples in an adopted project do not refuse the
+session. The code-tools lifecycle no longer falls back to a Python seam: a
+mutating mode requires a verified native connection for `serena`, `nuphus` and
+`codegraph` or fails with an explicit provisioning error.
+
+Verified on 2026-09-17 against the adopted package: the real two-project
+isolation case (`rust_session_isolates_two_owned_projects_and_preserves_shared_config`)
+passed with rust-analyzer semantic edits, the shared-pool case
+(`shared_pool_reuses_one_worker_and_isolates_projects`) reused one worker per
+project and kept it across a client disconnect, the end-to-end proxy case
+(`mcp_serena_proxy_shares_one_worker_and_filters_the_catalogue`) passed through
+the actual broker service, the config case asserted the user's shared Serena
+configuration is untouched, and the live global registration served
+`initialize` (Serena 1.28.1) plus a real `get_symbols_overview` on this
+checkout after the older broker was retired. `cargo fmt --check`,
+`clippy -D warnings` and the default suite are clean.
+
+A live probe of the Python-backed path exposed a degraded-worker case: when a
+language-server process dies during project initialization, Serena keeps the
+session alive but answers every later semantic call with its fatal
+"language server manager is not initialized" error. The shared pool now
+retires a worker that answers with that exact marker so the next request gets a
+fresh worker (the client still receives Serena's own failure once); an ordinary
+tool error does not retire a worker. After that retirement a fresh live call
+returned the real symbol overview for `tools/code-tools/serena_broker.py`,
+confirming the adopted python backend (node + basedpyright `ls_base_cmd`) is
+pinned correctly.
+
+Operating condition: replacing a running Serena broker is two-phase. The first
+`mcp broker-retire` marks it retiring and its drain took about 84 seconds on
+this host; a client that connects during the drain is refused with "broker
+readiness/source differs; preserving owner" (by design, the owner is
+preserved). After it exits, the next client starts a broker from the current
+build. The live global installation was updated to candidate
+`state/builds/3a32b5f17d812d22-1789618209389928100-11232` (source identity
+`3a32b5f17d812d22ad2d90a868baa82b988f160fcfa28a3ff7dbb34da34b453e`); all four
+component Checks report connected and a live `get_symbols_overview` on
+`crates/harness-core/src/lifecycle.rs` returned the real symbol overview.
+
+## Matched candidate comparison (migration 9.4, 2026-09-17)
+
+`crates/codex-harness/tests/migration_baseline.rs` gained the candidate
+comparison required by task 9.4:
+`compare_candidate_paths_against_the_recorded_baseline` is opt-in on
+`HARNESS_MIGRATION_BASELINE` and reuses the recorded method, sample count and
+noise boundary unchanged (five samples, first discarded, median of the warm
+set, MAD/range dispersion, material regression only when the warm median grows
+by more than 100 ms **and** more than 10% of the baseline median). Replaced
+script paths are compared against their native replacements through an
+explicit mapping; every other scenario is re-measured on the same native path,
+so any delta there is environment noise.
+
+Run on 2026-09-17 against the recorded baseline (head `53b8552`, test profile,
+private receipt `%TEMP%\harness-migration-comparison-rH4ah8\comparison.json`):
+
+| Scenario (baseline → candidate) | Baseline warm median | Candidate warm median | Delta |
+| --- | --- | --- | --- |
+| `check.script_missing_owned_homes` → `check.core_missing_installation` | 677.0 ms | 18.0 ms | −659.0 ms |
+| `launch.script_fallback_missing_module_unicode_nonzero` → `launch.native_degraded_fallback_unicode_nonzero` | 498.9 ms | 596.0 ms | +97.1 ms |
+| `launch.native_argv_unicode_stdin_nonzero` (unchanged native) | 218.2 ms | 227.7 ms | +9.4 ms |
+| `check.diagnose_owned_report_and_mixed_selector_refusal` (unchanged native) | 540.8 ms | 520.7 ms | −20.1 ms |
+| `check.core_missing_installation` (unchanged native) | 20.1 ms | 18.0 ms | −2.1 ms |
+| `check.build_missing_metadata` (unchanged native) | 18.9 ms | 15.7 ms | −3.2 ms |
+| `mcp.stdio_unicode_ids_output_purity_and_incomplete_failure` (unchanged native) | 187.8 ms | 174.1 ms | −13.7 ms |
+| `process.timeout_streams_and_foreign_preservation` (unchanged native) | 213.4 ms | 209.3 ms | −4.1 ms |
+| `console.unicode_stdin_nonzero_and_cancellation` (unchanged native) | 105.8 ms | 97.0 ms | −8.8 ms |
+| `subscription.bounded_node_fixture_nonzero_and_timeout` (unchanged native) | 3740.6 ms | 3411.8 ms | −328.8 ms |
+| `rtk.exec_once_hook_rewrite_and_malformed_silence` (unchanged native) | 203.1 ms | 186.7 ms | −16.3 ms |
+
+All candidate oracles passed and there were **no material regressions**:
+every unchanged native scenario stayed inside the pre-established noise
+boundary (largest increase 9.4 ms; dispersions 0.4–73 ms MAD). The two replaced
+paths are reported as information: the native Check replaces the script Check
+at roughly 1/37th of the wall time, and the native degraded launcher adds
+97 ms over the retired script fallback — below the material threshold — for
+reading the build record and hashing the registered upstream, i.e. the new
+integrity work rather than a port regression.
+
+Limits (unchanged from the baseline): owned model-free targets only; live
+global MCP/service and provider/network timings are excluded from this
+comparison set and must not be reported as rewrite acceleration. Fixture
+preparation is included in every sample of every scenario, and the degraded
+launcher fixture prepares its registered build once outside the timed closure
+so the measurement covers launcher startup rather than fixture copying.
+
+## Real global consumers (migration 9.3, 2026-09-17)
+
+Exercised against the actual connected build
+`state/builds/3a32b5f17d812d22-1789618209389928100-11232` (all four component
+Checks `connected`):
+
+- **MCP**: real stdio sessions through the installed registrations returned
+  `initialize` and `tools/list` for `codegraph` (0.1.0;
+  `codegraph_search`/`codegraph_detail`), `harness-nuphus` (0.1.0; 38 tools)
+  and `Serena` (1.28.1; 14 filtered tools), and live `get_symbols_overview`
+  calls returned real symbol data for both a Rust and a Python file in this
+  checkout. The older account brokers were retired explicitly; replacement
+  drains before new clients attach (documented above).
+- **Launcher and diagnostics**: from a fresh terminal outside the checkout,
+  `codex` resolves to the native `harness/bin/codex.exe` and reports
+  `codex-cli 0.154.0` through the registered upstream; `codex-harness-check`
+  resolves to the native alias and a model-free `diagnose` reports `healthy`
+  with no model calls.
+- **RTK**: the installed `harness/bin/harness-rtk.exe hook` rewrote a live
+  `PreToolUse` payload from `harness-rtk.exe exec git status --short` to
+  `harness-rtk.exe compact git status --short` and exited zero.
+- **Skill helpers**: the linked `harness-observe.exe` ran from an owned
+  outside-checkout directory with its documented contract
+  (`--cwd/--timeout/--output-limit -- ABSOLUTE_EXE ARGUMENTS`), bounded the
+  installed launcher in a Job (peak memory recorded, zero active processes
+  after exit) and retained stdout/stderr receipts. The skill references no
+  longer claim the helpers are unregistered; a connected kit links both
+  helpers into `harness/bin` on the user PATH.
+- **Subscription routing**: the native profile/catalog/routing state is
+  installed and `check --subscriptions-only` reports `connected` without
+  querying or stopping the live proxy; the live shim serving current sessions
+  is deliberately left running (its port answers), because destructive
+  recovery probes must use separate targets. No live model request was issued
+  for this acceptance: the replaced paths do not change model routing, the
+  accepted provider behaviour was verified earlier with explicitly selected
+  probes recorded in this file, and spending the user's subscription quota is
+  not required to prove the migrated boundary.
+- **Delegation**: the native `delegation-usage` consumer is covered by the
+  default suite; the model-backed delegation probes remain the open successor
+  work owned by `orchestrate-subscription-agents` (tracked by task 8.2).
+
+## Transitional lifecycle retirement (migration 8.2/9.5, 2026-09-17)
+
+The retired script and Python lifecycles were removed from the repository after
+consumer checks, with machine-local rollback copies kept under the owned staging
+root (`%LOCALAPPDATA%\codex-harness-native\migration-91\legacy-rollback\<stamp>`,
+including the pre-retirement `installation.json`). Deleted: `install.ps1`, the
+`tools/*.psm1` modules, `tools/codex.ps1`, `tools/codex-harness-check.ps1`,
+`tools/hook.ps1`, `tools/mcp.ps1`, `global/kit.psd1`, the Python MCP chain
+(`tools/code-tools/*.py` including `launch.py` and `serena_entry.py`,
+`tools/process_ownership.py`), the retired `tools/lsp` stack, the legacy
+`opencodex-process.ps1/.cs` bounded-process oracle, the Python outcome and
+delegation drivers, the temporary `tmp-*.ps1` verification drivers and the
+legacy `tests/ConPty.cs`, `tests/consumer-rpc.ps1`,
+`tests/token-workflow-native.ps1`, `tests/agent-delegation.py` and
+`tests/subscription-consumer.Tests.ps1` drivers. Generated bytecode caches and
+the obsolete `pyrightconfig.json` were removed with them.
+
+Consumer checks before removal: the live installation's launcher, diagnostic
+alias, hook definitions, RTK binaries and all three MCP registrations resolve to
+native commands and paths; nothing in the delivered installation referenced the
+removed files; Check reported `connected` for all four components before and
+after the removal. Native successors retained: `native_launcher` fail-open cases
+replace the script launcher regression suite, `harness-inspect`/`harness-observe`
+and the native console fixtures replace `ConPty.cs` and the script drivers, the
+native `outcome-*` and `delegation-usage` CLIs replace the Python drivers, and
+the native bounded-process case replaces the retired script oracle in the
+measurement harness (`process.native_bounded_node_fixture_nonzero_and_timeout`).
+Deleted test-only drivers have named replacements: `context_delivery.rs`'s
+opt-in probes by `harness-core/tests/launcher.rs::task_effort_does_not_interpret_prompts_or_override_native_settings`,
+`launcher.rs::per_model_effort_defaults_without_explicit_selection` and
+`harness-core/tests/feature_edit.rs::actual_native_feature_edit_preserves_unrelated_configuration`,
+and `script_launcher_fallback.rs`'s global TUI smoke by
+`crates/codex-harness/tests/tui.rs::actual_tui_status_model_and_trust_write_locally`
+plus the `native_launcher` fail-open cases.
+
+Operating condition for acceptance: the `native_build` suite runs candidate
+builds inside its 2 GiB build job. With two heavy suites running concurrently on
+one machine, three of its seven tests failed with candidate-build exits inside
+the job while the active installation was correctly preserved; the same suite
+passed 7/7 with the machine otherwise idle (`native_build` rerun 2026-09-17,
+1053 s). Run workspace acceptance, and `native_build` in particular, without
+another heavy compilation active.
+
+Inventories and documentation were reconciled: `executable-ownership.json` now
+declares only the external `.venv` root and the two inert analysis samples,
+`legacy-mcp-retirement.json` records the retirement, `installation.md` was
+rewritten for the native lifecycle, and `README.md`, `docs/code-tools.md`,
+`docs/source-diagnostics.md`, `docs/subscription-models.md`,
+`docs/token-workflow.md`, `docs/project-decisions.md` and the two skill
+references now quote the native commands. The ownership check reports
+**2 executable files (both declared inert analysis samples), 0 findings** and
+exits zero, and its default suite asserts that state as the delivered
+selection; materialized builds are unaffected because the workspace member
+`tools/rtk-adapter` is Rust and was preserved.
 
 
 
 
 
+
+
+## Independent review and recovery fix (migration 8.4/9.6, 2026-09-17)
+
+An independent read-only review covered the post-retirement native tree for
+process containment, authentication boundaries, ownership and rollback. It
+found one material defect plus two evidence/tooling gaps; all three are
+resolved.
+
+R1 (fixed, regression-covered): `token_workflow_lifecycle::recover` derived the
+owning source root only from the journal's `previousState`, which is null on a
+first install, so a crash between creating the hook link and writing the state
+file left that first-install operation unresolvable ("destination is outside its
+owned connections") with no path back except deleting the pending file by hand.
+`recover` now falls back to the journal's `plannedState.sourceRoot` while the
+ownership guard keeps requiring the destination to be `<home>/hooks.json` and
+its target to be that root's `global/rtk-hooks.json`. Two tests cover the
+first-install rollback
+(`recover_rolls_back_first_install_hooks_link_from_planned_root`) and the
+preserved refusal for a foreign destination
+(`recover_refuses_first_install_hooks_operation_outside_planned_root`).
+
+F1 (fixed): the requirement map referenced checks that no longer exist after
+retirement — the deleted `script_launcher_fallback.rs` and
+`subscription_service.rs` files, and the renamed
+`configure_restart_reports_retirement`. Its launch/TUI and subscription rows now
+name existing native checks (`native_launcher` fail-open,
+`subscription_lifecycle` install/check/disconnect/restart tests,
+`subscription_login` token handling and the bounded `process_service`
+containment cases), every remaining name-level reference was resolved against
+the current tree, and the five stale "cutover open / alias still script" status
+strings now reflect the verified 9.2 activation.
+
+F2 (recorded): the deleted test-only drivers have named successors in the
+retirement evidence above — `context_delivery.rs` by the launcher task-effort
+and native feature-edit tests, `script_launcher_fallback.rs` by the native TUI
+status/trust test plus the `native_launcher` fail-open cases.
+
+F3 (recorded as the operating condition above): the only observed check
+failures were candidate-build OOMs inside the 2 GiB build job when two heavy
+suites ran concurrently; the affected suite passes 7/7 alone, and the active
+installation was preserved throughout.
+
+Checks on the reviewed tree: `cargo fmt --all -- --check` clean; workspace
+clippy (`--all-targets --locked -D warnings`) clean; the full documented suite
+(`cargo test --workspace --locked --jobs 1 --no-fail-fast`) passed 83 targets
+with 0 failures, including `native_build` 7/7 in 1120 s; `harness-source-check`
+reports 0 findings over 494 working-tree files including local links and
+anchors; `ownership-check --source` reports 2 declared inert samples and 0
+findings; `openspec validate migrate-harness-to-rust --strict` is valid. The
+116 opt-in tests (real Serena registry, model-backed and live-provider suites)
+remain deliberately unexecuted in this default pass and keep their separate
+evidence above.
+
+Spec synchronization (9.6): the change's three deltas were merged into
+`openspec/specs/` — `harness-source-diagnostics` (native Check entry point,
+upgrade of the owned script diagnostic) and `linked-global-kit`
+(compiled-artifact distinction, native entry point and script-installation
+upgrade, native build/degraded-launch/previous-build/stale-manager behavior) as
+MODIFIED requirements, and the new `rust-native-harness` capability as 10
+requirements / 28 scenarios. No existing requirement or scenario was removed
+(linked-global-kit 42 to 47 scenarios, diagnostics 7 to 8), and
+`openspec validate --specs --strict` passes for all 21 specs.

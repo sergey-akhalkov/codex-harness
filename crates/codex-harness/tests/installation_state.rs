@@ -39,9 +39,15 @@ impl Fixture {
             "schemaVersion":1, "sourceRoot":old, "codexHome":self.home, "userHome":self.user,
             "codexCommand": self.root.path().join("unavailable-upstream/codex.ps1"),
             "profileName":"harness", "pathScope":"Process", "pathAdded":false,
+            "launcherSource": self.home.join("harness/launchers/fixture/codex.ps1"),
+            // The script lifecycle records the configuration bridge as a
+            // verbatim drive path.
+            "configBridge": format!("\\\\?\\{}", self.home.join("harness/config-bridge/builds/fixture/codex-harness.exe").display()),
             "versions":{"codex":"private version sentinel", "future-version":"preserved"},
             "links":[
                 {"kind":"instructions","name":"AGENTS","source":old.join("global/principles-of-work.md"),"destination":self.home.join("AGENTS.md"),"owned":false},
+                // The published launcher copy lives inside CODEX_HOME.
+                {"kind":"launcher","name":"codex","source":self.home.join("harness/launchers/fixture/codex.ps1"),"destination":self.home.join("harness/bin/codex.ps1"),"owned":true},
                 {"kind":"skill","name":"example","source":old.join(".agents/skills/example"),"destination":self.user.join(".agents/skills/example"),"owned":true}
             ]
         })
@@ -87,7 +93,7 @@ fn actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation() 
     assert!(!f.home.exists());
     assert!(!f.user.exists());
     let mut aliased = f.metadata();
-    aliased["links"][1]["name"] = "different-descriptor-name".into();
+    aliased["links"][2]["name"] = "different-descriptor-name".into();
     aliased["pathScope"] = "pRoCeSs".into();
     let bytes = f.write(&aliased);
     let output = f.run();
@@ -97,8 +103,8 @@ fn actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation() 
         String::from_utf8_lossy(&output.stderr)
     );
     let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(summary["links"], 2);
-    assert_eq!(summary["owned_links"], 1);
+    assert_eq!(summary["links"], 3);
+    assert_eq!(summary["owned_links"], 2);
     assert_eq!(summary["adopted_links"], 1);
     assert_eq!(summary["path_scope"], "Process");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private version sentinel"));
@@ -106,8 +112,8 @@ fn actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation() 
         .unwrap()
         .unwrap();
     assert!(!state.links()[0].owned);
-    assert!(state.links()[1].owned);
-    assert_eq!(state.links()[1].name, "different-descriptor-name");
+    assert!(state.links()[2].owned);
+    assert_eq!(state.links()[2].name, "different-descriptor-name");
     assert!(!format!("{state:?}").contains("private version sentinel"));
     state.verify_unchanged().unwrap();
     assert_eq!(fs::read(&f.state).unwrap(), bytes);
@@ -131,7 +137,12 @@ fn unsupported_foreign_duplicate_or_unbounded_metadata_never_becomes_fresh_state
             json!(f.root.path().join("missing-old-checkout/../foreign")),
         ),
         ("/links/1/name", json!("../escape")),
+        (
+            "/links/1/source",
+            json!(f.root.path().join("foreign-launcher/codex.ps1")),
+        ),
         ("/links/0/kind", json!("unknown")),
+        ("/launcherSource", json!("relative/codex.ps1")),
         (
             "/versions/codex",
             json!("private version sentinel".repeat(60000)),

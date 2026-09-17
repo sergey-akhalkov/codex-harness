@@ -4,7 +4,7 @@
 #![cfg(windows)]
 
 use crate::{
-    build_identity, codegraph_integration,
+    codegraph_integration,
     codegraph_registration::{self, RegistrationRequest},
     config_file::ConfigSnapshot,
     dependency_discovery::{self, local_path},
@@ -156,48 +156,6 @@ fn recorded_registrations(home: &Path) -> io::Result<Map<String, Value>> {
     }
 }
 
-fn python_spec(source: &Path, home: &Path, python: &Path, name: &str) -> io::Result<Value> {
-    Ok(json!({
-        "command": local_path(python)?.to_str().ok_or_else(|| conflict("python path is not UTF-8"))?,
-        "args": [
-            "-B",
-            "-u",
-            local_path(&source.join("tools/code-tools/launch.py"))?
-                .to_str()
-                .ok_or_else(|| conflict("launch path is not UTF-8"))?,
-            name,
-            "--registry",
-            local_path(&home.join("harness/code-tools.json"))?
-                .to_str()
-                .ok_or_else(|| conflict("registry path is not UTF-8"))?
-        ],
-        "env": {"CODEX_HOME": local_path(home)?.to_str().ok_or_else(|| conflict("home path is not UTF-8"))?}
-    }))
-}
-
-fn retained_from_inventory(source: &Path, home: &Path, inventory: &Value) -> io::Result<Value> {
-    let mut retained = Map::new();
-    for name in ["serena", "nuphus"] {
-        let Some(item) = inventory["mcp"]
-            .as_array()
-            .and_then(|items| items.iter().find(|item| item["id"] == name))
-        else {
-            continue;
-        };
-        if !adopted(item) {
-            continue;
-        }
-        let python = item["paths"]["python"]
-            .as_str()
-            .ok_or_else(|| conflict(&format!("{name} is adopted but has no python path")))?;
-        retained.insert(
-            name.into(),
-            python_spec(source, home, Path::new(python), name)?,
-        );
-    }
-    Ok(Value::Object(retained))
-}
-
 fn snapshot_opencode_cache(user: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
     let root = user.join(".cache/opencode/bin");
     inventory::ordinary_parents(&root.join("probe"))?;
@@ -263,26 +221,18 @@ pub fn run(request: &Request) -> io::Result<Report> {
             absent(&home.join(name))?;
         }
     }
-    let launch = source.join("tools/code-tools/launch.py");
-    if !launch.is_file() {
-        return Err(conflict("code-tools launch entry is missing"));
-    }
     let inventory = dependency_discovery::discover(&discovery_request(&source, &dependency)?)?;
-    let retained = retained_from_inventory(&source, &home, &inventory)?;
-    // The recorded selection stays authoritative; discovery seams only fill
-    // names it does not already own.
-    let mut desired = recorded_registrations(&home)?;
-    for (name, spec) in retained.as_object().into_iter().flatten() {
-        desired.entry(name.clone()).or_insert_with(|| spec.clone());
-    }
+    // The recorded selection stays authoritative until a fresh native
+    // projection replaces the same name.
+    let desired = recorded_registrations(&home)?;
     let mut retained_for_graph = json!({"registrations": desired});
     let opencode = snapshot_opencode_cache(&dependency)?;
-    if matches!(request.mode, Mode::Install | Mode::Update)
-        && !request.preview
-        && retained
-            .as_object()
-            .is_some_and(|map| !map.contains_key("serena"))
-    {
+    let serena_adopted = inventory["mcp"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| item["id"] == "serena" && adopted(item));
+    if matches!(request.mode, Mode::Install | Mode::Update) && !request.preview && !serena_adopted {
         return Err(conflict(
             "Serena dependency is missing or incompatible; explicit provisioning is required.",
         ));
@@ -334,6 +284,17 @@ pub fn run(request: &Request) -> io::Result<Report> {
             .flatten()
         {
             retained_for_graph["registrations"][name] = spec.clone();
+        }
+    }
+    // Mutating modes never silently drop a managed connection: every managed
+    // tool must carry a verified native registration.
+    if activating {
+        for name in ["serena", "nuphus", "codegraph"] {
+            if retained_for_graph["registrations"][name].is_null() {
+                return Err(conflict(&format!(
+                    "{name} has no verified native connection; explicit provisioning is required."
+                )));
+            }
         }
     }
     let registration = codegraph_registration::apply(&RegistrationRequest {
@@ -393,7 +354,6 @@ pub fn run(request: &Request) -> io::Result<Report> {
         &home.join("harness/lsp-servers.json"),
         &json!({"schema_version": 1, "servers": {}}),
     )?;
-    let _ = build_identity::hash_file(&launch)?;
     preserved_opencode_cache(&opencode)?;
     Ok(Report {
         status: registration["status"]
@@ -577,7 +537,7 @@ mod tests {
         .unwrap();
         let config = if connection {
             format!(
-                "[mcp_servers.serena]\nargs = [\"mcp\", \"serena\", \"--python\", 'D:/python.exe', \"--entry\", 'D:/serena_entry.py']\ncommand = 'D:/mgr.exe'\nenv = {{ CODEX_HOME = '{}' }}\nstartup_timeout_sec = 30\ntool_timeout_sec = 660\n",
+                "[mcp_servers.serena]\nargs = [\"mcp\", \"serena\", \"--serena\", 'D:/serena.exe']\ncommand = 'D:/mgr.exe'\nenv = {{ CODEX_HOME = '{}' }}\nstartup_timeout_sec = 30\ntool_timeout_sec = 660\n",
                 home.display()
             )
         } else {
@@ -605,7 +565,7 @@ mod tests {
         fs::create_dir_all(home.join("harness")).unwrap();
         let native = json!({
             "command": "D:/mgr.exe",
-            "args": ["mcp", "serena", "--python", "D:/python.exe", "--entry", "D:/serena_entry.py"],
+            "args": ["mcp", "serena", "--serena", "D:/serena.exe"],
             "env": {"CODEX_HOME": home.to_string_lossy()},
             "startup_timeout_sec": 30,
             "tool_timeout_sec": 660,

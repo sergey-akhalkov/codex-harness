@@ -24,6 +24,10 @@ struct State {
     codex_command: PathBuf,
     #[serde(default)]
     config_bridge: Option<PathBuf>,
+    /// The script lifecycle records the launcher copy it published. The native
+    /// connection replaces that link, so the path is read and validated only.
+    #[serde(default)]
+    launcher_source: Option<PathBuf>,
     profile_name: String,
     links: Vec<LegacyLink>,
     path_scope: PathScope,
@@ -112,6 +116,14 @@ pub(crate) fn key(path: &Path) -> io::Result<String> {
         .ok_or_else(invalid)?
         .trim_end_matches('\\')
         .to_lowercase())
+}
+
+/// The script lifecycle records its launcher copy and configuration bridge as
+/// verbatim (`\\?\`) drive paths. Only that prefix is dropped before the
+/// ordinary absolute-path validation; the recorded value is never rewritten.
+pub(crate) fn recorded_path(path: &Path) -> io::Result<PathBuf> {
+    let text = path.to_str().ok_or_else(invalid)?;
+    normal(Path::new(text.strip_prefix(r"\\?\").unwrap_or(text)))
 }
 
 pub(crate) fn portable_name(name: &str) -> bool {
@@ -204,12 +216,18 @@ impl LegacyInstallation {
         }
         let source_root = normal(&state.source_root)?;
         normal(&state.codex_command)?;
+        if let Some(launcher) = &state.launcher_source {
+            recorded_path(launcher)?;
+        }
         if let Some(bridge) = &state.config_bridge {
-            normal(bridge)?;
+            recorded_path(bridge)?;
         }
         // The old checkout and upstream may be missing after relocation. Check
         // only recorded names here; do not follow/read their former locations.
         let source_prefix = format!("{}\\", key(&source_root)?);
+        // The script lifecycle published its launcher copy inside CODEX_HOME
+        // instead of the checkout; every other source stays in the checkout.
+        let launcher_prefix = format!("{}\\", key(&codex_home.join("harness/launchers"))?);
         if key(&codex_home)?.starts_with(&source_prefix) || key(&codex_home)? == key(&source_root)?
         {
             return Err(invalid());
@@ -235,9 +253,15 @@ impl LegacyInstallation {
                 _ => return Err(invalid()),
             };
             let destination = key(&link.destination)?;
-            if destination != key(&expected)?
-                || !destinations.insert(destination)
-                || !key(&link.source)?.starts_with(&source_prefix)
+            let source = key(&link.source)?;
+            let owned_source = if link.kind == "launcher" {
+                // Current script layouts publish a launcher copy inside
+                // CODEX_HOME; historical ones linked the checkout bootstrap.
+                source.starts_with(&launcher_prefix) || source.starts_with(&source_prefix)
+            } else {
+                source.starts_with(&source_prefix)
+            };
+            if destination != key(&expected)? || !destinations.insert(destination) || !owned_source
             {
                 return Err(invalid());
             }

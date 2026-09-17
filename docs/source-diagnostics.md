@@ -3,24 +3,24 @@
 From any directory in PowerShell:
 
 ```powershell
-codex-harness-check.ps1 -Json
-codex-harness-check.ps1 -ProjectPath <project-directory> -Json
+codex-harness-check --source <checkout>
+codex-harness-check --source <checkout> --project <project-directory>
 ```
 
 From the checkout the equivalent command is
-`./install.ps1 -Mode Check -Diagnose -ProjectPath <directory>`.
-Without `-Json` the global command returns a PowerShell object. Status is the
-`status` field, not the process exit code. Ordinary `Check` keeps installation
-and protocol checks. Diagnostics do not repair found conflicts.
+`& <build>\codex-harness.exe check --diagnose --source <checkout> --project <directory>`.
+The command prints the JSON report; status is the `status` field, not the
+process exit code. Ordinary `Check` keeps installation and protocol checks.
+Diagnostics do not repair found conflicts.
 
-The native candidate exposes `codex-harness.exe diagnose` (also
+`codex-harness.exe diagnose` (also
 `check --diagnose`) with `--project`, `--source`, `--codex-home`,
 `--user-home`, `--dependency-user-home`, `--upstream`, `--profile` and
-`--timeout-seconds`. Core installation registers `codex-harness-check.exe`,
+`--timeout-seconds` is the native diagnostic entry. Core installation links
+`codex-harness-check.exe`,
 which calls the same diagnostics. CLI paths resolve relative to the calling
 command directory; the report is always JSON. Native port checks are recorded
 in [native Rust commands](rust-native.md#diagnostics-dependencies-and-cbm).
-Global cutover has not replaced the current `.ps1` entry point.
 
 ## What is returned
 
@@ -76,6 +76,6 @@ them before publishing a report.
 
 The command is part of ordinary Install/Update/Disconnect/Recover inventory.
 Do not automatically replace a damaged foreign link: establish its owner first.
-For a full kit update use `install.ps1 -Mode Update`. `-CoreOnly` creates only
+For a full kit update use `codex-harness update`. `--core-only` creates only
 core inventory; on an existing installation it preserves recorded hook links
 and the accepted RTK selection.

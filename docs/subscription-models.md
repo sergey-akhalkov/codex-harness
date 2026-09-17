@@ -12,11 +12,11 @@ and [project decisions](project-decisions.md#subscriptions).
 From the pack checkout:
 
 ```powershell
-./install.ps1 -WhatIf
-./install.ps1
+& <build>\codex-harness.exe install --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME> --preview
+& <build>\codex-harness.exe install --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
 codex-harness subscription-login xai --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY
 codex-harness subscription-login zai --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY --key-file FILE
-./install.ps1 -Mode Check
+& <build>\codex-harness.exe check --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
 ```
 
 The native login writes a private OAuth store under
@@ -88,11 +88,10 @@ sessions are safe.
 ## Update, stop and recovery
 
 ```powershell
-./install.ps1 -Mode Update -WhatIf
-./install.ps1 -Mode Update
-./install.ps1 -Mode Check
-./install.ps1 -Mode Recover
-./install.ps1 -Mode Disconnect
+& <build>\codex-harness.exe update     --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe check      --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe recover    --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe disconnect --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
 ```
 
 `Update` applies pack sources and rewrites the xAI profile. `Recover`
@@ -103,8 +102,8 @@ and local profile stay in place.
 Everyday disconnect and restore of only subscriptions:
 
 ```powershell
-./install.ps1 -SubscriptionsOnly -Mode Disconnect
-./install.ps1 -SubscriptionsOnly -Mode Install
+& <build>\codex-harness.exe disconnect --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe install    --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
 ```
 
 The `ConfigureRestart` mode is retired together with the OpenCodex proxy; no

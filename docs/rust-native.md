@@ -9,18 +9,16 @@ servers retain their own implementations and supported runtimes. The
 first-party CodeGraph adapter is Rust and is the live global graph after
 replacement acceptance.
 
-Global installation still uses the existing script lifecycle. Native commands
-prepare, check and recover isolated candidates; they do not yet replace the
-global launcher or installer. The Rust configuration bridge is already consumed
-by the script launcher; the full native lifecycle cutover remains open. Remaining work lives in
-[Rust migration](evidence/rust-migration.md).
+The native lifecycle is the live global installation: the manager, launcher,
+diagnostic alias, MCP servers and RTK adapter are Rust. The transitional
+PowerShell and Python lifecycles are retired from the repository; machine-local
+rollback copies are not maintained source. Evidence and remaining acceptance
+live in [Rust migration](evidence/rust-migration.md).
 
 ## Supported command mapping
 
-The script lifecycle stays the live global registration until migration task
-9.2; the native equivalents below already exist and are acceptance-tested in
-isolation. Selectors, preview (`--preview` for `-WhatIf`), homes and source
-arguments are preserved.
+The retired script interface and its native equivalent. Selectors, preview
+(`--preview` for `-WhatIf`), homes and source arguments are preserved.
 
 | Retiring script interface | Native equivalent |
 | --- | --- |

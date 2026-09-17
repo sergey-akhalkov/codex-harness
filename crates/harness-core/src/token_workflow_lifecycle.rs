@@ -11,6 +11,7 @@ use crate::{
     config_file::ConfigSnapshot,
     dependency_archive, dependency_assets,
     dependency_fetch::Client,
+    dependency_package::same_path,
     feature_edit::{self, Feature},
     installation_lock::InstallationLocks,
     installation_state::normal,
@@ -103,7 +104,12 @@ fn recorded_codex_command(home: &Path) -> io::Result<Option<PathBuf>> {
     let Some(value) = read_json(&metadata)? else {
         return Ok(None);
     };
-    let Some(text) = value["codexCommand"].as_str() else {
+    // Schema 2 records the resolved original CLI under settings; schema 1 kept
+    // it at the top level until the native lifecycle replaced the script layout.
+    let Some(text) = value["settings"]["codexCommand"]
+        .as_str()
+        .or_else(|| value["codexCommand"].as_str())
+    else {
         return Ok(None);
     };
     let path = PathBuf::from(text);
@@ -234,20 +240,35 @@ fn planned_token_workflow_state(
     Ok(next)
 }
 
-fn owned_bin_link(home: &Path, destination: &Path) -> io::Result<PathBuf> {
+/// Destinations owned by the token-workflow component: the two RTK binary
+/// links, and the hook definitions that select the accepted RTK hook. The hook
+/// file is only owned while it points at this checkout's token hooks file.
+fn owned_connection(
+    home: &Path,
+    source_root: Option<&Path>,
+    destination: &Path,
+    source: &Path,
+) -> io::Result<PathBuf> {
     let destination = local_drive(destination)?;
     let bin = local_drive(&home.join("harness/bin"))?;
     let name = destination
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if destination.parent() != Some(bin.as_path()) || !matches!(name, "rtk.exe" | "harness-rtk.exe")
+    if destination.parent() == Some(bin.as_path()) && matches!(name, "rtk.exe" | "harness-rtk.exe")
     {
-        return Err(conflict(
-            "token workflow destination is outside harness/bin; preserving it",
-        ));
+        return Ok(destination);
     }
-    Ok(destination)
+    if let Some(source_root) = source_root {
+        let hooks = local_drive(&home.join("hooks.json"))?;
+        let expected = local_drive(&source_root.join("global/rtk-hooks.json"))?;
+        if same_path(&destination, &hooks) && same_path(&local_drive(source)?, &expected) {
+            return Ok(destination);
+        }
+    }
+    Err(conflict(
+        "token workflow destination is outside its owned connections; preserving it",
+    ))
 }
 
 fn optional_path(value: &Value) -> io::Result<Option<PathBuf>> {
@@ -368,6 +389,7 @@ pub fn check(request: &Request) -> io::Result<Report> {
     let links = state["links"]
         .as_array()
         .ok_or_else(|| conflict("token workflow links are missing"))?;
+    let source_root = state["sourceRoot"].as_str().map(PathBuf::from);
     for link in links {
         let destination = PathBuf::from(
             link["destination"]
@@ -379,6 +401,7 @@ pub fn check(request: &Request) -> io::Result<Report> {
                 .as_str()
                 .ok_or_else(|| conflict("token workflow source is missing"))?,
         );
+        owned_connection(&home, source_root.as_deref(), &destination, &source)?;
         let expected = link["sha256"]
             .as_str()
             .ok_or_else(|| conflict("token workflow hash is missing"))?;
@@ -441,20 +464,29 @@ pub fn recover(request: &Request) -> io::Result<Report> {
     let operations = pending_value["operations"]
         .as_array()
         .ok_or_else(|| conflict("token workflow pending operations are missing"))?;
+    // The owning root normally comes from the recorded previous state; a first
+    // install has no previous state, so fall back to the root the journal
+    // itself planned. The ownership guard below still requires the hook
+    // destination and its target to match that root exactly.
+    let source_root = pending_value["previousState"]["sourceRoot"]
+        .as_str()
+        .or_else(|| pending_value["plannedState"]["sourceRoot"].as_str())
+        .map(PathBuf::from);
     for operation in operations.iter().rev() {
-        let destination = owned_bin_link(
-            &home,
-            &PathBuf::from(
-                operation["destination"]
-                    .as_str()
-                    .ok_or_else(|| conflict("token workflow pending destination is missing"))?,
-            ),
-        )?;
-        restore_link(
-            &destination,
-            optional_path(&operation["oldSource"])?.as_deref(),
-            optional_path(&operation["newSource"])?.as_deref(),
-        )?;
+        let destination = PathBuf::from(
+            operation["destination"]
+                .as_str()
+                .ok_or_else(|| conflict("token workflow pending destination is missing"))?,
+        );
+        let old = optional_path(&operation["oldSource"])?;
+        let new = optional_path(&operation["newSource"])?;
+        let connection = old
+            .as_deref()
+            .or(new.as_deref())
+            .ok_or_else(|| conflict("token workflow pending source is missing"))?;
+        let destination =
+            owned_connection(&home, source_root.as_deref(), &destination, connection)?;
+        restore_link(&destination, old.as_deref(), new.as_deref())?;
     }
     if pending_value
         .get("previousState")
@@ -526,20 +558,23 @@ pub fn disconnect(request: &Request) -> io::Result<Report> {
     let links = state["links"]
         .as_array()
         .ok_or_else(|| conflict("token workflow links are missing"))?;
+    let source_root = state["sourceRoot"].as_str().map(PathBuf::from);
     for link in links {
-        let destination = owned_bin_link(
-            &home,
-            &PathBuf::from(
-                link["destination"]
-                    .as_str()
-                    .ok_or_else(|| conflict("token workflow destination is missing"))?,
-            ),
-        )?;
         let source = PathBuf::from(
             link["source"]
                 .as_str()
                 .ok_or_else(|| conflict("token workflow source is missing"))?,
         );
+        let destination = owned_connection(
+            &home,
+            source_root.as_deref(),
+            &PathBuf::from(
+                link["destination"]
+                    .as_str()
+                    .ok_or_else(|| conflict("token workflow destination is missing"))?,
+            ),
+            &source,
+        )?;
         operations.push(serde_json::json!({
             "destination": path_text(&destination)?,
             "oldSource": path_text(&source)?,
@@ -857,14 +892,21 @@ pub fn install(request: &Request) -> io::Result<Report> {
     require_file(&rtk, executable_hash, "RTK binary")?;
     let adapter = build_adapter(&source, &home, &rtk, &identity)?;
     build_identity::ordinary(&adapter)?;
+    // The accepted RTK hook selection is this component's data connection: the
+    // Codex hook definitions file points at the checkout's token hooks.
+    let hooks = source.join("global/rtk-hooks.json");
+    if !hooks.is_file() {
+        return Err(conflict("token hook definitions are missing"));
+    }
     let planned = [
-        ("rtk.exe", rtk.clone()),
-        ("harness-rtk.exe", adapter.clone()),
+        (home.join("harness/bin/rtk.exe"), rtk.clone()),
+        (home.join("harness/bin/harness-rtk.exe"), adapter.clone()),
+        (home.join("hooks.json"), hooks),
     ];
     let mut operations = Vec::new();
     let mut links = Vec::new();
-    for (name, next) in planned {
-        let destination = owned_bin_link(&home, &home.join("harness/bin").join(name))?;
+    for (destination, next) in planned {
+        let destination = owned_connection(&home, Some(&source), &destination, &next)?;
         let current = current_target(&destination)?;
         let previous = state.as_ref().and_then(|value| {
             value["links"].as_array().and_then(|items| {
@@ -886,7 +928,12 @@ pub fn install(request: &Request) -> io::Result<Report> {
                 destination.display()
             )));
         }
-        if current.is_some() && previous.is_none() {
+        // An identical existing connection, such as the hook link inherited
+        // from an upgraded script installation, is adopted rather than refused.
+        if let Some(current) = current.as_ref()
+            && previous.is_none()
+            && !same_target(current, &next)?
+        {
             return Err(conflict(&format!(
                 "Token workflow target conflict; preserving {}",
                 destination.display()
@@ -1138,6 +1185,80 @@ mod tests {
     }
 
     #[test]
+    fn recover_rolls_back_first_install_hooks_link_from_planned_root() {
+        let root = tempfile::tempdir().unwrap();
+        let (home, _, _, request) = staged_request(root.path());
+        let upstream = compile_codex_features(root.path());
+        write_installation(&home, &upstream);
+        fs::write(
+            home.join("config.toml"),
+            b"[features]
+hooks = true
+code_mode = false
+",
+        )
+        .unwrap();
+        let hooks = request.source.join("global/rtk-hooks.json");
+        let destination = home.join("hooks.json");
+        std::os::windows::fs::symlink_file(&hooks, &destination).unwrap();
+        fs::write(
+            home.join("harness/token-workflow-pending.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "previousState": null,
+                "plannedState": {
+                    "schemaVersion": 1,
+                    "enabled": true,
+                    "links": [],
+                    "sourceRoot": request.source,
+                    "rtkVersion": "0.48.0",
+                    "sourceIdentity": "staged"
+                },
+                "operations": [{
+                    "destination": destination,
+                    "oldSource": null,
+                    "newSource": hooks
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let report = recover(&request).unwrap();
+        assert_eq!(report.status, "Recovered token workflow");
+        assert!(!destination.exists());
+        assert!(!home.join("harness/token-workflow.json").exists());
+        assert!(!home.join("harness/token-workflow-pending.json").exists());
+        assert!(config_text(&home).contains("hooks = false"));
+    }
+
+    #[test]
+    fn recover_refuses_first_install_hooks_operation_outside_planned_root() {
+        let root = tempfile::tempdir().unwrap();
+        let (home, _, _, request) = staged_request(root.path());
+        let foreign = root.path().join("foreign-hooks.json");
+        fs::write(&foreign, b"{}").unwrap();
+        let destination = home.join("hooks.json");
+        std::os::windows::fs::symlink_file(&foreign, &destination).unwrap();
+        fs::write(
+            home.join("harness/token-workflow-pending.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "previousState": null,
+                "plannedState": {"enabled": true, "sourceRoot": request.source},
+                "operations": [{
+                    "destination": destination,
+                    "oldSource": null,
+                    "newSource": foreign
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = recover(&request).unwrap_err();
+        assert!(error.to_string().contains("outside its owned connections"));
+        assert_eq!(fs::read_link(&destination).unwrap(), foreign);
+        assert!(home.join("harness/token-workflow-pending.json").exists());
+    }
+
+    #[test]
     fn disconnect_preserves_foreign_regular_file_at_owned_destination() {
         let root = tempfile::tempdir().unwrap();
         let home = std::path::absolute(root.path()).unwrap().join("codex");
@@ -1193,7 +1314,7 @@ mod tests {
         )
         .unwrap();
         let error = disconnect(&request(&home, &user)).unwrap_err();
-        assert!(error.to_string().contains("outside harness/bin"));
+        assert!(error.to_string().contains("outside its owned connections"));
         assert_eq!(fs::read(home.join("harness/foreign.exe")).unwrap(), b"keep");
     }
 
@@ -1211,6 +1332,16 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "version": "0.48.0",
                 "executableSha256": build_identity::hash_file(&rtk).unwrap()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            source.join("global/rtk-hooks.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "harness-rtk.exe hook", "timeout": 2}
+                ]}]}
             }))
             .unwrap(),
         )
@@ -1414,6 +1545,21 @@ mod tests {
         .unwrap();
     }
 
+    /// The native schema-2 metadata record written by a core connection.
+    fn write_native_installation(home: &Path, upstream: &Path) {
+        fs::create_dir_all(home.join("harness")).unwrap();
+        fs::write(
+            home.join("harness/installation.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "settings": {"sourceRoot": home.join("source"), "codexCommand": upstream},
+                "links": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     fn config_text(home: &Path) -> String {
         fs::read_to_string(home.join("config.toml")).unwrap_or_default()
     }
@@ -1441,6 +1587,24 @@ code_mode = false
             serde_json::from_slice(&fs::read(home.join("harness/token-workflow.json")).unwrap())
                 .unwrap();
         assert_eq!(state["previousCodeMode"], false);
+    }
+
+    #[test]
+    fn native_metadata_settings_record_drives_feature_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let (home, _, _, request) = staged_request(root.path());
+        let upstream = compile_codex_features(root.path());
+        write_native_installation(&home, &upstream);
+        fs::write(
+            home.join("config.toml"),
+            b"[features]\nhooks = false\ncode_mode = false\n",
+        )
+        .unwrap();
+        let report = install(&request).unwrap();
+        assert_eq!(report.status, "Token workflow connected");
+        let config = config_text(&home);
+        assert!(config.contains("hooks = true"), "{config}");
+        assert!(config.contains("code_mode = true"), "{config}");
     }
 
     #[test]

@@ -78,18 +78,20 @@ fn serena_registration(
         return Ok(None);
     };
     let registry_path = home.join("harness/code-tools.json");
-    let Some(python) = record["paths"]["python"].as_str().map(PathBuf::from) else {
+    let Some(console) = record["paths"]["console_entrypoint"]
+        .as_str()
+        .or_else(|| record["executable"].as_str())
+        .map(PathBuf::from)
+    else {
         return Ok(None);
     };
-    let entry = source.join("tools/code-tools/serena_entry.py");
-    if !python.is_file() || !entry.is_file() {
+    if !console.is_file() {
         return Ok(None);
     }
     Ok(Some(json!({
         "command": manager,
         "args": ["mcp", "serena",
-            "--python", python,
-            "--entry", entry,
+            "--serena", console,
             "--registry", registry_path,
             "--codex-home", home,
             "--source-root", source,
@@ -239,16 +241,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serena_projection_requires_an_adopted_interpreter_and_entry() {
+    fn serena_projection_requires_an_adopted_console_entrypoint() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("codex-home");
         let source = root.path().join("source");
         std::fs::create_dir_all(home.join("harness")).unwrap();
-        std::fs::create_dir_all(source.join("tools/code-tools")).unwrap();
-        let python = root.path().join("python.exe");
-        std::fs::write(&python, b"fixture interpreter").unwrap();
-        let entry = source.join("tools/code-tools/serena_entry.py");
-        std::fs::write(&entry, b"fixture entry").unwrap();
+        let console = root.path().join("serena.exe");
+        std::fs::write(&console, b"fixture console").unwrap();
 
         // Without a registry record the projection stays with the seam.
         assert!(
@@ -262,7 +261,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "mcp": [{
                     "id": "serena",
-                    "paths": {"python": python}
+                    "paths": {"console_entrypoint": console}
                 }]
             }))
             .unwrap(),
@@ -280,7 +279,7 @@ mod tests {
             .collect();
         assert_eq!(
             arguments[..4],
-            ["mcp", "serena", "--python", &python.to_string_lossy()]
+            ["mcp", "serena", "--serena", &console.to_string_lossy()]
         );
         assert!(arguments.contains(&"--registry"));
         assert!(arguments.contains(&"--codex-home"));
@@ -293,8 +292,8 @@ mod tests {
         assert_eq!(registration["startup_timeout_sec"], 30);
         assert_eq!(registration["tool_timeout_sec"], 660);
 
-        // A missing entry or interpreter keeps the current seam registration.
-        std::fs::remove_file(&entry).unwrap();
+        // A missing console entry point keeps the current seam registration.
+        std::fs::remove_file(&console).unwrap();
         assert!(
             serena_registration(&home, Path::new("D:/mgr.exe"), &source, None)
                 .unwrap()
@@ -307,16 +306,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("codex-home");
         let source = root.path().join("source");
-        std::fs::create_dir_all(source.join("tools/code-tools")).unwrap();
-        let python = root.path().join("python.exe");
-        std::fs::write(&python, b"fixture interpreter").unwrap();
-        let entry = source.join("tools/code-tools/serena_entry.py");
-        std::fs::write(&entry, b"fixture entry").unwrap();
+        let console = root.path().join("serena.exe");
+        std::fs::write(&console, b"fixture console").unwrap();
         let original = root.path().join("nuphus-mcp.exe");
         std::fs::write(&original, b"fixture original").unwrap();
         let digest = crate::build_identity::hash_file(&original).unwrap();
         let inventory = serde_json::json!({"mcp": [
-            {"id": "serena", "status": "adopted", "paths": {"python": python}},
+            {"id": "serena", "status": "adopted", "paths": {"console_entrypoint": console}},
             {"id": "nuphus", "status": "modified",
              "paths": {"original_native_executable": original,
                        "native_executable": root.path().join("nuphus-mcp-schema-fixed.exe")}},
@@ -326,9 +322,10 @@ mod tests {
         // switches both connections to their native projections.
         let serena = serena_registration(&home, Path::new("D:/mgr.exe"), &source, Some(&inventory))
             .unwrap()
-            .expect("adopted interpreter projects from the inventory");
+            .expect("adopted console entry point projects from the inventory");
         assert_eq!(serena["command"], "D:/mgr.exe");
         assert_eq!(serena["args"][1], "serena");
+        assert_eq!(serena["args"][3], console.to_string_lossy().into_owned());
         let nuphus = nuphus_registration(&home, Path::new("D:/mgr.exe"), &source, Some(&inventory))
             .unwrap()
             .expect("adopted original projects from the inventory");

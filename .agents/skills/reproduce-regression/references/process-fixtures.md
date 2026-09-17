@@ -18,5 +18,6 @@ Invoke it with `--cwd DIR --timeout SECONDS [--ready-timeout SECONDS]
 Windows Jobs directly, with the receipt and readiness contract above. An
 optional `--root` must name a new absolute directory; existing roots and
 redirected receipt writes are refused. Missing receipt persistence is an
-infrastructure failure even when the child exited zero. Global native command
-registration remains pending, so do not assume the helper is already on PATH.
+infrastructure failure even when the child exited zero. A connected kit links
+`harness-observe.exe` into `harness/bin` on the user PATH; use that path or the
+absolute path recorded by the installation.

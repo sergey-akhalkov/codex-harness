@@ -37,6 +37,16 @@ pub struct Request {
     pub path_scope: Option<PathScope>,
 }
 
+/// Native commands owned by the core component. The RTK adapter link belongs
+/// to the token-workflow component, which records its own versioned build and
+/// update path for the accepted RTK exception.
+pub fn core_linked_binaries() -> impl Iterator<Item = &'static str> {
+    build_identity::BINARIES
+        .iter()
+        .copied()
+        .filter(|name| *name != "harness-rtk.exe")
+}
+
 #[derive(Serialize)]
 pub struct Report {
     pub status: &'static str,
@@ -273,10 +283,11 @@ fn inherit_recorded_hooks(
     next_source: &Path,
     desired: &mut Vec<Link>,
 ) -> io::Result<()> {
-    for (link, _) in old
-        .iter()
-        .filter(|(l, _)| matches!(l.kind.as_str(), "hooks" | "hook-launcher"))
-    {
+    // Owned hook *data* connections are inherited until their owning component
+    // migrates the selection. The script hook launcher is not inherited: the
+    // native chain invokes the RTK adapter directly, so the transitional
+    // bootstrap registration retires with the script lifecycle.
+    for (link, _) in old.iter().filter(|(l, _)| l.kind == "hooks") {
         let relative = link
             .source
             .strip_prefix(previous_source)
@@ -427,7 +438,7 @@ impl Plan {
         if let Some(previous) = &previous {
             inherit_recorded_hooks(&old, &previous.source_root, &request.source, &mut desired)?;
         }
-        for binary in build_identity::BINARIES {
+        for binary in core_linked_binaries() {
             desired.push(Link {
                 kind: "native-command".into(),
                 name: binary.trim_end_matches(".exe").into(),
@@ -732,6 +743,25 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A killed child releases its installation mutex and file handles during
+    /// process teardown. Bounded retries keep the assertion about recovery
+    /// state instead of racing the kernel's cleanup.
+    fn wait_for_teardown<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match attempt() {
+                Err(error)
+                    if (error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(32))
+                        && std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => return other,
+            }
+        }
+    }
     use crate::environment_path::UserPathSnapshot;
     use serde_json::json;
 
@@ -849,7 +879,7 @@ mod tests {
             let fixture = Fixture::new();
             let report = connect(&fixture.request, true).unwrap();
             assert_eq!(report.status, "preview");
-            assert_eq!(report.links, 10);
+            assert_eq!(report.links, 9);
             assert!(!fixture.request.codex_home.exists());
             assert!(!fixture.request.user_home.exists());
             assert!(!fixture.request.dependency_user_home.exists());
@@ -1333,10 +1363,9 @@ mod tests {
                 fs::read_link(home.join("hooks.json")).unwrap(),
                 relocated.join("global/hooks.json")
             );
-            assert_eq!(
-                fs::read_link(home.join("harness/bin/hook.ps1")).unwrap(),
-                relocated.join("legacy-hook.fixture")
-            );
+            // The transitional script hook launcher retires with the native
+            // connection instead of being inherited.
+            assert!(!home.join("harness/bin/hook.ps1").exists());
             assert_eq!(
                 fs::read_link(home.join("harness/bin/codex-harness-check.exe")).unwrap(),
                 fixture.request.build.join("codex-harness.exe")
@@ -1369,16 +1398,22 @@ mod tests {
                 relocated.join("global/hooks.json")
             );
             let before = fs::read(&metadata).unwrap();
-            fs::remove_file(home.join("harness/bin/hook.ps1")).unwrap();
+            // The retired script destination is no longer owned: a foreign file
+            // created there is preserved and does not block a later connection.
             fs::write(home.join("harness/bin/hook.ps1"), b"foreign replacement").unwrap();
-            for preview in [true, false] {
-                assert!(connect(&fixture.request, preview).is_err());
-            }
-            assert_eq!(fs::read(&metadata).unwrap(), before);
+            assert!(connect(&fixture.request, true).is_ok());
+            assert!(
+                connect(&fixture.request, false)
+                    .unwrap()
+                    .runtime
+                    .unwrap()
+                    .passed
+            );
             assert_eq!(
                 fs::read(home.join("harness/bin/hook.ps1")).unwrap(),
                 b"foreign replacement"
             );
+            assert_eq!(fs::read(&metadata).unwrap(), before);
             assert!(!old_source.exists());
         });
     }
@@ -1590,22 +1625,29 @@ mod tests {
                 fs::read_link(home.join("harness/bin/codex.exe")).unwrap(),
                 fixture.request.build.join("codex.exe")
             );
-            let preview = preview_recovery(
-                &home,
-                &fixture.request.user_home,
-                &fixture.request.dependency_user_home,
-            )
-            .unwrap();
+            let preview = wait_for_teardown(|| {
+                preview_recovery(
+                    &home,
+                    &fixture.request.user_home,
+                    &fixture.request.dependency_user_home,
+                )
+            })
+            .expect("owned recovery preview");
             assert_eq!(preview.status, "preview");
             assert_eq!(preview.action, "rollback");
             assert_eq!(preview.journal, Some("native"));
             assert_ne!(fs::read(&metadata).unwrap(), before);
-            let report = recover(
-                &home,
-                &fixture.request.user_home,
-                &fixture.request.dependency_user_home,
-            )
-            .unwrap();
+            // The killed child releases its installation mutex and file
+            // handles during process teardown; retry that short window
+            // instead of racing the kernel.
+            let report = wait_for_teardown(|| {
+                recover(
+                    &home,
+                    &fixture.request.user_home,
+                    &fixture.request.dependency_user_home,
+                )
+            })
+            .expect("owned recovery");
             assert_eq!(report.status, "recovered");
             assert!(!report.committed);
             assert_eq!(fs::read(&metadata).unwrap(), before);

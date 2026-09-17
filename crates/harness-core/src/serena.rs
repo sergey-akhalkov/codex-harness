@@ -1,5 +1,8 @@
-//! Rust-controlled Serena startup around the existing guarded entry.
-//! The Python seam remains until this boundary proves equivalent isolation.
+//! Rust-controlled Serena startup for the adopted package.
+//!
+//! A worker is launched from Serena's own console entry point with a generated
+//! harness-owned home (`serena_configuration`), so provisioning suppression,
+//! explicit backend commands and configuration ownership stay native.
 #![cfg(windows)]
 
 use crate::{
@@ -21,10 +24,11 @@ const CLEANUP: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct Launch {
-    pub python: PathBuf,
-    pub entry: PathBuf,
+    /// The adopted Serena console entry point.
+    pub serena: PathBuf,
     pub registry: PathBuf,
     pub project: PathBuf,
+    /// CODEX_HOME; the owned Serena home is derived from it.
     pub home: PathBuf,
 }
 
@@ -46,18 +50,17 @@ fn ordinary(path: &Path) -> io::Result<PathBuf> {
 
 /// Launch inputs that passed adoption and path validation.
 pub struct Validated {
-    pub python: PathBuf,
-    pub entry: PathBuf,
+    pub serena: PathBuf,
     pub registry: PathBuf,
     pub home: PathBuf,
+    pub serena_home: PathBuf,
 }
 
 pub fn validated(launch: &Launch) -> io::Result<Validated> {
-    let python = ordinary(&launch.python)?;
-    let entry = ordinary(&launch.entry)?;
+    let executable = ordinary(&launch.serena)?;
     let registry = ordinary(&launch.registry)?;
     let home = ordinary(&launch.home)?;
-    if !python.is_file() || !entry.is_file() || !registry.is_file() {
+    if !executable.is_file() || !registry.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "Serena launch inputs are missing",
@@ -65,35 +68,43 @@ pub fn validated(launch: &Launch) -> io::Result<Validated> {
     }
     let inventory: Value = serde_json::from_slice(&fs::read(&registry)?)
         .map_err(|_| io::Error::other("Serena registry is not JSON"))?;
-    let serena = inventory
+    let record = inventory
         .get("mcp")
         .and_then(Value::as_array)
         .and_then(|items| items.iter().find(|item| item["id"] == "serena"))
         .ok_or_else(|| io::Error::other("Serena is not in the adopted registry"))?;
-    if serena["identity"] != PACKAGE || serena["version"] != VERSION {
+    if record["identity"] != PACKAGE || record["version"] != VERSION {
         return Err(io::Error::other(
             "Reassess the Serena adapter for this package version.",
         ));
     }
     if !matches!(
-        serena["status"].as_str(),
+        record["status"].as_str(),
         Some("adopted" | "present" | "installed" | "ready" | "verified")
     ) {
         return Err(io::Error::other(
             "Serena dependency is missing or incompatible; explicit provisioning is required.",
         ));
     }
+    let console = record["paths"]["console_entrypoint"]
+        .as_str()
+        .or_else(|| record["executable"].as_str());
+    if console.is_none_or(|path| !ordinary(Path::new(path)).is_ok_and(|path| path == executable)) {
+        return Err(io::Error::other(
+            "Serena console entry point does not match the adopted registry record.",
+        ));
+    }
     fs::create_dir_all(home.join("harness/runtime/serena"))?;
-    fs::create_dir_all(home.join("serena-home"))?;
+    let serena_home = crate::serena_configuration::prepare(&registry, &home)?;
     Ok(Validated {
-        python,
-        entry,
+        serena: executable,
         registry,
         home,
+        serena_home,
     })
 }
 
-fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path) {
+fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path, serena_home: &Path) {
     for key in [
         "PIP_REQUIRE_VIRTUALENV",
         "UV_NO_CACHE",
@@ -102,7 +113,6 @@ fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path) {
         "SERENA_HOME",
         "PYTHONUTF8",
         "PYTHONDONTWRITEBYTECODE",
-        "HARNESS_SERENA_SHARED_WORKER",
     ] {
         command.env.insert(key.into(), None);
     }
@@ -116,7 +126,7 @@ fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path) {
     );
     command.env.insert(
         "SERENA_HOME".into(),
-        Some(home.join("serena-home").into_os_string()),
+        Some(serena_home.as_os_str().to_os_string()),
     );
     command.env.insert("PYTHONUTF8".into(), Some("1".into()));
     command
@@ -130,10 +140,10 @@ fn base_environment(command: &mut CommandSpec, registry: &Path, home: &Path) {
 
 pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
     let Validated {
-        python,
-        entry,
+        serena,
         registry,
         home,
+        serena_home: _,
     } = validated(launch)?;
     let project = ordinary(&launch.project)?;
     if !project.is_dir() {
@@ -142,12 +152,15 @@ pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
             "Serena launch inputs are missing",
         ));
     }
-    let mut command = CommandSpec::new(python);
+    crate::serena_configuration::ensure_supported_languages(
+        &serde_json::from_slice(&fs::read(&registry)?)
+            .map_err(|_| io::Error::other("Serena registry is not JSON"))?,
+        &project,
+    )?;
+    let serena_home = crate::serena_configuration::prepare_worker(&registry, &home, &project)?;
+    let mut command = CommandSpec::new(serena);
     command.current_dir = Some(project.clone());
     command.args = vec![
-        "-B".into(),
-        "-u".into(),
-        entry.into_os_string(),
         "start-mcp-server".into(),
         "--context".into(),
         "codex".into(),
@@ -158,24 +171,21 @@ pub fn command(launch: &Launch) -> io::Result<CommandSpec> {
         "--enable-gui-log-window".into(),
         "false".into(),
     ];
-    base_environment(&mut command, &registry, &home);
+    base_environment(&mut command, &registry, &home, &serena_home);
     Ok(command)
 }
 
 /// The shared-worker command for a resolved client route. Forwarded native
-/// options keep their order; the resolved project is appended explicitly and
-/// the shared-worker marker plus removed-project list are set for the entry.
+/// options keep their order and the resolved project is appended explicitly.
 pub fn shared_command(
     launch: &Launch,
     route: &crate::serena_route::Route,
-    removed_projects: &[String],
-    serena_home: &Path,
 ) -> io::Result<CommandSpec> {
     let Validated {
-        python,
-        entry,
+        serena,
         registry,
         home,
+        serena_home: _,
     } = validated(launch)?;
     let cwd = route.project.clone().unwrap_or_else(|| route.cwd.clone());
     if !cwd.is_dir() {
@@ -184,30 +194,20 @@ pub fn shared_command(
             "Serena launch inputs are missing",
         ));
     }
-    let mut command = CommandSpec::new(python);
+    crate::serena_configuration::ensure_supported_languages(
+        &serde_json::from_slice(&fs::read(&registry)?)
+            .map_err(|_| io::Error::other("Serena registry is not JSON"))?,
+        &cwd,
+    )?;
+    let serena_home = crate::serena_configuration::prepare_worker(&registry, &home, &cwd)?;
+    let mut command = CommandSpec::new(serena);
     command.current_dir = Some(cwd);
-    command.args = vec!["-B".into(), "-u".into(), entry.into_os_string()];
-    command.args.extend(route.arguments.iter().cloned());
+    command.args = route.arguments.to_vec();
     if let Some(project) = &route.project {
         command.args.push("--project".into());
         command.args.push(project.clone().into_os_string());
     }
-    base_environment(&mut command, &registry, &home);
-    command
-        .env
-        .insert("HARNESS_SERENA_SHARED_WORKER".into(), Some("1".into()));
-    command.env.insert(
-        "HARNESS_SERENA_REMOVED_PROJECTS".into(),
-        Some(
-            serde_json::to_string(removed_projects)
-                .unwrap_or_else(|_| "[]".into())
-                .into(),
-        ),
-    );
-    command.env.insert(
-        "SERENA_HOME".into(),
-        Some(serena_home.as_os_str().to_os_string()),
-    );
+    base_environment(&mut command, &registry, &home, &serena_home);
     Ok(command)
 }
 

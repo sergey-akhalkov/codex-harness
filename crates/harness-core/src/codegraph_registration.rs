@@ -59,7 +59,7 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
     }
     if pending_path.exists() {
         return Err(conflict(
-            "Interrupted MCP registration: run install.ps1 -Mode Recover.",
+            "Interrupted MCP registration: run the native code-tools Recover.",
         ));
     }
     let before = read_bytes(&config)?;

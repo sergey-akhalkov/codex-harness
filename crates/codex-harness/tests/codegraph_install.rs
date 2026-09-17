@@ -783,19 +783,15 @@ fn isolated_apply_accepts_native_serena_proxy_and_keeps_foreign_servers() {
     let home = write_home(root.path());
     let package = root.path().join("shared-package");
     fs::create_dir_all(&package).unwrap();
-    let python = root.path().join("python.exe");
-    let entry = root.path().join("serena_entry.py");
-    fs::write(&python, b"fixture interpreter").unwrap();
-    fs::write(&entry, b"fixture entry").unwrap();
+    let console = root.path().join("serena.exe");
+    fs::write(&console, b"fixture console").unwrap();
     let serena = json!({
         "command": env!("CARGO_BIN_EXE_codex-harness"),
         "args": [
             "mcp",
             "serena",
-            "--python",
-            python,
-            "--entry",
-            entry,
+            "--serena",
+            console,
             "--registry",
             home.join("harness/code-tools.json"),
             "--codex-home",
@@ -904,89 +900,6 @@ fn native_prepare_with_source_emits_serena_proxy_for_adopted_interpreter() {
         same_path(serena["args"][3].as_str().unwrap(), &python),
         "{serena}"
     );
-}
-
-#[test]
-#[ignore = "requires explicit existing CODEGRAPH_LIFECYCLE_PYTHON; parent runs --ignored with the adopted Serena interpreter"]
-fn planner_handoff_from_existing_inspect_registers_retained_tools_without_mutating_during_plan() {
-    let python = std::env::var("CODEGRAPH_LIFECYCLE_PYTHON")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .expect("CODEGRAPH_LIFECYCLE_PYTHON must name an existing lifecycle interpreter");
-    let powershell = std::env::var("CODEGRAPH_LIFECYCLE_POWERSHELL")
-        .unwrap_or_else(|_| std::env::var("PWSH").unwrap_or_else(|_| "pwsh".into()));
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let home = write_home(root.path());
-    let package = root.path().join("shared-package");
-    fs::create_dir_all(&package).unwrap();
-    let before_config = fs::read(home.join("config.toml")).unwrap();
-    let planner = source.join("tools/code-tools/registration.py");
-    let projection = json!({
-        "registrations": {
-            "codegraph": {
-                "command": env!("CARGO_BIN_EXE_codex-harness"),
-                "args": ["mcp", "codegraph", "--package-root", package],
-                "env": {"CODEX_HOME": home}
-            }
-        },
-        "retired": ["codebase-memory"]
-    })
-    .to_string();
-    let planned = Command::new(&python)
-        .args([
-            "-B",
-            planner.to_str().unwrap(),
-            "--codex-home",
-            home.to_str().unwrap(),
-            "--source-root",
-            source.to_str().unwrap(),
-            "--native-codex",
-            env!("CARGO_BIN_EXE_codex-harness"),
-            "--powershell",
-            &powershell,
-            "--python",
-            &python,
-            "--mode",
-            "Install",
-            "--plan-only",
-            "--native-providers-json",
-            &projection,
-        ])
-        .output()
-        .unwrap();
-    assert!(planned.status.success(), "{}", fail(&planned));
-    assert_eq!(fs::read(home.join("config.toml")).unwrap(), before_config);
-    assert!(!home.join("harness/code-tools-registration.json").exists());
-    let handoff: Value =
-        serde_json::from_slice(&planned.stdout).unwrap_or_else(|_| panic!("{}", fail(&planned)));
-    let registrations = handoff
-        .get("registrations")
-        .cloned()
-        .unwrap_or(handoff.clone());
-    assert!(registrations.get("serena").is_some(), "{handoff}");
-    assert!(registrations.get("graphify").is_none(), "{handoff}");
-    assert!(registrations.get("nuphus").is_some(), "{handoff}");
-    assert!(registrations.get("harness-lsp").is_none(), "{handoff}");
-    let connected = run_apply(
-        &home,
-        "Install",
-        Some(&package),
-        &["--retained-registrations-json", &handoff.to_string()],
-    );
-    assert_eq!(connected["status"], "connected");
-    let servers = servers(&home);
-    assert!(servers.get("codegraph").is_some(), "{servers}");
-    assert_eq!(
-        retained_names(&servers),
-        vec!["serena".to_string(), "nuphus".to_string()]
-    );
-    assert!(servers.get("codebase-memory").is_none(), "{servers}");
-    assert!(servers.get("harness-lsp").is_none(), "{servers}");
-    assert_eq!(servers["foreign"]["command"], "untouched.exe");
 }
 
 #[test]

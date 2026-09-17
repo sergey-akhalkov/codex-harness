@@ -9,8 +9,8 @@ build's source checkout. For a development binary without a build receipt, pass
 `--schema <absolute installed skill asset path>` explicitly. It passes that
 source path directly to Codex, records its hash and rejects changes during the
 run. Unsupported schema extensions fail before launch; they are never silently
-ignored. Global native command registration is still pending, so do not assume
-this executable is already on PATH.
+ignored. A connected kit links `harness-inspect.exe` into `harness/bin` on the
+user PATH; use that path or the absolute path recorded by the installation.
 
 `harness-inspect.exe` is the current helper. Pass a JSON array for the launch prefix: either an absolute native Codex `.exe`, or an absolute `pwsh.exe` plus `-NoProfile -File` and the installed launcher path. There is no shell-command string parsing. Resolve the original CLI through the kit installation receipt when PATH points to a wrapper; record its version with `--version` before the run.
 

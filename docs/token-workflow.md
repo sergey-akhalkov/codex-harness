@@ -85,16 +85,16 @@ For first trust, launch the original CLI from `codexCommand` in
 single `harness-rtk.exe hook` definition in review or `/hooks`. That lets the
 native editor store the machine hash in the base config for consumers that do
 not select a profile. Ordinary harness startup uses this same local writer;
-shared defaults are read separately by the launcher. Acceptance script
-`tests/token-workflow-native.ps1 -TrustHook` uses the base consumer and checks
-actual `trustStatus` with a new connection.
+shared defaults are read separately by the launcher. The native RTK acceptance
+suite (`cargo test -p codex-harness --test rtk_adapter`) and the native console
+fixtures check the accepted behavior with a new connection.
 
 ```powershell
-./install.ps1 -TokenWorkflowOnly             # after core installation
-./install.ps1 -TokenWorkflowOnly -Mode Check
-./install.ps1 -TokenWorkflowOnly -Mode Update
-./install.ps1 -TokenWorkflowOnly -Mode Disconnect
-./install.ps1 -TokenWorkflowOnly -Mode Recover # if an unfinished transaction remains
+& <build>\codex-harness.exe install    --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>   # after core installation
+& <build>\codex-harness.exe check      --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe update     --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe disconnect --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe recover    --token-workflow-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>   # if an unfinished transaction remains
 ```
 
 Ordinary full installation includes the selected capability. Fresh `-CoreOnly`

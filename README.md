@@ -14,11 +14,12 @@ The [instruction adaptation record](docs/principles-port.md) explains how offici
 Astra guidance applies to this pack. Externally maintained OpenSpec instructions
 remain unchanged; project-owned specifications track unfinished acceptance.
 
-On Windows, with PowerShell 7.4+, Codex CLI and OpenSpec installed:
+On Windows, with a Rust MSVC toolchain, Codex CLI and OpenSpec installed:
 
 ```powershell
-.\install.ps1 -WhatIf
-.\install.ps1
+cargo run --release --locked -p codex-harness -- build --source . --state "$env:LOCALAPPDATA\codex-harness-native"
+& <build>\codex-harness.exe install --core-only --source . --build <build> --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE" --preview
+& <build>\codex-harness.exe install --core-only --source . --build <build> --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
 ```
 
 Open a new PowerShell terminal and use `codex` from any project. The launcher
@@ -26,8 +27,8 @@ selects the shared `harness` profile automatically; an explicit `--profile` or
 configuration override retains Codex's normal precedence.
 
 ```powershell
-.\install.ps1 -Mode Check
-.\install.ps1 -Mode Disconnect
+& <build>\codex-harness.exe check --core-only --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
+& <build>\codex-harness.exe disconnect --core-only --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
 ```
 
 - [Installation, updates and recovery](docs/installation.md)
@@ -35,7 +36,7 @@ configuration override retains Codex's normal precedence.
 - [Confirmed product decisions](docs/project-decisions.md)
 - [Full global instruction source](global/principles-of-work.md)
 - [Shared configuration](global/harness.config.toml)
-- [Managed source and prerequisite inventory](global/kit.psd1)
+- [Managed source and prerequisite inventory](global/kit.json)
 - [Native Rust commands](docs/rust-native.md)
 
 Clients that start their own executable, such as IDE or app-server integrations,

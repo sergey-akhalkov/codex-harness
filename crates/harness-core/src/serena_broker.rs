@@ -49,26 +49,27 @@ impl Drop for Admission {
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
-    pub python: PathBuf,
-    pub entry: PathBuf,
+    /// The adopted Serena console entry point.
+    pub serena: PathBuf,
     pub registry: PathBuf,
     pub codex_home: PathBuf,
-    pub serena_home: PathBuf,
     pub source_root: PathBuf,
 }
 
 pub fn source(configuration: &Configuration) -> io::Result<String> {
+    let serena_home =
+        crate::serena_configuration::prepare(&configuration.registry, &configuration.codex_home)?;
     Ok(build_identity::hash_bytes(
         serde_json::to_string(&json!({
             "protocol":"coding-agents-harness/serena-broker/v1",
             "manager":build_identity::hash_file(&std::env::current_exe()?)?,
-            "python":build_identity::hash_file(&configuration.python)?,
-            "entry":build_identity::hash_file(&configuration.entry)?,
+            "serena":build_identity::hash_file(&configuration.serena)?,
             "registry":build_identity::hash_file(&configuration.registry)?,
             "resources":build_identity::hash_file(
                 &configuration.source_root.join("global/tool-resources.json"),
             )?,
-            "serena_home":configuration.serena_home,
+            "config":build_identity::hash_file(&serena_home.join(crate::serena_configuration::CONFIG_NAME))?,
+            "serena_home":serena_home,
         }))?
         .as_bytes(),
     ))
@@ -299,20 +300,18 @@ struct Backend {
 impl Backend {
     fn start(policy: serena_route::Policy, configuration: &Configuration) -> io::Result<Arc<Self>> {
         let cancel = Cancellation::default();
+        let serena_home = crate::serena_configuration::prepare(
+            &configuration.registry,
+            &configuration.codex_home,
+        )?;
         let launch = serena::Launch {
-            python: configuration.python.clone(),
-            entry: configuration.entry.clone(),
+            serena: configuration.serena.clone(),
             registry: configuration.registry.clone(),
             project: configuration.codex_home.clone(),
             home: configuration.codex_home.clone(),
         };
-        let factory =
-            serena_shared::session_factory(launch, configuration.serena_home.clone(), cancel)?;
-        let pool = Arc::new(Mutex::new(Pool::new(
-            policy,
-            configuration.serena_home.clone(),
-            factory,
-        )?));
+        let factory = serena_shared::session_factory(launch, cancel)?;
+        let pool = Arc::new(Mutex::new(Pool::new(policy, serena_home, factory)?));
         let stop = Arc::new(AtomicBool::new(false));
         {
             let pool = Arc::clone(&pool);

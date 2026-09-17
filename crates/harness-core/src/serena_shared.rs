@@ -71,6 +71,18 @@ fn valid_client(client: &str) -> bool {
     client.len() == 32 && client.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Serena's own fatal marker for a language-server manager that failed during
+/// project initialization. Such a worker answers every later semantic call
+/// with the same error until it is replaced.
+fn fatal_language_server(result: &Value) -> bool {
+    result["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["text"].as_str())
+        .any(|text| text.contains("The language server manager is not initialized"))
+}
+
 impl Pool {
     pub fn new(
         policy: serena_route::Policy,
@@ -304,6 +316,14 @@ impl Pool {
         let key = self.worker_for(&route, &initialize, deadline)?;
         let entry = self.workers.get_mut(&key).expect("worker was started");
         let result = entry.worker.request(method, params, deadline)?;
+        // A worker whose language-server manager failed stays alive but can
+        // never answer semantic calls. Retire it so the next request starts a
+        // fresh worker, while this client still receives Serena's own failure.
+        if fatal_language_server(&result)
+            && let Some(mut failed) = self.workers.remove(&key)
+        {
+            let _ = failed.worker.close();
+        }
         let succeeded = result.get("error").is_none()
             && !result["result"]
                 .get("isError")
@@ -382,17 +402,16 @@ impl Drop for Pool {
     }
 }
 
-/// The real worker factory around the guarded shared entry point.
+/// The real worker factory around the adopted Serena entry point.
 pub fn session_factory(
     launch: serena::Launch,
-    home: PathBuf,
     cancel: crate::process::Cancellation,
 ) -> io::Result<WorkerFactory> {
     let stderr_root = launch.home.join("harness/runtime/serena-workers");
     std::fs::create_dir_all(&stderr_root)?;
     let serial = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     Ok(Box::new(move |route, initialize, deadline| {
-        let command = serena::shared_command(&launch, route, &route.removed_projects, &home)?;
+        let command = serena::shared_command(&launch, route)?;
         let index = serial.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let stderr = stderr_root.join(format!("worker-{index}.txt"));
         let mut session = serena::Session::start_shared(command, stderr, &cancel)?;
@@ -467,6 +486,19 @@ mod tests {
         alive: bool,
         requests: Vec<(String, Value)>,
         closed: bool,
+    }
+
+    #[test]
+    fn only_the_fatal_language_server_marker_retires_a_worker() {
+        let fatal = json!({"result": {"content": [
+            {"type": "text", "text": "Error executing tool get_symbols_overview: Exception: The language server manager is not initialized, indicating a problem during project initialisation."}
+        ]}});
+        assert!(fatal_language_server(&fatal));
+        let ordinary = json!({"result": {"isError": true, "content": [
+            {"type": "text", "text": "Error executing tool find_symbol: symbol not found"}
+        ]}});
+        assert!(!fatal_language_server(&ordinary));
+        assert!(!fatal_language_server(&json!({"result": {}})));
     }
 
     struct FakeWorker {

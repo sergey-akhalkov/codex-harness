@@ -230,12 +230,12 @@ requires them.
 
 ## Reproducible installation
 
-The repository is the portable source of the declared kit. `install.ps1` on
-Windows native PowerShell links the checkout to already installed Codex CLI and
-OpenSpec. Copying artifacts into destination directories or assembling a
-separate deployed config from their contents is excluded. Existing local
-capabilities and machine data are preserved. External dependencies are declared
-explicitly.
+The repository is the portable source of the declared kit. The native manager
+(`codex-harness install|update|check|recover|disconnect`) links the checkout to
+already installed Codex CLI and OpenSpec and installs immutable Rust builds.
+Copying artifacts into destination directories or assembling a separate
+deployed config from their contents is excluded. Existing local capabilities
+and machine data are preserved. External dependencies are declared explicitly.
 
 Default session permissions are Full Access:
 `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`. Explicit

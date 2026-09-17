@@ -159,7 +159,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
 fn serena(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp serena --python FILE --entry FILE --registry FILE --codex-home DIRECTORY --serena-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; memory and onboarding tools stay hidden unless HARNESS_SERENA_UNFILTERED=1."
+            "codex-harness mcp serena --serena FILE --registry FILE --codex-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. The adopted Serena console entry point runs with a generated harness-owned home that pins every adopted language backend, so a session never provisions or updates a package. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; memory and onboarding tools stay hidden unless HARNESS_SERENA_UNFILTERED=1."
         );
         return Ok(0);
     }
@@ -169,11 +169,9 @@ fn serena(args: &[OsString]) -> io::Result<i32> {
         if !matches!(
             key.to_str(),
             Some(
-                "--python"
-                    | "--entry"
+                "--serena"
                     | "--registry"
                     | "--codex-home"
-                    | "--serena-home"
                     | "--source-root"
                     | "--connection-seconds"
             )
@@ -209,16 +207,9 @@ fn serena(args: &[OsString]) -> io::Result<i32> {
         .map(|value| value.as_str().ok_or_else(invalid).map(OsString::from))
         .collect::<io::Result<_>>()?;
     let configuration = harness_core::serena_broker::Configuration {
-        python: path("--python")?,
-        entry: path("--entry")?,
+        serena: path("--serena")?,
         registry: path("--registry")?,
         codex_home: path("--codex-home")?,
-        serena_home: match options.get(&OsString::from("--serena-home")) {
-            Some(value) => local_path(Path::new(value))?,
-            None => std::env::var_os("USERPROFILE")
-                .map(|home| Path::new(&home).join(".serena"))
-                .ok_or_else(invalid)?,
-        },
         source_root,
     };
     let (input, output) = mcp_stdio::standard_files()?;

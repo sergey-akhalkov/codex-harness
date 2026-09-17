@@ -104,6 +104,7 @@ pub mod resource_admission;
 #[cfg(windows)]
 pub mod serena;
 pub mod serena_broker;
+pub mod serena_configuration;
 pub mod serena_route;
 pub mod serena_shared;
 pub mod serena_stdio;

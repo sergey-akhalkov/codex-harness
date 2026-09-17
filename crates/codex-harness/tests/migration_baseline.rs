@@ -52,12 +52,6 @@ fn sha256_file(path: &Path) -> String {
     harness_core::build_identity::hash_file(path).unwrap()
 }
 
-fn looks_like_codex_dir(entry: &Path) -> bool {
-    ["codex.exe", "codex.cmd", "codex.ps1", "codex.bat"]
-        .iter()
-        .any(|name| entry.join(name).is_file())
-}
-
 fn warmup_powershell() {
     let status = Command::new(desktop_pwsh())
         .args(["-NoLogo", "-NoProfile", "-Command", "exit 0"])
@@ -186,15 +180,13 @@ fn capture_current_path_baselines_with_identity_oracles_and_noise_method() {
     warmup_powershell();
     let cases = vec![
         native_launch_case(),
-        script_launch_case(),
         missing_core_check(),
-        script_missing_check(),
         diagnose_case(),
         missing_build_check(),
         mcp_case(),
         process_case(),
         console_case(),
-        subscription_case(),
+        native_bounded_node_case(),
         rtk_case(),
     ];
     let failed: Vec<_> = cases
@@ -222,6 +214,134 @@ fn capture_current_path_baselines_with_identity_oracles_and_noise_method() {
         serde_json::to_string_pretty(&json!({"evidence": evidence, "failed": failed})).unwrap()
     );
     assert!(failed.is_empty(), "baseline oracles failed: {failed:?}");
+}
+
+/// Task 9.4: rerun the recorded scenario set on the current source and compare
+/// the matched warm medians against the recorded baseline with the noise
+/// boundary established before candidate results existed. Replaced script
+/// paths are compared against their native replacements.
+///
+/// Set `HARNESS_MIGRATION_BASELINE` to a recorded `baseline.json`.
+#[test]
+#[ignore = "requires HARNESS_MIGRATION_BASELINE pointing at a recorded baseline.json"]
+fn compare_candidate_paths_against_the_recorded_baseline() {
+    let baseline_path = PathBuf::from(
+        std::env::var_os("HARNESS_MIGRATION_BASELINE")
+            .expect("explicit recorded baseline path required"),
+    );
+    let baseline: Value =
+        serde_json::from_slice(&fs::read(&baseline_path).expect("baseline is readable")).unwrap();
+    let recorded: BTreeMap<String, Value> = baseline["cases"]
+        .as_array()
+        .expect("baseline cases")
+        .iter()
+        .map(|case| (case["name"].as_str().unwrap().to_owned(), case.clone()))
+        .collect();
+    let evidence = tempfile::Builder::new()
+        .prefix("harness-migration-comparison-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("comparison evidence: {}", evidence.display());
+    warmup_powershell();
+
+    // Unchanged native scenarios are re-measured through the same case
+    // functions; the replaced script scenarios map to native replacements.
+    let cases = vec![
+        native_launch_case(),
+        native_degraded_launch_case(),
+        missing_core_check(),
+        diagnose_case(),
+        missing_build_check(),
+        mcp_case(),
+        process_case(),
+        console_case(),
+        native_bounded_node_case(),
+        rtk_case(),
+    ];
+    let replacement: BTreeMap<&str, &str> = BTreeMap::from([
+        (
+            "launch.script_fallback_missing_module_unicode_nonzero",
+            "launch.native_degraded_fallback_unicode_nonzero",
+        ),
+        (
+            "check.script_missing_owned_homes",
+            "check.core_missing_installation",
+        ),
+        (
+            "subscription.bounded_node_fixture_nonzero_and_timeout",
+            "process.native_bounded_node_fixture_nonzero_and_timeout",
+        ),
+    ]);
+    let by_name: BTreeMap<String, Value> = cases
+        .iter()
+        .map(|case| (case["name"].as_str().unwrap().to_owned(), case.clone()))
+        .collect();
+    let mut rows = Vec::new();
+    let mut failed = Vec::new();
+    let mut regressions = Vec::new();
+    for (name, case) in &recorded {
+        let candidate_name = replacement.get(name.as_str()).copied().unwrap_or(name);
+        let Some(candidate) = by_name.get(candidate_name) else {
+            continue;
+        };
+        let baseline_median = case["warm"]["median_ms"].as_f64().unwrap_or_default();
+        let candidate_median = candidate["warm"]["median_ms"].as_f64().unwrap_or_default();
+        let delta = candidate_median - baseline_median;
+        let material = delta > 100.0 && delta > baseline_median * 0.10;
+        if candidate["oracle"]["passed"] != true {
+            failed.push(candidate_name.to_owned());
+        }
+        // A replaced path is compared for information; an unchanged owned path
+        // must not regress materially against its recorded baseline.
+        let replaced = replacement.contains_key(name.as_str());
+        if material && !replaced {
+            regressions.push(format!(
+                "{candidate_name}: {baseline_median:.1}ms -> {candidate_median:.1}ms"
+            ));
+        }
+        rows.push(json!({
+            "baseline_case": name,
+            "candidate_case": candidate_name,
+            "replaced": replaced,
+            "baseline_warm_median_ms": baseline_median,
+            "candidate_warm_median_ms": candidate_median,
+            "candidate_warm_mad_ms": candidate["warm"]["mad_ms"],
+            "delta_ms": delta,
+            "material": material,
+            "oracle_passed": candidate["oracle"]["passed"] == true,
+        }));
+    }
+    let report = json!({
+        "schema": 1,
+        "task": "9.4",
+        "baseline": baseline_path,
+        "identity": identity(),
+        "method": method(),
+        "rows": rows,
+        "failed_oracles": failed,
+        "material_regressions": regressions,
+        "limits": baseline["limits"],
+    });
+    fs::write(
+        evidence.join("comparison.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "evidence": evidence,
+            "failed": failed,
+            "material_regressions": regressions
+        }))
+        .unwrap()
+    );
+    assert!(failed.is_empty(), "candidate oracles failed: {failed:?}");
+    assert!(
+        regressions.is_empty(),
+        "material owned-boundary regressions: {regressions:?}"
+    );
 }
 
 fn native_launch_case() -> Value {
@@ -326,86 +446,6 @@ fn native_launch_case() -> Value {
     })
 }
 
-fn script_launch_case() -> Value {
-    let root = tempfile::Builder::new()
-        .prefix("script-launch-baseline-")
-        .tempdir()
-        .unwrap();
-    let home = root.path().join("home");
-    let source = root.path().join("source");
-    let workspace = root.path().join("workspace");
-    let bin = root.path().join("bin");
-    let launchers = home.join("harness/launchers/owned/codex.ps1");
-    let tools = source.join("tools");
-    fs::create_dir_all(launchers.parent().unwrap()).unwrap();
-    fs::create_dir_all(&tools).unwrap();
-    fs::create_dir_all(&workspace).unwrap();
-    fs::create_dir_all(&bin).unwrap();
-    let origin = checkout();
-    fs::write(
-        &launchers,
-        fs::read(origin.join("tools/codex.ps1")).unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        tools.join("codex.ps1"),
-        fs::read(origin.join("tools/codex.ps1")).unwrap(),
-    )
-    .unwrap();
-    let launcher = bin.join("codex.ps1");
-    std::os::windows::fs::symlink_file(&launchers, &launcher).unwrap();
-    let upstream = root.path().join("upstream.exe");
-    fs::copy(env!("CARGO_BIN_EXE_harness-launch-fixture"), &upstream).unwrap();
-    fs::copy(&upstream, bin.join("codex.exe")).unwrap();
-    fs::write(home.join("harness/installation.json"), serde_json::to_vec(&json!({"schemaVersion":1,"sourceRoot":source,"codexHome":home,"userHome":root.path().join("user"),"codexCommand":upstream,"profileName":"harness","pathScope":"Process","pathAdded":false,"versions":{},"links":[],"launcherSource":launchers,"configBridge":env!("CARGO_BIN_EXE_codex-harness")})).unwrap()).unwrap();
-    let isolated_path = {
-        let mut entries = vec![bin.clone()];
-        entries.extend(
-            env::split_paths(&env::var_os("PATH").unwrap()).filter(|entry| {
-                let text = entry.to_string_lossy().to_ascii_lowercase();
-                !text.contains("windowsapps") && entry != &bin && !looks_like_codex_dir(entry)
-            }),
-        );
-        env::join_paths(entries).unwrap()
-    };
-    let runner = root.path().join("stdin-runner.ps1");
-    fs::write(&runner, "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)\n[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n$OutputEncoding = [Console]::OutputEncoding\n[string[]]$forwarded = @(ConvertFrom-Json $env:HARNESS_SCRIPT_ARGUMENTS)\n$input | & $env:HARNESS_SCRIPT_LAUNCHER @forwarded\nexit $LASTEXITCODE\n").unwrap();
-    let args =
-        serde_json::to_string(&["exec", "", "проверка", "trailing", "literal", "--"]).unwrap();
-    sample_case(
-        "launch.script_fallback_missing_module_unicode_nonzero",
-        || {
-            let mut child = Command::new(desktop_pwsh())
-                .args(["-NoLogo", "-NoProfile", "-File"])
-                .arg(&runner)
-                .current_dir(&workspace)
-                .env("CODEX_HOME", &home)
-                .env("PATH", &isolated_path)
-                .env("HARNESS_SCRIPT_LAUNCHER", &launcher)
-                .env("HARNESS_SCRIPT_ARGUMENTS", &args)
-                .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
-                .env("PYTHONUTF8", "1")
-                .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all("первая строка\nsecond line\n".as_bytes())
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(json!({}));
-            let stdin = report["stdin"].as_str().unwrap_or("").replace("\r\n", "\n");
-            json!({"passed": output.status.code() == Some(19) && stderr.contains("Harness unavailable") && stdin == "первая строка\nsecond line\n", "exit": output.status.code()})
-        },
-    )
-}
-
 fn missing_core_check() -> Value {
     sample_case("check.core_missing_installation", || {
         let root = tempfile::tempdir().unwrap();
@@ -421,33 +461,6 @@ fn missing_core_check() -> Value {
             .output()
             .unwrap();
         json!({"passed": !output.status.success() && !home.exists() && !user.exists(), "exit": output.status.code()})
-    })
-}
-
-fn script_missing_check() -> Value {
-    sample_case("check.script_missing_owned_homes", || {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("codex");
-        let user = root.path().join("user");
-        fs::create_dir_all(&user).unwrap();
-        let output = Command::new(desktop_pwsh())
-            .args(["-NoLogo", "-NoProfile", "-File"])
-            .arg(checkout().join("install.ps1"))
-            .args([
-                "-CoreOnly",
-                "-Mode",
-                "Check",
-                "-PathScope",
-                "Process",
-                "-CodexHome",
-            ])
-            .arg(&home)
-            .arg("-UserHome")
-            .arg(&user)
-            .current_dir(checkout())
-            .output()
-            .unwrap();
-        json!({"passed": !output.status.success(), "exit": output.status.code()})
     })
 }
 
@@ -545,6 +558,99 @@ fn missing_build_check() -> Value {
             .unwrap();
         let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(json!({}));
         json!({"passed": !output.status.success() && report["runtime_allowed"] == false, "exit": output.status.code(), "status": report["status"]})
+    })
+}
+
+/// Native replacement for the retired script fallback: a degraded native
+/// installation starts the verified upstream with the original arguments,
+/// streams and exit status instead of running the harness.
+fn native_degraded_launch_case() -> Value {
+    // The registered build (including the launcher copy) is prepared once so
+    // the measurement covers launcher startup, not fixture copying.
+    let fixture = tempfile::Builder::new()
+        .prefix("native-degraded-build-")
+        .tempdir()
+        .unwrap();
+    let build = fixture.path().join("build");
+    fs::create_dir_all(&build).unwrap();
+    let launcher_exe = build.join("codex.exe");
+    fs::copy(env!("CARGO_BIN_EXE_codex"), &launcher_exe).unwrap();
+    // A small stub keeps the record valid without copying the full manager.
+    let manager_exe = build.join("codex-harness.exe");
+    fs::write(&manager_exe, b"inert manager fixture; never executed").unwrap();
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "source_root": fixture.path().join("source"),
+            "source": {"sha256": sha256_file(&launcher_exe), "files": {}},
+            "rustc": "fixture",
+            "cargo": "fixture",
+            "target": "x86_64-pc-windows-msvc",
+            "profile": "test",
+            "binaries": {
+                "codex.exe": sha256_file(&launcher_exe),
+                "codex-harness.exe": sha256_file(&manager_exe)
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    sample_case("launch.native_degraded_fallback_unicode_nonzero", || {
+        let root = tempfile::Builder::new()
+            .prefix("native-degraded-launch-")
+            .tempdir()
+            .unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let upstream = root.path().join("upstream.exe");
+        fs::copy(env!("CARGO_BIN_EXE_harness-launch-fixture"), &upstream).unwrap();
+        fs::write(
+            home.join("harness/native-launch.json"),
+            serde_json::to_vec(&json!({
+                "task_control": false,
+                "schema": 2,
+                "state": null,
+                "build": build,
+                "upstream": {
+                    "executable": upstream,
+                    "sha256": sha256_file(&upstream),
+                    "package": null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let args = ["exec", "", "проверка", "trailing", "literal", "--"];
+        let mut child = Command::new(&launcher_exe)
+            .args(args)
+            .current_dir(&workspace)
+            .env("CODEX_HOME", &home)
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all("первая строка\nsecond line\n".as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(json!({}));
+        let stdin = report["stdin"].as_str().unwrap_or("").replace("\r\n", "\n");
+        json!({
+            "passed": output.status.code() == Some(19)
+                && stderr.contains("shared harness unavailable")
+                && stdin == "первая строка\nsecond line\n",
+            "exit": output.status.code(),
+            "degraded": stderr.contains("shared harness unavailable")
+        })
     })
 }
 
@@ -813,41 +919,49 @@ fn resolve_node() -> PathBuf {
         .expect("node.exe on PATH outside WindowsApps")
 }
 
-fn subscription_case() -> Value {
+/// Native replacement for the retired script bounded-process oracle: the same
+/// node fixture under the native helper's job containment.
+fn native_bounded_node_case() -> Value {
     let node = resolve_node();
     sample_case(
-        "subscription.bounded_node_fixture_nonzero_and_timeout",
+        "process.native_bounded_node_fixture_nonzero_and_timeout",
         || {
             let root = tempfile::Builder::new()
-                .prefix("harness-baseline-subscription-")
+                .prefix("harness-baseline-bounded-node-")
                 .tempdir()
                 .unwrap();
             let fixture = root.path().join("fixture.cjs");
             fs::write(&fixture, "const fs=require('node:fs');\nconst [mode,...args]=process.argv.slice(2);\nif(mode==='normal'){console.log(JSON.stringify({argv:args}));console.error('fixture stderr');process.exitCode=7;}\nelse if(mode==='linger'){fs.writeFileSync(args[0], String(process.pid)); setInterval(()=>{},1000);}\n").unwrap();
-            let request = root.path().join("normal.request.json");
-            fs::write(&request, serde_json::to_vec(&json!({"executable": node, "arguments": [fixture, "normal", "проверка"], "workingDirectory": root.path(), "stdoutPath": root.path().join("normal.stdout"), "stderrPath": root.path().join("normal.stderr"), "memoryLimitMiB": 160, "timeoutSeconds": 10, "environment": {"CODEX_BOUNDED_TEST": "маркер"}})).unwrap()).unwrap();
-            let result_path = root.path().join("normal.result.json");
-            let output = Command::new(desktop_pwsh())
-                .args(["-NoLogo", "-NoProfile", "-File"])
-                .arg(checkout().join("tools/opencodex-process.ps1"))
-                .arg("-RequestPath")
-                .arg(&request)
-                .arg("-ResultPath")
-                .arg(&result_path)
-                .output()
-                .unwrap();
-            let result: Value = serde_json::from_slice(&fs::read(&result_path).unwrap_or_default())
-                .unwrap_or(json!({}));
-            let linger_request = root.path().join("linger.request.json");
-            fs::write(&linger_request, serde_json::to_vec(&json!({"executable": node, "arguments": [fixture, "linger", root.path().join("linger.pid")], "workingDirectory": root.path(), "stdoutPath": root.path().join("linger.stdout"), "stderrPath": root.path().join("linger.stderr"), "memoryLimitMiB": 160, "timeoutSeconds": 1, "environment": {}})).unwrap()).unwrap();
-            let linger = Command::new(desktop_pwsh())
-                .args(["-NoLogo", "-NoProfile", "-File"])
-                .arg(checkout().join("tools/opencodex-process.ps1"))
-                .arg("-RequestPath")
-                .arg(&linger_request)
-                .output()
-                .unwrap();
-            json!({"passed": output.status.code() == Some(7) && (result["ExitCode"] == 7 || result["exitCode"] == 7) && linger.status.code() != Some(0), "exit": output.status.code(), "timeout_exit": linger.status.code()})
+            let pid_file = root.path().join("linger.pid");
+            let run = |timeout: &str, mode: &str, extra: &Path| {
+                Command::new(env!("CARGO_BIN_EXE_harness-observe"))
+                    .args(["--cwd"])
+                    .arg(root.path())
+                    .args(["--timeout", timeout, "--output-limit", "1048576", "--"])
+                    .arg(&node)
+                    .arg(&fixture)
+                    .arg(mode)
+                    .arg(extra)
+                    .output()
+                    .unwrap()
+            };
+            let normal = run("10", "normal", root.path());
+            let normal_report: Value = serde_json::from_slice(&normal.stdout).unwrap_or(json!({}));
+            let linger = run("1", "linger", &pid_file);
+            let linger_report: Value = serde_json::from_slice(&linger.stdout).unwrap_or(json!({}));
+            // The helper exits nonzero for an ordinary child failure and for a
+            // bounded timeout; the receipt carries the distinguishable detail.
+            json!({
+                "passed": normal.status.code() == Some(1)
+                    && normal_report["native"]["ExitCode"] == 7
+                    && linger.status.code() == Some(1)
+                    && linger_report["status"] == "timeout"
+                    && linger_report["reason"] == "Timeout"
+                    && linger_report["job"]["active_processes"] == 0
+                    && linger_report["native"]["ExitCode"] == 124,
+                "exit": normal_report["native"]["ExitCode"],
+                "timeout_reason": linger_report["reason"]
+            })
         },
     )
 }

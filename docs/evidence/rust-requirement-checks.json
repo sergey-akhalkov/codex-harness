@@ -2,12 +2,12 @@
   "schema": 1,
   "capturedUtc": "2026-09-15T12:54:17Z",
   "change": "migrate-harness-to-rust",
-  "task": "7.4; 8.2 executable ownership increment",
-  "scope": "Current requirement-to-check map for accepted native behavior. Dated rust-migration-map.json remains a 2026-09-08 file inventory, not remaining work. Transitional first-party Python/PowerShell/JS/C# paths stay until tasks 8.1-8.2. Global outside-checkout cutover stays 9.x. Graphify is retired from the managed selection and is not ported.",
+  "task": "7.4; 8.2 executable ownership increment; updated by 9.5; check references corrected by the 8.4 review",
+  "scope": "Current requirement-to-check map for accepted native behavior. Dated rust-migration-map.json remains a 2026-09-08 file inventory, not remaining work. Transitional first-party Python/PowerShell/JS/C# paths were retired 2026-09-17 (task 9.5); the executable ownership check reports zero open findings. Global outside-checkout cutover completed in 9.2-9.3. Graphify is retired from the managed selection and is not ported.",
   "matrix": [
     {
       "area": "executable ownership accounting",
-      "status": "native check active; legacy removal open",
+      "status": "native check active; zero open findings (9.5)",
       "checks": [
         "crates/codex-harness/tests/executable_ownership.rs::current_checkout_inventory_is_complete",
         "crates/codex-harness/tests/executable_ownership.rs::unclassified_foreign_executable_fails",
@@ -16,11 +16,11 @@
         "crates/codex-harness/tests/executable_ownership.rs::third_party_dependencies_and_inert_data_remain_distinguishable",
         "crates/codex-harness/tests/executable_ownership.rs::cli_reports_findings_and_clean_trees"
       ],
-      "unfinished": "8.2 removal of classified first-party legacy paths; 9.x native cutover for the live script lifecycle and Python MCP chain"
+      "unfinished": "closed 2026-09-17: the classified legacy paths were deleted and the ownership check passes with only the two declared inert samples"
     },
     {
       "area": "installation/upgrade/repair/relocation/disconnect",
-      "status": "native-covered; global cutover open",
+      "status": "native-covered; staged and global activation verified (9.2)",
       "checks": [
         "crates/codex-harness/tests/native_build.rs::cli_build_reuse_source_staleness_integrity_and_failed_update",
         "crates/codex-harness/tests/native_launcher.rs::installed_manager_link_enforces_integrity_and_allows_source_stale_recovery",
@@ -28,14 +28,14 @@
         "crates/codex-harness/tests/codegraph_install.rs::deferred_install_recover_restores_cbm_manual_policy_and_index_bytes",
         "crates/codex-harness/tests/codegraph_install.rs::disconnect_removes_owned_native_entry_and_keeps_foreign_server"
       ],
-      "unfinished": "9.1-9.2 global install/activation and real-CLI relocation"
+      "unfinished": "closed 2026-09-17: staged 9.1 acceptance and the journaled 9.2 global activation are verified; real-CLI relocation remains covered by the default acceptance suites"
     },
     {
       "area": "component isolation",
       "status": "native-covered",
       "checks": [
         "crates/codex-harness/src/install_cli.rs::tests::mutually_exclusive_selectors_are_rejected",
-        "crates/harness-core/src/lifecycle.rs::component selectors",
+        "crates/harness-core/src/lifecycle.rs::selectors_are_mutually_exclusive",
         "crates/codex-harness/tests/source_diagnostics.rs::check_diagnose_keeps_its_report_and_rejects_mixed_selectors_before_execution"
       ]
     },
@@ -59,13 +59,13 @@
         "crates/codex-harness/tests/console.rs::device_status_and_attributes_queries_are_answered",
         "crates/codex-harness/tests/tui.rs::isolated_path_resolves_the_linked_ordinary_codex_command",
         "crates/codex-harness/tests/tui.rs::actual_tui_status_model_and_trust_write_locally",
-        "crates/codex-harness/tests/script_launcher_fallback.rs::actual_global_cli_tui_smoke_ready_then_quit"
+        "crates/codex-harness/tests/native_launcher.rs::missing_stale_source_and_shared_toml_fail_open_to_verified_upstream"
       ],
-      "unfinished": "tests/ConPty.cs remains only as the opt-in global token-workflow driver's terminal helper until a native global consumer check replaces it (9.3); native ConPTY answers CSI 6n/c queries"
+      "unfinished": "native ConPTY answers CSI 6n/c queries; the transitional tests/ConPty.cs helper and the script token-workflow driver were retired 2026-09-17 and the native global consumer checks live in rtk_adapter, console and tui suites"
     },
     {
       "area": "model-free private diagnostics",
-      "status": "native-covered; global alias still script",
+      "status": "native-covered; native diagnostic alias connected (9.2)",
       "checks": [
         "crates/codex-harness/tests/source_diagnostics.rs::check_diagnose_keeps_its_report_and_rejects_mixed_selectors_before_execution",
         "crates/codex-harness/tests/source_diagnostics.rs::actual_native_layers_conflicts_privacy_and_restoration",
@@ -84,18 +84,21 @@
       ]
     },
     {
-      "area": "subscription lifecycle/containment",
+      "area": "subscription lifecycle/owned-task preservation",
       "status": "native-covered; live global proxy never targeted",
       "checks": [
-        "crates/codex-harness/tests/subscription_service.rs::native_host_assigns_2048_mib_job_publishes_ready_and_cleans_owned_runtime",
-        "crates/harness-core/src/subscription_service.rs::production_host_retries_three_times_one_minute_apart_at_2048_mib",
+        "crates/harness-core/src/subscription_lifecycle.rs::install_writes_native_profile_and_v2_state_without_opencodex",
+        "crates/harness-core/src/subscription_lifecycle.rs::check_reports_legacy_state_as_degraded",
         "crates/harness-core/src/subscription_lifecycle.rs::disconnect_refuses_running_owned_task_without_stopping_it",
-        "crates/harness-core/src/subscription_lifecycle.rs::configure_restart_updates_running_owned_task_in_place_without_stopping_it"
+        "crates/harness-core/src/subscription_lifecycle.rs::configure_restart_reports_retirement",
+        "crates/codex-harness/tests/subscription_login.rs::xai_token_valid_store_prints_only_access_token",
+        "crates/codex-harness/tests/process_service.rs::service_survives_first_client_job_and_reclaims_its_child",
+        "crates/codex-harness/tests/process_service.rs::crash_before_readiness_reclaims_the_service_child"
       ]
     },
     {
       "area": "RTK raw recovery/single execution",
-      "status": "native-covered; global cutover 9.x",
+      "status": "native-covered; global cutover verified (9.2)",
       "checks": [
         "crates/codex-harness/tests/rtk_adapter.rs::exec_preserves_child_identity_and_runs_once",
         "crates/codex-harness/tests/rtk_adapter.rs::hook_rewrites_literal_exec_and_ignores_malformed_and_stop",
@@ -115,14 +118,14 @@
     },
     {
       "area": "skill helpers",
-      "status": "native-covered; global registration 9.x",
+      "status": "native-covered; global registration verified (9.2)",
       "checks": [
         "crates/codex-harness/tests/structured.rs::native_inspect_runs_from_owned_project_outside_checkout",
         "crates/codex-harness/tests/regression.rs::native_observe_runs_from_owned_project_outside_checkout",
         "crates/codex-harness/tests/analysis_samples.rs::observe_and_inspect_refuse_declared_samples_as_helpers",
         "crates/codex-harness/tests/nuphus_stdio.rs::window_fixture_publishes_state_and_stops_cleanly"
       ],
-      "unfinished": "global registration 9.x; transitional skill scripts deleted 2026-09-16"
+      "unfinished": "skill helpers are linked in harness/bin on the user PATH; transitional skill scripts retired 2026-09-16"
     },
     {
       "area": "inert analysis samples",

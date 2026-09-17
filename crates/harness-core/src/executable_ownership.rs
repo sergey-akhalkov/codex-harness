@@ -16,14 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// Roots that always belong to first-party maintained source. Foreign
 /// executables there can never be reclassified as third-party material.
-const FIRST_PARTY_ROOTS: &[&str] = &[
-    "tools/",
-    "tests/",
-    ".agents/",
-    "global/",
-    "crates/",
-    "install.ps1",
-];
+const FIRST_PARTY_ROOTS: &[&str] = &["tools/", "tests/", ".agents/", "global/", "crates/"];
 
 /// The only location where inert language-analysis samples may live.
 const INERT_DATA_PREFIX: &str = "tests/fixtures/";

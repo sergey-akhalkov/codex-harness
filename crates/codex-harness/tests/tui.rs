@@ -133,10 +133,12 @@ fn optional_host_codex_command() -> Option<PathBuf> {
     if let Some(path) = env::var_os("HARNESS_TUI_CODEX") {
         return Some(PathBuf::from(path));
     }
-    let registration = host_codex_home().join("harness/installation.json");
+    // The connected installation records the resolved original CLI in its
+    // native launch registration.
+    let registration = host_codex_home().join("harness/native-launch.json");
     let bytes = fs::read(&registration).ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
-    value["codexCommand"].as_str().map(PathBuf::from)
+    value["upstream"]["executable"].as_str().map(PathBuf::from)
 }
 
 struct IsolatedHome {
@@ -162,34 +164,50 @@ impl IsolatedHome {
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&workspace).unwrap();
         let source = checkout();
-        let launcher = bin.join("codex.ps1");
-        std::os::windows::fs::symlink_file(source.join("tools/codex.ps1"), &launcher).unwrap();
+        // The isolated home reuses the host installation's verifiable build and
+        // registered upstream, so the ordinary launcher path is exercised with
+        // real artifacts instead of a legacy script layout.
+        let host = host_codex_home();
+        let registration: Value = serde_json::from_slice(
+            &fs::read(host.join("harness/native-launch.json"))
+                .expect("connect the kit globally before this suite"),
+        )
+        .unwrap();
+        let host_build = PathBuf::from(registration["build"].as_str().unwrap());
+        let upstream = PathBuf::from(registration["upstream"]["executable"].as_str().unwrap());
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        for entry in fs::read_dir(&host_build).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().is_file() {
+                fs::copy(entry.path(), build.join(entry.file_name())).unwrap();
+            }
+        }
+        let launcher = bin.join("codex.exe");
+        std::os::windows::fs::symlink_file(build.join("codex.exe"), &launcher).unwrap();
+        fs::create_dir_all(home.join("harness")).unwrap();
         std::os::windows::fs::symlink_file(
             source.join("global/principles-of-work.md"),
             home.join("AGENTS.md"),
         )
         .unwrap();
-        let host = host_codex_home();
         if host.join("auth.json").is_file() {
             std::os::windows::fs::symlink_file(host.join("auth.json"), home.join("auth.json"))
                 .unwrap();
         }
-        let bridge = env::var_os("HARNESS_TUI_BRIDGE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_codex-harness")));
         fs::write(
-            home.join("harness/installation.json"),
+            home.join("harness/native-launch.json"),
             serde_json::to_vec_pretty(&json!({
-                "schemaVersion": 1,
-                "sourceRoot": source,
-                "codexCommand": optional_host_codex_command()
-                    .unwrap_or_else(|| source.join("tools/codex.ps1")),
-                "profileName": "harness",
-                "configBridge": bridge,
+                "schema": 2,
+                "task_control": false,
+                "state": null,
+                "build": build,
+                "upstream": registration["upstream"].clone(),
             }))
             .unwrap(),
         )
         .unwrap();
+        let _ = upstream;
         let workspace_key =
             serde_json::to_string(&workspace.to_string_lossy().into_owned()).unwrap();
         fs::write(

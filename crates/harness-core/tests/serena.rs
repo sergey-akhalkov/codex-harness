@@ -12,7 +12,6 @@ use std::{
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -20,11 +19,7 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn entry() -> PathBuf {
-    repo().join("tools/code-tools/serena_entry.py")
-}
-
-fn write_registry(root: &Path, status: &str, version: &str, python: &Path) -> PathBuf {
+fn write_registry(root: &Path, status: &str, version: &str, console: &Path) -> PathBuf {
     let path = root.join("code-tools.json");
     fs::write(
         &path,
@@ -34,7 +29,11 @@ fn write_registry(root: &Path, status: &str, version: &str, python: &Path) -> Pa
                 "identity": "serena-agent",
                 "version": version,
                 "status": status,
-                "paths": {"python": python}
+                "paths": {"console_entrypoint": console}
+            }],
+            "languages": [{
+                "id": "rust", "serena_id": "rust", "status": "adopted",
+                "paths": {"executable": console}
             }]
         }))
         .unwrap(),
@@ -43,18 +42,17 @@ fn write_registry(root: &Path, status: &str, version: &str, python: &Path) -> Pa
     path
 }
 
-fn dummy_python(root: &Path) -> PathBuf {
-    let path = root.join("python.exe");
+fn dummy_console(root: &Path) -> PathBuf {
+    let path = root.join("serena.exe");
     fs::write(&path, b"not-executed").unwrap();
     path
 }
 
-fn owned_launch(root: &Path, registry: PathBuf, python: PathBuf) -> Launch {
+fn owned_launch(root: &Path, registry: PathBuf, console: PathBuf) -> Launch {
     let project = root.join("project");
     fs::create_dir_all(&project).unwrap();
     Launch {
-        python,
-        entry: entry(),
+        serena: console,
         registry,
         project,
         home: root.join("home"),
@@ -68,11 +66,11 @@ fn error_text(error: &io::Error) -> String {
 #[test]
 fn missing_registry_is_rejected_before_child_start() {
     let root = tempfile::tempdir().unwrap();
-    let python = dummy_python(root.path());
+    let console = dummy_console(root.path());
     let launch = owned_launch(
         root.path(),
         root.path().join("missing-registry.json"),
-        python,
+        console,
     );
     let error = serena::command(&launch).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -82,55 +80,63 @@ fn missing_registry_is_rejected_before_child_start() {
 #[test]
 fn incompatible_version_is_rejected_before_child_start() {
     let root = tempfile::tempdir().unwrap();
-    let python = dummy_python(root.path());
-    let registry = write_registry(root.path(), "adopted", "0.0.0", &python);
-    let error = serena::command(&owned_launch(root.path(), registry, python)).unwrap_err();
+    let console = dummy_console(root.path());
+    let registry = write_registry(root.path(), "adopted", "0.0.0", &console);
+    let error = serena::command(&owned_launch(root.path(), registry, console)).unwrap_err();
     assert!(error_text(&error).contains("Reassess the Serena adapter"));
 }
 
 #[test]
-fn missing_python_is_rejected_before_child_start() {
+fn missing_console_entrypoint_is_rejected_before_child_start() {
     let root = tempfile::tempdir().unwrap();
-    let python = root.path().join("missing-python.exe");
-    let registry = write_registry(root.path(), "adopted", "1.7.0", &python);
-    let error = serena::command(&owned_launch(root.path(), registry, python)).unwrap_err();
+    let console = root.path().join("missing-serena.exe");
+    let registry = write_registry(root.path(), "adopted", "1.7.0", &console);
+    let error = serena::command(&owned_launch(root.path(), registry, console)).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
 }
 
 #[test]
 fn incompatible_status_is_rejected_before_child_start() {
     let root = tempfile::tempdir().unwrap();
-    let python = dummy_python(root.path());
-    let registry = write_registry(root.path(), "missing", "1.7.0", &python);
-    let error = serena::command(&owned_launch(root.path(), registry, python)).unwrap_err();
+    let console = dummy_console(root.path());
+    let registry = write_registry(root.path(), "missing", "1.7.0", &console);
+    let error = serena::command(&owned_launch(root.path(), registry, console)).unwrap_err();
     assert!(error_text(&error).contains("explicit provisioning"));
 }
 
 #[test]
-fn command_sets_owned_serena_home_without_spawning() {
+fn command_uses_the_generated_owned_home_without_spawning() {
     let root = tempfile::tempdir().unwrap();
-    let python = dummy_python(root.path());
-    let registry = write_registry(root.path(), "adopted", "1.7.0", &python);
-    let launch = owned_launch(root.path(), registry, python);
+    let console = dummy_console(root.path());
+    let registry = write_registry(root.path(), "adopted", "1.7.0", &console);
+    let launch = owned_launch(root.path(), registry, console.clone());
     let command = serena::command(&launch).unwrap();
-    let expected = launch.home.join("serena-home");
-    assert_eq!(
+    assert_eq!(command.program, console);
+    let expected = launch.home.join("harness/serena-home/workers");
+    let serena_home = PathBuf::from(
         command
             .env
             .get(OsStr::new("SERENA_HOME"))
             .cloned()
-            .flatten(),
-        Some(expected.clone().into_os_string())
+            .flatten()
+            .expect("worker home is configured"),
     );
-    assert!(expected.is_dir());
-    assert_eq!(
-        command
-            .env
-            .get(OsStr::new("HARNESS_SERENA_SHARED_WORKER"))
-            .cloned()
-            .flatten(),
-        None
-    );
+    assert!(serena_home.starts_with(&expected), "{serena_home:?}");
+    assert!(serena_home.is_dir());
+    let generated = fs::read_to_string(serena_home.join("serena_config.yml")).unwrap();
+    assert!(generated.contains("rust"), "{generated}");
+    assert!(generated.contains("ls_base_cmd"), "{generated}");
+}
+
+#[test]
+fn unadopted_project_language_is_refused_before_child_start() {
+    let root = tempfile::tempdir().unwrap();
+    let console = dummy_console(root.path());
+    let registry = write_registry(root.path(), "adopted", "1.7.0", &console);
+    let launch = owned_launch(root.path(), registry, console);
+    fs::write(launch.project.join("App.csproj"), b"<Project/>").unwrap();
+    let error = serena::command(&launch).unwrap_err();
+    assert!(error_text(&error).contains("csharp"), "{error}");
 }
 
 fn adopted_registry() -> Value {
@@ -140,14 +146,14 @@ fn adopted_registry() -> Value {
     serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
 }
 
-fn adopted_python(inventory: &Value) -> PathBuf {
+fn adopted_console(inventory: &Value) -> PathBuf {
     PathBuf::from(
         inventory["mcp"]
             .as_array()
             .unwrap()
             .iter()
             .find(|item| item["id"] == "serena")
-            .unwrap()["paths"]["python"]
+            .unwrap()["paths"]["console_entrypoint"]
             .as_str()
             .unwrap(),
     )
@@ -198,64 +204,35 @@ fn tool_text(session: &mut Session, name: &str, arguments: Value) -> String {
 
 #[test]
 #[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
-fn runtime_guard_rejects_upstream_install_without_mutation() {
+fn generated_configuration_pins_the_adopted_backends_without_touching_the_user_config() {
     let inventory = adopted_registry();
-    let python = adopted_python(&inventory);
+    let console = adopted_console(&inventory);
     let root = tempfile::tempdir().unwrap();
-    let probe = root.path().join("guard");
-    fs::create_dir_all(&probe).unwrap();
-    let inline = probe.join("deny_install.py");
-    fs::write(
-        &inline,
-        r#"
-import importlib.util, json, os, sys
-from pathlib import Path
-entry, registry, probe = sys.argv[1:4]
-os.environ["CODEX_HOME"] = str(Path(probe) / "guard-codex-home")
-spec = importlib.util.spec_from_file_location("serena_entry", entry)
-guard = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(guard)
-inventory = json.loads(Path(registry).read_text(encoding="utf-8-sig"))
-guard.install_runtime_guard(inventory)
-from solidlsp.language_servers.common import RuntimeDependencyCollection
-from solidlsp.ls import SolidLanguageServer
-from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
-target = Path(probe) / "must-not-be-created"
-try:
-    RuntimeDependencyCollection([]).install(str(target))
-except guard.RuntimeProvisioningDenied as error:
-    assert "disabled during MCP sessions" in str(error)
-else:
-    raise SystemExit("Provisioning guard did not reject operation")
-assert not target.exists()
-try:
-    SolidLanguageServer.create(LanguageServerConfig(ls_id=LanguageServerId.JAVA), probe)
-except guard.RuntimeProvisioningDenied as error:
-    assert "disabled during MCP sessions" in str(error)
-else:
-    raise SystemExit("Unmapped language constructor was not denied")
-assert not target.exists()
-print("PASS runtime install denial")
-"#,
-    )
-    .unwrap();
-    let status = Command::new(&python)
-        .args(["-B", inline.to_str().unwrap(), entry().to_str().unwrap()])
-        .arg(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap())
-        .arg(&probe)
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "runtime provisioning guard failed; unmapped language constructors must stay denied"
-    );
+    let project = crate_project(root.path(), "config probe", 7);
+    let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
+    let shared_config =
+        PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(".serena/serena_config.yml");
+    let before = optional_hash(&shared_config);
+    let launch = Launch {
+        serena: console,
+        registry,
+        project,
+        home: root.path().join("home"),
+    };
+    serena::command(&launch).unwrap();
+    let generated =
+        fs::read_to_string(launch.home.join("harness/serena-home/serena_config.yml")).unwrap();
+    assert!(generated.contains("rust:"), "{generated}");
+    assert!(generated.contains("ls_base_cmd"), "{generated}");
+    assert!(generated.contains("rust-analyzer"), "{generated}");
+    assert_eq!(optional_hash(&shared_config), before);
 }
 
 #[test]
 #[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
 fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
     let inventory = adopted_registry();
-    let python = adopted_python(&inventory);
+    let console = adopted_console(&inventory);
     let rust_analyzer = inventory["languages"]
         .as_array()
         .unwrap()
@@ -268,8 +245,7 @@ fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
         PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(".serena/serena_config.yml");
     let before = [
         ("shared-config", optional_hash(&shared_config)),
-        ("python", optional_hash(&python)),
-        ("entry", optional_hash(&entry())),
+        ("serena", optional_hash(&console)),
         ("rust-analyzer", optional_hash(&rust_analyzer)),
     ];
     let root = tempfile::tempdir().unwrap();
@@ -280,8 +256,7 @@ fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
     let cancel = Cancellation::default();
     let mut alpha = Session::start(
         &Launch {
-            python: python.clone(),
-            entry: entry(),
+            serena: console.clone(),
             registry: registry.clone(),
             project: alpha_project,
             home: root.path().join("home-alpha"),
@@ -291,8 +266,7 @@ fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
     .unwrap();
     let mut beta = Session::start(
         &Launch {
-            python: python.clone(),
-            entry: entry(),
+            serena: console.clone(),
             registry,
             project: beta_project,
             home: root.path().join("home-beta"),
@@ -371,8 +345,7 @@ fn rust_session_isolates_two_owned_projects_and_preserves_shared_config() {
     for (label, hash) in before {
         let path = match label {
             "shared-config" => shared_config.as_path(),
-            "python" => python.as_path(),
-            "entry" => &entry(),
+            "serena" => console.as_path(),
             "rust-analyzer" => rust_analyzer.as_path(),
             _ => unreachable!(),
         };
@@ -387,26 +360,25 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
     use harness_core::serena_shared::{self, Pool};
 
     let inventory = adopted_registry();
-    let python = adopted_python(&inventory);
+    let console = adopted_console(&inventory);
     let root = tempfile::tempdir().unwrap();
     eprintln!("Serena shared-pool probe root: {}", root.path().display());
     let alpha_project = crate_project(root.path(), "shared alpha", 301);
     let beta_project = crate_project(root.path(), "shared beta", 302);
     let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
     let codex_home = root.path().join("codex-home");
-    let serena_home = root.path().join("serena-home");
-    fs::create_dir_all(&serena_home).unwrap();
-    fs::write(serena_home.join("serena_config.yml"), "projects: []\n").unwrap();
     let launch = Launch {
-        python: python.clone(),
-        entry: entry(),
+        serena: console,
         registry: registry.clone(),
         project: root.path().to_path_buf(),
         home: codex_home,
     };
     let cancel = Cancellation::default();
-    let factory = serena_shared::session_factory(launch, serena_home.clone(), cancel).unwrap();
+    let factory = serena_shared::session_factory(launch, cancel).unwrap();
     let policy = serena_route::policy(&repo()).unwrap();
+    let serena_home =
+        harness_core::serena_configuration::prepare(&registry, &root.path().join("codex-home"))
+            .unwrap();
     let mut pool = Pool::new(policy, serena_home, factory).unwrap();
     let initialize = json!({
         "protocolVersion": "2024-11-05",

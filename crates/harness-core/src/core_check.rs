@@ -234,8 +234,7 @@ fn inspect_native_launch(
 }
 
 fn require_native_commands(links: &[InstalledLink], build: &Path) -> io::Result<()> {
-    let expected: BTreeSet<_> = build_identity::BINARIES
-        .iter()
+    let expected: BTreeSet<_> = crate::core_install::core_linked_binaries()
         .map(|name| name.trim_end_matches(".exe").to_owned())
         .collect();
     let mut found = BTreeSet::new();
@@ -430,7 +429,7 @@ mod tests {
                     connection: Connection::Missing,
                 },
             ];
-            for binary in build_identity::BINARIES {
+            for binary in crate::core_install::core_linked_binaries() {
                 links.push(Link {
                     kind: "native-command".into(),
                     name: binary.trim_end_matches(".exe").into(),

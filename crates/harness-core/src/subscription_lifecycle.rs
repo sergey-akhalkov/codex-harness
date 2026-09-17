@@ -1181,7 +1181,16 @@ mod tests {
         (base.join("codex"), base.join("user"), base.join("source"))
     }
 
-    fn legacy_installed(root: &Path) -> (PathBuf, Value) {
+    /// Owned scheduled tasks are machine state; retire this fixture's
+    /// definition even when a test finishes before its own disconnect.
+    struct TaskCleanup(String);
+    impl Drop for TaskCleanup {
+        fn drop(&mut self) {
+            let _ = task_scheduler::remove(&self.0, None);
+        }
+    }
+
+    fn legacy_installed(root: &Path) -> (PathBuf, Value, TaskCleanup) {
         write_source(root);
         let manager = write_manager(root);
         let (home, user, source) = absolute_paths(root);
@@ -1227,7 +1236,11 @@ mod tests {
             }
         });
         write_json(&home.join("harness/subscription-routing.json"), &state).unwrap();
-        (home.join("harness/subscription-routing.json"), state)
+        (
+            home.join("harness/subscription-routing.json"),
+            state,
+            TaskCleanup(task),
+        )
     }
 
     #[test]
@@ -1269,7 +1282,7 @@ mod tests {
     #[test]
     fn install_retires_legacy_opencodex_records() {
         let root = tempfile::tempdir().unwrap();
-        let (state_path, state) = legacy_installed(root.path());
+        let (state_path, state, _task) = legacy_installed(root.path());
         let (home, user, source) = absolute_paths(root.path());
         let report = install(&request(root.path())).unwrap();
         assert_eq!(report.status, "connected-native");
@@ -1306,7 +1319,7 @@ mod tests {
     #[test]
     fn install_preserves_foreign_config_link() {
         let root = tempfile::tempdir().unwrap();
-        let (_, state) = legacy_installed(root.path());
+        let (_, state, _task) = legacy_installed(root.path());
         let (_home, user, _source) = absolute_paths(root.path());
         let foreign = std::path::absolute(root.path())
             .unwrap()
@@ -1396,7 +1409,7 @@ mod tests {
     #[test]
     fn check_reports_legacy_state_as_degraded() {
         let root = tempfile::tempdir().unwrap();
-        legacy_installed(root.path());
+        let (_, _, _task) = legacy_installed(root.path());
         let observed = check(&request(root.path())).unwrap();
         assert_eq!(observed.status, "degraded");
         assert_eq!(observed.port, Some(10100));
@@ -1406,7 +1419,7 @@ mod tests {
     #[test]
     fn recover_preview_preserves_pending_and_private_files() {
         let root = tempfile::tempdir().unwrap();
-        let (_, state) = legacy_installed(root.path());
+        let (_, state, _task) = legacy_installed(root.path());
         let (home, _user, _source) = absolute_paths(root.path());
         let pending_path = home.join("harness/subscription-routing-pending.json");
         let pending = serde_json::json!({
@@ -1440,7 +1453,7 @@ mod tests {
     #[test]
     fn recover_completes_retirement_journal() {
         let root = tempfile::tempdir().unwrap();
-        let (_, state) = legacy_installed(root.path());
+        let (_, state, _task) = legacy_installed(root.path());
         let (home, user, _source) = absolute_paths(root.path());
         let pending_path = home.join("harness/subscription-routing-pending.json");
         let pending = serde_json::json!({
@@ -1479,7 +1492,7 @@ mod tests {
     #[test]
     fn disconnect_removes_native_profile_and_legacy_records() {
         let root = tempfile::tempdir().unwrap();
-        let (_, state) = legacy_installed(root.path());
+        let (_, state, _task) = legacy_installed(root.path());
         let (home, user, _source) = absolute_paths(root.path());
         install(&request(root.path())).unwrap();
         let report = disconnect(&request(root.path())).unwrap();
@@ -1506,7 +1519,7 @@ mod tests {
     #[test]
     fn disconnect_refuses_running_owned_task_without_stopping_it() {
         let root = tempfile::tempdir().unwrap();
-        let (_, state) = legacy_installed(root.path());
+        let (_, state, _task) = legacy_installed(root.path());
         let (home, _user, _source) = absolute_paths(root.path());
         let task = state["task"].as_str().unwrap().to_string();
         let xml = crate::task_scheduler::with_exec_action(

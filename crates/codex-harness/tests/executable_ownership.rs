@@ -263,27 +263,20 @@ fn current_checkout_inventory_is_complete() {
     let bytes = fs::read(source.join("docs/evidence/executable-ownership.json")).unwrap();
     let doc: OwnershipDocument = serde_json::from_slice(&bytes).unwrap();
     let report = executable_ownership::check(&source, &doc).unwrap();
-    let unexpected: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|finding| finding.kind != "legacy-executable")
-        .collect();
     assert!(
-        unexpected.is_empty(),
-        "unexpected ownership findings: {unexpected:?}"
+        report.findings.is_empty(),
+        "the delivered tree must carry no open ownership findings: {:?}",
+        report.findings
     );
-    let legacy = report
-        .findings
-        .iter()
-        .filter(|finding| finding.kind == "legacy-executable")
-        .count();
-    assert!(legacy > 0);
     assert_eq!(
         report.classified_counts.get("inert-data"),
         Some(&2),
         "declared analysis samples must stay classified"
     );
-    assert_eq!(report.executable_files, legacy + 2);
+    assert_eq!(
+        report.executable_files, 2,
+        "only declared inert analysis samples remain foreign-language files"
+    );
 }
 
 #[test]

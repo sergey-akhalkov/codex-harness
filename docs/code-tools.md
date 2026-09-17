@@ -86,8 +86,9 @@ only their statement spans and preserves foreign settings and comments.
 Conflicting owned settings are preserved and reported.
 
 Each registration explicitly supplies the active `CODEX_HOME` path. Native MCP
-processes do not inherit it by default. [mcp.ps1](../tools/mcp.ps1) reads the
-resolved shared installation registry and dispatches into repository source.
+processes do not inherit it by default. The native `codex-harness mcp` entry
+reads the resolved shared installation registry and serves the selected tool
+through its first-party adapter.
 There are no copied server definitions in the user config. The native connection
 also owns `mcp_optional_startup_grace_ms=0`: initial and resumed sessions wait for
 each optional server's finite startup timeout before building the tool catalogue.
@@ -306,11 +307,11 @@ On an existing installation, reconcile only code-tool connections and resource
 policy without package changes, core links or subscription routing:
 
 ```powershell
-pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Install -WhatIf
-pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Install
-pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Check
-pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Recover
-pwsh -NoProfile -File ./install.ps1 -CodeToolsOnly -Mode Disconnect
+& <build>\codex-harness.exe install    --code-tools-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME> --preview
+& <build>\codex-harness.exe install    --code-tools-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe check      --code-tools-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe recover    --code-tools-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe disconnect --code-tools-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
 ```
 
 Install adopts discovered dependencies and commits registration, registry and
@@ -319,8 +320,8 @@ connection/dependency health and resource drift; it does not install packages.
 Recover rolls back an interrupted scoped transaction or completes cleanup after
 its durable commit. Disconnect retires owned shared services and removes
 still-owned connections. Unrelated component journals remain untouched. A pending
-combined activation requires Recover without the selector. `-CodeToolsOnly`
-does not support Update; missing dependencies need the full explicit
+combined activation requires Recover without the selector.
+Missing dependencies need the full explicit
 installation lifecycle. See [installation and recovery](installation.md).
 
 Restart native Codex sessions that loaded the previous MCP processes.
@@ -337,13 +338,12 @@ reported as a connection conflict.
 The full kit lifecycle, including explicit dependency maintenance, remains:
 
 ```powershell
-./install.ps1 -Mode Install -WhatIf
-./install.ps1 -Mode Install
-./install.ps1 -Mode Update -WhatIf
-./install.ps1 -Mode Update
-./install.ps1 -Mode Check
-./install.ps1 -Mode Recover
-./install.ps1 -Mode Disconnect
+& <build>\codex-harness.exe install    --core-only --source . --build <build> --codex-home <CODEX_HOME> --user-home <USER_HOME> --preview
+& <build>\codex-harness.exe install    --core-only --source . --build <build> --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe update     --core-only --source . --build <build> --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe check      --core-only --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe recover    --core-only --codex-home <CODEX_HOME> --user-home <USER_HOME>
+& <build>\codex-harness.exe disconnect --core-only --codex-home <CODEX_HOME> --user-home <USER_HOME>
 ```
 
 Preview performs read-only discovery and official metadata requests. Package
@@ -362,7 +362,7 @@ Native MCP/hook contract notes that remain current:
 
 - MCP registrations are path references into live source, not copied bodies.
 - Native TUI trust and unprofiled app-server writers have distinct targets; see
-  [installation](installation.md#shared-defaults-and-local-tui-writes).
+  [installation](installation.md#what-is-connected).
 - Child agents may be unable to resolve a parent's connected adapter in the
   tested CLI; a source-owned command fallback must preserve original results
   and never turn failed analysis into a clean report.

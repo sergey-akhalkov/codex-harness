@@ -22,11 +22,7 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn entry() -> PathBuf {
-    repo().join("tools/code-tools/serena_entry.py")
-}
-
-fn adopted_python() -> PathBuf {
+fn adopted_console() -> PathBuf {
     let path = PathBuf::from(
         std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit adopted registry"),
     );
@@ -37,7 +33,7 @@ fn adopted_python() -> PathBuf {
             .unwrap()
             .iter()
             .find(|item| item["id"] == "serena")
-            .unwrap()["paths"]["python"]
+            .unwrap()["paths"]["console_entrypoint"]
             .as_str()
             .unwrap(),
     )
@@ -76,24 +72,19 @@ impl Proxy {
     fn start(
         _root: &Path,
         codex_home: &Path,
-        serena_home: &Path,
         registry: &Path,
         project: &Path,
-        python: &Path,
+        console: &Path,
     ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
             .arg("mcp")
             .arg("serena")
-            .arg("--python")
-            .arg(python)
-            .arg("--entry")
-            .arg(entry())
+            .arg("--serena")
+            .arg(console)
             .arg("--registry")
             .arg(registry)
             .arg("--codex-home")
             .arg(codex_home)
-            .arg("--serena-home")
-            .arg(serena_home)
             .arg("--source-root")
             .arg(repo())
             .arg("--connection-seconds")
@@ -196,27 +187,17 @@ fn broker_status(codex_home: &Path) -> Value {
 #[test]
 #[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
 fn mcp_serena_proxy_shares_one_worker_and_filters_the_catalogue() {
-    let python = adopted_python();
+    let console = adopted_console();
     let registry = PathBuf::from(
         std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit adopted registry"),
     );
     let root = tempfile::tempdir().unwrap();
     eprintln!("Serena proxy end-to-end root: {}", root.path().display());
     let codex_home = root.path().join("codex-home");
-    let serena_home = root.path().join("serena-home");
-    fs::create_dir_all(&serena_home).unwrap();
-    fs::write(serena_home.join("serena_config.yml"), "projects: []\n").unwrap();
     let alpha = crate_project(root.path(), "proxy alpha", 401);
     let beta = crate_project(root.path(), "proxy beta", 402);
 
-    let mut first = Proxy::start(
-        root.path(),
-        &codex_home,
-        &serena_home,
-        &registry,
-        &alpha,
-        &python,
-    );
+    let mut first = Proxy::start(root.path(), &codex_home, &registry, &alpha, &console);
     let initialize = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {},
@@ -259,14 +240,7 @@ fn mcp_serena_proxy_shares_one_worker_and_filters_the_catalogue() {
     assert!(text.contains("401"), "{text}");
 
     // A second stdio client of the same project shares the broker worker.
-    let mut second = Proxy::start(
-        root.path(),
-        &codex_home,
-        &serena_home,
-        &registry,
-        &alpha,
-        &python,
-    );
+    let mut second = Proxy::start(root.path(), &codex_home, &registry, &alpha, &console);
     let reply = second.request(1, "initialize", initialize.clone());
     assert_eq!(reply["result"]["serverInfo"]["name"], "Serena");
     let status = broker_status(&codex_home);
@@ -274,14 +248,7 @@ fn mcp_serena_proxy_shares_one_worker_and_filters_the_catalogue() {
     assert_eq!(status["backend"]["clients"], 2, "{status}");
 
     // A different project gets its own isolated worker.
-    let mut third = Proxy::start(
-        root.path(),
-        &codex_home,
-        &serena_home,
-        &registry,
-        &beta,
-        &python,
-    );
+    let mut third = Proxy::start(root.path(), &codex_home, &registry, &beta, &console);
     let reply = third.request(1, "initialize", initialize.clone());
     assert_eq!(reply["result"]["serverInfo"]["name"], "Serena");
     let search = third.request(
