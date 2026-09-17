@@ -7,12 +7,12 @@ Make the accepted MCP and language capabilities usable from globally configured 
 
 Serena, CodeGraph from `colbymchenry/codegraph`, and Nuphus SHALL be the
 managed global capabilities, subject to applicable user overrides. Graphify
-SHALL be retired from the managed selection the same way Codebase Memory was:
-an update removes only the owned registration, while shared packages, saved
-graphs and explicit local rollback routes remain installed and usable without
-per-project configuration. The accepted subscription-efficiency selection SHALL
-still be allowed to disable an LSP-bearing integration when its language
-functions fail the benefit gate, including Serena; unrelated useful MCP
+SHALL remain retired from the managed selection the same way Codebase Memory
+was: an update removes only the owned registration, while the shared package
+and saved state remain installed and usable through an explicit local route
+without per-project configuration. The accepted subscription-efficiency
+selection SHALL still be allowed to disable an LSP-bearing integration when
+its language functions fail the benefit gate, including Serena; unrelated useful MCP
 functions and external installations SHALL be preserved. Retained integrations
 SHALL be discoverable without per-project configuration, manual startup or a
 special working directory in supported interactive, non-interactive,
@@ -172,18 +172,6 @@ Project-sensitive calls, language-server state, diagnostics and indexes SHALL be
 - **WHEN** a session operates in that root
 - **THEN** the selected project, configuration, cache identity and reported file paths agree with that root
 
-### Requirement: Graphify lifecycle and repository selection
-
-Graphify SHALL reuse the intended graphifyy installation and preserve the existing graph data. A healthy compatible shared endpoint SHALL be reused when its authenticated connection and ownership are available; otherwise the kit SHALL provide a verified independent connection using the same installation and selected graph without depending on launching OpenCode. Secrets SHALL stay outside tracked source and ordinary logs. Repository-specific Graphify operations SHALL require an explicit resolved repository and MUST NOT infer it from the shared service's working directory.
-
-#### Scenario: The existing shared service is stopped
-- **WHEN** Codex starts in an ordinary terminal
-- **THEN** Graphify becomes callable through the managed connection lifecycle without requiring OpenCode to be launched and without replacing the saved graph
-
-#### Scenario: A repository-specific call lacks repository identity
-- **WHEN** a shared Graphify repository operation has no explicit valid repository
-- **THEN** it fails with a precise input error before querying or acting on an unintended repository
-
 ### Requirement: Complete global acceptance evidence
 
 Acceptance SHALL exercise the selected configuration through actual installed Codex consumers outside this checkout. It SHALL cover retained operations, intentional absence of retired hooks/LSP, applicable entry points, concurrent-root isolation and selected install/update/recovery paths. Component versions, source identities, inputs, outputs and substitute-environment limits SHALL be recorded. Automatic diagnostic evidence SHALL be required only for capabilities passing the benefit gate, including every strict no-trigger scenario. Unrelated OpenCode configuration SHALL be preserved; additional runs of the original source-kit consumer SHALL NOT be required. Rejected capabilities SHALL NOT be misrepresented as verified support or force unbounded further evaluation.
@@ -193,7 +181,7 @@ Acceptance SHALL exercise the selected configuration through actual installed Co
 - **THEN** all accepted operations and lifecycle requirements have evidence, rejected capabilities remain absent, and no required task is unchecked
 
 ### Requirement: CodeGraph MCP starts with Codex CLI
-Owned CodeGraph SHALL become ready during Codex CLI startup through the installed registration, together with the other retained MCP servers. The registered command MUST remain able to complete MCP initialize when its native binaries still match their recorded hashes, even if the linked checkout later differs from that build. A manager that is admitted only for integrity-checked management MUST NOT be the Codex MCP command unless it is also admitted for serving. Ordinary Codex startup MUST NOT download packages, rebuild native source, alter agent instructions, install hooks or enable telemetry. Unrelated MCP registrations, user edits, published CodeGraph/Node and existing indexes SHALL be preserved. An unavailable CodeGraph process SHALL remain explicit and MUST NOT disable Serena, Graphify or Nuphus.
+Owned CodeGraph SHALL become ready during Codex CLI startup through the installed registration, together with the other retained MCP servers. The registered command MUST remain able to complete MCP initialize when its native binaries still match their recorded hashes, even if the linked checkout later differs from that build. A manager that is admitted only for integrity-checked management MUST NOT be the Codex MCP command unless it is also admitted for serving. Ordinary Codex startup MUST NOT download packages, rebuild native source, alter agent instructions, install hooks or enable telemetry. Unrelated MCP registrations, user edits, published CodeGraph/Node and existing indexes SHALL be preserved. An unavailable CodeGraph process SHALL remain explicit and MUST NOT disable the other retained MCP servers.
 
 #### Scenario: Codex CLI starts after later source edits
 - **WHEN** a consumer starts Codex CLI through the installed launcher after the linked checkout has changed relative to the recorded native build, and the recorded CodeGraph binaries still match
@@ -205,7 +193,7 @@ Owned CodeGraph SHALL become ready during Codex CLI startup through the installe
 
 #### Scenario: Native binaries no longer match the recorded build
 - **WHEN** the registered CodeGraph command is missing, hash-mismatched or otherwise not admitted for serving
-- **THEN** Codex CLI still starts, CodeGraph is omitted with an explicit startup failure, and Serena, Graphify and Nuphus remain available
+- **THEN** Codex CLI still starts, CodeGraph is omitted with an explicit startup failure, and Serena and Nuphus remain available
 
 ### Requirement: Check reports CodeGraph serving admission
 Check SHALL inspect owned CodeGraph without installing, rebuilding or mutating configuration. Check MUST NOT report the owned CodeGraph registration as connected when the registered command cannot complete MCP initialize. A source-stale checkout whose recorded binaries still match MAY be reported as degraded for rebuild awareness while remaining callable. Interrupted registration recovery, unrelated settings and user edits SHALL stay preserved.

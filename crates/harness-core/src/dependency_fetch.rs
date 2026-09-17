@@ -28,7 +28,6 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
             "uv",
             "https://pypi.org/pypi/serena-agent/json",
         ),
-        Some("graphify") => ("graphifyy", "uv", "https://pypi.org/pypi/graphifyy/json"),
         Some("codebase-memory") => (
             "codebase-memory-mcp",
             "npm",

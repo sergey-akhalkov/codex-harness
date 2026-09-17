@@ -1006,7 +1006,7 @@ mod tests {
         );
         let error = install(
             &fixture.request,
-            "graphify",
+            "serena",
             "1.9.9",
             &mut FakeOps::new(false),
         )

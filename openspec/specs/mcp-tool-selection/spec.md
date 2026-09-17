@@ -93,7 +93,7 @@ Delivered tool guidance SHALL preserve current user authority, source-based unce
 
 ### Requirement: Evidence-based optional capability selection
 
-Graphify-based mixed-source context and Serena-based cross-project querying SHALL receive bounded applicability evaluations with an independent expected answer. Selection SHALL include preparation, freshness, process resources and maintenance cost. A candidate SHALL be adopted only with demonstrated task benefit and a supported preservation/lifecycle path; otherwise the existing route SHALL be retained with an evidence-backed reason. Evaluation MUST NOT silently add model billing, downloads, automatic indexing or a permanent service.
+Optional mixed-source or cross-project candidates SHALL receive bounded applicability evaluations with an independent expected answer. Selection SHALL include preparation, freshness, process resources and maintenance cost. A candidate SHALL be adopted only with demonstrated task benefit and a supported preservation/lifecycle path; otherwise the existing route SHALL be retained with an evidence-backed reason. Evaluation MUST NOT silently add model billing, downloads, automatic indexing or a permanent service.
 
 #### Scenario: Applicability evaluation was not completed
 - **WHEN** a candidate has neither an evidence-backed adoption nor a justified retention decision

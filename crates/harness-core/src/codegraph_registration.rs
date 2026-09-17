@@ -22,6 +22,12 @@ use std::{
 const BEGIN: &str = "# BEGIN codex-harness MCP registrations\n";
 const END: &str = "# END codex-harness MCP registrations\n";
 const CBM: &str = "codebase-memory";
+/// Retired names stay in the skip/conflict lists so Update removes an owned
+/// registration recorded by a pre-retirement version instead of re-registering
+/// it, and still refuses name/ownership conflicts on an unowned same-name
+/// table. Removal condition: no supported host state can predate the
+/// 2026-09-15 Graphify retirement (revisit at the next major lifecycle
+/// change); see `docs/evidence/legacy-mcp-retirement.json`.
 const GRAPHIFY: &str = "graphify";
 const GRAPH: &str = "codegraph";
 const LSP: &str = "harness-lsp";

@@ -1,10 +1,10 @@
 # Native Rust implementation
 
-The [migration specification](../openspec/changes/migrate-harness-to-rust/proposal.md)
+The [migration specification](../openspec/changes/archive/2026-09-17-migrate-harness-to-rust/proposal.md)
 requires Rust for all maintained harness-owned executable code, including tests
 and skill helpers. This is a rule for pack development; it does not change the
 languages of projects using the kit. External Codex, Serena,
-Codebase Memory, published CodeGraph/Node, Graphify, Nuphus and language
+Codebase Memory, published CodeGraph/Node, Nuphus and language
 servers retain their own implementations and supported runtimes. The
 first-party CodeGraph adapter is Rust and is the live global graph after
 replacement acceptance.
@@ -615,7 +615,7 @@ the shared user npm tree through a native journaled create-directory
 transaction: audited official archives only, staged and installed executables
 probed, provenance marker recorded, and any post-activation failure rolls the
 activation back to prior absence. Existing installations, a shared npm
-lockfile and foreign markers are preserved without mutation. Serena, Graphify,
+lockfile and foreign markers are preserved without mutation. Serena,
 shared-tree replacement updates and the remaining language backends stay
 pending for their owning tasks. Complete provisioning and global connection
 remain open.

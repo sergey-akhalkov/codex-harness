@@ -429,7 +429,7 @@ pub fn apply(request: &Request) -> io::Result<Value> {
         "results": results,
         "complete": complete,
         "all_updates_applied": all_updates_applied,
-        "note": "Missing shared npm MCP packages install through the native journaled path; serena, graphify and shared-tree replacements stay pending for their owning tasks. Installed-unverified records require real consumer checks."
+        "note": "Missing shared npm MCP packages install through the native journaled path; serena and shared-tree replacements stay pending for their owning tasks. Installed-unverified records require real consumer checks."
     }))
 }
 

@@ -15,7 +15,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const STORE_DIR_NAME: &str = ".codegraph-harness-store";
@@ -479,7 +479,10 @@ fn rotate_checkpoint(
 ) -> io::Result<()> {
     // SQLite readers on Windows do not share deletion. A short read must not
     // permanently disable automatic refresh; an ACL denial must stay bounded.
-    let until = Deadline::after(deadline.remaining().min(Duration::from_secs(2)))?;
+    // The retry window starts with the first retryable failure and is always
+    // shorter than the remaining deadline, so an expired deadline reports a
+    // timeout instead of the last raw sharing error.
+    let mut retry_until: Option<Instant> = None;
     loop {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
@@ -495,8 +498,16 @@ fn rotate_checkpoint(
         }
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) && !until.expired() => {
-                std::thread::sleep(until.remaining().min(Duration::from_millis(10)));
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {
+                let cap =
+                    *retry_until.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if Instant::now() >= cap {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("CodeGraph checkpoint rotation failed: {error}"),
+                    ));
+                }
+                std::thread::sleep(deadline.remaining().min(Duration::from_millis(10)));
             }
             Err(error) => {
                 return Err(io::Error::new(
@@ -809,8 +820,17 @@ impl GenerationStore {
         };
         write_generation(&pending.join(METADATA_FILE_NAME), &record)?;
         self.check_limits(None)?;
-        if deadline.expired() || cancel.is_cancelled() {
-            return Err(storage("checkpoint publication cancelled or expired"));
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "checkpoint publication cancelled",
+            ));
+        }
+        if deadline.expired() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "checkpoint publication deadline expired",
+            ));
         }
         let previous = layout.store.join(PREVIOUS_COMMIT);
         rotate_checkpoint(&layout.committed, &previous, deadline, cancel)?;

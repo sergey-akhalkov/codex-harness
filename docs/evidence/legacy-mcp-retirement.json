@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "capturedUtc": "2026-09-17T04:46:19Z",
-  "change": "migrate-harness-to-rust",
-  "task": "8.1; updated by 9.5",
+  "capturedUtc": "2026-09-17T08:55:13Z",
+  "change": "migrate-harness-to-rust; remove-graphify-remnants",
+  "task": "8.1; updated by 9.5; graphify removal and guard recorded by remove-graphify-remnants 3.3/5.4",
   "liveMcp": [
     "serena",
     "codegraph",
@@ -37,5 +37,43 @@
       ],
       "action": "declared analysis samples; native helpers refuse them as launchable programs"
     }
-  ]
+  ],
+  "graphify": {
+    "retired": "2026-09-15 from the managed MCP selection after measured use collapsed to a handful of calls; CodeGraph covers the selected graph role",
+    "removedSurface": [
+      "crates/harness-core/src/dependency_discovery.rs: the uv verification branch (graphify/serve.py module, Scripts/graphify-mcp.exe entry, graphify-mcp console identity, graphify package dirs), the (mcp,graphify) -> (graphifyy,uv) identity mapping, the @dreamtree-org/graphify npm exclusion, the shared-service manifest read and the graphify_manifest request/discovery field",
+      "crates/harness-core/src/dependency_plan.rs and dependency_fetch.rs: dispatch arms; fixtures re-pointed to retained ids with normalized-name coverage kept",
+      "crates/harness-core/src/dependency_apply.rs and crates/codex-harness/src/dependency_apply_cli.rs: the graphify mention in the apply note and help (an accepted CLI break for the retired tool only)",
+      "crates/codex-harness/src/dependency_cli.rs: the --graphify-manifest flag, its help text and the PROGRAMDATA/OpenCodeWorkstation/manifest.json default",
+      "crates/harness-core/src/subscription_lifecycle.rs: the bootstrap-graphify-pending.json restart blocker (a retired tool cannot be mid-bootstrap and a stale marker must not block restart-policy changes)",
+      "crates/codex-harness/tests: the manifest-secret test (feature-specific) and the retired-tool fixture ids; the rustup observation it also covered remains as rustup_metadata_is_observed_without_executing_or_claiming_versions"
+    ],
+    "registrationGuard": {
+      "where": [
+        "crates/harness-core/src/codegraph_registration.rs (GRAPHIFY skip/conflict lists, retired projection, all_names)",
+        "crates/harness-core/src/codegraph_integration.rs (retired projection)"
+      ],
+      "rationale": "an Update must remove an owned registration recorded by a pre-retirement version instead of re-registering a broken server, and must still refuse name/ownership conflicts on an unowned same-name table",
+      "removalCondition": "drop only when no supported host state can predate the 2026-09-15 retirement; revisit at the next major lifecycle change",
+      "tests": [
+        "crates/codex-harness/tests/codegraph_install.rs (graphify-absence assertions preserved)",
+        "crates/codex-harness/tests/codegraph_consumers.rs"
+      ]
+    },
+    "referenceSweep": {
+      "date": "2026-09-17",
+      "commands": [
+        "git grep -i graphify",
+        "git ls-files | rg -i graphify"
+      ],
+      "allowlist": [
+        "the current change artifacts and OpenSpec archives (historical records)",
+        "docs/evidence/rust-migration-map.json (dated 2026-09-08 inventory), docs/evidence/rust-migration.md (migration evidence) and docs/project-decisions.md (decision records)",
+        "docs/code-tools.md retired-tool note and docs/evidence/legacy-mcp-retirement.json / rust-requirement-checks.json",
+        "the GRAPHIFY registration guard, its comment and the graphify-absence assertions",
+        "current specs that describe the accepted retired selection (global-code-tools scenarios)"
+      ],
+      "result": "5.4/5.5 re-run 2026-09-17T08:55:13Z after native workspace tests: no graphify-named source files; every remaining hit falls in this allowlist; the transitional tools/ layer no longer exists (migrate-harness-to-rust 9.2/9.5 landed before this change)"
+    }
+  }
 }

@@ -6,8 +6,8 @@
 
 
 The live global MCP selection is Serena, CodeGraph and Nuphus. Codebase Memory
-and Graphify are retired from the managed selection; their shared packages,
-saved graphs, indexes and explicit local rollback commands remain installed.
+and Graphify are retired from the managed selection; leftover shared packages,
+saved graphs and indexes stay on the host.
 Start a new Codex session to load current registrations. Existing sessions keep
 previously loaded catalogues until restart.
 
@@ -71,9 +71,9 @@ their owned process cleanup; no additional Project Server is selected.
 
 Graphify 0.9.55 is retired from the managed selection after measured use
 collapsed to a handful of calls while CodeGraph covers the selected graph role.
-The shared installation and saved graphs remain; the explicit local proxy and
-update sources stay available for a deliberate rollback route without a
-managed registration.
+Leftover shared packages and saved graphs stay on the host; the first-party
+proxy and update sources were removed with the retirement, so Graphify has no
+managed registration and no in-repo rollback route.
 
 The kit adds MCP path registrations and one owned readiness setting to the
 existing user config. The native Codex TOML editor renders these registrations
@@ -117,7 +117,7 @@ introduce a shared Codex app-server.
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
 | Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers and 300-second idle expiry. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. The proxy filters memory, onboarding and introspection tools from tools/list; native Git records stay authoritative. |
 | Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
-| Graphify | Retired from the managed selection; not registered and not launched. Saved graphs may remain on a host; first-party proxy/update tools are not a live MCP. |
+| Graphify | Retired from the managed selection; not registered and not launched. Leftover shared packages and saved graphs stay on the host; the first-party proxy and update sources were removed with the retirement. |
 
 Windows ownership guards reclaim owned descendant processes on owner exit or
 crash, including language servers and private browsers. Pool eviction closes the
@@ -249,7 +249,7 @@ sessions in three indexed projects plus another client of the first root
 (automatic add/change-burst/rename/delete, shared worker identity, last-client
 retirement, offline-root stop and reopen catch-up, 49.9 seconds), a fresh
 interactive TUI smoke through the installed launcher, resume and fork of a
-saved thread, retained Serena/Graphify/Nuphus operations including an owned
+saved thread, retained Serena/Nuphus operations including an owned
 browser effect, and one explicit exec parent plus tool-capable middle child
 that each performed a real CodeGraph search with the expected canonical root.
 The default probe model is Astra; the recorded run used the separately

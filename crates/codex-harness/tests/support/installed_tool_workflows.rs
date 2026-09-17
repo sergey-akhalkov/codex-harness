@@ -308,8 +308,9 @@ fn installed_code_and_memory_operations() {
         90,
     );
     let servers = inventory["data"].as_array().unwrap();
-    // This scenario exercises Serena. Graphify is retired from the managed selection.
-    // CodeGraph qualification is independent and must not suppress these checks.
+    // This scenario exercises Serena; retired tools are absent from the managed
+    // selection. CodeGraph qualification is independent and must not suppress
+    // these checks.
     let name = "serena";
     assert!(
         servers

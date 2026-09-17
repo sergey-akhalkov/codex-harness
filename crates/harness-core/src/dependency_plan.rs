@@ -116,7 +116,7 @@ fn parse_release(spec: &Value, body: &[u8]) -> Result<Parsed, &'static str> {
         .ok_or("unsupported-metadata-source")?;
     let text = utf8(body)?;
     match spec["id"].as_str() {
-        Some("serena" | "graphify") => parse_pypi(package, text),
+        Some("serena") => parse_pypi(package, text),
         Some("codebase-memory" | "nuphus" | "python") => parse_npm(package, text),
         Some("codegraph") => crate::dependency_discovery::dependency_codegraph::parse_release(body)
             .map(|version| Parsed {
@@ -398,10 +398,7 @@ fn inventory_records<'a>(
     let mut expected = BTreeMap::new();
     for spec in specs {
         let id = spec["id"].as_str().unwrap();
-        let group = if matches!(
-            id,
-            "serena" | "graphify" | "codebase-memory" | "nuphus" | "codegraph"
-        ) {
+        let group = if matches!(id, "serena" | "codebase-memory" | "nuphus" | "codegraph") {
             "mcp"
         } else {
             "languages"
@@ -542,9 +539,6 @@ mod tests {
             "serena" => {
                 json!({"id":"serena","package":"serena-agent","manager":"uv","metadata":"https://pypi.org/pypi/serena-agent/json","runtime":["Python >=3.11","uv"]})
             }
-            "graphify" => {
-                json!({"id":"graphify","package":"graphifyy","manager":"uv","metadata":"https://pypi.org/pypi/graphifyy/json","runtime":["Python >=3.11","uv"]})
-            }
             "codebase-memory" => {
                 json!({"id":"codebase-memory","package":"codebase-memory-mcp","manager":"npm","metadata":"https://registry.npmjs.org/codebase-memory-mcp/latest","runtime":["Node.js"]})
             }
@@ -585,9 +579,7 @@ mod tests {
         let mut languages = Vec::new();
         for id in ids {
             match *id {
-                "serena" | "graphify" | "codebase-memory" | "nuphus" | "codegraph" => {
-                    mcp.push(spec(id))
-                }
+                "serena" | "codebase-memory" | "nuphus" | "codegraph" => mcp.push(spec(id)),
                 _ => languages.push(spec(id)),
             }
         }
@@ -599,7 +591,7 @@ mod tests {
         let mut languages = Vec::new();
         for item in records {
             match item["id"].as_str() {
-                Some("serena" | "graphify" | "codebase-memory" | "nuphus" | "codegraph") => {
+                Some("serena" | "codebase-memory" | "nuphus" | "codegraph") => {
                     mcp.push(item.clone())
                 }
                 _ => languages.push(item.clone()),
@@ -626,7 +618,6 @@ mod tests {
     fn checked(id: &str, version: &str) -> Value {
         let body = match id {
             "serena" => pypi("serena-agent", version),
-            "graphify" => pypi("Graphifyy", version),
             "codebase-memory" => npm("codebase-memory-mcp", version),
             "nuphus" => npm("@nuphus/nuphus-mcp", version),
             "codegraph" => serde_json::to_vec(&json!({
@@ -1023,10 +1014,10 @@ mod tests {
 
     #[test]
     fn pypi_normalized_name_and_npm_exact_name_are_required() {
-        let graphify = release(&spec("graphify"), Ok(&pypi("Graphifyy", "0.9.55")));
-        assert_eq!(graphify["state"], "checked");
-        assert_eq!(graphify["version"], "0.9.55");
-        assert_eq!(graphify["source"], "https://pypi.org/pypi/graphifyy/json");
+        let serena = release(&spec("serena"), Ok(&pypi("Serena-Agent", "1.7.0")));
+        assert_eq!(serena["state"], "checked");
+        assert_eq!(serena["version"], "1.7.0");
+        assert_eq!(serena["source"], "https://pypi.org/pypi/serena-agent/json");
         let scoped = release(&spec("nuphus"), Ok(&npm("@nuphus/nuphus-mcp", "0.2.2")));
         assert_eq!(scoped["state"], "checked");
         let wrong_scope = release(&spec("nuphus"), Ok(&npm("nuphus-mcp", "0.2.2")));
@@ -1034,20 +1025,12 @@ mod tests {
     }
 
     #[test]
-    fn current_catalogue_plan_reports_six_read_only_items() {
-        let ids = [
-            "serena",
-            "codebase-memory",
-            "graphify",
-            "nuphus",
-            "python",
-            "rust",
-        ];
+    fn current_catalogue_plan_reports_five_read_only_items() {
+        let ids = ["serena", "codebase-memory", "nuphus", "python", "rust"];
         let cat = catalogue(&ids);
         let inv = inventory(&[
             record("serena", "adopted", json!("1.7.0"), idle()),
             record("codebase-memory", "adopted", json!("0.10.8"), idle()),
-            record("graphify", "adopted", json!("0.9.55"), idle()),
             record("nuphus", "modified", json!("0.2.2"), idle()),
             record("python", "adopted", json!("1.29.0"), idle()),
             record(
@@ -1063,14 +1046,13 @@ mod tests {
             "codebase-memory".into(),
             checked("codebase-memory", "0.10.8"),
         );
-        releases.insert("graphify".into(), checked("graphify", "0.9.55"));
         releases.insert("nuphus".into(), checked("nuphus", "0.2.2"));
         releases.insert("python".into(), checked("python", "1.29.0"));
         releases.insert("rust".into(), checked("rust", "1.98.1"));
         let planned = plan(&cat, &inv, &releases).unwrap();
         assert_eq!(planned["mode"], "plan");
         assert_eq!(planned["read_only"], true);
-        assert_eq!(planned["items"].as_array().unwrap().len(), 6);
+        assert_eq!(planned["items"].as_array().unwrap().len(), 5);
         assert_eq!(
             planned["items"]
                 .as_array()
@@ -1080,8 +1062,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ids
         );
-        assert_eq!(planned["items"][3]["action"], "preserve-and-audit");
-        assert_eq!(planned["items"][5]["action"], "reuse");
-        assert_eq!(planned["items"][5]["reason"], "held-toolchain-policy");
+        assert_eq!(planned["items"][2]["action"], "preserve-and-audit");
+        assert_eq!(planned["items"][4]["action"], "reuse");
+        assert_eq!(planned["items"][4]["reason"], "held-toolchain-policy");
     }
 }

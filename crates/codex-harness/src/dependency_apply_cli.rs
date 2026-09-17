@@ -16,7 +16,7 @@ pub(crate) fn run(args: &[OsString]) -> Option<io::Result<i32>> {
 fn execute(_operation: &str, args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness dependencies apply|update --source CHECKOUT --user-home DIRECTORY --state DIRECTORY [--preview|--check] [--node FILE --node-sha256 DIGEST]\nCheck and preview plan without staging, selecting, acquiring packages or stopping shared OpenCode consumers. Apply stages and selects native CodeGraph and, with an explicit Node path and digest, BasedPyright. Missing codebase-memory and nuphus packages install into the shared npm tree through a journaled native transaction. Serena, graphify and shared-tree replacements stay pending."
+            "codex-harness dependencies apply|update --source CHECKOUT --user-home DIRECTORY --state DIRECTORY [--preview|--check] [--node FILE --node-sha256 DIGEST]\nCheck and preview plan without staging, selecting, acquiring packages or stopping shared OpenCode consumers. Apply stages and selects native CodeGraph and, with an explicit Node path and digest, BasedPyright. Missing codebase-memory and nuphus packages install into the shared npm tree through a journaled native transaction. Serena and shared-tree replacements stay pending."
         );
         return Ok(0);
     }

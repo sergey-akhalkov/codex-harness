@@ -772,7 +772,6 @@ fn unfinished_restart_blockers(home: &Path) -> io::Result<()> {
         "code-tools-registration-pending.json",
         "code-tools-files-pending.json",
         "bootstrap-pending.json",
-        "bootstrap-graphify-pending.json",
         "bootstrap-runtime-pending.json",
         "subscription-routing-pending.json",
     ] {

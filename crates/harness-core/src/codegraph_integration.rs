@@ -220,6 +220,8 @@ pub fn prepare(request: &Request, manager: &Path) -> io::Result<Value> {
             registrations.insert("nuphus".into(), nuphus);
         }
     }
+    // Retired names stay projected so Update can remove an owned pre-retirement
+    // registration; see `docs/evidence/legacy-mcp-retirement.json` (GRAPHIFY guard).
     Ok(
         json!({"schema_version":1,"status":"prepared","read_only":read_only,"model_calls":0,
         "registrations":registrations,"retired":["codebase-memory","graphify"],

@@ -127,7 +127,6 @@ fn discovery_request(
         serena_cache: None,
         rustup_home: selected("RUSTUP_HOME"),
         path: if include { env::var_os("PATH") } else { None },
-        graphify_manifest: None,
         nuphus_models: selected("NUPHUS_MODELS_DIR"),
         codegraph_roots: Vec::new(),
         full_records: false,

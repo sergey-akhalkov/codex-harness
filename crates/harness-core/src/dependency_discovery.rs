@@ -23,7 +23,6 @@ pub struct Request {
     pub serena_cache: Option<PathBuf>,
     pub rustup_home: Option<PathBuf>,
     pub path: Option<OsString>,
-    pub graphify_manifest: Option<PathBuf>,
     pub nuphus_models: Option<PathBuf>,
     pub codegraph_roots: Vec<PathBuf>,
     pub full_records: bool,
@@ -164,41 +163,19 @@ fn uv(spec: &Value, tools: &Path, full: bool) -> io::Result<Vec<Value>> {
         if !candidates.is_empty() {
             return Err(package::invalid());
         }
-        let serena = spec["id"] == "serena";
         let python = local_path(&root.join("Scripts/python.exe"))?;
-        let module = local_path(&site.join(if serena {
-            "serena/cli.py"
-        } else {
-            "graphify/serve.py"
-        }))?;
-        let entry = local_path(&root.join(if serena {
-            "Scripts/serena.exe"
-        } else {
-            "Scripts/graphify-mcp.exe"
-        }))?;
+        let module = local_path(&site.join("serena/cli.py"))?;
+        let entry = local_path(&root.join("Scripts/serena.exe"))?;
         let entry_points = package::read_text(&package::package_file(&dist, "entry_points.txt")?)?;
-        let entry_identity = entry_points.is_some_and(|text| {
-            console_entry(
-                &text,
-                if serena { "serena" } else { "graphify-mcp" },
-                if serena {
-                    "serena.cli:top_level"
-                } else {
-                    "graphify.serve:_main"
-                },
-            )
-        });
+        let entry_identity =
+            entry_points.is_some_and(|text| console_entry(&text, "serena", "serena.cli:top_level"));
         let installed = python.is_file()
             && entry.is_file()
             && module.is_file()
             && entry_identity
             && package::contained(&entry, &root)
             && package::contained(&module, &root);
-        let package_dirs: &[&str] = if serena {
-            &["serena", "solidlsp"]
-        } else {
-            &["graphify"]
-        };
+        let package_dirs: &[&str] = &["serena", "solidlsp"];
         let integrity = wheel_record::verify_record(&dist, &root, full, package_dirs);
         let receipt = package::package_file(&root, "uv-receipt.toml")?;
         let receipt_identity = package::read_text(&receipt)?
@@ -249,7 +226,6 @@ struct Discovery {
     rustup: PathBuf,
     node: Option<PathBuf>,
     models: PathBuf,
-    graphify_manifest: Option<PathBuf>,
     codegraph_roots: Vec<PathBuf>,
     full: bool,
     probe_versions: bool,
@@ -267,7 +243,6 @@ impl Discovery {
                 let id = entry["id"].as_str().ok_or_else(package::invalid)?;
                 let expected = match (group, id) {
                     ("mcp", "serena") => ("serena-agent", "uv"),
-                    ("mcp", "graphify") => ("graphifyy", "uv"),
                     ("mcp", "codebase-memory") => ("codebase-memory-mcp", "npm"),
                     ("mcp", "codegraph") => ("@colbymchenry/codegraph", "native"),
                     ("mcp", "nuphus") => ("@nuphus/nuphus-mcp", "npm"),
@@ -355,11 +330,6 @@ impl Discovery {
                     .as_deref()
                     .unwrap_or(&home.join("AppData/Roaming/Nuphus/models")),
             )?,
-            graphify_manifest: request
-                .graphify_manifest
-                .as_deref()
-                .map(local_path)
-                .transpose()?,
             codegraph_roots: {
                 let mut roots = Vec::new();
                 for path in &request.codegraph_roots {
@@ -476,7 +446,7 @@ impl Discovery {
 
     fn record(&self, spec: &Value, group: &str) -> Value {
         let result = match spec["id"].as_str().unwrap() {
-            "serena" | "graphify" => uv(spec, &self.uv, self.full),
+            "serena" => uv(spec, &self.uv, self.full),
             "codebase-memory" => self.npm("codebase-memory-mcp", "codebase-memory-mcp", None),
             "nuphus" => self.npm("@nuphus/nuphus-mcp", "nuphus-mcp", None),
             "codegraph" => {
@@ -546,35 +516,8 @@ impl Discovery {
                 record["health"]["onnxruntime_exists"] = json!(runtime.is_file());
                 record["paths"]["onnxruntime"] = json!(runtime);
             }
-        } else if spec["id"] == "graphify" {
-            record["excluded_installations"] = match self.npm("@dreamtree-org/graphify", "graphify", None) {
-                Ok(candidates) => json!(candidates.iter().map(|candidate| json!({"identity":"@dreamtree-org/graphify","installation_root":candidate["installation_root"],"version":candidate["version"],"reason":"Unrelated package; command name is not identity."})).collect::<Vec<_>>()),
-                Err(_) => json!([{"identity":"@dreamtree-org/graphify","status":"incomplete"}]),
-            };
-            record["shared_service"] = self.graphify();
         }
         record
-    }
-
-    fn graphify(&self) -> Value {
-        let mut report = json!({"state":"unverified","manifest":self.graphify_manifest});
-        let Some(path) = &self.graphify_manifest else {
-            return report;
-        };
-        let Ok(Some(data)) = package::read_json(path) else {
-            return report;
-        };
-        let config = &data["graphify"]["configuration"];
-        for key in ["python", "graph"] {
-            if let Some(path) = package::text(&config[key]["path"]) {
-                report[format!("{key}_path")] = json!(path);
-                report[format!("{key}_exists")] = json!(Path::new(path).is_file());
-            }
-        }
-        report["module_name"] = json!(package::text(&config["module"]["name"]));
-        report["package_version"] = json!(package::text(&config["module"]["packageVersion"]));
-        report["authentication"] = json!("not-read; connection layer must resolve securely");
-        report
     }
 }
 

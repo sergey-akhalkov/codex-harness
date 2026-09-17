@@ -358,7 +358,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "codex-harness dependencies audit --package-root DIRECTORY (explicit official archive comparison)"
         );
         println!(
-            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY] [--npm-prefix DIRECTORY ...] [--codegraph-root DIRECTORY ...] [--uv-tools-dir DIRECTORY] [--serena-cache DIRECTORY] [--rustup-home DIRECTORY] [--graphify-manifest FILE] [--nuphus-models DIRECTORY] [--full-records] [--probe-versions] [--processes] [--include-process-environment|--no-process-environment]\nDefault discovery executes no packages. --probe-versions requests a bounded native Rust analyzer version read. --processes observes existing host consumers without retaining arguments. --codegraph-root observes a published CodeGraph package without installing it. Plan explicitly reads official release metadata through system curl and proposes actions requiring further compatibility checks. Neither command installs packages or changes a project."
+            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY] [--npm-prefix DIRECTORY ...] [--codegraph-root DIRECTORY ...] [--uv-tools-dir DIRECTORY] [--serena-cache DIRECTORY] [--rustup-home DIRECTORY] [--nuphus-models DIRECTORY] [--full-records] [--probe-versions] [--processes] [--include-process-environment|--no-process-environment]\nDefault discovery executes no packages. --probe-versions requests a bounded native Rust analyzer version read. --processes observes existing host consumers without retaining arguments. --codegraph-root observes a published CodeGraph package without installing it. Plan explicitly reads official release metadata through system curl and proposes actions requiring further compatibility checks. Neither command installs packages or changes a project."
         );
         return Ok(0);
     }
@@ -391,12 +391,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 codegraph_roots.push(PathBuf::from(arguments.next().ok_or_else(invalid)?))
             }
             Some(
-                "--source"
-                | "--user-home"
-                | "--uv-tools-dir"
-                | "--serena-cache"
-                | "--rustup-home"
-                | "--graphify-manifest"
+                "--source" | "--user-home" | "--uv-tools-dir" | "--serena-cache" | "--rustup-home"
                 | "--nuphus-models",
             ) => {
                 if values
@@ -448,12 +443,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         serena_cache: path("--serena-cache"),
         rustup_home: selected("--rustup-home", "RUSTUP_HOME"),
         path: if include { env::var_os("PATH") } else { None },
-        graphify_manifest: path("--graphify-manifest").or_else(|| {
-            include.then(|| {
-                PathBuf::from(env::var_os("PROGRAMDATA").unwrap_or_else(|| "C:/ProgramData".into()))
-                    .join("OpenCodeWorkstation/manifest.json")
-            })
-        }),
         nuphus_models: selected("--nuphus-models", "NUPHUS_MODELS_DIR"),
         codegraph_roots,
         full_records: full,

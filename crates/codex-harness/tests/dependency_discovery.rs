@@ -408,7 +408,7 @@ fn package_identity_escape_ambiguity_aliases_and_partial_failures_stay_distinct(
 }
 
 #[test]
-fn rustup_metadata_and_saved_graph_are_read_without_executing_or_leaking_credentials() {
+fn rustup_metadata_is_observed_without_executing_or_claiming_versions() {
     let fixture = Fixture::new();
     let rustup = fixture.home.join(".rustup");
     let bin = rustup.join("toolchains/1.97.1-x86_64-pc-windows-msvc/bin");
@@ -419,16 +419,7 @@ fn rustup_metadata_and_saved_graph_are_read_without_executing_or_leaking_credent
     )
     .unwrap();
     fs::write(bin.join("rust-analyzer.exe"), b"inert analyzer, never run").unwrap();
-    let graph = fixture.root.path().join("owned-graph.json");
-    fs::write(&graph, "owned inert graph").unwrap();
-    let manifest = fixture.root.path().join("graph-service.json");
-    fs::write(&manifest,serde_json::to_vec(&json!({"credentials":"private credential sentinel","graphify":{"configuration":{"graph":{"path":graph},"python":{"path":fixture.bin.join("node.exe")},"module":{"name":"graphify.serve","packageVersion":"1.2.3","token":"private module sentinel"},"headers":{"Authorization":"private authorization sentinel"}}}})).unwrap()).unwrap();
-    let output = fixture
-        .command()
-        .arg("--graphify-manifest")
-        .arg(&manifest)
-        .output()
-        .unwrap();
+    let output = fixture.command().output().unwrap();
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(record(&report, "rust")["status"], "adopted");
@@ -437,21 +428,6 @@ fn rustup_metadata_and_saved_graph_are_read_without_executing_or_leaking_credent
         false
     );
     assert_eq!(record(&report, "rust")["version"], Value::Null);
-    assert!(
-        report["mcp"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["id"] != "graphify")
-    );
-    for private in [
-        "private credential sentinel",
-        "private module sentinel",
-        "private authorization sentinel",
-    ] {
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(private));
-    }
-    assert_eq!(fs::read_to_string(graph).unwrap(), "owned inert graph");
 }
 
 #[test]

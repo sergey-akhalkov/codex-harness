@@ -308,8 +308,6 @@ mod tests {
              "paths": {"node": node, "entrypoint": entry}},
             {"id": "rust", "serena_id": "rust", "status": "adopted",
              "paths": {"executable": rust}},
-            {"id": "graphify", "serena_id": "graphify", "status": "missing",
-             "paths": {"executable": root.join("absent.exe")}},
         ]})
     }
 
@@ -339,7 +337,14 @@ mod tests {
         let rendered = render(&settings);
         assert!(rendered.contains("ls_base_cmd"));
         assert!(rendered.contains("langserver.js"));
-        assert!(!rendered.contains("absent.exe"));
+        // A backend recorded as missing is not pinned.
+        let mut incomplete = registry;
+        incomplete["languages"][1] = json!({
+            "id": "rust", "serena_id": "rust", "status": "missing",
+            "paths": {"executable": root.path().join("absent.exe")},
+        });
+        let skipped = ls_specific_settings(&incomplete).unwrap();
+        assert!(!render(&skipped).contains("absent.exe"));
     }
 
     #[test]
