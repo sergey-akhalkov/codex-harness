@@ -1,6 +1,7 @@
 # Global Code Tools Specification
 ## Purpose
 Make the accepted MCP and language capabilities usable from globally configured Codex sessions in other projects, with correct workspace context, explicit retained or retired selection, and evidence for each delivered operation.
+
 ## Requirements
 
 ### Requirement: Three globally available MCP integrations
@@ -12,13 +13,14 @@ was: an update removes only the owned registration, while the shared package
 and saved state remain installed and usable through an explicit local route
 without per-project configuration. The accepted subscription-efficiency
 selection SHALL still be allowed to disable an LSP-bearing integration when
-its language functions fail the benefit gate, including Serena; unrelated useful MCP
-functions and external installations SHALL be preserved. Retained integrations
-SHALL be discoverable without per-project configuration, manual startup or a
-special working directory in supported interactive, non-interactive,
-resumed/forked and subagent consumers. Desktop/IDE coverage SHALL require
-actual configuration-consumer evidence rather than a CLI-only claim. Existing
-processes needing registration reload SHALL be identified explicitly.
+its language functions fail the benefit gate, including Serena; unrelated
+useful MCP functions and external installations SHALL be preserved. Retained
+integrations SHALL be discoverable without per-project configuration, manual
+startup or a special working directory in supported interactive,
+non-interactive, resumed/forked and subagent consumers. Desktop/IDE coverage
+SHALL require actual configuration-consumer evidence rather than a CLI-only
+claim. Existing processes needing registration reload SHALL be identified
+explicitly.
 
 #### Scenario: Codex starts in an unrelated project
 - **WHEN** Codex starts outside the checkout after this change is active
@@ -181,7 +183,18 @@ Acceptance SHALL exercise the selected configuration through actual installed Co
 - **THEN** all accepted operations and lifecycle requirements have evidence, rejected capabilities remain absent, and no required task is unchecked
 
 ### Requirement: CodeGraph MCP starts with Codex CLI
-Owned CodeGraph SHALL become ready during Codex CLI startup through the installed registration, together with the other retained MCP servers. The registered command MUST remain able to complete MCP initialize when its native binaries still match their recorded hashes, even if the linked checkout later differs from that build. A manager that is admitted only for integrity-checked management MUST NOT be the Codex MCP command unless it is also admitted for serving. Ordinary Codex startup MUST NOT download packages, rebuild native source, alter agent instructions, install hooks or enable telemetry. Unrelated MCP registrations, user edits, published CodeGraph/Node and existing indexes SHALL be preserved. An unavailable CodeGraph process SHALL remain explicit and MUST NOT disable the other retained MCP servers.
+
+Owned CodeGraph SHALL become ready during Codex CLI startup through the
+installed registration, together with the other retained MCP servers. The
+registered command MUST remain able to complete MCP initialize when its native
+binaries still match their recorded hashes, even if the linked checkout later
+differs from that build. A manager that is admitted only for integrity-checked
+management MUST NOT be the Codex MCP command unless it is also admitted for
+serving. Ordinary Codex startup MUST NOT download packages, rebuild native
+source, alter agent instructions, install hooks or enable telemetry. Unrelated
+MCP registrations, user edits, published CodeGraph/Node and existing indexes
+SHALL be preserved. An unavailable CodeGraph process SHALL remain explicit and
+MUST NOT disable the other retained MCP servers.
 
 #### Scenario: Codex CLI starts after later source edits
 - **WHEN** a consumer starts Codex CLI through the installed launcher after the linked checkout has changed relative to the recorded native build, and the recorded CodeGraph binaries still match
