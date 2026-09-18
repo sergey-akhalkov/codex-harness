@@ -1,5 +1,8 @@
 #![cfg(windows)]
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::{Command, Output},
+};
 
 #[test]
 fn native_mcp_options_fail_before_opening_a_connection_or_creating_state() {
@@ -166,6 +169,19 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
         String::from_utf8_lossy(&served.stderr)
     );
     assert!(String::from_utf8_lossy(&served.stdout).contains("--package-root"));
+    for name in ["serena", "nuphus"] {
+        let served = serving_help(&manager, root.path(), name);
+        assert!(
+            served.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&served.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&served.stderr)
+                .contains("source-consuming runtime is disabled"),
+            "{name} still refused as source-consuming runtime"
+        );
+    }
     let check = Command::new(&manager)
         .current_dir(root.path())
         .args(["check", "--build"])
@@ -209,6 +225,14 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
         "{}",
         String::from_utf8_lossy(&still_served.stderr)
     );
+    for name in ["serena", "nuphus"] {
+        let served = serving_help(&manager, root.path(), name);
+        assert!(
+            served.status.success(),
+            "{name} after source loss: {}",
+            String::from_utf8_lossy(&served.stderr)
+        );
+    }
 }
 
 #[test]
@@ -305,4 +329,12 @@ fn source_stale_manager_still_emits_shared_config_overrides() {
         stdout.contains("features.context_management.experimental_mode"),
         "{stdout}"
     );
+}
+
+fn serving_help(manager: &std::path::Path, cwd: &std::path::Path, name: &str) -> Output {
+    Command::new(manager)
+        .current_dir(cwd)
+        .args(["mcp", name, "--help"])
+        .output()
+        .unwrap()
 }

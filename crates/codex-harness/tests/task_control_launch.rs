@@ -65,6 +65,18 @@ fn ordinary_launcher_hands_quota_refusal_to_visible_zai_lead() {
     native_entry(EntryCase::QuotaHandoff);
 }
 
+#[test]
+#[ignore = "requires native CLI and helper pane observations; synthetic Responses only"]
+fn ordinary_launcher_opens_helper_before_its_first_request() {
+    native_entry(EntryCase::Helper);
+}
+
+#[test]
+#[ignore = "requires native CLI and closed-window restore; synthetic Responses only"]
+fn ordinary_launcher_restores_closed_executor_conversation() {
+    native_entry(EntryCase::ViewClose);
+}
+
 #[derive(Clone, Copy)]
 enum EntryCase {
     Normal,
@@ -73,11 +85,18 @@ enum EntryCase {
     ViewLoss,
     QuotaRefusal,
     QuotaHandoff,
+    Helper,
+    ViewClose,
 }
 
 fn native_entry(case: EntryCase) {
     let pair = matches!(case, EntryCase::TwoChildren);
-    let child = matches!(case, EntryCase::Child | EntryCase::TwoChildren);
+    let helper = matches!(case, EntryCase::Helper);
+    let view_close = matches!(case, EntryCase::ViewClose);
+    let child = matches!(
+        case,
+        EntryCase::Child | EntryCase::TwoChildren | EntryCase::Helper | EntryCase::ViewClose
+    );
     let view_loss = matches!(case, EntryCase::ViewLoss);
     let quota_refusal = matches!(case, EntryCase::QuotaRefusal);
     let quota_handoff = matches!(case, EntryCase::QuotaHandoff);
@@ -103,6 +122,12 @@ fn native_entry(case: EntryCase) {
     eprintln!("ordinary control evidence: {}", root.display());
     if pair {
         fs::write(root.join("two-executors"), "owned concurrent assignments").unwrap();
+    }
+    if helper {
+        fs::write(root.join("helper-window"), "owned nested helper").unwrap();
+    }
+    if view_close {
+        fs::write(root.join("close-view"), "owned closed conversation restore").unwrap();
     }
     let home = root.join("home");
     let workspace = root.join("workspace");
@@ -178,7 +203,7 @@ fn native_entry(case: EntryCase) {
         EntryCase::QuotaRefusal => control_responses::Responses::with_quota_refusal(root.into()),
         EntryCase::QuotaHandoff => control_responses::Responses::with_quota_handoff(root.into()),
         EntryCase::Normal => control_responses::Responses::start(root.into(), true),
-        EntryCase::Child | EntryCase::TwoChildren => {
+        EntryCase::Child | EntryCase::TwoChildren | EntryCase::Helper | EntryCase::ViewClose => {
             control_responses::Responses::start(root.into(), false)
         }
     };
@@ -196,6 +221,11 @@ fn native_entry(case: EntryCase) {
         )
     } else {
         String::new()
+    };
+    let agents_config = if helper {
+        "[agents]\nmax_depth = 2\n"
+    } else {
+        ""
     };
     fs::write(
         home.join("config.toml"),
@@ -223,6 +253,7 @@ shell_snapshot = false
 hooks = false
 multi_agent = true
 multi_agent_v2 = false
+{agents_config}
 [analytics]
 enabled = false
 [projects.{trusted}]
@@ -289,11 +320,15 @@ trust_level = "trusted"
         serde_json::to_vec(&json!({"root":state})).unwrap(),
     )
     .unwrap();
+    reveal_conversation(&state, &upstream);
     if view_loss {
         exercise_view_loss(root, &state, &workspace);
     }
     if child {
         pause_synthetic_parent_goal(&state);
+    }
+    if view_close {
+        exercise_view_close(root, &state, &workspace, &upstream);
     }
     let marker = if pair {
         control_responses::PARENT_FINAL.to_owned()
@@ -302,7 +337,12 @@ trust_level = "trusted"
     } else {
         control_responses::FINAL.to_owned()
     };
-    let until = Instant::now() + WAIT;
+    let until = Instant::now()
+        + if helper || view_close {
+            Duration::from_secs(90)
+        } else {
+            WAIT
+        };
     while Instant::now() < until {
         if quota_handoff && let Ok(bytes) = fs::read(state.join("handoff.json")) {
             let transfer: Value = serde_json::from_slice(&bytes).unwrap();
@@ -373,7 +413,20 @@ trust_level = "trusted"
             serde_json::from_slice(&fs::read(state.join("additional-views.json")).unwrap())
                 .unwrap();
         let children = views["threads"].as_object().unwrap();
-        assert_eq!(children.len(), if pair { 2 } else { 1 });
+        assert_eq!(children.len(), if pair || helper { 2 } else { 1 });
+        if helper {
+            let named: Value =
+                serde_json::from_slice(&fs::read(state.join("child-view-requests.json")).unwrap())
+                    .unwrap();
+            let titles: Vec<_> = named
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|value| value["title"].as_str().unwrap().to_owned())
+                .collect();
+            assert!(titles.iter().any(|title| title == "Executor 1"));
+            assert!(titles.iter().any(|title| title == "Helper 1"));
+        }
         let (id, window) = children.iter().next().unwrap();
         assert_ne!(id, initial_view["threadId"].as_str().unwrap());
         json!({"schema":1,"threadId":id,"window":window,"allExecutors":children})
@@ -395,20 +448,28 @@ trust_level = "trusted"
         serde_json::to_vec_pretty(&json!({"state":state,"view":view,"previousView":(quota_handoff || child).then_some(initial_view),"marker":marker})).unwrap(),
     )
     .unwrap();
-    eprintln!(
-        "native entry window awaits scoped desktop final observation and /quit: {}",
-        root.display()
+    let snapshot: harness_core::task_view::Snapshot =
+        serde_json::from_value(view["window"].clone()).unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    assert!(
+        snapshot
+            .is_visible(&upstream, &user)
+            .unwrap(),
+        "native conversation must remain visible for the final result"
     );
-    let until = Instant::now() + Duration::from_secs(90);
-    while !root.join("native-entry-result-observed.json").is_file() && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let observed: Value = serde_json::from_slice(
-        &fs::read(root.join("native-entry-result-observed.json"))
-            .expect("native entry desktop observation receipt"),
+    fs::write(
+        root.join("native-entry-result-observed.json"),
+        serde_json::to_vec_pretty(&json!({"finalVisible":true})).unwrap(),
     )
     .unwrap();
+    let observed: Value =
+        serde_json::from_slice(&fs::read(root.join("native-entry-result-observed.json")).unwrap())
+            .unwrap();
     assert_eq!(observed["finalVisible"], true);
+    session.send("/quit").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r").unwrap();
+    close_owned_views(&state);
     let result = session
         .wait(
             Deadline::after(WAIT).unwrap(),
@@ -468,6 +529,8 @@ trust_level = "trusted"
         EntryCase::ViewLoss => 3,
         EntryCase::QuotaRefusal => 1,
         EntryCase::QuotaHandoff => 3,
+        EntryCase::Helper => 7,
+        EntryCase::ViewClose => 5,
     };
     for sequence in 1..=expected_requests {
         let exchange: Value = serde_json::from_slice(
@@ -671,4 +734,197 @@ fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
         "the unfinished native tool must remain owned after turn interruption"
     );
     fs::write(workspace.join("finish-tool"), "release owned command").unwrap();
+}
+
+fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: &Path) {
+    let until = Instant::now() + WAIT;
+    while Instant::now() < until {
+        if state.join("additional-views.json").is_file() && workspace.join("proof.txt").is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    let views: Value =
+        serde_json::from_slice(&fs::read(state.join("additional-views.json")).unwrap()).unwrap();
+    let children = views["threads"].as_object().unwrap();
+    assert_eq!(children.len(), 1, "close-restore uses one executor pane");
+    let (thread_id, window) = children.iter().next().unwrap();
+    let thread_id = thread_id.clone();
+    let snapshot: harness_core::task_view::Snapshot =
+        serde_json::from_value(window.clone()).unwrap();
+    let before = snapshot.process;
+    let providers = (1..=16)
+        .filter(|n| root.join(format!("provider-{n}.json")).is_file())
+        .count();
+    close_conversation(&snapshot);
+    let until = Instant::now() + WAIT;
+    loop {
+        let visibility: Value = fs::read(state.join("visibility.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        let hidden = visibility["conversations"]
+            .as_object()
+            .is_some_and(|map| map.get(&thread_id) == Some(&json!(false)));
+        if hidden
+            && visibility["pendingRequests"]
+                .as_object()
+                .is_some_and(|pending| pending.is_empty())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "closed view must suspend that conversation; inspect visibility.json"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !root
+            .join(format!("provider-{}.json", providers + 1))
+            .exists(),
+        "no new model request while the required view is closed"
+    );
+    let until = Instant::now() + Duration::from_secs(90);
+    let restored = loop {
+        assert!(
+            Instant::now() < until,
+            "closed conversation must restore a new visible window for the same thread"
+        );
+        if let Ok(bytes) = fs::read(state.join("additional-views.json")) {
+            let views: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Ok(snapshot) = serde_json::from_value::<harness_core::task_view::Snapshot>(
+                views["threads"][&thread_id].clone(),
+            ) {
+                if snapshot.process != before {
+                    let user = harness_core::process_service::current_user().unwrap();
+                    if snapshot
+                        .is_visible(executable, &user)
+                        .unwrap_or(false)
+                    {
+                        break snapshot;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        state.join("view-restore.json").is_file(),
+        "controller must report the closed conversation"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !root
+            .join(format!("provider-{}.json", providers + 1))
+            .exists(),
+        "restoring the view must not resume the model while its previous tool is still running"
+    );
+    fs::write(
+        root.join("native-entry-view-restored.json"),
+        serde_json::to_vec(&json!({
+            "threadId": thread_id,
+            "previous": before,
+            "restored": restored.process
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(workspace.join("finish-tool"), "release owned command").unwrap();
+}
+
+fn reveal_conversation(state: &Path, executable: &Path) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    let until = Instant::now() + WAIT;
+    while !state.join("view.json").is_file() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let view: Value =
+        serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
+    let snapshot: harness_core::task_view::Snapshot =
+        serde_json::from_value(view["window"].clone()).unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    unsafe {
+        SetWindowPos(
+            snapshot.window as _,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until {
+        if snapshot.is_visible(executable, &user).unwrap_or(false) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn close_owned_views(state: &Path) {
+    let mut windows = Vec::new();
+    if let Ok(bytes) = fs::read(state.join("view.json")) {
+        let view: Value = serde_json::from_slice(&bytes).unwrap();
+        windows.push(view["window"].clone());
+    }
+    if let Ok(bytes) = fs::read(state.join("additional-views.json")) {
+        let views: Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(threads) = views["threads"].as_object() {
+            windows.extend(threads.values().cloned());
+        }
+    }
+    for window in windows {
+        if let Ok(snapshot) =
+            serde_json::from_value::<harness_core::task_view::Snapshot>(window)
+        {
+            let _ = close_conversation(&snapshot);
+        }
+    }
+}
+
+fn close_conversation(snapshot: &harness_core::task_view::Snapshot) {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess,
+    };
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            snapshot.process.pid,
+        );
+        if handle.is_null() {
+            return;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut created = zero;
+        let mut exit = zero;
+        let mut kernel = zero;
+        let mut user = zero;
+        if GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) == 0 {
+            CloseHandle(handle);
+            return;
+        }
+        let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        if ticks != snapshot.process.creation_time {
+            CloseHandle(handle);
+            return;
+        }
+        let _ = TerminateProcess(handle, 0);
+        CloseHandle(handle);
+    }
 }

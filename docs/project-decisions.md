@@ -230,6 +230,14 @@ requires them.
 
 ## Reproducible installation
 
+**2026-09-17, confirmed:** a new Codex CLI session uses the freshest delivered
+manager. Delivering a newer version adds its immutable build and moves the
+stable `harness/bin` links; it never replaces, deletes or rewrites a manager
+file that running sessions hold. Sessions that already started keep their
+build until they finish, one verified build per source stays reusable, and the
+managed MCP registrations name the stable link so a later scoped update cannot
+pin an older manager for new sessions.
+
 The repository is the portable source of the declared kit. The native manager
 (`codex-harness install|update|check|recover|disconnect`) links the checkout to
 already installed Codex CLI and OpenSpec and installs immutable Rust builds.
@@ -323,9 +331,10 @@ preserves open acceptance without a circular dependency.
 SuperGrok Heavy is delivered as the native `codex --profile xai` provider with
 a kit-owned compatibility shim on `127.0.0.1:56122`. The OpenCodex proxy, its
 Windows task and its runtime sources are retired. The main model stays GPT-6
-Astra. The shim adapts four wire-format mismatches between Codex 0.154 and
+Astra. The shim adapts five wire-format mismatches between Codex 0.154 and
 api.x.ai (reasoning `content: null`, custom tool types, namespace tool
-declarations, `external_web_access`); see
+declarations, `external_web_access`, whole-number JSON floats in tool
+arguments); see
 [subscription models](subscription-models.md#compatibility-shim). Remove the
 shim when Codex or xAI fixes the serialization.
 

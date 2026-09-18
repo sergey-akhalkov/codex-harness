@@ -3,7 +3,7 @@
 use harness_core::{
     code_tools_lifecycle, core_install,
     lifecycle::{self, Component},
-    subscription_lifecycle, token_workflow_lifecycle,
+    native_build, subscription_lifecycle, token_workflow_lifecycle,
 };
 use std::env;
 use std::{collections::BTreeMap, ffi::OsString, io, path::PathBuf, time::Duration};
@@ -294,6 +294,15 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
     let report = match options.component {
         Component::Core => {
             let user_home = required(&options.values, "--user-home")?;
+            let source = required(&options.values, "--source")?;
+            // A named build is explicit; otherwise deliver the freshest
+            // verified build of the selected source in this manager's owned
+            // state, so new sessions pick up a fresh manager without replacing
+            // one that is still running.
+            let build = match optional(&options.values, "--build") {
+                Some(build) => build,
+                None => native_build::delivery_build(&source)?,
+            };
             let timeout = options
                 .values
                 .get(&OsString::from("--timeout-seconds"))
@@ -306,8 +315,8 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
                 .unwrap_or(45);
             serde_json::to_value(core_install::connect(
                 &core_install::Request {
-                    source: required(&options.values, "--source")?,
-                    build: required(&options.values, "--build")?,
+                    source,
+                    build,
                     codex_home: required(&options.values, "--codex-home")?,
                     dependency_user_home: optional(&options.values, "--dependency-user-home")
                         .unwrap_or_else(|| user_home.clone()),
@@ -334,9 +343,15 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
             )?)?
         }
         Component::CodeTools => {
+            let codex_home = required(&options.values, "--codex-home")?;
+            // The MCP registrations name the stable manager link, not this
+            // build: a new Codex CLI session then resolves whatever manager the
+            // last Install/Update delivered, and running an older manager can
+            // no longer pin itself for later sessions.
+            let manager = codex_home.join("harness/bin/codex-harness.exe");
             serde_json::to_value(code_tools_lifecycle::run(&code_tools_lifecycle::Request {
                 source: required(&options.values, "--source")?,
-                codex_home: required(&options.values, "--codex-home")?,
+                codex_home,
                 user_home: required(&options.values, "--user-home")?,
                 dependency_user_home: optional(&options.values, "--dependency-user-home")
                     .or_else(|| optional(&options.values, "--user-home"))
@@ -347,7 +362,7 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
                     code_tools_lifecycle::Mode::Install
                 },
                 preview: options.preview,
-                manager: Some(env::current_exe()?),
+                manager: Some(manager),
             })?)?
         }
         Component::TokenWorkflow => serde_json::to_value(token_workflow_lifecycle::install(

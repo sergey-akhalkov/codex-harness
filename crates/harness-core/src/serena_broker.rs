@@ -10,7 +10,7 @@
 
 use crate::{
     broker_launch, broker_rpc, broker_service,
-    broker_state::BrokerRoot,
+    broker_state::{BrokerRoot, Generation},
     build_identity,
     process::{Cancellation, Deadline},
     process_service::ServiceGuard,
@@ -56,6 +56,11 @@ pub struct Configuration {
     pub source_root: PathBuf,
 }
 
+fn serena_rpc_recoverable(error: &io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("tree cleanup was not confirmed") || text.contains("route echo is incomplete")
+}
+
 pub fn source(configuration: &Configuration) -> io::Result<String> {
     let serena_home =
         crate::serena_configuration::prepare(&configuration.registry, &configuration.codex_home)?;
@@ -80,6 +85,10 @@ struct Record {
     owner: String,
     account: String,
     root: PathBuf,
+    /// One broker location per delivered build generation; see
+    /// [`crate::broker_state::choose_generation`].
+    #[serde(default)]
+    generations: Vec<Generation>,
 }
 
 const OWNER: &str = "codex-harness-serena-broker";
@@ -122,38 +131,67 @@ impl Admission {
 /// The shared broker root for one CODEX_HOME. The anchor record names a
 /// private prepared root; an unused CODEX_HOME creates no service state until
 /// the first proxy connects.
-pub fn root(codex_home: &Path, deadline: Deadline, cancel: &Cancellation) -> io::Result<PathBuf> {
+pub fn root(
+    codex_home: &Path,
+    source: &str,
+    deadline: Deadline,
+    cancel: &Cancellation,
+) -> io::Result<PathBuf> {
     let parent = crate::dependency_discovery::local_path(&codex_home.join("harness/runtime"))?;
     std::fs::create_dir_all(&parent)?;
     let account = crate::process_service::current_user()?;
     let _admission = Admission::acquire(&account, deadline, cancel)?;
     let anchor = parent.join("serena-broker.json");
     match crate::registration_native::FileGuard::read_regular(&anchor) {
-        Ok((_guard, bytes)) => {
+        Ok((guard, bytes)) => {
             if bytes.len() > 4096 {
                 return Err(io::Error::other(
                     "Serena broker location record exceeds its bound",
                 ));
             }
-            let record: Record = serde_json::from_slice(&bytes)
+            let mut record: Record = serde_json::from_slice(&bytes)
                 .map_err(|_| io::Error::other("Serena broker location record is invalid"))?;
             if record.owner != OWNER || record.account != account {
                 return Err(io::Error::other(
                     "Serena broker location record is not owned; preserving it",
                 ));
             }
-            Ok(BrokerRoot::open(&record.root)?.path().to_path_buf())
+            let identity = guard.object_identity()?;
+            drop(guard);
+            let (location, changed) = crate::broker_state::choose_generation(
+                &record.root,
+                &mut record.generations,
+                source,
+                || {
+                    let prepared = BrokerRoot::prepare()?;
+                    Ok(prepared.keep().path().to_path_buf())
+                },
+            )?;
+            if changed {
+                crate::registration_native::FileGuard::replace_regular(
+                    &anchor,
+                    &identity,
+                    &bytes,
+                    &serde_json::to_vec(&record)?,
+                )?;
+            }
+            Ok(location)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let prepared = BrokerRoot::prepare()?;
+            let root = prepared.keep().path().to_path_buf();
             let record = Record {
                 owner: OWNER.to_owned(),
                 account,
-                root: prepared.root().path().into(),
+                root: root.clone(),
+                generations: vec![Generation {
+                    source: source.to_owned(),
+                    root: root.clone(),
+                }],
             };
             crate::registration_native::StagedFile::create(&anchor, &serde_json::to_vec(&record)?)?
                 .commit()?;
-            Ok(prepared.keep().path().to_path_buf())
+            Ok(root)
         }
         Err(error) => Err(error),
     }
@@ -161,7 +199,7 @@ pub fn root(codex_home: &Path, deadline: Deadline, cancel: &Cancellation) -> io:
 
 pub struct Client {
     configuration: Configuration,
-    root: PathBuf,
+    root: Mutex<PathBuf>,
     source: String,
     client: String,
 }
@@ -173,14 +211,14 @@ impl Client {
         cancel: &Cancellation,
     ) -> io::Result<Self> {
         let source = source(&configuration)?;
-        let root = root(&configuration.codex_home, deadline, cancel)?;
+        let root = root(&configuration.codex_home, &source, deadline, cancel)?;
         let key = crate::broker_endpoint::random_key()?;
         // The pool's client identities are 32 hex characters, matching the
         // seam's per-session tokens.
         let client = key[..32].to_owned();
         Ok(Self {
             configuration,
-            root,
+            root: Mutex::new(root),
             source,
             client,
         })
@@ -197,27 +235,98 @@ impl Client {
         deadline: Deadline,
         cancel: &Cancellation,
     ) -> io::Result<Value> {
-        let root = BrokerRoot::open(&self.root)?;
         let mut environment = BTreeMap::new();
         for key in ["SystemRoot", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"] {
             if let Ok(value) = std::env::var(key) {
                 environment.insert(key.into(), value);
             }
         }
-        let endpoint = broker_launch::ensure(
-            &root,
+        let arguments = vec![
+            "serena".into(),
+            self.source.clone(),
+            serde_json::to_string(&self.configuration)?,
+        ];
+        let startup = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+        let mut location = self.location()?;
+        let mut endpoint = match broker_launch::ensure(
+            &BrokerRoot::open(&location)?,
             &std::env::current_exe()?,
-            vec![
-                "serena".into(),
-                self.source.clone(),
-                serde_json::to_string(&self.configuration)?,
-            ],
-            environment,
+            arguments.clone(),
+            environment.clone(),
             &self.source,
-            Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?,
+            startup,
             cancel,
-        )?;
-        match broker_rpc::invoke(&endpoint, operation, payload, deadline, cancel) {
+        ) {
+            Ok(endpoint) => endpoint,
+            // Another build generation took the location between resolution
+            // and startup; resolve this generation's own location once.
+            Err(error) if broker_launch::source_conflict(&error) => {
+                let retry = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+                location = root(&self.configuration.codex_home, &self.source, retry, cancel)?;
+                self.relocate(&location)?;
+                broker_launch::ensure(
+                    &BrokerRoot::open(&location)?,
+                    &std::env::current_exe()?,
+                    arguments.clone(),
+                    environment.clone(),
+                    &self.source,
+                    retry,
+                    cancel,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+        match Self::rpc_once(&endpoint, operation, payload, deadline, cancel) {
+            Ok(value) => Ok(value),
+            Err(error) if serena_rpc_recoverable(&error) => {
+                let retry = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+                match broker_launch::retire(&BrokerRoot::open(&location)?, retry, cancel)? {
+                    broker_launch::Retirement::Pending { pid } => Err(io::Error::other(format!(
+                        "Serena broker retirement still pending (pid {pid:?})"
+                    ))),
+                    broker_launch::Retirement::Absent
+                    | broker_launch::Retirement::Exited { .. } => {
+                        endpoint = broker_launch::ensure(
+                            &BrokerRoot::open(&location)?,
+                            &std::env::current_exe()?,
+                            arguments,
+                            environment,
+                            &self.source,
+                            retry,
+                            cancel,
+                        )?;
+                        Self::rpc_once(&endpoint, operation, payload, deadline, cancel)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn location(&self) -> io::Result<PathBuf> {
+        self.root
+            .lock()
+            .map(|root| root.clone())
+            .map_err(|_| io::Error::other("Serena broker location lock poisoned"))
+    }
+
+    fn relocate(&self, root: &Path) -> io::Result<()> {
+        *self
+            .root
+            .lock()
+            .map_err(|_| io::Error::other("Serena broker location lock poisoned"))? =
+            root.to_owned();
+        Ok(())
+    }
+
+    fn rpc_once(
+        endpoint: &crate::broker_endpoint::Endpoint,
+        operation: &str,
+        payload: &Value,
+        deadline: Deadline,
+        cancel: &Cancellation,
+    ) -> io::Result<Value> {
+        match broker_rpc::invoke(endpoint, operation, payload, deadline, cancel) {
             Ok(value) if value.get("error").is_some() => Err(io::Error::other(
                 value["error"]
                     .as_str()
@@ -276,7 +385,7 @@ impl Client {
     }
 
     pub fn disconnect(&self) -> io::Result<()> {
-        let root = BrokerRoot::open(&self.root)?;
+        let root = BrokerRoot::open(&self.location()?)?;
         if let crate::broker_endpoint::Observation::Ready { endpoint, .. } =
             crate::broker_endpoint::observe(&root)?
         {

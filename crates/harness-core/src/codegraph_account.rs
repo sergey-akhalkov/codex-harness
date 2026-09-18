@@ -1,7 +1,7 @@
 //! One reusable private broker location per Windows account, across Codex homes.
 #![cfg(windows)]
 use crate::{
-    broker_state::BrokerRoot,
+    broker_state::{BrokerRoot, Generation},
     dependency_discovery::local_path,
     process::{Cancellation, Deadline},
     registration_native::{FileGuard, StagedFile},
@@ -19,6 +19,8 @@ struct Record {
     owner: String,
     account: String,
     root: PathBuf,
+    #[serde(default)]
+    generations: Vec<Generation>,
 }
 
 struct Admission(std::os::windows::io::OwnedHandle);
@@ -70,7 +72,16 @@ impl Drop for Admission {
 pub fn root(deadline: Deadline, cancel: &Cancellation) -> io::Result<PathBuf> {
     let parent = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| io::Error::other("CodeGraph local account storage is unavailable"))?;
-    root_in(Path::new(&parent), deadline, cancel)
+    root_in(Path::new(&parent), None, deadline, cancel)
+}
+
+/// The location for one build generation: an existing entry, a free legacy
+/// account root, or a freshly prepared root. Consumers of another generation
+/// keep their own broker instead of being retired.
+pub fn root_for(source: &str, deadline: Deadline, cancel: &Cancellation) -> io::Result<PathBuf> {
+    let parent = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| io::Error::other("CodeGraph local account storage is unavailable"))?;
+    root_in(Path::new(&parent), Some(source), deadline, cancel)
 }
 
 /// Read-only lookup for Check/Disconnect; an unused installation creates no
@@ -98,7 +109,12 @@ pub fn existing_root() -> io::Result<Option<PathBuf>> {
     Ok(Some(BrokerRoot::open(&record.root)?.path().to_path_buf()))
 }
 
-fn root_in(parent: &Path, deadline: Deadline, cancel: &Cancellation) -> io::Result<PathBuf> {
+fn root_in(
+    parent: &Path,
+    source: Option<&str>,
+    deadline: Deadline,
+    cancel: &Cancellation,
+) -> io::Result<PathBuf> {
     let parent = local_path(parent)?;
     if !parent.is_dir() {
         return Err(io::Error::other("CodeGraph account parent is missing"));
@@ -107,31 +123,60 @@ fn root_in(parent: &Path, deadline: Deadline, cancel: &Cancellation) -> io::Resu
     let _admission = Admission::acquire(&account, deadline, cancel)?;
     let anchor = parent.join("coding-agents-harness-codegraph.json");
     match FileGuard::read_regular(&anchor) {
-        Ok((_guard, bytes)) => {
+        Ok((guard, bytes)) => {
             if bytes.len() > 4096 {
                 return Err(io::Error::other(
                     "CodeGraph account record exceeds its bound",
                 ));
             }
-            let record: Record = serde_json::from_slice(&bytes)?;
+            let mut record: Record = serde_json::from_slice(&bytes)?;
             if record.owner != OWNER || record.account != account {
                 return Err(io::Error::other(
                     "CodeGraph account record is not owned; preserving it",
                 ));
             }
-            let root = BrokerRoot::open(&record.root)?;
-            Ok(root.path().to_path_buf())
+            let Some(source) = source else {
+                let root = BrokerRoot::open(&record.root)?;
+                return Ok(root.path().to_path_buf());
+            };
+            let identity = guard.object_identity()?;
+            drop(guard);
+            let (root, changed) = crate::broker_state::choose_generation(
+                &record.root,
+                &mut record.generations,
+                source,
+                || {
+                    let prepared = BrokerRoot::prepare()?;
+                    Ok(prepared.keep().path().to_path_buf())
+                },
+            )?;
+            if changed {
+                crate::registration_native::FileGuard::replace_regular(
+                    &anchor,
+                    &identity,
+                    &bytes,
+                    &serde_json::to_vec(&record)?,
+                )?;
+            }
+            Ok(root)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let prepared = BrokerRoot::prepare()?;
+            let root = prepared.keep().path().to_path_buf();
             let record = Record {
                 owner: OWNER.into(),
                 account,
-                root: prepared.root().path().into(),
+                root: root.clone(),
+                generations: source
+                    .map(|source| Generation {
+                        source: source.to_owned(),
+                        root: root.clone(),
+                    })
+                    .into_iter()
+                    .collect(),
             };
             StagedFile::create(&anchor, &serde_json::to_vec(&record)?)?.commit()?;
-            let root = prepared.keep();
-            Ok(root.path().to_path_buf())
+            Ok(root)
         }
         Err(error) => Err(error),
     }
@@ -146,14 +191,46 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let deadline = Deadline::after(Duration::from_secs(5)).unwrap();
         let cancel = Cancellation::default();
-        let root = root_in(parent.path(), deadline, &cancel).unwrap();
-        assert_eq!(root_in(parent.path(), deadline, &cancel).unwrap(), root);
+        let root = root_in(parent.path(), None, deadline, &cancel).unwrap();
+        assert_eq!(
+            root_in(parent.path(), None, deadline, &cancel).unwrap(),
+            root
+        );
         let anchor = parent.path().join("coding-agents-harness-codegraph.json");
         std::fs::write(&anchor, b"{\"owner\":\"foreign\"}").unwrap();
-        assert!(root_in(parent.path(), deadline, &cancel).is_err());
+        assert!(root_in(parent.path(), None, deadline, &cancel).is_err());
         assert_eq!(std::fs::read(anchor).unwrap(), b"{\"owner\":\"foreign\"}");
         // Only this test's known private root is removed; no service was started.
         drop(BrokerRoot::open(&root).unwrap());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_second_generation_gets_its_own_location_and_reuses_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let deadline = Deadline::after(Duration::from_secs(5)).unwrap();
+        let cancel = Cancellation::default();
+        // The first generation adopts the free legacy root.
+        let first = root_in(parent.path(), Some("aaaa0000aaaa0000"), deadline, &cancel).unwrap();
+        assert_eq!(
+            root_in(parent.path(), Some("aaaa0000aaaa0000"), deadline, &cancel).unwrap(),
+            first
+        );
+        // While that root's instance lease is held, the next generation is
+        // prepared beside it instead of retiring the first broker.
+        let lease = BrokerRoot::open(&first).unwrap();
+        let _held = lease.try_instance().unwrap().unwrap();
+        let second = root_in(parent.path(), Some("bbbb0000bbbb0000"), deadline, &cancel).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            root_in(parent.path(), Some("bbbb0000bbbb0000"), deadline, &cancel).unwrap(),
+            second
+        );
+        drop(_held);
+        drop(lease);
+        for root in [first, second] {
+            drop(BrokerRoot::open(&root).unwrap());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

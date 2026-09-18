@@ -146,7 +146,7 @@ fn observed_attempt(request: &RequestIdentity, tasks: &Value, visibility: &Value
     }
     if thread["id"] != request.thread
         || thread["sessionId"] != request.session
-        || thread["ephemeral"] != false
+        || !thread["ephemeral"].is_boolean()
     {
         return Admission::Rejected("native thread identity or scope differs");
     }
@@ -197,6 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn an_ephemeral_helper_is_ready_only_with_its_own_matching_identity() {
+        let request = RequestIdentity {
+            thread: "helper".into(),
+            session: "parent".into(),
+            turn: "current".into(),
+            kind: "turn".into(),
+        };
+        let tasks =
+            json!({"threads":{"helper":{"id":"helper","sessionId":"parent","ephemeral":true}}});
+        let visibility = json!({"visible":true,"activeTurns":{"helper":"current"},"conversations":{"helper":true}});
+        assert_eq!(
+            observed_attempt(&request, &tasks, &visibility),
+            Admission::Ready
+        );
+        let mismatched =
+            json!({"threads":{"helper":{"id":"helper","sessionId":"other","ephemeral":true}}});
+        assert!(matches!(
+            observed_attempt(&request, &mismatched, &visibility),
+            Admission::Rejected(_)
+        ));
+    }
+
+    #[test]
     fn a_recorded_attempt_without_its_own_window_never_reaches_upstream() {
         let owned = BrokerRoot::prepare().unwrap();
         let root = owned.root();
@@ -221,6 +244,27 @@ mod tests {
         let body = serde_json::to_vec(&json!({"client_metadata":{"thread_id":"child","session_id":"parent","turn_id":"current","x-codex-turn-metadata":metadata.to_string()}})).unwrap();
         let mut gate = Gate::new(Path::new("unused-native-executable")).unwrap();
         let forwarder = Forwarder::new().unwrap();
+        let result = gate.forward(
+            &forwarder,
+            root,
+            ForwardRequest {
+                url: &url,
+                headers: &[],
+                body: &body,
+            },
+            Deadline::after(Duration::from_millis(150)).unwrap(),
+            &Cancellation::default(),
+            |_| panic!("no response before admission"),
+        );
+        assert!(result.is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        crate::task_runtime::save(
+            &root.path().join("task.json"),
+            &json!({"threads":{"child":{"id":"child","sessionId":"parent","ephemeral":true}}}),
+        )
+        .unwrap();
         let result = gate.forward(
             &forwarder,
             root,

@@ -16,6 +16,24 @@ use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(20);
 
+/// A configured program that Windows cannot load as an image (a broken or
+/// non-executable file) otherwise raises a modal loader dialog on the user's
+/// desktop for every attempt. The failure must reach the caller as an
+/// `io::Error`. Bounded spawning calls this itself; a caller that deliberately
+/// starts a possibly invalid program through another API (native launch, an
+/// explicit failure fixture) calls it before that attempt.
+pub fn suppress_loader_dialogs() {
+    use std::sync::Once;
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX,
+        );
+    });
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
 
@@ -676,6 +694,7 @@ mod windows {
             command: &CommandSpec,
             pseudoconsole: Option<isize>,
         ) -> io::Result<SuspendedProcess> {
+            suppress_loader_dialogs();
             if !command.program.is_absolute() {
                 return Err(invalid("executable must be an absolute path"));
             }

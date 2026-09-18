@@ -52,7 +52,7 @@ fn main() -> io::Result<()> {
         if let Some(root) = std::env::args_os().nth(3) {
             return harness_core::codegraph_stdio::serve_shared(
                 configuration,
-                root.into(),
+                Some(root.into()),
                 input,
                 output,
                 &harness_core::process::Cancellation::default(),

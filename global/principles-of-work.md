@@ -4,7 +4,7 @@ Deliver a quality, working end-to-end result early, then continue to the complet
 
 ## Language and shell defaults
 
-Rust by default for new code (resource and energy efficiency); PowerShell for commands, scripts and examples, especially on Windows; both apply to main and delegated work in every project. Another language or shell only on request or a concrete task, integration or platform constraint, explained. Defaults authorize no unrelated rewrites or migrations.
+Rust by default for new code (resource and energy efficiency); PowerShell for commands, scripts and examples, especially on Windows; both apply to main and delegated work in every project. Another language or shell only on request or a concrete task, integration or platform constraint, explained. Defaults authorize no unrelated rewrites or migrations. Use only the single owner-designated PowerShell 7 (`pwsh`) instance already installed on a machine; never install an additional PowerShell distribution or version, and never fall back to Windows PowerShell 5.1 for tooling.
 
 ## Mandatory skill use
 

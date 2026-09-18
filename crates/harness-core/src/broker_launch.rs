@@ -116,6 +116,14 @@ fn healthy(
     Ok(endpoint)
 }
 
+/// A live owner that answers for another build generation of the same broker.
+/// Delivery resolves such a conflict with a location of its own instead of
+/// retiring a broker that running consumers still use.
+pub fn source_conflict(error: &io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("older source/runtime") || text.contains("broker readiness/source differs")
+}
+
 /// The caller supplies a trusted bootstrap and the source identity of its full
 /// service configuration. A compatible live owner is joined, never replaced.
 /// New services must publish an exact endpoint and answer authenticated status.

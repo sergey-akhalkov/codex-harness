@@ -213,13 +213,14 @@ pub fn serve(
 
 pub fn serve_shared(
     configuration: Configuration,
-    root: PathBuf,
+    root: Option<PathBuf>,
     input: File,
     output: File,
     cancel: &Cancellation,
     deadline: Deadline,
 ) -> io::Result<()> {
-    let shared = crate::codegraph_broker::Client::new(configuration.clone(), root)?;
+    let shared =
+        crate::codegraph_broker::Client::new(configuration.clone(), root, deadline, cancel)?;
     serve_inner(configuration, Some(shared), input, output, cancel, deadline)
 }
 

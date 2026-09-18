@@ -288,6 +288,122 @@ pub(crate) fn owner_root(state: &Path) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Publication order of one `builds/<identity>` directory name. Names are
+/// `<source>-<nanos>-<pid>`; a foreign or malformed name is skipped instead of
+/// being delivered.
+fn published_sequence(build: &Path) -> Option<(u128, u32)> {
+    let name = build.file_name()?.to_str()?;
+    let mut parts = name.split('-');
+    let source = parts.next()?;
+    let sequence = parts.next()?.parse::<u128>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some()
+        || source.len() != 16
+        || !source.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((sequence, pid))
+}
+
+fn candidate_builds(state: &Path) -> io::Result<Vec<((u128, u32), PathBuf)>> {
+    owner_root(state)?;
+    let builds = state.join("builds");
+    let missing = || {
+        io::Error::other(
+            "No integrity-verified native build is available in the owned state; run an explicit build first.",
+        )
+    };
+    if !builds.exists() {
+        return Err(missing());
+    }
+    directory(&builds)?;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&builds)? {
+        let path = entry?.path();
+        let Some(sequence) = published_sequence(&path) else {
+            continue;
+        };
+        let Ok(record) = build_identity::verify_record_integrity(&path) else {
+            continue;
+        };
+        if !BINARIES
+            .iter()
+            .all(|name| record.binaries.contains_key(*name))
+        {
+            continue;
+        }
+        candidates.push((sequence, path));
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    Ok(candidates)
+}
+
+/// The freshest published build whose full record and every recorded binary
+/// still verify. An unverified, altered or foreign directory is never chosen.
+pub fn freshest_verified(state: &Path) -> io::Result<PathBuf> {
+    candidate_builds(state)?
+        .into_iter()
+        .next()
+        .map(|(_, path)| path)
+        .ok_or_else(|| {
+            io::Error::other(
+                "No integrity-verified native build is available in the owned state; run an explicit build first.",
+            )
+        })
+}
+
+/// The freshest verified build published from exactly this source. A build
+/// from another checkout, or one whose recorded source no longer matches the
+/// live files, is never selected for delivery.
+fn freshest_for_source(state: &Path, source: &Path) -> io::Result<Option<PathBuf>> {
+    let source = source.canonicalize()?;
+    Ok(candidate_builds(state)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| {
+            build_identity::read_record(path)
+                .ok()
+                .and_then(|record| record.source_root.canonicalize().ok())
+                .is_some_and(|root| root == source)
+                && build_identity::check(path, Some(&source)).runtime_allowed
+        }))
+}
+
+/// The build delivered by an Install/Update that names none: the freshest
+/// verified build of the selected source in the owned state this manager
+/// itself runs from. A manager outside such a state keeps requiring an
+/// explicit build instead of guessing, and a stale or foreign-source build is
+/// never delivered silently.
+pub fn delivery_build(source: &Path) -> io::Result<PathBuf> {
+    delivery_from(&std::env::current_exe()?, source)
+}
+
+/// Spelling matters: every lifecycle check rejects verbatim (`\\?\`) paths, so
+/// the delivered build is returned in its ordinary local form.
+fn delivery_from(executable: &Path, source: &Path) -> io::Result<PathBuf> {
+    let executable = crate::dependency_package::plain(&executable.canonicalize()?);
+    let build = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("Native manager has no build directory."))?;
+    let outside = || {
+        io::Error::other(
+            "This manager does not run from an owned native state; pass --build DIRECTORY.",
+        )
+    };
+    let builds = build.parent().ok_or_else(outside)?;
+    if builds.file_name() != Some(OsStr::new("builds")) {
+        return Err(outside());
+    }
+    let state = builds.parent().ok_or_else(outside)?;
+    freshest_for_source(state, source)?
+        .ok_or_else(|| {
+            io::Error::other(
+                "No integrity-verified native build matches the selected source; run an explicit build first.",
+            )
+        })
+}
+
 fn find_reusable(
     state: &Path,
     source: &Path,
@@ -638,5 +754,147 @@ mod tests {
         assert!(b.try_lock().is_err());
         drop(a);
         b.try_lock().unwrap();
+    }
+
+    fn source_fixture(root: &Path, name: &str) -> PathBuf {
+        let source = root.join(name);
+        for directory in ["crates/one/src", "tools/rtk-adapter/src"] {
+            fs::create_dir_all(source.join(directory)).unwrap();
+        }
+        for file in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/one/src/lib.rs",
+            "tools/rtk-adapter/src/lib.rs",
+        ] {
+            fs::write(source.join(file), "fixture").unwrap();
+        }
+        source
+    }
+
+    fn published_from(state: &Path, name: &str, source: &Path, binaries: &[&str]) -> PathBuf {
+        let build = state.join("builds").join(name);
+        fs::create_dir_all(&build).unwrap();
+        let mut hashes = std::collections::BTreeMap::new();
+        for binary in binaries {
+            fs::write(build.join(binary), binary).unwrap();
+            hashes.insert(
+                (*binary).to_owned(),
+                build_identity::hash_file(&build.join(binary)).unwrap(),
+            );
+        }
+        let record = build_identity::BuildRecord {
+            schema: build_identity::SCHEMA,
+            source_root: source.to_path_buf(),
+            source: build_identity::source_identity(source).unwrap(),
+            rustc: "fixture".into(),
+            cargo: "fixture".into(),
+            target: "x86_64-pc-windows-msvc".into(),
+            profile: "release".into(),
+            binaries: hashes,
+        };
+        fs::write(
+            build.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        build
+    }
+
+    fn published(state: &Path, name: &str, binaries: &[&str]) -> PathBuf {
+        let source = source_fixture(state.parent().unwrap(), "source");
+        published_from(state, name, &source, binaries)
+    }
+
+    #[test]
+    fn delivery_uses_the_freshest_verified_published_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let older = published(&state, "aaaa0000aaaa0000-1500-1", BINARIES);
+        let newer = published(&state, "bbbb0000bbbb0000-2500-2", BINARIES);
+        assert_eq!(freshest_verified(&state).unwrap(), newer);
+        // A newer directory that cannot verify is skipped, never delivered.
+        let altered = published(&state, "cccc0000cccc0000-3500-3", BINARIES);
+        fs::write(altered.join("codex-harness.exe"), "altered").unwrap();
+        assert_eq!(freshest_verified(&state).unwrap(), newer);
+        // A record missing this consumer's binaries is not a delivery candidate.
+        let partial = published(&state, "dddd0000dddd0000-4500-4", &["codex-harness.exe"]);
+        assert_eq!(freshest_verified(&state).unwrap(), newer);
+        fs::remove_dir_all(&altered).unwrap();
+        fs::remove_dir_all(&partial).unwrap();
+        fs::remove_dir_all(&newer).unwrap();
+        assert_eq!(freshest_verified(&state).unwrap(), older);
+    }
+
+    #[test]
+    fn delivery_refuses_a_state_without_verified_builds() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let error = freshest_verified(&state).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("integrity-verified native build"),
+            "{error}"
+        );
+        let foreign = temp.path().join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("keep"), "keep").unwrap();
+        assert!(freshest_verified(&foreign).is_err());
+        assert_eq!(fs::read_to_string(foreign.join("keep")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn delivery_ignores_builds_from_another_or_changed_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let first = source_fixture(temp.path(), "one");
+        let second = source_fixture(temp.path(), "two");
+        let from_first = published_from(&state, "aaaa0000aaaa0000-1500-1", &first, BINARIES);
+        let from_second = published_from(&state, "bbbb0000bbbb0000-2500-2", &second, BINARIES);
+        assert_eq!(freshest_verified(&state).unwrap(), from_second);
+        assert_eq!(
+            freshest_for_source(&state, &first).unwrap(),
+            Some(from_first.clone())
+        );
+        // A build whose live source no longer matches is not deliverable.
+        fs::write(first.join("crates/one/src/lib.rs"), "changed").unwrap();
+        assert_eq!(freshest_for_source(&state, &first).unwrap(), None);
+    }
+
+    #[test]
+    fn delivery_build_requires_a_manager_inside_an_owned_state() {
+        let source = std::env::current_dir().unwrap();
+        let error = delivery_build(&source).unwrap_err();
+        assert!(error.to_string().contains("--build DIRECTORY"), "{error}");
+    }
+
+    #[test]
+    fn delivery_returns_a_spelling_the_lifecycle_accepts() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let source = source_fixture(temp.path(), "source");
+        let older = published_from(&state, "aaaa0000aaaa0000-1500-1", &source, BINARIES);
+        let newer = published_from(&state, "bbbb0000bbbb0000-2500-2", &source, BINARIES);
+        // The manager runs from the older build while a fresher one exists.
+        let manager = older.join("codex-harness.exe");
+        let delivered = delivery_from(&manager, &source).unwrap();
+        assert_eq!(delivered, newer);
+        assert!(
+            !delivered.to_string_lossy().starts_with(r"\\?\"),
+            "verbatim spelling is rejected by the installer: {delivered:?}"
+        );
+        assert!(crate::installation_state::normal(&delivered).is_ok());
+        // A source without a matching build is refused instead of guessed.
+        let other = source_fixture(temp.path(), "other");
+        let error = delivery_from(&manager, &other).unwrap_err();
+        assert!(
+            error.to_string().contains("matches the selected source"),
+            "{error}"
+        );
     }
 }

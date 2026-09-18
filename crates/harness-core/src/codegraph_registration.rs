@@ -391,9 +391,20 @@ fn serving_status(
         .as_str()
         .ok_or_else(|| invalid("CodeGraph registration command is missing"))?;
     let path = PathBuf::from(command);
-    let parent = path.parent();
-    if parent.is_some_and(|parent| parent.join("build.json").is_file()) {
-        let check = build_identity::check(parent.unwrap(), None);
+    // The registered command is the stable manager link; inspect the build its
+    // target actually belongs to, not only a frozen build path.
+    let build = path
+        .parent()
+        .filter(|parent| parent.join("build.json").is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            crate::dependency_package::resolved(&path)
+                .ok()
+                .and_then(|resolved| resolved.parent().map(Path::to_path_buf))
+        })
+        .filter(|parent| parent.join("build.json").is_file());
+    if let Some(parent) = build {
+        let check = build_identity::check(&parent, None);
         if !check.serving_allowed {
             return Ok(ServingStatus {
                 admitted: false,

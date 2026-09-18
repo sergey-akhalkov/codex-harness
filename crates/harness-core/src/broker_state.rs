@@ -20,6 +20,49 @@ use windows_sys::Win32::{Foundation::HANDLE, Security::*, Storage::FileSystem::F
 
 const OWNER: &str = "codex-harness/native-resource-broker/v1";
 const MARKER: &str = "broker-owner.json";
+
+/// One broker location per delivered build generation. A generation with live
+/// consumers keeps its broker; a newer generation gets its own location instead
+/// of retiring a broker that running consumers still use.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct Generation {
+    pub source: String,
+    pub root: PathBuf,
+}
+
+/// Pick the location for `source`: an existing generation entry, a free legacy
+/// root, or a freshly prepared root. Entries whose directory is gone are
+/// dropped, so the list stays bounded by usable generations. Returns the
+/// location and whether the record must be rewritten.
+pub fn choose_generation(
+    legacy: &Path,
+    generations: &mut Vec<Generation>,
+    source: &str,
+    prepare: impl FnOnce() -> io::Result<PathBuf>,
+) -> io::Result<(PathBuf, bool)> {
+    generations.retain(|generation| BrokerRoot::open(&generation.root).is_ok());
+    if let Some(generation) = generations
+        .iter()
+        .find(|generation| generation.source == source)
+    {
+        return Ok((generation.root.clone(), false));
+    }
+    let legacy_free = BrokerRoot::open(legacy)
+        .is_ok_and(|root| crate::broker_endpoint::Instance::claim(&root).is_ok())
+        && !generations
+            .iter()
+            .any(|generation| generation.root == legacy);
+    let root = if legacy_free {
+        legacy.to_path_buf()
+    } else {
+        prepare()?
+    };
+    generations.push(Generation {
+        source: source.to_owned(),
+        root: root.clone(),
+    });
+    Ok((root, true))
+}
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }

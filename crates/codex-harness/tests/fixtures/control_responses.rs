@@ -62,6 +62,8 @@ impl Responses {
         background: bool,
     ) -> Self {
         let pair = evidence.join("two-executors").is_file();
+        let helper_case = evidence.join("helper-window").is_file();
+        let close_view = evidence.join("close-view").is_file();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -174,6 +176,25 @@ impl Responses {
                 let second_spawned = request["input"].as_array().unwrap().iter().any(|item| {
                     item["type"] == "function_call_output" && item["call_id"] == "control-spawn-2"
                 });
+                let helper_worker = request["input"].as_array().unwrap().iter().any(|item| {
+                    (item["type"] == "agent_message" || item["role"] == "user")
+                        && item["content"].as_array().is_some_and(|content| {
+                            content.iter().any(|part| {
+                                part["text"].as_str().is_some_and(|text| {
+                                    text.contains("CONTROL_HELPER_ASSIGNMENT")
+                                })
+                            })
+                        })
+                });
+                let helper_spawned = request["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["call_id"] == "control-spawn-helper"
+                });
+                let helper_waited = request["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["call_id"] == "control-wait-helper"
+                });
+                let worker = worker && !helper_worker;
                 if pair && worker {
                     assert_eq!(
                         request["model"],
@@ -221,6 +242,11 @@ impl Responses {
                         "the child's assignment must arrive as visible text"
                     );
                 }
+                if helper_worker {
+                    assert_helper_visible(&evidence, &identity.thread);
+                } else if helper_case && worker {
+                    assert_executor_visible(&evidence, &identity.thread);
+                }
                 let title = request["input"].as_array().unwrap().iter().any(|item| {
                     item["role"] == "user"
                         && item["content"].as_array().is_some_and(|parts| {
@@ -231,14 +257,15 @@ impl Responses {
                             })
                         })
                 });
-                let item = if view_loss && sequence > 1 {
-                    assert!(
-                        request["input"]
-                            .to_string()
-                            .contains("Continue only the previously authorized task"),
-                        "recovery must receive the bounded visible continuation"
-                    );
-                    if sequence == 2 {
+                let recovering = request["input"]
+                    .to_string()
+                    .contains("Continue only the previously authorized task");
+                let item = if recovering {
+                    let read_done = request["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "function_call_output"
+                            && item["call_id"] == "control-read-1"
+                    });
+                    if !read_done {
                         json!({"type":"function_call","call_id":"control-read-1","name":"exec_command",
                             "arguments":serde_json::to_string(&json!({"cmd":"Get-Content proof.txt","shell":"powershell","yield_time_ms":10000})).unwrap()})
                     } else {
@@ -312,6 +339,26 @@ impl Responses {
                     json!({"type":"message","id":"msg-parent-final","role":"assistant","content":[{"type":"output_text","text":FINAL}]})
                 } else if !direct && !worker {
                     json!({"type":"message","id":"msg-parent","role":"assistant","content":[{"type":"output_text","text":"Owned child dispatched."}]})
+                } else if helper_case && worker && !helper_spawned {
+                    json!({"type":"function_call","call_id":"control-spawn-helper","namespace":"multi_agent_v1","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"fork_context":false,"message":"CONTROL_HELPER_ASSIGNMENT: run the owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
+                } else if helper_case && worker && !helper_waited {
+                    let spawn: Value = serde_json::from_str(
+                        request["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|item| {
+                                item["type"] == "function_call_output"
+                                    && item["call_id"] == "control-spawn-helper"
+                            })
+                            .and_then(|item| item["output"].as_str())
+                            .expect("native helper spawn result must identify the child"),
+                    )
+                    .unwrap();
+                    let id = spawn["agent_id"].as_str().expect("native helper id");
+                    json!({"type":"function_call","call_id":"control-wait-helper","namespace":"multi_agent_v1","name":"wait_agent","arguments":serde_json::to_string(&json!({"targets":[id],"timeout_ms":30000})).unwrap()})
+                } else if helper_case && worker {
+                    json!({"type":"message","id":"msg-executor-helper","role":"assistant","content":[{"type":"output_text","text":"Owned helper consumed."}]})
                 } else if result_seen {
                     if pair {
                         assert!(
@@ -370,9 +417,9 @@ impl Responses {
                         }
                     );
                     let arguments=serde_json::to_string(&json!({
-                        "cmd":if pair { pair_command.as_str() } else if view_loss || background { "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-tool); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-tool)) { throw 'owned tool release deadline' }; Get-Content proof.txt" }
+                        "cmd":if pair { pair_command.as_str() } else if view_loss || close_view || background { "[IO.File]::AppendAllText('proof.txt', 'one'); for ($n = 0; $n -lt 600 -and !(Test-Path finish-tool); $n++) { Start-Sleep -Milliseconds 100 }; if (!(Test-Path finish-tool)) { throw 'owned tool release deadline' }; Get-Content proof.txt" }
                             else { "[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt" },
-                        "shell":"powershell","yield_time_ms":if background { 1000 } else if view_loss || pair { 30000 } else { 10000 }
+                        "shell":"powershell","yield_time_ms":if background { 1000 } else if view_loss || close_view || pair { 30000 } else { 10000 }
                     })).unwrap();
                     if request["tools"].as_array().is_some_and(|tools| {
                         tools
@@ -428,6 +475,13 @@ impl Drop for Responses {
     }
 }
 
+fn view_executable(evidence: &std::path::Path) -> PathBuf {
+    std::env::var_os("HARNESS_CONTROL_CODEX_EXE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| evidence.join("build").join("codex.exe"))
+}
+
 fn assert_initial_visible(evidence: &std::path::Path, requested_thread: &str) {
     let pointer: Value = serde_json::from_slice(
         &fs::read(evidence.join("controller-state.json"))
@@ -448,7 +502,7 @@ fn assert_initial_visible(evidence: &std::path::Path, requested_thread: &str) {
     assert_eq!(view["threadId"], requested_thread);
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
-    let native = PathBuf::from(std::env::var_os("HARNESS_CONTROL_CODEX_EXE").unwrap());
+    let native = view_executable(evidence);
     assert!(
         snapshot
             .is_visible(
@@ -477,7 +531,7 @@ fn assert_executor_visible(evidence: &std::path::Path, requested_thread: &str) {
         serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
     assert_ne!(initial["threadId"], requested_thread);
     assert!(!views["threads"][requested_thread].is_null());
-    let native = PathBuf::from(std::env::var_os("HARNESS_CONTROL_CODEX_EXE").unwrap());
+    let native = view_executable(evidence);
     let user = harness_core::process_service::current_user().unwrap();
     for value in
         std::iter::once(&initial["window"]).chain(views["threads"].as_object().unwrap().values())
@@ -489,6 +543,20 @@ fn assert_executor_visible(evidence: &std::path::Path, requested_thread: &str) {
             "all established conversations must be visible at executor dispatch"
         );
     }
+}
+
+fn assert_helper_visible(evidence: &std::path::Path, requested_thread: &str) {
+    assert_executor_visible(evidence, requested_thread);
+    let pointer: Value =
+        serde_json::from_slice(&fs::read(evidence.join("controller-state.json")).unwrap()).unwrap();
+    let state = PathBuf::from(pointer["root"].as_str().unwrap());
+    let requests: Value =
+        serde_json::from_slice(&fs::read(state.join("child-view-requests.json")).unwrap()).unwrap();
+    assert_eq!(requests[requested_thread]["title"], "Helper 1");
+    assert!(
+        requests[requested_thread]["slot"].as_u64().unwrap() >= 4,
+        "helpers occupy panes after the two executor slots"
+    );
 }
 
 fn assert_successor_visible(evidence: &std::path::Path, requested_thread: &str) {
@@ -506,7 +574,7 @@ fn assert_successor_visible(evidence: &std::path::Path, requested_thread: &str) 
     assert_ne!(initial["threadId"], id);
     assert_eq!(leader["model"], "zai/glm-5.3");
     assert_eq!(leader["previousThreadId"], initial["threadId"]);
-    let native = PathBuf::from(std::env::var_os("HARNESS_CONTROL_CODEX_EXE").unwrap());
+    let native = view_executable(evidence);
     let user = harness_core::process_service::current_user().unwrap();
     for snapshot in [&views["threads"][id], &initial["window"]] {
         let snapshot: harness_core::task_view::Snapshot =
@@ -537,7 +605,7 @@ fn send_response(
         pointer["root"].as_str().unwrap(),
     ))
     .unwrap();
-    let native = PathBuf::from(std::env::var_os("HARNESS_CONTROL_CODEX_EXE").unwrap());
+    let native = view_executable(evidence);
     let mut gate = harness_core::task_admission::Gate::new(&native).unwrap();
     let forwarder = harness_core::task_forward::Forwarder::new().unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

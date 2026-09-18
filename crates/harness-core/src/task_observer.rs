@@ -83,7 +83,7 @@ pub(crate) fn observe(
                         // titles. They are not user work and cannot be resumed
                         // with full history. Subscribe only after a real turn
                         // starts, when the native rollout is resumable.
-                        if params["thread"]["ephemeral"] != true
+                        if admit_started_thread(&params["thread"], &tasks)
                             && let Some(id) = params["thread"]["id"].as_str()
                         {
                             tasks.insert(id.into(), params["thread"].clone());
@@ -104,9 +104,13 @@ pub(crate) fn observe(
                     }
                     Some("item/completed") => {
                         if let Some((child, parent)) = discovered_child(params, &tasks) {
-                            tasks.entry(child).or_insert_with(|| json!({
-                                "pendingNativeRead":true,"discoveredParent":parent,"status":{"type":"unknown"}
-                            }));
+                            tasks.entry(child).or_insert_with(|| {
+                                json!({
+                                    "pendingNativeRead":true,
+                                    "discoveredParent":parent,
+                                    "status":{"type":"unknown"}
+                                })
+                            });
                             changed = true;
                         }
                         if let Some(thread) = params["threadId"].as_str()
@@ -218,6 +222,17 @@ pub(crate) fn observe(
     }
 }
 
+fn admit_started_thread(thread: &Value, tasks: &BTreeMap<String, Value>) -> bool {
+    if thread["id"].as_str().is_none_or(|id| id.is_empty()) {
+        return false;
+    }
+    if thread["ephemeral"] != true {
+        return true;
+    }
+    crate::task_child_views::conversation_parent(thread)
+        .is_some_and(|parent| tasks.contains_key(parent))
+}
+
 fn discovered_child(params: &Value, tasks: &BTreeMap<String, Value>) -> Option<(String, String)> {
     let parent = params["threadId"].as_str()?;
     let item = &params["item"];
@@ -259,8 +274,36 @@ fn thread_settled(thread: &Value, failure: Option<&Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BTreeMap, BrokerRoot, Visibility, discovered_child, thread_settled};
+    use super::{
+        BTreeMap, BrokerRoot, Visibility, admit_started_thread, discovered_child, thread_settled,
+    };
     use serde_json::json;
+
+    #[test]
+    fn ephemeral_title_threads_stay_out_until_a_known_parent_owns_them() {
+        let tasks = BTreeMap::from([("lead".into(), json!({"id":"lead"}))]);
+        assert!(admit_started_thread(
+            &json!({"id":"lead","ephemeral":false}),
+            &tasks
+        ));
+        assert!(admit_started_thread(
+            &json!({"id":"helper","ephemeral":true,"parentThreadId":"lead"}),
+            &tasks
+        ));
+        assert!(!admit_started_thread(
+            &json!({"id":"title","ephemeral":true}),
+            &tasks
+        ));
+        assert!(admit_started_thread(
+            &json!({"id":"forked","ephemeral":true,"forkedFromId":"lead"}),
+            &tasks
+        ));
+        assert!(!admit_started_thread(
+            &json!({"id":"title","ephemeral":true,"parentThreadId":"missing"}),
+            &tasks
+        ));
+        assert!(!admit_started_thread(&json!({"ephemeral":false}), &tasks));
+    }
 
     #[test]
     fn v1_spawn_discovery_requires_completed_tool_and_matching_known_parent() {
@@ -434,10 +477,22 @@ impl Visibility {
             && let Some(action) = self.pending.remove(id)
         {
             if event.get("error").is_some() {
-                save(&root.path().join("visibility-error.json"), event)?;
-                return Err(io::Error::other(
-                    "native visibility control failed; reconcile saved work",
-                ));
+                let already_settled = matches!(action, ViewAction::Interrupt { .. })
+                    && event["error"]["message"] == "no active turn to interrupt";
+                if already_settled {
+                    if let ViewAction::Interrupt { thread, turn } = &action {
+                        if self.stopping.get(thread) == Some(turn) {
+                            self.stopping.remove(thread);
+                        }
+                        self.recovery.remove(thread);
+                    }
+                    changed = true;
+                } else {
+                    save(&root.path().join("visibility-error.json"), event)?;
+                    return Err(io::Error::other(
+                        "native visibility control failed; reconcile saved work",
+                    ));
+                }
             }
             if matches!(action, ViewAction::Continue { .. })
                 && !event["result"]["turn"]["id"].is_string()

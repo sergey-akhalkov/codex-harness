@@ -23,7 +23,7 @@
 
 ## 4. Isolated visible executors and steering
 
-- [ ] 4.1 Implement controller-owned worktree lifecycle: create per assignment from the task base revision, record the mapping, preserve through interruption, retire after merge or explicit discard; verify executors never write to the shared checkout.
+- [ ] 4.1 Verify installed CLI 0.154.0 managed worktrees on Windows and use them as the executor checkout: enable experimental `worktrees`, allocate a native managed worktree from the task base revision, bind it before the first model request, record the mapping, preserve it through interruption, and retire it after merge or explicit discard (CLI allocations are not auto-cleaned). Because the verified control TUI uses `--remote`, do not pass `--worktree` on that view; attach the visible window to the managed cwd. Add harness mapping only where native is insufficient (remote TUI, ephemeral spawn_agent helpers, missing feature). Verify executors never write to the shared checkout and that unsupported installations report an explicit limitation instead of using the shared tree.
 - [ ] 4.2 Integrate profile-backed executor dispatch with its own window and worktree before the first model request; verify two executors run simultaneously in separate worktrees and windows with distinct live identities.
 - [ ] 4.3 Deliver lead steering through the verified session channel into the executor's visible conversation; verify no hidden model calls, no status polling and continuation in the same session and worktree.
 - [ ] 4.4 Verify view-loss behavior: suspension of new dispatch, reconciliation without replay, explicit reporting and restoration before continuation.

@@ -118,6 +118,23 @@ pub(crate) fn save(path: &Path, value: &Value) -> io::Result<()> {
     })
 }
 
+fn persist_additional(
+    root: &BrokerRoot,
+    snapshots: &BTreeMap<String, crate::task_view::Snapshot>,
+) -> io::Result<()> {
+    save(
+        &root.path().join("additional-views.json"),
+        &json!({"schema":1,"threads":snapshots}),
+    )
+}
+
+fn report_closed_views(root: &BrokerRoot, closed: &[String]) -> io::Result<()> {
+    save(
+        &root.path().join("view-restore.json"),
+        &json!({"schema":1,"closed":closed,"reason":"conversation view closed"}),
+    )
+}
+
 /// The caller has already verified the registered upstream and runtime. None
 /// preserves the ordinary CLI path for commands outside managed interaction.
 pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<i32>> {
@@ -135,11 +152,7 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             return Ok(None);
         }
     };
-    let mut placements = crate::task_view::three_windows()?.to_vec();
-    let mut replacement = placements[0];
-    replacement.y += replacement.height / 2;
-    replacement.height -= replacement.height / 2;
-    placements.push(replacement);
+    let mut placements = crate::task_view::layout(4)?;
     let root = BrokerRoot::prepare()?.keep();
     let launch = Launch {
         schema: 1,
@@ -235,18 +248,19 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
         "codex-harness: task control state: {}",
         root.path().display()
     );
-    let view = match crate::task_view::View::spawn(&tui, placements[0], STARTUP).and_then(|view| {
-        if endpoint.thread_id.is_some() {
-            view.wait_for_title("Codex task", STARTUP)?;
-        }
-        Ok(view)
-    }) {
-        Ok(view) => view,
-        Err(error) => {
-            request_stop(root.path())?;
-            return Err(error);
-        }
-    };
+    let mut view =
+        match crate::task_view::View::spawn(&tui, placements[0], STARTUP).and_then(|view| {
+            if endpoint.thread_id.is_some() {
+                view.wait_for_title("Codex task", STARTUP)?;
+            }
+            Ok(view)
+        }) {
+            Ok(view) => view,
+            Err(error) => {
+                request_stop(root.path())?;
+                return Err(error);
+            }
+        };
     save(
         &root.path().join("view.json"),
         &json!({"schema":1,"threadId":endpoint.thread_id,"window":view.snapshot()?}),
@@ -266,6 +280,79 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                 "task controller exited while its conversation was open",
             ));
         }
+        let stopped = root.path().join("stop.json").try_exists()?;
+        if !stopped {
+            let primary_live = view.is_running()?;
+            let additional_live = additional
+                .values()
+                .map(crate::task_view::View::is_running)
+                .collect::<io::Result<Vec<_>>>()?
+                .into_iter()
+                .any(|live| live);
+            if primary_live || additional_live {
+                let mut closed = Vec::new();
+                additional.retain(|id, child| match child.is_running() {
+                    Ok(true) => true,
+                    _ => {
+                        closed.push(id.clone());
+                        snapshots.remove(id);
+                        false
+                    }
+                });
+                if !closed.is_empty() {
+                    persist_additional(&root, &snapshots)?;
+                    report_closed_views(&root, &closed)?;
+                }
+                if !view.is_running()?
+                    && additional
+                        .values()
+                        .map(crate::task_view::View::is_running)
+                        .collect::<io::Result<Vec<_>>>()?
+                        .into_iter()
+                        .any(|live| live)
+                {
+                    let Some(thread_id) = endpoint.thread_id.clone() else {
+                        request_stop(root.path())?;
+                        return Err(io::Error::other(
+                            "lead conversation closed before its thread was named",
+                        ));
+                    };
+                    report_closed_views(&root, &[thread_id.clone()])?;
+                    let mut next = CommandSpec::new(command.get_program());
+                    next.env.clone_from(&tui.env);
+                    next.current_dir = Some(env::current_dir()?);
+                    next.args = vec![
+                        "--remote".into(),
+                        format!("ws://127.0.0.1:{}", endpoint.port).into(),
+                        "--remote-auth-token-env".into(),
+                        TOKEN_ENV.into(),
+                        "resume".into(),
+                        thread_id.clone().into(),
+                        "--no-alt-screen".into(),
+                    ];
+                    next.new_console = Some("Opening Codex task".into());
+                    view = match crate::task_view::View::spawn(&next, placements[0], STARTUP)
+                        .and_then(|view| {
+                            view.wait_for_title("Codex task", STARTUP)?;
+                            Ok(view)
+                        }) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            save(
+                                &root.path().join("view-error.json"),
+                                &json!({"schema":1,"threadId":thread_id,"error":error.to_string()}),
+                            )?;
+                            request_stop(root.path())?;
+                            return Err(error);
+                        }
+                    };
+                    save(
+                        &root.path().join("view.json"),
+                        &json!({"schema":1,"threadId":thread_id,"window":view.snapshot()?}),
+                    )?;
+                }
+            }
+        }
         let mut requests = Vec::new();
         match read_json::<crate::task_view::Request>(&root.path().join("view-request.json")) {
             Ok(request) => requests.push(request),
@@ -282,7 +369,7 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
         for request in requests {
             if request.schema != 1
                 || request.slot == 0
-                || request.slot >= placements.len()
+                || request.slot > 32
                 || request.thread_id.is_empty()
                 || endpoint.thread_id.as_ref() == Some(&request.thread_id)
             {
@@ -294,6 +381,9 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 additional.entry(request.thread_id.clone())
             {
+                if request.slot >= placements.len() {
+                    placements = crate::task_view::layout(request.slot + 1)?;
+                }
                 if request.slot == 3 {
                     let mut previous = placements[0];
                     previous.height /= 2;
@@ -333,10 +423,7 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                 };
                 snapshots.insert(request.thread_id.clone(), next.snapshot()?);
                 entry.insert(next);
-                save(
-                    &root.path().join("additional-views.json"),
-                    &json!({"schema":1,"threads":snapshots}),
-                )?;
+                persist_additional(&root, &snapshots)?;
             }
         }
         if !view.is_running()?

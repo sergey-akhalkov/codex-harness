@@ -170,13 +170,13 @@ the first active turn; global thread-start events alone do not subscribe them
 to final turn events. The new visible-console option retains Job ownership
 and gives the new window its own standard devices.
 
-The native-entry test now also opens an owned conversation window. Its
-`native-entry-result-ready.json` identifies the runtime/window for scoped Nuphus
-inspection. After observing the final output, supply
-`native-entry-result-observed.json` with `finalVisible=true` and issue `/quit`
-in that exact native window. The fixture then checks wrapper exit, final checkpoint
-and service cleanup. Simultaneous active executor work, automatic runtime view
-loss/reconnection and global delivery remain unfinished.
+The native-entry test opens an owned conversation window, then checks that
+window against the release wrapper (`build/codex.exe`), writes
+`native-entry-result-observed.json` with `finalVisible=true`, and sends `/quit`.
+Do not point `Snapshot::is_visible` at the upstream Codex binary: the TUI process
+is the harness wrapper. Spawned children get their own named window (`Executor N`
+or `Helper N`) before the fixture answers their first model request. View-loss
+restore still uses scoped desktop receipts. Global delivery remains unfinished.
 
 A frontend that exits early records its native exit code in private
 `client-closed.json`; the entry-point test reports that exit immediately instead
@@ -502,6 +502,20 @@ binaries are never overwritten or removed. Ordinary consumers must reject an
 unfinished selection journal or stale build. An integrity-verified manager may
 select a repaired build even if the old binary was altered; recovery refuses to
 restore an altered previous build as usable.
+
+Core `install|update` deliver the freshest integrity-verified published build
+of the running manager's owned state when `--build` is omitted; an explicit
+`--build` overrides that choice, and a manager outside an owned state keeps
+requiring it. Delivery only re-points the `harness/bin` links, so a running
+manager file is never replaced: already started sessions keep their build and
+the next session resolves the delivered one. Code-tools registrations name that
+stable manager link instead of a frozen build path.
+
+The shared Serena and CodeGraph brokers keep one private location per delivered
+build generation, so a new session serves from its own manager while sessions
+of the previous build keep their broker until they finish. A generation with no
+consumers retires on its idle timeout; explicit retirement remains a separate
+maintenance command.
 
 Every compilation uses a fresh owned temporary target with a short path for
 MSVC; unchanged candidates reuse verified immutable binaries. Explicit release

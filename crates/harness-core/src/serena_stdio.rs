@@ -65,6 +65,41 @@ pub fn with_list_changed(message: Value) -> Value {
     message
 }
 
+/// Serena's stock initialize `instructions` tell the model to call
+/// `initial_instructions`, which this proxy hides. Codex puts that text in
+/// context and shows `Serena` in the TUI while the model tries the missing
+/// tool, so drop instructions that name a hidden tool.
+pub fn sanitize_initialize(message: Value) -> Value {
+    let mut message = with_list_changed(message);
+    let mentions_hidden = message["result"]["instructions"]
+        .as_str()
+        .is_some_and(|instructions| HIDDEN_TOOLS.iter().any(|name| instructions.contains(name)));
+    if mentions_hidden && let Some(result) = message["result"].as_object_mut() {
+        result.remove("instructions");
+    }
+    message
+}
+
+fn hidden_tool_name(params: &Value) -> Option<&str> {
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| HIDDEN_TOOLS.contains(name))
+}
+
+/// The broker answers with the shared worker-session envelope, whose id
+/// belongs to the broker's exchange with Serena. The stdio client owns
+/// per-connection ids, so every forwarded response must carry the id of the
+/// request that opened it; otherwise the MCP client reports a conflicting
+/// initialize response id and closes the server.
+fn client_response(mut response: Value, id: &Value) -> Value {
+    if let Some(object) = response.as_object_mut() {
+        object.insert("id".into(), id.clone());
+        object.insert("jsonrpc".into(), json!("2.0"));
+    }
+    response
+}
+
 fn filter_catalogue(message: Value) -> Value {
     let mut message = message;
     if let Some(tools) = message["result"]["tools"].as_array() {
@@ -139,7 +174,10 @@ impl<'a> Proxy<'a> {
                     cancel,
                 )?;
                 self.route = Some(response["route"].clone());
-                return Ok(with_list_changed(response["message"].clone()));
+                return Ok(sanitize_initialize(response["message"].clone()));
+            }
+            if method == "tools/call" && !unfiltered() && hidden_tool_name(&params).is_some() {
+                return Err(io::Error::other("unknown tool"));
             }
             let Some(initialize) = self.initialize.clone() else {
                 return Err(io::Error::other("Serena client must initialize first"));
@@ -164,7 +202,7 @@ impl<'a> Proxy<'a> {
             Ok(message)
         })();
         match result {
-            Ok(response) => Ok(response),
+            Ok(response) => Ok(client_response(response, &id)),
             Err(error) => Ok(json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -334,6 +372,63 @@ mod tests {
             "result": {"capabilities": {}},
         }));
         assert!(bare["result"]["capabilities"]["tools"].is_null());
+    }
+
+    #[test]
+    fn initialize_drops_instructions_that_name_hidden_tools() {
+        let message = sanitize_initialize(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "serverInfo": {"name": "Serena"},
+                "capabilities": {"tools": {}},
+                "instructions": "CRITICAL: Before starting to work on a coding task, call the `initial_instructions` tool to read the 'Serena Instructions Manual'."
+            },
+        }));
+        assert!(message["result"].get("instructions").is_none());
+        assert_eq!(
+            message["result"]["capabilities"]["tools"]["listChanged"],
+            true
+        );
+        let kept = sanitize_initialize(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "capabilities": {"tools": {}},
+                "instructions": "Use find_symbol for a known file."
+            },
+        }));
+        assert_eq!(
+            kept["result"]["instructions"],
+            "Use find_symbol for a known file."
+        );
+    }
+
+    #[test]
+    fn hidden_tool_calls_are_detected() {
+        assert_eq!(
+            hidden_tool_name(&json!({"name": "initial_instructions"})),
+            Some("initial_instructions")
+        );
+        assert!(hidden_tool_name(&json!({"name": "find_symbol"})).is_none());
+    }
+
+    #[test]
+    fn forwarded_responses_carry_the_client_request_id() {
+        let worker_envelope = json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "result": {"serverInfo": {"name": "Serena"}},
+        });
+        let rewritten = client_response(worker_envelope, &json!(0));
+        assert_eq!(rewritten["id"], 0);
+        assert_eq!(rewritten["jsonrpc"], "2.0");
+        assert_eq!(rewritten["result"]["serverInfo"]["name"], "Serena");
+        let named = client_response(
+            json!({"id": 7, "jsonrpc": "2.0", "result": {}}),
+            &json!("opaque"),
+        );
+        assert_eq!(named["id"], "opaque");
     }
 
     #[test]

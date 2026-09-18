@@ -180,7 +180,7 @@ unsafe extern "system" fn find_window(window: HWND, parameter: LPARAM) -> i32 {
 
 impl View {
     /// The native TUI replaces the launch caption after loading its named thread.
-    pub(crate) fn wait_for_title(&self, title: &str, timeout: Duration) -> io::Result<()> {
+    pub fn wait_for_title(&self, title: &str, timeout: Duration) -> io::Result<()> {
         let until = Instant::now() + timeout;
         let expected = format!("{title} | ");
         loop {
@@ -254,7 +254,7 @@ impl View {
                         bounds.y,
                         bounds.width,
                         bounds.height,
-                        SWP_NOACTIVATE | SWP_NOZORDER,
+                        SWP_NOACTIVATE,
                     )
                 } == 0
                 {
@@ -384,6 +384,46 @@ pub fn three_windows() -> io::Result<[Bounds; 3]> {
     ])
 }
 
+/// Tile lead, two executors, replacement lead, then extra helper panes.
+pub fn layout(count: usize) -> io::Result<Vec<Bounds>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let three = three_windows()?;
+    if count <= 3 {
+        return Ok(three.into_iter().take(count).collect());
+    }
+    let mut placements = three.to_vec();
+    let mut replacement = placements[0];
+    replacement.y += replacement.height / 2;
+    replacement.height -= replacement.height / 2;
+    placements.push(replacement);
+    if count == 4 {
+        return Ok(placements);
+    }
+    let extra = count - 4;
+    let base = placements[2];
+    if extra == 0 || base.width < extra as i32 || base.height < extra as i32 {
+        return Err(unavailable());
+    }
+    let strip = (base.height / (1 + extra as i32)).max(1);
+    placements[2].height -= strip * extra as i32;
+    for index in 0..extra {
+        placements.push(Bounds {
+            x: base.x,
+            y: placements[2].y + placements[2].height + strip * index as i32,
+            width: base.width,
+            height: if index + 1 == extra {
+                base.y + base.height
+                    - (placements[2].y + placements[2].height + strip * index as i32)
+            } else {
+                strip
+            },
+        });
+    }
+    Ok(placements)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +436,18 @@ mod tests {
             "Opening Executor 1 | workspace",
             "Executor 1 | "
         ));
+    }
+    #[test]
+    fn layout_grows_helper_tiles_without_dropping_executor_slots() {
+        let four = layout(4).unwrap();
+        assert_eq!(four.len(), 4);
+        assert_eq!(four[0].x, three_windows().unwrap()[0].x);
+        assert!(four[3].width > 0 && four[3].height > 0);
+        let five = layout(5).unwrap();
+        assert_eq!(five.len(), 5);
+        assert_eq!(five[1], four[1]);
+        assert!(five[4].width > 0 && five[4].height > 0);
+        assert!(five[4].y >= five[2].y);
     }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, SW_HIDE, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOPMOST,

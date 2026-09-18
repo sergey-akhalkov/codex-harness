@@ -23,7 +23,10 @@ validation and Nuphus for authorized UI work. Connected Apps serve their
 matching remote resources when enabled locally; the portable default disables
 the Apps feature. Literal text and narrow line edits retain native tools. The
 Serena proxy hides memory, onboarding and configuration-introspection tools;
-HARNESS_SERENA_UNFILTERED=1 restores the full catalogue for debugging.
+HARNESS_SERENA_UNFILTERED=1 restores the full catalogue for debugging. Initialize
+`instructions` that name those hidden tools are stripped so Codex does not keep
+the model and TUI on Serena while it retries `initial_instructions`.
+
 Desktop window identity uses list, title, bounds and state. Screenshots are for
 genuine visual questions about owned non-text UI, not to prove Codex conversation
 visibility. Desktop/window captures without a path become native image blocks;
@@ -115,7 +118,7 @@ introduce a shared Codex app-server.
 | Codebase Memory | Retired from the managed selection; not registered and not launched. Existing indexes and leftover native rollback commands are compatibility residue, not a live MCP. |
 | CodeGraph | Live graph provider. One account-wide indexing slot, one parse worker, one resolve worker, a 2 GiB Windows Job and 25% CPU. Each indexing episode has a 600-second deadline. Native observation covers every active indexed root; clients of the same root share resources. Healthy worker retirement preserves queued refresh. The model-facing MCP surface is codegraph_search plus codegraph_detail; deliberate index/sync/status run through the native codegraph-control CLI. Check is read-only; Install/Update stage the pinned published Windows x64 1.6.0 tree (940 files). Ordinary startup does not download, build or enable telemetry. |
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
-| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers and 300-second idle expiry. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. The proxy filters memory, onboarding and introspection tools from tools/list; native Git records stay authoritative. |
+| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers and 300-second idle expiry. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. The proxy filters memory, onboarding and introspection tools from tools/list and drops initialize instructions that name them; native Git records stay authoritative. |
 | Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
 | Graphify | Retired from the managed selection; not registered and not launched. Leftover shared packages and saved graphs stay on the host; the first-party proxy and update sources were removed with the retirement. |
 
@@ -257,15 +260,28 @@ authorized xAI/Grok route while that account quota was unavailable.
 
 Restart boundaries: already running sessions keep their previous MCP catalogue
 until restarted. After Install/Update rebuilds native source, an account broker
-from the older build is not adopted by frontends from the new build; run
-`codex-harness.exe mcp retire-codegraph` once from the current build before
-starting new consumers. A later checkout edit does not stop an already recorded
-hash-matching CodeGraph adapter: Codex CLI can still complete MCP initialize
-from that command. Native adapter changes still need explicit Install/Update
-and a new session. Source-consuming native operations remain gated on a healthy
-source match. Do not continue a CBM port; retire CBM-only paths only with
-further consumer-backed evidence. Disconnect retires only owned CodeGraph
-workers and registrations.
+from the older build is not adopted by frontends from the new build. The Codex
+MCP command retires that incompatible broker once and starts the current source
+instead of failing initialize. `codex-harness.exe mcp retire-codegraph` remains
+the explicit maintenance path. A later checkout edit does not stop an already recorded
+hash-matching CodeGraph, Serena or Nuphus adapter: Codex CLI can still complete
+MCP initialize from that command. Native adapter changes still need explicit
+Install/Update and a new session. Source-consuming native operations remain
+gated on a healthy source match. Do not continue a CBM port; retire CBM-only
+paths only with further consumer-backed evidence. Disconnect retires only owned
+CodeGraph workers and registrations.
+
+The managed registrations name the stable `<CODEX_HOME>/harness/bin/codex-harness.exe`
+link, which core Install/Update re-points at the freshest integrity-verified
+build. A new session therefore starts the delivered manager without rewriting
+`config.toml`, and a manager that running sessions still hold is left in place.
+
+Each delivered build generation gets its own private broker location. A new
+session starts or joins the broker of the manager it runs, and does not retire
+the broker that sessions of the previous build still use; those keep working
+and their broker expires on its own idle timeout once they finish. Sharing
+within one generation is unchanged, and `mcp broker-retire` /
+`mcp retire-codegraph` remain the explicit maintenance path.
 
 ## Large-repository indexing
 

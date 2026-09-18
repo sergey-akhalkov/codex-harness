@@ -143,6 +143,16 @@ build is reported by Check with its update action, and ordinary launch never
 compiles. After adding or removing a top-level skill directory, rerun `update`
 to reconcile its registration; repeated installation is idempotent.
 
+Core Install/Update deliver the freshest integrity-verified build of the owned
+state when `--build` is omitted; an explicit `--build` still selects exactly
+that directory. Delivery adds the new immutable build and re-points the
+`<CODEX_HOME>/harness/bin` links, so a manager that already running sessions
+hold is never replaced or rewritten. Those sessions keep their build until
+they finish, and the next Codex CLI session resolves the delivered one. The
+managed MCP registrations name the same stable manager link, so a scoped
+`update --code-tools-only` run from an older manager cannot pin it for new
+sessions.
+
 After moving the checkout, run `update` from its new location; broken source
 references are diagnosed by Check. If Codex itself moved, pass `--upstream` with
 its real entry point - never the harness launcher.

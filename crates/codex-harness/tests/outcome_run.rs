@@ -288,6 +288,9 @@ fn private_failure_retains_the_launch_phase_and_original_windows_error() {
     let f = Fixture::new();
     let broken = f.root.path().join("broken.exe");
     fs::write(&broken, "not a PE executable").unwrap();
+    // The deliberate invalid-image attempt must produce an error code, not a
+    // Windows loader dialog on the operator's desktop.
+    harness_core::process::suppress_loader_dialogs();
     let native_error = Command::new(&broken)
         .current_dir(&f.case)
         .output()

@@ -304,8 +304,9 @@ fn run() -> io::Result<i32> {
         } else if args
             .get(1)
             .and_then(|arg| arg.to_str())
-            .is_some_and(|op| matches!(op, "codegraph" | "codegraph-control"))
+            .is_some_and(|op| matches!(op, "codegraph" | "codegraph-control" | "serena" | "nuphus"))
         {
+            // Retained Codex MCP frontends stay callable after later source edits.
             verify_serving()?;
         } else {
             verify_runtime()?;

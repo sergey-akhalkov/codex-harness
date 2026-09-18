@@ -3,6 +3,7 @@
 //! dispatcher coordinates native registration and the retained registry writes.
 #![cfg(windows)]
 use crate::{
+    build_identity,
     dependency_discovery::{self, local_path},
     dependency_selection, dependency_stage, native_build,
     registration_native::FileGuard,
@@ -22,6 +23,47 @@ pub struct Request {
     /// discovered it. The CLI projection falls back to the on-disk registry.
     pub inventory: Option<Value>,
     pub mode: String,
+}
+
+/// The registered MCP command stays the stable manager link so a new Codex CLI
+/// session resolves whatever manager the last Install/Update delivered. A
+/// registration that is about to be written requires the link target to be an
+/// integrity-verified build, otherwise it is refused instead of pinning a
+/// missing, altered or foreign executable. Read-only modes keep the path
+/// informational and unresolved.
+fn manager_command(manager: &Path, writing: bool) -> io::Result<PathBuf> {
+    let path = std::path::absolute(manager)?;
+    if !matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The manager command must be an absolute local path.",
+        ));
+    }
+    if !writing {
+        return Ok(path);
+    }
+    if !path.is_file() {
+        return Err(io::Error::other(
+            "The manager command is missing from the installation; run core Install/Update first.",
+        ));
+    }
+    let resolved = crate::dependency_package::resolved(&path)?;
+    let verified = resolved
+        .file_name()
+        .is_some_and(|name| name == "codex-harness.exe")
+        && resolved
+            .parent()
+            .is_some_and(|build| build_identity::verify_record_integrity(build).is_ok());
+    if !verified {
+        return Err(io::Error::other(
+            "The manager command does not resolve into an integrity-verified native build.",
+        ));
+    }
+    Ok(path)
 }
 
 fn previous_package(home: &Path) -> io::Result<Option<PathBuf>> {
@@ -153,7 +195,8 @@ pub fn prepare(request: &Request, manager: &Path) -> io::Result<Value> {
         ));
     }
     let home = local_path(&request.codex_home)?;
-    let manager = local_path(manager)?;
+    let writes_registrations = matches!(request.mode.as_str(), "Install" | "Update");
+    let manager = manager_command(manager, writes_registrations)?;
     let state = local_path(&request.dependency_state)?;
     let read_only = request.mode == "Check";
     let explicit = request.package_root.clone().or(previous_package(&home)?);
@@ -241,6 +284,69 @@ pub fn prepare(request: &Request, manager: &Path) -> io::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verified_build(root: &Path) -> PathBuf {
+        let source = root.join("source");
+        let build = root.join("state/builds/aaaa0000aaaa0000-1500-1");
+        std::fs::create_dir_all(source.join("crates/one/src")).unwrap();
+        std::fs::create_dir_all(source.join("tools/rtk-adapter/src")).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        for file in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/one/src/lib.rs",
+            "tools/rtk-adapter/src/lib.rs",
+        ] {
+            std::fs::write(source.join(file), "fixture").unwrap();
+        }
+        let mut binaries = std::collections::BTreeMap::new();
+        for name in build_identity::BINARIES {
+            let path = build.join(name);
+            std::fs::write(&path, name).unwrap();
+            binaries.insert(
+                (*name).to_owned(),
+                build_identity::hash_file(&path).unwrap(),
+            );
+        }
+        let record = build_identity::BuildRecord {
+            schema: build_identity::SCHEMA,
+            source_root: source.clone(),
+            source: build_identity::source_identity(&source).unwrap(),
+            rustc: "fixture".into(),
+            cargo: "fixture".into(),
+            target: "x86_64-pc-windows-msvc".into(),
+            profile: "release".into(),
+            binaries,
+        };
+        std::fs::write(
+            build.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        build
+    }
+
+    #[test]
+    fn manager_command_keeps_the_stable_link_and_requires_a_verified_build() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex-home");
+        let build = verified_build(root.path());
+        let link = home.join("harness/bin/codex-harness.exe");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::windows::fs::symlink_file(build.join("codex-harness.exe"), &link).unwrap();
+
+        // A written registration keeps the link and validates only its target.
+        assert_eq!(manager_command(&link, true).unwrap(), link);
+        // Read-only modes keep the informational path unresolved.
+        assert_eq!(manager_command(&link, false).unwrap(), link);
+        let missing = home.join("harness/bin/missing.exe");
+        assert!(manager_command(&missing, true).is_err());
+        assert!(manager_command(&missing, false).is_ok());
+        // An altered target is refused instead of being recorded.
+        std::fs::write(build.join("codex-harness.exe"), b"altered").unwrap();
+        let error = manager_command(&link, true).unwrap_err();
+        assert!(error.to_string().contains("integrity-verified"), "{error}");
+    }
 
     #[test]
     fn serena_projection_requires_an_adopted_console_entrypoint() {

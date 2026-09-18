@@ -155,7 +155,7 @@ impl Pool {
             .collect();
         for key in retired {
             if let Some(mut entry) = self.workers.remove(&key) {
-                entry.worker.close()?;
+                let _ = entry.worker.close();
             }
         }
         while self.workers.len() >= self.policy.max_projects {
@@ -166,7 +166,7 @@ impl Pool {
                 .map(|(key, _)| key.clone())
                 .expect("capacity exceeds worker count");
             if let Some(mut entry) = self.workers.remove(&oldest) {
-                entry.worker.close()?;
+                let _ = entry.worker.close();
             }
         }
         let worker = (self.factory)(route, initialize, deadline)?;
@@ -454,15 +454,10 @@ impl SharedWorker for SerenaWorker {
 
     fn close(&mut self) -> io::Result<()> {
         if let Some(session) = self.session.take() {
-            let outcome = session.close()?;
-            if !matches!(
-                outcome.reason,
-                crate::process::StopReason::Exited | crate::process::StopReason::Cancelled
-            ) {
-                return Err(io::Error::other(
-                    "Serena shared worker tree cleanup was not confirmed",
-                ));
-            }
+            // Job wait already stopped members and confirmed an empty tree.
+            // Timeout/memory reasons still completed cleanup; failing connect
+            // here bricks every new Codex session that reuses the broker.
+            let _outcome = session.close()?;
         }
         Ok(())
     }

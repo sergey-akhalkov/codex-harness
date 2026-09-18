@@ -474,11 +474,8 @@ fn codegraph(args: &[OsString]) -> io::Result<i32> {
     };
     let cancel = Cancellation::default();
     let root = match options.get(&OsString::from("--broker-root")) {
-        Some(value) => local_path(Path::new(value))?,
-        None => harness_core::codegraph_account::root(
-            Deadline::after(Duration::from_secs(30))?,
-            &cancel,
-        )?,
+        Some(value) => Some(local_path(Path::new(value))?),
+        None => None,
     };
     let (input, output) = mcp_stdio::standard_files()?;
     harness_core::codegraph_stdio::serve_shared(
@@ -543,7 +540,12 @@ fn codegraph_control(args: &[OsString]) -> io::Result<i32> {
     let deadline = Deadline::after(Duration::from_secs(seconds))?;
     if let Some(root) = options.get(&OsString::from("--broker-root")) {
         let root = local_path(Path::new(root))?;
-        let client = harness_core::codegraph_broker::Client::new(configuration, root)?;
+        let client = harness_core::codegraph_broker::Client::new(
+            configuration,
+            Some(root),
+            deadline,
+            &cancel,
+        )?;
         client.connect(deadline, &cancel)?;
         let arguments = serde_json::json!({});
         let value = client.call(name, &arguments, deadline, &cancel)?;

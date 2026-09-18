@@ -37,11 +37,15 @@ The kit SHALL provide a `team-lead` skill, delivered through its installation li
 
 ### Requirement: Isolated and visible executor sessions
 
-Every executor assignment SHALL run a native `codex --profile <id>` session in its own visible terminal window established before its first model request, and in a dedicated Git worktree created from the task's base revision. The controller SHALL record the worktree mapping with the assignment, preserve it through interruption, and retire it only after the lead merges or explicitly discards the result; executors SHALL NOT write to the shared checkout. Each window SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A switchable list, hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
+Every executor assignment SHALL run a native `codex --profile <id>` session in its own visible terminal window established before its first model request, and in a Codex-managed Git worktree created from the task's base revision and bound to that session before its first model request. The controller SHALL record the native worktree mapping with the assignment, preserve it through interruption, and retire it only after the lead merges or explicitly discards the result; it SHALL NOT maintain a second harness-owned worktree tree. A control view that cannot pass native `--worktree` SHALL attach to the already bound managed checkout instead of allocating another one. Executors SHALL NOT write to the shared checkout. Each window SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A switchable list, hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
 
 #### Scenario: Two executors work in parallel
 - **WHEN** the lead dispatches two independent assignments to different configured profiles
-- **THEN** both executor sessions run simultaneously in separate windows and separate worktrees with distinct live identities and no shared-checkout writes
+- **THEN** both executor sessions run simultaneously in separate windows and separate Codex-managed worktrees with distinct live identities and no shared-checkout writes
+
+#### Scenario: A remote control view attaches to a managed worktree
+- **WHEN** an executor is dispatched through the verified remote control path
+- **THEN** its session cwd is the already bound Codex-managed worktree before the first model request, the visible window attaches without allocating a second checkout, and the shared checkout is unmodified
 
 #### Scenario: An executor window is lost
 - **WHEN** a required executor view fails or closes while its session is active

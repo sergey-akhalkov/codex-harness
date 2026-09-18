@@ -22,16 +22,27 @@ use std::{
 
 pub struct Client {
     configuration: Configuration,
-    root: PathBuf,
+    root: std::sync::Mutex<PathBuf>,
     source: String,
     client: String,
 }
 impl Client {
-    pub fn new(configuration: Configuration, root: PathBuf) -> io::Result<Self> {
+    /// An explicit root serves one deliberate maintenance operation; otherwise
+    /// the client resolves the account location for its own build generation.
+    pub fn new(
+        configuration: Configuration,
+        root: Option<PathBuf>,
+        deadline: Deadline,
+        cancel: &Cancellation,
+    ) -> io::Result<Self> {
         let source = source(&configuration)?;
+        let root = match root {
+            Some(root) => root,
+            None => crate::codegraph_account::root_for(&source, deadline, cancel)?,
+        };
         Ok(Self {
             configuration,
-            root,
+            root: std::sync::Mutex::new(root),
             source,
             client: crate::broker_endpoint::random_key()?,
         })
@@ -54,7 +65,7 @@ impl Client {
         Ok(())
     }
     pub fn disconnect(&self) -> io::Result<()> {
-        let root = BrokerRoot::open(&self.root)?;
+        let root = BrokerRoot::open(&self.location()?)?;
         if let crate::broker_endpoint::Observation::Ready { endpoint, .. } =
             crate::broker_endpoint::observe(&root)?
         {
@@ -85,31 +96,68 @@ impl Client {
     fn invoke(
         &self,
         name: &str,
-        arguments: &Value,
+        payload: &Value,
         deadline: Deadline,
         cancel: &Cancellation,
     ) -> io::Result<Value> {
-        let root = BrokerRoot::open(&self.root)?;
         let mut environment = BTreeMap::new();
         for key in ["SystemRoot", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"] {
             if let Ok(value) = std::env::var(key) {
                 environment.insert(key.into(), value);
             }
         }
-        let endpoint = broker_launch::ensure(
-            &root,
+        let arguments = vec![
+            "codegraph".into(),
+            self.source.clone(),
+            serde_json::to_string(&self.configuration)?,
+        ];
+        let startup = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+        let mut root = self.location()?;
+        let endpoint = match broker_launch::ensure(
+            &BrokerRoot::open(&root)?,
             &std::env::current_exe()?,
-            vec![
-                "codegraph".into(),
-                self.source.clone(),
-                serde_json::to_string(&self.configuration)?,
-            ],
-            environment,
+            arguments.clone(),
+            environment.clone(),
             &self.source,
-            Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?,
+            startup,
             cancel,
-        )?;
-        broker_rpc::invoke(&endpoint, name, arguments, deadline, cancel)
+        ) {
+            Ok(endpoint) => endpoint,
+            // Another build generation took the account location between
+            // resolution and startup; resolve this generation's own once.
+            Err(error) if broker_launch::source_conflict(&error) => {
+                let retry = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+                root = crate::codegraph_account::root_for(&self.source, retry, cancel)?;
+                self.relocate(&root)?;
+                broker_launch::ensure(
+                    &BrokerRoot::open(&root)?,
+                    &std::env::current_exe()?,
+                    arguments,
+                    environment,
+                    &self.source,
+                    retry,
+                    cancel,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+        broker_rpc::invoke(&endpoint, name, payload, deadline, cancel)
+    }
+
+    fn location(&self) -> io::Result<PathBuf> {
+        self.root
+            .lock()
+            .map(|root| root.clone())
+            .map_err(|_| io::Error::other("CodeGraph broker location lock poisoned"))
+    }
+
+    fn relocate(&self, root: &std::path::Path) -> io::Result<()> {
+        *self
+            .root
+            .lock()
+            .map_err(|_| io::Error::other("CodeGraph broker location lock poisoned"))? =
+            root.to_owned();
+        Ok(())
     }
 }
 

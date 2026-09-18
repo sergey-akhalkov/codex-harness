@@ -12,7 +12,7 @@ foundation and retiring obsolete routing assumptions.
 ## What Changes
 
 - Add kit-owned orchestration configuration naming the lead profile, executor profiles and the maximum concurrent executor count. The existing installation check validates it: a missing profile or invalid limit is an explicit error, never a silent substitute.
-- Spawn every executor as a native `codex --profile <id>` session in its own visible terminal window and its own Git worktree before its first model request. The controller owns worktree creation, mapping and retirement; executors never write to the shared checkout.
+- Spawn every executor as a native `codex --profile <id>` session in its own visible terminal window and a Codex-managed Git worktree before its first model request. Allocation follows installed CLI 0.154.0 managed worktrees (`--worktree`, experimental `worktrees` feature). The controller records that native mapping and retires the checkout after merge or discard, because CLI allocations are not auto-cleaned. The verified `--remote` control view does not pass `--worktree` (native rejects that combination) and attaches only after the session cwd is the managed checkout. Executors never write to the shared checkout. Do not invent a second harness worktree tree.
 - Coordinate assignments asynchronously through the consuming project's task board (`beads` / `bd` CLI): stages as epics, specifications as features, executor feedback as feedback tasks, and lead-initiated improvements as tasks or OpenSpec changes. The Rust controller stays board-agnostic; the kit delivers board availability and workflow guidance through its lifecycle.
 - Deliver lead steering through the verified controller session channel into the executor's visible conversation, with no hidden model calls and no status polling. Executors escalate blockers as board feedback tasks.
 - Make the lead accept completed assignments against their requirements and checks, return concrete defects to the original executor, and merge accepted branches itself.
@@ -36,7 +36,7 @@ foundation and retiring obsolete routing assumptions.
 
 Affected owners include `global/harness.config.toml` role configuration, the
 Rust `task_*` controller modules in `crates/harness-core`, native conversation
-views and worktree management, the `beads` dependency assessment and lifecycle
+views and mapping onto Codex-managed worktrees, the `beads` dependency assessment and lifecycle
 integration, existing delegation/routing/subscription checks, and the owning
 delegation, subscription, installation and decision records. The verified
 app-server control contract, Rust control connection, implemented lead-handoff

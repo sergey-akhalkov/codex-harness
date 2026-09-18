@@ -48,7 +48,7 @@ general-purpose orchestration platform.
 ### 1. Lead judgment with deterministic controller mechanics
 
 The active lead chooses workstreams, assignments and acceptance boundaries. A
-small Rust controller owns dispatch records, windows, worktrees, event
+small Rust controller owns dispatch records, windows, native worktree mapping and retirement, event
 correlation and recovery transitions. It does not ask another model to
 classify routine events, poll for progress or decide whether a known
 unavailable route is available. Session execution stays native Codex through
@@ -96,14 +96,28 @@ execution (identity, license, maintenance, install effects, vulnerabilities).
 ### 5. Executors are isolated and visible
 
 Every executor runs `codex --profile <id>` in its own visible terminal window
-and its own Git worktree created from the task's base revision. The
-controller owns the worktree lifecycle: create, map to the assignment,
-preserve through interruption, retire after the lead merges or explicitly
-discards. Executors never write to the shared checkout. Views are established
-before the first model request and show assignment, role, effective
-profile/model/effort and live activity; reuse the owned native-console
-approach and view-loss behavior from the verified contract. A switchable list
-or hidden session does not qualify.
+and a Codex-managed Git worktree created from the task's base revision.
+Installed CLI 0.154.0 is the allocation owner: experimental feature
+`worktrees`, flag `--worktree` / TUI `/worktree`, detached HEAD from the
+source commit, checkout under the native pool (`$CODEX_HOME/worktrees` or
+the configured Desktop root), thread bound before the first turn. CLI
+allocations are not auto-cleaned, do not copy uncommitted or ignored files,
+and reject ephemeral sessions, `--ignore-user-config`, code review, and
+`exec resume --worktree`. Interactive `--worktree` also rejects `--remote`,
+so the verified harness control view must not pass `--worktree`; the
+controller allocates or reuses the native checkout, records the mapping
+(thread, root, cwd, source, head), then attaches the `--remote` TUI with
+that cwd. Resume does not pass `--worktree` again. Spawn_agent helpers stay
+ephemeral in the parent executor checkout and must be visible; they do not
+get a second `--worktree`. Add harness mapping only for those native gaps.
+Do not invent a second worktree tree. Unsupported or disabled `worktrees`
+is an explicit limitation, never a shared-checkout write. The lead still
+merges accepted work; because the checkout is detached, merge creates a
+branch or cherry-picks rather than checking the same branch out in two
+trees. Views are established before the first model request and show
+assignment, role, effective profile/model/effort and live activity; reuse
+the owned native-console approach and view-loss behavior from the verified
+contract. A switchable list or hidden session does not qualify.
 
 ### 6. Steering through the session channel
 
@@ -164,6 +178,7 @@ isolated behavior determine actual compatibility:
 
 - [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents): native agents and scoped context remain the execution basis; no second agent framework.
 - [Codex app-server](https://learn.chatgpt.com/docs/app-server): native session/turn control and local transport; experimental status requires version checks and contract tests.
+- Installed Codex CLI 0.154.0 managed worktrees: `codex --worktree`, `codex features` (`worktrees` experimental, default off), TUI `/worktree`. Inspected 0.154.0 help and rust-v0.154.0 sources (#42652, #43069, #43286). `--worktree` with `--remote` is rejected (`startup_orchestration.rs`). `codex exec --worktree` rejects `--ephemeral`, `--ignore-user-config`, review and `exec resume`. CLI `WorktreeSettings::for_cli` shares the Desktop pool and disables automatic cleanup. Desktop [worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees) remain a distinct product: `.worktreeinclude` and auto-delete do not apply to CLI allocations.
 - [Beads](https://github.com/gastownhall/beads): agent-first graph tracker with a non-interactive CLI and git-friendly storage; suitability on Windows and lifecycle integration require the task-owned assessment before execution.
 
 The implemented transport uses pinned `tungstenite` 0.30.0 with only its
@@ -186,7 +201,7 @@ assessment before execution.
 
 - External `beads` dependency -> proportional assessment, supported-version pinning, lifecycle check, and explicit board-unavailable behavior instead of silent degradation.
 - Experimental native control contract -> bind acceptance to the tested CLI/schema and exact behavior; unsupported installations keep their previous usable path with an explicit limitation.
-- Worktree sprawl and stale branches -> controller-owned lifecycle, retirement after merge or discard, preservation on interruption, no shared-checkout writes.
+- Worktree sprawl -> native CLI allocations are not auto-cleaned; the controller records the native mapping and retires after merge or discard, preserves interrupted checkouts, and does not create a second harness tree or check the same branch out twice.
 - Two coordination planes (board and live channel) -> the board is the durable asynchronous record, the channel is live steering; neither duplicates the other's state and the controller parses neither board content nor transcripts.
 - Parallel executors share account windows -> concurrency comes from validated configuration; budget measurement is deliberately deferred to the follow-up change, so this change makes no savings claims.
 - Publication boundary -> synthetic consuming-project examples only; private paths, identities and evidence stay in host-private storage.
@@ -204,6 +219,9 @@ assessment before execution.
 
 - Exact non-interactive `bd` command contract on Windows (owned by the board
   integration task).
+- Windows allocation of a 0.154.0 managed worktree in an owned isolated
+  `CODEX_HOME` (task 4.1), including bind-before-first-turn and leftover
+  checkout cleanup.
 - Preferred-lead return boundaries when several executors are healthy.
 - The follow-up change owns: deterministic `codex resume` session selection
   and instruction-reload regression checks, telemetry ingestion from provider

@@ -250,7 +250,9 @@ pub fn create_helper() -> io::Result<u32> {
     )
     .map_err(|_| invalid("invalid service request fields"))?;
     request.validate()?;
-    let program = std::env::current_exe()?.canonicalize()?;
+    // The helper may have been started through the stable installation link;
+    // pin and report the ordinary file it resolves to.
+    let program = crate::dependency_discovery::local_path(&std::env::current_exe()?)?;
     let _program_guard = ReadGuard::open(&program)?;
     let command = request.command(&program)?;
     let directory = request
@@ -441,7 +443,12 @@ pub fn spawn(
     if !program.is_absolute() {
         return Err(invalid("service executable must be absolute"));
     }
-    let _program_guard = ReadGuard::open(program)?;
+    // A Codex MCP frontend is launched through its stable installation link.
+    // The service must be pinned and started as the ordinary file that link
+    // resolves to, otherwise the reparse path is refused and re-pointing the
+    // link could retarget a service that is already running.
+    let program = crate::dependency_discovery::local_path(program)?;
+    let _program_guard = ReadGuard::open(&program)?;
     let began = creation_clock();
     let request = Request {
         directory: directory.into(),
@@ -451,7 +458,7 @@ pub fn spawn(
         user: current_user()?,
     };
     request.validate()?;
-    request.command(program)?;
+    request.command(&program)?;
     let bytes = serde_json::to_vec(&request)
         .map_err(|_| invalid("service request serialization failed"))?;
     if bytes.len() > MAX_REQUEST {
@@ -459,7 +466,7 @@ pub fn spawn(
     }
     let (stdin, write) = anonymous_pipe(4096)?;
     let (read, stdout) = anonymous_pipe(4096)?;
-    let mut command = CommandSpec::new(program);
+    let mut command = CommandSpec::new(&program);
     command.args.push(CREATE_ARGUMENT.into());
     command.current_dir = Some(directory.into());
     command.stdin = Some(stdin);
@@ -504,7 +511,7 @@ pub fn spawn(
     )
     .map_err(|_| invalid("invalid service helper receipt"))?;
     match (outcome.exit_code, receipt.pid, receipt.error) {
-        (0, Some(pid), None) => ServiceProcess::observe(pid, program, began, &request.user),
+        (0, Some(pid), None) => ServiceProcess::observe(pid, &program, began, &request.user),
         (2, None, Some(error)) => Err(io::Error::other(format!("native service helper: {error}"))),
         _ => Err(invalid("inconsistent service helper receipt")),
     }
