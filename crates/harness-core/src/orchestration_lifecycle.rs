@@ -57,6 +57,7 @@ mod tests {
         )
         .unwrap();
         fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
+        fs::write(home.join("zai.config.toml"), "model = 'glm-5.3'\n").unwrap();
         let before: Vec<_> = walkdir(&home);
         let preview = check(&source, &home, true).unwrap();
         assert!(!preview.mutated);
