@@ -83,6 +83,10 @@ each. Sequence only genuinely dependent slices; respect
 `max_concurrent_executors` and shared accounts or machines; the lead owns
 integration and acceptance conflicts.
 The `--exec` prompt points at board ids; the beads issue is the assignment.
+Assignments require bounded milestone self-reports: after each numbered
+outcome inside the assignment, the executor posts a short board comment on
+its issue (done, next, blockers in at most three lines) instead of waiting
+for the lead to ask.
 The default exec mode streams the assignment in a visible tab and exits on
 completion, closing the tab; a mid-work stop is detected by the watcher and
 the exact session continues through `codex exec resume SESSION_ID`. Do not
@@ -102,6 +106,12 @@ Do not poll from model turns or executor PIDs. While an executor runs, keep
 one native watcher process that checks the board review queue, the
 assignment's result artifact and executor liveness on a cheap shell loop and
 emits a single event; the lead blocks on that event between useful work.
+Track session-file growth in the same loop: a live executor whose rollout is
+silent beyond a bounded threshold (about 15 minutes) is a stuck-suspect -
+then read its recent reasoning and diff, and only for a confirmed anomaly ask
+one bounded question through an exact-session resume (status, blockers, next
+step in at most five lines, then continue). Timed status polling of healthy
+executors is waste.
 While executors run, the lead analyzes bottlenecks, spend and next cuts, and
 files those as board tasks.
 
