@@ -56,7 +56,7 @@ mod tests {
             include_bytes!("../../../global/orchestration.toml"),
         )
         .unwrap();
-        fs::write(home.join("xai.config.toml"), "model = 'grok-4.6'\n").unwrap();
+        fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
         let before: Vec<_> = walkdir(&home);
         let preview = check(&source, &home, true).unwrap();
         assert!(!preview.mutated);
@@ -76,7 +76,7 @@ mod tests {
             active_lead: "default".into(),
             assignments: vec![Assignment {
                 id: "a1".into(),
-                profile: "xai".into(),
+                profile: "ds".into(),
                 owner_thread: Some("t1".into()),
                 worktree: Some(home.join("worktrees/exec/repo")),
                 attempt: 1,
@@ -94,7 +94,7 @@ mod tests {
             fs::read(home.join("worktrees/exec/repo/partial.txt")).unwrap(),
             b"keep"
         );
-        assert!(home.join("xai.config.toml").is_file());
+        assert!(home.join("ds.config.toml").is_file());
     }
 
     fn walkdir(root: &Path) -> Vec<String> {

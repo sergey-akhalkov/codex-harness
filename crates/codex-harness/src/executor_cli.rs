@@ -303,7 +303,7 @@ fn terminal_tab_args(
         "executor".into(),
         "run".into(),
         "--file".into(),
-        native_path(receipt)?,
+        escape_wt_commandline(&native_path(receipt)?),
     ]);
     if args.iter().any(|arg| {
         arg == "--focus"
