@@ -31,6 +31,16 @@ On session start, read the board before rediscovering work: `lead_review`,
 assignee `lead`, then ready items. Record new lead follow-ups as tasks assigned
 to `lead` so a later session does not repeat completed verification.
 
+## Feedback
+
+Improvement observations from the lead or an executor are bounded board
+feedback tasks, not real-time chat. Record them through the `board-workflow`
+skill and keep working. Batch-triage at a safe boundary after in-flight tool
+effects, between assignments, without interrupting a healthy executor.
+Listing, merging and voting are board commands: no model calls beyond the
+lead's similarity judgment. Steering remains the live course-correction
+channel; the incubator carries durable demand.
+
 ## Assign and brief
 
 Brief executors through harness commands, not by automating TUI keystrokes:
@@ -43,6 +53,12 @@ Each executor gets a complete outcome, its configured profile, its own visible
 window, and a Codex-managed worktree before the first model request. Do not
 write to the shared checkout. Do not solve delegated work in parallel. A small
 or tightly coupled task stays with the lead.
+When an outcome arrives, split it into independently verifiable parallel
+slices before dispatching a single worker: distinct worktrees from a committed
+known base, disjoint file and system ownership per slice, complete outcomes
+each. Sequence only genuinely dependent slices; respect
+`max_concurrent_executors` and shared accounts or machines; the lead owns
+integration and acceptance conflicts.
 The `--exec` prompt points at board ids; the beads issue is the assignment.
 Start executor prompts with `/goal` so a bounded assignment survives a
 mid-work stop; accept only against the assignment, not effort spent.
@@ -68,10 +84,22 @@ files those as board tasks.
 Review completed assignments against requirements and applicable checks. Merge
 accepted branches yourself. Return in-scope defects with acceptance conditions
 to the original executor. Record acceptance on the board and in task state.
-Retire a clean managed worktree through native confirmed deletion when eligible;
-otherwise preserve it and report the limit.
+Worktrees are lane-owned, not task-owned: creating one is a cheap local
+checkout (seconds, hardlinked objects, no upstream), while the per-worktree
+build cache is the real cost. After an accepted merge, reset the lane worktree
+to the new committed base (`git reset --hard` plus `git clean -fd`, keeping
+ignored caches) and reuse it for the next task in the same lane. Delete a
+worktree only when its lane is retired or its state cannot be reset safely;
+keep merged branches. The authoritative inventory is `git worktree list`;
+lane purpose lives in kit-local task state and board records, never in
+tracked files.
 Executors set status `lead_review` instead of closing. The lead closes on
 accept or returns the item to `in_progress` with conditions.
+Executor terminal tabs are per-assignment, never pooled: a fresh session must
+not inherit another assignment's context. After acceptance the lead ends the
+idle executor session (graceful exit first) so its terminal tab closes itself;
+reuse a tab and session only when returning the same assignment with
+conditions.
 
 ## Recovery
 

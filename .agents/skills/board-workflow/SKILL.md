@@ -40,6 +40,42 @@ OpenSpec changes when they alter accepted requirements. Public examples stay
 synthetic. Leave project `.beads/` state in the consuming project; disconnect
 does not erase it.
 
+## Bounded feedback
+
+Lead and executor observations are tasks labeled `feedback`, not chat. Keep the
+description bounded and structured:
+
+```
+observation: dispatch waits after tools
+scope: dispatch
+reporter: exec-a
+episode: e1
+kind: lead|executor|diagnostic
+```
+
+Do not paste transcripts. `kind: diagnostic` records the observation but must
+not count as a vote.
+
+## Batch triage
+
+The lead applies merges at a safe boundary. Listing, merging and voting are
+`bd` commands and make no model calls:
+
+| Step | Command |
+| --- | --- |
+| List | `bd list --label feedback --status open --json --brief` |
+| Admit unique item | `bd label add <id> incubator --json` then `bd label remove <id> feedback --json` |
+| Merge similar | `bd duplicate <id> --of <canonical> --json` |
+| Record vote | `bd comment <canonical> --json "feedback-vote v1 episode=<id> reporter=<id> kind=executor counted=true reason=counted"` |
+| Record merge | `bd comment <canonical> --json "feedback-merge v1 from=<id> into=<canonical>"` |
+| Inspect provenance | `bd comments <canonical> --json` |
+
+One counted vote per distinct episode and reporter. Same-reporter repeats use
+`counted=false reason=repeat`. Diagnostics use `counted=false reason=automated-diagnostic`.
+Cap a batch at `feedback_batch_limit` from kit `global/orchestration.toml`.
+Do not use `bd find-duplicates`; it may call a model. Similarity is lead
+judgment, then these mechanics.
+
 ## Pipeline
 
 All agent work goes through this board. Do not use process polling or chat as

@@ -484,6 +484,19 @@ No listed CVE specific to this pin was found in the assessment. Socket.dev
 dependency alerts are not OSV proof. Private query receipts stay out of Git.
 Report issues to security@steveyegge.com.
 
+**2026-09-19, confirmed:** executor worktrees are lane-owned and reused, not
+task-owned and rebuilt. After an accepted merge the lead resets the lane
+worktree to the new committed base (`git reset --hard` plus `git clean -fd`,
+keeping ignored build caches) and dispatches the next lane task into it;
+deletion happens only on lane retirement or unresolvable state, and merged
+branches are kept. Rationale: `git worktree add` is a ~2 s local hardlink
+checkout with no upstream, while the per-worktree build cache (gigabytes of
+`target/`) is the real cost of a cold worktree — reuse keeps it warm, like
+developers pulling instead of rebuilding from scratch. Inventory authority is
+`git worktree list`; lane purpose stays in kit-local task state and board
+records, never in tracked files. Implementation task for the native lifecycle:
+board `codex-harness-pvr.5`.
+
 ## Recording further decisions
 
 - Record durable goals, constraints, preferences and confirmed decisions here

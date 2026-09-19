@@ -12,6 +12,7 @@ pub const WINDOWS_AMD64_ARCHIVE: &str = "beads_1.3.0_windows_amd64.zip";
 pub const WINDOWS_AMD64_SHA256: &str =
     "fa4c72c5d27f68f906e89a759656b5a051b330088c4acc38fa445cbb561e5cdf";
 pub const FEEDBACK_LABEL: &str = "feedback";
+pub const INCUBATOR_LABEL: &str = "incubator";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contract {
@@ -419,19 +420,14 @@ pub fn verify_incubator_contract(bd: &Path, project: &Path) -> io::Result<Incuba
 }
 
 fn run_actor(bd: &Path, project: &Path, actor: &str, args: &[&str]) -> io::Result<Output> {
-    let out = Command::new(bd)
-        .args(args)
-        .current_dir(project)
-        .env("BD_NON_INTERACTIVE", "1")
-        .env("BEADS_ACTOR", actor)
-        .output()?;
+    let out = command(bd, project, actor).args(args).output()?;
     if !out.status.success() {
         return Err(failed(args.first().unwrap_or(&"bd"), &out));
     }
     Ok(out)
 }
 
-fn seed_git(project: &Path) -> io::Result<()> {
+pub(crate) fn seed_git(project: &Path) -> io::Result<()> {
     fs::create_dir_all(project)?;
     git(project, &["init", "-q"])?;
     git(
@@ -460,25 +456,46 @@ fn git(project: &Path, args: &[&str]) -> io::Result<()> {
     }
 }
 
-fn json_ok(bd: &Path, project: &Path, args: &[&str]) -> io::Result<Value> {
-    let out = run(bd, project, args)?;
-    if !out.status.success() {
-        return Err(failed(args.first().unwrap_or(&"bd"), &out));
-    }
+pub(crate) fn json_ok(bd: &Path, project: &Path, args: &[&str]) -> io::Result<Value> {
+    json_ok_actor(bd, project, "board-contract", args)
+}
+
+pub(crate) fn json_ok_actor(
+    bd: &Path,
+    project: &Path,
+    actor: &str,
+    args: &[&str],
+) -> io::Result<Value> {
+    let out = run_actor(bd, project, actor, args)?;
     serde_json::from_slice(&out.stdout)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("bd JSON: {error}")))
 }
 
-fn run(bd: &Path, project: &Path, args: &[&str]) -> io::Result<Output> {
-    Command::new(bd)
-        .args(args)
-        .current_dir(project)
-        .env("BD_NON_INTERACTIVE", "1")
-        .env("BEADS_ACTOR", "board-contract")
-        .output()
+pub(crate) fn run(bd: &Path, project: &Path, args: &[&str]) -> io::Result<Output> {
+    command(bd, project, "board-contract").args(args).output()
 }
 
-fn string_field(value: &Value, field: &str) -> io::Result<String> {
+fn command(bd: &Path, project: &Path, actor: &str) -> Command {
+    let mut cmd = Command::new(bd);
+    cmd.current_dir(project)
+        .env("BD_NON_INTERACTIVE", "1")
+        .env("BEADS_ACTOR", actor);
+    if let Some(path) = child_path() {
+        cmd.env("PATH", path);
+    }
+    cmd
+}
+
+fn child_path() -> Option<std::ffi::OsString> {
+    let path = std::env::var_os("PATH")?;
+    let filtered = std::env::split_paths(&path).filter(|entry| {
+        let lower = entry.to_string_lossy().to_ascii_lowercase();
+        !(lower.ends_with(r"\windowsapps") || lower.contains(r"\windowsapps\"))
+    });
+    std::env::join_paths(filtered).ok()
+}
+
+pub(crate) fn string_field(value: &Value, field: &str) -> io::Result<String> {
     value
         .get(field)
         .and_then(Value::as_str)
@@ -491,15 +508,12 @@ fn string_field(value: &Value, field: &str) -> io::Result<String> {
         })
 }
 
-fn failed(op: &str, out: &Output) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "{op} failed: {} {}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
-    )
+pub(crate) fn failed(op: &str, out: &Output) -> io::Error {
+    io::Error::other(format!(
+        "{op} failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
 }
 
 #[cfg(test)]

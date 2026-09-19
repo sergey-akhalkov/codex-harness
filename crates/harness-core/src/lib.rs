@@ -2,6 +2,7 @@
 pub mod agent_config;
 pub mod analysis_samples;
 pub mod board_cli;
+pub mod board_feedback;
 #[cfg(windows)]
 pub mod board_lifecycle;
 #[cfg(windows)]

@@ -18,7 +18,7 @@ use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible TUI, and returns so the lead can keep working. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling.";
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible TUI, and returns so the lead can keep working. The prompt is prefixed with /goal unless it already starts with a slash command, and a terminal tab hosts the session through `executor run`, which closes the tab on any exit. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling.";
 const STARTUP: Duration = Duration::from_secs(20);
 /// Runtime identity of the dispatching session must not leak into the
 /// executor: an inherited session/thread id makes the child attach to the
@@ -33,6 +33,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("spawn") => spawn(&args[1..]),
         Some("steer") => steer(&args[1..]),
+        Some("run") => run_exec(&args[1..]),
         _ => Err(invalid("invalid native executor options")),
     }
 }
@@ -77,7 +78,9 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
     let workspace = required(workspace, "--workspace")?;
-    let prompt = prompt.ok_or_else(|| invalid("--exec is required"))?;
+    let prompt = prompt
+        .ok_or_else(|| invalid("--exec is required"))
+        .map(|prompt| goal_prompt(&prompt))?;
     if !source.is_absolute() || !codex_home.is_absolute() || !workspace.is_absolute() {
         return Err(invalid("executor spawn paths must be absolute"));
     }
@@ -115,6 +118,31 @@ fn dispatch(codex_home: &Path, workspace: &Path, profile: &str, prompt: &str) ->
     }
 }
 
+/// Executor assignments are bounded outcomes: carry them as a goal so a
+/// mid-work stop does not silently drop the assignment. An explicit slash
+/// command from the caller keeps native precedence.
+fn goal_prompt(prompt: &str) -> String {
+    if prompt.starts_with('/') {
+        prompt.to_owned()
+    } else {
+        format!("/goal {prompt}")
+    }
+}
+
+/// Tab host: forward argv to the launcher and exit successfully regardless of
+/// the child outcome, so Windows Terminal closes the tab on any exit instead
+/// of leaving a dead tab that someone must remember to close.
+fn run_exec(args: &[OsString]) -> io::Result<i32> {
+    let Some((launcher, rest)) = args.split_first() else {
+        return Err(invalid("executor run requires the launcher path"));
+    };
+    if !Path::new(launcher).is_absolute() {
+        return Err(invalid("executor run launcher must be absolute"));
+    }
+    Command::new(launcher).args(rest).status()?;
+    Ok(0)
+}
+
 fn prefers_terminal_tab(session: Option<&std::ffi::OsStr>, client: Option<&Path>) -> bool {
     session.is_some() && client.is_some()
 }
@@ -147,6 +175,7 @@ fn escape_wt_commandline(arg: &str) -> String {
 fn terminal_tab_args(
     title: &str,
     workspace: &Path,
+    wrapper: &Path,
     launcher: &Path,
     tui: &[String],
 ) -> io::Result<Vec<String>> {
@@ -159,6 +188,8 @@ fn terminal_tab_args(
         "--suppressApplicationTitle".into(),
         "-d".into(),
         unicode(workspace)?,
+        unicode(wrapper)?,
+        "run".into(),
         unicode(launcher)?,
     ];
     args.extend(tui.iter().map(|arg| escape_wt_commandline(arg)));
@@ -217,7 +248,9 @@ fn dispatch_terminal_tab(
     bound: &ProfileBinding,
     codex_home: &Path,
 ) -> io::Result<i32> {
-    let args = terminal_tab_args(title, workspace, launcher, tui)?;
+    let wrapper = std::env::current_exe()
+        .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
+    let args = terminal_tab_args(title, workspace, &wrapper, launcher, tui)?;
     save_receipt(
         workspace,
         profile,
@@ -519,6 +552,7 @@ mod tests {
         let args = terminal_tab_args(
             "Codex executor (xai)",
             Path::new(r"D:\wt\xai"),
+            Path::new(r"C:\harness\codex-harness.exe"),
             Path::new(r"C:\codex.exe"),
             &["--profile".into(), "xai".into(), "do;the work".into()],
         )
@@ -527,7 +561,13 @@ mod tests {
         assert_eq!(args[1], "0");
         assert_eq!(args[2], "new-tab");
         assert!(args.contains(&"--suppressApplicationTitle".to_string()));
-        assert!(args.contains(&r"C:\codex.exe".to_string()));
+        let wrapper = args
+            .iter()
+            .position(|arg| arg == r"C:\harness\codex-harness.exe")
+            .expect("wrapper executable");
+        assert_eq!(args[wrapper + 1], "run");
+        assert_eq!(args[wrapper + 2], r"C:\codex.exe");
+        assert_eq!(args.last().unwrap(), r"do\;the work");
         assert!(args.contains(&r"do\;the work".to_string()));
         assert!(
             !args.iter().any(|arg| {
@@ -610,5 +650,23 @@ mod tests {
         assert!(text.contains("trust_level = \"trusted\""));
         assert!(text.contains("model = \"x\""));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_prefix_is_added_only_without_an_explicit_command() {
+        assert_eq!(
+            goal_prompt("finish the outcome"),
+            "/goal finish the outcome"
+        );
+        assert_eq!(goal_prompt("/goal finish"), "/goal finish");
+        assert_eq!(goal_prompt("/compact"), "/compact");
+    }
+
+    #[test]
+    fn executor_run_requires_an_absolute_launcher() {
+        let error = run_exec(&[OsString::from(r"codex.exe")]).unwrap_err();
+        assert!(error.to_string().contains("absolute"));
+        let error = run_exec(&[]).unwrap_err();
+        assert!(error.to_string().contains("launcher path"));
     }
 }
