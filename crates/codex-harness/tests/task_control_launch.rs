@@ -452,9 +452,7 @@ trust_level = "trusted"
         serde_json::from_value(view["window"].clone()).unwrap();
     let user = harness_core::process_service::current_user().unwrap();
     assert!(
-        snapshot
-            .is_visible(&upstream, &user)
-            .unwrap(),
+        snapshot.is_visible(&upstream, &user).unwrap(),
         "native conversation must remain visible for the final result"
     );
     fs::write(
@@ -803,10 +801,7 @@ fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: 
             ) {
                 if snapshot.process != before {
                     let user = harness_core::process_service::current_user().unwrap();
-                    if snapshot
-                        .is_visible(executable, &user)
-                        .unwrap_or(false)
-                    {
+                    if snapshot.is_visible(executable, &user).unwrap_or(false) {
                         break snapshot;
                     }
                 }
@@ -846,8 +841,7 @@ fn reveal_conversation(state: &Path, executable: &Path) {
     while !state.join("view.json").is_file() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let view: Value =
-        serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
+    let view: Value = serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
     let user = harness_core::process_service::current_user().unwrap();
@@ -884,9 +878,7 @@ fn close_owned_views(state: &Path) {
         }
     }
     for window in windows {
-        if let Ok(snapshot) =
-            serde_json::from_value::<harness_core::task_view::Snapshot>(window)
-        {
+        if let Ok(snapshot) = serde_json::from_value::<harness_core::task_view::Snapshot>(window) {
             let _ = close_conversation(&snapshot);
         }
     }

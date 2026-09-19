@@ -27,6 +27,16 @@ specifications are features, executor feedback is a `task` labeled `feedback`.
 If `bd` is missing or broken, report `board unavailable` and continue only work
 whose acceptance does not depend on the board.
 
+## Feedback
+
+Improvement observations from the lead or an executor are bounded board
+feedback tasks, not real-time chat. Record them through the `board-workflow`
+skill and keep working. Batch-triage at a safe boundary after in-flight tool
+effects, between assignments, without interrupting a healthy executor.
+Listing, merging and voting are board commands: no model calls beyond the
+lead's similarity judgment. Steering remains the live course-correction
+channel; the incubator carries durable demand.
+
 ## Assign and brief
 
 Brief executors through harness commands, not by automating TUI keystrokes:

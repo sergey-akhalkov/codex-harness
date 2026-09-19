@@ -1,6 +1,8 @@
 //! Native harness primitives. Read-only checks never build or acquire dependencies.
 pub mod agent_config;
 pub mod analysis_samples;
+pub mod board_cli;
+pub mod board_feedback;
 #[cfg(windows)]
 pub mod broker_endpoint;
 #[cfg(windows)]

@@ -180,9 +180,9 @@ impl Responses {
                     (item["type"] == "agent_message" || item["role"] == "user")
                         && item["content"].as_array().is_some_and(|content| {
                             content.iter().any(|part| {
-                                part["text"].as_str().is_some_and(|text| {
-                                    text.contains("CONTROL_HELPER_ASSIGNMENT")
-                                })
+                                part["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains("CONTROL_HELPER_ASSIGNMENT"))
                             })
                         })
                 });

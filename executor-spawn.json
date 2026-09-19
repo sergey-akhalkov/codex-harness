@@ -1,0 +1,34 @@
+{
+  "args": [
+    "--profile",
+    "ds",
+    "-C",
+    "D:/home/sergey-akhalkov/codex-harness-ofap-feedback",
+    "/goal Finish and verify OFAP tasks 2.1-2.3 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-dl6.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Stop only when the assignment outcome is fully done."
+  ],
+  "host": "windows-terminal-tab",
+  "isolation": false,
+  "model": "deepseek-flash",
+  "modelProvider": "deepseek",
+  "profile": "ds",
+  "reasoningEffort": "max",
+  "schema": 1,
+  "terminal": [
+    "-w",
+    "0",
+    "new-tab",
+    "--title",
+    "Codex executor (ds)",
+    "--suppressApplicationTitle",
+    "-d",
+    "D:/home/sergey-akhalkov/codex-harness-ofap-feedback",
+    "C:/Users/noilw/.codex\\harness/bin/codex.exe",
+    "--profile",
+    "ds",
+    "-C",
+    "D:/home/sergey-akhalkov/codex-harness-ofap-feedback",
+    "/goal Finish and verify OFAP tasks 2.1-2.3 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-dl6.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Stop only when the assignment outcome is fully done."
+  ],
+  "visible": true,
+  "window": null
+}
