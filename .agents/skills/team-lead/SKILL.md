@@ -140,6 +140,9 @@ rejected, the improvement stays unadopted.
 Review completed assignments against requirements and applicable checks. Merge
 accepted branches yourself. Return in-scope defects with acceptance conditions
 to the original executor. Record acceptance on the board and in task state.
+Reconcile planning artifacts explicitly on integration: an executor's
+tasks.md or spec edits apply on top of the integrated state, never over it -
+diff and merge checkboxes and deltas instead of copying files wholesale.
 Worktrees are lane-owned, not task-owned: creating one is a cheap local
 checkout (seconds, hardlinked objects, no upstream), while the per-worktree
 build cache is the real cost. After an accepted merge, reset the lane worktree
