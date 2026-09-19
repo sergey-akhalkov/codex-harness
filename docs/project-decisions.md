@@ -506,6 +506,17 @@ host-local and out of Git. The consuming item keeps every vote, merge and route
 comment as history, so promotion never deletes evidence. This resolves the
 design.md open question for OFAP task 3.2.
 
+**2026-09-20, confirmed:** executor assignments run in `codex exec` mode
+inside a visible terminal tab by default: the output streams while the
+executor works, the process exits on completion and the tab closes itself, so
+finished tabs never linger and the lead has no manual close step. Corrections
+and continuation reopen the exact session through `codex resume` /
+`codex exec resume` with the acceptance conditions stated in that session.
+Prompt-level `/goal` prefixes are not used for spawned executors: the CLI has
+no argv goal hook, so such a prefix is inert text; crash recovery is owned by
+the lead's watcher plus exact-session resume. Interactive `--mode tui` remains
+available for human-attended executors.
+
 ## Recording further decisions
 
 - Record durable goals, constraints, preferences and confirmed decisions here

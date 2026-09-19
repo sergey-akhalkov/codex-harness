@@ -83,8 +83,11 @@ each. Sequence only genuinely dependent slices; respect
 `max_concurrent_executors` and shared accounts or machines; the lead owns
 integration and acceptance conflicts.
 The `--exec` prompt points at board ids; the beads issue is the assignment.
-Start executor prompts with `/goal` so a bounded assignment survives a
-mid-work stop; accept only against the assignment, not effort spent.
+The default exec mode streams the assignment in a visible tab and exits on
+completion, closing the tab; a mid-work stop is detected by the watcher and
+the exact session continues through `codex exec resume SESSION_ID`. Do not
+prefix prompts with `/goal`: the CLI has no argv goal hook and the prefix
+would be inert text. Accept only against the assignment, not effort spent.
 Spawn returns after the executor window/tab is open so the lead can keep
 working. Executors look at the board and do assigned issues.
 
@@ -119,10 +122,11 @@ tracked files.
 Executors set status `lead_review` instead of closing. The lead closes on
 accept or returns the item to `in_progress` with conditions.
 Executor terminal tabs are per-assignment, never pooled: a fresh session must
-not inherit another assignment's context. After acceptance the lead ends the
-idle executor session (graceful exit first) so its terminal tab closes itself;
-reuse a tab and session only when returning the same assignment with
-conditions.
+not inherit another assignment's context. Exec mode closes the tab when the
+assignment finishes; nothing lingers and nobody has to remember to close it.
+To return defects or continue after a stop, resume the exact session
+(`codex resume SESSION_ID` interactively, `codex exec resume SESSION_ID` for a
+bounded continuation) and state the acceptance conditions there.
 
 ## Recovery
 
