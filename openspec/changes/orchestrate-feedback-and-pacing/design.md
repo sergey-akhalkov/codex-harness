@@ -157,5 +157,10 @@ replace the skill-evaluation accept/reject/inconclusive contract.
   (`bd -C <kit>`). The board's runtime state stays host-local and out of Git;
   only kit-level summary and scope cross over (no reporter, episode, project
   path or raw observation), so the publication boundary holds.
-- How dashboard snapshots reach the lead: manual paste on request versus a
-  bounded browser read; decision needed before pacing implementation.
+- **Resolved 2026-09-20 (tasks 5.1-5.2):** dashboard snapshots reach the lead
+  as bounded user-supplied readings recorded on a board pacing item. Fields the
+  user does not supply stay `unknown`, the controller reads no dashboard, and no
+  browser scrape or provider probe is made. Only the GPT/Codex limit comes from
+  the installed native contract (the CLI's own session `rate_limits` record,
+  read newest-first with a freshness bound); every other provider paces from
+  actual refusals and user-supplied snapshots.

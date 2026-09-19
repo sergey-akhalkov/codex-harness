@@ -142,6 +142,46 @@ Triggers: `stage-or-epic-closed` and `incubator-above-cap size=<n> cap=<n>`.
 Archiving keeps labels, merge history and votes, so reopening restores the item
 on fresh evidence. With no lead session active the sweep waits unchanged.
 
+## Scoped observations and pacing records
+
+Pacing reads three sources and nothing else: the native Codex/GPT limit
+snapshot the CLI itself records, actual provider refusals reported by
+executors, and bounded dashboard snapshots the user supplies. Unknown stays
+unknown - no probe call, no local request-count remainder, no invented
+percentage. Record observations on the pacing item (the stage epic or a
+dedicated task):
+
+| Step | Command |
+| --- | --- |
+| Record | `bd comment <item> --json "pacing-observation v1 scope=<account> source=native-limit\|provider-refusal\|dashboard-snapshot used=<percent\|unknown> resets_at=<epoch\|unknown> window_minutes=<minutes\|unknown> refusals=<n> observed_at=<epoch> max_age=<seconds>"` |
+| Inspect | `bd comments <item> --json` |
+
+`used=unknown` is correct whenever the source exposes no percentage. A refusal
+records the refusal only; a dashboard snapshot is an opaque user-supplied
+reading and is never fetched or scraped. A native read is bounded to the
+newest session records and to the provider-issued `rate_limits` object.
+
+| Step | Command |
+| --- | --- |
+| Record a decision | `bd comment <item> --json "pacing-decision v1 id=<scope>:<knob> scope=<account> knob=new-assignments\|concurrency\|effort\|feedback-cadence from=<old> to=<new> expires_at=<epoch\|none> reason=<why> basis=<observation>"` |
+| Withdraw one | `bd comment <item> --json "pacing-revoke v1 id=<scope>:<knob> reason=<why>"` |
+
+A decision expires with the observation it was derived from and is re-derived
+at the next boundary; there is no background scheduler.
+
+## Benefit gate
+
+A promoted improvement becomes a default only after a matched comparison and
+only with an adopted gate record. Record the comparison on the promoted item:
+
+| Step | Command |
+| --- | --- |
+| Record | `bd comment <item> --json "benefit-gate v1 item=<item> improvement=<name> outcome=<adopt\|reject\|inconclusive> quality=<unchanged\|improved\|regressed\|unmeasurable> matched=<n> tolerance_percent=<n> baseline_seconds=<n> candidate_seconds=<n> regression_percent=<n> baseline=<arm> candidate=<arm> accounting=check+coordination+rework detail=<why>"` |
+
+Declare the tolerance before the run and include feedback-triage, coordination
+and rework in each arm's seconds. An inconclusive or rejected record leaves the
+improvement unadopted.
+
 ## Pipeline
 
 All agent work goes through this board. Do not use process polling or chat as

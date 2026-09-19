@@ -3030,4 +3030,125 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("not an incubator item"));
     }
+
+    #[test]
+    fn pacing_observations_decisions_and_gate_records_round_trip_on_the_board() {
+        use crate::benefit_gate::{
+            ArmTiming, ComparisonRecord, GateOutcome, MatchedTask, default_allowed, evaluate,
+            format_gate_comment, parse_gate_comments,
+        };
+        use crate::pacing::{
+            NewAssignment, PacingLimits, applicable, format_revoke_comment, parse_pacing_comments,
+            plan,
+        };
+        use crate::scoped_observations::{
+            DEFAULT_MAX_AGE_SECONDS, DashboardSnapshotDraft, account_view, dashboard_snapshot,
+            list_observations, provider_refusal, record_observation,
+        };
+
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let item = json_ok(
+            &bd,
+            &project,
+            &[
+                "create",
+                "Pacing: account window for the stage",
+                "--type",
+                "task",
+                "--parent",
+                &parent,
+                "--description",
+                "Synthetic pacing item.",
+                "--json",
+            ],
+        )
+        .unwrap();
+        let item_id = string_field(&item, "id").unwrap();
+        let now = 1_789_853_000;
+        let reset = now + 1800;
+        let snapshot = dashboard_snapshot(DashboardSnapshotDraft {
+            scope: "gpt".into(),
+            used_percent: Some(93),
+            resets_at: Some(reset),
+            window_minutes: Some(10_080),
+            observed_at: now - 30,
+            max_age_seconds: DEFAULT_MAX_AGE_SECONDS,
+        })
+        .unwrap();
+        let refusal = provider_refusal("xai", 1, now - 60, DEFAULT_MAX_AGE_SECONDS).unwrap();
+        record_observation(&bd, &project, &item_id, &snapshot).unwrap();
+        record_observation(&bd, &project, &item_id, &refusal).unwrap();
+        let read = list_observations(&bd, &project, &item_id).unwrap();
+        assert_eq!(read, vec![snapshot.clone(), refusal.clone()]);
+        let view = account_view(&read, "gpt", now);
+        assert_eq!(view.used_percent, Some(93));
+        assert_eq!(view.resets_at, Some(reset));
+        assert_eq!(account_view(&read, "xai", now).used_percent, None);
+        assert_eq!(account_view(&read, "xai", now).refusals, 1);
+
+        let limits = PacingLimits::configured(2, 8).unwrap();
+        let assignments = [NewAssignment {
+            id: "next-lane-task".into(),
+            scope: "gpt".into(),
+            requested_effort: Some("xhigh".into()),
+        }];
+        let paced = plan(&limits, &read, &[], &assignments, now);
+        assert_eq!(paced.scopes[0].concurrency_limit, 1);
+        assert!(!paced.decisions.is_empty());
+        for decision in &paced.decisions {
+            json_ok(
+                &bd,
+                &project,
+                &["comment", &item_id, "--json", &decision.to_comment()],
+            )
+            .unwrap();
+        }
+        let comments = list_comments(&bd, &project, &item_id).unwrap();
+        let records = parse_pacing_comments(&comments);
+        assert_eq!(records.decisions, paced.decisions);
+        assert_eq!(applicable(&records, now).len(), paced.decisions.len());
+
+        let withdrawal =
+            format_revoke_comment("gpt", paced.decisions[0].knob, "observation superseded");
+        json_ok(&bd, &project, &["comment", &item_id, "--json", &withdrawal]).unwrap();
+        let comments = list_comments(&bd, &project, &item_id).unwrap();
+        let records = parse_pacing_comments(&comments);
+        assert_eq!(records.revoked, vec![paced.decisions[0].id()]);
+        assert_eq!(applicable(&records, now).len(), paced.decisions.len() - 1);
+
+        let comparison = ComparisonRecord {
+            item: "codex-harness-pvr.5".into(),
+            improvement: "lane-reuse".into(),
+            baseline_label: "fresh-worktree".into(),
+            candidate_label: "lane-reuse".into(),
+            tolerance_percent: 10.0,
+            matched: vec![MatchedTask {
+                task: "verify-crate-tests".into(),
+                baseline_passed: true,
+                candidate_passed: true,
+                baseline: ArmTiming::new(212.0, 1.0, 0.0).unwrap(),
+                candidate: ArmTiming::new(3.0, 0.5, 0.0).unwrap(),
+            }],
+        };
+        let outcome = evaluate(&comparison);
+        assert!(matches!(outcome, GateOutcome::Adopt { .. }));
+        json_ok(
+            &bd,
+            &project,
+            &[
+                "comment",
+                &item_id,
+                "--json",
+                &format_gate_comment(&comparison, &outcome),
+            ],
+        )
+        .unwrap();
+        let comments = list_comments(&bd, &project, &item_id).unwrap();
+        let gate = parse_gate_comments(&comments);
+        assert!(default_allowed(&gate, "codex-harness-pvr.5"));
+        assert!(!default_allowed(&gate, "codex-harness-qr6.1"));
+    }
 }

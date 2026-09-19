@@ -19,8 +19,9 @@
 - [x] 3.4 Implement lead-owned incubator hygiene with deterministic triggers: a sweep whenever the lead closes a stage or epic during acceptance and whenever a triage batch finds the incubator above its configured size cap; verify safe deferral when no lead session is active, archived reasons, inspectable history, restoration on fresh evidence, and no model calls for size checks.
 
 ## 4. Instruction-refresh succession
-- [x] 4.1 Implement successor spawning through the verified `codex resume` path at safe boundaries after in-flight tool effects, with durable context handover and predecessor process stop. Consume the compact revision identity published by skill-evolution; do not implement catalogue injection or compact recovery.
-- [x] 4.2 Verify succession preserves partial work and authorization, does not replay uncertain external operations, and reports "succession not established" when reload verification fails.
+
+- [ ] 4.1 Implement successor spawning through the verified `codex resume` path at safe boundaries after in-flight tool effects, with durable context handover and predecessor process stop. Consume the compact revision identity published by skill-evolution; do not implement catalogue injection or compact recovery.
+- [ ] 4.2 Verify succession preserves partial work and authorization, does not replay uncertain external operations, and reports "succession not established" when reload verification fails.
 
 ## 5. Pacing and the benefit gate
 

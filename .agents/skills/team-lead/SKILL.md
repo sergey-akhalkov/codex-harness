@@ -105,6 +105,36 @@ emits a single event; the lead blocks on that event between useful work.
 While executors run, the lead analyzes bottlenecks, spend and next cuts, and
 files those as board tasks.
 
+## Pace spend
+
+Pace from fresh scoped observations only: the native Codex/GPT limit snapshot
+the CLI itself records, actual provider refusals reported by executors, and
+bounded dashboard snapshots the user supplies (recorded through
+`board-workflow`). Unknown stays unknown: no probe call, no local
+request-count remainder, no invented percentage, and unknown is neither zero
+nor unlimited, so the configured limits hold.
+
+| Fresh observation | New assignments | Concurrency | Effort | Feedback cadence |
+| --- | --- | --- | --- | --- |
+| below 70% used | admit | configured | requested | configured |
+| 70% used or more | admit | half, at least 1 | requested | half, at least 1 |
+| 90% used or more, or a refusal | wait for the reset | 1 | `low` ceiling | 1 |
+| stale or unknown | admit | configured | requested | configured |
+
+Pacing changes new work only: a healthy executor keeps its slot, model and
+instructions and is never preempted, and accepted work is never dropped. When
+several tasks share an account, spread their eligibility after a reset instead
+of issuing one synchronized burst. Record each deviation from the configured
+limits with its reason and basis, and withdraw it with a revoke record once the
+observation no longer holds; decisions expire with their basis and no
+background scheduler runs.
+
+Before a promoted improvement becomes the default for assignments, worktrees,
+concurrency or cadence, run the matched comparison and record the gate result
+through `board-workflow`, with check time, coordination and rework in each
+arm and the tolerance declared beforehand. While that record is inconclusive or
+rejected, the improvement stays unadopted.
+
 ## Accept and merge
 
 Review completed assignments against requirements and applicable checks. Merge
