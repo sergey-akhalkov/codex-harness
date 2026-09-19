@@ -28,7 +28,7 @@ use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] [--terminal-profile NAME] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible TUI, and returns so the lead can keep working. The prompt is prefixed with /goal unless it already starts with a slash command, and a terminal tab hosts the session through `executor run`, which closes the tab on any exit. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] [--mode exec|tui] [--terminal-profile NAME] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible console, and returns so the lead can keep working. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
 const STARTUP: Duration = Duration::from_secs(20);
 const SUCCESSION_LIMIT: u64 = 4 * 1024 * 1024;
 const INSTRUCTION_READ_LIMIT: u64 = 1024 * 1024;
@@ -76,6 +76,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let mut workspace = None;
     let mut profile = None;
     let mut terminal_profile = None;
+    let mut mode = None;
     let mut prompt = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -105,6 +106,14 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
                         .to_owned(),
                 )
             }
+            "--mode" => {
+                mode = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                )
+            }
             "--exec" => {
                 prompt = Some(
                     value
@@ -119,21 +128,50 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
     let workspace = required(workspace, "--workspace")?;
-    let prompt = prompt
-        .ok_or_else(|| invalid("--exec is required"))
-        .map(|prompt| goal_prompt(&prompt))?;
+    let prompt = prompt.ok_or_else(|| invalid("--exec is required"))?;
     if !source.is_absolute() || !codex_home.is_absolute() || !workspace.is_absolute() {
         return Err(invalid("executor spawn paths must be absolute"));
     }
     let config = load(&source)?;
     let profile = executor_profile(&config, profile.as_deref())?.to_owned();
+    let mode = SpawnMode::parse(mode.as_deref())?;
     dispatch(
         &codex_home,
         &workspace,
         &profile,
         &prompt,
+        mode,
         terminal_profile.as_deref(),
     )
+}
+
+/// `exec` streams the assignment in a visible tab and exits on completion, so
+/// the tab closes itself and corrections reopen the exact session via
+/// `codex resume`. `tui` keeps an interactive conversation for cases that
+/// need a human-attended executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnMode {
+    Exec,
+    Tui,
+}
+
+impl SpawnMode {
+    fn parse(value: Option<&str>) -> io::Result<Self> {
+        match value {
+            None | Some("exec") => Ok(Self::Exec),
+            Some("tui") => Ok(Self::Tui),
+            Some(other) => Err(invalid(&format!(
+                "unknown executor mode {other}; use exec or tui"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Tui => "tui",
+        }
+    }
 }
 
 fn dispatch(
@@ -141,6 +179,7 @@ fn dispatch(
     workspace: &Path,
     profile: &str,
     prompt: &str,
+    mode: SpawnMode,
     terminal_profile: Option<&str>,
 ) -> io::Result<i32> {
     let bound = orchestration_config::binding(codex_home, profile)?;
@@ -151,7 +190,7 @@ fn dispatch(
     if !launcher.is_file() {
         return Err(invalid("installed Codex launcher is missing"));
     }
-    let args = tui_args(profile, workspace, prompt, &isolation)?;
+    let args = child_args(profile, workspace, prompt, &isolation, mode)?;
     let title = format!("Codex executor ({profile})");
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
@@ -169,17 +208,6 @@ fn dispatch(
         )
     } else {
         dispatch_owned_console(&launcher, workspace, profile, &args, &bound, codex_home)
-    }
-}
-
-/// Executor assignments are bounded outcomes: carry them as a goal so a
-/// mid-work stop does not silently drop the assignment. An explicit slash
-/// command from the caller keeps native precedence.
-fn goal_prompt(prompt: &str) -> String {
-    if prompt.starts_with('/') {
-        prompt.to_owned()
-    } else {
-        format!("/goal {prompt}")
     }
 }
 
@@ -510,6 +538,29 @@ fn tui_args(
         ));
     }
     Ok(args)
+}
+
+fn child_args(
+    profile: &str,
+    workspace: &Path,
+    prompt: &str,
+    isolation: &[String],
+    mode: SpawnMode,
+) -> io::Result<Vec<String>> {
+    match mode {
+        SpawnMode::Exec => {
+            let mut args = profile_args(profile)?;
+            args.extend([
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "-C".into(),
+                native_path(workspace)?,
+                prompt.to_owned(),
+            ]);
+            Ok(args)
+        }
+        SpawnMode::Tui => tui_args(profile, workspace, prompt, isolation),
+    }
 }
 
 fn save_receipt(
@@ -1576,12 +1627,32 @@ mod tests {
 
     #[test]
     fn goal_prefix_is_added_only_without_an_explicit_command() {
+        assert!(SpawnMode::parse(None).is_ok());
+        assert_eq!(SpawnMode::parse(Some("tui")).unwrap(), SpawnMode::Tui);
+        let error = SpawnMode::parse(Some("headless")).unwrap_err();
+        assert!(error.to_string().contains("unknown executor mode"));
+    }
+
+    #[test]
+    fn exec_mode_streams_the_assignment_without_a_fake_goal_prefix() {
+        let args = child_args(
+            "ds",
+            Path::new(r"D:\wt\ds"),
+            "Complete the outcome in ASSIGNMENT.md.",
+            &[],
+            SpawnMode::Exec,
+        )
+        .unwrap();
+        assert_eq!(args[0], "--profile");
+        assert_eq!(args[1], "ds");
+        assert_eq!(args[2], "exec");
+        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        assert!(args.contains(&r"D:\wt\ds".to_string()));
         assert_eq!(
-            goal_prompt("finish the outcome"),
-            "/goal finish the outcome"
+            args.last().unwrap(),
+            "Complete the outcome in ASSIGNMENT.md."
         );
-        assert_eq!(goal_prompt("/goal finish"), "/goal finish");
-        assert_eq!(goal_prompt("/compact"), "/compact");
+        assert!(!args.iter().any(|arg| arg.starts_with("/goal")));
     }
 
     #[test]
