@@ -1,0 +1,34 @@
+{
+  "args": [
+    "--profile",
+    "ds",
+    "-C",
+    "D:/home/sergey-akhalkov/codex-harness-ofap-succession",
+    "/goal Complete OFAP tasks 4.1-4.2 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-kon.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Verify succession only with synthetic sessions in %TEMP%; never touch live lead/executor sessions. Stop only when the assignment outcome is fully done."
+  ],
+  "host": "windows-terminal-tab",
+  "isolation": false,
+  "model": "deepseek-flash",
+  "modelProvider": "deepseek",
+  "profile": "ds",
+  "reasoningEffort": "max",
+  "schema": 1,
+  "terminal": [
+    "-w",
+    "0",
+    "new-tab",
+    "--title",
+    "Codex executor (ds)",
+    "--suppressApplicationTitle",
+    "-d",
+    "D:/home/sergey-akhalkov/codex-harness-ofap-succession",
+    "C:/Users/noilw/.codex\\harness/bin/codex.exe",
+    "--profile",
+    "ds",
+    "-C",
+    "D:/home/sergey-akhalkov/codex-harness-ofap-succession",
+    "/goal Complete OFAP tasks 4.1-4.2 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-kon.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Verify succession only with synthetic sessions in %TEMP%\\; never touch live lead/executor sessions. Stop only when the assignment outcome is fully done."
+  ],
+  "visible": true,
+  "window": null
+}

@@ -81,6 +81,32 @@ tasks. Do not poll executor process ids.
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
 stop. Ordinary sessions without that activation spawn nothing.
 
+## Instruction-refresh succession
+
+When an accepted instruction or skill change must reach an active executor
+session, replace its CLI process through the verified non-interactive resume
+path instead of steering the stale session:
+
+```powershell
+codex-harness executor succeed --request FILE
+```
+
+The request names the exact session id (never `--last` or a picker), the
+configured profile, the workspace, the private session state root or its
+recorded pointer, the compact revision identity published by skill-evolution
+(`name`, canonical `path`, `revision`, `operation`), the durable task context
+and a private evidence directory. The command makes no model calls: it waits
+for a safe boundary after in-flight tool effects, writes the handover record
+into the owning task records, confirms the predecessor process stopped, spawns
+`codex exec resume <SESSION_ID>` with the recorded sandbox and approval
+policy, and verifies from the successor's own session rollout that the current
+instructions and skill revision were reloaded. A stale published revision or
+a missing reload is reported as `succession not established` with a non-zero
+exit; the gap is fixed before the refresh is relied on. The successor is a
+bounded continuation turn, not an interactive view; same-session compact
+recovery, catalogue delivery and in-process activation remain owned by
+`autonomous-skill-evolution`.
+
 ## Board workflow
 
 Asynchronous assignment and executor feedback use the consuming project's

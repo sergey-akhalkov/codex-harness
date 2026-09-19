@@ -360,6 +360,14 @@ installed pinned `bd`, and started the ordinary linked launcher with
 modified. `ordinary_launcher_stops_on_explicit_user_stop` passed on CLI 0.155.1:
 the emergency `request_stop` path recorded `explicit stop`, preserved the
 partial file effect and issued no further model request.
+The ignored `executor_succession` checks replace a managed synthetic session's
+CLI process at a safe boundary through `codex exec resume <SESSION_ID>`: they
+verify deferred replacement while the predecessor turn is in flight, a durable
+handover record, confirmed predecessor stop, preserved partial work and
+authorization, successor reload evidence from the session rollout, and the
+`succession not established` report for a stale published revision or a
+missing reload. They cover owned temp sessions only; interactive successor
+views and production resume ingress are not part of this increment.
 
 This implementation currently requires an explicit provider base URL and a new
 session; resume/fork and implicit built-in routing return an explicit unsupported
