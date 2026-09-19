@@ -1,11 +1,16 @@
-//! Bounded board feedback intake and model-free triage mechanics.
+//! Bounded board feedback intake, observation routing, promotion and
+//! lead-owned incubator hygiene.
 //!
-//! Lead and executor observations become `bd` tasks. Listing, merging and
-//! voting invoke only the board CLI. Similarity remains lead judgment, supplied
-//! as explicit merge decisions. The controller does not parse the board.
+//! Lead and executor observations become `bd` tasks. Listing, merging, voting,
+//! promotion, size checks and sweeps invoke only the board CLI: no model calls
+//! run in the routine mechanics. Similarity and consequence remain lead
+//! judgment, supplied as explicit merge and routing decisions. The controller
+//! does not parse the board. Handing a verified procedure to
+//! `autonomous-skill-evolution` is a reference only: this module never writes
+//! skill packages.
 use crate::board_cli::{FEEDBACK_LABEL, INCUBATOR_LABEL, json_ok, json_ok_actor, string_field};
 use serde_json::Value;
-use std::{io, path::Path};
+use std::{fs, io, path::Path};
 
 pub const DEFAULT_FEEDBACK_BATCH_LIMIT: usize = 8;
 pub const MAX_OBSERVATION: usize = 512;
@@ -13,9 +18,29 @@ pub const MAX_SCOPE: usize = 128;
 pub const MAX_REPORTER: usize = 64;
 pub const MAX_EPISODE: usize = 64;
 pub const MAX_PARENT: usize = 64;
+pub const MAX_REASON: usize = 160;
+
+/// Kit default: promote after more than two counted votes.
+pub const DEFAULT_VOTE_THRESHOLD: u32 = 3;
+pub const DEFAULT_INCUBATOR_SIZE_CAP: usize = 32;
+
+/// Labels owned by this loop on the consuming project's board.
+pub const SKILL_EVOLUTION_LABEL: &str = "skill-evolution";
+pub const BACKLOG_LABEL: &str = "backlog";
+pub const OPENSPEC_LABEL: &str = "openspec";
+pub const KIT_FORWARDED_LABEL: &str = "kit-forwarded";
+/// Label of sanitized kit-concern items created on the kit's own board.
+pub const KIT_FEEDBACK_LABEL: &str = "kit-feedback";
 
 const VOTE_PREFIX: &str = "feedback-vote v1";
 const MERGE_PREFIX: &str = "feedback-merge v1";
+const ROUTE_PREFIX: &str = "feedback-route v1";
+const PROMOTE_PREFIX: &str = "feedback-promote v1";
+const ARCHIVE_PREFIX: &str = "feedback-archive v1";
+const RESTORE_PREFIX: &str = "feedback-restore v1";
+/// Actor recorded for kit-board items created by promotion; carries no
+/// consuming-project identity.
+const KIT_ROUTING_ACTOR: &str = "feedback-routing";
 const MAX_TITLE_BYTES: usize = 72;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,12 +181,235 @@ pub struct MergeRecord {
 pub struct VoteLedger {
     pub votes: Vec<VoteRecord>,
     pub merges: Vec<MergeRecord>,
+    pub routes: Vec<RouteRecord>,
+    pub promotions: Vec<PromotionRecord>,
 }
 
 impl VoteLedger {
     pub fn counted(&self) -> usize {
         self.votes.iter().filter(|vote| vote.counted).count()
     }
+}
+
+/// How an observation is classified before it competes as an incubator vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationKind {
+    /// A verified reusable procedure in owned skill scope.
+    SkillProcedure,
+    Process,
+    Orchestration,
+    Requirement,
+    Tool,
+    Unclear,
+    Material,
+    /// Kit-wide instruction, skill or tool demand from a consuming project.
+    KitConcern,
+}
+
+impl ObservationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SkillProcedure => "skill-procedure",
+            Self::Process => "process",
+            Self::Orchestration => "orchestration",
+            Self::Requirement => "requirement",
+            Self::Tool => "tool",
+            Self::Unclear => "unclear",
+            Self::Material => "material",
+            Self::KitConcern => "kit-concern",
+        }
+    }
+
+    fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "skill-procedure" => Ok(Self::SkillProcedure),
+            "process" => Ok(Self::Process),
+            "orchestration" => Ok(Self::Orchestration),
+            "requirement" => Ok(Self::Requirement),
+            "tool" => Ok(Self::Tool),
+            "unclear" => Ok(Self::Unclear),
+            "material" => Ok(Self::Material),
+            "kit-concern" => Ok(Self::KitConcern),
+            _ => Err(invalid(format!("unknown observation kind {value}"))),
+        }
+    }
+
+    /// Intake routing: a verified reusable procedure in owned skill scope is
+    /// handed to `autonomous-skill-evolution`; every other kind incubates.
+    pub fn intake(self) -> IntakeRoute {
+        match self {
+            Self::SkillProcedure => IntakeRoute::SkillEvolution,
+            _ => IntakeRoute::Incubator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntakeRoute {
+    SkillEvolution,
+    Incubator,
+}
+
+/// Promotion consequence: where a promoted incubator item goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionRoute {
+    BacklogTask,
+    OpenSpecChange,
+    KitBacklog,
+}
+
+impl PromotionRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BacklogTask => "backlog-task",
+            Self::OpenSpecChange => "openspec-change",
+            Self::KitBacklog => "kit-backlog",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "backlog-task" => Some(Self::BacklogTask),
+            "openspec-change" => Some(Self::OpenSpecChange),
+            "kit-backlog" => Some(Self::KitBacklog),
+            _ => None,
+        }
+    }
+
+    /// Label the promoted item keeps on the consuming project's board.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BacklogTask => BACKLOG_LABEL,
+            Self::OpenSpecChange => OPENSPEC_LABEL,
+            Self::KitBacklog => KIT_FORWARDED_LABEL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTarget {
+    Incubator,
+    SkillEvolution,
+}
+
+impl RouteTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incubator => "incubator",
+            Self::SkillEvolution => "skill-evolution",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "incubator" => Some(Self::Incubator),
+            "skill-evolution" => Some(Self::SkillEvolution),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRecord {
+    pub kind: ObservationKind,
+    pub target: RouteTarget,
+    /// The observation that supplied this classification.
+    pub item: String,
+}
+
+/// Kit-level wording of a kit concern. Only these fields may reach the kit
+/// board: no reporter, episode, project path or raw transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KitConcern {
+    pub summary: String,
+    pub scope: String,
+}
+
+impl KitConcern {
+    fn bounded(&self) -> io::Result<Self> {
+        Ok(Self {
+            summary: require_field("summary", &self.summary, MAX_OBSERVATION)?,
+            scope: require_field("scope", &self.scope, MAX_SCOPE)?,
+        })
+    }
+}
+
+/// Evidence used to promote an incubator item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionEvidence {
+    /// The configured vote threshold was reached.
+    Votes { threshold: u32 },
+    /// Lead consequence override for material correctness, integrity or safety
+    /// evidence. Both fields are recorded verbatim.
+    ConsequenceOverride { consequence: String, reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionOutcome {
+    pub item_id: String,
+    pub route: PromotionRoute,
+    /// `None` for the local backlog, `openspec:<name>` or `kit:<item>`.
+    pub target: Option<String>,
+    pub counted: usize,
+    pub override_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionCandidate {
+    pub item_id: String,
+    pub counted: usize,
+    pub kinds: Vec<ObservationKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionRecord {
+    pub route: PromotionRoute,
+    pub counted: usize,
+    pub override_used: bool,
+    pub target: Option<String>,
+}
+
+/// Deterministic hygiene triggers observed by the lead session. There is no
+/// background scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HygieneTrigger {
+    /// The lead closes a stage or epic during acceptance.
+    StageOrEpicClosed,
+    /// A triage batch found the incubator above its configured size cap.
+    IncubatorAboveCap { size: usize, cap: usize },
+}
+
+impl HygieneTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StageOrEpicClosed => "stage-or-epic-closed",
+            Self::IncubatorAboveCap { .. } => "incubator-above-cap",
+        }
+    }
+
+    fn comment_tail(self) -> String {
+        match self {
+            Self::StageOrEpicClosed => String::new(),
+            Self::IncubatorAboveCap { size, cap } => format!(" size={size} cap={cap}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepDecision {
+    pub item_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepOutcome {
+    Swept {
+        archived: Vec<String>,
+    },
+    /// No lead session is active; the incubator waits unchanged.
+    Deferred {
+        size: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +429,31 @@ pub struct AppliedAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriageReport {
     pub applied: Vec<AppliedAction>,
+    pub deferred: usize,
+}
+
+/// A triage action that also carries the observation classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedAction {
+    pub feedback_id: String,
+    pub kind: ObservationKind,
+    pub merge_into: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedOutcome {
+    pub feedback_id: String,
+    pub route: IntakeRoute,
+    /// Incubator item the observation landed on, or the handed-off item.
+    pub target_id: String,
+    /// `Some` for incubated observations, `None` for a skill-evolution
+    /// reference handoff (which records no vote).
+    pub vote: Option<VoteDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedReport {
+    pub applied: Vec<RoutedOutcome>,
     pub deferred: usize,
 }
 
@@ -208,14 +481,25 @@ pub fn decide_vote(existing: &[VoteRecord], candidate: &VoteCandidate) -> VoteDe
 pub fn parse_ledger(comments: &[String]) -> VoteLedger {
     let mut votes = Vec::new();
     let mut merges = Vec::new();
+    let mut routes = Vec::new();
+    let mut promotions = Vec::new();
     for comment in comments {
         if let Some(vote) = parse_vote_comment(comment) {
             votes.push(vote);
         } else if let Some(merge) = parse_merge_comment(comment) {
             merges.push(merge);
+        } else if let Some(route) = parse_route_comment(comment) {
+            routes.push(route);
+        } else if let Some(promotion) = parse_promotion_comment(comment) {
+            promotions.push(promotion);
         }
     }
-    VoteLedger { votes, merges }
+    VoteLedger {
+        votes,
+        merges,
+        routes,
+        promotions,
+    }
 }
 
 pub fn format_vote_comment(candidate: &VoteCandidate, decision: &VoteDecision) -> String {
@@ -231,6 +515,14 @@ pub fn format_vote_comment(candidate: &VoteCandidate, decision: &VoteDecision) -
 
 pub fn format_merge_comment(from: &str, into: &str) -> String {
     format!("{MERGE_PREFIX} from={from} into={into}")
+}
+
+pub fn format_route_comment(kind: ObservationKind, target: RouteTarget, item: &str) -> String {
+    format!(
+        "{ROUTE_PREFIX} kind={} target={} item={item}",
+        kind.as_str(),
+        target.as_str()
+    )
 }
 
 pub fn record_feedback(
@@ -305,13 +597,161 @@ pub fn apply_triage(
     Ok(TriageReport { applied, deferred })
 }
 
+/// Applies classified triage actions in one bounded batch. A verified
+/// procedure is handed to `autonomous-skill-evolution` as a reference and
+/// records no vote; every other observation is admitted (or merged) into the
+/// incubator with one counted vote and a visible classification.
+pub fn apply_routed_triage(
+    bd: &Path,
+    project: &Path,
+    actions: &[RoutedAction],
+    batch_limit: usize,
+) -> io::Result<RoutedReport> {
+    if batch_limit == 0 {
+        return Err(invalid("feedback batch limit must be positive"));
+    }
+    let deferred = actions.len().saturating_sub(batch_limit);
+    let mut applied = Vec::new();
+    for action in actions.iter().take(batch_limit) {
+        applied.push(apply_routed_action(bd, project, action)?);
+    }
+    Ok(RoutedReport { applied, deferred })
+}
+
+fn apply_routed_action(
+    bd: &Path,
+    project: &Path,
+    action: &RoutedAction,
+) -> io::Result<RoutedOutcome> {
+    match action.kind.intake() {
+        IntakeRoute::SkillEvolution => {
+            if action.merge_into.is_some() {
+                return Err(invalid(format!(
+                    "feedback {} is a verified procedure; it is handed to skill-evolution instead of merging into an incubator item",
+                    action.feedback_id
+                )));
+            }
+            hand_off_procedure(bd, project, &action.feedback_id)?;
+            Ok(RoutedOutcome {
+                feedback_id: action.feedback_id.clone(),
+                route: IntakeRoute::SkillEvolution,
+                target_id: action.feedback_id.clone(),
+                vote: None,
+            })
+        }
+        IntakeRoute::Incubator => {
+            let triage = TriageAction {
+                feedback_id: action.feedback_id.clone(),
+                merge_into: action.merge_into.clone(),
+            };
+            let applied = apply_action_kind(bd, project, &triage, Some(action.kind))?;
+            Ok(RoutedOutcome {
+                feedback_id: applied.feedback_id,
+                route: IntakeRoute::Incubator,
+                target_id: applied.incubator_id,
+                vote: Some(applied.vote),
+            })
+        }
+    }
+}
+
+/// Hands a verified reusable procedure to `autonomous-skill-evolution` as a
+/// reference only: one route record plus the handoff label. No skill package
+/// is written and `SKILL.md` is never touched.
+fn hand_off_procedure(bd: &Path, project: &Path, feedback_id: &str) -> io::Result<()> {
+    let snapshot = load_snapshot(bd, project, feedback_id)?
+        .ok_or_else(|| invalid(format!("feedback {feedback_id} is missing")))?;
+    if snapshot.status != "open" {
+        return Err(invalid(format!("feedback {feedback_id} is not open")));
+    }
+    if snapshot.feedback.is_none() {
+        return Err(invalid(format!(
+            "feedback {feedback_id} is missing bounded fields"
+        )));
+    }
+    let ledger = inspect_ledger(bd, project, feedback_id)?;
+    if ledger
+        .routes
+        .iter()
+        .any(|route| route.target == RouteTarget::SkillEvolution)
+    {
+        // Repair labels after an interrupted handoff; never duplicate the
+        // route record.
+        json_ok(
+            bd,
+            project,
+            &["label", "add", feedback_id, SKILL_EVOLUTION_LABEL, "--json"],
+        )?;
+        json_ok(
+            bd,
+            project,
+            &["label", "remove", feedback_id, FEEDBACK_LABEL, "--json"],
+        )?;
+        return Ok(());
+    }
+    if ledger.counted() > 0
+        || !ledger.routes.is_empty()
+        || snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL)
+    {
+        return Err(invalid(format!(
+            "feedback {feedback_id} already competes as incubator demand"
+        )));
+    }
+    json_ok(
+        bd,
+        project,
+        &[
+            "comment",
+            feedback_id,
+            "--json",
+            &format_route_comment(
+                ObservationKind::SkillProcedure,
+                RouteTarget::SkillEvolution,
+                feedback_id,
+            ),
+        ],
+    )?;
+    json_ok(
+        bd,
+        project,
+        &["label", "add", feedback_id, SKILL_EVOLUTION_LABEL, "--json"],
+    )?;
+    json_ok(
+        bd,
+        project,
+        &["label", "remove", feedback_id, FEEDBACK_LABEL, "--json"],
+    )?;
+    Ok(())
+}
+
 fn apply_action(bd: &Path, project: &Path, action: &TriageAction) -> io::Result<AppliedAction> {
-    let incoming = load_feedback(bd, project, &action.feedback_id)?.ok_or_else(|| {
+    apply_action_kind(bd, project, action, None)
+}
+
+fn apply_action_kind(
+    bd: &Path,
+    project: &Path,
+    action: &TriageAction,
+    kind: Option<ObservationKind>,
+) -> io::Result<AppliedAction> {
+    let snapshot = load_snapshot(bd, project, &action.feedback_id)?.ok_or_else(|| {
         invalid(format!(
             "feedback {} is missing bounded fields",
             action.feedback_id
         ))
     })?;
+    let incoming = snapshot.feedback.ok_or_else(|| {
+        invalid(format!(
+            "feedback {} is missing bounded fields",
+            action.feedback_id
+        ))
+    })?;
+    if kind.is_some() && snapshot.status != "open" {
+        return Err(invalid(format!(
+            "feedback {} is not open",
+            action.feedback_id
+        )));
+    }
     let candidate = VoteCandidate {
         episode: incoming.episode.clone(),
         reporter: incoming.reporter.clone(),
@@ -319,6 +759,7 @@ fn apply_action(bd: &Path, project: &Path, action: &TriageAction) -> io::Result<
     };
     match action.merge_into.as_deref() {
         None => {
+            reject_skill_handoff(bd, project, &action.feedback_id, &snapshot.labels)?;
             json_ok(
                 bd,
                 project,
@@ -342,14 +783,33 @@ fn apply_action(bd: &Path, project: &Path, action: &TriageAction) -> io::Result<
                 ],
             )?;
             let vote = record_vote(bd, project, &action.feedback_id, &candidate)?;
-            Ok(AppliedAction {
+            let applied = AppliedAction {
                 feedback_id: action.feedback_id.clone(),
                 incubator_id: action.feedback_id.clone(),
                 merged: false,
                 vote,
-            })
+            };
+            if let Some(kind) = kind {
+                record_route(
+                    bd,
+                    project,
+                    &applied.incubator_id,
+                    kind,
+                    &applied.feedback_id,
+                )?;
+            }
+            Ok(applied)
         }
         Some(canonical) => {
+            require_open_incubator(bd, project, canonical)?;
+            let incoming_snapshot =
+                load_snapshot(bd, project, &action.feedback_id)?.ok_or_else(|| {
+                    invalid(format!(
+                        "feedback {} is missing bounded fields",
+                        action.feedback_id
+                    ))
+                })?;
+            reject_skill_handoff(bd, project, &action.feedback_id, &incoming_snapshot.labels)?;
             json_ok(
                 bd,
                 project,
@@ -372,14 +832,561 @@ fn apply_action(bd: &Path, project: &Path, action: &TriageAction) -> io::Result<
                 ],
             )?;
             let vote = record_vote(bd, project, canonical, &candidate)?;
-            Ok(AppliedAction {
+            let applied = AppliedAction {
                 feedback_id: action.feedback_id.clone(),
                 incubator_id: canonical.to_owned(),
                 merged: true,
                 vote,
-            })
+            };
+            if let Some(kind) = kind {
+                record_route(
+                    bd,
+                    project,
+                    &applied.incubator_id,
+                    kind,
+                    &applied.feedback_id,
+                )?;
+            }
+            Ok(applied)
         }
     }
+}
+
+fn reject_skill_handoff(
+    bd: &Path,
+    project: &Path,
+    feedback_id: &str,
+    labels: &[String],
+) -> io::Result<()> {
+    if labels.iter().any(|label| label == SKILL_EVOLUTION_LABEL) {
+        return Err(invalid(format!(
+            "feedback {feedback_id} was handed to skill-evolution; it cannot compete as incubator demand"
+        )));
+    }
+    let ledger = inspect_ledger(bd, project, feedback_id)?;
+    if ledger
+        .routes
+        .iter()
+        .any(|route| route.target == RouteTarget::SkillEvolution)
+    {
+        return Err(invalid(format!(
+            "feedback {feedback_id} was handed to skill-evolution; it cannot compete as incubator demand"
+        )));
+    }
+    Ok(())
+}
+
+fn record_route(
+    bd: &Path,
+    project: &Path,
+    item_id: &str,
+    kind: ObservationKind,
+    source_id: &str,
+) -> io::Result<()> {
+    json_ok(
+        bd,
+        project,
+        &[
+            "comment",
+            item_id,
+            "--json",
+            &format_route_comment(kind, RouteTarget::Incubator, source_id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Default consequence route for the recorded observation kinds: a kit concern
+/// goes to the kit backlog, a requirement change enters OpenSpec, anything
+/// else is a small improvement for the local backlog. `None` when the item is
+/// unclassified or merges a kit concern with project-scope observations.
+pub fn default_promotion_route(kinds: &[ObservationKind]) -> Option<PromotionRoute> {
+    if kinds.is_empty() {
+        return None;
+    }
+    if kinds.contains(&ObservationKind::KitConcern) {
+        return kinds
+            .iter()
+            .all(|kind| *kind == ObservationKind::KitConcern)
+            .then_some(PromotionRoute::KitBacklog);
+    }
+    if kinds.contains(&ObservationKind::Requirement) {
+        return Some(PromotionRoute::OpenSpecChange);
+    }
+    Some(PromotionRoute::BacklogTask)
+}
+
+fn check_promotion_route(kinds: &[ObservationKind], route: PromotionRoute) -> io::Result<()> {
+    if kinds.is_empty() {
+        return Err(invalid(
+            "incubator item is not classified; record an observation kind before promotion",
+        ));
+    }
+    if kinds.contains(&ObservationKind::SkillProcedure) {
+        return Err(invalid(
+            "a verified reusable procedure is handed to skill-evolution, not promoted",
+        ));
+    }
+    if kinds.contains(&ObservationKind::KitConcern) {
+        if kinds
+            .iter()
+            .any(|kind| *kind != ObservationKind::KitConcern)
+        {
+            return Err(invalid(
+                "kit concern is merged with project-scope observations; split the item before promotion",
+            ));
+        }
+        if route != PromotionRoute::KitBacklog {
+            return Err(invalid(
+                "kit concerns promote to the kit backlog, not to the project backlog",
+            ));
+        }
+        return Ok(());
+    }
+    if route == PromotionRoute::KitBacklog {
+        return Err(invalid(
+            "only kit instruction, skill or tool concerns promote to the kit backlog",
+        ));
+    }
+    if kinds.contains(&ObservationKind::Requirement) && route != PromotionRoute::OpenSpecChange {
+        return Err(invalid(
+            "a behavior or requirement change enters OpenSpec instead of the local backlog",
+        ));
+    }
+    Ok(())
+}
+
+/// Lists incubator items at or above the configured promotion threshold using
+/// only the board CLI. The lead decides when to run this at a safe boundary.
+pub fn promotion_candidates(
+    bd: &Path,
+    project: &Path,
+    threshold: u32,
+) -> io::Result<Vec<PromotionCandidate>> {
+    if threshold < 2 {
+        return Err(invalid("vote threshold must be at least 2"));
+    }
+    let mut candidates = Vec::new();
+    for item_id in list_incubator(bd, project)? {
+        let ledger = inspect_ledger(bd, project, &item_id)?;
+        let counted = ledger.counted();
+        if counted >= threshold as usize {
+            candidates.push(PromotionCandidate {
+                item_id,
+                counted,
+                kinds: incubator_kinds(&ledger),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .counted
+            .cmp(&left.counted)
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+    Ok(candidates)
+}
+
+/// Promotes an incubator item into the local backlog or an OpenSpec change
+/// entry. History (votes, merges, classifications) stays on the item.
+pub fn promote_item(
+    bd: &Path,
+    project: &Path,
+    item_id: &str,
+    route: PromotionRoute,
+    evidence: &PromotionEvidence,
+) -> io::Result<PromotionOutcome> {
+    if route == PromotionRoute::KitBacklog {
+        return Err(invalid(
+            "kit concerns promote through promote_kit_concern so private consuming-project data stays off the kit board",
+        ));
+    }
+    let snapshot = require_open_incubator(bd, project, item_id)?;
+    let ledger = inspect_ledger(bd, project, item_id)?;
+    if !ledger.promotions.is_empty() {
+        return Err(invalid(format!(
+            "incubator item {item_id} is already promoted"
+        )));
+    }
+    let kinds = incubator_kinds(&ledger);
+    check_promotion_route(&kinds, route)?;
+    let (counted, override_note) = validate_evidence(&ledger, evidence)?;
+    let feedback = snapshot.feedback.as_ref().ok_or_else(|| {
+        invalid(format!(
+            "incubator item {item_id} is missing bounded fields"
+        ))
+    })?;
+    let target = match route {
+        PromotionRoute::BacklogTask => None,
+        PromotionRoute::OpenSpecChange => Some(format!(
+            "openspec:{}",
+            create_openspec_entry(project, item_id, feedback)?
+        )),
+        PromotionRoute::KitBacklog => unreachable!(),
+    };
+    let comment = PromotionComment {
+        route,
+        counted,
+        threshold: match evidence {
+            PromotionEvidence::Votes { threshold } => Some(*threshold),
+            PromotionEvidence::ConsequenceOverride { .. } => None,
+        },
+        target: target.as_deref(),
+        override_note: override_note.as_ref(),
+    }
+    .format();
+    json_ok(bd, project, &["comment", item_id, "--json", &comment])?;
+    json_ok(
+        bd,
+        project,
+        &["label", "remove", item_id, INCUBATOR_LABEL, "--json"],
+    )?;
+    json_ok(
+        bd,
+        project,
+        &["label", "add", item_id, route.label(), "--json"],
+    )?;
+    Ok(PromotionOutcome {
+        item_id: item_id.to_owned(),
+        route,
+        target,
+        counted,
+        override_used: override_note.is_some(),
+    })
+}
+
+/// Promotes a kit concern to the kit's own backlog. Only the explicit
+/// kit-level summary and scope reach the kit board: no reporter, episode,
+/// project path or raw observation is copied.
+pub fn promote_kit_concern(
+    bd: &Path,
+    project: &Path,
+    kit_project: &Path,
+    item_id: &str,
+    concern: &KitConcern,
+    evidence: &PromotionEvidence,
+) -> io::Result<PromotionOutcome> {
+    require_open_incubator(bd, project, item_id)?;
+    let ledger = inspect_ledger(bd, project, item_id)?;
+    if !ledger.promotions.is_empty() {
+        return Err(invalid(format!(
+            "incubator item {item_id} is already promoted"
+        )));
+    }
+    let kinds = incubator_kinds(&ledger);
+    check_promotion_route(&kinds, PromotionRoute::KitBacklog)?;
+    let (counted, override_note) = validate_evidence(&ledger, evidence)?;
+    let concern = concern.bounded()?;
+    let kit_id = create_kit_item(bd, kit_project, &concern)?;
+    let target = format!("kit:{kit_id}");
+    let comment = PromotionComment {
+        route: PromotionRoute::KitBacklog,
+        counted,
+        threshold: match evidence {
+            PromotionEvidence::Votes { threshold } => Some(*threshold),
+            PromotionEvidence::ConsequenceOverride { .. } => None,
+        },
+        target: Some(target.as_str()),
+        override_note: override_note.as_ref(),
+    }
+    .format();
+    json_ok(bd, project, &["comment", item_id, "--json", &comment])?;
+    json_ok(
+        bd,
+        project,
+        &["label", "remove", item_id, INCUBATOR_LABEL, "--json"],
+    )?;
+    json_ok(
+        bd,
+        project,
+        &[
+            "label",
+            "add",
+            item_id,
+            PromotionRoute::KitBacklog.label(),
+            "--json",
+        ],
+    )?;
+    Ok(PromotionOutcome {
+        item_id: item_id.to_owned(),
+        route: PromotionRoute::KitBacklog,
+        target: Some(target),
+        counted,
+        override_used: override_note.is_some(),
+    })
+}
+
+/// Non-interactive incubator size. The board query is the whole check: no
+/// model call is made or needed.
+pub fn incubator_size(bd: &Path, project: &Path) -> io::Result<usize> {
+    Ok(list_incubator(bd, project)?.len())
+}
+
+/// `Some(size)` when the incubator is above its configured cap. Never makes a
+/// model call.
+pub fn incubator_over_cap(bd: &Path, project: &Path, cap: usize) -> io::Result<Option<usize>> {
+    if cap == 0 {
+        return Err(invalid("incubator size cap must be positive"));
+    }
+    let size = incubator_size(bd, project)?;
+    Ok((size > cap).then_some(size))
+}
+
+/// Lead-owned incubator sweep. A non-lead caller (no lead session active)
+/// defers without touching the board; archived items keep their labels,
+/// comments and votes so fresh evidence can restore them.
+pub fn sweep_incubator(
+    bd: &Path,
+    project: &Path,
+    caller: ReporterKind,
+    trigger: HygieneTrigger,
+    decisions: &[SweepDecision],
+) -> io::Result<SweepOutcome> {
+    if caller != ReporterKind::Lead {
+        return Ok(SweepOutcome::Deferred {
+            size: incubator_size(bd, project)?,
+        });
+    }
+    if let HygieneTrigger::IncubatorAboveCap { size, cap } = trigger {
+        if cap == 0 {
+            return Err(invalid("incubator size cap must be positive"));
+        }
+        let actual = incubator_size(bd, project)?;
+        if actual <= cap {
+            return Err(invalid(format!(
+                "incubator size {actual} is not above cap {cap}; the trigger does not match the board"
+            )));
+        }
+        if actual != size {
+            return Err(invalid(format!(
+                "reported incubator size {size} does not match the board ({actual})"
+            )));
+        }
+    }
+    let mut archived = Vec::new();
+    for decision in decisions {
+        let reason = require_field("reason", &decision.reason, MAX_REASON)?;
+        require_open_incubator(bd, project, &decision.item_id)?;
+        json_ok(
+            bd,
+            project,
+            &[
+                "comment",
+                &decision.item_id,
+                "--json",
+                &format!(
+                    "{ARCHIVE_PREFIX} trigger={}{} reason={reason}",
+                    trigger.as_str(),
+                    trigger.comment_tail()
+                ),
+            ],
+        )?;
+        json_ok(
+            bd,
+            project,
+            &[
+                "close",
+                &decision.item_id,
+                "--reason",
+                &format!("archived: {reason}"),
+                "--json",
+            ],
+        )?;
+        archived.push(decision.item_id.clone());
+    }
+    Ok(SweepOutcome::Swept { archived })
+}
+
+/// Restores an archived item on fresh evidence. The item keeps its incubator
+/// label, merge history and votes.
+pub fn restore_archived(bd: &Path, project: &Path, item_id: &str, reason: &str) -> io::Result<()> {
+    let reason = require_field("reason", reason, MAX_REASON)?;
+    let snapshot = load_snapshot(bd, project, item_id)?
+        .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
+    if !snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL) {
+        return Err(invalid(format!("item {item_id} is not an incubator item")));
+    }
+    json_ok(
+        bd,
+        project,
+        &[
+            "comment",
+            item_id,
+            "--json",
+            &format!("{RESTORE_PREFIX} reason={reason}"),
+        ],
+    )?;
+    json_ok(
+        bd,
+        project,
+        &["reopen", item_id, "--reason", &reason, "--json"],
+    )?;
+    Ok(())
+}
+
+struct PromotionComment<'a> {
+    route: PromotionRoute,
+    counted: usize,
+    threshold: Option<u32>,
+    target: Option<&'a str>,
+    override_note: Option<&'a (String, String)>,
+}
+
+impl PromotionComment<'_> {
+    fn format(&self) -> String {
+        let basis = if self.override_note.is_some() {
+            "override"
+        } else {
+            "votes"
+        };
+        let threshold = match self.threshold {
+            Some(value) => value.to_string(),
+            None => "none".to_owned(),
+        };
+        let target = self.target.unwrap_or("none");
+        let mut text = format!(
+            "{PROMOTE_PREFIX} route={} basis={basis} counted={} threshold={threshold} target={target}",
+            self.route.as_str(),
+            self.counted
+        );
+        if let Some((consequence, reason)) = self.override_note {
+            text.push_str(&format!(" consequence={consequence} reason={reason}"));
+        }
+        text
+    }
+}
+
+fn validate_evidence(
+    ledger: &VoteLedger,
+    evidence: &PromotionEvidence,
+) -> io::Result<(usize, Option<(String, String)>)> {
+    let counted = ledger.counted();
+    match evidence {
+        PromotionEvidence::Votes { threshold } => {
+            if *threshold < 2 {
+                return Err(invalid("vote threshold must be at least 2"));
+            }
+            if counted < *threshold as usize {
+                return Err(invalid(format!(
+                    "counted votes {counted} are below the configured threshold {threshold}"
+                )));
+            }
+            Ok((counted, None))
+        }
+        PromotionEvidence::ConsequenceOverride {
+            consequence,
+            reason,
+        } => {
+            let consequence = require_field("consequence", consequence, MAX_REASON)?;
+            let reason = require_field("reason", reason, MAX_REASON)?;
+            Ok((counted, Some((consequence, reason))))
+        }
+    }
+}
+
+fn incubator_kinds(ledger: &VoteLedger) -> Vec<ObservationKind> {
+    let mut kinds = Vec::new();
+    for route in &ledger.routes {
+        if route.target == RouteTarget::Incubator && !kinds.contains(&route.kind) {
+            kinds.push(route.kind);
+        }
+    }
+    kinds
+}
+
+fn list_incubator(bd: &Path, project: &Path) -> io::Result<Vec<String>> {
+    let listed = json_ok(
+        bd,
+        project,
+        &[
+            "list",
+            "--label",
+            INCUBATOR_LABEL,
+            "--status",
+            "open",
+            "--json",
+            "--brief",
+        ],
+    )?;
+    issue_ids(&listed)
+}
+
+fn require_open_incubator(bd: &Path, project: &Path, item_id: &str) -> io::Result<IssueSnapshot> {
+    let snapshot = load_snapshot(bd, project, item_id)?
+        .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
+    if snapshot.status != "open" {
+        return Err(invalid(format!("item {item_id} is not open")));
+    }
+    if !snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL) {
+        return Err(invalid(format!("item {item_id} is not an incubator item")));
+    }
+    Ok(snapshot)
+}
+
+fn create_openspec_entry(
+    project: &Path,
+    item_id: &str,
+    feedback: &BoundedFeedback,
+) -> io::Result<String> {
+    let name = format!("feedback-{}", bounded_slug(item_id));
+    if name == "feedback-" {
+        return Err(invalid(
+            "incubator item id has no usable OpenSpec change name",
+        ));
+    }
+    let directory = project.join("openspec/changes").join(&name);
+    if directory.exists() {
+        return Err(invalid(format!(
+            "OpenSpec entry {name} already exists; preserving it"
+        )));
+    }
+    fs::create_dir_all(&directory)?;
+    let proposal = format!(
+        "# Feedback promotion: {observation}\n\nPromoted from incubator item `{item_id}` as a behavior or requirement change.\nThis draft entry opens the OpenSpec workflow; complete the planning artifacts before implementation.\n\n## Why\n\n{observation}\n\n## What Changes\n\n- {scope}\n",
+        observation = feedback.observation,
+        scope = feedback.scope,
+        item_id = item_id
+    );
+    fs::write(directory.join("proposal.md"), proposal)?;
+    Ok(name)
+}
+
+/// Creates the sanitized kit-backlog task from explicit kit-level wording.
+fn create_kit_item(bd: &Path, kit_project: &Path, concern: &KitConcern) -> io::Result<String> {
+    let title = format!("Kit feedback: {}", bounded_title(&concern.summary));
+    let description = format!(
+        "summary: {}\nscope: {}\nkind: kit-concern\n",
+        concern.summary, concern.scope
+    );
+    let created = json_ok_actor(
+        bd,
+        kit_project,
+        KIT_ROUTING_ACTOR,
+        &[
+            "create",
+            &title,
+            "--type",
+            "task",
+            "--labels",
+            KIT_FEEDBACK_LABEL,
+            "--description",
+            &description,
+            "--json",
+        ],
+    )?;
+    string_field(&created, "id")
+}
+
+fn bounded_slug(value: &str) -> String {
+    let mut slug = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_owned()
 }
 
 fn record_vote(
@@ -404,12 +1411,48 @@ fn record_vote(
 }
 
 fn load_feedback(bd: &Path, project: &Path, id: &str) -> io::Result<Option<BoundedFeedback>> {
+    Ok(load_snapshot(bd, project, id)?.and_then(|snapshot| snapshot.feedback))
+}
+
+struct IssueSnapshot {
+    status: String,
+    labels: Vec<String>,
+    feedback: Option<BoundedFeedback>,
+}
+
+fn load_snapshot(bd: &Path, project: &Path, id: &str) -> io::Result<Option<IssueSnapshot>> {
     let shown = json_ok(bd, project, &["show", id, "--json"])?;
     let issue = issue_object(&shown, id)?;
-    let description = issue_description(issue);
-    match parse_description(description) {
-        Ok(feedback) => Ok(Some(feedback)),
-        Err(_) => Ok(None),
+    let feedback = parse_description(issue_description(issue)).ok();
+    Ok(Some(IssueSnapshot {
+        status: issue_status(issue),
+        labels: issue_labels(issue),
+        feedback,
+    }))
+}
+
+fn issue_status(issue: &Value) -> String {
+    issue
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn issue_labels(issue: &Value) -> Vec<String> {
+    match issue.get("labels") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(text)) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -504,6 +1547,63 @@ fn parse_merge_comment(comment: &str) -> Option<MergeRecord> {
     Some(MergeRecord {
         from: from?,
         into: into?,
+    })
+}
+
+fn parse_route_comment(comment: &str) -> Option<RouteRecord> {
+    let rest = comment.strip_prefix(ROUTE_PREFIX)?.trim();
+    let mut kind = None;
+    let mut target = None;
+    let mut item = None;
+    for part in rest.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "kind" => kind = ObservationKind::parse(value).ok(),
+            "target" => target = RouteTarget::parse(value),
+            "item" => item = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Some(RouteRecord {
+        kind: kind?,
+        target: target?,
+        item: item?,
+    })
+}
+
+fn parse_promotion_comment(comment: &str) -> Option<PromotionRecord> {
+    let rest = comment.strip_prefix(PROMOTE_PREFIX)?.trim();
+    // Free-text override fields follow the structured tokens and may contain
+    // spaces, so only the head before them is parsed.
+    let head = rest.split(" consequence=").next()?;
+    let mut route = None;
+    let mut basis = None;
+    let mut counted = None;
+    let mut target = None;
+    for part in head.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "route" => route = PromotionRoute::parse(value),
+            "basis" => basis = Some(value.to_owned()),
+            "counted" => counted = value.parse::<usize>().ok(),
+            "target" => {
+                target = match value {
+                    "none" => None,
+                    _ => Some(value.to_owned()),
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(PromotionRecord {
+        route: route?,
+        counted: counted?,
+        override_used: basis? == "override",
+        target,
     })
 }
 
@@ -783,9 +1883,23 @@ mod tests {
         let lead = include_str!("../../../.agents/skills/team-lead/SKILL.md");
         assert!(board.contains("kind: lead|executor|diagnostic"));
         assert!(board.contains("Do not use `bd find-duplicates`"));
+        assert!(board.contains("feedback-route v1"));
+        assert!(board.contains("feedback-promote v1"));
+        assert!(board.contains("feedback-archive v1"));
+        assert!(board.contains("feedback-restore v1"));
+        assert!(board.contains("vote_threshold"));
+        assert!(board.contains("incubator_size_cap"));
+        assert!(board.contains("skill-evolution"));
+        assert!(board.contains("stage-or-epic-closed"));
+        assert!(board.contains("never writes a skill package"));
+        assert!(board.contains("Size checks are board queries"));
         assert!(lead.contains("not real-time chat"));
         assert!(lead.contains("safe boundary"));
         assert!(lead.contains("no model calls"));
+        assert!(lead.contains("vote_threshold"));
+        assert!(lead.contains("skill-evolution"));
+        assert!(lead.contains("incubator_size_cap"));
+        assert!(lead.contains("consequence override"));
     }
 
     fn bd_executable() -> Option<PathBuf> {
@@ -1096,5 +2210,824 @@ mod tests {
         let report = apply_triage(&bd, &project, &actions, 2).unwrap();
         assert_eq!(report.applied.len(), 2);
         assert_eq!(report.deferred, 1);
+    }
+
+    fn record(
+        bd: &Path,
+        project: &Path,
+        observation: &str,
+        reporter: &str,
+        episode: &str,
+        kind: ReporterKind,
+        parent: &str,
+    ) -> String {
+        record_feedback(
+            bd,
+            project,
+            &BoundedFeedback::try_from_draft(draft(observation, reporter, episode, kind, parent))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn skills_snapshot(project: &Path) -> Vec<(String, Vec<u8>)> {
+        let root = project.join(".agents/skills");
+        let mut entries = Vec::new();
+        if let Ok(directories) = fs::read_dir(&root) {
+            for directory in directories.flatten() {
+                let path = directory.path().join("SKILL.md");
+                if let Ok(bytes) = fs::read(&path) {
+                    entries.push((path.to_string_lossy().into_owned(), bytes));
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    fn seed_skill_package(project: &Path) -> Vec<(String, Vec<u8>)> {
+        let directory = project.join(".agents/skills/demo");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("SKILL.md"), "sentinel skill body\n").unwrap();
+        skills_snapshot(project)
+    }
+
+    #[test]
+    fn observation_kinds_route_and_promote_by_consequence() {
+        assert_eq!(
+            ObservationKind::SkillProcedure.intake(),
+            IntakeRoute::SkillEvolution
+        );
+        for kind in [
+            ObservationKind::Process,
+            ObservationKind::Orchestration,
+            ObservationKind::Requirement,
+            ObservationKind::Tool,
+            ObservationKind::Unclear,
+            ObservationKind::Material,
+            ObservationKind::KitConcern,
+        ] {
+            assert_eq!(kind.intake(), IntakeRoute::Incubator);
+        }
+
+        assert_eq!(default_promotion_route(&[]), None);
+        assert_eq!(
+            default_promotion_route(&[ObservationKind::Process]),
+            Some(PromotionRoute::BacklogTask)
+        );
+        assert_eq!(
+            default_promotion_route(&[ObservationKind::Requirement]),
+            Some(PromotionRoute::OpenSpecChange)
+        );
+        assert_eq!(
+            default_promotion_route(&[ObservationKind::KitConcern]),
+            Some(PromotionRoute::KitBacklog)
+        );
+        assert_eq!(
+            default_promotion_route(&[ObservationKind::KitConcern, ObservationKind::Process]),
+            None
+        );
+
+        check_promotion_route(&[ObservationKind::KitConcern], PromotionRoute::KitBacklog).unwrap();
+        let error =
+            check_promotion_route(&[ObservationKind::KitConcern], PromotionRoute::BacklogTask)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("kit concerns promote to the kit backlog")
+        );
+        let error =
+            check_promotion_route(&[ObservationKind::Requirement], PromotionRoute::BacklogTask)
+                .unwrap_err();
+        assert!(error.to_string().contains("enters OpenSpec"));
+        let error = check_promotion_route(
+            &[ObservationKind::SkillProcedure],
+            PromotionRoute::BacklogTask,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("handed to skill-evolution"));
+        let error = check_promotion_route(
+            &[ObservationKind::KitConcern, ObservationKind::Process],
+            PromotionRoute::KitBacklog,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("split the item"));
+        let error = check_promotion_route(&[], PromotionRoute::BacklogTask).unwrap_err();
+        assert!(error.to_string().contains("not classified"));
+    }
+
+    #[test]
+    fn route_and_promotion_records_round_trip_and_evidence_is_validated() {
+        let route = format_route_comment(
+            ObservationKind::KitConcern,
+            RouteTarget::Incubator,
+            "bdct-1.1.2",
+        );
+        let ledger = parse_ledger(&[route]);
+        assert_eq!(ledger.routes[0].kind, ObservationKind::KitConcern);
+        assert_eq!(ledger.routes[0].target, RouteTarget::Incubator);
+        assert_eq!(ledger.routes[0].item, "bdct-1.1.2");
+
+        let comment = PromotionComment {
+            route: PromotionRoute::BacklogTask,
+            counted: 3,
+            threshold: Some(3),
+            target: None,
+            override_note: None,
+        }
+        .format();
+        assert!(comment.contains("basis=votes"));
+        let ledger = parse_ledger(&[comment]);
+        assert_eq!(
+            ledger.promotions[0],
+            PromotionRecord {
+                route: PromotionRoute::BacklogTask,
+                counted: 3,
+                override_used: false,
+                target: None,
+            }
+        );
+
+        let note = (
+            "losing votes loses demand".to_owned(),
+            "correctness evidence".to_owned(),
+        );
+        let comment = PromotionComment {
+            route: PromotionRoute::KitBacklog,
+            counted: 1,
+            threshold: None,
+            target: Some("kit:prb-1"),
+            override_note: Some(&note),
+        }
+        .format();
+        assert!(
+            comment.contains("consequence=losing votes loses demand reason=correctness evidence")
+        );
+        let ledger = parse_ledger(&[comment]);
+        assert!(ledger.promotions[0].override_used);
+        assert_eq!(ledger.promotions[0].target.as_deref(), Some("kit:prb-1"));
+
+        let ledger = parse_ledger(&[]);
+        let error =
+            validate_evidence(&ledger, &PromotionEvidence::Votes { threshold: 2 }).unwrap_err();
+        assert!(error.to_string().contains("below the configured threshold"));
+        let error =
+            validate_evidence(&ledger, &PromotionEvidence::Votes { threshold: 1 }).unwrap_err();
+        assert!(error.to_string().contains("at least 2"));
+        let error = validate_evidence(
+            &ledger,
+            &PromotionEvidence::ConsequenceOverride {
+                consequence: " ".into(),
+                reason: "why".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("consequence is required"));
+    }
+
+    #[test]
+    fn kit_promotion_defaults_match_orchestration_config() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = crate::orchestration_config::load(&root).unwrap();
+        assert_eq!(config.vote_threshold, DEFAULT_VOTE_THRESHOLD);
+        assert_eq!(config.vote_threshold, 3);
+        assert_eq!(
+            config.incubator_size_cap as usize,
+            DEFAULT_INCUBATOR_SIZE_CAP
+        );
+        let text = include_str!("../../../global/orchestration.toml");
+        assert!(text.contains("vote_threshold = 3"));
+        assert!(text.contains("incubator_size_cap = 32"));
+        assert!(text.contains("more than two distinct votes"));
+    }
+
+    #[test]
+    fn verified_procedure_is_handed_off_without_votes_or_package_writes() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let before = seed_skill_package(&project);
+
+        let procedure = record(
+            &bd,
+            &project,
+            "one investigated failure yields a reusable diagnostic method",
+            "exec-a",
+            "e1",
+            ReporterKind::Executor,
+            &parent,
+        );
+        let report = apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: procedure.clone(),
+                kind: ObservationKind::SkillProcedure,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(report.applied[0].route, IntakeRoute::SkillEvolution);
+        assert!(report.applied[0].vote.is_none());
+        assert_eq!(report.applied[0].target_id, procedure);
+
+        let snapshot = load_snapshot(&bd, &project, &procedure).unwrap().unwrap();
+        assert!(
+            snapshot
+                .labels
+                .iter()
+                .any(|label| label == SKILL_EVOLUTION_LABEL)
+        );
+        assert!(!snapshot.labels.iter().any(|label| label == FEEDBACK_LABEL));
+        assert!(!snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+        let ledger = inspect_ledger(&bd, &project, &procedure).unwrap();
+        assert_eq!(ledger.counted(), 0);
+        assert_eq!(ledger.routes.len(), 1);
+        assert_eq!(ledger.routes[0].target, RouteTarget::SkillEvolution);
+        assert!(
+            !list_feedback(&bd, &project)
+                .unwrap()
+                .iter()
+                .any(|row| row.id == procedure)
+        );
+        assert!(!list_incubator(&bd, &project).unwrap().contains(&procedure));
+
+        // The same observation is never both handed off and incubator demand.
+        let error = apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: procedure.clone(),
+                kind: ObservationKind::Process,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("handed to skill-evolution"));
+        assert_eq!(
+            inspect_ledger(&bd, &project, &procedure).unwrap().counted(),
+            0
+        );
+
+        // And an incubating observation is never handed off afterwards.
+        let friction = record(
+            &bd,
+            &project,
+            "dispatch waits after tools",
+            "exec-b",
+            "e2",
+            ReporterKind::Executor,
+            &parent,
+        );
+        let report = apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: friction.clone(),
+                kind: ObservationKind::Orchestration,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(report.applied[0].route, IntakeRoute::Incubator);
+        assert_eq!(
+            report.applied[0].vote.as_ref().unwrap().reason,
+            VoteReason::Counted
+        );
+        let error = apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: friction.clone(),
+                kind: ObservationKind::SkillProcedure,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("already competes as incubator demand")
+        );
+        assert_eq!(
+            inspect_ledger(&bd, &project, &friction).unwrap().counted(),
+            1
+        );
+
+        assert_eq!(skills_snapshot(&project), before);
+    }
+
+    #[test]
+    fn vote_threshold_promotes_to_backlog_with_history() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let first = record(
+            &bd,
+            &project,
+            "dispatch waits after tools",
+            "exec-a",
+            "e1",
+            ReporterKind::Executor,
+            &parent,
+        );
+        let second = record(
+            &bd,
+            &project,
+            "dispatch waits after tools",
+            "exec-b",
+            "e2",
+            ReporterKind::Executor,
+            &parent,
+        );
+        let third = record(
+            &bd,
+            &project,
+            "dispatch waits after tools",
+            "lead-1",
+            "e3",
+            ReporterKind::Lead,
+            &parent,
+        );
+        let report = apply_routed_triage(
+            &bd,
+            &project,
+            &[
+                RoutedAction {
+                    feedback_id: first.clone(),
+                    kind: ObservationKind::Orchestration,
+                    merge_into: None,
+                },
+                RoutedAction {
+                    feedback_id: second.clone(),
+                    kind: ObservationKind::Orchestration,
+                    merge_into: Some(first.clone()),
+                },
+                RoutedAction {
+                    feedback_id: third.clone(),
+                    kind: ObservationKind::Process,
+                    merge_into: Some(first.clone()),
+                },
+            ],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(report.applied.len(), 3);
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let threshold = crate::orchestration_config::load(&root)
+            .unwrap()
+            .vote_threshold;
+        let candidates = promotion_candidates(&bd, &project, threshold).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].item_id, first);
+        assert_eq!(candidates[0].counted, 3);
+        assert!(
+            candidates[0]
+                .kinds
+                .contains(&ObservationKind::Orchestration)
+        );
+        assert!(candidates[0].kinds.contains(&ObservationKind::Process));
+        assert!(
+            promotion_candidates(&bd, &project, threshold + 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        let error = promote_item(
+            &bd,
+            &project,
+            &first,
+            PromotionRoute::BacklogTask,
+            &PromotionEvidence::Votes {
+                threshold: threshold + 1,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("below the configured threshold"));
+
+        let outcome = promote_item(
+            &bd,
+            &project,
+            &first,
+            PromotionRoute::BacklogTask,
+            &PromotionEvidence::Votes { threshold },
+        )
+        .unwrap();
+        assert_eq!(outcome.counted, 3);
+        assert!(!outcome.override_used);
+        assert_eq!(outcome.target, None);
+
+        let snapshot = load_snapshot(&bd, &project, &first).unwrap().unwrap();
+        assert!(snapshot.labels.iter().any(|label| label == BACKLOG_LABEL));
+        assert!(!snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+        let ledger = inspect_ledger(&bd, &project, &first).unwrap();
+        assert_eq!(ledger.counted(), 3);
+        assert_eq!(ledger.merges.len(), 2);
+        assert_eq!(ledger.routes.len(), 3);
+        assert_eq!(ledger.promotions.len(), 1);
+        assert_eq!(ledger.promotions[0].route, PromotionRoute::BacklogTask);
+        assert_eq!(ledger.promotions[0].counted, 3);
+        assert!(list_incubator(&bd, &project).unwrap().is_empty());
+        let comments = list_comments(&bd, &project, &first).unwrap();
+        assert!(comments.iter().any(|comment| {
+            comment.contains("route=backlog-task basis=votes counted=3 threshold=3 target=none")
+        }));
+
+        let error = promote_item(
+            &bd,
+            &project,
+            &first,
+            PromotionRoute::BacklogTask,
+            &PromotionEvidence::Votes { threshold },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not an incubator item"));
+    }
+
+    #[test]
+    fn requirement_change_enters_openspec_with_recorded_override() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let item = record(
+            &bd,
+            &project,
+            "backlog must record the promotion rationale",
+            "lead-1",
+            "e1",
+            ReporterKind::Lead,
+            &parent,
+        );
+        apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: item.clone(),
+                kind: ObservationKind::Requirement,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+
+        let error = promote_item(
+            &bd,
+            &project,
+            &item,
+            PromotionRoute::BacklogTask,
+            &PromotionEvidence::Votes { threshold: 2 },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("enters OpenSpec"));
+
+        let evidence = PromotionEvidence::ConsequenceOverride {
+            consequence: "accepted behavior would silently change".to_owned(),
+            reason: "material correctness evidence".to_owned(),
+        };
+        let outcome = promote_item(
+            &bd,
+            &project,
+            &item,
+            PromotionRoute::OpenSpecChange,
+            &evidence,
+        )
+        .unwrap();
+        assert!(outcome.override_used);
+        assert_eq!(outcome.counted, 1);
+
+        let proposal = project
+            .join("openspec/changes")
+            .join(format!("feedback-{}", bounded_slug(&item)))
+            .join("proposal.md");
+        let text = fs::read_to_string(&proposal).unwrap();
+        assert!(text.contains(&item));
+        assert!(text.contains("backlog must record the promotion rationale"));
+
+        let snapshot = load_snapshot(&bd, &project, &item).unwrap().unwrap();
+        assert!(snapshot.labels.iter().any(|label| label == OPENSPEC_LABEL));
+        assert!(!snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+        let ledger = inspect_ledger(&bd, &project, &item).unwrap();
+        assert_eq!(ledger.counted(), 1);
+        assert_eq!(ledger.promotions.len(), 1);
+        assert!(ledger.promotions[0].override_used);
+        assert!(
+            ledger.promotions[0]
+                .target
+                .as_deref()
+                .unwrap()
+                .starts_with("openspec:feedback-")
+        );
+        let comments = list_comments(&bd, &project, &item).unwrap();
+        assert!(comments.iter().any(|comment| {
+            comment.contains("route=openspec-change basis=override counted=1 threshold=none")
+                && comment.contains("consequence=accepted behavior would silently change")
+                && comment.contains("reason=material correctness evidence")
+        }));
+    }
+
+    #[test]
+    fn kit_concern_promotes_without_private_data_or_package_writes() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let (_kit_root, kit_project, _kit_parent) = isolated_feature(&bd);
+        let before = seed_skill_package(&project);
+
+        let observation = "kit board-workflow skill confuses our internal dispatch naming";
+        let first = record(
+            &bd,
+            &project,
+            observation,
+            "exec-k",
+            "e7",
+            ReporterKind::Executor,
+            &parent,
+        );
+        let second = record(
+            &bd,
+            &project,
+            observation,
+            "exec-l",
+            "e8",
+            ReporterKind::Executor,
+            &parent,
+        );
+        let third = record(
+            &bd,
+            &project,
+            observation,
+            "lead-2",
+            "e9",
+            ReporterKind::Lead,
+            &parent,
+        );
+        apply_routed_triage(
+            &bd,
+            &project,
+            &[
+                RoutedAction {
+                    feedback_id: first.clone(),
+                    kind: ObservationKind::KitConcern,
+                    merge_into: None,
+                },
+                RoutedAction {
+                    feedback_id: second.clone(),
+                    kind: ObservationKind::KitConcern,
+                    merge_into: Some(first.clone()),
+                },
+                RoutedAction {
+                    feedback_id: third.clone(),
+                    kind: ObservationKind::KitConcern,
+                    merge_into: Some(first.clone()),
+                },
+            ],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let threshold = crate::orchestration_config::load(&root)
+            .unwrap()
+            .vote_threshold;
+        let error = promote_item(
+            &bd,
+            &project,
+            &first,
+            PromotionRoute::KitBacklog,
+            &PromotionEvidence::Votes { threshold },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("promote_kit_concern"));
+
+        let concern = KitConcern {
+            summary: "board-workflow skill: document promotion and hygiene labels".to_owned(),
+            scope: "kit skill: board-workflow".to_owned(),
+        };
+        let outcome = promote_kit_concern(
+            &bd,
+            &project,
+            &kit_project,
+            &first,
+            &concern,
+            &PromotionEvidence::Votes { threshold },
+        )
+        .unwrap();
+        let kit_id = outcome
+            .target
+            .as_deref()
+            .unwrap()
+            .strip_prefix("kit:")
+            .unwrap()
+            .to_owned();
+        assert_eq!(outcome.counted, 3);
+
+        let shown = json_ok(&bd, &kit_project, &["show", &kit_id, "--json"]).unwrap();
+        let kit_item = issue_object(&shown, &kit_id).unwrap();
+        let title = kit_item["title"].as_str().unwrap();
+        let description = issue_description(kit_item);
+        assert!(title.starts_with("Kit feedback: "));
+        assert!(
+            description.contains("board-workflow skill: document promotion and hygiene labels")
+        );
+        assert!(description.contains("scope: kit skill: board-workflow"));
+        for private in [observation, "exec-k", "e7", &parent] {
+            assert!(!description.contains(private), "kit item leaked {private}");
+        }
+        assert!(
+            issue_labels(kit_item)
+                .iter()
+                .any(|label| label == KIT_FEEDBACK_LABEL)
+        );
+
+        let snapshot = load_snapshot(&bd, &project, &first).unwrap().unwrap();
+        assert!(
+            snapshot
+                .labels
+                .iter()
+                .any(|label| label == KIT_FORWARDED_LABEL)
+        );
+        assert!(!snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+        let comments = list_comments(&bd, &project, &first).unwrap();
+        assert!(comments.iter().any(|comment| {
+            comment.contains("route=kit-backlog basis=votes counted=3")
+                && comment.contains(&format!("target=kit:{kit_id}"))
+        }));
+        assert_eq!(skills_snapshot(&project), before);
+    }
+
+    #[test]
+    fn lead_sweep_is_deterministic_restorable_and_defers_without_lead() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let mut items = Vec::new();
+        for (index, kind) in [
+            ObservationKind::Process,
+            ObservationKind::Tool,
+            ObservationKind::Unclear,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = record(
+                &bd,
+                &project,
+                &format!("stale friction {index}"),
+                &format!("exec-{index}"),
+                &format!("e{index}"),
+                ReporterKind::Executor,
+                &parent,
+            );
+            apply_routed_triage(
+                &bd,
+                &project,
+                &[RoutedAction {
+                    feedback_id: id.clone(),
+                    kind,
+                    merge_into: None,
+                }],
+                DEFAULT_FEEDBACK_BATCH_LIMIT,
+            )
+            .unwrap();
+            items.push(id);
+        }
+
+        assert_eq!(incubator_size(&bd, &project).unwrap(), 3);
+        assert_eq!(incubator_over_cap(&bd, &project, 3).unwrap(), None);
+        assert_eq!(incubator_over_cap(&bd, &project, 2).unwrap(), Some(3));
+
+        // No lead session: the sweep defers without touching the board.
+        let decision = SweepDecision {
+            item_id: items[0].clone(),
+            reason: "superseded by a newer observation".to_owned(),
+        };
+        let outcome = sweep_incubator(
+            &bd,
+            &project,
+            ReporterKind::Executor,
+            HygieneTrigger::IncubatorAboveCap { size: 3, cap: 2 },
+            std::slice::from_ref(&decision),
+        )
+        .unwrap();
+        assert_eq!(outcome, SweepOutcome::Deferred { size: 3 });
+        assert_eq!(incubator_size(&bd, &project).unwrap(), 3);
+        assert_eq!(
+            load_snapshot(&bd, &project, &items[0])
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
+
+        // The lead sweeps on the trigger with visible reasons and history.
+        let outcome = sweep_incubator(
+            &bd,
+            &project,
+            ReporterKind::Lead,
+            HygieneTrigger::IncubatorAboveCap { size: 3, cap: 2 },
+            std::slice::from_ref(&decision),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SweepOutcome::Swept {
+                archived: items[..1].to_vec()
+            }
+        );
+        assert_eq!(incubator_size(&bd, &project).unwrap(), 2);
+        let snapshot = load_snapshot(&bd, &project, &items[0]).unwrap().unwrap();
+        assert_eq!(snapshot.status, "closed");
+        assert!(snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+        let comments = list_comments(&bd, &project, &items[0]).unwrap();
+        assert!(comments.iter().any(|comment| {
+            comment.contains("feedback-archive v1 trigger=incubator-above-cap size=3 cap=2")
+                && comment.contains("reason=superseded by a newer observation")
+        }));
+        assert_eq!(
+            inspect_ledger(&bd, &project, &items[0]).unwrap().counted(),
+            1
+        );
+
+        // A trigger that no longer matches the board is refused.
+        let error = sweep_incubator(
+            &bd,
+            &project,
+            ReporterKind::Lead,
+            HygieneTrigger::IncubatorAboveCap { size: 3, cap: 2 },
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match the board"));
+
+        // Fresh evidence restores the item with its history visible.
+        restore_archived(
+            &bd,
+            &project,
+            &items[0],
+            "fresh report of the same friction",
+        )
+        .unwrap();
+        assert_eq!(incubator_size(&bd, &project).unwrap(), 3);
+        let snapshot = load_snapshot(&bd, &project, &items[0]).unwrap().unwrap();
+        assert_eq!(snapshot.status, "open");
+        assert_eq!(
+            inspect_ledger(&bd, &project, &items[0]).unwrap().counted(),
+            1
+        );
+
+        // The stage/epic-closure trigger records itself.
+        let outcome = sweep_incubator(
+            &bd,
+            &project,
+            ReporterKind::Lead,
+            HygieneTrigger::StageOrEpicClosed,
+            &[SweepDecision {
+                item_id: items[1].clone(),
+                reason: "stale after stage acceptance".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SweepOutcome::Swept {
+                archived: vec![items[1].clone()]
+            }
+        );
+        let comments = list_comments(&bd, &project, &items[1]).unwrap();
+        assert!(comments.iter().any(|comment| {
+            comment.contains("feedback-archive v1 trigger=stage-or-epic-closed")
+        }));
+
+        // Non-incubator items are never swept.
+        let plain = json_ok(
+            &bd,
+            &project,
+            &["create", "Plain task", "--type", "task", "--json"],
+        )
+        .unwrap();
+        let plain_id = string_field(&plain, "id").unwrap();
+        let error = sweep_incubator(
+            &bd,
+            &project,
+            ReporterKind::Lead,
+            HygieneTrigger::StageOrEpicClosed,
+            &[SweepDecision {
+                item_id: plain_id,
+                reason: "not incubator".to_owned(),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not an incubator item"));
     }
 }

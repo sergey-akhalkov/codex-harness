@@ -76,6 +76,72 @@ Cap a batch at `feedback_batch_limit` from kit `global/orchestration.toml`.
 Do not use `bd find-duplicates`; it may call a model. Similarity is lead
 judgment, then these mechanics.
 
+## Observation routing
+
+Classify each observation at triage (lead judgment; no model call) so it is
+never both an incubator vote and a skill candidate.
+
+| Observation | Intake route |
+| --- | --- |
+| verified reusable procedure in owned skill scope | hand to `autonomous-skill-evolution` as a reference |
+| process, orchestration, requirement, tool, unclear or material | incubator item |
+| kit instruction, skill or tool demand | incubator item, then the kit backlog at promotion |
+
+Kinds: `skill-procedure`, `process`, `orchestration`, `requirement`, `tool`,
+`unclear`, `material`, `kit-concern`.
+
+| Step | Command |
+| --- | --- |
+| Admit with kind | `bd label add <id> incubator --json`; `bd label remove <id> feedback --json`; `bd comment <id> --json "feedback-route v1 kind=<kind> target=incubator item=<id>"` |
+| Hand off a procedure | `bd label add <id> skill-evolution --json`; `bd label remove <id> feedback --json`; `bd comment <id> --json "feedback-route v1 kind=skill-procedure target=skill-evolution item=<id>"` |
+
+The handoff is a reference only: it writes no skill package and leaves
+`SKILL.md` untouched. An item handed off is never voted into the incubator, and
+an incubating item is never handed off.
+
+## Promotion
+
+Read `vote_threshold` and `incubator_size_cap` from kit
+`global/orchestration.toml` (default `vote_threshold = 3`: promote after more
+than two counted votes). Counting uses `bd comments` only.
+
+| Step | Command |
+| --- | --- |
+| Eligible items | `bd list --label incubator --status open --json --brief`, then count `feedback-vote v1 ... counted=true` comments |
+| Promote to backlog | `bd label remove <id> incubator --json`; `bd label add <id> backlog --json`; `bd comment <id> --json "feedback-promote v1 route=backlog-task basis=votes counted=<n> threshold=<t> target=none"` |
+| Behavior or requirement change | create `openspec/changes/feedback-<id>/proposal.md`, then promote with `route=openspec-change target=openspec:feedback-<id>` |
+| Kit concern | create a sanitized kit task (`bd -C <kit> create "Kit feedback: <summary>" --type task --labels kit-feedback --json`), then promote with `route=kit-backlog target=kit:<kit-id>` |
+
+Route by consequence, never by habit: small improvements become backlog tasks,
+changes to accepted behavior or requirements enter OpenSpec instead of being
+implemented directly from the backlog, and items about kit instructions, skills
+or tools go to the kit's own board with kit-level wording only - no reporter,
+episode, project path or raw observation. Promotion keeps every vote, merge and
+route comment as history and confers eligibility for planning, not
+implementation authority; it never writes a skill package.
+
+Lead consequence override: with material correctness, integrity or safety
+evidence, promote without votes and record
+`basis=override counted=<n> threshold=none consequence=<...> reason=<...>` in
+the promotion comment.
+
+## Incubator hygiene (lead-owned)
+
+Two deterministic triggers, no background scheduler: the lead sweeps when it
+closes a stage or epic during acceptance, and after a triage batch finds the
+incubator above `incubator_size_cap`. Size checks are board queries; no model
+call is made.
+
+| Step | Command |
+| --- | --- |
+| Size | `bd list --label incubator --status open --json --brief` |
+| Archive stale | `bd comment <id> --json "feedback-archive v1 trigger=<trigger> reason=<reason>"`; `bd close <id> --reason "archived: <reason>" --json` |
+| Restore | `bd comment <id> --json "feedback-restore v1 reason=<fresh evidence>"`; `bd reopen <id> --reason "<fresh evidence>" --json` |
+
+Triggers: `stage-or-epic-closed` and `incubator-above-cap size=<n> cap=<n>`.
+Archiving keeps labels, merge history and votes, so reopening restores the item
+on fresh evidence. With no lead session active the sweep waits unchanged.
+
 ## Pipeline
 
 All agent work goes through this board. Do not use process polling or chat as

@@ -497,6 +497,15 @@ developers pulling instead of rebuilding from scratch. Inventory authority is
 records, never in tracked files. Implementation task for the native lifecycle:
 board `codex-harness-pvr.5`.
 
+**2026-09-19, confirmed:** the feedback loop's kit-level backlog is the kit
+checkout's own `bd` board, addressed explicitly by the lead session
+(`bd -C <kit>`). Promoting a kit concern copies only kit-level summary and
+scope to that board; reporter, episode, project path and the raw observation
+stay in the consuming project's record, and the kit board's runtime state stays
+host-local and out of Git. The consuming item keeps every vote, merge and route
+comment as history, so promotion never deletes evidence. This resolves the
+design.md open question for OFAP task 3.2.
+
 ## Recording further decisions
 
 - Record durable goals, constraints, preferences and confirmed decisions here

@@ -152,7 +152,10 @@ replace the skill-evaluation accept/reject/inconclusive contract.
 
 ## Open Questions
 
-- Where exactly the kit-level backlog lives (host-private store versus the
-  kit repository) while preserving the publication boundary.
+- **Resolved 2026-09-19 (task 3.2):** the kit-level backlog is the kit
+  checkout's own `bd` board, reached explicitly by the lead session
+  (`bd -C <kit>`). The board's runtime state stays host-local and out of Git;
+  only kit-level summary and scope cross over (no reporter, episode, project
+  path or raw observation), so the publication boundary holds.
 - How dashboard snapshots reach the lead: manual paste on request versus a
   bounded browser read; decision needed before pacing implementation.
