@@ -23,7 +23,15 @@ const STARTUP: Duration = Duration::from_secs(20);
 /// Runtime identity of the dispatching session must not leak into the
 /// executor: an inherited session/thread id makes the child attach to the
 /// lead's conversation instead of the assignment.
-const INHERITED_SESSION_ENV: [&str; 3] = ["CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CI"];
+const INHERITED_SESSION_ENV: [&str; 5] = [
+    "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_CI",
+    // The lead's tooling may force monochrome TUI output; executors render
+    // in their own terminal host and must not inherit that decision.
+    "NO_COLOR",
+    "TERM",
+];
 
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_ARGV_LOG") {
@@ -310,6 +318,8 @@ fn apply_executor_env(spec: &mut CommandSpec, codex_home: &Path) {
     for name in INHERITED_SESSION_ENV {
         spec.env.insert(name.into(), None);
     }
+    spec.env
+        .insert("COLORTERM".into(), Some("truecolor".into()));
 }
 
 /// Codex blocks an untrusted project directory behind an interactive prompt
@@ -374,6 +384,7 @@ fn dispatch_terminal_tab(
         for name in INHERITED_SESSION_ENV {
             cmd.env_remove(name);
         }
+        cmd.env("COLORTERM", "truecolor");
         let status = cmd.status()?;
         if !status.success() {
             return Err(invalid("windows terminal tab spawn failed"));
