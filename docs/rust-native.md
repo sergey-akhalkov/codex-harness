@@ -22,7 +22,7 @@ The retired script interface and its native equivalent. Selectors, preview
 
 | Retiring script interface | Native equivalent |
 | --- | --- |
-| `install.ps1 -Mode Install` / `-Mode Update` | `codex-harness install` / `update`, with `--core-only`, `--code-tools-only`, `--subscriptions-only` or `--token-workflow-only` |
+| `install.ps1 -Mode Install` / `-Mode Update` | `codex-harness install` / `update`, with `--core-only`, `--code-tools-only`, `--subscriptions-only`, `--token-workflow-only` or `--board-only` |
 | `install.ps1 -Mode Check` (`-Diagnose`) / `codex-harness-check.ps1` | `codex-harness check` / `check --diagnose` / `codex-harness diagnose` |
 | `install.ps1 -Mode Disconnect` / `-Mode Recover` | `codex-harness disconnect` / `recover` |
 | `install.ps1 -Mode ConfigureRestart -SubscriptionsOnly` | `codex-harness configure-restart --subscriptions-only` |
@@ -31,6 +31,7 @@ The retired script interface and its native equivalent. Selectors, preview
 | `tools/delegation-usage.py` | `codex-harness delegation-usage` |
 | `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
 | Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
+| Skill evolution helpers | `codex-harness skills isolate` / `usage` / `publish` / `identity` |
 
 ## Prerequisites and checks
 
@@ -258,8 +259,9 @@ synthetic provider as image data alongside unchanged multiline text, followed by
 one successful tool effect. That check uses the parsed deferred input and native
 `turn/start`; image input through the complete window launcher still needs its
 own acceptance. This is initial-prompt acceptance only;
-later interactive requests, resume/fork prompts, executor/helper dispatch and
-window recovery remain part of unfinished task 1.4.
+later interactive requests and resume/fork prompts remain outside this
+increment. Executor/helper dispatch and closed-window recovery are covered
+by the ordinary launcher checks below.
 
 The native request-correlation check uses `client_metadata.thread_id`,
 `session_id` and `turn_id`, requiring agreement with the nested
@@ -306,7 +308,7 @@ and test authorization, native tool execution, visible final results and process
 cleanup after `/quit`. Both predecessor and successor windows were inspected
 simultaneously during handoff. These checks establish the fixture integration;
 they do not establish production routing, live subscription compatibility or
-complete worker/helper visibility. Private receipts retain the concrete runs.
+subscribed worker/helper work. Private receipts retain the concrete runs.
 
 The next integration adds `task_gateway`, an owned loopback listener using this
 gate and transport. Native startup reads effective configuration and passes its
@@ -327,8 +329,38 @@ irregular overlays can also suspend admission. This follows the documented
 and [window ordering contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow).
 The integrated ordinary, quota-handoff and minimize/restore release checks passed
 with this change and CLI 0.154.0. The handoff windows were observed simultaneously;
-all three checks showed the final result and verified process cleanup. Complete
-worker/helper simultaneous-visibility acceptance remains open.
+all three checks showed the final result and verified process cleanup.
+On CLI 0.155.1, `ordinary_launcher_opens_helper_before_its_first_request`
+passed through the release entry point: lead, executor and helper panes were
+established before the helper's first model request (helper title `Helper 1`,
+slot >= 4), seven ingress exchanges succeeded, and the helper tool effect
+occurred once. Nested helper spawn uses the native `collaboration` namespace
+and a distinct helper result marker so the parent wait is not closed by the
+helper's completion. `ordinary_launcher_restores_closed_executor_conversation`
+also passed: closing the executor pane reported `view-restore.json`, suspended
+new model requests, restored a new visible window for the same thread, and
+let the in-flight tool finish without a continuation replay (four ingress
+exchanges). These fixture checks still do not establish subscribed provider
+work or global activation.
+On CLI 0.155.1, `ordinary_launcher_opens_two_distinct_executor_conversations`
+passed through the same release entry point using `collaboration.spawn_agent`
+with required `task_name` values and `fork_turns=none` so Z.AI/Grok `high`
+overrides apply. A catalog that omits parent `gpt-6-astra` does not register
+collaboration tools. The fixture catalog therefore includes that parent slug
+and both executor slugs; v2 `wait_agent` takes only `timeout_ms`.
+`ordinary_launcher_hands_quota_refusal_to_visible_zai_lead` and
+`ordinary_launcher_suspends_and_recovers_visible_conversation` also passed on
+0.155.1 (successor present in the catalog; scoped minimize/restore). These
+still do not establish subscribed work, live skill linking, or a real
+consuming-project task.
+An isolated core+board install from this checkout into owned temp homes linked
+`team-lead`, `board-workflow` and `AGENTS.md` to the portable principles,
+installed pinned `bd`, and started the ordinary linked launcher with
+`--version` from a workspace outside the checkout. Live user home was not
+modified. `ordinary_launcher_stops_on_explicit_user_stop` passed on CLI 0.155.1:
+the emergency `request_stop` path recorded `explicit stop`, preserved the
+partial file effect and issued no further model request.
+
 This implementation currently requires an explicit provider base URL and a new
 session; resume/fork and implicit built-in routing return an explicit unsupported
 error. It is not globally activated. Ingress accepts bounded HTTP/1.1 POST bodies
@@ -558,8 +590,9 @@ relocation, final private-state cleanup and ordinary global installation remain
 unfinished.
 Registration currently requires local NTFS with TxF.
 
-Mutually exclusive `--core-only`, `--code-tools-only`, `--subscriptions-only`
-and `--token-workflow-only` are accepted. Combined activation is refused.
+Mutually exclusive `--core-only`, `--code-tools-only`, `--subscriptions-only`,
+`--token-workflow-only` and `--board-only` are accepted. Combined activation is
+refused.
 `--code-tools-only` Check/preview/Install reuse adopted packages and preserve an
 existing CodeGraph registration. Update rewrites owned MCP registrations from
 adopted inventory without acquiring packages or stopping shared OpenCode
@@ -735,22 +768,23 @@ discovery and both skill comparison modes. `tools/outcome_native_pairs.py` is
 the explicit opt-in driver for one native baseline/candidate pair per local
 case; it spends ChatGPT quota only with `--run-model-probes` and keeps
 evidence in a private temporary root. One such pair later ran for each local
-case on hooks-off Astra/xhigh. Benefit remains unproven. External consumer
-cases, full suite migration and global lifecycle remain open. Build the
+case on hooks-off Astra/xhigh. Benefit remains unproven. Two-consumer
+quantitative comparison is out of this change's acceptance (2026-09-18).
+Verification-skill global lifecycle is delivered. Build the
 workspace binaries first (`cargo build -p codex-harness --bins`): the legacy
 pair driver's independent process oracle now runs commands through native
 `harness-observe.exe`.
 `tools/outcome_cases.py --prepare --primary PATH --secondary PATH` copies two
 explicit local checkouts into an owned inputs root as generic `primary` and
 `secondary` snapshots. It does not discover neighboring repositories by
-directory name. Do not pass this checkout as a consumer. Model-backed benefit
-pairs stay gated until both consumers are named.
+directory name. Do not pass this checkout as a consumer. Model-backed
+two-consumer benefit pairs are not authorized by `accelerate-verified-delivery`.
 
 The native launcher and argument policy preserve upstream-managed background
 process lifetime, package-manager metadata, argv, Unicode, streams, exit codes,
-task-effort options and Ctrl+C. Isolated tests refuse self-recursion and a
-wrong upstream executable. The actual global launcher still uses its existing
-script. Native profile/config
+task-effort options and Ctrl+C. Isolated tests refuse self-recursion; a changed
+registered upstream still launches without a compatibility warning. The actual
+global launcher still uses its existing script. Native profile/config
 precedence follows the
 [official configuration contract](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence).
 

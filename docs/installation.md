@@ -11,6 +11,20 @@ adopted Serena package is started through the native boundary. See
 [code tools](code-tools.md) and the
 [project decisions](project-decisions.md#mcp-language-tools-and-resources).
 
+Skill-library evolution is under `autonomous-skill-evolution`. Use
+`codex-harness skills isolate`, `publish`, `usage` and
+`identity --path`. `identity --codex-home` and `usage --codex-home` honor
+`[[skills.config]] enabled = false`. Ordinary hooks stay off. On CLI 0.155.0 a
+skill added mid-turn is missing from the first same-turn continuation, with or
+without compact, and present on the next user turn, after idle `/compact`, on
+resume and in a new child without fork. Catalogue listing is not activation.
+Disablement and delete can remain listed in that session; observe them with
+identity or usage. After publish, read the live `SKILL.md` or identity before
+the next use; already loaded tokens are not refunded. Same-turn compact
+catalogue injection can omit a late add; recovery is that live read, not
+SessionStart/PostToolUse/Stop hooks. Limits and open scenarios live in
+[skill evolution](memory/skill-evolution.md).
+
 The checkout is the source of the portable kit. The native manager links
 instructions, skills and agents into native Codex locations and installs
 immutable Rust builds for the launcher, manager, diagnostic alias and helpers.
@@ -24,8 +38,8 @@ The [MCP extension](code-tools.md) is globally connected by the code-tools
 component. On an existing installation, core Install/Update also retains
 recorded hook connections, repairs missing managed links and follows a
 relocated checkout. The component selectors are mutually exclusive:
-`--core-only`, `--code-tools-only`, `--subscriptions-only` and
-`--token-workflow-only`.
+`--core-only`, `--code-tools-only`, `--subscriptions-only`,
+`--token-workflow-only` and `--board-only`.
 
 ## Prerequisites
 
@@ -89,6 +103,7 @@ Install the remaining components with the same candidate:
 ```powershell
 & <build>\codex-harness.exe install --code-tools-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE" --dependency-user-home "$env:USERPROFILE"
 & <build>\codex-harness.exe install --token-workflow-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
+& <build>\codex-harness.exe install --board-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
 & <build>\codex-harness.exe install --subscriptions-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
 ```
 
@@ -102,13 +117,17 @@ Install the remaining components with the same candidate:
 | `global/agents/` and its resources | `<CODEX_HOME>/agents/codex-harness/` |
 | Immutable build binaries | `<CODEX_HOME>/harness/bin` launcher, manager, inspect/observe helpers and the `codex-harness-check.exe` diagnostic alias |
 | `global/rtk-hooks.json` | `<CODEX_HOME>/hooks.json` (token-workflow component) and `harness/bin/{rtk,harness-rtk}.exe` |
+| `global/board.json` and the `board-workflow` skill | `<CODEX_HOME>/harness/bin/bd.exe` (board component) and `<user profile>/.agents/skills/board-workflow/` after core skill linking |
 | `global/code-tools.json` and the adopted packages | native MCP registrations in local `<CODEX_HOME>/config.toml` |
 
 The launcher resolves the original CLI through its recorded registration,
-distinguishes its own executable, and refuses self-recursion or a wrong
-upstream. If shared defaults are unavailable it still starts the original CLI
-with the native arguments and a degraded notice. Core recovery preserves the
-earlier owned selection and unrelated configuration.
+distinguishes its own executable, and refuses self-recursion. An in-place
+Codex CLI update that changes the registered executable or package digest
+still starts that current CLI; the launcher does not treat digest drift as
+incompatibility and does not warn when harness enhancements still apply. If
+shared defaults are unavailable it still starts the original CLI with the
+native arguments and a degraded notice. Core recovery preserves the earlier
+owned selection and unrelated configuration.
 
 The repository-root `AGENTS.md` remains maintenance guidance for this project;
 the portable global instruction text has one authoritative home under `global/`.
@@ -193,7 +212,8 @@ consumer's actual project and keep command records in its documentation home.
 
 Model evaluation is opt-in. Installation and ordinary documentation checks do
 not invoke it. Controlled native baseline/candidate pairs are described in
-[Rust migration](evidence/rust-migration.md); benefit remains unproven and no
+[Rust migration](evidence/rust-migration.md). Two-consumer quantitative
+comparison is not required for this delivery; benefit remains unproven and no
 model or quota speedup is claimed.
 
 - [Configuration precedence](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence)

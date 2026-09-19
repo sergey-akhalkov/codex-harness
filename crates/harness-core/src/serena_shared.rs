@@ -72,8 +72,8 @@ fn valid_client(client: &str) -> bool {
 }
 
 /// Serena's own fatal marker for a language-server manager that failed during
-/// project initialization. Such a worker answers every later semantic call
-/// with the same error until it is replaced.
+/// project initialization. The pool replaces that worker and retries the
+/// call once; a second failure is returned to the client.
 fn fatal_language_server(result: &Value) -> bool {
     result["result"]["content"]
         .as_array()
@@ -81,6 +81,12 @@ fn fatal_language_server(result: &Value) -> bool {
         .flatten()
         .filter_map(|item| item["text"].as_str())
         .any(|text| text.contains("The language server manager is not initialized"))
+}
+
+fn retire_worker(workers: &mut BTreeMap<String, PoolEntry>, key: &str) {
+    if let Some(mut failed) = workers.remove(key) {
+        let _ = failed.worker.close();
+    }
 }
 
 impl Pool {
@@ -314,15 +320,24 @@ impl Pool {
             })
             .flatten();
         let key = self.worker_for(&route, &initialize, deadline)?;
-        let entry = self.workers.get_mut(&key).expect("worker was started");
-        let result = entry.worker.request(method, params, deadline)?;
+        let retry_params = params.clone();
+        let mut result = {
+            let entry = self.workers.get_mut(&key).expect("worker was started");
+            entry.worker.request(method, params, deadline)?
+        };
         // A worker whose language-server manager failed stays alive but can
-        // never answer semantic calls. Retire it so the next request starts a
-        // fresh worker, while this client still receives Serena's own failure.
-        if fatal_language_server(&result)
-            && let Some(mut failed) = self.workers.remove(&key)
-        {
-            let _ = failed.worker.close();
+        // never answer semantic calls. Replace it and retry this request once
+        // so a transient initialization failure is not returned to the client.
+        if fatal_language_server(&result) {
+            retire_worker(&mut self.workers, &key);
+            let key = self.worker_for(&route, &initialize, deadline)?;
+            result = {
+                let entry = self.workers.get_mut(&key).expect("worker was started");
+                entry.worker.request(method, retry_params, deadline)?
+            };
+            if fatal_language_server(&result) {
+                retire_worker(&mut self.workers, &key);
+            }
         }
         let succeeded = result.get("error").is_none()
             && !result["result"]
@@ -500,6 +515,7 @@ mod tests {
         identity: ProcessIdentity,
         initialized: Value,
         state: Arc<Mutex<FakeState>>,
+        fatal_calls: Arc<AtomicU64>,
     }
 
     impl SharedWorker for FakeWorker {
@@ -513,6 +529,10 @@ mod tests {
             state.requests.push((method.to_owned(), params.clone()));
             if deadline.expired() || !state.alive {
                 return Err(io::Error::other("fixture worker is unavailable"));
+            }
+            if method == "tools/call" && self.fatal_calls.load(Ordering::SeqCst) > 0 {
+                self.fatal_calls.fetch_sub(1, Ordering::SeqCst);
+                return Ok(fatal_ls_message());
             }
             Ok(json!({
                 "jsonrpc": "2.0",
@@ -546,6 +566,7 @@ mod tests {
         home: PathBuf,
         starts: Arc<AtomicU64>,
         states: Arc<Mutex<Vec<Arc<Mutex<FakeState>>>>>,
+        fatal_calls: Arc<AtomicU64>,
     }
 
     impl Fixture {
@@ -560,8 +581,10 @@ mod tests {
             fs::write(home.join("contexts/codex.yml"), "tools: []\n").unwrap();
             let starts = Arc::new(AtomicU64::new(0));
             let states: Arc<Mutex<Vec<Arc<Mutex<FakeState>>>>> = Arc::new(Mutex::new(Vec::new()));
+            let fatal_calls = Arc::new(AtomicU64::new(0));
             let factory_starts = Arc::clone(&starts);
             let factory_states = Arc::clone(&states);
+            let factory_fatal = Arc::clone(&fatal_calls);
             let factory: WorkerFactory = Box::new(move |_route, _initialize, _deadline| {
                 let index = factory_starts.fetch_add(1, Ordering::SeqCst);
                 let state = Arc::new(Mutex::new(FakeState {
@@ -577,6 +600,7 @@ mod tests {
                     },
                     initialized: json!({"serverInfo": {"name": "Serena"}, "fixture": index}),
                     state,
+                    fatal_calls: Arc::clone(&factory_fatal),
                 }) as Box<dyn SharedWorker>)
             });
             let pool = Pool::new(
@@ -594,6 +618,7 @@ mod tests {
                     home,
                     starts,
                     states,
+                    fatal_calls,
                 },
                 pool,
             )
@@ -622,6 +647,34 @@ mod tests {
             "--context".into(),
             "codex".into(),
         ]
+    }
+
+    fn fatal_ls_message() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "isError": true,
+                "content": [{
+                    "type": "text",
+                    "text": "Error executing tool find_symbol: Exception: The language server manager is not initialized, indicating a problem during project initialisation."
+                }]
+            }
+        })
+    }
+
+    fn managed_route(project: &Path) -> Route {
+        Route {
+            project: Some(project.to_path_buf()),
+            cwd: project.to_path_buf(),
+            arguments: vec![
+                "start-mcp-server".into(),
+                "--context".into(),
+                "codex".into(),
+            ],
+            removed_projects: Vec::new(),
+            mutation_owner: None,
+        }
     }
 
     #[test]
@@ -744,6 +797,84 @@ mod tests {
         );
         assert_eq!(fixture.starts.load(Ordering::SeqCst), 2);
         assert!(fixture.states.lock().unwrap()[0].lock().unwrap().closed);
+        pool.close().unwrap();
+    }
+
+    #[test]
+    fn fatal_language_server_is_retried_once_on_a_fresh_worker() {
+        let (fixture, mut pool) = Fixture::new("fatal-retry", 3, 300);
+        let project = fixture.project("retry-project");
+        let client = Fixture::client(11);
+        pool.connect(
+            &client,
+            &managed_arguments(&project),
+            &project,
+            json!({"protocolVersion": "2024-11-05"}),
+            Fixture::deadline(),
+        )
+        .unwrap();
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        fixture.fatal_calls.store(1, Ordering::SeqCst);
+        let result = pool
+            .rpc(
+                &client,
+                "tools/call",
+                json!({"name": "find_symbol", "arguments": {"name_path_pattern": "shared"}}),
+                managed_route(&project),
+                json!({"protocolVersion": "2024-11-05"}),
+                Fixture::deadline(),
+            )
+            .unwrap();
+        assert_eq!(
+            result["message"]["result"]["structuredContent"]["name"],
+            "find_symbol"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 2);
+        assert!(fixture.states.lock().unwrap()[0].lock().unwrap().closed);
+        assert!(!fixture.states.lock().unwrap()[1].lock().unwrap().closed);
+        pool.close().unwrap();
+    }
+
+    #[test]
+    fn persistent_fatal_language_server_is_returned_after_one_retry() {
+        let (fixture, mut pool) = Fixture::new("fatal-persist", 3, 300);
+        let project = fixture.project("persist-project");
+        let client = Fixture::client(12);
+        pool.connect(
+            &client,
+            &managed_arguments(&project),
+            &project,
+            json!({"protocolVersion": "2024-11-05"}),
+            Fixture::deadline(),
+        )
+        .unwrap();
+        fixture.fatal_calls.store(2, Ordering::SeqCst);
+        let result = pool
+            .rpc(
+                &client,
+                "tools/call",
+                json!({"name": "find_symbol", "arguments": {}}),
+                managed_route(&project),
+                json!({"protocolVersion": "2024-11-05"}),
+                Fixture::deadline(),
+            )
+            .unwrap();
+        let text = result["message"]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("The language server manager is not initialized"),
+            "{text}"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 2);
+        assert!(
+            fixture
+                .states
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|state| state.lock().unwrap().closed)
+        );
         pool.close().unwrap();
     }
 

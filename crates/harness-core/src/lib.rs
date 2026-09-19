@@ -1,6 +1,9 @@
 //! Native harness primitives. Read-only checks never build or acquire dependencies.
 pub mod agent_config;
 pub mod analysis_samples;
+pub mod board_cli;
+#[cfg(windows)]
+pub mod board_lifecycle;
 #[cfg(windows)]
 pub mod broker_endpoint;
 #[cfg(windows)]
@@ -90,6 +93,8 @@ pub mod nuphus_protocol;
 pub mod nuphus_stdio;
 #[cfg(windows)]
 pub mod opencodex_login;
+pub mod orchestration_config;
+pub mod orchestration_lifecycle;
 pub mod outcome_report;
 pub mod path_plan;
 pub mod portable_config;
@@ -130,13 +135,16 @@ pub mod task_gateway;
 mod task_handoff;
 #[cfg(windows)]
 mod task_observer;
+pub mod task_orchestrate;
 pub mod task_request;
 #[cfg(windows)]
 pub mod task_runtime;
 #[cfg(windows)]
 pub mod task_scheduler;
+pub mod task_store;
 #[cfg(windows)]
 pub mod task_view;
+pub mod task_worktree;
 #[cfg(windows)]
 pub mod token_workflow_lifecycle;
 mod wheel_record;

@@ -37,7 +37,7 @@ The kit SHALL provide a `team-lead` skill, delivered through its installation li
 
 ### Requirement: Isolated and visible executor sessions
 
-Every executor assignment SHALL run a native `codex --profile <id>` session in its own visible terminal window established before its first model request, and in a Codex-managed Git worktree created from the task's base revision and bound to that session before its first model request. The controller SHALL record the native worktree mapping with the assignment, preserve it through interruption, and retire it only after the lead merges or explicitly discards the result; it SHALL NOT maintain a second harness-owned worktree tree. A control view that cannot pass native `--worktree` SHALL attach to the already bound managed checkout instead of allocating another one. Executors SHALL NOT write to the shared checkout. Each window SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A switchable list, hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
+Every executor assignment SHALL run a native `codex --profile <id>` session in its own visible terminal window established before its first model request, and in a Codex-managed Git worktree created from the task's base revision and bound to that session before its first model request. Executor isolation SHALL use that Codex-managed checkout and SHALL NOT substitute an ordinary Git worktree from `isolated-worktree-workflow` or a second harness-owned tree. The controller SHALL record the native worktree mapping with the assignment, including native owner identity (owning thread, archived or unavailable status, path and source revision), preserve it through interruption, and retire the checkout only after the lead merges or explicitly discards the result. Retirement SHALL use the installed CLI's confirmed deletion of a clean managed worktree when that operation applies: the checkout is a managed worktree of the current repository, is not the current checkout or a path alias of it, and contains no local, untracked or ignored changes. When native deletion does not apply or is unavailable, the controller SHALL preserve the checkout and report the limitation; it MUST NOT force-remove a dirty or unmerged worktree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as worktree retirement. CLI allocations remain not auto-cleaned. A control view that cannot pass native `--worktree` SHALL attach to the already bound managed checkout instead of allocating another one. Ephemeral spawn_agent helpers SHALL remain in the parent executor checkout and MUST NOT receive a second `--worktree`. Executors SHALL NOT write to the shared checkout. Each window SHALL show assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A switchable list, hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. Automatic model-backed helpers SHALL be visible and attributable or disabled. If a required view fails or closes and no other attached view displays that conversation, the controller SHALL suspend new model dispatch for it, reconcile in-flight effects without replay, report the failure and restore visibility before continuing.
 
 #### Scenario: Two executors work in parallel
 - **WHEN** the lead dispatches two independent assignments to different configured profiles
@@ -54,6 +54,22 @@ Every executor assignment SHALL run a native `codex --profile <id>` session in i
 #### Scenario: An interrupted worktree is recovered
 - **WHEN** a controller interruption occurs while an executor has partial work in its worktree
 - **THEN** the recorded worktree mapping and partial changes survive reconciliation and are reused instead of being recreated
+
+#### Scenario: A clean managed worktree is retired natively
+- **WHEN** the lead has merged or explicitly discarded an assignment whose Codex-managed worktree has no local, untracked or ignored changes, is not the current checkout, and belongs to the current repository
+- **THEN** retirement uses the CLI confirmed-deletion path for that managed worktree and does not allocate a second harness tree
+
+#### Scenario: A dirty managed worktree cannot be force-removed
+- **WHEN** retirement is due but the managed worktree still has local, untracked or ignored changes, or native confirmed deletion is unavailable
+- **THEN** the checkout and its mapping are preserved, the limitation is reported, and the tree is not force-removed
+
+#### Scenario: Ordinary Git worktrees are not executor isolation
+- **WHEN** an executor assignment needs an isolated checkout
+- **THEN** the session is bound to a Codex-managed worktree rather than an ordinary Git worktree created by `isolated-worktree-workflow`
+
+#### Scenario: Overview archive does not retire a worktree
+- **WHEN** an executor task is hidden, archived or deleted in the agents overview while its managed worktree still exists
+- **THEN** the worktree mapping remains until merge or explicit discard retirement, and overview task deletion is not treated as checkout cleanup
 
 ### Requirement: Board-based asynchronous assignment and feedback
 
@@ -89,7 +105,7 @@ The lead SHALL review each completed assignment against its accepted requirement
 
 #### Scenario: Accepted work is merged
 - **WHEN** an executor branch passes the applicable checks and meets its requirements
-- **THEN** the lead merges it, the worktree is retired, and the board and task records show the accepted outcome
+- **THEN** the lead merges it, the worktree is retired through native confirmed deletion when the clean-managed preconditions hold, otherwise preserved with an explicit limitation, and the board and task records show the accepted outcome
 
 #### Scenario: A defect returns to the executor
 - **WHEN** review finds a concrete defect that the original executor can correct within its scope

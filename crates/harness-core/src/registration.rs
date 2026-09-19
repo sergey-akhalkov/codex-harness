@@ -30,6 +30,9 @@ mod finish;
 pub use finish::COMMIT;
 #[path = "registration_metadata.rs"]
 pub(crate) mod metadata;
+#[cfg(test)]
+#[path = "registration_skill_package.rs"]
+mod skill_package_publication;
 
 pub const JOURNAL: &str = "journal.json";
 // Schema 11 distinguishes process-owned PATH from registry PATH. Older readers

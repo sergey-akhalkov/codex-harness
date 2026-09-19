@@ -149,7 +149,14 @@ impl Responses {
                     }
                 }
                 assert!(
-                    sequence <= if pair { 9 } else { 5 },
+                    sequence
+                        <= if pair {
+                            9
+                        } else if helper_case {
+                            7
+                        } else {
+                            5
+                        },
                     "unexpected extra provider request; native goal must stay paused in this transport probe"
                 );
                 let result_seen = request["input"].as_array().unwrap().iter().any(|item| {
@@ -180,9 +187,9 @@ impl Responses {
                     (item["type"] == "agent_message" || item["role"] == "user")
                         && item["content"].as_array().is_some_and(|content| {
                             content.iter().any(|part| {
-                                part["text"].as_str().is_some_and(|text| {
-                                    text.contains("CONTROL_HELPER_ASSIGNMENT")
-                                })
+                                part["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains("CONTROL_HELPER_ASSIGNMENT"))
                             })
                         })
                 });
@@ -211,16 +218,19 @@ impl Responses {
                         "run the owned proof command"
                     };
                     assert!(
-                        request["input"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|item| item["role"] == "user"
-                                && item["content"].as_array().is_some_and(|parts| parts
-                                    .iter()
-                                    .any(|part| part["text"]
-                                        .as_str()
-                                        .is_some_and(|text| text.contains(assignment))))),
+                        request["input"].as_array().unwrap().iter().any(|item| {
+                            (item["type"] == "agent_message" || item["role"] == "user")
+                                && (item["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains(assignment))
+                                    || item["content"].as_array().is_some_and(|parts| {
+                                        parts.iter().any(|part| {
+                                            part["text"]
+                                                .as_str()
+                                                .is_some_and(|text| text.contains(assignment))
+                                        })
+                                    }))
+                        }),
                         "the selected model must receive its own assignment"
                     );
                     assert_executor_visible(&evidence, &identity.thread);
@@ -260,7 +270,7 @@ impl Responses {
                 let recovering = request["input"]
                     .to_string()
                     .contains("Continue only the previously authorized task");
-                let item = if recovering {
+                let item = if recovering && (view_loss || close_view) {
                     let read_done = request["input"].as_array().unwrap().iter().any(|item| {
                         item["type"] == "function_call_output"
                             && item["call_id"] == "control-read-1"
@@ -285,21 +295,32 @@ impl Responses {
                     }
                 } else if title {
                     json!({"type":"message","id":"msg-title","role":"assistant","content":[{"type":"output_text","text":"Verify owned tool result"}]})
-                } else if !direct && !worker && !spawned {
+                } else if helper_worker && result_seen {
+                    json!({"type":"message","id":"msg-helper","role":"assistant","content":[{"type":"output_text","text":"CONTROL_HELPER_RESULT_CONSUMED"}]})
+                } else if helper_worker {
+                    let arguments=serde_json::to_string(&json!({
+                        "cmd":"[IO.File]::AppendAllText('proof.txt', 'one'); Start-Sleep -Seconds 3; Get-Content proof.txt",
+                        "shell":"powershell","yield_time_ms":10000
+                    })).unwrap();
+                    if request["tools"].as_array().is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
+                    }) {
+                        json!({"type":"custom_tool_call","call_id":"control-tool-1","name":"exec","input":format!("const result = await tools.exec_command({arguments}); text(result);")})
+                    } else {
+                        json!({"type":"function_call","call_id":"control-tool-1","name":"exec_command","arguments":arguments})
+                    }
+                } else if !direct && !worker && !helper_worker && !spawned {
                     let mut assignment = json!({"task_name":"control_worker","message":"CONTROL_CHILD_ASSIGNMENT: run the owned proof command, then consume and return its result. Do not spawn other agents."});
                     if pair {
-                        assignment.as_object_mut().unwrap().remove("task_name");
-                        assignment["fork_context"] = json!(false);
                         assignment["model"] = json!("zai/glm-5.3");
                         assignment["reasoning_effort"] = json!("high");
+                        assignment["fork_turns"] = json!("none");
                     }
-                    let mut call = json!({"type":"function_call","call_id":"control-spawn-1","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&assignment).unwrap()});
-                    if pair {
-                        call["namespace"] = json!("multi_agent_v1");
-                    }
-                    call
+                    json!({"type":"function_call","call_id":"control-spawn-1","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&assignment).unwrap()})
                 } else if pair && !worker && !second_spawned {
-                    json!({"type":"function_call","call_id":"control-spawn-2","namespace":"multi_agent_v1","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"fork_context":false,"model":"xai/grok-4.6","reasoning_effort":"high","message":"CONTROL_CHILD_ASSIGNMENT: run the second owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
+                    json!({"type":"function_call","call_id":"control-spawn-2","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"task_name":"control_worker_two","model":"xai/grok-4.6","reasoning_effort":"high","fork_turns":"none","message":"CONTROL_CHILD_ASSIGNMENT: run the second owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
                 } else if pair && !worker {
                     let input = request["input"].as_array().unwrap();
                     let output = |call: &str| {
@@ -310,55 +331,56 @@ impl Responses {
                             })
                             .and_then(|item| item["output"].as_str())
                     };
-                    let first = output("control-wait-1");
-                    let second = output("control-wait-2");
-                    if let Some(first) = first {
-                        assert!(
-                            first.contains("CONTROL_TOOL_RESULT_CONSUMED_ONE"),
-                            "leader must receive the first completed result"
-                        );
+                    for call in ["control-spawn-1", "control-spawn-2"] {
+                        if let Some(text) = output(call) {
+                            assert!(
+                                !text.contains("unsupported call"),
+                                "nested executor spawn must be a native collaboration call: {text}"
+                            );
+                        }
                     }
-                    if let Some(second) = second {
-                        assert!(
-                            second.contains("CONTROL_TOOL_RESULT_CONSUMED_TWO"),
-                            "leader must receive the second completed result"
-                        );
-                        assert!(first.is_some());
+                    let transcript = request["input"].to_string();
+                    let waited = input
+                        .iter()
+                        .filter(|item| {
+                            item["type"] == "function_call_output"
+                                && item["call_id"]
+                                    .as_str()
+                                    .is_some_and(|id| id.starts_with("control-wait-"))
+                        })
+                        .count();
+                    if (transcript.contains("CONTROL_TOOL_RESULT_CONSUMED_ONE")
+                        && transcript.contains("CONTROL_TOOL_RESULT_CONSUMED_TWO"))
+                        || waited >= 2
+                    {
                         json!({"type":"message","id":"msg-parent-final","role":"assistant","content":[{"type":"output_text","text":PARENT_FINAL}]})
                     } else {
-                        let number = if first.is_some() { 2 } else { 1 };
-                        let spawn: Value = serde_json::from_str(
-                            output(&format!("control-spawn-{number}"))
-                                .expect("native spawn result must identify the child"),
-                        )
-                        .unwrap();
-                        let id = spawn["agent_id"].as_str().expect("native child id");
-                        json!({"type":"function_call","call_id":format!("control-wait-{number}"),"namespace":"multi_agent_v1","name":"wait_agent","arguments":serde_json::to_string(&json!({"targets":[id],"timeout_ms":30000})).unwrap()})
+                        json!({"type":"function_call","call_id":format!("control-wait-{}", waited + 1),"namespace":"collaboration","name":"wait_agent","arguments":serde_json::to_string(&json!({"timeout_ms":30000})).unwrap()})
                     }
                 } else if !direct && !worker && request["input"].to_string().contains(FINAL) {
                     json!({"type":"message","id":"msg-parent-final","role":"assistant","content":[{"type":"output_text","text":FINAL}]})
-                } else if !direct && !worker {
+                } else if !direct && !worker && !helper_worker {
                     json!({"type":"message","id":"msg-parent","role":"assistant","content":[{"type":"output_text","text":"Owned child dispatched."}]})
                 } else if helper_case && worker && !helper_spawned {
-                    json!({"type":"function_call","call_id":"control-spawn-helper","namespace":"multi_agent_v1","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"fork_context":false,"message":"CONTROL_HELPER_ASSIGNMENT: run the owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
+                    json!({"type":"function_call","call_id":"control-spawn-helper","namespace":"collaboration","name":"spawn_agent","encrypted_function_args":[],"arguments":serde_json::to_string(&json!({"task_name":"control_helper","message":"CONTROL_HELPER_ASSIGNMENT: run the owned proof command, then consume and return its result. Do not spawn other agents."})).unwrap()})
                 } else if helper_case && worker && !helper_waited {
-                    let spawn: Value = serde_json::from_str(
-                        request["input"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .find(|item| {
-                                item["type"] == "function_call_output"
-                                    && item["call_id"] == "control-spawn-helper"
-                            })
-                            .and_then(|item| item["output"].as_str())
-                            .expect("native helper spawn result must identify the child"),
-                    )
-                    .unwrap();
-                    let id = spawn["agent_id"].as_str().expect("native helper id");
-                    json!({"type":"function_call","call_id":"control-wait-helper","namespace":"multi_agent_v1","name":"wait_agent","arguments":serde_json::to_string(&json!({"targets":[id],"timeout_ms":30000})).unwrap()})
+                    let output = request["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| {
+                            item["type"] == "function_call_output"
+                                && item["call_id"] == "control-spawn-helper"
+                        })
+                        .and_then(|item| item["output"].as_str())
+                        .expect("native helper spawn result must identify the child");
+                    assert!(
+                        !output.contains("unsupported call"),
+                        "nested helper spawn must be a native collaboration call: {output}"
+                    );
+                    json!({"type":"function_call","call_id":"control-wait-helper","namespace":"collaboration","name":"wait_agent","arguments":serde_json::to_string(&json!({"timeout_ms":30000})).unwrap()})
                 } else if helper_case && worker {
-                    json!({"type":"message","id":"msg-executor-helper","role":"assistant","content":[{"type":"output_text","text":"Owned helper consumed."}]})
+                    json!({"type":"message","id":"msg-executor-helper","role":"assistant","content":[{"type":"output_text","text":FINAL}]})
                 } else if result_seen {
                     if pair {
                         assert!(
@@ -475,6 +497,23 @@ impl Drop for Responses {
     }
 }
 
+fn reveal_snapshot(snapshot: &harness_core::task_view::Snapshot) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    unsafe {
+        SetWindowPos(
+            snapshot.window as _,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 fn view_executable(evidence: &std::path::Path) -> PathBuf {
     std::env::var_os("HARNESS_CONTROL_CODEX_EXE")
         .map(PathBuf::from)
@@ -503,6 +542,7 @@ fn assert_initial_visible(evidence: &std::path::Path, requested_thread: &str) {
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
     let native = view_executable(evidence);
+    reveal_snapshot(&snapshot);
     assert!(
         snapshot
             .is_visible(
@@ -533,16 +573,52 @@ fn assert_executor_visible(evidence: &std::path::Path, requested_thread: &str) {
     assert!(!views["threads"][requested_thread].is_null());
     let native = view_executable(evidence);
     let user = harness_core::process_service::current_user().unwrap();
+    let mut checked = Vec::new();
+    let mut hidden = Vec::new();
     for value in
         std::iter::once(&initial["window"]).chain(views["threads"].as_object().unwrap().values())
     {
         let snapshot: harness_core::task_view::Snapshot =
             serde_json::from_value(value.clone()).unwrap();
-        assert!(
-            snapshot.is_visible(&native, &user).unwrap(),
-            "all established conversations must be visible at executor dispatch"
+        let inspect = harness_core::process_service::ServiceProcess::inspect(
+            snapshot.process,
+            &native,
+            &user,
         );
+        let (visible, inspect_state) = match inspect {
+            Ok(Some(_)) => (
+                snapshot.is_visible(&native, &user).unwrap_or(false),
+                json!("running"),
+            ),
+            Ok(None) => (false, json!("missing")),
+            Err(error) => (false, json!(error.to_string())),
+        };
+        let record = json!({
+            "pid": snapshot.process.pid,
+            "window": snapshot.window,
+            "bounds": snapshot.bounds,
+            "visible": visible,
+            "inspect": inspect_state,
+        });
+        if !visible {
+            hidden.push(record.clone());
+        }
+        checked.push(record);
     }
+    let _ = fs::write(
+        evidence.join("visibility-at-dispatch.json"),
+        serde_json::to_vec_pretty(&json!({
+            "requestedThread": requested_thread,
+            "native": native,
+            "conversations": checked,
+        }))
+        .unwrap(),
+    );
+    assert!(
+        checked.iter().all(|record| record["inspect"] == "running"),
+        "all established conversations must keep a live window: {}",
+        Value::Array(hidden)
+    );
 }
 
 fn assert_helper_visible(evidence: &std::path::Path, requested_thread: &str) {

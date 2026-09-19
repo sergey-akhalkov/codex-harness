@@ -32,8 +32,28 @@ After init, `bd -C <project>` works. It cannot be used for `init`.
 | Feedback list | `bd list --label feedback --json` |
 | Epic progress | `bd epic status --json` |
 | Resolve | `bd close <id> --reason "…" --json` |
+| Lead inbox | `bd list --status lead_review --json` |
+| Lead work | `bd list --assignee lead --json` |
 
 `--type feedback` is rejected. Lead-initiated improvements are tasks, or
 OpenSpec changes when they alter accepted requirements. Public examples stay
 synthetic. Leave project `.beads/` state in the consuming project; disconnect
 does not erase it.
+
+## Pipeline
+
+All agent work goes through this board. Do not use process polling or chat as
+the assignment record.
+
+Custom status `lead_review` (wip): configure with
+`bd config set status.custom "lead_review:wip"`.
+
+| Actor | Does |
+| --- | --- |
+| Lead | Creates epics/features/tasks, assigns executor work, records its own follow-ups as tasks assigned to `lead` so a later lead session does not repeat them |
+| Executor | Claims assigned work, implements the outcome, sets `lead_review` when done. Does not `bd close` its own assignment |
+| Lead | Periodically lists `lead_review` and `assignee=lead`, reviews, merges, closes or returns to `in_progress` with feedback |
+
+On a new lead session: read the board first (`lead_review`, assignee `lead`,
+ready work). Create new tasks for new situation; do not re-open completed
+verification.

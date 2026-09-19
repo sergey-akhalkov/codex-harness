@@ -18,6 +18,9 @@ mod fixture {
     unsafe extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
         fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+        fn GetStdHandle(kind: u32) -> *mut c_void;
+        fn GetFileType(handle: *mut c_void) -> u32;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
         fn VirtualAlloc(
             address: *const c_void,
             bytes: usize,
@@ -85,6 +88,29 @@ mod fixture {
                     .map_err(io::Error::other)?;
                 record(artifact, json!({"pid": std::process::id(), "exit": code}))?;
                 std::process::exit(code as i32);
+            }
+            "stdio-kind" => {
+                const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+                let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+                let stdout_type = unsafe { GetFileType(handle) };
+                let mut mode = 0;
+                let console = unsafe { GetConsoleMode(handle, &mut mode) } != 0;
+                let mut in_job = 0;
+                if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) }
+                    == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                record(
+                    artifact,
+                    json!({
+                        "pid": std::process::id(),
+                        "in_job": in_job != 0,
+                        "stdout_type": stdout_type,
+                        "console": console
+                    }),
+                )?;
+                std::process::exit(17);
             }
             "report" | "hold" => {
                 if role == "report" {

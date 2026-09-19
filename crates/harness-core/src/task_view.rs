@@ -16,9 +16,9 @@ use windows_sys::Win32::{
         Gdi::ClientToScreen,
     },
     UI::WindowsAndMessaging::{
-        EnumWindows, GW_HWNDPREV, GetClientRect, GetWindow, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, SPI_GETWORKAREA, SWP_NOACTIVATE,
-        SWP_NOZORDER, SetWindowPos, SystemParametersInfoW,
+        EnumWindows, GW_HWNDPREV, GetClientRect, GetForegroundWindow, GetWindow, GetWindowRect,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SPI_GETWORKAREA,
+        SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SystemParametersInfoW,
     },
 };
 
@@ -90,10 +90,30 @@ impl Watch {
             && visible_bounds(self.window, self.process.identity().pid).is_ok()
             && unobscured(self.window as HWND)?)
     }
+
+    pub(crate) fn process_running(&self) -> io::Result<bool> {
+        self.process.is_running()
+    }
 }
 
 fn unavailable() -> io::Error {
     io::Error::other("conversation window is unavailable; suspend new model dispatch")
+}
+
+/// Run `f` without leaving the user in a newly created window.
+///
+/// Creating a console or asking the current terminal to add a tab can still
+/// activate that window. Restore the previous foreground window afterwards so
+/// a spawn from the lead does not yank focus from another app.
+pub fn preserve_foreground<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let previous = unsafe { GetForegroundWindow() };
+    let result = f();
+    if !previous.is_null() {
+        unsafe {
+            let _ = SetForegroundWindow(previous);
+        }
+    }
+    result
 }
 
 /// Conservatively require the conversation client area to be unobscured.

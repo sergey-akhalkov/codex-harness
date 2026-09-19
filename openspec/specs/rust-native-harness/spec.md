@@ -159,3 +159,105 @@ Completion SHALL include passing applicable acceptance from the real connected e
 #### Scenario: Performance evidence
 - **WHEN** migration results are reported
 - **THEN** matched local runtime measurements include their dispersion and resource observations, external provider/network effects are separated, and unsupported acceleration or quota claims are absent
+
+### Requirement: Fresh manager delivery to new sessions
+
+Installing or updating the native manager SHALL deliver a fresher published
+build by adding its immutable files and moving the stable links that new
+consumers resolve, and MUST NOT replace, delete or rewrite a build file that a
+running session may hold. The delivered build SHALL be an integrity-verified
+published build: the explicit `--build` when the operator supplies one,
+otherwise the freshest verified build published from the selected source in
+the owned state of the running manager. When the running manager does not
+belong to an owned state, or no verified build matches the selected source,
+the explicit build remains required and the failure is reported before any
+registration changes. A Codex CLI session started before delivery SHALL keep
+its already-resolved manager and MUST NOT be interrupted; a session started
+after delivery SHALL resolve the freshly delivered manager through the stable
+links. Selection MUST stay explicit: ordinary launch performs no build,
+download or registration mutation, and a build that merely exists without an
+explicit Install/Update MUST NOT become the consumer's manager.
+
+#### Scenario: Delivery while an earlier manager still runs
+
+- **WHEN** Install/Update delivers a newer verified build while a session still
+  runs the previous manager
+- **THEN** the operation succeeds without touching the previous build file, the
+  running session continues on its manager, and a new consumer resolves the
+  delivered build through the stable manager link
+
+#### Scenario: Scoped update from an older manager
+
+- **WHEN** a scoped update is run from, or refers to, an older manager while the
+  owned state already holds a fresher verified build
+- **THEN** new sessions resolve the freshest delivered build, and the update
+  does not pin the older manager for later consumers
+
+#### Scenario: Unverified or foreign candidate
+
+- **WHEN** the newest directory under an owned state has a missing, altered or
+  unverifiable record or binary
+- **THEN** it is not delivered, the previous delivered manager stays in place
+  and the failure is reported explicitly
+
+### Requirement: Broker generations coexist across a delivery
+
+The shared Serena and CodeGraph brokers SHALL resolve one private location per
+delivered build generation. A consumer of a newer generation MUST NOT retire a
+live broker that consumers of an older generation still use; it starts or joins
+its own generation's broker instead, and MUST keep the existing behavior of
+joining a broker that already matches its own generation. A broker whose
+consumers are all gone SHALL retire on its own idle timeout, and an explicit
+maintenance retirement SHALL remain available. Records whose location no longer
+exists SHALL be dropped so the generation list stays bounded.
+
+#### Scenario: New generation starts while an older session is live
+
+- **WHEN** a new Codex CLI session starts after a delivery while a session of
+  the previous build still uses its broker
+- **THEN** both sessions complete MCP initialize against their own broker, and
+  neither session interrupts the other
+
+#### Scenario: Older generation drains
+
+- **WHEN** every consumer of a generation has finished
+- **THEN** that generation's broker retires on its idle timeout while the
+  delivered generation keeps serving
+
+### Requirement: Ordinary launch survives an upstream Codex update
+
+When the registered upstream Codex executable or its managed `@openai/codex`
+package metadata changes in place, ordinary `codex` invocation SHALL still
+start that current CLI. The launcher MUST NOT require an explicit harness
+update, rewrite launch registration, compile, download or start a second
+session. A digest mismatch alone is not incompatibility and MUST NOT produce
+a launch warning when harness enhancements still apply. A warning is allowed
+only when harness enhancements cannot be applied to the current CLI, and
+Codex MUST still start. Integrity checks for harness extensions, refusal of
+launcher recursion and failure when the upstream executable itself is missing
+SHALL remain. Check MAY report the stale registration until explicit update
+refreshes it.
+
+#### Scenario: Codex CLI updates in place
+- **WHEN** a user updates the installed Codex CLI so the registered upstream executable hash or package.json digest no longer matches launch registration, and that path still names a usable Codex executable whose harness session can be prepared
+- **THEN** the next `codex` invocation starts that current CLI with the supplied arguments, without an explicit-update error and without an extra compatibility warning
+
+#### Scenario: Recursion and a missing CLI stay explicit failures
+- **WHEN** launch registration points at the harness launcher itself, or the registered upstream executable is missing
+- **THEN** the launcher fails explicitly without invoking an arbitrary replacement or a second session
+
+### Requirement: Interactive CLI session process tree
+
+Ordinary interactive Codex CLI sessions started through the harness launcher SHALL run the registered upstream executable inside a Windows Job that kills remaining members when the last job handle closes. Containment SHALL be established before the upstream image executes. The session job SHALL NOT apply the helper memory or CPU caps used for MCP, indexer and probe workers. Independently started kit services, including the xAI shim and shared MCP brokers, SHALL remain outside that session job. Interactive standard streams and the calling console SHALL be inherited so argument, Unicode, cwd, stdin, stdout, stderr and exit-code contracts stay unchanged. The launcher SHALL wait for the session root to exit with no execution deadline, then reap surviving session descendants. Cleanup MUST target only that owned tree. Closing the wrapper or the console SHALL also reclaim the tree. The kit SHALL NOT hunt processes by name or PID alone, SHALL NOT scan the computer for closed sessions, and SHALL NOT leave a detached scavenger running after the launcher returns.
+
+#### Scenario: Hidden helper outlives the CLI today
+- **WHEN** an ordinary `codex` session started through the harness launcher spawns a detached helper and then the CLI root exits
+- **THEN** the helper is reclaimed with the session job, a separately started kit service keeps running, and the launcher returns the CLI exit code
+
+#### Scenario: Wrapper or console dies first
+- **WHEN** the harness launcher process or its console is terminated while session descendants are still running
+- **THEN** those owned descendants terminate and unrelated processes remain
+
+#### Scenario: Interactive streams stay attached
+- **WHEN** a user starts `codex` from an existing terminal through the harness launcher
+- **THEN** the upstream CLI inherits that console and standard streams and is not attached to NUL

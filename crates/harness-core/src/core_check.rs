@@ -88,6 +88,7 @@ pub fn check(
     let inventory = inventory::read(&settings.source_root, codex_home, user_home)?;
     require_data_links(metadata.links(), &inventory.links)?;
     agent_config::check(codex_home, &inventory.agents)?;
+    crate::orchestration_config::check_installation(&settings.source_root, codex_home)?;
     let instructions =
         read_instructions(&settings.source_root.join(&inventory.manifest.instructions))?;
     let runtime = core_runtime::verify(

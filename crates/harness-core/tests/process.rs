@@ -493,6 +493,60 @@ mod native {
     }
 
     #[test]
+    fn inherit_console_stays_in_job_and_is_not_nul() {
+        let root = root("inherit-console");
+        let redirected = spec("stdio-kind", &root.join("nul.json"));
+        let job = Job::new(Limits::default()).unwrap();
+        let child = job.spawn(&redirected).unwrap();
+        assert_eq!(run(job, &child).exit_code, 17);
+        let nul = receipt(&root.join("nul.json"));
+        assert_eq!(nul["in_job"], true);
+        assert_eq!(nul["stdout_type"], 2);
+        assert_eq!(nul["console"], false);
+
+        let mut inherited = spec("stdio-kind", &root.join("inherit.json"));
+        inherited.inherit_console = true;
+        inherited.stdout = Some(std::fs::File::create(root.join("nope.log")).unwrap());
+        let job = Job::new(Limits::default()).unwrap();
+        let error = job.spawn(&inherited).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with redirected streams"),
+            "{error}"
+        );
+
+        let mut inherited = spec("stdio-kind", &root.join("inherit.json"));
+        inherited.inherit_console = true;
+        let job = Job::new(Limits::default()).unwrap();
+        let child = job.spawn(&inherited).unwrap();
+        assert!(job.contains(&child).unwrap());
+        assert_eq!(run(job, &child).exit_code, 17);
+        let inherited = receipt(&root.join("inherit.json"));
+        assert_eq!(inherited["in_job"], true);
+        assert!(
+            inherited["stdout_type"] != 2 || inherited["console"] == true,
+            "inherited stdout should not be NUL: {inherited}"
+        );
+    }
+
+    #[test]
+    fn foreground_wait_reaps_grandchild_without_deadline() {
+        let root = root("foreground");
+        let job = Job::new(Limits::default()).unwrap();
+        let mut command = spec("tree-exit", &root.join("tree.json"));
+        command.inherit_console = true;
+        let child = job.spawn(&command).unwrap();
+        let data = receipt(&root.join("tree.json"));
+        let grandchild = Observer::open(data["grandchild"].as_u64().unwrap() as u32);
+        let start = Instant::now();
+        let code = job.wait_foreground(&child, CLEANUP).unwrap();
+        assert_eq!(code, 17);
+        assert!(start.elapsed() < Duration::from_secs(6));
+        grandchild.assert_dead();
+    }
+
+    #[test]
     fn owner_death_before_resume_and_after_resume_closes_child_job() {
         for role in ["owner-suspended", "owner-running", "owner-exit"] {
             let root = root(role);

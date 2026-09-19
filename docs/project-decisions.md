@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-15**.
+Last updated: **2026-09-19**.
 
 ## Public pack
 
@@ -58,8 +58,11 @@ not build, install dependencies or rewrite configuration to recover. Preserve
 stdin/stdout/stderr, cwd, exit status and recursion protection; never launch a
 second session after an upstream process already started. The command bootstrap
 is an explicitly installed local executable artifact independent of the checkout;
-shared data remains live-linked. Check still reports degraded harness health,
-and explicit core update restores the optional shared behavior. See
+shared data remains live-linked. An in-place Codex CLI update must still start
+that current CLI; digest drift is not incompatibility and must not warn when
+harness enhancements still apply. Warn only when those enhancements cannot be
+applied, and never refuse Codex for that. Check still reports degraded harness
+health, and explicit core update restores the optional shared behavior. See
 [installation and recovery](installation.md).
 
 ## Global delivery
@@ -365,6 +368,37 @@ ordinary hooks off, in both experimental-context values. Same-session
 compact/resume catalogue delivery without ordinary hooks remains an open blocker
 in `autonomous-skill-evolution`.
 
+Re-checked on CLI **0.155.0** (hooks off, canned local Responses, ordinary TUI):
+automatic mid-turn compact and continuation were observed; the late skill was
+absent from the first continuation and present on the next user turn. That does
+not close same-turn compact recovery.
+The same split held with `experimental_context` true.
+
+The non-compact same-turn continuation on that CLI also omitted a skill added
+while a tool call was in flight; the following user turn included it. Hooks-off
+catalogue delivery remains next-turn, not in-process continuation.
+
+Further 0.155.0 hooks-off probes: a new child without fork sees current on-disk
+skills; an already-running child's continuation does not. Resume and the next
+user turn pick up a newly added skill but still list a skill disabled via
+`[[skills.config]]` or deleted from disk. Custom descriptions are not present in
+the injected catalogue. Manual `/compact` after an idle turn included a skill
+added while stopped; automatic mid-turn compact did not. Unrelated prompts list
+names without loading skill body markers. `codex-harness skills identity` reads
+the live revision and does not claim tokens were refunded.
+
+`identity --codex-home` and `usage --codex-home` report disablement; the
+injected catalogue may still list the name. Matching-task use without `$skill`
+is proven on live ConPTY; net benefit of the shortening candidate remains
+unproven. User-authorized Grok (`codex --profile xai`, `grok-4.6` / `xhigh`)
+completed the four-case 0.2 batch as **inconclusive**; Astra remains the
+declared plan default and is not rewritten. An independent add-vs-absence
+Grok batch on unused CLI cases was also **inconclusive**: the tasks already
+pass without the added skill. User decision 2026-09-19: close
+`autonomous-skill-evolution` without claimed net benefit; `decide()` rules
+for later candidates stay. Coverage of the measured limit is in
+[skill evolution](memory/skill-evolution.md).
+
 ## Native workflows
 
 Goals remain enabled. Native Codex memories stay off; durable project knowledge
@@ -385,11 +419,13 @@ an already installed desktop PowerShell. Parent and global PATH stay unchanged.
 
 A neighboring source kit was an idea source and isolated experimental consumer,
 not a runtime dependency. Further runs against it have stopped. Remaining
-quantitative two-consumer comparison in `accelerate-verified-delivery` is an
-open user decision; tasks 5.4 and 6.4 stay open and must not resume that
-research or spend further model-backed runs until a second consumer is chosen.
-Controlled native pairs for the remaining local cases already ran on hooks-off
-Astra; they do not prove benefit.
+quantitative two-consumer comparison in `accelerate-verified-delivery` is not
+required (user decision 2026-09-18). Installation, skill delivery and local
+hooks-off Astra pairs remain accepted; benefit stays unproven. Do not spend
+further model-backed runs for that comparison under this change, resume
+source-kit support, lower the historical 15-second / 15% threshold
+retroactively, or claim acceleration or quota savings. A later change may
+reopen measurement with frozen criteria.
 
 ## Token-burn reduction (2026-09-14)
 
@@ -412,6 +448,41 @@ layer cannot stage BasedPyright updates, so registry drift now resolves as
 `held-backend-staging` retention instead of blocking every install; the stale
 OpenCode `clangd` cache symlink was removed once (versioned directory
 preserved) because the dependency guard refuses reparse points in that cache.
+
+## Orchestration board
+
+**2026-09-19:** `beads` (`bd`) is accepted as an optional lifecycle-delivered
+CLI for consuming-project board coordination. It is not a first-party Rust
+crate, not an MCP, and not a Codex startup dependency. Missing or broken board
+state is an explicit limitation: orchestration reports it and continues only
+work whose acceptance does not depend on the board. It must not invent a
+replacement protocol or silently drop acceptance records.
+
+Identity and license: canonical source
+[gastownhall/beads](https://github.com/gastownhall/beads) (MIT, Copyright 2025
+Beads Contributors). Released Go modules still declare
+`github.com/steveyegge/beads`. npm `@beads/bd` is not the kit install path.
+
+Supported version path: pin **v1.3.0** (published 2026-09-15), the first tested
+release off `main` since the 1.1 line. Windows delivery is the GitHub release
+archive `beads_1.3.0_windows_amd64.zip` with SHA-256
+`fa4c72c5d27f68f906e89a759656b5a051b330088c4acc38fa445cbb561e5cdf` from that
+release's `checksums.txt`; ARM64 uses `beads_1.3.0_windows_arm64.zip`. Verify
+the archive against that checksums file before first run. Do not install
+through `curl | bash`, `irm …/install.ps1 | iex`, npm, or
+`CGO_ENABLED=0 go install` (server-mode only; no embedded Dolt). Do not use
+retracted or recovered tags `v1.2.0`, `v1.2.1`, or `v1.2.2` (the last re-ships
+1.1.2-era code).
+
+Install effects: default `bd init` writes `AGENTS.md` and agent integrations;
+owned isolated checks and kit-owned installs use `--skip-agents` or
+`--stealth`. Do not run `bd setup codex` during kit install without an explicit
+isolated preview — it mutates skills, `AGENTS.md` and hooks. Runtime state is
+embedded Dolt under `.beads/`. Windows antivirus false positives on Go binaries
+are documented by upstream; checksum verification is the first trust step.
+No listed CVE specific to this pin was found in the assessment. Socket.dev
+dependency alerts are not OSV proof. Private query receipts stay out of Git.
+Report issues to security@steveyegge.com.
 
 ## Recording further decisions
 

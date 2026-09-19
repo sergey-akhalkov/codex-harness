@@ -663,7 +663,9 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     command.stdout = Some(log.try_clone()?);
     command.stderr = Some(log);
     let job = Job::new(Limits {
-        memory_bytes: Some(2048 * 1024 * 1024),
+        // Release LTO of every manager binary exceeds a 4 GiB Job; keep the
+        // compiler bounded without killing the candidate compile.
+        memory_bytes: Some(8 * 1024 * 1024 * 1024),
         cpu_percent: Some(50.0),
     })?;
     let child = job

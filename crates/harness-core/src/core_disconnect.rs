@@ -46,7 +46,11 @@ pub fn disconnect(
     let dependency_user_home = normal(dependency_user_home)?;
     let owners = InstallationOwners::new(&codex_home, &user_home, &dependency_user_home)?;
     let _locks = InstallationLocks::acquire(&user_home, &dependency_user_home)?;
-    for name in ["pending.json", "token-workflow-pending.json"] {
+    for name in [
+        "pending.json",
+        "token-workflow-pending.json",
+        "board-pending.json",
+    ] {
         absent(&codex_home.join("harness").join(name))?;
     }
     let state = codex_home.join("harness/native-registration");

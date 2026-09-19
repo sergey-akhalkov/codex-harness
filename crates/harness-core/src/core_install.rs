@@ -1083,6 +1083,220 @@ mod tests {
     }
 
     #[test]
+    fn skill_evolution_lifecycle_g_isolated_roots_preserve_project_records() {
+        crate::process_path::with_test_environment(|| {
+            let mut fixture = Fixture::new();
+            fixture.request.path_scope = Some(PathScope::Process);
+            for name in ["skill-evolution", "skills-usage-analysis"] {
+                let dir = fixture.request.source.join("skills").join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(
+                    dir.join("SKILL.md"),
+                    format!("---\nname: {name}\ndescription: Isolated lifecycle skill.\n---\n"),
+                )
+                .unwrap();
+            }
+            let project = fixture.root.join("consumer");
+            fs::create_dir_all(project.join(".agents/skills/demo")).unwrap();
+            fs::create_dir_all(project.join("docs/memory")).unwrap();
+            fs::write(
+                project.join(".agents/skills/demo/SKILL.md"),
+                "---\nname: demo\ndescription: Project skill.\n---\n",
+            )
+            .unwrap();
+            fs::write(project.join("docs/memory/README.md"), "# memory\n").unwrap();
+            let git = |dir: &Path, args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(dir)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            git(&project, &["init", "-q"]);
+            git(&project, &["config", "user.email", "fixture@example.test"]);
+            git(&project, &["config", "user.name", "Fixture"]);
+            git(&project, &["add", "."]);
+            git(&project, &["commit", "-q", "-m", "origin"]);
+            let clone = fixture.root.join("clone");
+            assert!(
+                std::process::Command::new("git")
+                    .args([
+                        "clone",
+                        "-q",
+                        project.to_str().unwrap(),
+                        clone.to_str().unwrap()
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let compile_root = fixture.root.join("compile");
+            fs::create_dir_all(&compile_root).unwrap();
+            let upstream = compile_fixture(
+                &compile_root,
+                "upstream.exe",
+                include_str!("../tests/fixtures/fake_codex_features.rs"),
+            );
+            let launcher = compile_fixture(
+                &compile_root,
+                "codex.exe",
+                include_str!("../tests/fixtures/fake_codex_launcher.rs"),
+            );
+            fixture.request.upstream = Some(upstream);
+            fs::copy(&launcher, fixture.request.build.join("codex.exe")).unwrap();
+            fixture.record();
+            fs::create_dir_all(fixture.request.user_home.join(".agents/skills")).unwrap();
+            fs::write(
+                fixture
+                    .request
+                    .user_home
+                    .join(".agents/skills/foreign-project.md"),
+                b"keep-project",
+            )
+            .unwrap();
+            let preview = connect(&fixture.request, true).unwrap();
+            assert_eq!(preview.status, "preview");
+            let connected = connect(&fixture.request, false).unwrap();
+            assert_eq!(connected.status, "connected");
+            assert!(connected.runtime.unwrap().passed);
+            for name in ["skill-evolution", "skills-usage-analysis"] {
+                let dest = fixture.request.user_home.join(".agents/skills").join(name);
+                assert!(
+                    fs::symlink_metadata(&dest)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{name}"
+                );
+                assert_eq!(
+                    fs::read_link(&dest).unwrap(),
+                    fixture.request.source.join("skills").join(name)
+                );
+            }
+            assert_eq!(
+                fs::read(
+                    fixture
+                        .request
+                        .user_home
+                        .join(".agents/skills/foreign-project.md")
+                )
+                .unwrap(),
+                b"keep-project"
+            );
+            assert!(clone.join(".agents/skills/demo/SKILL.md").is_file());
+            assert!(clone.join("docs/memory/README.md").is_file());
+            assert!(!clone.join(".agents/skills/demo").is_symlink());
+            let checked = crate::core_check::check(
+                &fixture.request.codex_home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+                Duration::from_secs(45),
+            )
+            .unwrap();
+            assert_eq!(checked.status, "connected");
+            let extra = fixture
+                .request
+                .source
+                .join("skills/shared-without-reinstall");
+            fs::create_dir_all(&extra).unwrap();
+            fs::write(
+                extra.join("SKILL.md"),
+                "---\nname: shared-without-reinstall\ndescription: Added after connect.\n---\n",
+            )
+            .unwrap();
+            let updated = connect(&fixture.request, false).unwrap();
+            assert_eq!(updated.status, "connected");
+            assert!(
+                fs::symlink_metadata(
+                    fixture
+                        .request
+                        .user_home
+                        .join(".agents/skills/shared-without-reinstall")
+                )
+                .unwrap()
+                .file_type()
+                .is_symlink()
+            );
+            let old_source = fixture.request.source.clone();
+            let relocated = fixture.root.join("relocated");
+            fs::rename(&old_source, &relocated).unwrap();
+            fixture.request.source = relocated.clone();
+            fixture.record();
+            let moved = connect(&fixture.request, false).unwrap();
+            assert_eq!(moved.status, "connected");
+            assert_eq!(
+                fs::read_link(
+                    fixture
+                        .request
+                        .user_home
+                        .join(".agents/skills/skill-evolution")
+                )
+                .unwrap(),
+                relocated.join("skills/skill-evolution")
+            );
+            let recovered = recover(
+                &fixture.request.codex_home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+            )
+            .unwrap();
+            assert_eq!(recovered.model_calls, 0);
+            assert!(
+                recovered.status == "recovered"
+                    || recovered.status == "no-pending-operation"
+                    || recovered.status == "recovered-legacy",
+                "{}",
+                recovered.status
+            );
+            let disconnected = crate::core_disconnect::disconnect(
+                &fixture.request.codex_home,
+                &fixture.request.user_home,
+                &fixture.request.dependency_user_home,
+                false,
+            )
+            .unwrap();
+            assert_eq!(disconnected.status, "disconnected");
+            assert!(
+                !fixture
+                    .request
+                    .user_home
+                    .join(".agents/skills/skill-evolution")
+                    .exists()
+            );
+            assert!(
+                !fixture
+                    .request
+                    .user_home
+                    .join(".agents/skills/skills-usage-analysis")
+                    .exists()
+            );
+            assert!(
+                !fixture
+                    .request
+                    .user_home
+                    .join(".agents/skills/shared-without-reinstall")
+                    .exists()
+            );
+            assert_eq!(
+                fs::read(
+                    fixture
+                        .request
+                        .user_home
+                        .join(".agents/skills/foreign-project.md")
+                )
+                .unwrap(),
+                b"keep-project"
+            );
+            assert!(clone.join(".agents/skills/demo/SKILL.md").is_file());
+            assert!(clone.join("docs/memory/README.md").is_file());
+            assert!(!clone.join(".agents/skills/demo").is_symlink());
+        });
+    }
+
+    #[test]
     fn relocated_connect_preserves_a_foreign_retargeted_link() {
         crate::process_path::with_test_environment(|| {
             let mut fixture = Fixture::new();

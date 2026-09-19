@@ -394,3 +394,56 @@ fn process_oracle_rejects_stale_reports_forced_exit_codes_and_incomplete_streams
         );
     }
 }
+
+#[test]
+fn skill_library_comparison_matrix_executes_held_out_and_negative_absence() {
+    use skill_evolution::comparison::{self, CaseResult};
+    let mut order = 0u32;
+    let mut rows = Vec::new();
+    for (id, arm, absence) in [
+        ("entrypoint", "baseline", false),
+        ("entrypoint", "candidate", false),
+        ("negative", "candidate", true),
+        ("missing", "candidate", true),
+        ("freshness", "candidate", false),
+    ] {
+        order += 1;
+        let case = Case::new(id, arm);
+        case.report(id == "missing");
+        if ["entrypoint", "freshness"].contains(&id) {
+            case.product("build");
+            case.product("cli");
+        }
+        if id == "negative" {
+            corrected_guide(&case);
+        }
+        if id == "freshness" {
+            use std::io::Write;
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(case.root.join("docs/validation.md"))
+                    .unwrap(),
+                "Current source version 2: rebuilt and ran the product CLI, stdout 2, exit 0."
+            )
+            .unwrap();
+        }
+        let result = case.check(true);
+        let skill_used = result["details"]["skill_used"]
+            .as_bool()
+            .unwrap_or(arm == "candidate" && id != "negative");
+        rows.push(CaseResult {
+            case_id: id.into(),
+            arm: arm.into(),
+            skill_used,
+            absence_expected: absence,
+            order,
+        });
+    }
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0].order, 1);
+    assert!(!comparison::bypass(
+        rows.iter().find(|r| r.case_id == "negative").unwrap()
+    ));
+    assert_ne!(rows[0].arm, rows[1].arm);
+}

@@ -1,0 +1,7 @@
+{
+  "version": "1.3.0",
+  "platform": "x86_64-pc-windows-msvc",
+  "url": "https://github.com/gastownhall/beads/releases/download/v1.3.0/beads_1.3.0_windows_amd64.zip",
+  "sha256": "fa4c72c5d27f68f906e89a759656b5a051b330088c4acc38fa445cbb561e5cdf",
+  "executableSha256": "9632ef4ea0941a247fcb3178a604404fd434d686e79e50805c6345b35ba9b8f1"
+}

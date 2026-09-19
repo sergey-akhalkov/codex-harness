@@ -18,24 +18,90 @@ their former meaning; it does not prescribe an effort for every new assignment.
 
 For example, use an ordinary agent with `model="gpt-6-astra"` and
 `reasoning_effort="high"` instead of `agent_type="middle_backup"`. The same
-parameter selection applies to enabled external models. The subscription-owned
-`middle` preset currently remains for lifecycle compatibility; it maps to
-`xai/grok-4.6` and `xhigh` and is not required for direct selection. Its retirement
-is still open. The former `grok_reviewer` remains retired.
+parameter selection applies to enabled external models. Use `codex --profile xai` with `grok-4.6` / `xhigh` instead of any subscription
+middle preset. Those OpenCodex role files are retired. The former
+`grok_reviewer` remains retired.
 
 Every active conversation must appear simultaneously in its own window or pane,
 showing assignment, model/effort, messages/tool activity and status. Include any
 model-backed helpers and explicitly show changes of leader. A switchable list
 or a hidden transcript is insufficient. If required views disappear, suspend new
 model requests, preserve in-flight work and restore visibility before continuing.
-The controller's simultaneous views and automatic quota recovery are still
-[under development](../openspec/changes/orchestrate-subscription-agents/tasks.md).
-Until verified views are available, keep execution in the visible main conversation;
-the previous single-TUI test is not simultaneous-view acceptance.
-Missing simultaneous views are a controller/UI gap. Do not capture Codex or sibling
+The controller opens a window or pane per conversation before dispatch. If a
+required view closes, it suspends new model requests, preserves in-flight work
+and restores visibility before continuing. Do not capture Codex or sibling
 agent windows with Nuphus screenshots, and do not poll window pixels for status.
 Identify non-Codex windows with list, title, bounds and state; keep screenshots for
 genuine visual questions about owned UI.
+
+## Orchestration configuration
+
+Kit-owned [orchestration.toml](../global/orchestration.toml) names the lead
+profile, the successor lead used after a confirmed lead quota failure, the
+executor profiles, and the maximum concurrent executor count. Installation check
+rejects a missing profile or a non-positive limit without substituting another
+route. `default` is the native session with no `--profile` flag. Other names must
+exist as `CODEX_HOME/<name>.config.toml` or `[profiles.<name>]`.
+
+Synthetic example (not a live consumer):
+
+```toml
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "xai"
+executor_profiles = ["xai"]
+max_concurrent_executors = 2
+```
+
+Dispatch an executor with the installed launcher:
+
+```powershell
+codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY --exec "assignment"
+```
+
+That command uses `codex --profile xai` from the example above. An unlisted
+`--profile` is an error. Explicit user `codex --profile <id>` keeps native
+precedence over role configuration. Quota succession looks up the successor
+profile's model in the native catalog; the verified handoff seed remains a
+configured `zai/glm-5.3` binding, not a hardcoded provider role.
+
+Spawn opens the assignment in a new tab of the current Windows terminal when
+the lead already runs there (`WT_SESSION`, `wt -w 0 new-tab`). It does not pass
+`--focus` / maximized / fullscreen, and it restores the previous foreground
+window so another app is not yanked forward. If the lead is not in that
+terminal, it falls back to a visible native TUI (`CREATE_NEW_CONSOLE`) with the
+same restore. It does not use headless `codex exec --json`. Do not pass
+`--worktree` together with `--remote`; attach with `-C` at the managed cwd.
+Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
+Spawn returns after the tab or window is open so the lead keeps working.
+Assignments live on the beads board; executors set `lead_review` when done
+instead of closing. The lead reviews that inbox and its own `assignee=lead`
+tasks. Do not poll executor process ids.
+
+The `team-lead` skill owns lead activation, briefs, steering, acceptance and
+stop. Ordinary sessions without that activation spawn nothing.
+
+## Board workflow
+
+Asynchronous assignment and executor feedback use the consuming project's
+`beads` (`bd`) CLI. Kit install delivers pinned v1.3.0 onto `harness/bin` with
+`--board-only` and the `board-workflow` skill through core skill linking. The
+controller does not parse the board. Missing or broken board state is an
+explicit limitation, not a substitute tracker. Init is
+`bd init --skip-agents --non-interactive --quiet`. Stages are epics,
+specifications are features, executor feedback is a `task` labeled `feedback`,
+and `bd status` / `bd list --label feedback` / `bd epic status` are the
+non-interactive reports. Do not run `bd setup codex` from kit install.
+
+## Executor worktrees
+
+Installed CLI 0.155.1 allocates experimental managed worktrees with
+`--enable worktrees --worktree`. `codex exec` may pass that flag; the verified
+`--remote` control TUI must not. Attach the window with `-C` at the managed
+cwd. Disabled `worktrees` is an explicit limitation: executors do not write to
+the shared checkout and do not fall back to an ordinary Git worktree.
+Native confirmed deletion is TUI-only and refuses dirty, untracked or ignored
+trees; otherwise the checkout is preserved.
 
 ## How selection works
 
@@ -105,7 +171,7 @@ at `~/.codex/agents/codex-harness` for installer compatibility and contains no
 presets. OpenCodex routing, including its subscription middle, is retired;
 direct native selection does not need those names. Do not create recursive
 worker trees; this remains policy until
-the controller's shared task-wide ownership and concurrency checks are complete.
+the controller enforces one active lead and the configured executor concurrency bound.
 
 `developer_instructions` is a scalar: the selected profile replaces the same
 base config.toml value rather than concatenating strings. The base file remains

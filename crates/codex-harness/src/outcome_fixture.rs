@@ -22,7 +22,7 @@ pub fn run() -> io::Result<()> {
     fs::write(
         "fixture-call.json",
         serde_json::to_vec(
-            &json!({"argv":args,"prompt":prompt,"home":home,"cwd":env::current_dir()?}),
+            &json!({"argv":args,"prompt":prompt,"home":home,"cwd":env::current_dir()?,"userprofile":env::var("USERPROFILE").ok()}),
         )?,
     )?;
     let final_path = args

@@ -169,6 +169,13 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
     };
     let launch_path = root.path().join("launch.json");
     save(&launch_path, &serde_json::to_value(&launch)?)?;
+    if let Some(build) = manager.parent()
+        && let Ok(record) = build_identity::read_record(build)
+        && let Ok(config) = crate::orchestration_config::load(&record.source_root)
+    {
+        let choice = crate::orchestration_config::successor_choice(&config, home)?;
+        crate::orchestration_config::persist_successor(root.path(), &choice)?;
+    }
     let mut environment = env::vars_os()
         .map(|(key, value)| Ok((unicode(&key)?.to_uppercase(), unicode(&value)?)))
         .collect::<io::Result<BTreeMap<_, _>>>()?;
@@ -281,6 +288,7 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             ));
         }
         let stopped = root.path().join("stop.json").try_exists()?;
+        let mut defer_spawn = false;
         if !stopped {
             let primary_live = view.is_running()?;
             let additional_live = additional
@@ -302,6 +310,9 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                 if !closed.is_empty() {
                     persist_additional(&root, &snapshots)?;
                     report_closed_views(&root, &closed)?;
+                    // Let visibility interrupt in-flight work before restoring
+                    // the pane. Same-iteration respawn hides that suspension.
+                    defer_spawn = true;
                 }
                 if !view.is_running()?
                     && additional
@@ -367,6 +378,9 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             Err(error) => return Err(error),
         }
         for request in requests {
+            if defer_spawn {
+                break;
+            }
             if request.schema != 1
                 || request.slot == 0
                 || request.slot > 32
@@ -391,7 +405,15 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                 }
                 let mut next = CommandSpec::new(command.get_program());
                 next.env.clone_from(&tui.env);
-                next.current_dir = Some(launch.cwd.clone());
+                next.current_dir = Some(
+                    crate::task_worktree::load(
+                        &root
+                            .path()
+                            .join(format!("worktree-{}.json", request.thread_id)),
+                    )
+                    .map(|mapping| mapping.path)
+                    .unwrap_or_else(|_| launch.cwd.clone()),
+                );
                 next.args = vec![
                     "--remote".into(),
                     format!("ws://127.0.0.1:{}", endpoint.port).into(),

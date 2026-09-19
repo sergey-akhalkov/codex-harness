@@ -1,7 +1,7 @@
 //! Native install/update/check/recover/disconnect with mutually exclusive
 //! component selectors. Combined activation remains unfinished.
 use harness_core::{
-    code_tools_lifecycle, core_install,
+    board_lifecycle, code_tools_lifecycle, core_install,
     lifecycle::{self, Component},
     native_build, subscription_lifecycle, token_workflow_lifecycle,
 };
@@ -121,6 +121,14 @@ pub fn recover(args: &[OsString]) -> io::Result<i32> {
                 manager: None,
             },
         )?)?,
+        Component::Board => {
+            serde_json::to_value(board_lifecycle::recover(&board_lifecycle::Request {
+                source: optional(&options.values, "--source").unwrap_or_default(),
+                codex_home: codex,
+                user_home: user,
+                preview: options.preview,
+            })?)?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(0)
@@ -194,6 +202,14 @@ pub fn check(args: &[OsString]) -> io::Result<i32> {
                 manager: None,
             },
         )?)?,
+        Component::Board => {
+            serde_json::to_value(board_lifecycle::check(&board_lifecycle::Request {
+                source: optional(&options.values, "--source").unwrap_or_default(),
+                codex_home: required(&options.values, "--codex-home")?,
+                user_home: user,
+                preview: options.preview,
+            })?)?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(0)
@@ -271,6 +287,14 @@ pub fn disconnect(args: &[OsString]) -> io::Result<i32> {
                 manager: None,
             },
         )?)?,
+        Component::Board => {
+            serde_json::to_value(board_lifecycle::disconnect(&board_lifecycle::Request {
+                source: optional(&options.values, "--source").unwrap_or_default(),
+                codex_home: required(&options.values, "--codex-home")?,
+                user_home: user,
+                preview: options.preview,
+            })?)?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(0)
@@ -382,6 +406,14 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
                 manager: Some(env::current_exe()?),
             },
         )?)?,
+        Component::Board => {
+            serde_json::to_value(board_lifecycle::install(&board_lifecycle::Request {
+                source: required(&options.values, "--source")?,
+                codex_home: required(&options.values, "--codex-home")?,
+                user_home: required(&options.values, "--user-home")?,
+                preview: options.preview,
+            })?)?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(0)

@@ -12,15 +12,17 @@ serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+skill-evolution = { path = "../skill-evolution" }
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 regex = "=1.12.4"
 toml = { version = "=0.9.11", default-features = false, features = ["std", "serde", "parse"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Security", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Security", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+skill-evolution = { path = "../skill-evolution" }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_UI_WindowsAndMessaging"] }

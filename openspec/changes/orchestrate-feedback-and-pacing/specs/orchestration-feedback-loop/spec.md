@@ -3,7 +3,8 @@
 Turn lead/executor feedback into durable, deduplicated demand signals with an
 incubator and vote promotion, refresh agent instructions through safe session
 succession, and pace orchestration spend so improvements must earn their token
-cost.
+cost. Skill-library mutation, in-process catalogue delivery and same-session
+compact recovery remain owned by `autonomous-skill-evolution`.
 
 ## ADDED Requirements
 
@@ -18,6 +19,22 @@ Lead and executor feedback about the work, the orchestration, instructions, tool
 #### Scenario: The lead wants to correct course
 - **WHEN** the lead observes a repeated mistake across executors
 - **THEN** it records its own feedback task for triage rather than steering every session individually with duplicated context
+
+### Requirement: Observations are routed by kind
+
+Each observation SHALL be classified before it competes as an incubator vote. A verified reusable procedure in owned skill scope SHALL be handed to `autonomous-skill-evolution` and SHALL NOT wait for the vote threshold. Process, orchestration, requirement, tool and unclear or material changes SHALL remain incubator items. Kit-wide skill or instruction demand from consuming projects SHALL promote to the kit backlog without private consuming-project data; `autonomous-skill-evolution` SHALL execute any subsequent library mutation under its own evaluation contract. Promotion and routing confer eligibility for planning; they SHALL NOT write skill packages or substitute incubator votes for skill-evaluation.
+
+#### Scenario: A verified procedure is not voted into a skill
+- **WHEN** an executor records a reusable diagnostic method with a checkable result in owned skill scope
+- **THEN** the observation is handed to skill-evolution instead of accumulating incubator votes for authoring that skill
+
+#### Scenario: Orchestration friction stays in the incubator
+- **WHEN** an executor reports process, quota or dispatch friction without a reusable owned procedure
+- **THEN** the item remains in the incubator and is not turned into a skill candidate by this loop
+
+#### Scenario: Kit skill demand does not write the package
+- **WHEN** consuming-project feedback about a kit skill or instruction reaches the vote threshold
+- **THEN** it promotes to the kit backlog without private project data, and skill-evolution remains the only path that may mutate the library
 
 ### Requirement: Incubator deduplicates and accumulates votes
 
@@ -71,9 +88,15 @@ Hygiene SHALL be owned and performed by the lead session, triggered by condition
 
 When accepted instruction or skill changes affect an active session, that session SHALL spawn a successor through a deterministic `codex resume` invocation of its profile that selects the exact prior session without an interactive picker, only at a safe boundary after in-flight tool effects complete. The successor SHALL be verified to reload the current instructions and skills; the predecessor SHALL hand over durable task context through the owning records and then stop its own CLI process. Succession SHALL NOT replay external operations with uncertain outcomes or lose partial work.
 
+This requirement owns process replacement for orchestrated workers. Succession SHALL consume the compact revision identity published by `autonomous-skill-evolution` (`name`, canonical path, revision, operation) when the change is a skill-library mutation. It SHALL NOT implement catalogue delivery, in-process activation or same-session compact recovery, and a replaced process SHALL NOT satisfy those `skill-session-awareness` requirements.
+
 #### Scenario: Instructions change while an executor works
 - **WHEN** an applicable instruction or skill update is accepted while an executor session is active
 - **THEN** a successor resumes that session's context under the new instructions at the next safe boundary and the predecessor process stops after the handover
+
+#### Scenario: Succession does not close in-process recovery
+- **WHEN** an orchestrated worker is replaced after a skill revision is accepted
+- **THEN** succession may refresh that worker, and same-session compact or in-process activation remains owned by skill-evolution
 
 #### Scenario: A resumed session misses the update
 - **WHEN** verification shows a resumed session did not reload current instructions or skills
@@ -81,7 +104,7 @@ When accepted instruction or skill changes affect an active session, that sessio
 
 ### Requirement: Budget-honest pacing
 
-Pacing SHALL use fresh, scoped observations: native account-limit reads where the installed contract exposes them, actual provider refusals, and bounded dashboard snapshots supplied by the user where no API exists. Missing or stale telemetry SHALL remain unknown, not zero or unlimited; local request logs SHALL NOT be treated as authoritative remainders; no model call SHALL be made solely to estimate quota. Pacing SHALL adjust new assignment allocation, concurrency, reasoning effort and feedback cadence without preempting a healthy executor, dropping accepted work or adding purchases. Feedback mechanisms themselves SHALL stay bounded so triage cost does not rival the work being improved.
+Pacing SHALL use fresh, scoped observations: native account-limit reads where the installed contract exposes them, actual provider refusals, and bounded dashboard snapshots supplied by the user where no API exists. Missing or stale telemetry SHALL remain unknown, not zero or unlimited; local request logs SHALL NOT be treated as authoritative remainders; no model call SHALL be made solely to estimate quota. Pacing SHALL adjust new assignment allocation, concurrency, reasoning effort and feedback cadence without preempting a healthy executor, dropping accepted work or adding purchases. Feedback mechanisms themselves SHALL stay bounded so triage cost does not rival the work being improved. This requirement paces account windows for orchestration; it SHALL NOT replace skill-evolution episode or period learning budgets.
 
 #### Scenario: A provider window depletes rapidly
 - **WHEN** current observations show fast depletion of an account window

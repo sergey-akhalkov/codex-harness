@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/harness-core", "crates/codex-harness", "tools/rtk-adapter"]
+members = [
+    "crates/harness-core",
+    "crates/codex-harness",
+    "crates/windows-disk-reclaim",
+    "crates/skill-evolution",
+    "tools/rtk-adapter",
+]
 resolver = "3"
 
 [workspace.package]

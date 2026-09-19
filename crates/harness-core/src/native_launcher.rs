@@ -1,5 +1,6 @@
 //! Ordinary Codex launch: verify the selected build, then inherit the caller's
-//! streams and console. Upstream owns its persistent background-process lifetime.
+//! streams and console. The session process tree is owned by a kill-on-close
+//! Job; independently started kit services are not members of that job.
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,6 +10,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 const REGISTRATION_LIMIT: u64 = 65536;
@@ -168,6 +170,30 @@ fn notice_degraded_session(task_args: &[OsString]) {
     }
 }
 
+/// Apply npm/bun/pnpm identity when the registered package is still
+/// `@openai/codex`. A changed digest is an upstream update, not a skip.
+fn managed_package_env(package: &Package) -> Option<(PathBuf, &'static str)> {
+    if !package.root.is_absolute() {
+        return None;
+    }
+    let root = package.root.canonicalize().ok()?;
+    let manifest = root.join("package.json");
+    let mut data = Vec::new();
+    File::open(&manifest)
+        .ok()?
+        .take(REGISTRATION_LIMIT + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() as u64 > REGISTRATION_LIMIT {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    if metadata.get("name").and_then(|v| v.as_str()) != Some("@openai/codex") {
+        return None;
+    }
+    Some((root, package.manager.variable()))
+}
+
 pub fn codex_home() -> io::Result<PathBuf> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -215,11 +241,6 @@ fn prepared_command(
             "upstream points to a harness launcher; explicit repair required",
         ));
     }
-    if target_hash != upstream.sha256 {
-        return Err(fail(
-            "upstream executable changed; explicit update is required",
-        ));
-    }
     let task_args = launcher::task_arguments(args)?;
     let default_model = session_model(&selected, home);
     let task_args = launcher::per_model_effort(&task_args, default_model.as_deref());
@@ -249,33 +270,14 @@ fn prepared_command(
     }
     // Match the adopted upstream npm entry point: contradictory manager hints
     // must not leak into a package launch. Bare native installs inherit theirs.
-    if let Some(package) = upstream.package {
-        if !package.root.is_absolute() {
-            return Err(fail("managed package root must be absolute"));
-        }
-        let root = package.root.canonicalize()?;
-        let manifest = root.join("package.json");
-        if build_identity::hash_file(&manifest)? != package.manifest_sha256 {
-            return Err(fail(
-                "upstream package metadata changed; explicit update required",
-            ));
-        }
-        let mut data = Vec::new();
-        File::open(&manifest)?
-            .take(REGISTRATION_LIMIT + 1)
-            .read_to_end(&mut data)?;
-        let metadata: serde_json::Value =
-            serde_json::from_slice(&data).map_err(|_| fail("invalid upstream package metadata"))?;
-        if data.len() as u64 > REGISTRATION_LIMIT
-            || metadata.get("name").and_then(|v| v.as_str()) != Some("@openai/codex")
-        {
-            return Err(fail("unexpected upstream package identity"));
-        }
-        for variable in MANAGERS {
-            command.env_remove(variable);
+    if let Some(package) = upstream.package
+        && let Some((root, variable)) = managed_package_env(&package)
+    {
+        for name in MANAGERS {
+            command.env_remove(name);
         }
         command.env("CODEX_MANAGED_PACKAGE_ROOT", root);
-        command.env(package.manager.variable(), "1");
+        command.env(variable, "1");
     }
     Ok((command, registration.task_control))
 }
@@ -519,11 +521,28 @@ impl Drop for ConsoleHandler {
     }
 }
 
+#[cfg(windows)]
+fn interactive_spec(command: &Command) -> io::Result<crate::process::CommandSpec> {
+    let program = PathBuf::from(command.get_program());
+    if !program.is_absolute() {
+        return Err(fail("upstream must be an absolute path"));
+    }
+    let mut spec = crate::process::CommandSpec::new(program);
+    spec.args = command.get_args().map(|arg| arg.to_os_string()).collect();
+    spec.current_dir = command.get_current_dir().map(|path| path.to_path_buf());
+    spec.inherit_console = true;
+    for (key, value) in command.get_envs() {
+        spec.env
+            .insert(key.to_os_string(), value.map(|value| value.to_os_string()));
+    }
+    Ok(spec)
+}
+
 pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32> {
     // An unusable upstream executable must fail as an error, not as a desktop
     // loader dialog.
     crate::process::suppress_loader_dialogs();
-    let (mut command, task_control) = prepared_command(executable, home, args)?;
+    let (command, task_control) = prepared_command(executable, home, args)?;
     if launcher::xai_shim_requested(args) {
         let manager = executable
             .canonicalize()?
@@ -548,10 +567,19 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     {
         return Ok(code);
     }
-    // Unlike bounded helper jobs, ordinary upstream sessions may deliberately
-    // leave managed background processes alive. Inherit streams and the console
-    // directly and do not impose a kill-on-wrapper-close job on the CLI.
+    // Shared kit services are started as siblings before this wait. The session
+    // Job owns only the upstream CLI tree and reaps leftovers when it exits.
+    #[cfg(windows)]
+    {
+        let spec = interactive_spec(&command)?;
+        let job = crate::process::Job::new(crate::process::Limits::default())?;
+        let child = job.spawn(&spec)?;
+        let code = job.wait_foreground(&child, Duration::from_secs(5))?;
+        return Ok(code as i32);
+    }
+    #[cfg(not(windows))]
     let status = command.status()?;
+    #[cfg(not(windows))]
     status
         .code()
         .ok_or_else(|| fail("upstream terminated without an exit code"))
@@ -586,6 +614,27 @@ mod tests {
                 .next()
                 .unwrap(),
         )
+    }
+
+    fn pid_running(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForSingleObject,
+        };
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            if handle.is_null() {
+                return false;
+            }
+            let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+            CloseHandle(handle);
+            running
+        }
     }
 
     /// Loopback stand-in for a running xAI shim: answers the identity endpoint
@@ -968,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn command_refuses_self_recursion_and_wrong_upstream() {
+    fn command_refuses_self_recursion() {
         let fixture = Fixture::new();
         let mut registration: serde_json::Value = serde_json::from_slice(
             &fs::read(fixture.home.join("harness/native-launch.json")).unwrap(),
@@ -984,20 +1033,41 @@ mod tests {
         .unwrap();
         let error = command(&fixture.launcher, &fixture.home, &[]).unwrap_err();
         assert!(error.to_string().contains("harness launcher"), "{}", error);
+    }
 
-        let foreign = fixture.root.join("foreign.exe");
-        fs::write(&foreign, b"not-the-registered-upstream").unwrap();
-        registration["upstream"]["executable"] = json!(foreign);
-        fs::write(
-            fixture.home.join("harness/native-launch.json"),
-            serde_json::to_vec_pretty(&registration).unwrap(),
-        )
-        .unwrap();
-        let error = command(&fixture.launcher, &fixture.home, &[]).unwrap_err();
+    #[test]
+    fn command_launches_when_upstream_or_package_digest_changes() {
+        let fixture = Fixture::new();
+        let path = fixture.home.join("harness/native-launch.json");
+        let mut registration: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        registration["upstream"]["sha256"] = json!("0".repeat(64));
+        fs::write(&path, serde_json::to_vec_pretty(&registration).unwrap()).unwrap();
+        let mut prepared = command(&fixture.launcher, &fixture.home, &["exec".into()]).unwrap();
+        prepared.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = prepared.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("exec"), "{stdout}");
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), "ERR:ok");
+
+        let package = fixture.root.join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"@openai/codex"}"#).unwrap();
+        registration["upstream"]["sha256"] =
+            json!(build_identity::hash_file(&fixture.upstream).unwrap());
+        registration["upstream"]["package"] = json!({
+            "root": package,
+            "manifest_sha256": "0".repeat(64),
+            "manager": "npm"
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&registration).unwrap()).unwrap();
+        let prepared = command(&fixture.launcher, &fixture.home, &["exec".into()]).unwrap();
         assert!(
-            error.to_string().contains("upstream executable changed"),
-            "{}",
-            error
+            prepared.get_envs().any(|(key, value)| {
+                key == "CODEX_MANAGED_BY_NPM" && value == Some(std::ffi::OsStr::new("1"))
+            }),
+            "managed npm identity must still be applied after a package digest change"
         );
     }
 
@@ -1077,6 +1147,42 @@ mod tests {
         assert!(
             stdout.contains("model_reasoning_effort=\"low\""),
             "{stdout}"
+        );
+    }
+
+    #[test]
+    fn run_reaps_detached_session_helper_and_returns_exit_code() {
+        let fixture = Fixture::new();
+        let compile = fixture.root.join("session-parent");
+        fs::create_dir_all(&compile).unwrap();
+        let parent = compile_fixture(
+            &compile,
+            "session-parent.exe",
+            include_str!("../tests/fixtures/fake_codex_session_parent.rs"),
+        );
+        let path = fixture.home.join("harness/native-launch.json");
+        let mut registration: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        registration["upstream"]["executable"] = json!(parent);
+        registration["upstream"]["sha256"] = json!(build_identity::hash_file(&parent).unwrap());
+        fs::write(&path, serde_json::to_vec_pretty(&registration).unwrap()).unwrap();
+        let marker = fixture.root.join("orphan.pid");
+        let code = run(
+            &fixture.launcher,
+            &fixture.home,
+            &[
+                "--orphan-marker".into(),
+                marker.as_os_str().to_owned(),
+                "--exit".into(),
+                "7".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(code, 7);
+        let pid: u32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        assert!(
+            !pid_running(pid),
+            "detached session helper {pid} survived launcher return"
         );
     }
 }

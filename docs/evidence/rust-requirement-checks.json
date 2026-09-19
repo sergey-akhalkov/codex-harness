@@ -59,7 +59,8 @@
         "crates/codex-harness/tests/console.rs::device_status_and_attributes_queries_are_answered",
         "crates/codex-harness/tests/tui.rs::isolated_path_resolves_the_linked_ordinary_codex_command",
         "crates/codex-harness/tests/tui.rs::actual_tui_status_model_and_trust_write_locally",
-        "crates/codex-harness/tests/native_launcher.rs::missing_stale_source_and_shared_toml_fail_open_to_verified_upstream"
+        "crates/codex-harness/tests/native_launcher.rs::missing_stale_source_and_shared_toml_fail_open_to_verified_upstream",
+        "crates/codex-harness/tests/native_launcher.rs::changed_upstream_digest_still_launches_without_a_compatibility_warning"
       ],
       "unfinished": "native ConPTY answers CSI 6n/c queries; the transitional tests/ConPty.cs helper and the script token-workflow driver were retired 2026-09-17 and the native global consumer checks live in rtk_adapter, console and tui suites"
     },
@@ -139,6 +140,19 @@
         "tests/fixtures/lsp/delayed-mcp.py",
         "tests/fixtures/lsp/mcp-edit.py"
       ]
+    },
+    {
+      "area": "skill evolution",
+      "status": "native helpers covered; live same-turn compact and model-eval benefit unfinished",
+      "checks": [
+        "crates/skill-evolution",
+        "crates/codex-harness/tests/skills_usage.rs",
+        "crates/codex-harness/tests/skills_isolate.rs",
+        "crates/codex-harness/tests/skill_eval_pilot.rs",
+        "crates/codex-harness/tests/skill_catalog_refresh.rs",
+        "crates/harness-core/tests/skill_kit_inventory.rs"
+      ],
+      "unfinished": "hooks-off same-turn compact continuation omits mid-turn skills on CLI 0.155.0; gpt-6-astra live extra scenarios blocked on provider usage limit; global kit activate and accepted-change benefit remain open in autonomous-skill-evolution"
     }
   ]
 }

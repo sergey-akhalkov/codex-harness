@@ -34,10 +34,14 @@ succession with a verified `codex resume` contract; honest pacing from
 scoped observations; a benefit gate before improvements become defaults.
 
 **Non-Goals:** Changing Stage 1 dispatch, visibility or acceptance behavior;
-the mechanics of evolving skills and instructions (owned by
-`autonomous-skill-evolution`); autonomous promotion of instructions without
-the applicable workflow; provider quota scraping with credentials or
-invented percentages; guaranteed throughput claims.
+the mechanics of evolving skills and instructions, skill-evaluation of
+library mutations, catalogue admission, in-process catalogue delivery and
+same-session compact recovery (owned by `autonomous-skill-evolution`);
+writing skill packages from incubator promotion; using incubator votes as a
+substitute for a verified owned procedure that already belongs to
+skill-evolution; autonomous promotion of instructions without the applicable
+workflow; provider quota scraping with credentials or invented percentages;
+guaranteed throughput claims.
 
 ## Decisions
 
@@ -67,7 +71,18 @@ the kit's own backlog so the signal aggregates across consuming projects
 without leaking private data. Promotion confers eligibility for planning,
 never silent implementation authority.
 
-### 4. Hygiene is lead-owned with deterministic triggers
+### 4. Observations are routed by kind, not double-counted
+
+The same friction must not become both an incubator vote and an immediate
+skill candidate. A verified reusable procedure in owned skill scope is
+handed to `autonomous-skill-evolution` and does not wait for three votes.
+Process, orchestration, requirement, tool and unclear or material changes
+stay in the incubator. Kit-wide skill or instruction demand from consuming
+projects promotes to the kit backlog without private data; skill-evolution
+then executes any library mutation under its own evaluation contract.
+Promotion never writes `SKILL.md`.
+
+### 5. Hygiene is lead-owned with deterministic triggers
 
 An unreviewed incubator becomes a graveyard that erodes the signal, but a
 "periodic review" leaves who and when unclear. The sweep belongs to the lead
@@ -80,7 +95,7 @@ no lead session is active, hygiene simply waits; archived items are
 restorable, so deferral is safe. The sweep archives stale items with visible
 reasons and never deletes evidence.
 
-### 5. Instruction refresh through verified `codex resume`
+### 6. Instruction refresh through verified `codex resume`
 
 A changed-instructions session spawns a successor via a deterministic
 `codex resume` invocation of its profile that selects the exact session
@@ -89,10 +104,16 @@ cannot be controller-driven). The handover happens at a safe boundary after
 in-flight tool effects; the predecessor hands over durable records and stops
 its own process. Two contracts require verification before dependence:
 non-interactive session selection, and that a resumed process reloads
-current AGENTS instructions and skills (earlier project evidence showed
-catalogue-delivery quirks around compaction/resume).
+current AGENTS instructions and skills. This path is process succession for
+orchestrated workers. It consumes the compact revision identity published by
+skill-evolution (`name`, canonical path, revision, operation). It does not
+implement catalogue injection, in-process activation or same-session compact
+recovery; those remain owning blockers of `autonomous-skill-evolution` when
+unsupported. Replacing a worker process does not close that same-session
+requirement. Resume-contract verification here is a consumer check, not a
+second catalogue-delivery research track.
 
-### 6. Pacing from scoped observations only
+### 7. Pacing from scoped observations only
 
 GPT limit reads use the installed native contract where exposed. Other
 providers pace from actual refusals and bounded user-supplied dashboard
@@ -101,19 +122,21 @@ requests, no invented percentages, no preemption of healthy workers. Pacing
 touches concurrency, effort and feedback cadence - the triage cadence itself
 is paced so the improvement loop cannot outrun the work it improves.
 
-### 7. Benefit gate before defaults
+### 8. Benefit gate before defaults
 
 A promoted improvement becomes a default only after a matched comparison
 shows unchanged-or-better quality and no material delivery-time regression
 beyond tolerance, with feedback-triage, coordination and rework included in
 the accounting. This is the enforcement point for the user's requirement
-that improvements must strongly justify their token burn.
+that improvements must strongly justify their token burn. It evaluates
+orchestration defaults, not skill-library mutations; it does not reuse or
+replace the skill-evaluation accept/reject/inconclusive contract.
 
 ## Risks / Trade-offs
 
 - Vote gaming or fragmentation -> episode/reporter-scoped votes with visible provenance and lead-owned merge decisions.
 - Incubator noise -> hygiene cadence, archiving with reasons, consequence override for rare-but-severe items.
-- `codex resume` contract drift -> verification tasks bound activation to the tested CLI behavior; gaps reported as "succession not established".
+- `codex resume` contract drift -> verification tasks bound activation to the tested CLI behavior; gaps reported as "succession not established". Catalogue compact-recovery research stays in `autonomous-skill-evolution`.
 - Dashboard snapshots are manual and stale -> they pace, they do not measure; reset windows and concurrency remain explicit.
 - Benefit comparisons cost tokens themselves -> reuse Stage 1 evidence, bounded scenarios, stop on sufficient evidence.
 - Sequencing -> this change cannot complete before Stage 1 delivers its dependencies; drafts may progress in parallel only on contract verification tasks.

@@ -1,9 +1,9 @@
 //! Owned Windows process trees. Jobs are anonymous, non-inheritable and created
-//! here; neither PIDs nor a caller's containing job confer cleanup authority.
-//! Windows 10+ is required for atomic assignment through JOB_LIST at creation.
-//! These children inherit the environment, accept an explicit cwd and inherit
-//! only allow-listed standard file handles. Interactive console support remains
-//! a separate boundary.
+//! with kill-on-close. Windows 10+ is required for atomic assignment through
+//! JOB_LIST at creation. Neither PIDs nor a caller's containing job confer
+//! cleanup authority. Children inherit the environment, accept an explicit cwd
+//! and, unless `inherit_console` is set, inherit only allow-listed standard
+//! file handles. Interactive console inheritance stays inside the same Job.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -154,7 +154,8 @@ pub struct CommandSpec {
     pub current_dir: Option<std::path::PathBuf>,
     /// Overrides affect only the new child; None removes the named variable.
     pub env: std::collections::BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>>,
-    /// Inherit the parent's console when used for an interactive foreground CLI.
+    /// Inherit the parent's console and standard streams for an interactive CLI.
+    /// Cannot be combined with redirected handles, a new console or a pseudoconsole.
     pub inherit_console: bool,
     /// Create a separate visible interactive console with this initial title.
     /// Its standard devices cannot be combined with redirected streams or ConPTY.
@@ -450,6 +451,13 @@ mod windows {
                 std::thread::sleep(POLL.min(deadline.remaining()));
             }
         }
+        pub fn wait_unbounded(&self) -> io::Result<()> {
+            match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), INFINITE) } {
+                WAIT_OBJECT_0 => Ok(()),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                _ => Err(io::Error::other("unexpected process wait status")),
+            }
+        }
     }
 
     /// Dropping before resume terminates only the newly created retained handle.
@@ -715,6 +723,16 @@ mod windows {
                     "a new visible console requires its own standard devices",
                 ));
             }
+            if command.inherit_console
+                && (pseudoconsole.is_some()
+                    || command.stdin.is_some()
+                    || command.stdout.is_some()
+                    || command.stderr.is_some())
+            {
+                return Err(invalid(
+                    "inheriting the parent console cannot be combined with redirected streams",
+                ));
+            }
             let directory = command
                 .current_dir
                 .as_ref()
@@ -754,16 +772,17 @@ mod windows {
             // A pseudoconsole supplies its own console standard handles. Even
             // without STARTF_USESTDHANDLES, inheriting our NUL handles can replace
             // them. Only the ordinary redirected process path has HANDLE_LIST.
-            let streams = if pseudoconsole.is_none() && console_title.is_none() {
-                let nul = OpenOptions::new().read(true).write(true).open("NUL")?;
-                Some([
-                    inherited_copy(command.stdin.as_ref().unwrap_or(&nul))?,
-                    inherited_copy(command.stdout.as_ref().unwrap_or(&nul))?,
-                    inherited_copy(command.stderr.as_ref().unwrap_or(&nul))?,
-                ])
-            } else {
-                None
-            };
+            let streams =
+                if !command.inherit_console && pseudoconsole.is_none() && console_title.is_none() {
+                    let nul = OpenOptions::new().read(true).write(true).open("NUL")?;
+                    Some([
+                        inherited_copy(command.stdin.as_ref().unwrap_or(&nul))?,
+                        inherited_copy(command.stdout.as_ref().unwrap_or(&nul))?,
+                        inherited_copy(command.stderr.as_ref().unwrap_or(&nul))?,
+                    ])
+                } else {
+                    None
+                };
             let inherited = streams
                 .as_ref()
                 .map(|s| s.each_ref().map(AsRawHandle::as_raw_handle));
@@ -797,7 +816,7 @@ mod windows {
             // Explicit null handles on ConPTY prevent the parent's redirected
             // streams from replacing the pseudoconsole's standard devices.
             // Same contract as the retained real C# console acceptance oracle.
-            startup.StartupInfo.dwFlags = if console_title.is_some() {
+            startup.StartupInfo.dwFlags = if console_title.is_some() || command.inherit_console {
                 0
             } else {
                 STARTF_USESTDHANDLES
@@ -819,7 +838,7 @@ mod windows {
                     line.as_mut_ptr(),
                     null(),
                     null(),
-                    i32::from(streams.is_some()),
+                    i32::from(streams.is_some() || command.inherit_console),
                     CREATE_SUSPENDED
                         | EXTENDED_STARTUPINFO_PRESENT
                         | if console_title.is_some() {
@@ -984,6 +1003,25 @@ mod windows {
                 process_exit_code,
                 job,
             })
+        }
+
+        /// Wait indefinitely for the session root, then reap leftover members.
+        /// Helper jobs with an execution budget keep using `wait`.
+        pub fn wait_foreground(
+            self,
+            process: &OwnedProcess,
+            cleanup_timeout: Duration,
+        ) -> io::Result<u32> {
+            if !self.contains(process)? {
+                return Err(invalid("process does not belong to this job"));
+            }
+            process.wait_unbounded()?;
+            let code = process
+                .exit_code()?
+                .ok_or_else(|| io::Error::other("root still running after wait"))?;
+            self.stop(code)?;
+            self.wait_empty(cleanup_timeout, Some(process))?;
+            Ok(code)
         }
     }
 }

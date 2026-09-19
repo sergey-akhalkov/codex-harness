@@ -15,6 +15,7 @@ use std::{
 
 const MODEL: &str = "gpt-6-astra";
 const EFFORT: &str = "xhigh";
+const XAI_MODEL: &str = "grok-4.6";
 const INPUT_LIMIT: u64 = 4 * 1024 * 1024;
 const PROMPT_LIMIT: usize = 1024 * 1024;
 
@@ -34,6 +35,19 @@ struct Request {
     extra_config: BTreeMap<String, Value>,
     useful_command_pattern: Option<String>,
     cancel_file: Option<PathBuf>,
+    #[serde(default)]
+    user_home: Option<PathBuf>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    xai_auth: Option<XaiAuth>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XaiAuth {
+    command: PathBuf,
+    home: PathBuf,
 }
 fn default_timeout() -> u64 {
     600
@@ -119,7 +133,7 @@ fn attempt(request: Request) -> io::Result<Value> {
     Ok(result)
 }
 
-fn validate(request: &Request) -> io::Result<(PathBuf, PathBuf, Vec<String>)> {
+fn validate(request: &Request) -> io::Result<(PathBuf, PathBuf, Option<PathBuf>, Vec<String>)> {
     if !(1..=604800).contains(&request.timeout)
         || !(1024..=512 * 1024 * 1024).contains(&request.output_limit)
         || request.prompt.len() > PROMPT_LIMIT
@@ -146,13 +160,27 @@ fn validate(request: &Request) -> io::Result<(PathBuf, PathBuf, Vec<String>)> {
     if case.starts_with(&home) || home.starts_with(&case) {
         return Err(invalid());
     }
+    let user = match &request.user_home {
+        Some(path) => {
+            let user = isolated(path)?;
+            if case.starts_with(&user)
+                || user.starts_with(&case)
+                || home.starts_with(&user)
+                || user.starts_with(&home)
+            {
+                return Err(invalid());
+            }
+            Some(user)
+        }
+        None => None,
+    };
     if let Some(pattern) = &request.useful_command_pattern {
         regex::RegexBuilder::new(pattern)
             .size_limit(1024 * 1024)
             .build()
             .map_err(|_| invalid())?;
     }
-    Ok((case, home, config_arguments(&request.extra_config)?))
+    Ok((case, home, user, config_arguments(&request.extra_config)?))
 }
 
 pub(crate) fn isolated(path: &Path) -> io::Result<PathBuf> {
@@ -165,6 +193,74 @@ pub(crate) fn isolated(path: &Path) -> io::Result<PathBuf> {
         return Err(invalid());
     }
     Ok(path)
+}
+
+fn selected_runner(request: &Request) -> io::Result<(&'static str, &'static str)> {
+    match request.profile.as_deref() {
+        None | Some("") => Ok((MODEL, "OpenAI")),
+        Some("xai") => {
+            let auth = request.xai_auth.as_ref().ok_or_else(invalid)?;
+            if !auth.command.is_absolute()
+                || !auth.command.is_file()
+                || !auth.home.is_absolute()
+                || !auth.home.is_dir()
+            {
+                return Err(invalid());
+            }
+            Ok((XAI_MODEL, "xai"))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn write_xai_home(home: &Path, auth: &XaiAuth) -> io::Result<()> {
+    let command = display_path(&auth.command).replace('\\', "\\\\");
+    let token_home = display_path(&auth.home).replace('\\', "\\\\");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model = \"{XAI_MODEL}\"\nmodel_provider = \"xai\"\nmodel_reasoning_effort = \"{EFFORT}\"\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[model_providers.xai]\nname = \"xAI\"\nbase_url = \"http://127.0.0.1:56122/v1\"\nwire_api = \"responses\"\n\n[model_providers.xai.auth]\ncommand = \"{command}\"\nargs = [\"xai-token\", \"--codex-home\", \"{token_home}\"]\ntimeout_ms = 15000\n\n[windows]\nsandbox = \"unelevated\"\n\n[features]\nhooks = false\n"
+        ),
+    )
+}
+
+fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+}
+
+fn isolate_user_profile(
+    env: &mut BTreeMap<OsString, Option<OsString>>,
+    user: &Path,
+) -> io::Result<()> {
+    fs::create_dir_all(user.join("AppData/Roaming"))?;
+    fs::create_dir_all(user.join("AppData/Local/Temp"))?;
+    fs::create_dir_all(user.join(".agents/skills"))?;
+    let profile = display_path(user);
+    env.insert("USERPROFILE".into(), Some(profile.clone().into()));
+    env.insert("HOME".into(), Some(profile.clone().into()));
+    env.insert("USERNAME".into(), Some("isolated-user".into()));
+    env.insert(
+        "APPDATA".into(),
+        Some(display_path(&user.join("AppData/Roaming")).into()),
+    );
+    env.insert(
+        "LOCALAPPDATA".into(),
+        Some(display_path(&user.join("AppData/Local")).into()),
+    );
+    env.insert(
+        "TEMP".into(),
+        Some(display_path(&user.join("AppData/Local/Temp")).into()),
+    );
+    env.insert(
+        "TMP".into(),
+        Some(display_path(&user.join("AppData/Local/Temp")).into()),
+    );
+    if profile.len() >= 2 && profile.as_bytes().get(1) == Some(&b':') {
+        env.insert("HOMEDRIVE".into(), Some(profile[..2].to_owned().into()));
+        env.insert("HOMEPATH".into(), Some(profile[2..].to_owned().into()));
+    }
+    Ok(())
 }
 
 pub(crate) fn repository() -> PathBuf {
@@ -243,8 +339,24 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
         time::Duration,
     };
     result["failure_phase"] = json!("validation");
-    let (case, home, extra) = validate(request)?;
-    if root.starts_with(&case) || root.starts_with(&home) {
+    let (case, home, user, mut extra) = validate(request)?;
+    let (model, provider) = selected_runner(request)?;
+    if provider == "xai" {
+        write_xai_home(&home, request.xai_auth.as_ref().ok_or_else(invalid)?)?;
+        extra.splice(
+            0..0,
+            [
+                "-c".into(),
+                format!("model_provider={}", json!("xai")),
+                "--disable".into(),
+                "hooks".into(),
+            ],
+        );
+    }
+    if root.starts_with(&case)
+        || root.starts_with(&home)
+        || user.as_ref().is_some_and(|user| root.starts_with(user))
+    {
         return Err(invalid());
     }
     result["failure_phase"] = json!("preparation");
@@ -262,16 +374,16 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     .into_iter()
     .map(str::to_owned)
     .chain([
-        case.to_string_lossy().into_owned(),
+        display_path(&case),
         "-m".into(),
-        MODEL.into(),
+        model.into(),
         "-c".into(),
         format!("model_reasoning_effort={}", json!(EFFORT)),
     ])
     .chain(extra)
     .chain([
         "--output-last-message".into(),
-        final_path.to_string_lossy().into_owned(),
+        display_path(&final_path),
         "-".into(),
     ])
     .collect();
@@ -280,19 +392,30 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     spec.args = args.iter().map(OsString::from).collect();
     spec.current_dir = Some(case.clone());
     spec.env
-        .insert("CODEX_HOME".into(), Some(home.as_os_str().into()));
+        .insert("CODEX_HOME".into(), Some(display_path(&home).into()));
+    if let Some(user) = &user {
+        spec.env
+            .insert("USERPROFILE".into(), Some(display_path(user).into()));
+        spec.env
+            .insert("HOME".into(), Some(display_path(user).into()));
+        isolate_user_profile(&mut spec.env, user)?;
+    }
     spec.stdin = Some(File::open(&stdin)?);
     spec.stdout = Some(create(&stdout)?);
     spec.stderr = Some(create(&stderr)?);
     result["executable_sha256"] = json!(hash_file(&request.launcher)?);
-    result["model"] = json!(MODEL);
+    result["model"] = json!(model);
     result["effort"] = json!(EFFORT);
+    let mut environment = json!({"CODEX_HOME": home});
+    if let Some(user) = &user {
+        environment["USERPROFILE"] = json!(user);
+        environment["HOME"] = json!(user);
+    }
     write_new(
         &root.join("request.json"),
         &json!({"executable":request.launcher,"arguments":args,
         "workingDirectory":case,"stdoutPath":stdout,"stderrPath":stderr,"stdinPath":stdin,
-        "memoryLimitMiB":2048,"timeoutSeconds":request.timeout,"outputLimitBytes":request.output_limit,
-        "environment":{"CODEX_HOME":home}}),
+        "memoryLimitMiB":2048,"timeoutSeconds":request.timeout,"outputLimitBytes":request.output_limit,"environment":environment}),
     )?;
     let mut telemetry = events::Events::open(
         &stdout,
@@ -440,9 +563,13 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     let verified = identities_match
         && errors.is_empty()
         && observed.iter().all(|t| {
-            (t["model"] == MODEL || t["model"] == format!("openai/{MODEL}"))
+            (t["model"] == model
+                || t["model"] == format!("openai/{model}")
+                || t["model"] == format!("xai/{model}"))
                 && t["reasoning"] == EFFORT
-                && t["provider"] == "OpenAI"
+                && t["provider"]
+                    .as_str()
+                    .is_some_and(|seen| seen.eq_ignore_ascii_case(provider))
         });
     if !verified {
         errors.insert("observed_model_policy_unverified".into());

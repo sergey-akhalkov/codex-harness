@@ -27,14 +27,13 @@ current source, the installed CLI and the relevant local inputs.
 | Native Rust commands and unfinished cutover | [Rust native](rust-native.md) |
 | Current migration map and remaining work | [Rust migration](evidence/rust-migration.md) |
 | Project memory index | [docs/memory](memory/README.md) |
+| Skill evolution calibration and limits | [Skill evolution](memory/skill-evolution.md) |
 
 Archived [CodeGraph replacement](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/proposal.md)
 recorded the accepted bounded automatic refresh and measured retrieval policy.
 Active OpenSpec work remains authoritative until its own tasks close:
 
 - [migrate-harness-to-rust](../openspec/changes/migrate-harness-to-rust/proposal.md)
-- [autonomous-skill-evolution](../openspec/changes/autonomous-skill-evolution/proposal.md)
-- [accelerate-verified-delivery](../openspec/changes/accelerate-verified-delivery/proposal.md)
 - [orchestrate-subscription-agents](../openspec/changes/orchestrate-subscription-agents/proposal.md)
 
 Use `openspec list` and the owning tasks for current progress. Publication and
@@ -64,8 +63,3 @@ Documentation and the binary can diverge.
 - Whether WSL, Linux or macOS support follows the current Windows native delivery
 - How to measure later capability gains on comparable tasks; level and spend
   policy is already recorded in [agent delegation](agent-delegation.md)
-- Whether two-consumer quantitative speed comparison remains required after
-  withdrawing ongoing source-kit support; remaining
-  [accelerate-verified-delivery](../openspec/changes/accelerate-verified-delivery/proposal.md)
-  benefit tasks 5.4 and 6.4 stay open. Controlled hooks-off Astra pairs for
-  the remaining local cases already ran; they do not prove benefit.

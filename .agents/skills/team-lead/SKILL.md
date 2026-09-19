@@ -27,6 +27,10 @@ specifications are features, executor feedback is a `task` labeled `feedback`.
 If `bd` is missing or broken, report `board unavailable` and continue only work
 whose acceptance does not depend on the board.
 
+On session start, read the board before rediscovering work: `lead_review`,
+assignee `lead`, then ready items. Record new lead follow-ups as tasks assigned
+to `lead` so a later session does not repeat completed verification.
+
 ## Assign and brief
 
 Brief executors through harness commands, not by automating TUI keystrokes:
@@ -39,6 +43,11 @@ Each executor gets a complete outcome, its configured profile, its own visible
 window, and a Codex-managed worktree before the first model request. Do not
 write to the shared checkout. Do not solve delegated work in parallel. A small
 or tightly coupled task stays with the lead.
+The `--exec` prompt points at board ids; the beads issue is the assignment.
+Start executor prompts with `/goal` so a bounded assignment survives a
+mid-work stop; accept only against the assignment, not effort spent.
+Spawn returns after the executor window/tab is open so the lead can keep
+working. Executors look at the board and do assigned issues.
 
 ## Steer, wait, stop
 
@@ -47,6 +56,12 @@ visible conversation. No hidden model calls and no status polling. Wait without
 takeover while an executor remains active. Executors escalate as board feedback
 tasks. `codex-harness` task stop remains the emergency path that works without
 the lead. Explicit stop stays stopped after restart.
+Do not poll from model turns or executor PIDs. While an executor runs, keep
+one native watcher process that checks the board review queue, the
+assignment's result artifact and executor liveness on a cheap shell loop and
+emits a single event; the lead blocks on that event between useful work.
+While executors run, the lead analyzes bottlenecks, spend and next cuts, and
+files those as board tasks.
 
 ## Accept and merge
 
@@ -55,6 +70,8 @@ accepted branches yourself. Return in-scope defects with acceptance conditions
 to the original executor. Record acceptance on the board and in task state.
 Retire a clean managed worktree through native confirmed deletion when eligible;
 otherwise preserve it and report the limit.
+Executors set status `lead_review` instead of closing. The lead closes on
+accept or returns the item to `in_progress` with conditions.
 
 ## Recovery
 

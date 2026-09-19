@@ -412,13 +412,12 @@ fn explicit_native_precedence_and_package_manager_metadata() {
 
 #[test]
 fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() {
-    for mode in ["registration", "journal", "upstream", "recursion"] {
+    for mode in ["registration", "journal", "recursion"] {
         let f = Fixture::new();
         let before = fs::read(f.state.join("active-build.json")).unwrap();
         match mode {
             "registration" => fs::remove_file(f.home.join("harness/native-launch.json")).unwrap(),
             "journal" => fs::write(f.state.join("build-selection-journal.json"),"interrupted").unwrap(),
-            "upstream" => { let mut file=fs::OpenOptions::new().append(true).open(&f.upstream).unwrap(); file.write_all(b"changed").unwrap(); },
             "recursion" => f.register(json!({"executable":f.launcher,"sha256":build_identity::hash_file(&f.launcher).unwrap(),"package":null})),
             _ => unreachable!(),
         }
@@ -440,6 +439,64 @@ fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() 
             "ordinary launch compiled: {mode}"
         );
     }
+}
+
+#[test]
+fn changed_upstream_digest_still_launches_without_a_compatibility_warning() {
+    let f = Fixture::new();
+    f.register(json!({
+        "executable": f.upstream,
+        "sha256": "0".repeat(64),
+        "package": null
+    }));
+    let out = f
+        .command()
+        .args(["--profile", "user", "exec"])
+        .env("CARGO", "must-not-run")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(stderr.trim(), "upstream stderr");
+    assert!(!stderr.contains("explicit update"), "{stderr}");
+    assert!(!f.state.join("staging").exists());
+
+    let f = Fixture::new();
+    let package = f.root.path().join("package");
+    fs::create_dir(&package).unwrap();
+    fs::write(
+        package.join("package.json"),
+        "{\"name\":\"@openai/codex\",\"version\":\"0.155.0\"}",
+    )
+    .unwrap();
+    f.register(json!({
+        "executable": f.upstream,
+        "sha256": build_identity::hash_file(&f.upstream).unwrap(),
+        "package": {
+            "root": package,
+            "manifest_sha256": "0".repeat(64),
+            "manager": "npm"
+        }
+    }));
+    let out = f
+        .command()
+        .args(["--profile", "user", "exec"])
+        .env("CARGO", "must-not-run")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+    assert_eq!(stderr.trim(), "upstream stderr");
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["environment"]["CODEX_MANAGED_BY_NPM"], "1");
 }
 
 #[test]

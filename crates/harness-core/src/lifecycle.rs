@@ -9,6 +9,7 @@ pub enum Component {
     CodeTools,
     Subscriptions,
     TokenWorkflow,
+    Board,
 }
 
 impl Component {
@@ -18,6 +19,7 @@ impl Component {
             Self::CodeTools => "--code-tools-only",
             Self::Subscriptions => "--subscriptions-only",
             Self::TokenWorkflow => "--token-workflow-only",
+            Self::Board => "--board-only",
         }
     }
 }
@@ -28,6 +30,7 @@ pub fn parse_flag(name: &str) -> Option<Component> {
         "--code-tools-only" => Some(Component::CodeTools),
         "--subscriptions-only" => Some(Component::Subscriptions),
         "--token-workflow-only" => Some(Component::TokenWorkflow),
+        "--board-only" => Some(Component::Board),
         _ => None,
     }
 }

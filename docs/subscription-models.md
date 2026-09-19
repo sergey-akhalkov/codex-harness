@@ -53,6 +53,8 @@ Ordinary `codex` uses the shared GPT-6 Astra default. Grok is opt-in via
 Z.AI GLM-5.3 is opt-in via `--profile zai`. The launcher starts the shim
 only for `xai`-profile invocations; it self-exits when no `codex.exe` process
 remains.
+Role routing for orchestrated executors lives in
+[orchestration configuration](agent-delegation.md#orchestration-configuration).
 The started process is the selected build's `codex-harness.exe`. A leftover
 shim holding `56122` is reused only while it belongs to the selected build; a
 shim from an earlier build is replaced on the next `xai` launch (see the

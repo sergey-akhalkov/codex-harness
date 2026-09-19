@@ -21,6 +21,11 @@ use std::{
 const PACKAGE: &str = "serena-agent";
 const VERSION: &str = "1.7.0";
 const CLEANUP: Duration = Duration::from_secs(5);
+/// rust-analyzer, optional Node language servers and Serena's Python file
+/// notifier share one Windows Job. 2 GiB caused `MemoryError` during baseline
+/// polling, after which every semantic call failed with an uninitialized
+/// language-server manager.
+const WORKER_JOB_MEMORY_BYTES: usize = 4096 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Launch {
@@ -249,7 +254,7 @@ impl Session {
         command.stdout = Some(stdout);
         command.stderr = Some(File::create(&stderr)?);
         let job = Job::new(Limits {
-            memory_bytes: Some(2048 * 1024 * 1024),
+            memory_bytes: Some(WORKER_JOB_MEMORY_BYTES),
             cpu_percent: Some(25.0),
         })?;
         let child = job.spawn(&command)?;

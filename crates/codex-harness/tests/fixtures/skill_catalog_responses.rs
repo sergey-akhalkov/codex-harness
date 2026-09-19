@@ -26,7 +26,14 @@ pub const USER_PROMPT: &str =
     "Run the outstanding inspection command. Do not create files. Do not mention skill names.";
 pub const NEXT_TURN_PROMPT: &str =
     "Next-turn catalogue control. Reply with SKILL_CATALOG_NEXT_TURN_OK.";
+pub const UNRELATED_PROMPT: &str =
+    "Unrelated request. Reply with SKILL_CATALOG_UNRELATED_OK. Do not mention skills.";
+pub const RETIRE_PROMPT: &str = "Retire catalogue control. Reply with SKILL_CATALOG_RETIRE_OK.";
+pub const RESUME_PROMPT: &str = "Resume catalogue control. Reply with SKILL_CATALOG_RESUME_OK.";
+pub const CHILD_PROMPT: &str =
+    "Child catalogue control. Reply with SKILL_CATALOG_CHILD_OK. Do not spawn other agents.";
 pub const EARLY_SKILL: &str = "skill_catalog_early_probe";
+pub const CHILD_CALL_ID: &str = "skill-catalog-child-exec-1";
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 
@@ -47,6 +54,12 @@ pub enum RequestKind {
     Compact,
     Continuation,
     NextTurn,
+    Resume,
+    ChildSampling,
+    ChildContinuation,
+    Unrelated,
+    RetireTurn,
+    SkillBody,
     Other,
 }
 
@@ -62,6 +75,10 @@ struct Inner {
     next_seq: AtomicUsize,
     requests: Mutex<Vec<CapturedRequest>>,
     root: PathBuf,
+    short_exec: AtomicBool,
+    spawn_child: AtomicBool,
+    skill_read: Mutex<Option<String>>,
+    skill_exec: Mutex<Option<String>>,
 }
 
 pub struct CannedResponses {
@@ -72,6 +89,18 @@ pub struct CannedResponses {
 
 impl CannedResponses {
     pub fn spawn(root: &Path) -> io::Result<Self> {
+        Self::spawn_mode(root, false, false)
+    }
+
+    pub fn spawn_short(root: &Path) -> io::Result<Self> {
+        Self::spawn_mode(root, true, false)
+    }
+
+    pub fn spawn_child(root: &Path) -> io::Result<Self> {
+        Self::spawn_mode(root, false, true)
+    }
+
+    fn spawn_mode(root: &Path, short_exec: bool, spawn_child: bool) -> io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
@@ -81,6 +110,10 @@ impl CannedResponses {
             next_seq: AtomicUsize::new(1),
             requests: Mutex::new(Vec::new()),
             root: root.to_path_buf(),
+            short_exec: AtomicBool::new(short_exec),
+            spawn_child: AtomicBool::new(spawn_child),
+            skill_read: Mutex::new(None),
+            skill_exec: Mutex::new(None),
         });
         let worker = Arc::clone(&inner);
         let thread = thread::spawn(move || accept_loop(listener, worker));
@@ -108,6 +141,14 @@ impl CannedResponses {
             thread::sleep(Duration::from_millis(50));
         }
         pred(&self.requests())
+    }
+
+    pub fn set_skill_read(&self, path: &Path) {
+        *self.inner.skill_read.lock().unwrap() = Some(path.to_string_lossy().into_owned());
+    }
+
+    pub fn set_exec_cmd(&self, cmd: impl Into<String>) {
+        *self.inner.skill_exec.lock().unwrap() = Some(cmd.into());
     }
 }
 
@@ -156,7 +197,7 @@ fn handle_connection(mut stream: TcpStream, inner: Arc<Inner>) -> io::Result<()>
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
     let body_text = String::from_utf8_lossy(&body).into_owned();
-    let kind = classify(&method, &path, &body_text);
+    let kind = classify(&method, &path, &body_text, &inner);
     let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
     let captured = CapturedRequest {
         seq,
@@ -175,11 +216,11 @@ fn handle_connection(mut stream: TcpStream, inner: Arc<Inner>) -> io::Result<()>
     };
     persist_request(&inner.root, &captured);
     inner.requests.lock().unwrap().push(captured);
-    let (status, content_type, payload) = response_for(&method, &path, kind);
+    let (status, content_type, payload) = response_for(&method, &path, kind, &inner);
     write_response(&mut stream, status, content_type, payload.as_bytes())
 }
 
-fn classify(method: &str, path: &str, body: &str) -> RequestKind {
+fn classify(method: &str, path: &str, body: &str, inner: &Inner) -> RequestKind {
     let path = path.split('?').next().unwrap_or(path);
     if method == "GET" && path.ends_with("/models") {
         return RequestKind::Models;
@@ -189,12 +230,66 @@ fn classify(method: &str, path: &str, body: &str) -> RequestKind {
     }
     if body.contains(COMPACT_PROMPT) {
         RequestKind::Compact
+    } else if body.contains(RETIRE_PROMPT) {
+        RequestKind::RetireTurn
+    } else if body.contains(UNRELATED_PROMPT) {
+        RequestKind::Unrelated
+    } else if body.contains(RESUME_PROMPT) {
+        RequestKind::Resume
     } else if body.contains(NEXT_TURN_PROMPT) {
-        RequestKind::NextTurn
+        let already = inner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|req| req.kind == RequestKind::NextTurn);
+        if already {
+            RequestKind::SkillBody
+        } else {
+            RequestKind::NextTurn
+        }
+    } else if body.contains(CHILD_PROMPT) {
+        let requests = inner.requests.lock().unwrap();
+        let had_sample = requests
+            .iter()
+            .any(|req| req.kind == RequestKind::ChildSampling);
+        let had_cont = requests
+            .iter()
+            .any(|req| req.kind == RequestKind::ChildContinuation);
+        if had_cont {
+            RequestKind::SkillBody
+        } else if had_sample {
+            RequestKind::ChildContinuation
+        } else {
+            RequestKind::ChildSampling
+        }
     } else if body.contains(SUMMARY_TEXT) || body.contains(SUMMARY_PREFIX) {
-        RequestKind::Continuation
+        let already = inner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|req| req.kind == RequestKind::Continuation);
+        if already {
+            RequestKind::SkillBody
+        } else {
+            RequestKind::Continuation
+        }
     } else if body.contains(USER_PROMPT) {
-        RequestKind::FirstSampling
+        let requests = inner.requests.lock().unwrap();
+        let had_first = requests
+            .iter()
+            .any(|req| req.kind == RequestKind::FirstSampling);
+        let had_cont = requests
+            .iter()
+            .any(|req| req.kind == RequestKind::Continuation);
+        if had_cont {
+            RequestKind::SkillBody
+        } else if had_first {
+            RequestKind::Continuation
+        } else {
+            RequestKind::FirstSampling
+        }
     } else {
         RequestKind::Other
     }
@@ -204,6 +299,7 @@ fn response_for(
     method: &str,
     path: &str,
     kind: RequestKind,
+    inner: &Inner,
 ) -> (&'static str, &'static str, String) {
     let path = path.split('?').next().unwrap_or(path);
     if method == "GET" && path.ends_with("/models") {
@@ -227,15 +323,56 @@ fn response_for(
     }
     let sse = match kind {
         RequestKind::Compact => compact_sse(),
-        RequestKind::Continuation => message_sse("cont-1", "SKILL_CATALOG_CONTINUATION_OK", 1200),
-        RequestKind::NextTurn => message_sse("next-1", "SKILL_CATALOG_NEXT_TURN_OK", 800),
-        RequestKind::FirstSampling | RequestKind::Other => first_sampling_sse(),
+        RequestKind::Continuation => {
+            live_read_or_message(inner, "cont-1", "SKILL_CATALOG_CONTINUATION_OK", 1200)
+        }
+        RequestKind::NextTurn => {
+            live_read_or_message(inner, "next-1", "SKILL_CATALOG_NEXT_TURN_OK", 800)
+        }
+        RequestKind::SkillBody => message_sse("skill-body-1", "SKILL_CATALOG_SKILL_BODY_OK", 800),
+        RequestKind::Unrelated => message_sse("unrelated-1", "SKILL_CATALOG_UNRELATED_OK", 400),
+        RequestKind::RetireTurn => message_sse("retire-1", "SKILL_CATALOG_RETIRE_OK", 400),
+        RequestKind::Resume => message_sse("resume-1", "SKILL_CATALOG_RESUME_OK", 800),
+        RequestKind::ChildSampling => child_sampling_sse(),
+        RequestKind::ChildContinuation => {
+            live_read_or_message(inner, "child-cont-1", "SKILL_CATALOG_CHILD_OK", 800)
+        }
+        RequestKind::FirstSampling | RequestKind::Other => first_sampling_sse(
+            inner.short_exec.load(Ordering::SeqCst),
+            inner.spawn_child.load(Ordering::SeqCst),
+        ),
         RequestKind::Models => unreachable!(),
     };
     ("200 OK", "text/event-stream", sse)
 }
 
-fn first_sampling_sse() -> String {
+fn first_sampling_sse(short_exec: bool, spawn_child: bool) -> String {
+    if spawn_child {
+        let arguments = serde_json::to_string(&json!({
+            "fork_context": false,
+            "message": CHILD_PROMPT
+        }))
+        .unwrap();
+        return sse(&[
+            json!({"type": "response.created", "response": {"id": "resp-first"}}),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "skill-catalog-spawn-1",
+                    "namespace": "multi_agent_v1",
+                    "name": "spawn_agent",
+                    "arguments": arguments
+                }
+            }),
+            completed("resp-first", 1_200),
+        ]);
+    }
+    let (cmd, yield_ms, tokens) = if short_exec {
+        ("ping -n 4 127.0.0.1", 3000, 1_200)
+    } else {
+        ("ping -n 40 127.0.0.1", 30000, 250_000)
+    };
     sse(&[
         json!({"type": "response.created", "response": {"id": "resp-first"}}),
         json!({
@@ -244,10 +381,82 @@ fn first_sampling_sse() -> String {
                 "type": "function_call",
                 "call_id": CALL_ID,
                 "name": "exec_command",
-                "arguments": "{\"cmd\":\"ping -n 40 127.0.0.1\",\"yield_time_ms\":30000}"
+                "arguments": format!("{{\"cmd\":\"{cmd}\",\"yield_time_ms\":{yield_ms}}}")
             }
         }),
-        completed("resp-first", 250_000),
+        completed("resp-first", tokens),
+    ])
+}
+
+fn child_sampling_sse() -> String {
+    sse(&[
+        json!({"type": "response.created", "response": {"id": "resp-child"}}),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": CHILD_CALL_ID,
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"ping -n 8 127.0.0.1\",\"yield_time_ms\":7000}"
+            }
+        }),
+        completed("resp-child", 1_200),
+    ])
+}
+
+fn self_skill_read(inner: &Inner) -> Option<String> {
+    inner.skill_read.lock().unwrap().clone()
+}
+
+fn live_read_or_message(inner: &Inner, id: &str, text: &str, tokens: i64) -> String {
+    if let Some(cmd) = inner.skill_exec.lock().unwrap().clone() {
+        skill_exec_sse(&cmd)
+    } else if let Some(path) = self_skill_read(inner) {
+        skill_read_sse(&path)
+    } else {
+        message_sse(id, text, tokens)
+    }
+}
+
+fn skill_exec_sse(cmd: &str) -> String {
+    let arguments = serde_json::to_string(&json!({
+        "cmd": cmd,
+        "yield_time_ms": 8000
+    }))
+    .unwrap();
+    sse(&[
+        json!({"type": "response.created", "response": {"id": "resp-skill-exec"}}),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "skill-catalog-identity-cmd-1",
+                "name": "exec_command",
+                "arguments": arguments
+            }
+        }),
+        completed("resp-skill-exec", 800),
+    ])
+}
+
+fn skill_read_sse(path: &str) -> String {
+    let arguments = serde_json::to_string(&json!({
+        "cmd": format!("Get-Content -LiteralPath '{}'", path.replace('\'', "''")),
+        "yield_time_ms": 5000
+    }))
+    .unwrap();
+    sse(&[
+        json!({"type": "response.created", "response": {"id": "resp-skill-read"}}),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "skill-catalog-identity-read-1",
+                "name": "exec_command",
+                "arguments": arguments
+            }
+        }),
+        completed("resp-skill-read", 800),
     ])
 }
 

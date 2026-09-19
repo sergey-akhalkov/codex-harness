@@ -27,6 +27,10 @@ struct Request {
     setup: Setup,
     execution: PathBuf,
     arm: Arm,
+    #[serde(default)]
+    compared_skill: Option<String>,
+    #[serde(default)]
+    reject_profile_skills: bool,
 }
 #[derive(Deserialize)]
 struct Setup {
@@ -115,10 +119,12 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 
 fn validate_setup(setup: &Setup, workspace: &Path) -> io::Result<()> {
     let names: &[&str] = match setup.case_id.as_str() {
-        "freshness" | "entrypoint" => &["README.md", "source.json", "case.exe"],
+        "freshness" | "entrypoint" | "cli-now" | "cli-prior" => {
+            &["README.md", "source.json", "case.exe"]
+        }
         "process" => &["README.md", "unrelated.txt", "case.exe", "observe.exe"],
         "missing" => &["verification.json"],
-        "negative" => &["guide.md"],
+        "negative" | "typo-fix" => &["guide.md"],
         _ => return Err(invalid()),
     };
     if setup.source_state != "controlled-v3-rust"
@@ -217,19 +223,33 @@ fn verify(
         "successful tool-input path reference; not proof of reading or applying instructions"
     );
     let case = request.setup.case_id.as_str();
-    if request.arm == Arm::Candidate && case != "negative" {
+    let compared = request
+        .compared_skill
+        .as_deref()
+        .unwrap_or(if case == "process" {
+            "reproduce-regression"
+        } else {
+            "project-verification"
+        });
+    let compared_used = evidence::referenced_skill(&observed.items, compared);
+    details["compared_skill"] = json!(compared);
+    if request.reject_profile_skills {
+        let profile_skill =
+            pattern(r"(?i)(?:^|[/\\])Users[/\\][^/\\]+[/\\]\.agents[/\\]skills[/\\]");
         checks.insert(
-            "positive_activation".into(),
-            uses[if case == "process" {
-                "reproduce-regression"
-            } else {
-                "project-verification"
-            }],
+            "no_profile_skill_path".into(),
+            !observed
+                .items
+                .iter()
+                .any(|item| profile_skill.is_match(&evidence::tool_input(item))),
         );
+    }
+    if request.arm == Arm::Candidate && case != "negative" && case != "typo-fix" {
+        checks.insert("positive_activation".into(), compared_used);
     } else {
         checks.insert(
             "negative_activation".into(),
-            !uses.values().any(|value| *value),
+            !compared_used && !uses.values().any(|value| *value),
         );
     }
     let report = read_json(&scoped_file(workspace, "outcome.json")?, 1024 * 1024)?;
@@ -249,7 +269,7 @@ fn verify(
             },
     );
     match case {
-        "freshness" | "entrypoint" => {
+        "freshness" | "entrypoint" | "cli-now" | "cli-prior" => {
             // Snapshot before our independent invocation; our execution cannot
             // retroactively supply evidence that the candidate ran the product.
             let audit_path = workspace.join("execution-audit.jsonl");
@@ -306,7 +326,7 @@ fn verify(
                 read_json(&scoped_file(workspace, "built.json")?, 1024)?
                     == read_json(&scoped_file(workspace, "source.json")?, 1024)?,
             );
-            if case == "freshness" {
+            if case == "freshness" || case == "cli-prior" {
                 let record = String::from_utf8(bounded(
                     &scoped_file(workspace, "docs/validation.md")?,
                     1024 * 1024,
@@ -354,7 +374,7 @@ fn verify(
             checks.insert("no_substitute_or_install".into(), !observed.items.iter().any(|item|
                 pattern(r"\b(?:pip|npm|uv|winget|choco)\s+(?:install|add)|Invoke-WebRequest|curl\s+https?").is_match(&evidence::tool_input(item))));
         }
-        "negative" => {
+        "negative" | "typo-fix" => {
             checks.insert(
                 "exact_edit".into(),
                 bounded(&scoped_file(workspace, "README.md")?, 1024 * 1024)?

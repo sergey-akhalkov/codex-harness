@@ -92,7 +92,7 @@ The kit SHALL expose portable principles, OpenSpec skills, managed agents and th
 
 ### Requirement: Source updates and checkout availability
 
-A new Codex process SHALL consume edited contents of already connected source-owned data files without a second install or content synchronization. Changed first-party executable source SHALL require an explicit verified build/update before the affected native executable runs; stale, missing or altered builds SHALL be reported with the corrective action. Ordinary consumer startup MUST NOT invoke Cargo, compile or download dependencies. Adding or removing separately registered artifacts SHALL be reconciled by rerunning native installation without copying data artifacts. Checkout relocation SHALL support reconnection and build-identity reconciliation. Verification SHALL identify a moved, deleted or inaccessible source and MUST NOT treat a dangling connection or source-stale binary as healthy. Already running sessions are not required to reload their initial context.
+A new Codex process SHALL consume edited contents of already connected source-owned data files without a second install or content synchronization. Changed first-party executable source SHALL require an explicit verified build/update before the affected native executable runs; stale, missing or altered builds SHALL be reported with the corrective action. Ordinary consumer startup MUST NOT invoke Cargo, compile or download dependencies. Adding or removing separately registered artifacts SHALL be reconciled by rerunning native installation without copying data artifacts. Checkout relocation SHALL support reconnection and build-identity reconciliation. Verification SHALL identify a moved, deleted or inaccessible source and MUST NOT treat a dangling connection or source-stale binary as healthy. Already running sessions are not required to reload their entire initial context; skills accepted and activated by the autonomous evolution workflow SHALL additionally satisfy current-session skill awareness and revision recovery without a user restart. Orchestrated worker succession through `codex resume` is a separate consumer of those updates and SHALL NOT satisfy the current-session awareness requirement.
 
 These harness health checks SHALL NOT block ordinary upstream Codex CLI launch. An installed command bootstrap independent of checkout availability SHALL preserve access to the original CLI when harness source, shared configuration or its required build is unavailable. It SHALL report the degraded harness and use native arguments/local settings without running unverified harness extensions, rebuilding, downloading or rewriting user configuration. Missing upstream Codex itself and recursive command discovery SHALL remain explicit failures, not reasons to invoke an arbitrary replacement.
 
@@ -123,6 +123,11 @@ These harness health checks SHALL NOT block ordinary upstream Codex CLI launch. 
 #### Scenario: Stale manager needs to update itself
 - **WHEN** source freshness differs but the last accepted manager still passes binary-integrity and metadata-compatibility checks
 - **THEN** Check and explicit update/recover/disconnect remain usable without starting the obsolete ordinary runtime; an unavailable or altered manager instead requires the documented native bootstrap recovery path
+
+#### Scenario: An accepted skill changes in a running session
+- **WHEN** the autonomous workflow activates a created, updated or restored skill
+- **THEN** the current session can apply the accepted revision before its next relevant action and recover it after compaction without requiring a new process
+- **AND** recovery uses a currently allowed ordinary-CLI path; restoring ordinary diagnostic, context or Stop hooks, or substituting App Server-only success, does not satisfy this scenario
 
 ### Requirement: Bounded and repeatable installation
 
@@ -254,3 +259,82 @@ The linked kit SHALL connect Grok and Z.AI as native Codex profiles from checkou
 #### Scenario: OpenCodex leftovers are checked
 - **WHEN** Check runs after successful retirement
 - **THEN** it reports the OpenCodex proxy/task/package as absent or retired and does not treat a leftover localhost injection as healthy kit routing
+
+### Requirement: Codex CLI updates do not block ordinary launch
+
+Harness compatibility and registration freshness checks SHALL NOT prevent the
+installed Codex CLI from starting after that CLI is updated. A digest mismatch
+for the registered upstream executable or its package metadata is not by itself
+an incompatibility: ordinary launch MUST start the current CLI and MUST NOT
+warn when harness enhancements still apply. A warning is allowed only when the
+harness cannot apply its enhancements to that CLI, and MUST NOT refuse the
+process. Missing Codex itself and recursive command discovery SHALL remain
+explicit failures.
+
+#### Scenario: User restarts Codex after its own updater
+- **WHEN** Codex CLI has been updated in place and the user starts `codex` again through the installed harness command with a still-preparable harness session
+- **THEN** the current Codex CLI starts without a launch blocker and without a compatibility warning; Check may still record stale registration
+
+### Requirement: Deliver verification workflows through the global lifecycle
+
+The installed skills and their resources MUST work without the original source-kit consumer
+checkout. Previously recorded use of that project is historical acceptance
+evidence, not a requirement for ongoing compatibility or additional test runs.
+
+The linked kit SHALL deliver `project-verification`, `reproduce-regression` and their referenced reusable resources through its existing installation and discovery lifecycle. Skill bodies and resources MUST remain linked to authoritative reusable sources. Installation, source updates, reconciliation, rollback and disconnection MUST preserve existing ownership and collision guarantees. Machine-local case state and traces MUST remain outside tracked portable configuration.
+
+#### Scenario: A new session starts outside the kit checkout
+
+- **WHEN** the linked kit is activated and a new ordinary Codex session starts in another project
+- **THEN** the session discovers both skills and can access their resources without being given absolute skill paths in the task prompt
+
+#### Scenario: An installed source resource changes
+
+- **WHEN** a referenced skill resource changes in its authoritative source
+- **THEN** a new consuming session sees the source update through the existing link lifecycle without a copied deployment body
+
+#### Scenario: Skill registration conflicts with a foreign installation
+
+- **WHEN** a destination belongs to another installation
+- **THEN** activation reports the collision and preserves that destination rather than overwriting it
+
+#### Scenario: The kit is disconnected and reconnected
+
+- **WHEN** the user exercises the installation lifecycle in an isolated acceptance environment
+- **THEN** only kit-owned links are removed, source and unrelated user files survive, and reconnection restores discovery and resources
+
+### Requirement: Prove actual outside-project consumption
+
+Delivery acceptance MUST exercise project verification in two existing projects outside the harness checkout and regression reproduction in at least one of them through new native Codex sessions. Isolated worktrees or snapshots of real projects MAY be used to preserve ongoing work, but manufactured fixture-only repositories MUST NOT substitute for the two real consumers. Evidence SHALL identify the source state, actual invoked command, skill use, observed outcome and limitations. A lint-only consumer MUST count only for its demonstrated validation scope. Both workflows MUST satisfy their qualitative consumption requirements before the reusable capability is declared complete. A two-consumer quantitative speed comparison is not an implementation-acceptance requirement of this change; benefit remains unproven.
+
+#### Scenario: A consumer has unrelated uncommitted work
+
+- **WHEN** its acceptance case is prepared
+- **THEN** the case uses recorded isolated source state without modifying or cleaning the user's live checkout or controlling its running services
+
+#### Scenario: Discovery succeeds without an actual task
+
+- **WHEN** installation tests find the skills but no outside-project behavior has been exercised
+- **THEN** discovery is recorded as passing while reusable-delivery acceptance remains incomplete
+
+#### Scenario: Quantitative benefit stays unproven
+
+- **WHEN** outside-project consumption has been exercised and the two-consumer speed comparison is not required
+- **THEN** reusable-delivery acceptance may close while benefit remains unproven
+- **AND** no acceleration claim is recorded
+
+### Requirement: Autonomous managed skill registration
+
+The kit SHALL expose the evolution workflow, the `skills-usage-analysis` skill, the usage command and their required runtime resources globally through its reproducible installation lifecycle. After accepted shared skill publication or retirement, the workflow SHALL reconcile only the affected kit-owned registrations and ownership state without requiring a user to rerun installation manually. This operation SHALL preserve direct source consumption, source ownership, rollback and disconnect semantics; it MUST NOT reinstall unrelated dependencies, rewrite unrelated configuration or restart shared services. Project-owned skill packages and their records SHALL survive kit disconnection.
+
+#### Scenario: New common skill is accepted outside the harness
+- **WHEN** an authorized evolution episode in another repository promotes a skill to the canonical kit source
+- **THEN** its scoped global registration is reconciled automatically and the originating session and another project can use it through live source references
+
+#### Scenario: Registration target has foreign ownership
+- **WHEN** scoped registration encounters a conflicting foreign destination or an active installation transaction
+- **THEN** it preserves the existing state, reports the conflict or busy condition and leaves publication pending or safely recovered without claiming complete activation
+
+#### Scenario: Installation moves or disconnects
+- **WHEN** the kit is reconnected at a new location or disconnected
+- **THEN** evolution registrations follow the same ownership-aware lifecycle while project skills, knowledge records and unrelated capabilities remain intact

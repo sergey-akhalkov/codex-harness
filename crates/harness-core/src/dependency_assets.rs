@@ -79,6 +79,7 @@ pub(crate) fn admitted_redirect(url: &str) -> bool {
     const PREFIX: &str =
         "https://release-assets.githubusercontent.com/github-production-release-asset/";
     const RTK_REPOSITORY_ID: &str = "1139971460";
+    const BEADS_REPOSITORY_ID: &str = "1074561042";
     let Some(rest) = url.strip_prefix(PREFIX) else {
         return false;
     };
@@ -88,6 +89,7 @@ pub(crate) fn admitted_redirect(url: &str) -> bool {
     if repo != "1166102148"
         && repo != crate::dependency_discovery::dependency_codegraph::REPOSITORY_ID
         && repo != RTK_REPOSITORY_ID
+        && repo != BEADS_REPOSITORY_ID
     {
         return false;
     }
@@ -158,5 +160,7 @@ mod tests {
         assert!(admitted_redirect(&codegraph));
         let rtk = valid.replace("1166102148", "1139971460");
         assert!(admitted_redirect(&rtk));
+        let beads = valid.replace("1166102148", "1074561042");
+        assert!(admitted_redirect(&beads));
     }
 }

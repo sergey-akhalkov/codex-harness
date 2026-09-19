@@ -9,6 +9,8 @@ mod dependency_cli;
 #[cfg(windows)]
 mod dependency_selection_cli;
 #[cfg(windows)]
+mod executor_cli;
+#[cfg(windows)]
 mod install_cli;
 #[cfg(windows)]
 mod mcp_cli;
@@ -24,6 +26,7 @@ mod outcome_prepare;
 mod outcome_report_cli;
 mod outcome_run;
 mod ownership_check_cli;
+mod skills_cli;
 #[cfg(windows)]
 mod source_diagnostics;
 #[cfg(windows)]
@@ -244,7 +247,7 @@ fn run() -> io::Result<i32> {
         );
         println!("codex-harness dependencies recover-npm --state DIRECTORY [--rollback-committed]");
         println!(
-            "codex-harness check --core-only|--code-tools-only|--subscriptions-only|--token-workflow-only --codex-home DIRECTORY --user-home DIRECTORY [--source CHECKOUT] [--dependency-user-home DIRECTORY] [--timeout-seconds SECONDS] [--preview]"
+            "codex-harness check --core-only|--code-tools-only|--subscriptions-only|--token-workflow-only|--board-only --codex-home DIRECTORY --user-home DIRECTORY [--source CHECKOUT] [--dependency-user-home DIRECTORY] [--timeout-seconds SECONDS] [--preview]"
         );
         println!(
             "codex-harness disconnect --core-only --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY] [--preview]"
@@ -253,13 +256,13 @@ fn run() -> io::Result<i32> {
             "codex-harness recover --core-only [--preview] --codex-home DIRECTORY --user-home DIRECTORY [--dependency-user-home DIRECTORY]"
         );
         println!(
-            "codex-harness disconnect|recover --code-tools-only|--subscriptions-only|--token-workflow-only --codex-home DIRECTORY --user-home DIRECTORY --source CHECKOUT [--dependency-user-home DIRECTORY] [--preview]"
+            "codex-harness disconnect|recover --code-tools-only|--subscriptions-only|--token-workflow-only|--board-only --codex-home DIRECTORY --user-home DIRECTORY --source CHECKOUT [--dependency-user-home DIRECTORY] [--preview]"
         );
         println!(
             "codex-harness install|update --core-only|--code-tools-only --source CHECKOUT [--build DIRECTORY] --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
         );
         println!(
-            "codex-harness install --token-workflow-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
+            "codex-harness install --token-workflow-only|--board-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
         );
         println!(
             "codex-harness install|update --subscriptions-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
@@ -273,6 +276,15 @@ fn run() -> io::Result<i32> {
         println!("codex-harness xai-responses-probe --user-home DIRECTORY --evidence DIRECTORY");
         println!("codex-harness xai-responses-shim [--port N] [--upstream https://api.x.ai]");
         println!("codex-harness xai-token --codex-home DIRECTORY");
+        println!(
+            "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]"
+        );
+        println!("codex-harness skills isolate --request PATH");
+        println!("codex-harness skills usage [--user-home DIRECTORY] [--codex-home DIRECTORY]");
+        println!("codex-harness skills publish --request PATH");
+        println!(
+            "codex-harness skills identity --path DIRECTORY [--operation NAME] [--journal PATH] [--codex-home DIRECTORY]"
+        );
         println!("codex-harness outcome-prepare --case CASE [--observer ABSOLUTE_EXE]");
         println!("codex-harness outcome-oracle --request PATH");
         println!("codex-harness outcome-arm --request PATH");
@@ -342,6 +354,7 @@ fn run() -> io::Result<i32> {
                         | "--code-tools-only"
                         | "--subscriptions-only"
                         | "--token-workflow-only"
+                        | "--board-only"
                 )
             )
         })
@@ -394,11 +407,19 @@ fn run() -> io::Result<i32> {
         verify_serving()?;
         return subscription_login_cli::run(&args[1..]);
     }
+    #[cfg(windows)]
+    if args[0] == "executor" {
+        verify_runtime()?;
+        return executor_cli::run(&args[1..]);
+    }
     if args[0] == "outcome-report" {
         return outcome_report_cli::run(&args[1..]);
     }
     if args[0] == "outcome-prepare" {
         return outcome_prepare::run(&args[1..]);
+    }
+    if args[0] == "skills" {
+        return skills_cli::run(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "outcome-oracle" {

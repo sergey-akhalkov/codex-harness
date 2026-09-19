@@ -1,0 +1,12 @@
+# Kit-owned role routing. Native `codex --profile <id>` names must exist on the
+# target installation; missing names and non-positive limits are errors.
+# `default` is the native session without an explicit profile flag.
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "zai"
+executor_profiles = ["ds"]
+max_concurrent_executors = 2
+# Promote an incubator item after more than two distinct votes (threshold 3).
+vote_threshold = 3
+incubator_size_cap = 32
+feedback_batch_limit = 8

@@ -18,8 +18,8 @@ do not certify that historical checks apply to current source or dirty changes.
 | Working principles | Portable philosophy and publication boundary | [global/principles-of-work.md](../../global/principles-of-work.md) |
 | Global instructions | Live AGENTS link, update and rollback | [Global instructions](../global-instructions.md) |
 | Git memory workflow | Independent consumer, fresh clone and conflict checks | [Git memory specification](../../openspec/specs/git-project-memory/spec.md) |
-| Skill catalogue | Hooks-off compact continuation limitation | [autonomous-skill-evolution](../../openspec/changes/autonomous-skill-evolution/proposal.md) |
-| Verification workflows | Current project-verification and remaining benefit tasks | [accelerate-verified-delivery](../../openspec/changes/accelerate-verified-delivery/proposal.md) |
+| Skill evolution | Calibration, catalogue limits and open coverage | [Skill evolution](skill-evolution.md) |
+| Verification workflows | Installed project-verification; quantitative benefit unproven | [project-verification](../../openspec/specs/project-verification/spec.md) |
 | Side questions | `/btw` / `/side` after a main conversation; no file isolation | [Agent delegation](../agent-delegation.md) |
 | Windows sandbox shell | Do not launch packaged WindowsApps PowerShell; select installed desktop PowerShell | [Installation](../installation.md) |
 

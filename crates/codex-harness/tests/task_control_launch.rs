@@ -77,6 +77,12 @@ fn ordinary_launcher_restores_closed_executor_conversation() {
     native_entry(EntryCase::ViewClose);
 }
 
+#[test]
+#[ignore = "requires native CLI; explicit user stop through the ordinary entry point; synthetic Responses only"]
+fn ordinary_launcher_stops_on_explicit_user_stop() {
+    native_entry(EntryCase::UserStop);
+}
+
 #[derive(Clone, Copy)]
 enum EntryCase {
     Normal,
@@ -87,6 +93,7 @@ enum EntryCase {
     QuotaHandoff,
     Helper,
     ViewClose,
+    UserStop,
 }
 
 fn native_entry(case: EntryCase) {
@@ -98,6 +105,7 @@ fn native_entry(case: EntryCase) {
         EntryCase::Child | EntryCase::TwoChildren | EntryCase::Helper | EntryCase::ViewClose
     );
     let view_loss = matches!(case, EntryCase::ViewLoss);
+    let user_stop = matches!(case, EntryCase::UserStop);
     let quota_refusal = matches!(case, EntryCase::QuotaRefusal);
     let quota_handoff = matches!(case, EntryCase::QuotaHandoff);
     assert_eq!(
@@ -162,6 +170,18 @@ fn native_entry(case: EntryCase) {
     )
     .unwrap();
     fs::write(source.join("global/kit.json"), serde_json::to_vec(&json!({"schema":1,"profile_name":"harness","profile":"global/profile.toml","instructions":"global/instructions.md","skills":"skills","agents":"global/agents","hooks":"global/hooks.json","token_hooks":"global/token-hooks.json"})).unwrap()).unwrap();
+    if quota_handoff {
+        fs::write(
+            source.join("global/orchestration.toml"),
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"zai\"\nexecutor_profiles = [\"zai\"]\nmax_concurrent_executors = 2\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("zai.config.toml"),
+            "model = \"zai/glm-5.3\"\nmodel_provider = \"control_fixture\"\n",
+        )
+        .unwrap();
+    }
     // Real Cargo outputs; the owned registration only substitutes install paths.
     for (name, binary) in [
         ("codex.exe", env!("CARGO_BIN_EXE_codex")),
@@ -199,7 +219,9 @@ fn native_entry(case: EntryCase) {
     .unwrap();
     fs::write(home.join("harness/native-launch.json"), serde_json::to_vec(&json!({"schema":2,"build":build,"task_control":true,"upstream":{"executable":upstream,"sha256":build_identity::hash_file(&upstream).unwrap(),"package":null}})).unwrap()).unwrap();
     let responses = match case {
-        EntryCase::ViewLoss => control_responses::Responses::with_view_loss(root.into()),
+        EntryCase::ViewLoss | EntryCase::UserStop => {
+            control_responses::Responses::with_view_loss(root.into())
+        }
         EntryCase::QuotaRefusal => control_responses::Responses::with_quota_refusal(root.into()),
         EntryCase::QuotaHandoff => control_responses::Responses::with_quota_handoff(root.into()),
         EntryCase::Normal => control_responses::Responses::start(root.into(), true),
@@ -214,7 +236,7 @@ fn native_entry(case: EntryCase) {
                 .expect("explicit model metadata, without credentials"),
         );
         let catalog = home.join("catalog.json");
-        fs::copy(source, &catalog).unwrap();
+        fs::write(&catalog, pair_model_catalog(&source)).unwrap();
         format!(
             "model_catalog_json = {}",
             serde_json::to_string(&catalog.to_string_lossy()).unwrap()
@@ -222,11 +244,12 @@ fn native_entry(case: EntryCase) {
     } else {
         String::new()
     };
-    let agents_config = if helper {
+    let agents_config = if helper || pair {
         "[agents]\nmax_depth = 2\n"
     } else {
         ""
     };
+    let multi_agent_v2 = if pair { "true" } else { "false" };
     fs::write(
         home.join("config.toml"),
         format!(
@@ -252,7 +275,7 @@ code_mode = false
 shell_snapshot = false
 hooks = false
 multi_agent = true
-multi_agent_v2 = false
+multi_agent_v2 = {multi_agent_v2}
 {agents_config}
 [analytics]
 enabled = false
@@ -324,6 +347,9 @@ trust_level = "trusted"
     if view_loss {
         exercise_view_loss(root, &state, &workspace);
     }
+    if user_stop {
+        exercise_user_stop(root, &state, &workspace);
+    }
     if child {
         pause_synthetic_parent_goal(&state);
     }
@@ -334,11 +360,13 @@ trust_level = "trusted"
         control_responses::PARENT_FINAL.to_owned()
     } else if quota_refusal {
         quota_refusal_result(root, &state, &workspace)
+    } else if user_stop {
+        "explicit stop".to_owned()
     } else {
         control_responses::FINAL.to_owned()
     };
     let until = Instant::now()
-        + if helper || view_close {
+        + if helper || view_close || pair {
             Duration::from_secs(90)
         } else {
             WAIT
@@ -356,7 +384,11 @@ trust_level = "trusted"
             !state.join("client-closed.json").is_file(),
             "native conversation closed before its result; inspect client-closed.json"
         );
-        if state.join("view.json").is_file()
+        if user_stop && state.join("closed.json").is_file() {
+            break;
+        }
+        if !user_stop
+            && state.join("view.json").is_file()
             && fs::read_to_string(state.join("task.json")).is_ok_and(|saved| {
                 saved.contains(&marker)
                     && (!pair
@@ -368,12 +400,20 @@ trust_level = "trusted"
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(
-        fs::read_to_string(state.join("task.json"))
-            .unwrap()
-            .contains(&marker),
-        "controller must consume the result in the visible native session"
-    );
+    if user_stop {
+        let closed: Value =
+            serde_json::from_slice(&fs::read(state.join("closed.json")).unwrap()).unwrap();
+        assert_eq!(closed["reason"], "explicit stop");
+        assert_eq!(closed["stopped"], true);
+        assert!(!root.join("provider-2.json").exists());
+    } else {
+        assert!(
+            fs::read_to_string(state.join("task.json"))
+                .unwrap()
+                .contains(&marker),
+            "controller must consume the result in the visible native session"
+        );
+    }
     if !quota_refusal {
         assert_eq!(
             fs::read_to_string(workspace.join("proof.txt")).unwrap(),
@@ -451,21 +491,25 @@ trust_level = "trusted"
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
     let user = harness_core::process_service::current_user().unwrap();
-    assert!(
-        snapshot
-            .is_visible(&upstream, &user)
-            .unwrap(),
-        "native conversation must remain visible for the final result"
-    );
+    if !user_stop {
+        assert!(
+            snapshot.is_visible(&upstream, &user).unwrap(),
+            "native conversation must remain visible for the final result"
+        );
+    }
     fs::write(
         root.join("native-entry-result-observed.json"),
-        serde_json::to_vec_pretty(&json!({"finalVisible":true})).unwrap(),
+        serde_json::to_vec_pretty(&json!({"finalVisible":!user_stop,"stopped":user_stop})).unwrap(),
     )
     .unwrap();
     let observed: Value =
         serde_json::from_slice(&fs::read(root.join("native-entry-result-observed.json")).unwrap())
             .unwrap();
-    assert_eq!(observed["finalVisible"], true);
+    if user_stop {
+        assert_eq!(observed["stopped"], true);
+    } else {
+        assert_eq!(observed["finalVisible"], true);
+    }
     session.send("/quit").unwrap();
     std::thread::sleep(Duration::from_millis(300));
     session.send("\r").unwrap();
@@ -478,7 +522,9 @@ trust_level = "trusted"
         )
         .unwrap();
     assert_eq!(result.outcome.reason, StopReason::Exited);
-    assert_eq!(result.outcome.exit_code, 0);
+    if !user_stop {
+        assert_eq!(result.outcome.exit_code, 0);
+    }
     let until = Instant::now() + Duration::from_secs(5);
     while !state.join("closed.json").is_file() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
@@ -487,11 +533,13 @@ trust_level = "trusted"
         state.join("closed.json").is_file(),
         "idle controller must close after native TUI exit"
     );
-    let checkpoint = fs::read_to_string(state.join("task.json")).unwrap();
-    assert!(
-        checkpoint.contains(&marker),
-        "controller must consume the final result"
-    );
+    if !user_stop {
+        let checkpoint = fs::read_to_string(state.join("task.json")).unwrap();
+        assert!(
+            checkpoint.contains(&marker),
+            "controller must consume the final result"
+        );
+    }
     let runtime: Value =
         serde_json::from_slice(&fs::read(state.join("runtime.json")).unwrap()).unwrap();
     let identity = harness_core::process::ProcessIdentity {
@@ -527,10 +575,11 @@ trust_level = "trusted"
         EntryCase::Child => 4,
         EntryCase::TwoChildren => 9,
         EntryCase::ViewLoss => 3,
+        EntryCase::UserStop => 1,
         EntryCase::QuotaRefusal => 1,
         EntryCase::QuotaHandoff => 3,
         EntryCase::Helper => 7,
-        EntryCase::ViewClose => 5,
+        EntryCase::ViewClose => 4,
     };
     for sequence in 1..=expected_requests {
         let exchange: Value = serde_json::from_slice(
@@ -560,6 +609,58 @@ trust_level = "trusted"
     fs::write(root.join("launch-result.json"), serde_json::to_vec(&json!({"schema":1,"upstreamSha256":build_identity::hash_file(&upstream).unwrap(),"nativeEntrySha256":record.binaries["codex.exe"],"managerSha256":record.binaries["codex-harness.exe"],"initialModel":"gpt-6-astra","model":if quota_handoff {"zai/glm-5.3"} else {"gpt-6-astra"},"outcome":if quota_handoff {"quotaHandoff"} else if quota_refusal {"quotaRefused"} else {"toolResult"},"toolSideEffectExactlyOnce":(!quota_refusal).then_some(true),"requests":expected_requests,"finalVisible":true,"manualSecondaryStartup":false})).unwrap()).unwrap();
 }
 
+fn pair_model_catalog(source: &Path) -> Vec<u8> {
+    let bytes = fs::read(source).expect("explicit model metadata, without credentials");
+    let mut catalog = if bytes.is_empty() {
+        json!({"models": []})
+    } else {
+        serde_json::from_slice::<Value>(&bytes)
+            .expect("model catalog must be JSON metadata without credentials")
+    };
+    if !catalog["models"].is_array() {
+        catalog = json!({"models": []});
+    }
+    let models = catalog["models"].as_array_mut().unwrap();
+    for (slug, display, effort) in [
+        ("gpt-6-astra", "GPT-6 Astra", "low"),
+        ("glm-5.3", "Z.AI GLM-5.3", "high"),
+        ("zai/glm-5.3", "Z.AI GLM-5.3", "high"),
+        ("grok-4.6", "Grok 4.6", "high"),
+        ("xai/grok-4.6", "Grok 4.6", "high"),
+    ] {
+        if !models.iter().any(|model| model["slug"] == slug) {
+            models.push(json!({
+                "slug": slug,
+                "display_name": display,
+                "description": display,
+                "default_reasoning_level": effort,
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "Light reasoning"},
+                    {"effort": "high", "description": "Enhanced reasoning"},
+                    {"effort": "max", "description": "Deep reasoning"}
+                ],
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 0,
+                "base_instructions": "",
+                "supports_reasoning_summaries": true,
+                "default_reasoning_summary": "none",
+                "support_verbosity": false,
+                "apply_patch_tool_type": "freeform",
+                "truncation_policy": {"mode": "bytes", "limit": 10000},
+                "context_window": 1048576,
+                "max_context_window": 1048576,
+                "effective_context_window_percent": 95,
+                "supports_parallel_tool_calls": true,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text"],
+                "multi_agent_version": "v2"
+            }));
+        }
+    }
+    serde_json::to_vec(&catalog).unwrap()
+}
 fn pause_synthetic_parent_goal(state: &Path) {
     // The canned final cannot complete a native goal. Disable that fixture-only
     // scheduling loop, as in the native child/reconnect contract, while the
@@ -642,6 +743,44 @@ fn quota_refusal_result(root: &Path, state: &Path, workspace: &Path) -> String {
     std::thread::sleep(Duration::from_secs(2));
     assert!(!root.join("provider-2.json").exists());
     failure["error"]["message"].as_str().unwrap().to_owned()
+}
+
+fn exercise_user_stop(root: &Path, state: &Path, workspace: &Path) {
+    let until = Instant::now() + WAIT;
+    while !(state.join("view.json").is_file() && workspace.join("proof.txt").is_file())
+        && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    harness_core::task_runtime::request_stop(state).unwrap();
+    let until = Instant::now() + WAIT;
+    while !state.join("closed.json").is_file() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let closed: Value = serde_json::from_slice(
+        &fs::read(state.join("closed.json")).expect("explicit stop must close the controller"),
+    )
+    .unwrap();
+    assert_eq!(closed["reason"], "explicit stop");
+    assert_eq!(closed["stopped"], true);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !root.join("provider-2.json").exists(),
+        "explicit stop must not start another model request"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        "one"
+    );
+    fs::write(
+        root.join("native-entry-stopped.json"),
+        serde_json::to_vec(&json!({"state":state,"stopped":true,"requests":1})).unwrap(),
+    )
+    .unwrap();
 }
 
 fn exercise_view_loss(root: &Path, state: &Path, workspace: &Path) {
@@ -803,10 +942,7 @@ fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: 
             ) {
                 if snapshot.process != before {
                     let user = harness_core::process_service::current_user().unwrap();
-                    if snapshot
-                        .is_visible(executable, &user)
-                        .unwrap_or(false)
-                    {
+                    if snapshot.is_visible(executable, &user).unwrap_or(false) {
                         break snapshot;
                     }
                 }
@@ -846,8 +982,7 @@ fn reveal_conversation(state: &Path, executable: &Path) {
     while !state.join("view.json").is_file() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let view: Value =
-        serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
+    let view: Value = serde_json::from_slice(&fs::read(state.join("view.json")).unwrap()).unwrap();
     let snapshot: harness_core::task_view::Snapshot =
         serde_json::from_value(view["window"].clone()).unwrap();
     let user = harness_core::process_service::current_user().unwrap();
@@ -884,9 +1019,7 @@ fn close_owned_views(state: &Path) {
         }
     }
     for window in windows {
-        if let Ok(snapshot) =
-            serde_json::from_value::<harness_core::task_view::Snapshot>(window)
-        {
+        if let Ok(snapshot) = serde_json::from_value::<harness_core::task_view::Snapshot>(window) {
             let _ = close_conversation(&snapshot);
         }
     }

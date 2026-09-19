@@ -162,6 +162,29 @@ fn actual_prompt_argv_home_evidence_and_usage_are_preserved() {
 }
 
 #[test]
+fn optional_user_home_is_applied_and_kept_outside_the_case() {
+    let f = Fixture::new();
+    let user = f.root.path().join("user");
+    fs::create_dir(&user).unwrap();
+    f.edit("user_home", json!(user));
+    let row = f.run("success", 0);
+    let call = read(&f.case.join("fixture-call.json"));
+    assert_eq!(row["status"], "completed");
+    assert_eq!(
+        Path::new(call["userprofile"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        user.canonicalize().unwrap()
+    );
+    assert_ne!(
+        Path::new(call["userprofile"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        f.case.canonicalize().unwrap()
+    );
+}
+
+#[test]
 fn no_policy_does_not_invent_usefulness_and_no_rollout_is_unknown() {
     let f = Fixture::new();
     f.edit("useful_command_pattern", Value::Null);

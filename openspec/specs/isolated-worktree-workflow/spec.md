@@ -41,3 +41,15 @@ The integrating agent SHALL inspect the candidate diff, preserve unrelated chang
 #### Scenario: Global workflow in another project
 - **WHEN** the installed workflow is used in an independent Git repository
 - **THEN** it creates an isolated task from explicit inputs, exercises preparation and verification, integrates its owned result, and cleans up only resources proven safe to remove
+
+### Requirement: Ordinary Git worktrees, not Codex-managed checkouts
+
+This workflow SHALL isolate work with ordinary Git worktrees created for the task. It MUST NOT use Codex CLI `--worktree`, TUI `/worktree`, or checkouts in the Codex-managed worktree pool (`$CODEX_HOME/worktrees` or a configured Desktop worktree root) as its isolation mechanism. A Codex-managed worktree bound to an executor session is outside this capability.
+
+#### Scenario: A bounded independent edit needs file isolation
+- **WHEN** an ordinary session needs a separate checkout and Codex-managed worktrees are available
+- **THEN** the workflow still creates an ordinary Git worktree from explicit inputs rather than allocating a Codex-managed checkout
+
+#### Scenario: An executor session needs isolation
+- **WHEN** a lead/executor assignment requires an isolated checkout for a native Codex session
+- **THEN** this workflow is not the allocator and does not create a substitute ordinary Git worktree for that session

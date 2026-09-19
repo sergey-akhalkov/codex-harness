@@ -617,7 +617,12 @@ impl Visibility {
             }
         }
         self.snapshots = snapshots;
-        let mut conversations = BTreeMap::new();
+        let mut conversations = self
+            .conversations
+            .keys()
+            .cloned()
+            .map(|id| (id, false))
+            .collect::<BTreeMap<_, _>>();
         for id in self.snapshots.keys() {
             conversations.insert(
                 id.clone(),
@@ -650,6 +655,18 @@ impl Visibility {
                 && child_views.awaiting_first_view(&thread)
                 && root.path().join("route-config.json").try_exists()?
             {
+                continue;
+            }
+            if child_views.awaiting_first_view(&thread)
+                && self
+                    .watches
+                    .get(&thread)
+                    .map(crate::task_view::Watch::process_running)
+                    .transpose()?
+                    != Some(true)
+            {
+                // A closed pane is restored by the runtime. Interrupting it
+                // races that restore and leaves a continuation with no client.
                 continue;
             }
             if self.visible_for(&thread) || self.stopping.get(&thread) == Some(&turn) {
