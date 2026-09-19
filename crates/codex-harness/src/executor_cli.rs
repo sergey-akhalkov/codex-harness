@@ -200,6 +200,7 @@ fn dispatch(
             &launcher,
             workspace,
             profile,
+            mode,
             terminal_profile,
             &title,
             &args,
@@ -207,7 +208,9 @@ fn dispatch(
             codex_home,
         )
     } else {
-        dispatch_owned_console(&launcher, workspace, profile, &args, &bound, codex_home)
+        dispatch_owned_console(
+            &launcher, workspace, profile, mode, &args, &bound, codex_home,
+        )
     }
 }
 
@@ -392,6 +395,7 @@ fn dispatch_terminal_tab(
     launcher: &Path,
     workspace: &Path,
     profile: &str,
+    mode: SpawnMode,
     terminal_profile: Option<&str>,
     title: &str,
     tui: &[String],
@@ -406,6 +410,7 @@ fn dispatch_terminal_tab(
         workspace,
         launcher,
         profile,
+        mode,
         tui,
         bound,
         None,
@@ -446,6 +451,7 @@ fn dispatch_owned_console(
     launcher: &Path,
     workspace: &Path,
     profile: &str,
+    mode: SpawnMode,
     args: &[String],
     bound: &ProfileBinding,
     codex_home: &Path,
@@ -454,6 +460,7 @@ fn dispatch_owned_console(
         workspace,
         launcher,
         profile,
+        mode,
         args,
         bound,
         None,
@@ -490,6 +497,7 @@ fn dispatch_owned_console(
         workspace,
         launcher,
         profile,
+        mode,
         args,
         bound,
         Some(&snapshot),
@@ -567,6 +575,7 @@ fn save_receipt(
     workspace: &Path,
     launcher: &Path,
     profile: &str,
+    mode: SpawnMode,
     args: &[String],
     bound: &ProfileBinding,
     window: Option<&task_view::Snapshot>,
@@ -584,6 +593,7 @@ fn save_receipt(
             "schema": 1,
             "launcher": native_path(launcher)?,
             "profile": profile,
+            "mode": mode.as_str(),
             "args": args,
             "visible": true,
             "host": host,
