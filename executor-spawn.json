@@ -2,12 +2,16 @@
   "args": [
     "--profile",
     "ds",
+    "exec",
+    "--skip-git-repo-check",
     "-C",
-    "D:/home/sergey-akhalkov/codex-harness-ofap-succession",
-    "/goal Complete OFAP tasks 4.1-4.2 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-kon.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Verify succession only with synthetic sessions in %TEMP%; never touch live lead/executor sessions. Stop only when the assignment outcome is fully done."
+    "D:\\home\\sergey-akhalkov\\codex-harness-ofap-succession",
+    "Complete OFAP tasks 6.1, 6.2, 6.3 and board item codex-harness-pvr.5 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-pvr.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Stop only when the assignment outcome is fully done."
   ],
   "host": "windows-terminal-tab",
   "isolation": false,
+  "launcher": "C:\\Users\\noilw\\.codex\\harness\\bin\\codex.exe",
+  "mode": "exec",
   "model": "deepseek-flash",
   "modelProvider": "deepseek",
   "profile": "ds",
@@ -20,14 +24,15 @@
     "--title",
     "Codex executor (ds)",
     "--suppressApplicationTitle",
-    "-d",
-    "D:/home/sergey-akhalkov/codex-harness-ofap-succession",
-    "C:/Users/noilw/.codex\\harness/bin/codex.exe",
     "--profile",
-    "ds",
-    "-C",
-    "D:/home/sergey-akhalkov/codex-harness-ofap-succession",
-    "/goal Complete OFAP tasks 4.1-4.2 exactly as described in ASSIGNMENT.md in this workspace. Board issue: codex-harness-kon.1 (set it to lead_review when done, never close). Work only in this worktree. Do not spawn agents. Verify succession only with synthetic sessions in %TEMP%\\; never touch live lead/executor sessions. Stop only when the assignment outcome is fully done."
+    "PowerShell",
+    "-d",
+    "D:\\home\\sergey-akhalkov\\codex-harness-ofap-succession",
+    "D:\\home\\sergey-akhalkov\\codex-harness\\target\\debug\\codex-harness.exe",
+    "executor",
+    "run",
+    "--file",
+    "D:\\home\\sergey-akhalkov\\codex-harness-ofap-succession\\executor-spawn.json"
   ],
   "visible": true,
   "window": null

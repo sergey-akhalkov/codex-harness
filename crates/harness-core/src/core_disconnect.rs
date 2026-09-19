@@ -22,6 +22,8 @@ pub struct Report {
     pub preserved_adopted: usize,
     pub path_change: bool,
     pub model_calls: u32,
+    /// Private loop evidence this rollback left in place.
+    pub orchestration: crate::orchestration_lifecycle::PreservationReport,
 }
 
 fn absent(path: &Path) -> io::Result<()> {
@@ -59,6 +61,8 @@ pub fn disconnect(
     }
     let metadata = Prior::read_homes(&codex_home, &user_home, &dependency_user_home)?;
     let Some(settings) = metadata.settings() else {
+        let orchestration =
+            crate::orchestration_lifecycle::disconnect_preserves_private(&codex_home, &user_home)?;
         return Ok(Report {
             status: "not-connected",
             removed_links: 0,
@@ -66,6 +70,7 @@ pub fn disconnect(
             preserved_adopted: 0,
             path_change: false,
             model_calls: 0,
+            orchestration,
         });
     };
     let mut changes = Vec::new();
@@ -112,6 +117,10 @@ pub fn disconnect(
         preserved_adopted: links.iter().filter(|(_, owned)| !owned).count(),
         path_change: !path.is_noop(),
         model_calls: 0,
+        orchestration: crate::orchestration_lifecycle::disconnect_preserves_private(
+            &codex_home,
+            &user_home,
+        )?,
     };
     metadata.snapshot()?.verify_unchanged()?;
     if preview {

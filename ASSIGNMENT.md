@@ -1,54 +1,55 @@
-# OFAP 4.1-4.2 complete outcome (executor profile ds)
+# OFAP 6.1-6.3 + worktree lane reuse (executor profile ds)
 
-You are the configured executor (`codex --profile ds`). Do not spawn nested
-agents. Do not write to other checkouts. Work only in this worktree
-(`D:\home\sergey-akhalkov\codex-harness-ofap-succession`, branch `ofap/succession`,
-base commit 3f5f14a).
+You are the configured executor (`codex --profile ds`, exec mode: your tab
+shows your work and closes when you finish). Do not spawn nested agents. Work
+only in this worktree (branch `ofap/stage6`, base bd912aa).
+
+## State
+
+Stages 1-5 are accepted and integrated in this base: feedback intake/triage/
+votes, observation routing, promotion/override/hygiene, scoped observations,
+pacing, benefit gate, and instruction-refresh succession. Do not redo them.
 
 ## Outcome
 
-Implement and verify OFAP tasks 4.1 and 4.2 from
-`openspec/changes/orchestrate-feedback-and-pacing/` (tasks.md, design.md
-decision 6, specs), reusing the Stage 1 machinery already in this tree:
+1. pvr.5 Worktree lane reuse in code: extend
+   `crates/harness-core/src/task_worktree.rs` so an accepted merge can
+   reset-and-reuse the lane worktree (`git reset --hard <base>` +
+   `git clean -fd`, keeping ignored build caches) instead of deleting it;
+   keep retire/delete for lane retirement and unresettable state; preserve the
+   existing audit/limit guard. Native tests for both paths.
+2. 6.1 Lifecycle delivery: connect the loop through the kit installation
+   lifecycle so a fresh external session discovers the workflow (skills,
+   orchestration config, board), unrelated configuration is preserved, and
+   rollback removes the loop without losing archived evidence. Use the
+   existing install/check lifecycle tests and add what is missing.
+3. 6.2 Owning records: update `docs/agent-delegation.md`,
+   `docs/subscription-models.md` (efficiency), token-workflow record and
+   `docs/project-decisions.md` links with the actual supported operation and
+   limits as integrated (exec-mode tabs, watcher waiting, lane reuse,
+   pacing bands, benefit gate, succession). Keep private evidence out of Git;
+   one authoritative home per fact.
+4. 6.3 End-to-end loop exercise on the real consuming task: assemble and
+   verify the already-completed real run (OFAP stages 1-5 through this board:
+   feedback -> dedup/votes -> promotion (pvr.5 lane reuse, benefit-gate
+   adopt -11.8%) -> implementation -> succession path exercised by the
+   stage-4 executor). Record the end-to-end evidence trail (board ids,
+   commits, result files) and close only tasks supported by actual results -
+   do not fabricate steps that did not happen; name any gap honestly.
 
-1. 4.1 Successor spawning through the verified `codex resume` path at a safe
-   boundary after in-flight tool effects: deterministic non-interactive session
-   selection, durable context handover, predecessor process stop. Consume the
-   compact revision identity published by skill-evolution (name, canonical
-   path, revision, operation) as read-only input. Do NOT implement catalogue
-   injection, in-process activation or same-session compact recovery (owned by
-   `autonomous-skill-evolution`).
-2. 4.2 Verify succession preserves partial work and authorization, does not
-   replay uncertain external operations, and reports "succession not
-   established" when reload verification fails.
+## Constraints
 
-Relevant existing code: `crates/harness-core/src/orchestration_lifecycle.rs`,
-`orchestration_config.rs` (`SuccessorChoice`), `task_orchestrate.rs`,
-`task_handoff.rs`; `crates/codex-harness/src/executor_cli.rs` shows the current
-dispatch patterns (trust handling, session-env isolation).
-
-## Ownership boundary
-
-A parallel executor owns `board_feedback.rs`/`board_cli.rs` and the 2.x-3.x
-slice. Do not modify those files or `.agents/skills/board-workflow/SKILL.md`.
-If a change there is required, record it as a comment on board issue
-`codex-harness-kon.1` instead.
-
-## Safety constraints
-
-- Verify resume/succession only against synthetic sessions in `%TEMP%`
-  projects. Never stop or resume the live lead or executor sessions.
-- Rust for first-party code. PowerShell 7 for shell. No private consumer data
-  in tracked files. No model calls for deterministic mechanics.
-- Do not archive OpenSpec changes. Do not close board issues. Do not start
-  stage 5+.
+Rust first-party; PowerShell 7; no model calls in deterministic mechanics;
+public pack free of private data (paths, dashboards, logs stay local); do not
+archive OpenSpec changes; do not close board issues. `executor_cli.rs` is
+stable - read-only reference.
 
 ## Done when
 
-- 4.1 and 4.2 are implemented and verified in this worktree; tasks.md
-  checkboxes marked only for fully completed work.
-- Native checks for changed code ran (cargo test/clippy/fmt as applicable);
-  keep a private evidence summary in `%TEMP%`.
-- `ofap-41-42-result.md` at this worktree root: what changed, how verified
-  (exact commands and outcomes), remaining limits.
-- `bd update codex-harness-kon.1 --status lead_review` (do not close).
+- 6.1, 6.2, 6.3 and pvr.5 implemented/verified; tasks.md checkboxes marked
+  only for fully completed work.
+- Native checks ran (cargo fmt/test/clippy as applicable, lifecycle checks);
+  private evidence in `%TEMP%`.
+- `ofap-6-result.md` at this worktree root: what changed, how verified, the
+  e2e evidence trail, remaining limits.
+- `bd update codex-harness-pvr.1 --status lead_review` (do not close).

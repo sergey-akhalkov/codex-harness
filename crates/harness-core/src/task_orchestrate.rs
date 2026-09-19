@@ -3,7 +3,7 @@ use crate::{
     orchestration_config::Orchestration,
     task_failure::FailureCause,
     task_store::{self, Assignment, TaskRecord},
-    task_worktree::{self, Mapping, Retirement},
+    task_worktree::{self, LaneDisposition, Mapping},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -133,7 +133,7 @@ pub fn merge_accepted(
     assignment: &str,
     mapping: &task_worktree::Mapping,
     current: &Path,
-) -> io::Result<Retirement> {
+) -> io::Result<LaneDisposition> {
     task_store::accept(record, assignment)?;
     if mapping.path.is_dir() && current.is_dir() {
         let head = Command::new("git")
@@ -153,7 +153,20 @@ pub fn merge_accepted(
             }
         }
     }
-    task_worktree::retire(mapping, current)
+    // Lanes are reused, not retired: reset the lane to the base the lead just
+    // merged so the next task in this lane starts from it with its build
+    // caches. Unresettable state is preserved for the lane retirement decision.
+    let base = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(current)
+        .output()?;
+    if !base.status.success() {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "merged base is unavailable; preserving the lane for retirement".into(),
+        });
+    }
+    let base = String::from_utf8_lossy(&base.stdout).trim().to_owned();
+    task_worktree::reset_for_reuse(mapping, current, &base)
 }
 
 pub fn reconcile_before_replace(record: &TaskRecord, assignment: &str) -> io::Result<()> {
@@ -363,13 +376,25 @@ mod tests {
             active_lead: "default".into(),
             assignments: vec![seed_assignment("a1", "xai", "exec-xai", &tree)],
         };
-        merge_accepted(&mut record, "a1", &mapping, &source).unwrap();
+        let disposition = merge_accepted(&mut record, "a1", &mapping, &source).unwrap();
         assert_eq!(record.assignments[0].accepted, Some(true));
         assert!(
             fs::read_to_string(source.join("done.txt"))
                 .unwrap()
                 .contains("merged")
         );
+        let base = git_output(&source, &["rev-parse", "HEAD"]);
+        assert_eq!(disposition, LaneDisposition::Reused { base: base.clone() });
+        assert_eq!(git_output(&tree, &["rev-parse", "HEAD"]), base);
+        assert!(
+            git_output(
+                &tree,
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            )
+            .is_empty(),
+            "the reused lane starts clean at the merged base"
+        );
+        assert!(tree.join("done.txt").exists(), "lane keeps the merged work");
     }
 
     fn git(cwd: &Path, args: &[&str]) {
@@ -383,6 +408,20 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn git_output(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     #[test]
@@ -412,8 +451,8 @@ mod tests {
         let retired = merge_accepted(&mut record, "a1", &mapping, root.path()).unwrap();
         assert_eq!(record.assignments[0].accepted, Some(true));
         match retired {
-            Retirement::Preserved { limitation } => assert!(!limitation.is_empty()),
-            Retirement::Deleted => panic!("missing tree must be preserved"),
+            LaneDisposition::Preserved { limitation } => assert!(!limitation.is_empty()),
+            LaneDisposition::Reused { .. } => panic!("missing tree must be preserved"),
         }
     }
 

@@ -23,6 +23,9 @@ pub struct CheckReport {
     pub model_calls: u32,
     pub links: usize,
     pub runtime: core_runtime::RuntimeReceipt,
+    /// Loop delivery report: configured roles and limits, the guidance skills
+    /// a fresh session discovers the workflow through, and the board tool.
+    pub orchestration: crate::orchestration_lifecycle::CheckReport,
 }
 
 /// Observe an existing native schema-2 core installation. Pending recovery is
@@ -88,7 +91,8 @@ pub fn check(
     let inventory = inventory::read(&settings.source_root, codex_home, user_home)?;
     require_data_links(metadata.links(), &inventory.links)?;
     agent_config::check(codex_home, &inventory.agents)?;
-    crate::orchestration_config::check_installation(&settings.source_root, codex_home)?;
+    let orchestration =
+        crate::orchestration_lifecycle::check(&settings.source_root, codex_home, user_home, false)?;
     let instructions =
         read_instructions(&settings.source_root.join(&inventory.manifest.instructions))?;
     let runtime = core_runtime::verify(
@@ -130,6 +134,7 @@ pub fn check(
         model_calls: 0,
         links: metadata.links().len(),
         runtime,
+        orchestration,
     })
 }
 

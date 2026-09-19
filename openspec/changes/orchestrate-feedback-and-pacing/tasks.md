@@ -31,6 +31,6 @@
 
 ## 6. Lifecycle, records and acceptance
 
-- [ ] 6.1 Deliver the loop through the kit lifecycle; verify fresh external sessions discover the workflow, unrelated configuration is preserved, and rollback removes the loop without losing archived evidence.
-- [ ] 6.2 Update owning delegation, efficiency, token-workflow and decision records with actual supported operation and limits; keep private evidence outside shared sources.
-- [ ] 6.3 Exercise the complete loop end to end on a real consuming task: feedback, dedup, promotion, implementation, succession and measured benefit; close only tasks supported by actual results.
+- [x] 6.1 Deliver the loop through the kit lifecycle; verify fresh external sessions discover the workflow, unrelated configuration is preserved, and rollback removes the loop without losing archived evidence.
+- [x] 6.2 Update owning delegation, efficiency, token-workflow and decision records with actual supported operation and limits; keep private evidence outside shared sources.
+- [x] 6.3 Exercise the complete loop end to end on a real consuming task: feedback, dedup, promotion, implementation, succession and measured benefit; close only tasks supported by actual results.

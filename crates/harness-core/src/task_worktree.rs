@@ -26,6 +26,16 @@ pub enum Retirement {
     Preserved { limitation: String },
 }
 
+/// Outcome of returning a lane worktree after an accepted merge. Lanes are
+/// lane-owned: a successfully reset lane stays in place for the next task in
+/// the same lane, keeping its ignored build caches. Lane retirement and
+/// unresettable state remain `retire`'s decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneDisposition {
+    Reused { base: String },
+    Preserved { limitation: String },
+}
+
 pub fn limitation(detail: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -147,6 +157,78 @@ pub fn retire(mapping: &Mapping, current: &Path) -> io::Result<Retirement> {
     }
 }
 
+/// Reset a lane worktree to the committed base the lead merged, so the next
+/// lane task starts from the new base with the lane's ignored build caches
+/// intact (`git reset --hard <base>` plus `git clean -fd`). Unresettable state
+/// is preserved with its reason for lane retirement instead of deleting or
+/// reusing it; the lane inventory guard (`audit`) is unchanged because a reset
+/// lane is not a new worktree.
+pub fn reset_for_reuse(
+    mapping: &Mapping,
+    current: &Path,
+    base: &str,
+) -> io::Result<LaneDisposition> {
+    let current = fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    let tree = fs::canonicalize(&mapping.path).unwrap_or_else(|_| mapping.path.clone());
+    if current == tree {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "lane reset refuses the current checkout".into(),
+        });
+    }
+    if mapping.archived || mapping.unavailable {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "agents-overview archive or unavailability is not lane reuse".into(),
+        });
+    }
+    if !mapping.path.is_dir() {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "managed worktree path is missing".into(),
+        });
+    }
+    let inside = git(&mapping.path, &["rev-parse", "--is-inside-work-tree"])?;
+    if inside.trim() != "true" {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "checkout is not a Git worktree".into(),
+        });
+    }
+    let Ok(commit) = git(
+        &mapping.path,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    ) else {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "committed base is not available in the lane; preserving the lane".into(),
+        });
+    };
+    let commit = commit.trim().to_owned();
+    if git(&mapping.path, &["reset", "--hard", &commit]).is_err() {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "lane reset failed; preserving the lane for retirement".into(),
+        });
+    }
+    if git(&mapping.path, &["clean", "-fd"]).is_err() {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "lane cleanup failed; preserving the lane for retirement".into(),
+        });
+    }
+    let head = git(&mapping.path, &["rev-parse", "HEAD"])?;
+    if head.trim() != commit {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "lane did not reach the merged base; preserving the lane for retirement"
+                .into(),
+        });
+    }
+    let porcelain = git(
+        &mapping.path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !porcelain.trim().is_empty() {
+        return Ok(LaneDisposition::Preserved {
+            limitation: "lane is not clean after reset; preserving the lane for retirement".into(),
+        });
+    }
+    Ok(LaneDisposition::Reused { base: commit })
+}
+
 pub fn exec_isolation_args(codex_home: &Path, workspace: &Path) -> io::Result<Vec<String>> {
     if !is_shared_git_checkout(workspace)? {
         return Ok(Vec::new());
@@ -181,17 +263,38 @@ pub struct WorktreeAudit {
 }
 
 pub fn audit(source: &Path) -> io::Result<WorktreeAudit> {
+    // A source that is not a Git checkout has no registered lanes; the guard
+    // is a lane-accumulation warning and must not fail dispatch with an
+    // unrelated `git worktree` error.
+    if !is_git_checkout(source)? {
+        return Ok(WorktreeAudit {
+            total: 0,
+            paths: Vec::new(),
+        });
+    }
     let output = git(source, &["worktree", "list", "--porcelain"])?;
     let mut paths = Vec::new();
     for line in output.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            paths.push(PathBuf::from(path));
+            paths.push(native_path(path));
         }
     }
     Ok(WorktreeAudit {
         total: paths.len() as u32,
         paths,
     })
+}
+
+/// `git worktree list --porcelain` reports forward-slash paths on Windows; the
+/// guard compares them with native paths, so normalize the separator and drop
+/// the verbatim prefix `Path::canonicalize` adds.
+fn native_path(path: &str) -> PathBuf {
+    let text = path.strip_prefix(r"\\?\").unwrap_or(path);
+    if cfg!(windows) {
+        PathBuf::from(text.replace('/', "\\"))
+    } else {
+        PathBuf::from(text)
+    }
 }
 
 #[cfg(test)]
@@ -270,7 +373,9 @@ mod tests {
         let audit = audit(&repo).unwrap();
         assert_eq!(audit.total, 2);
         assert!(audit.paths.contains(&repo));
-        assert!(audit.paths.contains(&lane.canonicalize().unwrap()));
+        // The guard reports native paths (`git` prints forward slashes on
+        // Windows); it must not report the verbatim `canonicalize` form.
+        assert!(audit.paths.contains(&lane), "{:?}", audit.paths);
     }
 
     fn repo(root: &Path) -> PathBuf {
@@ -416,5 +521,146 @@ mod tests {
             }
             Retirement::Deleted => panic!("archive must not delete"),
         }
+    }
+
+    #[test]
+    fn audit_of_a_non_git_source_has_no_lanes() {
+        let root = tempfile::tempdir().unwrap();
+        let exported = root.path().join("packaged-kit");
+        fs::create_dir_all(&exported).unwrap();
+        let audit = audit(&exported).unwrap();
+        assert_eq!(audit.total, 0);
+        assert!(audit.paths.is_empty());
+    }
+
+    #[test]
+    fn lane_reset_reuses_the_checkout_and_keeps_ignored_build_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path());
+        fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        git_ok(&repo, &["add", ".gitignore"]);
+        git_ok(&repo, &["commit", "-qm", "ignore build output"]);
+        let lane = root.path().join("lane");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                lane.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        fs::create_dir_all(lane.join("target")).unwrap();
+        fs::write(lane.join("target/cache.bin"), "warm\n").unwrap();
+        fs::write(lane.join("scratch.txt"), "leftover\n").unwrap();
+        fs::write(lane.join("README.md"), "executor edit\n").unwrap();
+        // The lead's accepted merge moves the shared checkout to the new base.
+        fs::write(repo.join("merged.txt"), "accepted\n").unwrap();
+        git_ok(&repo, &["add", "merged.txt"]);
+        git_ok(&repo, &["commit", "-qm", "accepted merge"]);
+        let base = rev(&repo);
+
+        let mapping = Mapping {
+            schema: 1,
+            path: lane.clone(),
+            source: repo.clone(),
+            head: base.clone(),
+            owner_thread: Some("exec-1".into()),
+            archived: false,
+            unavailable: false,
+            remote_tui_omits_worktree_flag: true,
+        };
+        let disposition = reset_for_reuse(&mapping, &repo, &base).unwrap();
+        assert_eq!(disposition, LaneDisposition::Reused { base: base.clone() });
+        assert_eq!(rev(&lane), base);
+        assert_eq!(
+            fs::read(lane.join("target/cache.bin")).unwrap(),
+            b"warm\n",
+            "ignored build caches stay for the next lane task"
+        );
+        assert!(!lane.join("scratch.txt").exists());
+        let readme = fs::read_to_string(lane.join("README.md")).unwrap();
+        assert!(readme.contains("shared"), "{readme}");
+        assert!(!readme.contains("executor edit"), "{readme}");
+        let status = git(
+            &lane,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert!(status.trim().is_empty(), "{status}");
+        assert_eq!(
+            audit(&repo).unwrap().total,
+            2,
+            "a reused lane adds no worktree"
+        );
+    }
+
+    #[test]
+    fn lane_reset_preserves_unresettable_state_for_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path());
+        let lane = root.path().join("lane");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                lane.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mapping = Mapping {
+            schema: 1,
+            path: lane.clone(),
+            source: repo.clone(),
+            head: "HEAD".into(),
+            owner_thread: Some("exec-1".into()),
+            archived: false,
+            unavailable: false,
+            remote_tui_omits_worktree_flag: true,
+        };
+        fs::write(lane.join("scratch.txt"), "dirty\n").unwrap();
+        match reset_for_reuse(&mapping, &repo, "not-a-commit").unwrap() {
+            LaneDisposition::Preserved { limitation } => {
+                assert!(
+                    limitation.contains("committed base"),
+                    "unavailable base must be explicit: {limitation}"
+                );
+            }
+            LaneDisposition::Reused { .. } => panic!("unknown base must not reset the lane"),
+        }
+        assert!(lane.join("scratch.txt").exists());
+        match reset_for_reuse(&mapping, &lane, "HEAD").unwrap() {
+            LaneDisposition::Preserved { limitation } => {
+                assert!(limitation.contains("current checkout"));
+            }
+            LaneDisposition::Reused { .. } => panic!("the current checkout must not reset"),
+        }
+        let archived = Mapping {
+            archived: true,
+            ..mapping.clone()
+        };
+        match reset_for_reuse(&archived, &repo, "HEAD").unwrap() {
+            LaneDisposition::Preserved { limitation } => {
+                assert!(limitation.contains("archive"));
+            }
+            LaneDisposition::Reused { .. } => panic!("archive is not lane reuse"),
+        }
+        let missing_path = Mapping {
+            path: root.path().join("gone"),
+            ..mapping
+        };
+        match reset_for_reuse(&missing_path, &repo, "HEAD").unwrap() {
+            LaneDisposition::Preserved { limitation } => {
+                assert!(limitation.contains("missing"));
+            }
+            LaneDisposition::Reused { .. } => panic!("a missing lane cannot be reused"),
+        }
+    }
+
+    fn rev(cwd: &Path) -> String {
+        git(cwd, &["rev-parse", "HEAD"]).unwrap().trim().to_owned()
     }
 }

@@ -69,6 +69,33 @@ topic, answer small follow-ups in a fresh or forked session with a concise
 handoff, and hand children concise briefs instead of parent history. This is
 advisory practice, not a scheduler.
 
+Orchestrated work applies the same accounting instead of a second budget:
+
+- Feedback, votes and promotion are `bd` commands. Recording, merging, counting
+  and archiving make no model calls; only the lead's similarity and consequence
+  judgments are model work, and one triage batch is bounded by
+  `feedback_batch_limit` from `global/orchestration.toml`.
+- Executor assignments run in exec-mode tabs that exit and close on completion,
+  and a successor is a bounded `codex exec resume` continuation turn. Neither
+  leaves a growing conversation to re-read, and neither replays uncertain
+  external effects.
+- Waiting uses one native watcher event instead of model-side polling, and lane
+  worktrees are reset and reused after an accepted merge so the next task starts
+  from a warm build cache. Both save wall-clock and spend rather than tokens
+  inside a turn.
+- Pacing lowers new-work concurrency, the triage batch size and the reasoning
+  effort ceiling when fresh scoped observations show pressure, and leaves a
+  healthy executor untouched. Unknown telemetry is neither zero nor unlimited,
+  and no request count is invented as a remainder.
+- The benefit gate charges an improvement with the check, coordination and
+  rework time of both arms before it may become a default. Byte counts and
+  thread `tokens_used` still do not convert into weekly-quota percentages, and
+  an adopted gate is a delivery-time comparison, not a token-budget claim.
+
+[Agent delegation](agent-delegation.md#improvement-loop) owns the loop,
+[subscription models](subscription-models.md#orchestration-spend) the provider
+side, and the `board-workflow` skill the record formats.
+
 Installation uses RTK 0.48.0 for Windows x64 with pinned archive and exe
 SHA-256. Building the small adapter needs Cargo/Rust; sources are in
 `tools/rtk-adapter`, build-identity artifacts stay outside Git under

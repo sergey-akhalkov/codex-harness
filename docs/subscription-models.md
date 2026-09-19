@@ -63,6 +63,34 @@ compatibility shim section). It self-exits when no `codex.exe` remains.
 For delegated work select the model and a supported effort directly. The
 delegation rules live in [agent delegation](agent-delegation.md).
 
+## Orchestration spend
+
+Orchestrated work is paced and gated so improvements and waiting do not consume
+the subscriptions they are meant to save:
+
+- Assignments run in exec-mode tabs: one process per assignment, output visible
+  while it works, and the tab closes on completion instead of leaving a finished
+  session to be re-read later.
+- The lead waits on one native watcher event (board review queue, result
+  artifact, liveness) rather than polling from model turns.
+- Lanes are reused after an accepted merge, so the next task starts with a warm
+  build cache instead of paying the cold-worktree build again
+  ([executor worktrees](agent-delegation.md#executor-worktrees)).
+- Feedback triage, votes and promotion are `bd` commands; the mechanics make no
+  model calls, and a batch is bounded by `feedback_batch_limit`.
+- Pacing reads the native Codex/GPT limit snapshot, actual refusals and
+  user-supplied dashboard snapshots only. Unknown telemetry stays unknown and
+  holds the configured limits, so an unmeasured account is never treated as
+  unlimited; only new assignments are paced, never a healthy executor.
+- An improvement becomes the default concurrency, effort, cadence or worktree
+  strategy only after a matched comparison inside a declared tolerance, with
+  check, coordination and rework in both arms
+  ([improvement loop](agent-delegation.md#improvement-loop)).
+
+The `team-lead` skill owns the pacing table and the gate, the `board-workflow`
+skill owns the record formats, and the shared contract is
+[subscription efficiency](../openspec/specs/subscription-efficiency/spec.md).
+
 ## Compatibility shim
 
 Codex 0.154 and api.x.ai have wire-format mismatches that the shim adapts on
