@@ -51,6 +51,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let mut codex_home = None;
     let mut workspace = None;
     let mut profile = None;
+    let mut terminal_profile = None;
     let mut prompt = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -66,6 +67,14 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
             "--workspace" => workspace = Some(PathBuf::from(value)),
             "--profile" => {
                 profile = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                )
+            }
+            "--terminal-profile" => {
+                terminal_profile = Some(
                     value
                         .to_str()
                         .ok_or_else(|| invalid("invalid native executor options"))?
@@ -94,10 +103,22 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     }
     let config = load(&source)?;
     let profile = executor_profile(&config, profile.as_deref())?.to_owned();
-    dispatch(&codex_home, &workspace, &profile, &prompt)
+    dispatch(
+        &codex_home,
+        &workspace,
+        &profile,
+        &prompt,
+        terminal_profile.as_deref(),
+    )
 }
 
-fn dispatch(codex_home: &Path, workspace: &Path, profile: &str, prompt: &str) -> io::Result<i32> {
+fn dispatch(
+    codex_home: &Path,
+    workspace: &Path,
+    profile: &str,
+    prompt: &str,
+    terminal_profile: Option<&str>,
+) -> io::Result<i32> {
     let bound = orchestration_config::binding(codex_home, profile)?;
     fs::create_dir_all(workspace)?;
     ensure_workspace_trust(codex_home, workspace)?;
@@ -116,6 +137,7 @@ fn dispatch(codex_home: &Path, workspace: &Path, profile: &str, prompt: &str) ->
             &launcher,
             workspace,
             profile,
+            terminal_profile,
             &title,
             &args,
             &bound,
@@ -237,6 +259,7 @@ fn terminal_tab_args(
     workspace: &Path,
     wrapper: &Path,
     receipt: &Path,
+    terminal_profile: Option<&str>,
 ) -> io::Result<Vec<String>> {
     let mut args = vec![
         "-w".into(),
@@ -245,6 +268,11 @@ fn terminal_tab_args(
         "--title".into(),
         title.to_owned(),
         "--suppressApplicationTitle".into(),
+    ];
+    if let Some(name) = terminal_profile {
+        args.extend(["--profile".into(), name.to_owned()]);
+    }
+    args.extend([
         "-d".into(),
         native_path(workspace)?,
         native_path(wrapper)?,
@@ -252,7 +280,7 @@ fn terminal_tab_args(
         "run".into(),
         "--file".into(),
         native_path(receipt)?,
-    ];
+    ]);
     if args.iter().any(|arg| {
         arg == "--focus"
             || arg == "-f"
@@ -310,6 +338,7 @@ fn dispatch_terminal_tab(
     launcher: &Path,
     workspace: &Path,
     profile: &str,
+    terminal_profile: Option<&str>,
     title: &str,
     tui: &[String],
     bound: &ProfileBinding,
@@ -318,7 +347,7 @@ fn dispatch_terminal_tab(
     let wrapper = std::env::current_exe()
         .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
     let receipt = workspace.join("executor-spawn.json");
-    let args = terminal_tab_args(title, workspace, &wrapper, &receipt)?;
+    let args = terminal_tab_args(title, workspace, &wrapper, &receipt, terminal_profile)?;
     save_receipt(
         workspace,
         launcher,
@@ -635,6 +664,7 @@ mod tests {
             Path::new(r"D:\wt\xai"),
             Path::new(r"C:\harness\codex-harness.exe"),
             Path::new(r"C:\wt\xai\executor-spawn.json"),
+            None,
         )
         .unwrap();
         assert_eq!(args[0], "-w");
@@ -768,6 +798,7 @@ mod tests {
             Path::new(r"D:/wt/xai"),
             Path::new(r"D:/harness/codex-harness.exe"),
             Path::new(r"C:/wt/xai/executor-spawn.json"),
+            Some("PowerShell"),
         )
         .unwrap();
         let joined = args.join(" ");
@@ -776,6 +807,11 @@ mod tests {
             r"D:\harness\codex-harness.exe executor run --file C:\wt\xai\executor-spawn.json",
         ));
         assert!(!joined.contains('/'));
+        let profile = args
+            .iter()
+            .position(|arg| arg == "--profile")
+            .expect("terminal profile option");
+        assert_eq!(args[profile + 1], "PowerShell");
     }
 
     #[test]
