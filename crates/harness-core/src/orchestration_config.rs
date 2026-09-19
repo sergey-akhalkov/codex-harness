@@ -290,15 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn kit_defaults_require_xai_and_a_positive_limit() {
+    fn kit_defaults_require_installed_profiles_and_positive_limits() {
         let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
         assert_eq!(config.vote_threshold, 3);
         assert_eq!(config.incubator_size_cap, 32);
         assert_eq!(config.feedback_batch_limit, 8);
-        validate(&config, &installed(&["default", "xai"])).unwrap();
-        let error = validate(&config, &installed(&["default"])).unwrap_err();
+        validate(&config, &installed(&["default", "ds", "zai"])).unwrap();
+        let error = validate(&config, &installed(&["default", "zai"])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("profile 'xai' is not installed"));
+        assert!(error.to_string().contains("profile 'ds' is not installed"));
         assert!(!error.to_string().contains("substitut"));
     }
 
@@ -369,14 +369,15 @@ mod tests {
             include_bytes!("../../../global/orchestration.toml"),
         )
         .unwrap();
-        fs::write(home.join("xai.config.toml"), "model = 'grok-4.6'\n").unwrap();
+        fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
+        fs::write(home.join("zai.config.toml"), "model = 'glm-5.3'\n").unwrap();
         check_installation(&source, &home).unwrap();
-        fs::remove_file(home.join("xai.config.toml")).unwrap();
+        fs::remove_file(home.join("ds.config.toml")).unwrap();
         let error = check_installation(&source, &home).unwrap_err();
-        assert!(error.to_string().contains("profile 'xai' is not installed"));
+        assert!(error.to_string().contains("profile 'ds' is not installed"));
         fs::write(
             home.join("config.toml"),
-            "[profiles.xai]\nmodel = 'grok-4.6'\n",
+            "[profiles.ds]\nmodel = 'deepseek-flash'\n\n[profiles.zai]\nmodel = 'glm-5.3'\n",
         )
         .unwrap();
         check_installation(&source, &home).unwrap();
@@ -392,8 +393,8 @@ mod tests {
         )
         .unwrap();
         let profile = executor_profile(&config, None).unwrap();
-        assert_eq!(profile, "xai");
-        assert_eq!(profile_args(&profile).unwrap(), ["--profile", "xai"]);
+        assert_eq!(profile, "ds");
+        assert_eq!(profile_args(&profile).unwrap(), ["--profile", "ds"]);
         assert!(profile_args("default").unwrap().is_empty());
         let error = executor_profile(&config, Some("gpt")).unwrap_err();
         assert!(error.to_string().contains("is not an executor"));
@@ -423,22 +424,22 @@ mod tests {
     #[test]
     fn successor_choice_uses_configured_profile_model() {
         let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
-        assert_eq!(config.successor_lead_profile, "xai");
+        assert_eq!(config.successor_lead_profile, "zai");
         let root =
             std::env::temp_dir().join(format!("orchestration-successor-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(
-            root.join("xai.config.toml"),
-            "model = 'grok-4.6'\nmodel_provider = 'xai'\n",
+            root.join("zai.config.toml"),
+            "model = 'glm-5.3'\nmodel_provider = 'zai'\n",
         )
         .unwrap();
         let choice = successor_choice(&config, &root).unwrap();
-        assert_eq!(choice.profile, "xai");
-        assert_eq!(choice.model, "grok-4.6");
+        assert_eq!(choice.profile, "zai");
+        assert_eq!(choice.model, "glm-5.3");
         persist_successor(&root, &choice).unwrap();
         let saved: SuccessorChoice =
             serde_json::from_slice(&fs::read(root.join("successor.json")).unwrap()).unwrap();
-        assert_eq!(saved.model, "grok-4.6");
+        assert_eq!(saved.model, "glm-5.3");
         let _ = fs::remove_dir_all(&root);
     }
 }

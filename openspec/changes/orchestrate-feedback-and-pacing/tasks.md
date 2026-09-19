@@ -9,14 +9,14 @@
 - [x] 2.1 Implement bounded feedback tasks from lead and executors on the existing board workflow; verify no real-time inter-agent chat is required and routine triage mechanics make no model calls.
 - [x] 2.2 Implement lead batch triage at safe boundaries with visible merge decisions and preserved provenance; verify similar feedback merges into one item with one vote per distinct episode and reporter.
 - [x] 2.3 Verify vote integrity: same-reporter repeats and automated diagnostics do not accumulate votes, and provenance remains inspectable.
-- [ ] 2.4 Implement observation routing: a verified reusable procedure in owned skill scope is handed to `autonomous-skill-evolution`; process, orchestration, requirement, tool and unclear or material changes stay in the incubator; kit skill or instruction demand promotes to the kit backlog without private data. Verify a single observation is not both voted as incubator demand and auto-authored as a skill, and that promotion never writes skill packages.
+- [x] 2.4 Implement observation routing: a verified reusable procedure in owned skill scope is handed to `autonomous-skill-evolution`; process, orchestration, requirement, tool and unclear or material changes stay in the incubator; kit skill or instruction demand promotes to the kit backlog without private data. Verify a single observation is not both voted as incubator demand and auto-authored as a skill, and that promotion never writes skill packages.
 
 ## 3. Incubator promotion and hygiene
 
-- [ ] 3.1 Implement the configurable promotion threshold (default: more than two votes) moving items to the backlog with history.
-- [ ] 3.2 Implement consequence routing: small improvements to backlog tasks, behavior changes to OpenSpec, kit-concern items to the kit backlog without private consuming-project data.
-- [ ] 3.3 Implement the lead consequence override with recorded reason for material correctness, integrity or safety evidence.
-- [ ] 3.4 Implement lead-owned incubator hygiene with deterministic triggers: a sweep whenever the lead closes a stage or epic during acceptance and whenever a triage batch finds the incubator above its configured size cap; verify safe deferral when no lead session is active, archived reasons, inspectable history, restoration on fresh evidence, and no model calls for size checks.
+- [x] 3.1 Implement the configurable promotion threshold (default: more than two votes) moving items to the backlog with history.
+- [x] 3.2 Implement consequence routing: small improvements to backlog tasks, behavior changes to OpenSpec, kit-concern items to the kit backlog without private consuming-project data.
+- [x] 3.3 Implement the lead consequence override with recorded reason for material correctness, integrity or safety evidence.
+- [x] 3.4 Implement lead-owned incubator hygiene with deterministic triggers: a sweep whenever the lead closes a stage or epic during acceptance and whenever a triage batch finds the incubator above its configured size cap; verify safe deferral when no lead session is active, archived reasons, inspectable history, restoration on fresh evidence, and no model calls for size checks.
 
 ## 4. Instruction-refresh succession
 
