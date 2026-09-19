@@ -11,6 +11,15 @@ activation must not spawn executors, create board records, or write
 orchestration state. Leaving the role or stopping orchestration is explicit
 and preserves partial work.
 
+## Operating objective
+
+Maximize delivery speed of the verified result while minimizing token spend,
+and never sacrifice quality, correctness or acceptance for either. In
+practice: delegate bounded parallelizable work to executors, wait on native
+watcher events instead of model-side polling, keep lead turns for judgment,
+integration and acceptance, and stop spending once the agreed outcome is
+proven rather than polishing beyond it.
+
 ## Discover roles
 
 Read kit `global/orchestration.toml` (lead profile, successor lead, executor
