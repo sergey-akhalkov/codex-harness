@@ -143,6 +143,7 @@ pub mod task_runtime;
 #[cfg(windows)]
 pub mod task_scheduler;
 pub mod task_store;
+pub mod task_succession;
 #[cfg(windows)]
 pub mod task_view;
 pub mod task_worktree;

@@ -222,6 +222,13 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
     if endpoint.schema != 1 {
         return Err(io::Error::other("unsupported task control endpoint"));
     }
+    // Exact-session lookup for orchestrated succession: the private root of a
+    // managed session is discoverable by session id without a picker.
+    if let Some(id) = endpoint.thread_id.as_deref()
+        && let Err(error) = record_session_pointer(home, id, root.path(), "recorded")
+    {
+        eprintln!("codex-harness: session pointer not recorded: {error}");
+    }
     let mut tui = CommandSpec::new(command.get_program());
     for (key, value) in command.get_envs() {
         if let Some(value) = value {
@@ -482,7 +489,25 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
         &root.path().join("client-closed.json"),
         &json!({"schema":1,"exitCode":exit_code}),
     )?;
+    if let Some(id) = endpoint.thread_id.as_deref() {
+        let _ = record_session_pointer(home, id, root.path(), "exited");
+    }
     Ok(Some(exit_code as i32))
+}
+
+/// Records the private controller root of one managed session. Later readers
+/// use this for exact-session succession; liveness still comes from the
+/// retained process and controller artifacts, never from this pointer alone.
+fn record_session_pointer(home: &Path, session: &str, root: &Path, state: &str) -> io::Result<()> {
+    let path = crate::task_succession::session_pointer_path(home, session);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    save(
+        &path,
+        &json!({"schema":1,"session":session,"root":root,"state":state,
+            "cwd":env::current_dir()?.to_string_lossy()}),
+    )
 }
 
 fn submit_initial(

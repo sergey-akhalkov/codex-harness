@@ -415,6 +415,44 @@ impl ServiceProcess {
         checked(unsafe { GetExitCodeProcess(self.handle.as_raw_handle(), &mut code) })?;
         Ok(Some(code))
     }
+
+    /// Terminate this exact process after re-validating the recorded identity
+    /// on a fresh terminate handle. A stale, exited or mismatched identity is
+    /// never killed; callers own the recorded session, not arbitrary PIDs.
+    pub fn terminate(&self, exit_code: u32) -> io::Result<bool> {
+        if !self.is_running()? {
+            return Ok(false);
+        }
+        let handle = owned(unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                self.identity.pid,
+            )
+        })?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut cpu = FILETIME::default();
+        checked(unsafe {
+            GetProcessTimes(
+                handle.as_raw_handle(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut cpu,
+            )
+        })?;
+        let creation =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        if creation != self.identity.creation_time {
+            return Err(io::Error::other(
+                "process identity changed before termination; preserving process",
+            ));
+        }
+        checked(unsafe { TerminateProcess(handle.as_raw_handle(), exit_code) })?;
+        Ok(true)
+    }
 }
 
 /// Caller supplies a trusted executable implementing both bootstrap commands,

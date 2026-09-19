@@ -1,25 +1,40 @@
-//! Dispatch a configured executor through native `codex --profile`.
+//! Dispatch a configured executor through native `codex --profile`, and
+//! replace one exact session's CLI process under refreshed instructions
+//! (instruction-refresh succession, OFAP 4.1).
 #![cfg(windows)]
 
 use harness_core::orchestration_config::{
     self, ProfileBinding, executor_profile, load, profile_args,
 };
+use harness_core::process::{Job, Limits, StopReason};
+use harness_core::process_service::ServiceProcess;
+use harness_core::task_control::ControlConnection;
+use harness_core::task_succession::{
+    self, Boundary, NativeFacts, Reload, ReloadExpectation, Request as SuccessionRequest,
+    SessionFacts, SuccessorPlan,
+};
 use harness_core::task_view;
 use serde_json::json;
 use std::{
     ffi::OsString,
-    fs, io,
+    fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible TUI, and returns so the lead can keep working. The prompt is prefixed with /goal unless it already starts with a slash command, and a terminal tab hosts the session through `executor run`, which closes the tab on any exit. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling.";
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] [--terminal-profile NAME] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible TUI, and returns so the lead can keep working. The prompt is prefixed with /goal unless it already starts with a slash command, and a terminal tab hosts the session through `executor run`, which closes the tab on any exit. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
 const STARTUP: Duration = Duration::from_secs(20);
+const SUCCESSION_LIMIT: u64 = 4 * 1024 * 1024;
+const INSTRUCTION_READ_LIMIT: u64 = 1024 * 1024;
+const BOUNDARY_POLL: Duration = Duration::from_millis(500);
+const STOP_GRACE: Duration = Duration::from_secs(30);
+const SUCCESSION_EXIT_CODE: u32 = 130;
 /// Runtime identity of the dispatching session must not leak into the
 /// executor: an inherited session/thread id makes the child attach to the
 /// lead's conversation instead of the assignment.
@@ -50,6 +65,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("spawn") => spawn(&args[1..]),
         Some("steer") => steer(&args[1..]),
         Some("run") => run_exec(&args[1..]),
+        Some("succeed") => succeed(&args[1..]),
         _ => Err(invalid("invalid native executor options")),
     }
 }
@@ -588,6 +604,791 @@ fn steer(args: &[OsString]) -> io::Result<i32> {
         println!("{}", serde_json::to_string_pretty(&payload)?);
     }
     Ok(0)
+}
+
+const SUCCESSION_HELP: &str = "codex-harness executor succeed --request FILE\nReplace one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary. The request names the session id, profile, workspace, the private session state root (or its recorded pointer), the compact skill revision identity published by skill-evolution, the durable task context and a private evidence directory. The command makes no model calls: it writes the handover record, confirms the predecessor process stopped, spawns the successor, verifies in the session rollout that current instructions and skills were reloaded, and reports 'succession not established' with a non-zero exit when that verification fails.";
+
+fn succeed(args: &[OsString]) -> io::Result<i32> {
+    if args.first().is_some_and(|arg| arg == "--help") {
+        println!("{SUCCESSION_HELP}");
+        return Ok(0);
+    }
+    if args.len() != 2 || args[0] != "--request" {
+        return Err(invalid(
+            "usage: codex-harness executor succeed --request FILE",
+        ));
+    }
+    let bytes = read_bounded(Path::new(&args[1]), SUCCESSION_LIMIT)?;
+    let request: SuccessionRequest =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("succession request is invalid"))?;
+    request.validate()?;
+    let (code, receipt) = execute_succession(&request);
+    write_succession_receipt(&request, &receipt)?;
+    if receipt["status"] != "established" {
+        eprintln!(
+            "codex-harness: {}",
+            receipt["message"]
+                .as_str()
+                .unwrap_or("succession did not complete")
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(code)
+}
+
+fn execute_succession(request: &SuccessionRequest) -> (i32, serde_json::Value) {
+    let mut receipt = json!({
+        "schema": 1,
+        "status": "blocked",
+        "message": "",
+        "session": request.session,
+        "profile": request.profile,
+        "revision": request.revision,
+        "mechanicsModelCalls": 0,
+        "state": serde_json::Value::Null,
+        "boundary": serde_json::Value::Null,
+        "handover": serde_json::Value::Null,
+        "predecessor": serde_json::Value::Null,
+        "successor": serde_json::Value::Null,
+        "reload": serde_json::Value::Null,
+    });
+    match attempt_succession(request, &mut receipt) {
+        Ok(code) => (code, receipt),
+        Err(error) => {
+            receipt["status"] = json!("blocked");
+            receipt["message"] = json!(error.to_string());
+            (2, receipt)
+        }
+    }
+}
+
+fn attempt_succession(
+    request: &SuccessionRequest,
+    receipt: &mut serde_json::Value,
+) -> io::Result<i32> {
+    let session = task_succession::exact_session_id(&request.session)?.to_owned();
+    let profile = orchestration_config::binding(&request.codex_home, &request.profile)?;
+    let launcher = request
+        .executable
+        .clone()
+        .unwrap_or_else(|| request.codex_home.join("harness/bin/codex.exe"));
+    if !launcher.is_file() {
+        return Err(invalid("installed Codex launcher is missing"));
+    }
+    let upstream = upstream_executable(&request.codex_home)?;
+    let state = match step(
+        "resolve the session state root",
+        resolve_state_root(request),
+    )? {
+        Some(state) => state,
+        None => {
+            return Err(invalid(
+                "the session's private state root is unavailable; succession cannot establish a safe boundary or stop the predecessor",
+            ));
+        }
+    };
+    receipt["state"] = json!(state);
+    let binding = step(
+        "read the recorded session binding",
+        task_succession::binding_from_leader(&state),
+    )?;
+    if let Some(binding) = &binding {
+        step(
+            "verify the recorded session binding",
+            task_succession::verify_binding(request, binding, &profile),
+        )?;
+    }
+    let record = step(
+        "reconcile the owning task record",
+        reconcile_task_record(request, &session),
+    )?;
+    let instruction_path = request.instruction_path();
+    let instruction_text = step(
+        "read the current instructions",
+        read_text(&instruction_path, INSTRUCTION_READ_LIMIT),
+    )?;
+    let live_skill = step(
+        "read the published skill package",
+        skill_evolution::package::load(Path::new(&request.revision.path)).map_err(|error| {
+            invalid(&format!(
+                "the published skill package is not readable; {}: {error}",
+                task_succession::NOT_ESTABLISHED
+            ))
+        }),
+    )?;
+    let published_path = Path::new(&request.revision.path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&request.revision.path));
+    if live_skill.root != published_path
+        || live_skill.name != request.revision.name
+        || live_skill.revision != request.revision.revision
+    {
+        finish_succession(
+            receipt,
+            "notEstablished",
+            format!(
+                "{NOT_ESTABLISHED}: the published revision differs from the live skill package"
+            ),
+        );
+        return Ok(1);
+    }
+    if live_skill.description.trim().is_empty() {
+        return Err(invalid(&format!(
+            "the published skill description is empty; {NOT_ESTABLISHED}"
+        )));
+    }
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(request.timeout_seconds))
+        .ok_or_else(|| invalid("succession deadline is invalid"))?;
+    let (decision, native) = step(
+        "wait for a safe boundary",
+        wait_for_boundary(request, &state, &upstream, deadline),
+    )?;
+    let safe = match decision {
+        Boundary::Safe(safe) => safe,
+        Boundary::Deferred(reason) => {
+            receipt["boundary"] =
+                json!({"predecessorRunning": serde_json::Value::Null, "native": native});
+            finish_succession(
+                receipt,
+                "deferred",
+                format!("succession deferred: {reason}"),
+            );
+            return Ok(2);
+        }
+    };
+    receipt["boundary"] = json!({
+        "predecessorRunning": safe.predecessor_running,
+        "native": safe.native,
+    });
+    let record_path = request.record_path();
+    let mut handover = task_succession::handover_record(
+        request,
+        binding.as_ref(),
+        &profile,
+        "pending",
+        Some(&state),
+    );
+    if let Some(record) = &record {
+        handover["taskRecord"] = json!({
+            "id": record.id,
+            "authorization": record.authorization,
+            "requirements": record.requirements,
+            "worktree": record.worktree,
+            "stopped": record.stopped,
+        });
+    }
+    step(
+        "write the handover record",
+        write_json(&record_path, &handover),
+    )?;
+    let state_record = state.join("succession.json");
+    step(
+        "write the handover record into the session state",
+        write_json(&state_record, &handover),
+    )?;
+    receipt["handover"] = json!({"record": record_path, "stateRecord": state_record});
+    let stop = step(
+        "stop the predecessor process",
+        stop_predecessor(&state, &upstream, safe.predecessor_running, deadline),
+    )?;
+    handover["predecessor"]["stop"] = json!(stop.status);
+    step(
+        "update the handover record",
+        write_json(&record_path, &handover),
+    )?;
+    step(
+        "update the session handover record",
+        write_json(&state_record, &handover),
+    )?;
+    receipt["predecessor"] = json!({
+        "stop": stop.status,
+        "process": stop.process,
+        "detail": stop.detail,
+    });
+    if stop.status == "notConfirmed" {
+        finish_succession(
+            receipt,
+            "notEstablished",
+            format!("{NOT_ESTABLISHED}: the predecessor process stop was not confirmed"),
+        );
+        return Ok(1);
+    }
+    let plan = step(
+        "build the successor invocation",
+        task_succession::successor_plan(request, binding.as_ref()),
+    )?;
+    let cwd = binding
+        .as_ref()
+        .and_then(|binding| binding.cwd.clone())
+        .unwrap_or_else(|| request.workspace.clone());
+    let run = step(
+        "spawn the successor process",
+        spawn_successor(request, &plan, &cwd),
+    )?;
+    receipt["successor"] = json!({
+        "argv": task_succession::argv_text(&plan.program, &plan.args),
+        "exitCode": run.exit_code,
+        "threadStarted": run.thread_started,
+        "stdout": run.stdout,
+        "stderr": run.stderr,
+    });
+    if run.exit_code != 0 {
+        finish_succession(
+            receipt,
+            "notEstablished",
+            format!(
+                "{NOT_ESTABLISHED}: the successor process exited with code {}",
+                run.exit_code
+            ),
+        );
+        return Ok(1);
+    }
+    if run.thread_started.as_deref() != Some(session.as_str()) {
+        finish_succession(
+            receipt,
+            "notEstablished",
+            format!("{NOT_ESTABLISHED}: the successor did not resume the exact session"),
+        );
+        return Ok(1);
+    }
+    let marker = task_succession::marker_for(&session);
+    let Some(rollout) = step(
+        "locate the successor rollout",
+        task_succession::find_rollout(&request.codex_home, &session, &marker),
+    )?
+    else {
+        finish_succession(
+            receipt,
+            "notEstablished",
+            format!(
+                "{NOT_ESTABLISHED}: no successor continuation turn evidence exists in the session rollout"
+            ),
+        );
+        return Ok(1);
+    };
+    let rollout_text = step(
+        "read the successor rollout",
+        task_succession::read_bounded_tail(&rollout),
+    )?;
+    let verified = task_succession::verify_reload(
+        &rollout_text,
+        &ReloadExpectation {
+            instruction_path: &instruction_path,
+            instruction_text: &instruction_text,
+            skill_name: &live_skill.name,
+            skill_description: &live_skill.description,
+            session: &session,
+        },
+    );
+    receipt["reload"] = json!({
+        "instructionPath": instruction_path,
+        "skill": live_skill.name,
+        "skillPath": request.revision.path,
+        "revision": request.revision.revision,
+        "rollout": rollout,
+        "rolloutSha256": task_succession::hash_text(&rollout_text),
+    });
+    match verified {
+        Reload::Verified => {
+            finish_succession(
+                receipt,
+                "established",
+                "succession established: the successor reloaded the current instructions and the published skill revision",
+            );
+            Ok(0)
+        }
+        Reload::NotVerified(reason) => {
+            finish_succession(
+                receipt,
+                "notEstablished",
+                format!("{NOT_ESTABLISHED}: {reason}"),
+            );
+            Ok(1)
+        }
+    }
+}
+
+fn finish_succession(receipt: &mut serde_json::Value, status: &str, message: impl Into<String>) {
+    receipt["status"] = json!(status);
+    receipt["message"] = json!(message.into());
+}
+
+fn step<T>(name: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|error| io::Error::new(error.kind(), format!("{name}: {error}")))
+}
+
+const NOT_ESTABLISHED: &str = task_succession::NOT_ESTABLISHED;
+
+fn resolve_state_root(request: &SuccessionRequest) -> io::Result<Option<PathBuf>> {
+    if let Some(state) = &request.state {
+        return Ok(state.is_dir().then(|| state.clone()));
+    }
+    task_succession::read_session_pointer(&request.codex_home, request.session.trim())
+}
+
+fn reconcile_task_record(
+    request: &SuccessionRequest,
+    session: &str,
+) -> io::Result<Option<harness_core::task_store::TaskRecord>> {
+    let Some(task_id) = request
+        .task
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let record = harness_core::task_store::load(&request.codex_home, task_id)?;
+    harness_core::task_orchestrate::resume(&record)?;
+    if let Some(worktree) = &record.worktree {
+        let recorded = worktree.canonicalize().unwrap_or_else(|_| worktree.clone());
+        let requested = request
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| request.workspace.clone());
+        if recorded != requested {
+            return Err(invalid(
+                "requested workspace differs from the recorded assignment worktree",
+            ));
+        }
+    }
+    if let Some(assignment_id) = request
+        .assignment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let assignment = record
+            .assignments
+            .iter()
+            .find(|assignment| assignment.id == assignment_id)
+            .ok_or_else(|| invalid("recorded assignment is missing from the owning task"))?;
+        if assignment.owner_thread.as_deref() != Some(session) {
+            return Err(invalid(
+                "recorded assignment owner differs from the session; refusing conflicting writers",
+            ));
+        }
+        if !assignment.profile.is_empty() && assignment.profile != request.profile {
+            return Err(invalid(
+                "recorded assignment profile differs from the request; refusing substitution",
+            ));
+        }
+    }
+    Ok(Some(record))
+}
+
+fn wait_for_boundary(
+    request: &SuccessionRequest,
+    state: &Path,
+    upstream: &Path,
+    deadline: Instant,
+) -> io::Result<(Boundary, Option<NativeFacts>)> {
+    loop {
+        let mut facts = task_succession::read_session_facts(state)?;
+        facts.predecessor_running = observe_predecessor(state, &facts, upstream)?;
+        let native = if facts.predecessor_running == Some(true) {
+            observe_native(state, request.session.trim())?
+        } else {
+            None
+        };
+        let decision = task_succession::boundary(&facts, native.as_ref());
+        if matches!(decision, Boundary::Safe(_)) || Instant::now() >= deadline {
+            return Ok((decision, native));
+        }
+        thread::sleep(BOUNDARY_POLL);
+    }
+}
+
+fn observe_predecessor(
+    state: &Path,
+    facts: &SessionFacts,
+    upstream: &Path,
+) -> io::Result<Option<bool>> {
+    if facts.closed {
+        return Ok(Some(false));
+    }
+    let value: serde_json::Value = match read_json(&state.join("view.json"))? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let Some(identity) = process_identity(&value["window"]["process"]) else {
+        return Ok(None);
+    };
+    let user = harness_core::process_service::current_user()?;
+    match ServiceProcess::inspect(identity, upstream, &user) {
+        Ok(Some(process)) => Ok(Some(process.is_running()?)),
+        Ok(None) => Ok(Some(false)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn observe_native(state: &Path, session: &str) -> io::Result<Option<NativeFacts>> {
+    let Some(endpoint) = read_json::<serde_json::Value>(&state.join("endpoint.json"))? else {
+        return Ok(None);
+    };
+    let (Some(port), Some(token)) = (endpoint["port"].as_u64(), endpoint["token"].as_str()) else {
+        return Ok(None);
+    };
+    let Ok(mut connection) = ControlConnection::connect(port as u16, token, Duration::from_secs(5))
+    else {
+        return Ok(None);
+    };
+    if native_call(
+        &mut connection,
+        1,
+        "initialize",
+        json!({"clientInfo":{"name":"harness-succession","version":"1"},"capabilities":{"experimentalApi":true}}),
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    if connection
+        .send(&json!({"method":"initialized"}), Duration::from_secs(5))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let terminals = match native_call(
+        &mut connection,
+        2,
+        "thread/backgroundTerminals/list",
+        json!({"threadId":session,"limit":8}),
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let read = match native_call(
+        &mut connection,
+        3,
+        "thread/read",
+        json!({"threadId":session,"includeTurns":true}),
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let terminals_empty = terminals["data"]
+        .as_array()
+        .is_some_and(|data| data.is_empty())
+        && terminals["nextCursor"].is_null();
+    let latest_turn_settled = read["thread"]["turns"]
+        .as_array()
+        .and_then(|turns| turns.last())
+        .is_none_or(|turn| turn["status"] != "inProgress");
+    Ok(Some(NativeFacts {
+        terminals_empty,
+        latest_turn_settled,
+    }))
+}
+
+fn native_call(
+    connection: &mut ControlConnection,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> io::Result<serde_json::Value> {
+    connection.send(
+        &json!({"id":id,"method":method,"params":params}),
+        Duration::from_secs(5),
+    )?;
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= until {
+            return Err(io::Error::other("native succession probe deadline"));
+        }
+        if let Some(value) = connection.receive(Duration::from_millis(200))? {
+            if value.get("method").is_some() || value["id"] != json!(id) {
+                continue;
+            }
+            if value.get("error").is_some() {
+                return Err(io::Error::other("native succession probe rejected"));
+            }
+            return Ok(value["result"].clone());
+        }
+    }
+}
+
+struct StopOutcome {
+    status: &'static str,
+    process: serde_json::Value,
+    detail: String,
+}
+
+fn stop_predecessor(
+    state: &Path,
+    upstream: &Path,
+    predecessor_running: bool,
+    deadline: Instant,
+) -> io::Result<StopOutcome> {
+    let user = harness_core::process_service::current_user()?;
+    let view = read_json::<serde_json::Value>(&state.join("view.json"))?
+        .and_then(|value| process_identity(&value["window"]["process"]));
+    let runtime = read_json::<serde_json::Value>(&state.join("runtime.json"))?;
+    let service = runtime
+        .as_ref()
+        .and_then(|value| process_identity(&value["process"]));
+    let service_executable = runtime
+        .as_ref()
+        .and_then(|value| value["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| upstream.to_path_buf());
+    let process = view.map_or(
+        serde_json::Value::Null,
+        |identity| json!({"pid": identity.pid, "creationTime": identity.creation_time}),
+    );
+    if !predecessor_running {
+        return Ok(StopOutcome {
+            status: "alreadyStopped",
+            process,
+            detail: "the predecessor had already stopped at a settled boundary".into(),
+        });
+    }
+    // The explicit stop suspends admission and stops the controller; the
+    // frontend then exits on its own when its server closes. Killing the
+    // exact recorded process stays a bounded fallback, never a first move.
+    harness_core::task_runtime::request_stop(state)?;
+    let until = deadline.min(Instant::now() + STOP_GRACE);
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let closed = state.join("closed.json").is_file();
+        let kill = attempts >= 3;
+        let view_state = match view {
+            Some(identity) => inspect_recorded(identity, upstream, &user, kill)?,
+            None => Recorded::Gone,
+        };
+        let service_state = match service {
+            Some(identity) => inspect_recorded(identity, &service_executable, &user, false)?,
+            None => Recorded::Gone,
+        };
+        let settled =
+            !matches!(view_state, Recorded::Running) && !matches!(service_state, Recorded::Running);
+        if (closed && !matches!(view_state, Recorded::Running)) || settled {
+            let closure = read_json::<serde_json::Value>(&state.join("closed.json"))?
+                .and_then(|value| value["reason"].as_str().map(str::to_owned));
+            return Ok(StopOutcome {
+                status: "confirmed",
+                process,
+                detail: format!(
+                    "the predecessor process stopped; controller closure: {}",
+                    closure.as_deref().unwrap_or("recorded")
+                ),
+            });
+        }
+        if Instant::now() >= until {
+            return Ok(StopOutcome {
+                status: "notConfirmed",
+                process,
+                detail: format!(
+                    "the predecessor did not stop before the deadline (closure recorded: {closed})"
+                ),
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+enum Recorded {
+    Running,
+    Gone,
+    Unknown,
+}
+
+/// Observes one recorded process. Access denied means the process is
+/// terminating or the handle was lost in an exit race; it never authorizes a
+/// different target and only defers confirmation to the next attempt.
+fn inspect_recorded(
+    identity: harness_core::process::ProcessIdentity,
+    executable: &Path,
+    user: &str,
+    kill: bool,
+) -> io::Result<Recorded> {
+    match ServiceProcess::inspect(identity, executable, user) {
+        Ok(Some(process)) => {
+            if !process.is_running()? {
+                return Ok(Recorded::Gone);
+            }
+            if kill {
+                match process.terminate(SUCCESSION_EXIT_CODE) {
+                    Ok(_) | Err(_) => (),
+                }
+                match process.wait_for_exit(harness_core::process::Deadline::after(
+                    Duration::from_secs(5),
+                )?) {
+                    Ok(true) => return Ok(Recorded::Gone),
+                    Ok(false) => return Ok(Recorded::Running),
+                    Err(_) => return Ok(Recorded::Unknown),
+                }
+            }
+            Ok(Recorded::Running)
+        }
+        Ok(None) => Ok(Recorded::Gone),
+        Err(error) if error.raw_os_error() == Some(5) => Ok(Recorded::Unknown),
+        Err(error) => Err(error),
+    }
+}
+
+struct SuccessorRun {
+    exit_code: u32,
+    thread_started: Option<String>,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+fn spawn_successor(
+    request: &SuccessionRequest,
+    plan: &SuccessorPlan,
+    cwd: &Path,
+) -> io::Result<SuccessorRun> {
+    fs::create_dir_all(&request.evidence)?;
+    let stdout_path = request.evidence.join("successor-stdout.jsonl");
+    let stderr_path = request.evidence.join("successor-stderr.txt");
+    let mut spec = CommandSpec::new(&plan.program);
+    spec.args = task_succession::os_argv(plan);
+    spec.current_dir = Some(cwd.to_path_buf());
+    spec.stdout = Some(fs::File::create(&stdout_path)?);
+    spec.stderr = Some(fs::File::create(&stderr_path)?);
+    apply_successor_env(&mut spec, &request.codex_home);
+    let job = Job::new(Limits {
+        memory_bytes: Some(2048 * 1024 * 1024),
+        cpu_percent: None,
+    })?;
+    let process = job.spawn(&spec)?;
+    let outcome = job.wait(
+        &process,
+        harness_core::process::Deadline::after(Duration::from_secs(request.timeout_seconds))?,
+        &harness_core::process::Cancellation::default(),
+        Duration::from_secs(5),
+    )?;
+    let exit_code = match outcome.reason {
+        StopReason::Exited => outcome.exit_code,
+        _ => u32::MAX,
+    };
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    Ok(SuccessorRun {
+        exit_code,
+        thread_started: parse_thread_started(&stdout),
+        stdout: stdout_path,
+        stderr: stderr_path,
+    })
+}
+
+fn apply_successor_env(spec: &mut CommandSpec, codex_home: &Path) {
+    spec.env
+        .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
+    if let Some(path) = filtered_path() {
+        spec.env.insert("PATH".into(), Some(path));
+    }
+    for name in INHERITED_SESSION_ENV {
+        spec.env.insert(name.into(), None);
+    }
+}
+
+fn parse_thread_started(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        (value["type"] == "thread.started").then(|| {
+            value["thread_id"]
+                .as_str()
+                .map(str::to_owned)
+                .filter(|id| !id.is_empty())
+        })?
+    })
+}
+
+fn upstream_executable(codex_home: &Path) -> io::Result<PathBuf> {
+    let registration =
+        read_json::<serde_json::Value>(&codex_home.join("harness/native-launch.json"))?
+            .ok_or_else(|| invalid("native launch registration is missing"))?;
+    let upstream = registration["upstream"]["executable"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("native launch registration has no upstream executable"))?;
+    Ok(upstream)
+}
+
+fn process_identity(value: &serde_json::Value) -> Option<harness_core::process::ProcessIdentity> {
+    let pid = value["pid"].as_u64()? as u32;
+    let creation_time = value["creation_time"]
+        .as_u64()
+        .or_else(|| value["creationTime"].as_u64())?;
+    (pid != 0 && creation_time != 0)
+        .then_some(harness_core::process::ProcessIdentity { pid, creation_time })
+}
+
+fn write_succession_receipt(
+    request: &SuccessionRequest,
+    receipt: &serde_json::Value,
+) -> io::Result<()> {
+    fs::create_dir_all(&request.evidence)?;
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    fs::write(request.evidence.join("succession-receipt.json"), &bytes)?;
+    // Every attempt keeps its own record; the stable name above is a pointer.
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let stamp = chrono::DateTime::from_timestamp_millis(millis as i64)
+        .map(|value| value.format("%Y%m%dT%H%M%S%.3fZ").to_string())
+        .unwrap_or_else(|| millis.to_string());
+    let session = receipt["session"].as_str().unwrap_or("session");
+    fs::write(
+        request
+            .evidence
+            .join(format!("succession-receipt-{session}-{stamp}.json")),
+        &bytes,
+    )?;
+    if let Some(state) = receipt["state"].as_str() {
+        let state = Path::new(state);
+        if state.is_dir() {
+            let _ = fs::write(state.join("succession-result.json"), &bytes);
+        }
+    }
+    Ok(())
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let temporary = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, path)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|_| invalid("succession input is unreadable"))?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(invalid("succession input exceeds its bound"));
+    }
+    Ok(bytes)
+}
+
+fn read_text(path: &Path, limit: u64) -> io::Result<String> {
+    let bytes = read_bounded(path, limit)?;
+    String::from_utf8(bytes).map_err(|_| invalid("instruction source is not UTF-8"))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {error}", path.display()),
+            )
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn invalid(message: &str) -> io::Error {

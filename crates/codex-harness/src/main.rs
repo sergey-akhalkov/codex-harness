@@ -277,7 +277,7 @@ fn run() -> io::Result<i32> {
         println!("codex-harness xai-responses-shim [--port N] [--upstream https://api.x.ai]");
         println!("codex-harness xai-token --codex-home DIRECTORY");
         println!(
-            "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]"
+            "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor succeed --request PATH"
         );
         println!("codex-harness skills isolate --request PATH");
         println!("codex-harness skills usage [--user-home DIRECTORY] [--codex-home DIRECTORY]");
