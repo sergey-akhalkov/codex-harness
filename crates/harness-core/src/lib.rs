@@ -1,6 +1,7 @@
 //! Native harness primitives. Read-only checks never build or acquire dependencies.
 pub mod agent_config;
 pub mod analysis_samples;
+pub mod benefit_gate;
 pub mod board_cli;
 pub mod board_feedback;
 #[cfg(windows)]
@@ -97,6 +98,7 @@ pub mod opencodex_login;
 pub mod orchestration_config;
 pub mod orchestration_lifecycle;
 pub mod outcome_report;
+pub mod pacing;
 pub mod path_plan;
 pub mod portable_config;
 pub mod process;
@@ -107,6 +109,7 @@ pub mod profile_state;
 pub mod registration;
 mod registration_native;
 pub mod resource_admission;
+pub mod scoped_observations;
 #[cfg(windows)]
 pub mod serena;
 pub mod serena_broker;
