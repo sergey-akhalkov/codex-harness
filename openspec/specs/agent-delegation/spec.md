@@ -18,88 +18,103 @@ until verified.
 
 ### Requirement: Universal capability levels
 
-The kit SHALL expose middle, senior and principal capability levels globally, with explicit replaceable model and reasoning assignments. Preferred middle SHALL use the authenticated Grok 4.6 subscription at xhigh; middle reserve SHALL use GPT-6 Astra high on the existing ChatGPT subscription. Senior SHALL use GPT-6 Astra xhigh and principal SHALL use GPT-6 Astra max. All OpenAI model assignments, including reserves and auxiliary calls, SHALL use only the Astra family; GPT-5 models SHALL NOT be selected. Levels SHALL support tasks selected by the assignment and relevant available skills rather than a permanent coding/review profession. `grok_reviewer` SHALL be retired with documented migration.
+The kit SHALL support direct native selection of an explicit provider profile, model and compatible reasoning effort per assignment without requiring separate named agent definitions. Lead and executor responsibilities SHALL come from the kit orchestration configuration rather than fixed provider roles, and effective identities SHALL be observable in each conversation view. Only efforts supported by the selected model SHALL be accepted; unsupported combinations SHALL NOT be silently substituted. Redundant supplied Grok middle and Astra middle reserve, senior and principal presets SHALL remain retired with the documented migration to model/effort arguments, preserving user-owned agents, skills and native GPT availability. All OpenAI assignments, including auxiliary calls and reserves, SHALL use only the Astra family, with GPT-5 excluded. Responsibilities and relevant skills SHALL select activities without profession-specific agents. The retired `grok_reviewer` SHALL remain retired.
 
 #### Scenario: One level performs different activities
-- **WHEN** the middle level receives a bounded implementation task and, separately, a bounded review task
-- **THEN** it executes the requested activity and returns appropriate verification evidence without requiring a different profession-specific agent
+- **WHEN** a configured executor receives an implementation assignment and separately a review or research assignment within its capabilities
+- **THEN** it performs each activity with applicable skills and evidence without requiring a separate profession-specific agent
 
 #### Scenario: Native model selection is verified
-- **WHEN** each supplied level is invoked through a new global Codex session outside the kit repository
-- **THEN** native metadata identifies its assigned model and reasoning, and the assigned subscription serves an actual response
+- **WHEN** an executor is launched with its configured profile and a supported effort from a fresh global Codex session outside the kit repository
+- **THEN** native metadata identifies its effective model and reasoning, and the profile's subscription serves an actual response
 
-### Requirement: Economical delegation and Grok priority
+#### Scenario: A requested effort is unsupported
+- **WHEN** an assignment requests an effort absent from the selected model's verified contract
+- **THEN** dispatch reports the unsupported combination before a model request, without silently choosing another model or effort
 
-The primary agent SHALL actively seek worthwhile bounded work to delegate and SHALL prefer available Grok middle over GPT middle for suitable delegation. It SHALL consider ambiguity, error consequences, verification cost, context transfer and expected rework. It SHALL perform work directly when delegation overhead outweighs the benefit or senior judgment is required. Completion and correctness SHALL take precedence over minimizing ChatGPT consumption; delegation count SHALL NOT be a success criterion.
+#### Scenario: Redundant presets are removed
+- **WHEN** the kit updates an installation that used supplied fixed agent profiles
+- **THEN** its own obsolete definitions and references are retired, direct model/effort selection remains usable, and unrelated user agents and `.agents/skills` remain intact
+
+### Requirement: Economical delegation through configured roles
+
+The lead SHALL assign worthwhile complete workstreams to configured executors according to reasoning needs, modality, tools, ambiguity, error consequences and verification cost. It SHALL retain requirements, consequential decisions, overall acceptance and merge responsibility, while executors own investigation, implementation, applicable checks and correction within their assignments. The lead SHALL consider handoff, coordination, waiting, integration and rework, avoid solving delegated work in parallel, and perform a small or tightly coupled task directly when delegation would cost more. Completion and correctness SHALL take precedence over quota minimization; delegation count SHALL NOT be a success criterion.
 
 #### Scenario: Independent routine work is available
-- **WHEN** a task contains independent, sufficiently specified work that benefits from delegation and Grok is available
-- **THEN** the primary agent selects Grok middle and continues useful independent work without duplicating the delegated investigation
+- **WHEN** a task contains sufficiently specified independent work that benefits from delegation and a configured executor is available
+- **THEN** the lead assigns the complete outcome to that executor in its own worktree and continues only non-overlapping useful work or waits without duplicating the investigation
 
 #### Scenario: Delegation would add overhead
-- **WHEN** a task is trivial, tightly coupled or requires senior judgment such that delegation is not worthwhile
-- **THEN** the primary agent completes it directly without a mandatory decomposition or agent round trip
+- **WHEN** a trivial or tightly coupled task costs more to brief and verify than to complete directly
+- **THEN** the lead completes it directly without a mandatory agent round trip
 
 ### Requirement: Autonomous recovery and escalation
 
-The primary agent SHALL distinguish model unavailability from insufficient reasoning capability. Observed unavailable models, authentication failures and quota exhaustion SHALL permit autonomous use of GPT middle reserve, with the cause made visible and partial work preserved. A genuine difficult reasoning blocker SHALL permit a bounded principal consultation without additional user approval within the authorized task. Principal SHALL NOT be a routine reviewer, a mandatory pipeline stage or a remedy for missing credentials or unavailable infrastructure. Repeated attempts SHALL depend on evidence of progress, not a required number of failures. Requests SHALL retain explicit provider/model identity; switching SHALL be a visible orchestration decision, never a hidden transport fallback or paid API substitution.
+The lead and task runtime SHALL distinguish unavailable access from insufficient reasoning capability and incomplete output. A confirmed model, authentication or quota failure SHALL permit visible reassignment to a capable configured executor within the existing authorization, preserving partial work; an unavailable profile SHALL NOT force unsuitable work onto another. Lead succession SHALL be governed by `lead-agent-orchestration`. A genuine hard reasoning blocker SHALL permit a bounded Astra principal consultation, with verified facts, attempted hypotheses and a precise question. Principal SHALL NOT be a routine review stage or an infrastructure/authentication remedy. Retries SHALL depend on their cause and evidence of progress. Provider/model identity SHALL remain explicit; no hidden transport fallback or paid substitution is permitted.
 
 #### Scenario: Grok cannot serve work
-- **WHEN** Grok middle is absent or fails because its model, authentication or quota is unavailable
-- **THEN** the primary agent briefly records the reason and continues suitable unfinished work using GPT middle reserve without asking the user to approve the already authorized work
+- **WHEN** Grok's assigned model, authentication or quota is unavailable
+- **THEN** suitable work continues on another capable configured executor, work requiring image input uses an available capable route, and any use of GPT reserve is explicitly attributed to the same GPT subscription as the lead
 
 #### Scenario: A hard reasoning blocker remains
-- **WHEN** evidence supports a materially difficult reasoning problem beyond the current approach
-- **THEN** the primary agent can consult principal with the problem, minimal reproduction, verified facts, attempted hypotheses and a specific desired result, then validate and integrate the answer
+- **WHEN** evidence supports a materially difficult reasoning problem beyond the current executor's approach
+- **THEN** the lead can consult principal on that bounded question and validate the answer while leaving the rest of the assignment with its executor
 
 ### Requirement: Bounded collaboration and verification
 
-Delegated work SHALL include a concise objective, relevant context, ownership, constraints and acceptance criteria. Assignments SHALL identify the independently verifiable result, required inputs and dependencies, integration consumer, and completion or return condition. Independent edits SHALL use disjoint write scopes or isolated worktrees. Mutable runtime resources such as a desktop session, service, installed directory or test device SHALL have an explicit owner, isolated allocation or serialized use; separate checkouts SHALL NOT imply runtime isolation. Agents SHALL perform applicable checks and report changed files or other concrete results, evidence, validity conditions, restoration state and unresolved issues concisely; detailed logs SHALL remain available on demand within the owning project's retention policy. The primary agent SHALL retain responsibility for acceptance and integration, continue useful independent work when available, and avoid duplicating the delegated investigation. The default collaboration SHALL limit concurrency to two spawned agents and prevent unsolicited recursive delegation. The kit SHALL distinguish configured concurrency/tool controls from advisory time or token budgets and SHALL NOT claim an unsupported hard reasoning-token cap.
+Each workstream SHALL receive a concise objective, sufficient inputs, dependencies, ownership of files and mutable runtime resources, constraints, acceptance checks, an integration consumer and a completion or return condition. Independent edits SHALL use disjoint scopes or Codex-managed worktrees recorded by the controller; ordinary Git worktrees from `isolated-worktree-workflow` SHALL NOT substitute for executor isolation. Shared desktop sessions, services, installed directories and devices SHALL have one interaction owner, isolated allocation or serialized use; a separate checkout SHALL NOT imply runtime isolation. Executors SHALL report changed files or other concrete results, relevant decisions, checks, validity conditions, restoration state and unresolved issues concisely, with details available on demand under the owning retention policy. The active lead SHALL verify important risks and the combined result without routinely repeating completed investigation or every worker check. A supporting result SHALL count as delivered only after its intended consumer uses it and applicable integrated acceptance passes. The task-wide concurrency limit SHALL come from the orchestration configuration; leadership changes SHALL NOT multiply that limit. Workers SHALL NOT create unsolicited recursive agent trees. Configured controls SHALL be distinguished from advisory time/token budgets; unsupported hard reasoning-token caps SHALL NOT be claimed.
 
 #### Scenario: Parallel work is integrated
-- **WHEN** two middle agents handle independent assignments
-- **THEN** their execution overlaps, changes remain within their ownership, their evidence is returned, and the primary agent verifies the combined outcome
+- **WHEN** two executors handle independent workstreams
+- **THEN** execution overlaps without conflicting resource ownership, evidence is returned, and the active lead verifies the consumed combined outcome
 
 #### Scenario: A worker discovers an out-of-scope issue
-- **WHEN** a worker observes unrelated diagnostics or a change outside its assignment
-- **THEN** it preserves unrelated work and reports only material information without expanding its assignment or creating additional agents
+- **WHEN** an executor observes unrelated diagnostics or a change outside its assignment
+- **THEN** it preserves unrelated work and reports material information without expanding scope or creating additional agents
 
 #### Scenario: Two workstreams need the same interactive application
 - **WHEN** separate agents would otherwise manipulate the same desktop or application session
-- **THEN** one agent owns its interaction, conflicting operations are serialized, and independent analysis or implementation proceeds only within separate resources and the existing aggregate resource limits
+- **THEN** one agent owns its interaction, conflicting operations are serialized, and independent work uses separate resources within existing aggregate limits
 
 #### Scenario: An isolated investigation needs a parent dependency
-- **WHEN** a worker can finish its own investigation but cannot yet exercise integration because a named prerequisite is unavailable
-- **THEN** it returns the verified result, unmet prerequisite and validity conditions, and the parent preserves the pending integration rather than restarting the investigation or marking the entire task complete
+- **WHEN** an executor finishes its investigation but cannot exercise integration because a named prerequisite is unavailable
+- **THEN** it returns the verified result, unmet prerequisite and validity conditions, and the lead preserves pending integration without restarting the investigation or claiming full completion
 
 ### Requirement: Explicit resource use
 
-The preferred middle path SHALL avoid implicit OpenAI search/vision helper calls. Required unsupported capabilities SHALL produce a visible limitation or an explicit assignment to an appropriate level. The kit SHALL document how to inspect available usage information for both subscriptions and distinguish observed quota values, token accounting, missing telemetry and cost estimates. No new paid API credentials, top-ups or account changes SHALL be introduced.
+Every role SHALL avoid implicit use of another subscription for search, vision or other auxiliary work. A capability unavailable on the selected route SHALL require an explicit capable assignment or an observable blocked dependency. The kit SHALL document available usage information for connected subscription profiles and distinguish observed account limits, task token accounting, missing telemetry and estimates. Native GPT descendants SHALL be attributed to the same ChatGPT subscription as their parent. No new paid API credentials, top-ups or account changes SHALL be introduced.
+
+#### Scenario: An executor needs an auxiliary capability
+- **WHEN** a selected route lacks image processing or search that an assignment needs
+- **THEN** the missing capability is handled by an explicit available tool or assignment with visible subscription identity, without hidden GPT helper use
 
 #### Scenario: Grok needs an auxiliary capability
-- **WHEN** a Grok task requires search or image processing
-- **THEN** the configured route does not silently invoke an OpenAI helper; the task uses an available explicit capability or reports its limitation for reassignment
+- **WHEN** a Grok-profile task requires search or image processing
+- **THEN** its route uses an available explicit capability or reports a limitation for reassignment without silently invoking an OpenAI helper
 
 ### Requirement: Evidence of efficiency and quality
 
-Acceptance SHALL exercise the global policy on representative implementation, review, parallel, fallback, escalation and direct-work scenarios. A reproducible comparison with direct Astra execution SHALL record total elapsed time, parent and descendant token usage by provider, verification outcomes and rework for matched accepted tasks. Repeated cumulative usage records SHALL NOT be double counted. Missing telemetry or concurrent account activity SHALL be disclosed. Claims of improvement SHALL be limited to measured scenarios; token differences SHALL NOT be presented as exact weekly quota savings. Findings that show overhead or quality failures SHALL drive correction before completion.
+Acceptance SHALL exercise the global policy on representative implementation, review, parallel, fallback, escalation, feedback triage and promotion, instruction-refresh succession and direct-work scenarios. A reproducible comparison with direct execution SHALL record total elapsed time, parent and descendant token usage by provider, verification outcomes, feedback-triage cost and rework for matched accepted tasks, both before and after a promoted improvement becomes a default. Repeated cumulative usage records SHALL NOT be double counted. Missing telemetry or concurrent account activity SHALL be disclosed. A feedback-driven improvement SHALL NOT become a default without unchanged-or-better quality and no material delivery-time regression beyond the declared tolerance; token differences SHALL NOT be presented as exact weekly quota savings. Findings that show overhead or quality failures SHALL drive correction before completion. This comparison is the orchestration-default benefit gate. It SHALL NOT substitute for `skill-evaluation` of library mutations, and skill-evaluation SHALL NOT be required of non-library orchestration defaults.
 
 #### Scenario: A comparative run finishes
 - **WHEN** matched direct and delegated tasks have completed their acceptance checks
 - **THEN** the report includes coordination and worker usage, both providers, elapsed time and quality evidence, and states whether each measured outcome improved or regressed
 
+#### Scenario: A promoted improvement would burn more tokens
+- **WHEN** a promoted change improves quality claims but increases attributable token use or delivery time beyond tolerance
+- **THEN** it is not adopted as a default until the regression is corrected or explicitly accepted by the user
+
 ### Requirement: Global lifecycle and recoverability
 
-Sources and setup SHALL remain in the kit and activate through its linked installation lifecycle for new Codex sessions in other projects. Grok availability SHALL follow the subscription integration; native GPT levels SHALL remain discoverable when that integration is disconnected. Existing credentials, unrelated work, MCP integrations and the running control channel SHALL be preserved. Updates and disconnection SHALL be verifiable without stopping the proxy serving the current session.
+Sources and setup SHALL activate through the existing linked global lifecycle for new Codex sessions in other projects. Available external models SHALL follow their subscription profile connections; direct native GPT assignment SHALL remain usable when external integration is disconnected. Dispatch SHALL NOT require redundant supplied agent presets. Existing credentials, unrelated user agents and skills, work, MCP integrations and active control channels SHALL be preserved. Updates and disconnection SHALL be verifiable in owned state without stopping a proxy serving other sessions.
 
 #### Scenario: A new external session starts
 - **WHEN** the kit is installed and ordinary Codex starts outside this repository
-- **THEN** the global delegation policy, available levels and relevant skills are discoverable without copying reusable sources into the target project
+- **THEN** the delegation policy, the `team-lead` skill, orchestration role configuration, board availability, explicit model/effort selection, simultaneous conversation views and task recovery are usable without copying sources or repeatedly performing manual setup
 
 #### Scenario: Subscription integration is disconnected
 - **WHEN** its lifecycle is exercised in an isolated installation
-- **THEN** the Grok level disappears, native GPT levels remain available, and no global service or credentials are disrupted by that test
-
+- **THEN** removed routes are unavailable for new assignments, native GPT remains usable, recoverable task state is retained, and unrelated services and credentials are preserved
 
 ### Requirement: Workstream completion includes consumption and recovery
 
@@ -132,3 +147,19 @@ The requirement that every active model conversation appear in its own window or
 #### Scenario: Window identity is needed for an owned desktop target
 - **WHEN** an authorized desktop task needs to select a non-Codex window
 - **THEN** list/title/state identify the window, and a screenshot is used only if a visual question remains
+
+### Requirement: Patient ownership of delegated outcomes
+
+Elapsed time, an expired observation wait, an intermediate answer or missing final prose SHALL NOT alone authorize takeover, duplicate execution, cancellation or reassignment. The lead SHALL wait without repeated model status calls when no independent useful work remains. Steering SHALL add relevant facts, resolve a request or correct an established mistake. Incomplete output SHALL first be reconciled with visible work and the owning result-delivery mechanism. A stopped or failed attempt SHALL be recovered or reassigned with its partial result and a concrete cause; it SHALL NOT silently become work for GPT. A verified reasoning limitation can justify bounded assistance, and user stop or redirection SHALL still take effect.
+
+#### Scenario: A correct worker takes longer than an observation interval
+- **WHEN** an executor remains active beyond several observation waits without a demonstrated failure
+- **THEN** its ownership is preserved, no competing solution starts, and waiting generates no repeated model status requests
+
+#### Scenario: A child returns only a progress message
+- **WHEN** a child ends with an intermediate response and partial artifacts but no provider rejection
+- **THEN** recovery examines its visible events and artifacts, retains completed work, and addresses continuation or delivery without treating the output as quota exhaustion
+
+#### Scenario: Review finds a defect in the assigned work
+- **WHEN** a concrete defect can be corrected within the executor's capabilities and scope
+- **THEN** the lead returns the finding and acceptance condition to that executor rather than routinely rewriting its work

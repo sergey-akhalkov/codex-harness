@@ -23,17 +23,21 @@ The kit SHALL provide xAI subscription authentication for the user's SuperGrok H
 - **WHEN** xAI authentication or quota prevents a request
 - **THEN** the failure is visible and the request is not silently sent to a paid API route or a different model
 
-### Requirement: Exact model assignment to named roles
+### Requirement: Exact model and effort assignment
 
-The kit SHALL deliver a globally discoverable Grok middle role supporting review tasks and a documented method of assigning an enabled provider/model to another named role. Role selection SHALL honor the declared model and compatible reasoning settings while the parent can remain on its existing GPT model. The supported heterogeneous delegation mode SHALL deliver the actual task and tool results to the child.
+The kit SHALL provide native assignment parameters for an enabled provider profile and its supported reasoning effort, with lead and executor bindings selected through kit orchestration configuration while explicit user profile selection retains its native precedence. The supported heterogeneous mode SHALL deliver the assigned task and actual tool results through the configured profiles. Each active conversation SHALL be simultaneously visible in its own window or pane with its effective identity. Autonomous recovery SHALL create a distinct visible task-level reassignment with a newly verified binding; an exact request SHALL NOT be silently relabeled or rerouted. Cross-provider continuation SHALL use sufficient visible task context and preserved artifacts, without assuming another provider can consume encrypted reasoning or compaction state.
 
 #### Scenario: GPT delegates a review to Grok middle
-- **WHEN** a GPT main agent invokes the named Grok middle for a review from outside the harness checkout
-- **THEN** the child receives the assigned task, uses the selected Grok model, exercises an appropriate local tool, and returns its findings to the parent
+- **WHEN** the lead assigns a review to the configured Grok executor profile from outside the harness checkout
+- **THEN** the child receives the task, uses the selected profile's model, exercises an appropriate local tool and returns its findings
 
 #### Scenario: The role's model is unavailable
-- **WHEN** the explicitly assigned model cannot serve the delegated request
-- **THEN** the failure remains observable and no fallback or alias silently substitutes another model
+- **WHEN** an explicitly assigned model cannot serve a delegated request
+- **THEN** the failure remains observable and any authorized fallback is a distinct, visible assignment to a capable configured profile with preserved partial work
+
+#### Scenario: A saved heterogeneous child needs recovery
+- **WHEN** a restored task must continue a child whose provider binding cannot be verified
+- **THEN** the runtime creates a fresh verified binding using the visible handoff and does not blindly resume it under an inherited model
 
 ### Requirement: Direct reusable configuration and private state
 Reusable native profile, catalog and helper sources SHALL be read directly from repository sources through supported references or links. OAuth tokens, runtime logs, process state and installation recovery records SHALL remain on the host. Source links SHALL survive supported non-secret configuration writes. The kit SHALL NOT keep a linked OpenCodex `config.json` or role directory as the live Grok transport.

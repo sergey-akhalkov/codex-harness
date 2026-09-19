@@ -146,15 +146,19 @@ Existing logs, checks and comparable evidence SHALL be reused before new model-b
 
 ### Requirement: Model and context efficiency within authorized routing
 
-Optimization SHALL evaluate routine Astra effort, unnecessary context loading, redundant tool preparation and total delegation cost. Every OpenAI assignment SHALL remain in the Astra family, with Grok as the preferred available middle and no silent provider, billing or Fast-mode change. A changed default SHALL require comparable accepted-result evidence; fewer tokens alone MUST NOT justify a quality regression. Lost child results SHALL be distinguished from model/auth/quota unavailability and recovered through their owning integration before duplicating completed work.
+Optimization SHALL evaluate lead reasoning effort, unnecessary context, redundant preparation, waiting, worker execution and total delegation cost. Provider preference SHALL follow the kit orchestration configuration rather than fixed provider roles, while preserving acceptance. All OpenAI assignments SHALL remain in the Astra family without hidden provider, billing or Fast-mode changes. Reasoning effort SHALL be selected at supported task or turn boundaries according to uncertainty and risk, without restarting ongoing work solely to change effort. Changed effort defaults SHALL require comparable accepted-result evidence; token savings SHALL NOT justify a quality regression. Lost child results SHALL be distinguished from model/auth/quota failure and recovered through their owning mechanism before completed work is duplicated. Quota pacing across account windows and token-benefit comparisons are owned by the separate follow-up change and SHALL NOT be claimed by this change.
 
 #### Scenario: A child ends without a final artifact
-- **WHEN** available evidence shows partial work but no model/auth/quota rejection
-- **THEN** the result is inspected and recovery is coordinated with the Grok stability change instead of treating absence as proof that Grok is unavailable
+- **WHEN** evidence shows partial work without a model/auth/quota rejection
+- **THEN** its visible state and delivery mechanism are reconciled without inferring provider unavailability or automatically transferring the work to GPT
 
 #### Scenario: A lower effort candidate saves tokens but misses a defect
-- **WHEN** that candidate fails the unchanged acceptance oracle
+- **WHEN** that candidate fails unchanged acceptance
 - **THEN** it does not become the global default
+
+#### Scenario: Effort is selected without a fixed agent profile
+- **WHEN** an assignment can use a supported lower effort without changing its required outcome
+- **THEN** the lead selects that model/effort combination directly, the effective values are visible in its conversation pane, and no separate agent definition is required
 
 ### Requirement: Complete accepted scope remains the measure
 
@@ -185,3 +189,15 @@ Each interface SHALL have a justified summary bound and representative output ch
 #### Scenario: Minimum output is validated
 - **WHEN** an interface's concise mode is accepted
 - **THEN** checks prove quiet no-ops, actionable error/changed-result summaries, detail retrieval, deduplication and preserved protocol semantics
+
+### Requirement: Quota-aware pacing across account windows
+
+Dispatch and feedback cadence SHALL consider fresh available account-limit observations, their scope, reset times and observed use, prioritizing conservation of lead capacity for consequential decisions while following the orchestration configuration for routing. Account state SHALL be shared by the controller's tasks on that account while task work and authorization remain separate. Missing or stale telemetry SHALL remain unknown, not zero or unlimited; local request logs SHALL NOT be treated as an authoritative subscription remainder; no model call SHALL be made solely to estimate remaining quota. Pacing SHALL adjust new work allocation, supported concurrency, reasoning effort and feedback cadence without abandoning an active healthy executor, dropping accepted work or adding purchases. Reset-time bursts SHALL be avoided across tasks sharing an account. This requirement paces orchestration account windows; it SHALL NOT replace skill-evolution episode or period learning budgets.
+
+#### Scenario: Lead capacity is depleting rapidly
+- **WHEN** comparable current observations show the lead account window depleting quickly
+- **THEN** new assignments and nonessential coordination are paced to preserve consequential decisions while healthy executors finish their owned work
+
+#### Scenario: Several tasks share one account
+- **WHEN** multiple tasks would retry or resume on the same account at its reset time
+- **THEN** retry eligibility is distributed instead of issuing a synchronized burst
