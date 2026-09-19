@@ -271,6 +271,7 @@ mod tests {
             vote_threshold: 3,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
+            worktree_limit: 6,
         }
     }
 

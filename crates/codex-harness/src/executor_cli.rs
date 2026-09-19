@@ -135,6 +135,13 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let config = load(&source)?;
     let profile = executor_profile(&config, profile.as_deref())?.to_owned();
     let mode = SpawnMode::parse(mode.as_deref())?;
+    let audit = harness_core::task_worktree::audit(&source)?;
+    if audit.total >= config.worktree_limit {
+        eprintln!(
+            "worktree warning: {} registered worktrees reach the limit {}; retire finished lanes or reset them for reuse (git worktree list)",
+            audit.total, config.worktree_limit
+        );
+    }
     dispatch(
         &codex_home,
         &workspace,

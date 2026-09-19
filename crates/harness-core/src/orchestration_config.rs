@@ -7,6 +7,7 @@ const MAX_EXECUTORS: u32 = 32;
 const DEFAULT_VOTE_THRESHOLD: u32 = 3;
 const DEFAULT_INCUBATOR_CAP: u32 = 32;
 const DEFAULT_FEEDBACK_BATCH: u32 = 8;
+const DEFAULT_WORKTREE_LIMIT: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +23,10 @@ pub struct Orchestration {
     pub incubator_size_cap: u32,
     #[serde(default = "default_feedback_batch")]
     pub feedback_batch_limit: u32,
+    /// Lanes are reused, not multiplied; crossing this count means a lane was
+    /// not reset or retired and needs lead attention.
+    #[serde(default = "default_worktree_limit")]
+    pub worktree_limit: u32,
 }
 
 fn default_vote_threshold() -> u32 {
@@ -32,6 +37,10 @@ fn default_incubator_cap() -> u32 {
 }
 fn default_feedback_batch() -> u32 {
     DEFAULT_FEEDBACK_BATCH
+}
+
+fn default_worktree_limit() -> u32 {
+    DEFAULT_WORKTREE_LIMIT
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +187,11 @@ pub fn validate(config: &Orchestration, installed: &BTreeSet<String>) -> io::Res
             "orchestration feedback_batch_limit must be a positive integer at most 32",
         ));
     }
+    if config.worktree_limit == 0 || config.worktree_limit > 64 {
+        return Err(invalid(
+            "orchestration worktree_limit must be a positive integer at most 64",
+        ));
+    }
     Ok(())
 }
 
@@ -313,6 +327,7 @@ mod tests {
             vote_threshold: 3,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
+            worktree_limit: 6,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -330,6 +345,7 @@ mod tests {
             vote_threshold: 3,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
+            worktree_limit: 6,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(
@@ -347,6 +363,7 @@ mod tests {
             vote_threshold: 1,
             incubator_size_cap: 32,
             feedback_batch_limit: 8,
+            worktree_limit: 6,
         };
         let error = validate(&config, &installed(&["default", "xai"])).unwrap_err();
         assert!(

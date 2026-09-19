@@ -171,6 +171,29 @@ pub fn is_git_checkout(path: &Path) -> io::Result<bool> {
     Ok(path.join(".git").exists())
 }
 
+/// Lane inventory guard: lanes are reused, not multiplied. The authoritative
+/// list is `git worktree list`; the lead warns and cleans up instead of
+/// silently accumulating worktrees when a lane was not reset or retired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeAudit {
+    pub total: u32,
+    pub paths: Vec<PathBuf>,
+}
+
+pub fn audit(source: &Path) -> io::Result<WorktreeAudit> {
+    let output = git(source, &["worktree", "list", "--porcelain"])?;
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    Ok(WorktreeAudit {
+        total: paths.len() as u32,
+        paths,
+    })
+}
+
 #[cfg(test)]
 fn allocate_in_pool(
     codex_home: &Path,
@@ -234,6 +257,21 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_counts_the_authoritative_worktree_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path());
+        let lane = root.path().join("lane");
+        git_ok(
+            &repo,
+            &["worktree", "add", "--detach", lane.to_str().unwrap()],
+        );
+        let audit = audit(&repo).unwrap();
+        assert_eq!(audit.total, 2);
+        assert!(audit.paths.contains(&repo));
+        assert!(audit.paths.contains(&lane.canonicalize().unwrap()));
+    }
 
     fn repo(root: &Path) -> PathBuf {
         let repo = root.join("repo");
