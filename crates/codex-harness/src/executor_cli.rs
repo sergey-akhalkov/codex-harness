@@ -26,6 +26,14 @@ const STARTUP: Duration = Duration::from_secs(20);
 const INHERITED_SESSION_ENV: [&str; 3] = ["CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CI"];
 
 pub fn run(args: &[OsString]) -> io::Result<i32> {
+    if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_ARGV_LOG") {
+        let dump = args
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(&log, dump);
+    }
     if args.first().is_some_and(|arg| arg == "--help") {
         println!("{USAGE}");
         return Ok(0);
@@ -133,14 +141,66 @@ fn goal_prompt(prompt: &str) -> String {
 /// the child outcome, so Windows Terminal closes the tab on any exit instead
 /// of leaving a dead tab that someone must remember to close.
 fn run_exec(args: &[OsString]) -> io::Result<i32> {
+    if args.len() == 2 && args[0] == "--file" {
+        return run_receipt(&args[1]);
+    }
     let Some((launcher, rest)) = args.split_first() else {
         return Err(invalid("executor run requires the launcher path"));
     };
+    let launcher = normalize_launcher(launcher)?;
+    run_child(&launcher, rest)
+}
+
+fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
+    let bytes =
+        fs::read(path).map_err(|error| invalid(&format!("executor run receipt: {error}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(&format!("executor run receipt JSON: {error}")))?;
+    let launcher = value
+        .get("launcher")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid("executor run receipt launcher is missing"))?
+        .to_owned();
+    let rest = value
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| invalid("executor run receipt args are missing"))?;
+    run_child(&launcher, &rest)
+}
+
+fn run_child(launcher: &str, rest: &[OsString]) -> io::Result<i32> {
+    let launcher = launcher.replace('/', r"\");
+    let launcher = launcher.as_str();
     if !Path::new(launcher).is_absolute() {
         return Err(invalid("executor run launcher must be absolute"));
     }
-    Command::new(launcher).args(rest).status()?;
+    let mut command = Command::new(launcher);
+    command.args(rest);
+    // Optional diagnostics: capture the child's stderr without touching its
+    // terminal stdout, so launch failures under a tab host stay observable.
+    if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_RUN_LOG") {
+        let file = fs::File::create(&log)
+            .map_err(|error| invalid(&format!("executor run log: {error}")))?;
+        command.stderr(file);
+    }
+    command.status()?;
     Ok(0)
+}
+
+/// Forward-slash launcher paths reach `CreateProcess` through a path that
+/// splits them; normalize to native separators before dispatch.
+fn normalize_launcher(launcher: &std::ffi::OsStr) -> io::Result<String> {
+    let text = launcher
+        .to_str()
+        .ok_or_else(|| invalid("executor run launcher must be unicode"))?;
+    Ok(text.replace('/', r"\"))
 }
 
 fn prefers_terminal_tab(session: Option<&std::ffi::OsStr>, client: Option<&Path>) -> bool {
@@ -176,8 +236,7 @@ fn terminal_tab_args(
     title: &str,
     workspace: &Path,
     wrapper: &Path,
-    launcher: &Path,
-    tui: &[String],
+    receipt: &Path,
 ) -> io::Result<Vec<String>> {
     let mut args = vec![
         "-w".into(),
@@ -187,12 +246,13 @@ fn terminal_tab_args(
         title.to_owned(),
         "--suppressApplicationTitle".into(),
         "-d".into(),
-        unicode(workspace)?,
-        unicode(wrapper)?,
+        native_path(workspace)?,
+        native_path(wrapper)?,
+        "executor".into(),
         "run".into(),
-        unicode(launcher)?,
+        "--file".into(),
+        native_path(receipt)?,
     ];
-    args.extend(tui.iter().map(|arg| escape_wt_commandline(arg)));
     if args.iter().any(|arg| {
         arg == "--focus"
             || arg == "-f"
@@ -204,6 +264,13 @@ fn terminal_tab_args(
         return Err(invalid("terminal tab spawn must not steal focus"));
     }
     Ok(args)
+}
+
+/// Windows Terminal re-tokenizes the tab commandline and mangles option-like
+/// tail arguments when paths use forward slashes; native separators keep the
+/// command boundary unambiguous.
+fn native_path(path: &Path) -> io::Result<String> {
+    Ok(unicode(path)?.replace('/', r"\"))
 }
 
 fn apply_executor_env(spec: &mut CommandSpec, codex_home: &Path) {
@@ -250,9 +317,11 @@ fn dispatch_terminal_tab(
 ) -> io::Result<i32> {
     let wrapper = std::env::current_exe()
         .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
-    let args = terminal_tab_args(title, workspace, &wrapper, launcher, tui)?;
+    let receipt = workspace.join("executor-spawn.json");
+    let args = terminal_tab_args(title, workspace, &wrapper, &receipt)?;
     save_receipt(
         workspace,
+        launcher,
         profile,
         tui,
         bound,
@@ -297,7 +366,16 @@ fn dispatch_owned_console(
     bound: &ProfileBinding,
     codex_home: &Path,
 ) -> io::Result<i32> {
-    save_receipt(workspace, profile, args, bound, None, "owned-console", None)?;
+    save_receipt(
+        workspace,
+        launcher,
+        profile,
+        args,
+        bound,
+        None,
+        "owned-console",
+        None,
+    )?;
     println!(
         "{}",
         spawn_summary(
@@ -326,6 +404,7 @@ fn dispatch_owned_console(
     let snapshot = view.snapshot()?;
     save_receipt(
         workspace,
+        launcher,
         profile,
         args,
         bound,
@@ -363,7 +442,7 @@ fn tui_args(
 ) -> io::Result<Vec<String>> {
     let mut args = isolation.to_vec();
     args.extend(profile_args(profile)?);
-    args.extend(["-C".into(), unicode(workspace)?, prompt.to_owned()]);
+    args.extend(["-C".into(), native_path(workspace)?, prompt.to_owned()]);
     if args.iter().any(|arg| arg == "--remote") && args.iter().any(|arg| arg == "--worktree") {
         return Err(invalid(
             "native CLI rejects --worktree with --remote; attach the view to the managed cwd",
@@ -379,6 +458,7 @@ fn tui_args(
 
 fn save_receipt(
     workspace: &Path,
+    launcher: &Path,
     profile: &str,
     args: &[String],
     bound: &ProfileBinding,
@@ -395,6 +475,7 @@ fn save_receipt(
         workspace.join("executor-spawn.json"),
         serde_json::to_vec_pretty(&json!({
             "schema": 1,
+            "launcher": native_path(launcher)?,
             "profile": profile,
             "args": args,
             "visible": true,
@@ -553,8 +634,7 @@ mod tests {
             "Codex executor (xai)",
             Path::new(r"D:\wt\xai"),
             Path::new(r"C:\harness\codex-harness.exe"),
-            Path::new(r"C:\codex.exe"),
-            &["--profile".into(), "xai".into(), "do;the work".into()],
+            Path::new(r"C:\wt\xai\executor-spawn.json"),
         )
         .unwrap();
         assert_eq!(args[0], "-w");
@@ -565,10 +645,10 @@ mod tests {
             .iter()
             .position(|arg| arg == r"C:\harness\codex-harness.exe")
             .expect("wrapper executable");
-        assert_eq!(args[wrapper + 1], "run");
-        assert_eq!(args[wrapper + 2], r"C:\codex.exe");
-        assert_eq!(args.last().unwrap(), r"do\;the work");
-        assert!(args.contains(&r"do\;the work".to_string()));
+        assert_eq!(args[wrapper + 1], "executor");
+        assert_eq!(args[wrapper + 2], "run");
+        assert_eq!(args[wrapper + 3], "--file");
+        assert_eq!(args[wrapper + 4], r"C:\wt\xai\executor-spawn.json");
         assert!(
             !args.iter().any(|arg| {
                 arg == "--focus" || arg == "-f" || arg == "--maximized" || arg == "-M"
@@ -668,5 +748,57 @@ mod tests {
         assert!(error.to_string().contains("absolute"));
         let error = run_exec(&[]).unwrap_err();
         assert!(error.to_string().contains("launcher path"));
+    }
+
+    #[test]
+    fn forward_slash_launcher_paths_are_normalized() {
+        assert_eq!(
+            normalize_launcher(std::ffi::OsStr::new(
+                r"C:/Users/noilw/.codex/harness/bin/codex.exe"
+            ))
+            .unwrap(),
+            r"C:\Users\noilw\.codex\harness\bin\codex.exe"
+        );
+    }
+
+    #[test]
+    fn terminal_tab_paths_use_native_separators() {
+        let args = terminal_tab_args(
+            "t",
+            Path::new(r"D:/wt/xai"),
+            Path::new(r"D:/harness/codex-harness.exe"),
+            Path::new(r"C:/wt/xai/executor-spawn.json"),
+        )
+        .unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains(r"-d D:\wt\xai"));
+        assert!(joined.contains(
+            r"D:\harness\codex-harness.exe executor run --file C:\wt\xai\executor-spawn.json",
+        ));
+        assert!(!joined.contains('/'));
+    }
+
+    #[test]
+    fn run_receipt_launches_the_recorded_command() {
+        let root = std::env::temp_dir().join(format!("executor-receipt-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("executor-spawn.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "launcher": r"C:/Windows/System32/cmd.exe",
+                "args": ["/c"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let code = run_exec(&[
+            OsString::from("--file"),
+            OsString::from(receipt.as_os_str()),
+        ])
+        .unwrap();
+        assert_eq!(code, 0);
+        let _ = fs::remove_dir_all(root);
     }
 }
