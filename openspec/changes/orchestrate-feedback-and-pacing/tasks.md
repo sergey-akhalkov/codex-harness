@@ -20,17 +20,17 @@
 
 ## 4. Instruction-refresh succession
 
-- [ ] 4.1 Implement successor spawning through the verified `codex resume` path at safe boundaries after in-flight tool effects, with durable context handover and predecessor process stop. Consume the compact revision identity published by skill-evolution; do not implement catalogue injection or compact recovery.
-- [ ] 4.2 Verify succession preserves partial work and authorization, does not replay uncertain external operations, and reports "succession not established" when reload verification fails.
+- [x] 4.1 Implement successor spawning through the verified `codex resume` path at safe boundaries after in-flight tool effects, with durable context handover and predecessor process stop. Consume the compact revision identity published by skill-evolution; do not implement catalogue injection or compact recovery.
+- [x] 4.2 Verify succession preserves partial work and authorization, does not replay uncertain external operations, and reports "succession not established" when reload verification fails.
 
 ## 5. Pacing and the benefit gate
 
-- [ ] 5.1 Connect scoped observations: native lead-account limit reads where exposed, actual refusals, and bounded user-supplied dashboard snapshots; verify unknown telemetry stays unknown and no probe calls are made.
-- [ ] 5.2 Apply pacing to new assignments, concurrency, effort and feedback cadence without preempting healthy executors; verify reset-time burst avoidance across tasks sharing an account.
-- [ ] 5.3 Run the benefit-gate comparison on at least one promoted improvement before it becomes a default: matched quality and delivery-time outcomes with feedback-triage, coordination and rework included. This comparison is the orchestration default gate, not skill-evaluation of a library mutation.
+- [x] 5.1 Connect scoped observations: native lead-account limit reads where exposed, actual refusals, and bounded user-supplied dashboard snapshots; verify unknown telemetry stays unknown and no probe calls are made.
+- [x] 5.2 Apply pacing to new assignments, concurrency, effort and feedback cadence without preempting healthy executors; verify reset-time burst avoidance across tasks sharing an account.
+- [x] 5.3 Run the benefit-gate comparison on at least one promoted improvement before it becomes a default: matched quality and delivery-time outcomes with feedback-triage, coordination and rework included. This comparison is the orchestration default gate, not skill-evaluation of a library mutation.
 
 ## 6. Lifecycle, records and acceptance
 
-- [ ] 6.1 Deliver the loop through the kit lifecycle; verify fresh external sessions discover the workflow, unrelated configuration is preserved, and rollback removes the loop without losing archived evidence.
-- [ ] 6.2 Update owning delegation, efficiency, token-workflow and decision records with actual supported operation and limits; keep private evidence outside shared sources.
-- [ ] 6.3 Exercise the complete loop end to end on a real consuming task: feedback, dedup, promotion, implementation, succession and measured benefit; close only tasks supported by actual results.
+- [x] 6.1 Deliver the loop through the kit lifecycle; verify fresh external sessions discover the workflow, unrelated configuration is preserved, and rollback removes the loop without losing archived evidence.
+- [x] 6.2 Update owning delegation, efficiency, token-workflow and decision records with actual supported operation and limits; keep private evidence outside shared sources.
+- [x] 6.3 Exercise the complete loop end to end on a real consuming task: feedback, dedup, promotion, implementation, succession and measured benefit; close only tasks supported by actual results.

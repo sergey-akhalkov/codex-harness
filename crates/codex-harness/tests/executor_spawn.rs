@@ -60,7 +60,8 @@ fn shared_checkout_without_worktrees_is_refused() {
         include_str!("../../../global/orchestration.toml"),
     )
     .unwrap();
-    fs::write(home.join("xai.config.toml"), "model = 'grok-4.6'\n").unwrap();
+    // The committed orchestration configuration names the `ds` executor.
+    fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
     Command::new("git")
         .args(["init", "-q"])
         .current_dir(&workspace)

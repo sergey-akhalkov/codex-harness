@@ -74,9 +74,16 @@ same restore. It does not use headless `codex exec --json`. Do not pass
 `--worktree` together with `--remote`; attach with `-C` at the managed cwd.
 Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.
+The default exec mode streams the assignment in that visible tab and exits on
+completion, so the tab closes itself; a mid-work stop is detected by the lead's
+watcher and the exact session continues through `codex exec resume SESSION_ID`.
+While an executor runs, one native watcher process checks the board review
+queue, the assignment's result artifact and executor liveness and emits a
+single event; the lead blocks on that event between other work instead of
+polling executor process ids from model turns or reading window pixels.
 Assignments live on the beads board; executors set `lead_review` when done
 instead of closing. The lead reviews that inbox and its own `assignee=lead`
-tasks. Do not poll executor process ids.
+tasks.
 
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
 stop. Ordinary sessions without that activation spawn nothing.
@@ -119,6 +126,44 @@ specifications are features, executor feedback is a `task` labeled `feedback`,
 and `bd status` / `bd list --label feedback` / `bd epic status` are the
 non-interactive reports. Do not run `bd setup codex` from kit install.
 
+## Improvement loop
+
+Feedback is a board queue, not chat: lead and executor observations become
+bounded `feedback` tasks, batch-triaged by the lead at safe boundaries.
+Listing, merging, voting and promotion are `bd` commands; only the lead's
+similarity and consequence judgments are model work. The incubator holds unique
+items, a merge or repeated report adds exactly one vote per distinct episode and
+reporter, and `vote_threshold` (kit `global/orchestration.toml`, default 3)
+promotes an item to the backlog in routing order: small improvements to backlog
+tasks, behavior or requirement changes into OpenSpec, and kit instruction or
+tool demand to the kit's own board with kit-level wording only. A material
+correctness, integrity or safety finding promotes immediately under the lead's
+consequence override with the reason recorded. The lead sweeps the incubator on
+two triggers it already observes - closing a stage or epic during acceptance,
+and a triage batch finding it above `incubator_size_cap` - archiving stale items
+with visible reasons instead of deleting evidence. The `board-workflow` skill
+owns the record formats; the `team-lead` skill owns the workflow.
+
+Pacing uses three scoped sources only: the native Codex/GPT limit snapshot the
+CLI records for itself, actual provider refusals, and bounded dashboard
+snapshots the user supplies. Unknown stays unknown - no probe call and no local
+request-count remainder - and unknown holds the configured limits rather than
+raising them. Below 70% used keeps configured concurrency and cadence, 70% or
+more halves new concurrency and the triage batch (at least 1), and 90% or more,
+or an observed refusal, waits for the reset with concurrency 1 and a `low`
+effort ceiling. Pacing changes new assignments only: a healthy executor keeps
+its slot, model and instructions, and tasks released by one reset are spread by
+a 120-second stagger instead of bursting together. Decisions are recorded on the
+board with reason, basis and expiry, and withdrawn with a revoke record.
+
+No improvement becomes a default for assignments, worktrees, concurrency or
+cadence before a matched comparison declares its tolerance in advance and shows
+unchanged-or-better quality inside that tolerance, with check time, coordination
+and rework counted in both arms. An adopted record is required: an inconclusive
+or rejected comparison, or no record at all, leaves the improvement unadopted.
+The gate evaluates orchestration defaults; it is not the skill-evaluation
+contract for library mutations.
+
 ## Executor worktrees
 
 Installed CLI 0.155.1 allocates experimental managed worktrees with
@@ -126,8 +171,19 @@ Installed CLI 0.155.1 allocates experimental managed worktrees with
 `--remote` control TUI must not. Attach the window with `-C` at the managed
 cwd. Disabled `worktrees` is an explicit limitation: executors do not write to
 the shared checkout and do not fall back to an ordinary Git worktree.
-Native confirmed deletion is TUI-only and refuses dirty, untracked or ignored
-trees; otherwise the checkout is preserved.
+Lanes are reused, not rebuilt: after an accepted merge the lead resets the lane
+worktree to the new committed base (`git reset --hard <base>` plus
+`git clean -fd`, so ignored build caches stay warm) and dispatches the next task
+of that lane into it. `crates/harness-core/src/task_worktree.rs` implements the
+reset (`reset_for_reuse` distinguishes a reused lane from unresettable state) and
+the merge flow reports which of the two happened. Deletion remains the lane
+retirement path: native confirmed deletion is TUI-only and refuses dirty,
+untracked or ignored trees, so a lane that cannot be reset is preserved with its
+reason instead of being deleted or reused blindly, and merged branches are kept.
+Lane purpose lives in kit-local task state and board records, never in tracked
+files. The authoritative inventory is `git worktree list`, and the configured
+`worktree_limit` warns when registered worktrees reach it, because a lane that
+was neither reset nor retired is the only way the count grows.
 
 ## How selection works
 

@@ -494,8 +494,16 @@ checkout with no upstream, while the per-worktree build cache (gigabytes of
 `target/`) is the real cost of a cold worktree — reuse keeps it warm, like
 developers pulling instead of rebuilding from scratch. Inventory authority is
 `git worktree list`; lane purpose stays in kit-local task state and board
-records, never in tracked files. Implementation task for the native lifecycle:
-board `codex-harness-pvr.5`.
+records, never in tracked files. The native lifecycle implements the reset in
+`crates/harness-core/src/task_worktree.rs` (`reset_for_reuse`, used by the
+accepted-merge flow) and reports reuse versus unresettable state; deletion stays
+the lane-retirement decision, so an unresettable lane is preserved with its
+reason rather than deleted. A matched benefit-gate comparison of the two
+strategies on unchanged quality (tolerance declared at 10% before the run)
+adopted lane reuse at a conservative -11.8% delivery time; the warm lane keeps
+its `target/` gigabytes, and
+[executor worktrees](agent-delegation.md#executor-worktrees) documents the
+supported operation and limits.
 
 **2026-09-19, confirmed:** the feedback loop's kit-level backlog is the kit
 checkout's own `bd` board, addressed explicitly by the lead session
@@ -516,6 +524,34 @@ Prompt-level `/goal` prefixes are not used for spawned executors: the CLI has
 no argv goal hook, so such a prefix is inert text; crash recovery is owned by
 the lead's watcher plus exact-session resume. Interactive `--mode tui` remains
 available for human-attended executors.
+
+**2026-09-19/20, confirmed:** the self-improvement loop runs on the consuming
+project's board, not in chat. Lead and executor observations become bounded
+`feedback` tasks; the lead batch-triages at safe boundaries; unique incubator
+items gain exactly one vote per distinct episode and reporter; `vote_threshold`
+(kit configuration, default promotion after more than two votes) promotes by
+consequence - small improvements to backlog tasks, behavior or requirement
+changes into OpenSpec, kit instruction or tool demand to the kit's own backlog
+with kit-level wording only, never with private consuming-project data.
+Material correctness, integrity or safety evidence promotes immediately under
+the lead's consequence override with a recorded reason, and incubator hygiene
+is lead-owned with two deterministic triggers: closing a stage or epic during
+acceptance, and a triage batch finding the incubator above `incubator_size_cap`.
+
+**2026-09-20, confirmed:** orchestration spend is paced and gated rather than
+promised. Pacing adjusts only new assignments from fresh scoped observations:
+the native Codex/GPT limit snapshot the CLI records, actual provider refusals,
+and bounded user-supplied dashboard snapshots. Unknown telemetry stays unknown
+and holds the configured limits, and a healthy executor is never preempted. An
+improvement becomes a default for assignments, worktrees, concurrency or
+cadence only after a matched comparison inside a tolerance declared in advance,
+with check, coordination and rework in both arms. Instruction-refresh
+succession replaces an executor's CLI process through the verified
+non-interactive resume path at a safe boundary and reports `succession not
+established` when the successor's own rollout does not show the reloaded
+instructions. Operating owners are the `team-lead` and `board-workflow` skills;
+[agent delegation](agent-delegation.md#improvement-loop) carries the limits and
+the change specifications carry the requirements.
 
 ## Recording further decisions
 
