@@ -52,5 +52,5 @@
 ## 8. End-to-end acceptance
 
 - [x] 8.1 Run the owned failure matrix through the integrated entry point: lead refusal before succession, worker refusal after partial work, delayed completion, throttling, auth/model/transport errors, board unavailability, all-capacity exhaustion, restart and explicit stop; verify unchanged spec outcomes without exhausting live accounts.
-- [ ] 8.2 Exercise the installed workflow on a locally selected real external development task with actual subscribed tool work through configured executor profiles; verify its results are consumed and applicable consuming-project acceptance passes, with private evidence outside shared sources.
+- [x] 8.2 Exercise the installed workflow on a locally selected real external development task with actual subscribed tool work through configured executor profiles; verify its results are consumed and applicable consuming-project acceptance passes, with private evidence outside shared sources.
 - [x] 8.3 Run applicable Rust formatting, static analysis, native and transitional launcher/delegation/subscription/lifecycle checks for the changed implementation; verify exact build identity and close only tasks supported by actual results.
