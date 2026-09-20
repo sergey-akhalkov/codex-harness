@@ -79,6 +79,88 @@ fn bash(command: &str) -> Value {
     })
 }
 
+fn rtk_fixture() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_harness-rtk-fixture"));
+    assert!(
+        path.is_file(),
+        "cargo test builds the fixture double; missing {}",
+        path.display()
+    );
+    path
+}
+
+/// Owned adapter copy whose `rtk.exe` dependency and whose allowlisted source
+/// command are the inert fixture double: no RTK download and no network.
+fn staged(root: &Path) -> (PathBuf, PathBuf) {
+    let directory = root.join("bin");
+    fs::create_dir_all(&directory).unwrap();
+    fs::copy(adapter(), directory.join("harness-rtk.exe")).unwrap();
+    fs::copy(rtk_fixture(), directory.join("rtk.exe")).unwrap();
+    let command = directory.join("git.exe");
+    fs::copy(rtk_fixture(), &command).unwrap();
+    (directory.join("harness-rtk.exe"), command)
+}
+
+fn packed_handle(stdout: &str) -> String {
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("[rtk pack: "))
+        .expect("compact output must carry the pack footer");
+    line["[rtk pack: ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn command_output(command: &Path, args: &[&str], workspace: &Path) -> Vec<u8> {
+    let output = Command::new(command)
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn pack_file(home: &Path, handle: &str) -> PathBuf {
+    home.join("harness/rtk/pack").join(format!("{handle}.log"))
+}
+
+fn present_locator(stdout: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stdout);
+    text.contains("[rtk pack:") || text.contains("[rtk raw:")
+}
+
+/// Numbered content lines of a recall response, in emitted order.
+fn numbered_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| {
+            line.split_once(": ")
+                .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
+        })
+        .collect()
+}
+
+fn window_bounds(text: &str) -> (usize, usize, usize) {
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("window: lines "))
+        .expect("recall must report its window");
+    let window = &line["window: lines ".len()..];
+    let (range, total) = window.split_once(" of ").expect("window totals");
+    let (first, last) = range.split_once('-').expect("window range");
+    (
+        first.parse().unwrap(),
+        last.parse().unwrap(),
+        total.parse().unwrap(),
+    )
+}
+
 #[test]
 fn exec_preserves_child_identity_and_runs_once() {
     let root = tempfile::tempdir().unwrap();
@@ -320,4 +402,426 @@ fn compact_without_rtk_and_disable_stay_raw() {
             .windows(9)
             .any(|window| window == b"[rtk raw:")
     );
+}
+
+#[test]
+fn compact_mints_a_handle_and_recall_returns_the_exact_window() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "300"], &workspace);
+    let compact = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        compact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let text = String::from_utf8(compact.stdout.clone()).unwrap();
+    assert!(
+        text.starts_with(&format!(
+            "fixture-pipe git-log: 300 lines, {} bytes\n",
+            expected.len()
+        )),
+        "{text}"
+    );
+    let handle = packed_handle(&text);
+    assert!(text.contains("sha256:"), "{text}");
+    let retained: Vec<PathBuf> = fs::read_dir(home.join("harness/rtk/raw"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(retained.len(), 1);
+    assert!(
+        text.contains(&format!("[rtk raw: {}]", retained[0].display())),
+        "{text}"
+    );
+    assert_eq!(fs::read(&retained[0]).unwrap(), expected);
+
+    // The command double is gone, so a recall that returns content cannot have
+    // rerun the source command.
+    fs::remove_file(&command).unwrap();
+    let window = invoke(
+        &binary,
+        &["recall", &handle, "--offset", "5", "--limit", "10"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        window.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&window.stderr)
+    );
+    let recalled = String::from_utf8(window.stdout).unwrap();
+    assert!(recalled.contains("source: "), "{recalled}");
+    assert!(
+        recalled.contains("digest: sha256 ") && recalled.contains(" verified"),
+        "{recalled}"
+    );
+    assert!(recalled.contains("stored: 300 lines"), "{recalled}");
+    assert!(recalled.contains("window: lines 5-14 of 300"), "{recalled}");
+    let expected = String::from_utf8(expected).unwrap();
+    for (position, line) in expected.lines().enumerate().skip(4).take(10) {
+        assert!(
+            recalled.contains(&format!("{}: {line}", position + 1)),
+            "{recalled}"
+        );
+    }
+    assert!(!recalled.contains("15: "), "{recalled}");
+    assert!(recalled.contains("--offset 15"), "{recalled}");
+
+    // Defaults are offset 1 and limit 200, with the next window named.
+    let defaults = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    let defaults = String::from_utf8(defaults.stdout).unwrap();
+    assert!(
+        defaults.contains("window: lines 1-200 of 300"),
+        "{defaults}"
+    );
+    assert!(defaults.contains("--offset 201"), "{defaults}");
+}
+
+#[test]
+fn compact_falls_back_to_todays_output_when_packing_is_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "300"], &workspace);
+    // A file where the pack area belongs makes every pack step fail.
+    fs::create_dir_all(home.join("harness/rtk")).unwrap();
+    fs::write(home.join("harness/rtk/pack"), b"not a directory").unwrap();
+    let compact = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        compact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let retained: Vec<PathBuf> = fs::read_dir(home.join("harness/rtk/raw"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        String::from_utf8(compact.stdout).unwrap(),
+        format!(
+            // The filter's own line, its newline and today's footer locator.
+            "fixture-pipe git-log: 300 lines, {} bytes\n\n[rtk raw: {}]\n",
+            expected.len(),
+            retained[0].display()
+        ),
+        "a pack failure must keep today's exact compact output"
+    );
+    assert_eq!(fs::read(&retained[0]).unwrap(), expected);
+    assert!(
+        String::from_utf8_lossy(&compact.stderr).contains("observation handle not issued"),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+}
+
+#[test]
+fn bypass_paths_never_present_a_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let log = command_output(&command, &["log", "-n", "300"], &workspace);
+    let status = command_output(&command, &["status"], &workspace);
+    let disabled = invoke_with_env(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_DISABLE", "1")],
+    );
+    assert_eq!(disabled.stdout, log);
+    assert!(!present_locator(&disabled.stdout));
+    let unsupported = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "status"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(unsupported.stdout, status);
+    assert!(!present_locator(&unsupported.stdout));
+    // Allowlisted, but below the retention floor, so it stays raw too.
+    let small = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "status", "--short"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(small.stdout, status);
+    assert!(!present_locator(&small.stdout));
+    // A present but failing filter dependency stays raw, and the `filter`
+    // entry point mints nothing because it knows no source command.
+    let payload = vec![b'x'; 600];
+    let failed = invoke(
+        &binary,
+        &["filter", "fixture-fail"],
+        &workspace,
+        &home,
+        Some(&payload),
+    );
+    assert!(failed.status.success());
+    assert_eq!(failed.stdout, payload);
+    assert!(!present_locator(&failed.stdout));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("raw passthrough"));
+    assert!(
+        !home.join("harness/rtk/pack/index.json").exists(),
+        "bypass paths must not mint observations"
+    );
+}
+
+#[test]
+fn recall_clamps_the_requested_window_and_marks_truncation() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let compact = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "3000"],
+        &workspace,
+        &home,
+        None,
+    );
+    let handle = packed_handle(&String::from_utf8(compact.stdout).unwrap());
+    let clamped = invoke(
+        &binary,
+        &["recall", &handle, "--limit", "5000"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(clamped.status.code(), Some(0));
+    assert!(
+        clamped.stdout.len() <= 256 * 1024,
+        "a recall response stays within the emitted byte bound: {} bytes",
+        clamped.stdout.len()
+    );
+    let text = String::from_utf8(clamped.stdout).unwrap();
+    let (first, last, total) = window_bounds(&text);
+    assert_eq!((first, total), (1, 3000), "{text}");
+    assert!(last <= 2000, "the limit clamps to 2000 lines: {text}");
+    assert!(
+        last < 2000,
+        "the byte clamp, not the line limit, must close this window: {text}"
+    );
+    assert!(
+        text.contains("[rtk pack: window truncated at 262144 bytes]"),
+        "{text}"
+    );
+    let content = numbered_lines(&text);
+    assert_eq!(content.len(), last - first + 1, "{text}");
+    assert!(text.contains(&format!("--offset {}", last + 1)), "{text}");
+
+    // A window that fits inside the byte bound reports the observation's end.
+    let small = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+    );
+    let small = packed_handle(&String::from_utf8(small.stdout).unwrap());
+    let complete = invoke(
+        &binary,
+        &["recall", &small, "--limit", "2000"],
+        &workspace,
+        &home,
+        None,
+    );
+    let text = String::from_utf8(complete.stdout).unwrap();
+    assert_eq!(window_bounds(&text), (1, 300, 300), "{text}");
+    assert!(text.contains("next: end of observation"), "{text}");
+
+    // An offset past the end reports that state instead of fabricating lines.
+    let past = invoke(
+        &binary,
+        &["recall", &small, "--offset", "5000"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(past.status.code(), Some(0));
+    let text = String::from_utf8(past.stdout).unwrap();
+    assert!(
+        text.contains("window: none; offset 5000 is past the last stored line (300)"),
+        "{text}"
+    );
+    assert!(numbered_lines(&text).is_empty(), "{text}");
+}
+
+#[test]
+fn retention_evicts_the_oldest_observation_and_cleans_orphans() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let pack = home.join("harness/rtk/pack");
+    fs::create_dir_all(&pack).unwrap();
+    let orphan = pack.join("ob-0000000000000000000-1-000000.log");
+    fs::write(&orphan, b"interrupted mint").unwrap();
+    let mut handles = Vec::new();
+    for _ in 0..66 {
+        let compact = invoke(
+            &binary,
+            &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+            &workspace,
+            &home,
+            None,
+        );
+        assert!(
+            compact.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compact.stderr)
+        );
+        handles.push(packed_handle(&String::from_utf8(compact.stdout).unwrap()));
+    }
+    assert!(!orphan.exists(), "orphan pack files are cleaned up");
+    let index: Value = serde_json::from_slice(&fs::read(pack.join("index.json")).unwrap()).unwrap();
+    assert_eq!(
+        index["entries"].as_array().unwrap().len(),
+        64,
+        "pack retention keeps 64 records"
+    );
+    let evicted = invoke(&binary, &["recall", &handles[0]], &workspace, &home, None);
+    assert_eq!(evicted.status.code(), Some(2));
+    assert!(evicted.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&evicted.stderr).into_owned();
+    assert!(
+        stderr.contains("unknown observation handle") && stderr.contains("[rtk raw:"),
+        "{stderr}"
+    );
+    let newest = invoke(
+        &binary,
+        &["recall", handles.last().unwrap()],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        newest.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&newest.stderr)
+    );
+    // An index record whose content is gone is reported as unknown, not served.
+    fs::remove_file(pack_file(&home, handles.last().unwrap())).unwrap();
+    let missing = invoke(
+        &binary,
+        &["recall", handles.last().unwrap()],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+}
+
+#[test]
+fn recall_withholds_content_when_the_digest_does_not_match() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let compact = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+        &workspace,
+        &home,
+        None,
+    );
+    let handle = packed_handle(&String::from_utf8(compact.stdout).unwrap());
+    let log = pack_file(&home, &handle);
+    let mut bytes = fs::read(&log).unwrap();
+    bytes[0] = b'X';
+    fs::write(&log, &bytes).unwrap();
+    let output = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no observation content may be returned: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("digest check") && stderr.contains(&handle) && stderr.contains("[rtk raw:"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn recall_reports_usage_and_unknown_handles_with_exit_codes() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    for (args, code, needle) in [
+        (vec!["recall"], 1, "handle is required"),
+        (vec!["recall", "ob-1-2-3"], 2, "unknown observation handle"),
+        (
+            vec!["recall", "ob-1-2-3", "--offset", "0"],
+            1,
+            "positive integer",
+        ),
+        (
+            vec!["recall", "ob-1-2-3", "--limit", "many"],
+            1,
+            "positive integer",
+        ),
+        (
+            vec!["recall", "ob-1-2-3", "--depth", "1"],
+            1,
+            "unknown option",
+        ),
+        (
+            vec!["recall", "ob-1-2-3", "ob-4-5-6"],
+            1,
+            "exactly one observation handle",
+        ),
+    ] {
+        let output = invoke(&binary, &args, &workspace, &home, None);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(code), "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}: {}", output.status);
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+    }
 }
