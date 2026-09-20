@@ -26,7 +26,8 @@ Read kit `global/orchestration.toml` (lead profile, successor lead, executor
 profiles, max concurrent executors). Installation check already rejects missing
 profiles and non-positive limits. Dispatch uses exactly those profiles.
 Explicit user `codex --profile <id>` keeps native precedence. Do not substitute
-another model.
+another model. `max_concurrent_executors` also sizes the executor worktree pool,
+and `executor spawn` - not the lead - allocates its slots.
 
 ## Board setup
 
@@ -69,8 +70,21 @@ Promotion confers eligibility for planning, never silent implementation.
 Brief executors through harness commands, not by automating TUI keystrokes:
 
 ```powershell
-codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY --exec "assignment"
+codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --exec "assignment"
 ```
+
+`--source` is the repository checkout, and `executor spawn` is the sole
+allocator of executor isolation: it selects a free slot of the harness-owned
+pool (sibling worktrees `<repository-name>-wt1` .. `-wtN`, where `N` is
+`max_concurrent_executors`), creates that position on first use, synchronizes
+the slot with upstream and binds the session to it before the first model
+request. `--workspace` is optional and no longer the isolation mechanism: it
+must name the source checkout or one of its pool slots, and an ad-hoc worktree
+path is refused. `--base REV` starts the slot from another revision than the
+fetched upstream default branch; `--owner ID` labels the session binding
+(default `exec-<profile>-<pid>`), and dispatching again with the same owner id
+rebinds the same slot - including after an interruption - instead of creating
+another tree.
 
 Before the first dispatch, probe the installed launcher:
 `codex-harness executor --help` must print the executor usage. An
@@ -85,13 +99,19 @@ subagents: that drops the visible conversation, steering, board and recovery
 contract.
 
 Each executor gets a complete outcome, its configured profile, its own visible
-terminal tab or window, and a Codex-managed worktree before the first model
-request. `executor spawn` establishes that view itself: inside the lead's
-Windows terminal it opens a titled tab of the same terminal. Do not resize,
-move or arrange desktop windows - including this terminal - so sessions fit
-the screen; titled tabs are sufficient and simultaneous tiling is not
-required. Do not write to the shared checkout. Do not solve delegated work in
-parallel. A small or tightly coupled task stays with the lead.
+terminal tab or window, and a synchronized pool slot before the first model
+request. Freshness is mechanical, not an executor obligation: dispatch fetches
+the configured remote and resets the slot to the resolved base (untracked files
+removed, ignored build caches kept) before that request, so no executor-side
+synchronization step is needed or accepted in its place. Executors never create
+an additional worktree: when every slot is held by a live session, wait or stop
+a running assignment instead of allocating another tree. `executor spawn`
+establishes the view itself: inside the lead's Windows terminal it opens a
+titled tab of the same terminal. Do not resize, move or arrange desktop windows
+- including this terminal - so sessions fit the screen; titled tabs are
+sufficient and simultaneous tiling is not required. Do not write to the shared
+checkout. Do not solve delegated work in parallel. A small or tightly coupled
+task stays with the lead.
 Before dispatch, do the analysis a slice needs to become sufficiently
 specified for its executor profile: requirement interpretation, risk and
 consequence decisions, approach direction and acceptance conditions. Size each
@@ -100,9 +120,9 @@ demanding for every available profile stays with the lead, is split further,
 or goes through a bounded principal consultation, never dispatched as-is.
 Exploration inside a delegated slice's boundaries remains executor work.
 When an outcome arrives, split it into independently verifiable parallel
-slices before dispatching a single worker: distinct worktrees from a committed
-known base, disjoint file and system ownership per slice, complete outcomes
-each. Sequence only genuinely dependent slices; respect
+slices before dispatching a single worker: one pool slot per worker from the
+dispatch-synchronized base, disjoint file and system ownership per slice,
+complete outcomes each. Sequence only genuinely dependent slices; respect
 `max_concurrent_executors` and shared accounts or machines; the lead owns
 integration and acceptance conflicts.
 The `--exec` prompt points at board ids; the beads issue is the assignment.
@@ -176,30 +196,51 @@ to the original executor. Record acceptance on the board and in task state.
 Reconcile planning artifacts explicitly on integration: an executor's
 tasks.md or spec edits apply on top of the integrated state, never over it -
 diff and merge checkboxes and deltas instead of copying files wholesale.
-Worktrees are lane-owned, not task-owned: creating one is a cheap local
-checkout (seconds, hardlinked objects, no upstream), while the per-worktree
-build cache is the real cost. After an accepted merge, reset the lane worktree
-to the new committed base (`git reset --hard` plus `git clean -fd`, keeping
-ignored caches) and reuse it for the next task in the same lane. Delete a
-worktree only when its lane is retired or its state cannot be reset safely;
-keep merged branches. The authoritative inventory is `git worktree list`;
-lane purpose lives in kit-local task state and board records, never in
-tracked files.
+Executor slots are pool-owned, not task-owned. The pool never grows past
+`max_concurrent_executors`, and slots are reused while conversations are not.
+Return a finished slot to the pool through the explicit release path, which
+records your disposition before anything is destroyed:
+
+```powershell
+codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT
+```
+
+Release resets the slot to the committed base with ignored build caches kept, so
+the next dispatch binds the same path; keep merged branches. A slot that cannot
+be safely reset is preserved with its reason and stays out of the pool until you
+resolve it: never force-reset unreviewed work, force-remove a tree, or count a
+preserved slot as free. Dispatch is fail-closed: no free slot, a failed upstream
+fetch, an occupied dirty slot, unreviewed changes in a free slot or a missing
+slot each abort with the concrete cause - a registered-but-missing slot asks for
+`git worktree prune` - instead of allocating another tree. `codex-harness
+executor pool --source CHECKOUT --codex-home DIRECTORY` reports the recorded
+mapping per slot (index, path, presence, tree state, state, lease, owner, base)
+and lists foreign or legacy worktrees for your review; `git worktree list` stays
+the authoritative tree inventory, and slot purpose lives in kit-local task state
+and board records, never in tracked files. An interruption keeps the recorded
+mapping, so reusing the owner id rebinds the same slot after re-synchronization,
+while a second live owner of one slot is refused instead of sharing a checkout.
+Legacy task-named or CLI-named executor trees in a consuming repository are
+never adopted or deleted by dispatch: merge accepted work, retire the rest with
+authorized `git worktree remove`, and prune stale entries afterwards.
 Executors set status `lead_review` instead of closing. The lead closes on
 accept or returns the item to `in_progress` with conditions.
-Executor terminal tabs are per-assignment, never pooled: a fresh session must
-not inherit another assignment's context. Exec mode closes the tab when the
-assignment finishes; nothing lingers and nobody has to remember to close it.
+Executor terminal tabs are per-assignment, never pooled: pool slots are reused,
+conversations are not, and a fresh session must not inherit another
+assignment's context. Exec mode closes the tab when the assignment finishes;
+nothing lingers and nobody has to remember to close it.
 To return defects or continue after a stop, resume the exact session
 (`codex resume SESSION_ID` interactively, `codex exec resume SESSION_ID` for a
 bounded continuation) and state the acceptance conditions there.
 
 ## Recovery
 
-One active lead. Reconcile surviving workers before replacement. Quota and
-transport failures stay classified from retained evidence. Succession uses the
-configured successor profile at a safe boundary. Do not purchase capacity or
-retry models infinitely.
+One active lead. Reconcile surviving workers and their slot occupancy before
+replacement: `executor pool` reports the recorded mapping and lease state, and a
+claim whose host process is gone is not an occupied slot. Quota and transport
+failures stay classified from retained evidence. Succession uses the configured
+successor profile at a safe boundary. Do not purchase capacity or retry models
+infinitely.
 
 Policy (do not copy it here): [portable principles](../../../global/principles-of-work.md)
 and [agent delegation](../../../docs/agent-delegation.md).

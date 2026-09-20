@@ -15,8 +15,8 @@
 
 ## 3. Skill and documentation
 
-- [ ] 3.1 Update the `team-lead` skill text from task-named lanes to fixed pool slots, remove the executor-side synchronization obligation, and document the explicit release path; verify by re-reading the skill against the updated `lead-agent-orchestration` scenarios
-- [ ] 3.2 Update `docs/agent-delegation.md` (executor worktrees section: pool slots, sync, fail-closed refusal, superseded `worktree_limit`, legacy-tree migration) and `global/orchestration.toml` comments; verify local links and consistency with the installed CLI help
+- [x] 3.1 Update the `team-lead` skill text from task-named lanes to fixed pool slots, remove the executor-side synchronization obligation, and document the explicit release path; verify by re-reading the skill against the updated `lead-agent-orchestration` scenarios
+- [x] 3.2 Update `docs/agent-delegation.md` (executor worktrees section: pool slots, sync, fail-closed refusal, superseded `worktree_limit`, legacy-tree migration) and `global/orchestration.toml` comments; verify local links and consistency with the installed CLI help
 
 ## 4. Native checks and hygiene
 

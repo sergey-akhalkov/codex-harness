@@ -60,7 +60,7 @@ max_concurrent_executors = 2
 Dispatch an executor with the installed launcher:
 
 ```powershell
-codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY --exec "assignment"
+codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --exec "assignment"
 ```
 
 Skills and `orchestration.toml` are live links into the kit checkout, while the
@@ -90,7 +90,7 @@ the lead already runs there (`WT_SESSION`, `wt -w 0 new-tab`). It does not pass
 window so another app is not yanked forward. If the lead is not in that
 terminal, it falls back to a visible native TUI (`CREATE_NEW_CONSOLE`) with the
 same restore. It does not use headless `codex exec --json`. Do not pass
-`--worktree` together with `--remote`; attach with `-C` at the managed cwd.
+`--worktree` together with `--remote`; attach with `-C` at the bound pool slot.
 Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.
 The default exec mode streams the assignment in that visible tab and exits on
@@ -185,24 +185,67 @@ contract for library mutations.
 
 ## Executor worktrees
 
-Installed CLI 0.155.1 allocates experimental managed worktrees with
-`--enable worktrees --worktree`. `codex exec` may pass that flag; the verified
-`--remote` control TUI must not. Attach the window with `-C` at the managed
-cwd. Disabled `worktrees` is an explicit limitation: executors do not write to
-the shared checkout and do not fall back to an ordinary Git worktree.
-Lanes are reused, not rebuilt: after an accepted merge the lead resets the lane
-worktree to the new committed base (`git reset --hard <base>` plus
-`git clean -fd`, so ignored build caches stay warm) and dispatches the next task
-of that lane into it. `crates/harness-core/src/task_worktree.rs` implements the
-reset (`reset_for_reuse` distinguishes a reused lane from unresettable state) and
-the merge flow reports which of the two happened. Deletion remains the lane
-retirement path: native confirmed deletion is TUI-only and refuses dirty,
-untracked or ignored trees, so a lane that cannot be reset is preserved with its
-reason instead of being deleted or reused blindly, and merged branches are kept.
-Lane purpose lives in kit-local task state and board records, never in tracked
-files. The authoritative inventory is `git worktree list`, and the configured
-`worktree_limit` warns when registered worktrees reach it, because a lane that
-was neither reset nor retired is the only way the count grows.
+`executor spawn` is the sole allocator of executor isolation. It maintains a
+fixed pool of ordinary Git worktrees (`git worktree add --detach`) created as
+sibling directories of the source checkout and named `<repository-name>-wt1`
+through `<repository-name>-wtN`, where `N` is `max_concurrent_executors` from
+[orchestration.toml](../global/orchestration.toml). Positions are fixed, so a
+dispatch that finds every slot held by a live session aborts naming them
+instead of registering another tree. `--workspace` is optional and no longer
+the isolation mechanism: it must be the source checkout or one of its pool
+slots, while an ad-hoc task-named worktree path is refused with a migration
+hint. `--base REV` starts the slot from another revision than the upstream
+default branch, and `--owner ID` labels the session binding (default
+`exec-<profile>-<pid>`); dispatching again with the same owner id rebinds the
+same slot after an interruption, while a second live owner of one slot is
+refused instead of sharing one checkout. The recorded mapping (index, path,
+owner, synchronized base) and its lease live in kit-local task state under
+`$CODEX_HOME/harness/executor-pool/`, never in tracked files, and a claim whose
+host process is gone is no longer an occupied slot.
+
+Freshness is a property of dispatch, not an executor obligation. Before the
+first model request, spawn fetches the configured remote (the remote named
+`origin`, or the single configured remote), resolves that remote's default
+branch - or the explicit `--base` override - runs `git reset --hard <base>` and
+`git clean -fd` (ignored build caches stay warm) and verifies a clean HEAD.
+Fail-closed applies throughout: a failed fetch, an unresolvable base, a missing
+slot, an occupied dirty slot or unreviewed changes in a free slot aborts
+dispatch with the concrete cause and leaves the slot untouched, so a stale base
+is never a silent fallback and no extra tree is allocated. A collision - a pool
+position occupied by anything that is not a registered worktree of this
+checkout - is refused instead of adopted or replaced.
+
+Slots move through `free`, `synchronizing`, `occupied`, `awaiting-review` and
+`released`; a slot is occupied only while its bound session is live. A dirty
+slot whose session has ended awaits review: dispatch neither selects nor resets
+it, reports it with its reason, and the lead must merge the work or record an
+explicit discard before it re-enters the pool. Release is explicit, and it
+records the disposition before anything is destroyed:
+
+```powershell
+codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]
+```
+
+The slot is then reset with `reset_for_reuse` (see
+`crates/harness-core/src/task_worktree.rs`) to the named base or the source
+checkout's committed HEAD, keeping ignored caches, or preserved with its
+limitation and reported as awaiting review again (exit code 2); a live owner is
+never reset beneath. `codex-harness executor pool --source CHECKOUT
+--codex-home DIRECTORY` reports the recorded mapping per slot (index, path,
+presence, tree state, state, lease, owner, base, disposition, reason) plus
+foreign or legacy worktrees and any worktree beyond the configured pool for
+lead review; `git worktree list` remains the authoritative tree inventory, and
+merged branches are kept.
+
+`worktree_limit` is superseded by the pool size: the field stays accepted in
+`orchestration.toml` for compatibility, but dispatch no longer warns at a
+threshold and cannot exceed `max_concurrent_executors` by construction. Legacy
+task-named and CLI-named executor worktrees in a consuming repository are
+neither adopted nor deleted automatically: the lead reviews them, merges
+accepted work, removes retired trees with authorized `git worktree remove` and
+prunes stale entries. Pool slots are ordinary Git worktrees, so once their work
+is preserved they can be removed manually and leave no harness-specific state
+in the repository.
 
 ## How selection works
 

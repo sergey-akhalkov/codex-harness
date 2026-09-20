@@ -5,9 +5,17 @@ schema = 1
 lead_profile = "default"
 successor_lead_profile = "zai"
 executor_profiles = ["ds"]
+# Also sizes the harness-owned executor worktree pool: dispatch creates,
+# synchronizes and binds sibling slots `<repository-name>-wt1` .. `-wtN`, and
+# refuses dispatch when all are held by live sessions instead of allocating
+# another tree.
 max_concurrent_executors = 2
 # Promote an incubator item after more than two distinct votes (threshold 3).
 vote_threshold = 3
 incubator_size_cap = 32
 feedback_batch_limit = 8
+# Superseded by the pool size above (`max_concurrent_executors`). Accepted for
+# compatibility with existing installations; dispatch no longer warns at this
+# threshold because the pool invariant bounds the worktree count by
+# construction.
 worktree_limit = 6
