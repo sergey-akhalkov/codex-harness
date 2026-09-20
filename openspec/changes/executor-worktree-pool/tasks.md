@@ -1,10 +1,10 @@
 ## 1. Pool core in harness-core
 
-- [ ] 1.1 Implement deterministic slot resolution (sibling path, `<repo-name>-wt1..N` from `max_concurrent_executors`, collision refusal for existing non-pool paths) in `task_worktree.rs` and verify with unit tests covering naming, cap size and foreign-path refusal
-- [ ] 1.2 Implement the slot state machine (free, synchronizing, occupied, awaiting-review, released) with kit-local task-state recording and compare-and-set slot claims, and verify with unit tests that a claimed slot is not double-claimed and that liveness reconciliation frees only session-less slots
-- [ ] 1.3 Implement fail-closed upstream synchronization (fetch configured remote, resolve default base or explicit override, `reset --hard`, `clean -fd` keeping ignored caches, verify clean HEAD) and verify with unit tests using a local `file://` remote, including fetch-failure abort and base-override behavior
-- [ ] 1.4 Preserve unreviewed work: verify with unit tests that a dirty slot without a live session is reported as awaiting-review and never selected or reset, and that `reset_for_reuse` still refuses unresettable state
-- [ ] 1.5 Rework `audit` to classify pool slots versus foreign/legacy trees and enforce the pool invariant (no harness allocation beyond the pool) and verify with unit tests that legacy task-named trees are reported, not adopted or deleted
+- [x] 1.1 Implement deterministic slot resolution (sibling path, `<repo-name>-wt1..N` from `max_concurrent_executors`, collision refusal for existing non-pool paths) in `task_worktree.rs` and verify with unit tests covering naming, cap size and foreign-path refusal
+- [x] 1.2 Implement the slot state machine (free, synchronizing, occupied, awaiting-review, released) with kit-local task-state recording and compare-and-set slot claims, and verify with unit tests that a claimed slot is not double-claimed and that liveness reconciliation frees only session-less slots
+- [x] 1.3 Implement fail-closed upstream synchronization (fetch configured remote, resolve default base or explicit override, `reset --hard`, `clean -fd` keeping ignored caches, verify clean HEAD) and verify with unit tests using a local `file://` remote, including fetch-failure abort and base-override behavior
+- [x] 1.4 Preserve unreviewed work: verify with unit tests that a dirty slot without a live session is reported as awaiting-review and never selected or reset, and that `reset_for_reuse` still refuses unresettable state
+- [x] 1.5 Rework `audit` to classify pool slots versus foreign/legacy trees and enforce the pool invariant (no harness allocation beyond the pool) and verify with unit tests that legacy task-named trees are reported, not adopted or deleted
 
 ## 2. Executor CLI integration
 
