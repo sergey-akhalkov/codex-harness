@@ -185,15 +185,21 @@ substantial senior text/code execution and temporary leadership after GPT quota
 exhaustion, and Grok for visual and suitable routine work. Effort names are
 model-specific; do not promise unsupported combinations or silently substitute.
 
-Every active conversation must be simultaneously visible in a separate window
-or pane: lead, workers and any model-backed helpers. Show assignment, actual
-model/effort, live messages/tool activity and status. A chat list requiring
-switching is insufficient. Make provider/leadership changes explicit and retain
-the old conversations for inspection. If required views disappear, suspend new
-model requests and restore visibility before continuing. Deterministic waiting
-does not need model calls. Simultaneous views and automatic quota recovery remain
-unfinished in [subscription orchestration](../openspec/changes/orchestrate-subscription-agents/tasks.md);
-the previous single-TUI proof does not establish them.
+Every active conversation needs its own visible terminal surface with a
+distinct title: lead, workers and any model-backed helpers. Show assignment,
+actual model/effort, live messages/tool activity and status. A dedicated,
+titled terminal tab in the same terminal is sufficient - revised 2026-09-20
+after lead sessions performed desktop window ceremony to tile separate windows
+on one screen; tiling every conversation on screen at once is not required,
+and agents must not resize, move or arrange desktop windows, including their
+own terminal, to make sessions fit. A hidden process, raw log or one chat
+identity masking several conversations remains insufficient. Make
+provider/leadership changes explicit and retain the old conversations for
+inspection. If required views disappear, suspend new model requests and
+restore visibility through the owning dispatch command. Deterministic waiting
+does not need model calls. The archived [subscription orchestration](../openspec/changes/archive/2026-09-20-orchestrate-subscription-agents/tasks.md)
+change delivered the successor-lead quota path; its earlier single-TUI proof
+did not establish today's tab-based views.
 
 All assigned OpenAI models stay in the Astra family; GPT-5.* is excluded,
 including auxiliary calls. Combine related routine work; splitting a pair of
@@ -326,7 +332,7 @@ The Rust migration consumes the same CodeGraph adapter and acceptance evidence;
 it must not resume a separate CBM port. Whole-Rust-migration cutover is not a
 prerequisite for replacement activation. The replacement owns native
 graph-provider implementation, while the Rust migration owns remaining
-generic/native lifecycle integration. [The dependency map](../openspec/changes/migrate-harness-to-rust/design.md#graph-provider-ownership-and-order)
+generic/native lifecycle integration. [The dependency map](../openspec/changes/archive/2026-09-17-migrate-harness-to-rust/design.md#graph-provider-ownership-and-order)
 preserves open acceptance without a circular dependency.
 
 ## Subscriptions

@@ -62,17 +62,23 @@ facts, correct a demonstrated problem or convey a changed user requirement.
 Continue independent work while children run. Require applicable checks and compact
 results (changed files, evidence, unresolved issues), with detailed logs on demand.
 Close finished children and retain responsibility for integration and acceptance.
-Every active model conversation must be simultaneously visible in its own window
-or pane, with assignment, actual model/effort, live messages/tool activity and state.
-A switchable list or hidden log is insufficient. Establish visible views before
-model work, including auxiliary calls, and make leadership changes explicit.
-If that capability is unavailable, report it and keep work in the visible main
-conversation instead of starting hidden model processes. If required views close,
-suspend new model dispatch, preserve in-flight work and restore visibility first.
-Simultaneous views are a native UI or controller obligation. Do not screenshot
-Codex or other agent windows, send those images to a model, or poll window pixels
-for status. Identify non-Codex windows with list, title, bounds and state;
-reserve desktop screenshots for a genuine visual question about owned UI.
+Every active model conversation needs its own visible terminal surface with a
+distinct title - a dedicated tab in the same terminal, a pane or a window - with
+assignment, actual model/effort, live messages/tool activity and state. The
+dispatch command establishes that surface before model work, including auxiliary
+calls; make leadership changes explicit. A titled terminal tab per conversation
+is sufficient, and tiling every conversation on screen at once is not required.
+A hidden process, raw log or one chat identity masking several conversations is
+insufficient. If that capability is unavailable, report it and keep work in the
+visible main conversation instead of starting hidden model processes. If a
+required view closes, suspend new model dispatch, preserve in-flight work and
+restore it through the owning dispatch command. Do not resize, move or arrange
+desktop windows - including this terminal - so sessions fit the screen:
+visibility is a controller obligation, not a desktop window-management task.
+Do not screenshot Codex or other agent windows, send those images to a model,
+or poll window pixels for status. Identify non-Codex windows with list, title,
+bounds and state; reserve desktop screenshots for a genuine visual question
+about owned UI.
 Do not create recursive delegation trees or mandatory task paperwork. Ignore unrelated
 automatic diagnostics when they do not affect the assignment. Judge efficiency by
 total accepted-result cost/time including coordination, all children and rework;

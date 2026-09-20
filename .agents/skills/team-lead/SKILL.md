@@ -85,9 +85,13 @@ subagents: that drops the visible conversation, steering, board and recovery
 contract.
 
 Each executor gets a complete outcome, its configured profile, its own visible
-window, and a Codex-managed worktree before the first model request. Do not
-write to the shared checkout. Do not solve delegated work in parallel. A small
-or tightly coupled task stays with the lead.
+terminal tab or window, and a Codex-managed worktree before the first model
+request. `executor spawn` establishes that view itself: inside the lead's
+Windows terminal it opens a titled tab of the same terminal. Do not resize,
+move or arrange desktop windows - including this terminal - so sessions fit
+the screen; titled tabs are sufficient and simultaneous tiling is not
+required. Do not write to the shared checkout. Do not solve delegated work in
+parallel. A small or tightly coupled task stays with the lead.
 Before dispatch, do the analysis a slice needs to become sufficiently
 specified for its executor profile: requirement interpretation, risk and
 consequence decisions, approach direction and acceptance conditions. Size each

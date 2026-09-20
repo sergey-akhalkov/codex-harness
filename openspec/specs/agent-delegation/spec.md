@@ -110,7 +110,7 @@ Sources and setup SHALL activate through the existing linked global lifecycle fo
 
 #### Scenario: A new external session starts
 - **WHEN** the kit is installed and ordinary Codex starts outside this repository
-- **THEN** the delegation policy, the `team-lead` skill, orchestration role configuration, board availability, explicit model/effort selection, simultaneous conversation views and task recovery are usable without copying sources or repeatedly performing manual setup
+- **THEN** the delegation policy, the `team-lead` skill, orchestration role configuration, board availability, explicit model/effort selection, per-conversation titled terminal views and task recovery are usable without copying sources or repeatedly performing manual setup
 
 #### Scenario: Subscription integration is disconnected
 - **WHEN** its lifecycle is exercised in an isolated installation
@@ -138,11 +138,11 @@ The primary agent SHALL verify that a delegated or directly isolated supporting 
 
 ### Requirement: Visibility policy does not capture conversation pixels
 
-The requirement that every active model conversation appear in its own window or pane SHALL remain a native UI or controller obligation. Until that capability is verified, agents SHALL keep execution in the already visible main conversation and MUST NOT start hidden model processes. They MUST NOT satisfy the visibility rule by taking screenshots of Codex or other agent windows, sending those images to a model, or polling window pixels for status. Missing simultaneous views SHALL be reported as an unavailable controller capability, not as a Nuphus visual task.
+The requirement that every active model conversation appear on its own visible terminal surface - a dedicated titled tab, a pane or a window - SHALL remain a native UI or controller obligation, established by the owning dispatch command before the first model request. A titled terminal tab per conversation SHALL satisfy the requirement; simultaneous on-screen tiling SHALL NOT be required. Until that capability is available, agents SHALL keep execution in the already visible main conversation and MUST NOT start hidden model processes. They MUST NOT satisfy the visibility rule by taking screenshots of Codex or other agent windows, sending those images to a model, or polling window pixels for status, and they MUST NOT resize, move or arrange desktop windows - including the terminal they run in - to make conversations fit the screen. Missing views SHALL be reported as an unavailable controller capability and restored through the owning dispatch command, not as a Nuphus visual or window-management task.
 
 #### Scenario: A child conversation needs a separate view
-- **WHEN** a lead would dispatch a child and simultaneous native views are not established
-- **THEN** it reports the missing view, keeps the work in the visible main conversation or waits for the controller, and does not screenshot existing Codex windows
+- **WHEN** a lead would dispatch a child and no titled terminal surface for it is established by the dispatch command
+- **THEN** it reports the missing view, keeps the work in the visible main conversation or waits for the controller, and neither screenshots existing Codex windows nor rearranges desktop windows
 
 #### Scenario: Window identity is needed for an owned desktop target
 - **WHEN** an authorized desktop task needs to select a non-Codex window

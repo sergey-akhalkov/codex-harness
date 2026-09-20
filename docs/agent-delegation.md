@@ -22,17 +22,21 @@ parameter selection applies to enabled external models. Use `codex --profile xai
 middle preset. Those OpenCodex role files are retired. The former
 `grok_reviewer` remains retired.
 
-Every active conversation must appear simultaneously in its own window or pane,
-showing assignment, model/effort, messages/tool activity and status. Include any
-model-backed helpers and explicitly show changes of leader. A switchable list
-or a hidden transcript is insufficient. If required views disappear, suspend new
-model requests, preserve in-flight work and restore visibility before continuing.
-The controller opens a window or pane per conversation before dispatch. If a
-required view closes, it suspends new model requests, preserves in-flight work
-and restores visibility before continuing. Do not capture Codex or sibling
-agent windows with Nuphus screenshots, and do not poll window pixels for status.
-Identify non-Codex windows with list, title, bounds and state; keep screenshots for
-genuine visual questions about owned UI.
+Every active conversation needs its own visible terminal surface with a
+distinct title - a dedicated tab in the same terminal, a pane or a window -
+showing assignment, model/effort, messages/tool activity and status. Include
+any model-backed helpers and explicitly show changes of leader. The controller
+opens that surface per conversation before dispatch; a titled terminal tab is
+sufficient, and tiling every conversation on screen at once is not required. A
+hidden process, raw log or one chat identity masking several conversations is
+insufficient. If a required view closes, suspend new model requests, preserve
+in-flight work and restore visibility through the owning dispatch command. Do
+not resize, move or arrange desktop windows - including the lead's own
+terminal - so sessions fit the screen; that ceremony is not part of dispatch.
+Do not capture Codex or sibling agent windows with Nuphus screenshots, and do
+not poll window pixels for status. Identify non-Codex windows with list,
+title, bounds and state; keep screenshots for genuine visual questions about
+owned UI.
 
 ## Orchestration configuration
 
