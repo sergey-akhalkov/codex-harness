@@ -648,17 +648,31 @@ fn rtk_url(definition: &Value) -> io::Result<&str> {
     Ok(url)
 }
 
+/// The component's current source inputs. The retired PowerShell lifecycle
+/// script was removed with the native migration and is no longer an input;
+/// tests stage exactly this list so fixtures cannot drift from the checkout.
+const SOURCE_FILES: [&str; 5] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "tools/rtk-adapter/Cargo.toml",
+    "tools/rtk-adapter/src/main.rs",
+    "global/rtk.json",
+];
+
 fn source_identity(source: &Path) -> io::Result<String> {
     let mut hashes = Vec::new();
-    for relative in [
-        "Cargo.toml",
-        "Cargo.lock",
-        "tools/rtk-adapter/Cargo.toml",
-        "tools/rtk-adapter/src/main.rs",
-        "global/rtk.json",
-        "tools/token-workflow.psm1",
-    ] {
-        hashes.push(build_identity::hash_file(&source.join(relative))?);
+    for relative in SOURCE_FILES {
+        let path = source.join(relative);
+        hashes.push(build_identity::hash_file(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                conflict(&format!(
+                    "token workflow source file is missing: {}",
+                    path.display()
+                ))
+            } else {
+                error
+            }
+        })?);
     }
     Ok(build_identity::hash_bytes(hashes.join(":").as_bytes()))
 }
@@ -1346,14 +1360,11 @@ code_mode = false
             .unwrap(),
         )
         .unwrap();
-        for relative in [
-            "Cargo.toml",
-            "Cargo.lock",
-            "tools/rtk-adapter/Cargo.toml",
-            "tools/rtk-adapter/src/main.rs",
-            "tools/token-workflow.psm1",
-        ] {
+        for relative in super::SOURCE_FILES {
             let path = source.join(relative);
+            if path.exists() {
+                continue;
+            }
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, relative.as_bytes()).unwrap();
         }
@@ -1398,6 +1409,9 @@ code_mode = false
     fn install_links_pre_staged_artifacts_and_preserves_foreign_bin_file() {
         let root = tempfile::tempdir().unwrap();
         let (home, rtk, adapter, request) = staged_request(root.path());
+        // The native checkout no longer contains the retired PowerShell
+        // lifecycle script; installation must not require it.
+        assert!(!request.source.join("tools/token-workflow.psm1").exists());
         let foreign = home.join("harness/bin/foreign.txt");
         fs::write(&foreign, b"keep").unwrap();
         let report = install(&request).unwrap();
@@ -1414,6 +1428,23 @@ code_mode = false
         assert!(!home.join("harness/token-workflow-pending.json").exists());
         let connected = check(&request).unwrap();
         assert_eq!(connected.status, "Token workflow connected");
+    }
+
+    #[test]
+    fn source_identity_names_a_missing_component_file() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, _, _, request) = staged_request(root.path());
+        fs::remove_file(request.source.join("global/rtk.json")).unwrap();
+        let error = super::source_identity(&request.source).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("token workflow source file is missing"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("global/rtk.json"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

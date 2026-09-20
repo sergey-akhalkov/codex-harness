@@ -1206,15 +1206,22 @@ failures were candidate-build OOMs inside the 2 GiB build job when two heavy
 suites ran concurrently; the affected suite passes 7/7 alone, and the active
 installation was preserved throughout.
 
-Open finding (2026-09-20): `native_launcher`'s
+Resolved finding (2026-09-20): `native_launcher`'s
 `upstream_background_lifetime_survives_ordinary_wrapper_exit` fails
-deterministically on the current tree (four of four runs, including with the
-launcher-preflight working-tree changes reverted): the delayed fixture child
-never writes its marker, so the pre-existing failure is not yet reduced to a
-cause. Reproduce with `cargo test --locked -p codex-harness --test native_launcher upstream_background_lifetime_survives_ordinary_wrapper_exit -- --test-threads=1`.
-On installations without MSI desktop PowerShell, `migration_baseline` and
-`tui` need `HARNESS_ACCEPTANCE_POWERSHELL` pointing at the owner-designated
-PowerShell 7 executable; with that override both suites pass.
+was a deterministic regression, not an environment fault: executor-spawn
+hardening had reused the reaping `wait_foreground` for the ordinary
+interactive launch, so `TerminateJobObject` killed the upstream-spawned
+background child right after the session root exited. The interactive path now
+uses `Job::wait_session_root`, which waits for the root and then disarms
+kill-on-close so upstream-managed background processes keep their own lifetime
+on an ordinary exit; an abnormal launcher death still reaps the session tree
+while the armed job handle closes. The reaping contract itself is unchanged
+and still covered by `foreground_wait_reaps_grandchild_without_deadline`;
+`session_root_wait_preserves_managed_grandchild` covers the preserved one.
+Verified: `native_launcher` 10/10 including the former failure, `process`
+17/17, `migration_baseline` and `tui` with the documented
+`HARNESS_ACCEPTANCE_POWERSHELL` override on this machine, bin unit tests
+67/67, `executor_succession`, plus `fmt`/`clippy -D warnings`.
 
 Open finding (2026-09-20): the global installation's lifecycle verbs
 (`update`, `disconnect`) are blocked by an out-of-band edit that recreated the
@@ -1224,18 +1231,39 @@ instead of guessing. The same damage made consumer sessions run a launcher
 older than their live-linked skill text. A temporary manual repoint restored
 the launcher; the one-action `deploy --reset` later performed the full clean
 reset with a receipt and a fresh valid installation, and `update --preview`
-validates again. Loop-guidance skills (`team-lead`,
-`board-workflow`) reach Codex sessions as copies under the Codex skill root
-and go stale when source skills change; no lifecycle step currently refreshes
-them.
+validates again.
 
-Open finding (2026-09-20): `install --token-workflow-only` fails on this
-machine with a raw `os error 2` before writing its links, both standalone and
-inside `deploy --all`; the recorded RTK package and build files exist, so the
-missing path is inside the component and not yet reduced. `deploy --all`
-reports it honestly and stops the chain; the component's `hooks.json` link was
-restored manually from its exact `token-workflow.json` record while the
-component stays broken.
+Resolved finding (2026-09-20): the loop-guidance skills (`team-lead`,
+`board-workflow`) had reached Codex sessions as copies under the Codex skill
+root, going stale when source skills changed. The duplicated copies were
+removed by an explicit out-of-band cleanup that preserved the retired
+directories under a dated folder in the machine-local Codex home; kit skills
+are consumed from the linked source roots again. This matches the
+linked-global-kit rule that managed skills are connected by links and never
+copied by the installer, so no refresh step is needed or allowed. Verified on
+this machine: the skill links resolve to the checkout with matching content
+hashes and `codex-harness skills usage` reports both skills enabled from the
+linked root.
+
+Resolved finding (2026-09-20): `install --token-workflow-only` failed with a
+raw `os error 2` because the component's source identity still hashed the
+retired `tools/token-workflow.psm1` after the native migration deleted it; the
+unit fixture fabricated that file, so suites passed while a real checkout
+failed before artifact reuse or linking. The identity list is now one shared
+`SOURCE_FILES` constant used by both production and the fixture, and a missing
+component input is reported by path instead of a raw OS error. Verified by the
+focused lifecycle tests, `rtk_adapter`, a fresh isolated install/check, the
+installed manager's standalone install/check on this machine, and a full
+`deploy --all` chain with all four components ok. The first post-fix
+`deploy --all` still reported `partial` because component steps then ran in
+the older starting process; `deploy --all` component steps now execute through
+the manager the same delivery just connected, with child stderr forwarded and
+nonzero exits reported per component. Verified by a controlled reversible
+regression: a source whose delivered build reintroduced the stale identity
+entry failed only its token-workflow step with that build's contextual error
+while the older starting manager's fixed code would have passed in-process,
+and the reverted source then completed the full chain (`deployed`, all four
+components ok, executor probe ok).
 
 Checks on the reviewed tree: `cargo fmt --all -- --check` clean; workspace
 clippy (`--all-targets --locked -D warnings`) clean; the full documented suite

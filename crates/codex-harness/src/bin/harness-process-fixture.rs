@@ -157,6 +157,26 @@ mod fixture {
                 // This root deliberately exits while its child remains alive.
                 std::process::exit(17);
             }
+            "tree-managed" => {
+                let grandchild_artifact = artifact.with_extension("grandchild.json");
+                // A plain standard-library spawn is the oracle for an
+                // upstream-managed background process with no escape flags.
+                let child = std::process::Command::new(std::env::current_exe()?)
+                    .arg("hold-until")
+                    .arg(&grandchild_artifact)
+                    .spawn()?;
+                ready(&grandchild_artifact)?;
+                record(
+                    artifact,
+                    json!({"pid": std::process::id(), "grandchild": child.id()}),
+                )?;
+                std::process::exit(17);
+            }
+            "hold-until" => {
+                record(artifact, json!({"pid": std::process::id()}))?;
+                ready(&artifact.with_extension("exit"))?;
+                std::process::exit(0);
+            }
             "owner-suspended" | "owner-running" | "owner-exit" => {
                 let job = Job::new(Limits::default())?;
                 let child_artifact = artifact.with_extension("child.json");

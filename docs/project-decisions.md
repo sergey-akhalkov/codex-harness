@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-19**.
+Last updated: **2026-09-20**.
 
 ## Public pack
 
@@ -552,6 +552,14 @@ established` when the successor's own rollout does not show the reloaded
 instructions. Operating owners are the `team-lead` and `board-workflow` skills;
 [agent delegation](agent-delegation.md#improvement-loop) carries the limits and
 the change specifications carry the requirements.
+
+**2026-09-20, confirmed:** work requests are proposals to examine, not text to
+transcribe. A material weakness of a requested route is raised before dependent
+implementation with consequence, trigger, a workable alternative and a
+recommendation; after a heard objection, the user's chosen route is implemented
+faithfully unless it risks serious harm. Routine taste choices proceed with
+disclosure, and silence means no material objection was found, not obedience.
+Canonical rule: [portable principles](../global/principles-of-work.md#partnership-and-dissent).
 
 ## Recording further decisions
 

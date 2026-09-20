@@ -492,6 +492,36 @@ fn verification(codex_home: &Path) -> serde_json::Value {
     })
 }
 
+/// Arguments for one `deploy --all` component step. The step is executed by
+/// the delivered manager, so the mapping must stay aligned with the component
+/// commands in [`run`]: `code-tools` uses `update` (never re-acquires
+/// packages) and is the only step that consumes a dependency user home.
+fn component_step_args(
+    name: &str,
+    source: &Path,
+    codex_home: &Path,
+    user_home: &Path,
+    dependency_user_home: &Path,
+) -> (&'static str, Vec<OsString>) {
+    let mut arguments = vec![
+        OsString::from(format!("--{name}-only")),
+        OsString::from("--source"),
+        source.as_os_str().to_owned(),
+        OsString::from("--codex-home"),
+        codex_home.as_os_str().to_owned(),
+        OsString::from("--user-home"),
+        user_home.as_os_str().to_owned(),
+    ];
+    let verb = if name == "code-tools" {
+        arguments.push(OsString::from("--dependency-user-home"));
+        arguments.push(dependency_user_home.as_os_str().to_owned());
+        "update"
+    } else {
+        "install"
+    };
+    (verb, arguments)
+}
+
 /// One-action delivery: build a candidate, install or update the core
 /// connection, optionally repair blocked ownership first, optionally chain
 /// the scoped components, and verify the installed launcher.
@@ -611,76 +641,61 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
     let mut status = if preview { "preview" } else { "deployed" };
     if all && !preview {
         let manager = codex_home.join("harness/bin/codex-harness.exe");
-        type Step<'a> = Box<dyn FnOnce() -> io::Result<serde_json::Value> + 'a>;
-        let chain: Vec<(&str, Step<'_>)> = vec![
-            (
-                "code-tools",
-                Box::new(|| {
-                    serde_json::to_value(code_tools_lifecycle::run(
-                        &code_tools_lifecycle::Request {
-                            source: source.clone(),
-                            codex_home: codex_home.clone(),
-                            user_home: user_home.clone(),
-                            dependency_user_home: dependency_user_home.clone(),
-                            mode: code_tools_lifecycle::Mode::Update,
-                            preview: false,
-                            manager: Some(manager.clone()),
-                        },
-                    )?)
-                    .map_err(io::Error::other)
-                }),
-            ),
-            (
-                "token-workflow",
-                Box::new(|| {
-                    serde_json::to_value(token_workflow_lifecycle::install(
-                        &token_workflow_lifecycle::Request {
-                            source: source.clone(),
-                            codex_home: codex_home.clone(),
-                            user_home: user_home.clone(),
-                            preview: false,
-                        },
-                    )?)
-                    .map_err(io::Error::other)
-                }),
-            ),
-            (
-                "board",
-                Box::new(|| {
-                    serde_json::to_value(board_lifecycle::install(&board_lifecycle::Request {
-                        source: source.clone(),
-                        codex_home: codex_home.clone(),
-                        user_home: user_home.clone(),
-                        preview: false,
-                    })?)
-                    .map_err(io::Error::other)
-                }),
-            ),
-            (
-                "subscriptions",
-                Box::new(|| {
-                    serde_json::to_value(subscription_lifecycle::install(
-                        &subscription_lifecycle::Request {
-                            source: source.clone(),
-                            codex_home: codex_home.clone(),
-                            user_home: user_home.clone(),
-                            preview: false,
-                            manager: Some(env::current_exe()?),
-                        },
-                    )?)
-                    .map_err(io::Error::other)
-                }),
-            ),
-        ];
-        for (name, step) in chain {
-            match step() {
-                Ok(report) => {
-                    components.push(serde_json::json!({"name": name, "ok": true, "report": report}))
+        // Component steps run through the manager this deploy just delivered,
+        // not through this possibly older process: their behavior then always
+        // matches the delivered source, and a component fix in that source
+        // takes effect in the same delivery run.
+        for name in ["code-tools", "token-workflow", "board", "subscriptions"] {
+            let (verb, arguments) = component_step_args(
+                name,
+                &source,
+                &codex_home,
+                &user_home,
+                &dependency_user_home,
+            );
+            let mut step = Command::new(&manager);
+            step.arg(verb).args(&arguments);
+            match step.output() {
+                Ok(output) => {
+                    if !output.stderr.is_empty() {
+                        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                    }
+                    let outcome = if output.status.success() {
+                        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .map(|report| {
+                                serde_json::json!({"name": name, "ok": true, "report": report})
+                            })
+                            .map_err(|error| {
+                                format!("delivered manager report is not JSON: {error}")
+                            })
+                    } else {
+                        let message = String::from_utf8_lossy(&output.stderr);
+                        let message = message.trim();
+                        Err(if message.is_empty() {
+                            format!("delivered manager exited with {}", output.status)
+                        } else {
+                            message.to_owned()
+                        })
+                    };
+                    match outcome {
+                        Ok(component) => components.push(component),
+                        Err(error) => {
+                            components.push(serde_json::json!({
+                                "name": name,
+                                "ok": false,
+                                "error": error
+                            }));
+                            status = "partial";
+                            break;
+                        }
+                    }
                 }
                 Err(error) => {
-                    components.push(
-                        serde_json::json!({"name": name, "ok": false, "error": error.to_string()}),
-                    );
+                    components.push(serde_json::json!({
+                        "name": name,
+                        "ok": false,
+                        "error": format!("starting delivered manager failed: {error}")
+                    }));
                     status = "partial";
                     break;
                 }
@@ -720,6 +735,43 @@ mod tests {
     fn deploy_rejects_a_relative_source_before_any_work() {
         let error = deploy(&os(&["--source", "kit"])).unwrap_err();
         assert!(error.to_string().contains("absolute checkout path"));
+    }
+
+    #[test]
+    fn deploy_component_steps_select_component_commands() {
+        let source = Path::new("D:/kit");
+        let codex_home = Path::new("C:/users/u/.codex");
+        let user_home = Path::new("C:/users/u");
+        let dependency_user_home = Path::new("D:/dependency-home");
+        for (name, verb, selector) in [
+            ("code-tools", "update", "--code-tools-only"),
+            ("token-workflow", "install", "--token-workflow-only"),
+            ("board", "install", "--board-only"),
+            ("subscriptions", "install", "--subscriptions-only"),
+        ] {
+            let (step_verb, arguments) =
+                component_step_args(name, source, codex_home, user_home, dependency_user_home);
+            assert_eq!(step_verb, verb);
+            let arguments: Vec<String> = arguments
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            let position = arguments
+                .iter()
+                .position(|value| value == selector)
+                .unwrap_or_else(|| panic!("{name} selector missing: {arguments:?}"));
+            assert_eq!(arguments[position + 1], "--source");
+            assert!(arguments.contains(&"--codex-home".to_owned()));
+            assert!(arguments.contains(&"--user-home".to_owned()));
+            let dependency = arguments
+                .iter()
+                .position(|value| value == "--dependency-user-home");
+            assert_eq!(
+                dependency.is_some(),
+                name == "code-tools",
+                "unexpected dependency-home handling for {name}: {arguments:?}"
+            );
+        }
     }
 
     #[test]

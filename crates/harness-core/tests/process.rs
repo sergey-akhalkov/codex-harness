@@ -547,6 +547,26 @@ mod native {
     }
 
     #[test]
+    fn session_root_wait_preserves_managed_grandchild() {
+        let root = root("session-root");
+        let tree = root.join("tree.json");
+        let exit_signal = tree.with_extension("grandchild.exit");
+        let job = Job::new(Limits::default()).unwrap();
+        let mut command = spec("tree-managed", &tree);
+        command.inherit_console = true;
+        let child = job.spawn(&command).unwrap();
+        let data = receipt(&tree);
+        let grandchild = Observer::open(data["grandchild"].as_u64().unwrap() as u32);
+        let code = job.wait_session_root(&child).unwrap();
+        assert_eq!(code, 17);
+        // The job handle is gone; an ordinary wrapper exit must not reap the
+        // upstream-managed background grandchild.
+        assert!(grandchild.alive());
+        std::fs::write(&exit_signal, "exit").unwrap();
+        grandchild.assert_dead();
+    }
+
+    #[test]
     fn owner_death_before_resume_and_after_resume_closes_child_job() {
         for role in ["owner-suspended", "owner-running", "owner-exit"] {
             let root = root(role);

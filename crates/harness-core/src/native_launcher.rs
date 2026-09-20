@@ -1,6 +1,8 @@
 //! Ordinary Codex launch: verify the selected build, then inherit the caller's
 //! streams and console. The session process tree is owned by a kill-on-close
-//! Job; independently started kit services are not members of that job.
+//! Job that reaps it after an abnormal launcher death; on an ordinary exit the
+//! upstream-managed background processes keep their own lifetime.
+//! Independently started kit services are not members of that job.
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,7 +12,6 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
 const REGISTRATION_LIMIT: u64 = 65536;
@@ -568,13 +569,14 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
         return Ok(code);
     }
     // Shared kit services are started as siblings before this wait. The session
-    // Job owns only the upstream CLI tree and reaps leftovers when it exits.
+    // Job owns the upstream CLI tree: an abnormal launcher death reaps it,
+    // while an ordinary exit preserves upstream-managed background processes.
     #[cfg(windows)]
     let code = {
         let spec = interactive_spec(&command)?;
         let job = crate::process::Job::new(crate::process::Limits::default())?;
         let child = job.spawn(&spec)?;
-        job.wait_foreground(&child, Duration::from_secs(5))? as i32
+        job.wait_session_root(&child)? as i32
     };
     #[cfg(not(windows))]
     let code = command

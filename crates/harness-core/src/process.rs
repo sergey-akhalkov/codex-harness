@@ -1023,5 +1023,25 @@ mod windows {
             self.wait_empty(cleanup_timeout, Some(process))?;
             Ok(code)
         }
+
+        /// Wait for an ordinary interactive session root, then preserve every
+        /// remaining member: upstream-managed background processes keep their
+        /// own lifetime after a normal wrapper exit. Kill-on-close stays armed
+        /// while this launcher is alive, so an abnormal launcher death still
+        /// reaps the session tree; only the normal-exit path disarms it.
+        pub fn wait_session_root(self, process: &OwnedProcess) -> io::Result<u32> {
+            if !self.contains(process)? {
+                return Err(invalid("process does not belong to this job"));
+            }
+            process.wait_unbounded()?;
+            let code = process
+                .exit_code()?
+                .ok_or_else(|| io::Error::other("root still running after wait"))?;
+            let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                self.query(JobObjectExtendedLimitInformation)?;
+            extended.BasicLimitInformation.LimitFlags &= !JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            self.set(JobObjectExtendedLimitInformation, &extended)?;
+            Ok(code)
+        }
     }
 }

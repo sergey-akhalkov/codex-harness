@@ -66,7 +66,10 @@ user-default homes, verifies the installed launcher and prints one receipt;
 `--all` chains the scoped component updates and `--reset` is the explicit
 repair when `install`/`update` refuse because recorded link ownership no
 longer matches (reset removes recorded link objects only, writes a receipt
-and never touches targets or regular files):
+and never touches targets or regular files). The `--all` component steps run
+through the manager this delivery just connected, so their behavior always
+matches the delivered checkout instead of the older process that started the
+delivery:
 
 ```powershell
 codex-harness deploy --source "<absolute-kit-checkout>" [--all] [--reset]
