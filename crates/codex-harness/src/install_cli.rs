@@ -1,12 +1,13 @@
 //! Native install/update/check/recover/disconnect with mutually exclusive
 //! component selectors. Combined activation remains unfinished.
 use harness_core::{
-    board_lifecycle, code_tools_lifecycle, core_install,
+    board_lifecycle, code_tools_lifecycle, core_install, installation_reset,
     lifecycle::{self, Component},
     native_build, subscription_lifecycle, token_workflow_lifecycle,
 };
 use std::env;
 use std::{collections::BTreeMap, ffi::OsString, io, path::PathBuf, time::Duration};
+use std::{path::Path, process::Command};
 
 #[derive(Debug)]
 struct Options {
@@ -319,6 +320,7 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
         Component::Core => {
             let user_home = required(&options.values, "--user-home")?;
             let source = required(&options.values, "--source")?;
+            absolute_source(&source)?;
             // A named build is explicit; otherwise deliver the freshest
             // verified build of the selected source in this manager's owned
             // state, so new sessions pick up a fresh manager without replacing
@@ -419,12 +421,305 @@ pub fn run(command: &str, args: &[OsString]) -> io::Result<i32> {
     Ok(0)
 }
 
+fn absolute_source(source: &Path) -> io::Result<()> {
+    if source.is_absolute() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "deploy/install --source must be an absolute checkout path",
+        ))
+    }
+}
+
+/// Lifecycle path checks reject verbatim (`\\?\`) spelling; candidates from
+/// `native_build::prepare` carry it, so normalize before connecting.
+fn plain_path(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(text) if text.starts_with(r"\\?\") => PathBuf::from(&text[4..]),
+        _ => path,
+    }
+}
+
+/// The state this manager itself runs from, so a deploy builds into the
+/// installation's existing build history instead of a guessed location.
+fn current_state() -> io::Result<PathBuf> {
+    let executable = env::current_exe()?.canonicalize()?;
+    let plain = executable
+        .to_str()
+        .and_then(|path| path.strip_prefix(r"\\?\"))
+        .unwrap_or_default()
+        .to_owned();
+    let executable = if plain.is_empty() {
+        executable
+    } else {
+        PathBuf::from(plain)
+    };
+    let build = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("deploy manager has no build directory"))?;
+    let builds = build
+        .parent()
+        .ok_or_else(|| io::Error::other("deploy requires --state or --build"))?;
+    if builds.file_name().and_then(|name| name.to_str()) != Some("builds") {
+        return Err(io::Error::other("deploy requires --state or --build"));
+    }
+    builds
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("deploy requires --state or --build"))
+}
+
+fn verification(codex_home: &Path) -> serde_json::Value {
+    let installed = codex_home.join("harness/bin/codex-harness.exe");
+    let version = Command::new(&installed).arg("--version").output();
+    let probe = Command::new(&installed)
+        .args(["executor", "--help"])
+        .output();
+    let version = match version {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => String::new(),
+    };
+    let probe_ok = probe.is_ok_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).starts_with("codex-harness executor spawn")
+    });
+    serde_json::json!({
+        "installed": installed,
+        "version": version,
+        "executor_probe_ok": probe_ok,
+    })
+}
+
+/// One-action delivery: build a candidate, install or update the core
+/// connection, optionally repair blocked ownership first, optionally chain
+/// the scoped components, and verify the installed launcher.
+pub fn deploy(args: &[OsString]) -> io::Result<i32> {
+    let mut values: BTreeMap<OsString, OsString> = BTreeMap::new();
+    let mut preview = false;
+    let mut reset = false;
+    let mut all = false;
+    let mut iter = args.iter();
+    while let Some(key) = iter.next() {
+        match key.to_str() {
+            Some("--preview") if !preview => preview = true,
+            Some("--reset") if !reset => reset = true,
+            Some("--all") if !all => all = true,
+            Some(name)
+                if [
+                    "--source",
+                    "--build",
+                    "--state",
+                    "--codex-home",
+                    "--user-home",
+                    "--dependency-user-home",
+                    "--upstream",
+                    "--timeout-seconds",
+                    "--path-scope",
+                    "--cargo",
+                ]
+                .contains(&name) =>
+            {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| io::Error::other("missing deploy option value"))?;
+                if values.insert(key.clone(), value.clone()).is_some() {
+                    return Err(io::Error::other("duplicate deploy option"));
+                }
+            }
+            _ => return Err(io::Error::other("unknown or duplicate deploy option")),
+        }
+    }
+    let optional = |name: &str| values.get(&OsString::from(name)).map(PathBuf::from);
+    let required =
+        |name: &str| optional(name).ok_or_else(|| io::Error::other(format!("{name} is required")));
+    let source = required("--source")?;
+    absolute_source(&source)?;
+    let user_home = match optional("--user-home") {
+        Some(home) => home,
+        None => PathBuf::from(
+            env::var_os("USERPROFILE")
+                .ok_or_else(|| io::Error::other("--user-home is required"))?,
+        ),
+    };
+    let codex_home = match optional("--codex-home") {
+        Some(home) => home,
+        None => user_home.join(".codex"),
+    };
+    let dependency_user_home =
+        optional("--dependency-user-home").unwrap_or_else(|| user_home.clone());
+    let timeout = values
+        .get(&OsString::from("--timeout-seconds"))
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| io::Error::other("invalid deploy timeout"))
+        })
+        .transpose()?
+        .unwrap_or(45);
+    let build = match optional("--build") {
+        Some(build) => build,
+        None => {
+            let state = match optional("--state") {
+                Some(state) => state,
+                None => current_state()?,
+            };
+            let cargo = values
+                .get(&OsString::from("--cargo"))
+                .cloned()
+                .unwrap_or_else(|| "cargo".into());
+            plain_path(native_build::prepare(&source, &state, &cargo)?.build)
+        }
+    };
+    let build = plain_path(build);
+    let build_identity = harness_core::build_identity::read_record(&build)
+        .map(|record| record.source.sha256.chars().take(16).collect::<String>())
+        .unwrap_or_default();
+    let reset_report = if reset && !preview {
+        Some(serde_json::to_value(installation_reset::run(
+            &codex_home,
+            &user_home,
+        )?)?)
+    } else {
+        None
+    };
+    let core = serde_json::to_value(core_install::connect(
+        &core_install::Request {
+            source: source.clone(),
+            build: build.clone(),
+            codex_home: codex_home.clone(),
+            dependency_user_home: dependency_user_home.clone(),
+            user_home: user_home.clone(),
+            upstream: optional("--upstream"),
+            timeout: Duration::from_secs(timeout),
+            path_scope: values
+                .get(&OsString::from("--path-scope"))
+                .map(
+                    |value| match value.to_str().map(str::to_ascii_lowercase).as_deref() {
+                        Some("user") => Ok(harness_core::installation_state::PathScope::User),
+                        Some("process") => Ok(harness_core::installation_state::PathScope::Process),
+                        _ => Err(io::Error::other("PATH scope must be User or Process")),
+                    },
+                )
+                .transpose()?,
+        },
+        preview,
+    )?)?;
+    let mut components = Vec::new();
+    let mut status = if preview { "preview" } else { "deployed" };
+    if all && !preview {
+        let manager = codex_home.join("harness/bin/codex-harness.exe");
+        type Step<'a> = Box<dyn FnOnce() -> io::Result<serde_json::Value> + 'a>;
+        let chain: Vec<(&str, Step<'_>)> = vec![
+            (
+                "code-tools",
+                Box::new(|| {
+                    serde_json::to_value(code_tools_lifecycle::run(
+                        &code_tools_lifecycle::Request {
+                            source: source.clone(),
+                            codex_home: codex_home.clone(),
+                            user_home: user_home.clone(),
+                            dependency_user_home: dependency_user_home.clone(),
+                            mode: code_tools_lifecycle::Mode::Update,
+                            preview: false,
+                            manager: Some(manager.clone()),
+                        },
+                    )?)
+                    .map_err(io::Error::other)
+                }),
+            ),
+            (
+                "token-workflow",
+                Box::new(|| {
+                    serde_json::to_value(token_workflow_lifecycle::install(
+                        &token_workflow_lifecycle::Request {
+                            source: source.clone(),
+                            codex_home: codex_home.clone(),
+                            user_home: user_home.clone(),
+                            preview: false,
+                        },
+                    )?)
+                    .map_err(io::Error::other)
+                }),
+            ),
+            (
+                "board",
+                Box::new(|| {
+                    serde_json::to_value(board_lifecycle::install(&board_lifecycle::Request {
+                        source: source.clone(),
+                        codex_home: codex_home.clone(),
+                        user_home: user_home.clone(),
+                        preview: false,
+                    })?)
+                    .map_err(io::Error::other)
+                }),
+            ),
+            (
+                "subscriptions",
+                Box::new(|| {
+                    serde_json::to_value(subscription_lifecycle::install(
+                        &subscription_lifecycle::Request {
+                            source: source.clone(),
+                            codex_home: codex_home.clone(),
+                            user_home: user_home.clone(),
+                            preview: false,
+                            manager: Some(env::current_exe()?),
+                        },
+                    )?)
+                    .map_err(io::Error::other)
+                }),
+            ),
+        ];
+        for (name, step) in chain {
+            match step() {
+                Ok(report) => {
+                    components.push(serde_json::json!({"name": name, "ok": true, "report": report}))
+                }
+                Err(error) => {
+                    components.push(
+                        serde_json::json!({"name": name, "ok": false, "error": error.to_string()}),
+                    );
+                    status = "partial";
+                    break;
+                }
+            }
+        }
+    }
+    let verify = if preview {
+        None
+    } else {
+        Some(verification(&codex_home))
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": status,
+            "source": source,
+            "build": build,
+            "build_identity": build_identity,
+            "reset": reset_report,
+            "core": core,
+            "components": components,
+            "verification": verify,
+        }))?
+    );
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn deploy_rejects_a_relative_source_before_any_work() {
+        let error = deploy(&os(&["--source", "kit"])).unwrap_err();
+        assert!(error.to_string().contains("absolute checkout path"));
     }
 
     #[test]

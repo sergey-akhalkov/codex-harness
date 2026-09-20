@@ -285,6 +285,9 @@ fn run() -> io::Result<i32> {
             "codex-harness install|update --core-only|--code-tools-only --source CHECKOUT [--build DIRECTORY] --codex-home DIRECTORY --user-home DIRECTORY [--upstream EXECUTABLE_OR_PACKAGE] [--dependency-user-home DIRECTORY] [--path-scope User|Process] [--preview]"
         );
         println!(
+            "codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview]"
+        );
+        println!(
             "codex-harness install --token-workflow-only|--board-only --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--preview]"
         );
         println!(
@@ -393,6 +396,11 @@ fn run() -> io::Result<i32> {
     if args[0] == "disconnect" {
         verify_manager()?;
         return install_cli::disconnect(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "deploy" {
+        verify_manager()?;
+        return install_cli::deploy(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "install" || args[0] == "update" {

@@ -76,6 +76,7 @@ pub mod installation_links;
 pub mod installation_lock;
 mod installation_metadata;
 mod installation_path;
+pub mod installation_reset;
 pub mod installation_state;
 pub mod inventory;
 pub mod launcher;

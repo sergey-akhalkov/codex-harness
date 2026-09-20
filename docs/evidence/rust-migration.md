@@ -1221,13 +1221,21 @@ Open finding (2026-09-20): the global installation's lifecycle verbs
 `harness/bin/codex-harness.exe` link to a working-tree build; the recorded
 object identity can never match again, and the kit correctly preserves state
 instead of guessing. The same damage made consumer sessions run a launcher
-older than their live-linked skill text. A verified manual repoint restored
-the delivered launcher to an immutable build; the full clean reset requires
-removing the recorded owned links and installation metadata and reinstalling,
-which the owning human must run. Loop-guidance skills (`team-lead`,
+older than their live-linked skill text. A temporary manual repoint restored
+the launcher; the one-action `deploy --reset` later performed the full clean
+reset with a receipt and a fresh valid installation, and `update --preview`
+validates again. Loop-guidance skills (`team-lead`,
 `board-workflow`) reach Codex sessions as copies under the Codex skill root
 and go stale when source skills change; no lifecycle step currently refreshes
 them.
+
+Open finding (2026-09-20): `install --token-workflow-only` fails on this
+machine with a raw `os error 2` before writing its links, both standalone and
+inside `deploy --all`; the recorded RTK package and build files exist, so the
+missing path is inside the component and not yet reduced. `deploy --all`
+reports it honestly and stops the chain; the component's `hooks.json` link was
+restored manually from its exact `token-workflow.json` record while the
+component stays broken.
 
 Checks on the reviewed tree: `cargo fmt --all -- --check` clean; workspace
 clippy (`--all-targets --locked -D warnings`) clean; the full documented suite

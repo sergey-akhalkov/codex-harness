@@ -519,6 +519,7 @@ leadership transfer, recovery after controller restart or measured quota benefit
 ## Manager, inventory and core connection
 
 ```powershell
+codex-harness deploy --source CHECKOUT [--codex-home DIRECTORY] [--user-home DIRECTORY] [--build DIRECTORY] [--state DIRECTORY] [--reset] [--all] [--preview]
 cargo run --release --locked -p codex-harness -- build --source . --state "$env:LOCALAPPDATA/codex-harness-native"
 codex-harness.exe check --build <directory> [--source <checkout>]
 codex-harness.exe inventory --source <checkout> --codex-home <directory> --user-home <directory>

@@ -60,6 +60,21 @@ and Check never provision or download packages.
 
 ## Install and verify
 
+Everyday delivery and update are one command. It builds an immutable
+candidate from the checkout, installs or updates the core connection with
+user-default homes, verifies the installed launcher and prints one receipt;
+`--all` chains the scoped component updates and `--reset` is the explicit
+repair when `install`/`update` refuse because recorded link ownership no
+longer matches (reset removes recorded link objects only, writes a receipt
+and never touches targets or regular files):
+
+```powershell
+codex-harness deploy --source "<absolute-kit-checkout>" [--all] [--reset]
+```
+
+The explicit candidate flow below remains for scoped, pinned or
+no-Cargo situations; `install`, `update` and `check` never compile.
+
 Build an immutable candidate from the checkout, then run the candidate manager:
 
 ```powershell
