@@ -1,5 +1,5 @@
 use harness_core::{build_identity, build_selection, native_build};
-use std::{collections::BTreeMap, env, ffi::OsString, io, path::PathBuf};
+use std::{collections::BTreeMap, env, ffi::OsString, fs, io, path::PathBuf};
 
 mod delegation_usage;
 #[cfg(windows)]
@@ -50,6 +50,29 @@ fn verify_runtime() -> io::Result<()> {
 
 fn verify_serving() -> io::Result<()> {
     verify_entrypoint(Admission::Serving)
+}
+
+/// Immutable builds carry their source identity next to the executable;
+/// cargo-built binaries have no record and keep the plain version line.
+const BUILD_RECORD_LIMIT: u64 = 1024 * 1024;
+
+fn installed_build_record() -> io::Result<build_identity::BuildRecord> {
+    let executable = env::current_exe()?.canonicalize()?;
+    let path = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("executable has no parent directory"))?
+        .join("build.json");
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() || metadata.len() > BUILD_RECORD_LIMIT {
+        return Err(io::Error::other("no adjacent native build record"));
+    }
+    Ok(serde_json::from_slice(&fs::read(&path)?)?)
+}
+
+fn unsupported_command(name: &str) -> io::Error {
+    io::Error::other(format!(
+        "unsupported command '{name}'; use --help; kit instructions referencing '{name}' mean this installed harness build is older than the kit source: rebuild and update it through the kit installation lifecycle"
+    ))
 }
 
 enum Admission {
@@ -297,6 +320,10 @@ fn run() -> io::Result<i32> {
     }
     if args[0] == "--version" {
         println!("codex-harness {}", env!("CARGO_PKG_VERSION"));
+        if let Ok(record) = installed_build_record() {
+            let identity: String = record.source.sha256.chars().take(16).collect();
+            println!("native build source {identity}");
+        }
         return Ok(0);
     }
     #[cfg(windows)]
@@ -536,7 +563,7 @@ fn run() -> io::Result<i32> {
     let activating = args[0] == "activate-build";
     let recovering = args[0] == "recover-build";
     if !building && !activating && !recovering && args[0] != "check" {
-        return Err(io::Error::other("unsupported command; use --help"));
+        return Err(unsupported_command(&args[0].to_string_lossy()));
     }
     let mut options = BTreeMap::new();
     let mut iter = args[1..].iter();
@@ -606,5 +633,19 @@ fn main() {
             eprintln!("codex-harness: {e}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsupported_command;
+
+    #[test]
+    fn unknown_command_names_command_and_version_skew_remedy() {
+        let message = unsupported_command("executor").to_string();
+        assert!(message.contains("unsupported command 'executor'"));
+        assert!(message.contains("use --help"));
+        assert!(message.contains("older than the kit source"));
+        assert!(message.contains("kit installation lifecycle"));
     }
 }

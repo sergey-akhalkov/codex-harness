@@ -49,14 +49,13 @@ fn live_codex_home() -> PathBuf {
 fn native_launcher() -> PathBuf {
     let requested = PathBuf::from(std::env::var_os("HARNESS_NATIVE_CODEX").unwrap());
     let registration = live_codex_home().join("harness/native-launch.json");
-    if let Ok(bytes) = fs::read(&registration) {
-        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(path) = value["upstream"]["executable"].as_str() {
-                let upstream = PathBuf::from(path);
-                if upstream.is_file() {
-                    return upstream;
-                }
-            }
+    if let Ok(bytes) = fs::read(&registration)
+        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(path) = value["upstream"]["executable"].as_str()
+    {
+        let upstream = PathBuf::from(path);
+        if upstream.is_file() {
+            return upstream;
         }
     }
     requested
@@ -299,7 +298,7 @@ fn independent_add_absence_batch_runs_on_authorized_xai() {
         "batch": serde_json::to_value(&batch).unwrap(),
         "pairs": pairs,
         "evidence": serde_json::to_value(&evidence).unwrap(),
-        "verdict": serde_json::to_value(&verdict).unwrap(),
+        "verdict": serde_json::to_value(verdict).unwrap(),
         "unsupported_measurements": plan::pilot().unsupported_measurements
     });
     write(

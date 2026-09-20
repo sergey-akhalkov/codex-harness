@@ -101,17 +101,17 @@ impl AccountObservation {
         if self.refusals > MAX_REFUSALS {
             return Err(invalid(format!("refusals must be at most {MAX_REFUSALS}")));
         }
-        if let Some(percent) = self.used_percent {
-            if percent > 100 {
-                return Err(invalid("used_percent must be at most 100"));
-            }
+        if let Some(percent) = self.used_percent
+            && percent > 100
+        {
+            return Err(invalid("used_percent must be at most 100"));
         }
-        if let Some(window) = self.window_minutes {
-            if window == 0 || window > MAX_WINDOW_MINUTES {
-                return Err(invalid(format!(
-                    "window_minutes must be between 1 and {MAX_WINDOW_MINUTES}"
-                )));
-            }
+        if let Some(window) = self.window_minutes
+            && (window == 0 || window > MAX_WINDOW_MINUTES)
+        {
+            return Err(invalid(format!(
+                "window_minutes must be between 1 and {MAX_WINDOW_MINUTES}"
+            )));
         }
         match self.source {
             ObservationSource::NativeLimit => {
@@ -493,7 +493,7 @@ fn recent_session_files(sessions: &Path) -> io::Result<Vec<PathBuf>> {
         // Session directories are dated, so descending names visit the newest
         // records first and the visit bound cannot hide them.
         let mut entries: Vec<fs::DirEntry> = fs::read_dir(&directory)?.collect::<Result<_, _>>()?;
-        entries.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.file_name().to_owned()));
         let mut directories = Vec::new();
         for entry in entries {
             visited += 1;
@@ -865,7 +865,7 @@ mod tests {
         let scope = "gpt";
         let now = 1_789_852_000;
         let refusal = provider_refusal(scope, 1, now - 10, DEFAULT_MAX_AGE_SECONDS).unwrap();
-        let view = account_view(&[refusal.clone()], scope, now);
+        let view = account_view(std::slice::from_ref(&refusal), scope, now);
         assert_eq!(view.used_percent, None);
         assert_eq!(view.refusals, 1);
         assert_eq!(view.sources, vec![ObservationSource::ProviderRefusal]);

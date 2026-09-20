@@ -72,10 +72,29 @@ Brief executors through harness commands, not by automating TUI keystrokes:
 codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY --exec "assignment"
 ```
 
+Before the first dispatch, probe the installed launcher:
+`codex-harness executor --help` must print the executor usage. An
+`unsupported command` answer is a stale harness build, not proof that
+executors are unavailable: kit skills are live links, while the launcher is an
+immutable build updated only through the kit lifecycle. Report `launcher stale`
+with the remedy - rebuild and update the kit from the source root recorded in
+`CODEX_HOME/harness/installation.json` - and meanwhile continue only work whose
+acceptance does not depend on executors. Do not repair the skew by substituting
+the profile or by dispatching raw `codex exec`, TUI automation or in-session
+subagents: that drops the visible conversation, steering, board and recovery
+contract.
+
 Each executor gets a complete outcome, its configured profile, its own visible
 window, and a Codex-managed worktree before the first model request. Do not
 write to the shared checkout. Do not solve delegated work in parallel. A small
 or tightly coupled task stays with the lead.
+Before dispatch, do the analysis a slice needs to become sufficiently
+specified for its executor profile: requirement interpretation, risk and
+consequence decisions, approach direction and acceptance conditions. Size each
+slice to the configured executor profiles' reasoning capability; a slice too
+demanding for every available profile stays with the lead, is split further,
+or goes through a bounded principal consultation, never dispatched as-is.
+Exploration inside a delegated slice's boundaries remains executor work.
 When an outcome arrives, split it into independently verifiable parallel
 slices before dispatching a single worker: distinct worktrees from a committed
 known base, disjoint file and system ownership per slice, complete outcomes

@@ -939,12 +939,11 @@ fn exercise_view_close(root: &Path, state: &Path, workspace: &Path, executable: 
             let views: Value = serde_json::from_slice(&bytes).unwrap();
             if let Ok(snapshot) = serde_json::from_value::<harness_core::task_view::Snapshot>(
                 views["threads"][&thread_id].clone(),
-            ) {
-                if snapshot.process != before {
-                    let user = harness_core::process_service::current_user().unwrap();
-                    if snapshot.is_visible(executable, &user).unwrap_or(false) {
-                        break snapshot;
-                    }
+            ) && snapshot.process != before
+            {
+                let user = harness_core::process_service::current_user().unwrap();
+                if snapshot.is_visible(executable, &user).unwrap_or(false) {
+                    break snapshot;
                 }
             }
         }
@@ -1020,7 +1019,7 @@ fn close_owned_views(state: &Path) {
     }
     for window in windows {
         if let Ok(snapshot) = serde_json::from_value::<harness_core::task_view::Snapshot>(window) {
-            let _ = close_conversation(&snapshot);
+            close_conversation(&snapshot);
         }
     }
 }

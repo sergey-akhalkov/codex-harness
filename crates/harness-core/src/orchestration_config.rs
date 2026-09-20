@@ -250,10 +250,10 @@ fn installed_profiles(codex_home: &Path) -> io::Result<BTreeSet<String>> {
                 let entry = entry?;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if let Some(profile) = name.strip_suffix(".config.toml") {
-                    if !profile.is_empty() {
-                        names.insert(profile.to_owned());
-                    }
+                if let Some(profile) = name.strip_suffix(".config.toml")
+                    && !profile.is_empty()
+                {
+                    names.insert(profile.to_owned());
                 }
             }
         }

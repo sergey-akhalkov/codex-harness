@@ -357,8 +357,7 @@ pub fn parse_gate_comments(comments: &[String]) -> Vec<GateRecord> {
 pub fn default_allowed(records: &[GateRecord], item: &str) -> bool {
     records
         .iter()
-        .filter(|record| record.item == item)
-        .next_back()
+        .rfind(|record| record.item == item)
         .is_some_and(|record| record.outcome == "adopt")
 }
 

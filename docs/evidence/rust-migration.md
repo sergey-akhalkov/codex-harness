@@ -1206,6 +1206,29 @@ failures were candidate-build OOMs inside the 2 GiB build job when two heavy
 suites ran concurrently; the affected suite passes 7/7 alone, and the active
 installation was preserved throughout.
 
+Open finding (2026-09-20): `native_launcher`'s
+`upstream_background_lifetime_survives_ordinary_wrapper_exit` fails
+deterministically on the current tree (four of four runs, including with the
+launcher-preflight working-tree changes reverted): the delayed fixture child
+never writes its marker, so the pre-existing failure is not yet reduced to a
+cause. Reproduce with `cargo test --locked -p codex-harness --test native_launcher upstream_background_lifetime_survives_ordinary_wrapper_exit -- --test-threads=1`.
+On installations without MSI desktop PowerShell, `migration_baseline` and
+`tui` need `HARNESS_ACCEPTANCE_POWERSHELL` pointing at the owner-designated
+PowerShell 7 executable; with that override both suites pass.
+
+Open finding (2026-09-20): the global installation's lifecycle verbs
+(`update`, `disconnect`) are blocked by an out-of-band edit that recreated the
+`harness/bin/codex-harness.exe` link to a working-tree build; the recorded
+object identity can never match again, and the kit correctly preserves state
+instead of guessing. The same damage made consumer sessions run a launcher
+older than their live-linked skill text. A verified manual repoint restored
+the delivered launcher to an immutable build; the full clean reset requires
+removing the recorded owned links and installation metadata and reinstalling,
+which the owning human must run. Loop-guidance skills (`team-lead`,
+`board-workflow`) reach Codex sessions as copies under the Codex skill root
+and go stale when source skills change; no lifecycle step currently refreshes
+them.
+
 Checks on the reviewed tree: `cargo fmt --all -- --check` clean; workspace
 clippy (`--all-targets --locked -D warnings`) clean; the full documented suite
 (`cargo test --workspace --locked --jobs 1 --no-fail-fast`) passed 83 targets

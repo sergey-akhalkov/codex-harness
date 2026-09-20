@@ -45,7 +45,7 @@ fn whole_package_link_and_descriptor_switch_recover_to_complete_revisions() {
     let link = skill_link(&source, &destination);
     let mut count = 0;
     let failed = reg.apply_inner(
-        &[link.clone()],
+        std::slice::from_ref(&link),
         &[descriptor.plan_replace(v2).unwrap()],
         &[],
         &[],

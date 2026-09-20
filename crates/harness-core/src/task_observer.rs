@@ -486,7 +486,6 @@ impl Visibility {
                         }
                         self.recovery.remove(thread);
                     }
-                    changed = true;
                 } else {
                     save(&root.path().join("visibility-error.json"), event)?;
                     return Err(io::Error::other(

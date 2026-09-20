@@ -570,19 +570,18 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     // Shared kit services are started as siblings before this wait. The session
     // Job owns only the upstream CLI tree and reaps leftovers when it exits.
     #[cfg(windows)]
-    {
+    let code = {
         let spec = interactive_spec(&command)?;
         let job = crate::process::Job::new(crate::process::Limits::default())?;
         let child = job.spawn(&spec)?;
-        let code = job.wait_foreground(&child, Duration::from_secs(5))?;
-        return Ok(code as i32);
-    }
+        job.wait_foreground(&child, Duration::from_secs(5))? as i32
+    };
     #[cfg(not(windows))]
-    let status = command.status()?;
-    #[cfg(not(windows))]
-    status
+    let code = command
+        .status()?
         .code()
-        .ok_or_else(|| fail("upstream terminated without an exit code"))
+        .ok_or_else(|| fail("upstream terminated without an exit code"))?;
+    Ok(code)
 }
 
 #[cfg(all(test, windows))]

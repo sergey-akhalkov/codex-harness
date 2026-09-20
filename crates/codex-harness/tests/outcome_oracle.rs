@@ -398,16 +398,18 @@ fn process_oracle_rejects_stale_reports_forced_exit_codes_and_incomplete_streams
 #[test]
 fn skill_library_comparison_matrix_executes_held_out_and_negative_absence() {
     use skill_evolution::comparison::{self, CaseResult};
-    let mut order = 0u32;
     let mut rows = Vec::new();
-    for (id, arm, absence) in [
+    for (index, (id, arm, absence)) in [
         ("entrypoint", "baseline", false),
         ("entrypoint", "candidate", false),
         ("negative", "candidate", true),
         ("missing", "candidate", true),
         ("freshness", "candidate", false),
-    ] {
-        order += 1;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let order = index as u32 + 1;
         let case = Case::new(id, arm);
         case.report(id == "missing");
         if ["entrypoint", "freshness"].contains(&id) {

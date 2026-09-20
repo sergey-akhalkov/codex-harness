@@ -59,6 +59,21 @@ Dispatch an executor with the installed launcher:
 codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY --exec "assignment"
 ```
 
+Skills and `orchestration.toml` are live links into the kit checkout, while the
+launcher is an immutable native build changed only by an explicit build and
+install. A checkout updated after the last install can therefore reference an
+`executor` command the installed launcher does not contain. Probe the launcher
+before the first dispatch with `codex-harness executor --help`; it must print
+the executor usage. `unsupported command` names a stale build, not unavailable
+executors: rebuild and update through the
+[installation lifecycle](installation.md#install-and-verify) from the source
+root recorded in `CODEX_HOME/harness/installation.json`. Until the update,
+orchestration stays blocked - no profile substitution, no raw `codex exec`, TUI
+automation or in-session helpers, which would drop visibility, steering, board
+and recovery guarantees. `codex-harness --version` prints the installed
+build's source identity when its build record is present, so a stale launcher
+is identifiable without guessing.
+
 That command uses `codex --profile xai` from the example above. An unlisted
 `--profile` is an error. Explicit user `codex --profile <id>` keeps native
 precedence over role configuration. Quota succession looks up the successor
@@ -192,6 +207,14 @@ routine work prefer Grok. A short edit,
 tightly coupled slice or expensive context handoff is often cheaper to do
 directly. Count briefing, execution, waiting, checking, integration and rework.
 The number of children is not a savings metric.
+
+Before dispatch, perform the analysis each slice needs to become sufficiently
+specified for its executor profile - requirement interpretation, risk and
+consequence decisions, approach direction and acceptance conditions - and size
+slices to the configured profiles' reasoning capability. A slice too demanding
+for every available profile stays with the lead, is split further, or uses a
+bounded principal consultation; it is never delegated as-is. Investigation
+inside a delegated slice's boundaries remains executor work.
 
 Combine related routine into one substantial assignment. Splitting a pair of
 short functions between two children increased parent time and spend in the

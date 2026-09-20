@@ -82,6 +82,18 @@ fn fixture(source: &Path) {
         source.join("crates/harness-core/Cargo.toml"),
     )
     .unwrap();
+    // The real manager manifest depends on skill-evolution; copy the real
+    // crate like harness-core instead of the generic member stub.
+    let evolution = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skill-evolution");
+    copy_source_tree(
+        &evolution.join("src"),
+        &source.join("crates/skill-evolution/src"),
+    );
+    fs::copy(
+        evolution.join("Cargo.toml"),
+        source.join("crates/skill-evolution/Cargo.toml"),
+    )
+    .unwrap();
     for (directory, name) in [
         ("crates/manager", "codex-harness"),
         ("tools/rtk-adapter", "harness-rtk"),
@@ -100,6 +112,35 @@ fn fixture(source: &Path) {
             },
         )
         .unwrap();
+    }
+    // The synthetic manifest keeps the real workspace member list so ancestor
+    // Cargo configuration stays part of build identity; every listed member
+    // must therefore exist, even when the fixture replaces it with a stub.
+    let manifest = fs::read_to_string(source.join("Cargo.toml")).unwrap();
+    let members = manifest
+        .split("members = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap();
+    for member in members.split_whitespace() {
+        let member = member.trim_matches(|character| character == '"' || character == ',');
+        if member.is_empty() {
+            continue;
+        }
+        let directory = source.join(member);
+        if directory.join("Cargo.toml").exists() {
+            continue;
+        }
+        fs::create_dir_all(directory.join("src")).unwrap();
+        fs::write(
+            directory.join("Cargo.toml"),
+            format!(
+                "[package]\nname='{}'\nversion='0.1.0'\nedition='2024'\n",
+                member.rsplit('/').next().unwrap_or(member)
+            ),
+        )
+        .unwrap();
+        fs::write(directory.join("src/lib.rs"), "").unwrap();
     }
     fs::create_dir_all(source.join("crates/manager/src/bin")).unwrap();
     for name in harness_core::build_identity::BINARIES {

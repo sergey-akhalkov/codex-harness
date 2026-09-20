@@ -335,7 +335,7 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
                             "lead conversation closed before its thread was named",
                         ));
                     };
-                    report_closed_views(&root, &[thread_id.clone()])?;
+                    report_closed_views(&root, std::slice::from_ref(&thread_id))?;
                     let mut next = CommandSpec::new(command.get_program());
                     next.env.clone_from(&tui.env);
                     next.current_dir = Some(env::current_dir()?);

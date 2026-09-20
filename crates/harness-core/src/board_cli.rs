@@ -543,6 +543,10 @@ mod tests {
         assert!(text.contains("must not spawn executors"));
         assert!(text.contains("board-workflow"));
         assert!(text.contains("executor spawn"));
+        assert!(text.contains("codex-harness executor --help"));
+        assert!(text.contains("stale harness build"));
+        assert!(text.contains("launcher stale"));
+        assert!(text.contains("installation.json"));
         assert!(text.contains("Do not use for a small direct task"));
     }
 

@@ -296,16 +296,16 @@ fn windows_terminal_client() -> Option<PathBuf> {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         candidates.push(PathBuf::from(local).join(r"Microsoft\WindowsApps\wt.exe"));
     }
-    if let Some(pf) = std::env::var_os("ProgramFiles") {
-        if let Ok(entries) = fs::read_dir(PathBuf::from(pf).join("WindowsApps")) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name
-                    .to_string_lossy()
-                    .starts_with("Microsoft.WindowsTerminal_")
-                {
-                    candidates.push(entry.path().join("wt.exe"));
-                }
+    if let Some(pf) = std::env::var_os("ProgramFiles")
+        && let Ok(entries) = fs::read_dir(PathBuf::from(pf).join("WindowsApps"))
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_string_lossy()
+                .starts_with("Microsoft.WindowsTerminal_")
+            {
+                candidates.push(entry.path().join("wt.exe"));
             }
         }
     }
@@ -397,6 +397,8 @@ fn ensure_workspace_trust(codex_home: &Path, workspace: &Path) -> io::Result<()>
     fs::write(&config, updated)
 }
 
+// One terminal dispatch carries the whole isolated assignment context.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_terminal_tab(
     wt: &Path,
     launcher: &Path,
@@ -578,6 +580,8 @@ fn child_args(
     }
 }
 
+// The receipt records every dispatch input the watcher and resume path need.
+#[allow(clippy::too_many_arguments)]
 fn save_receipt(
     workspace: &Path,
     launcher: &Path,

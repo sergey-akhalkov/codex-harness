@@ -530,14 +530,12 @@ pub fn parse_pacing_comments(comments: &[String]) -> PacingRecords {
     for comment in comments {
         if let Some(decision) = PacingDecision::parse(comment) {
             records.decisions.push(decision);
-        } else if let Some(rest) = comment.strip_prefix(REVOKE_PREFIX) {
-            if let Some(id) = rest
-                .trim()
+        } else if let Some(rest) = comment.strip_prefix(REVOKE_PREFIX)
+            && let Some(id) = rest
                 .split_whitespace()
                 .find_map(|part| part.strip_prefix("id="))
-            {
-                records.revoked.push(id.to_owned());
-            }
+        {
+            records.revoked.push(id.to_owned());
         }
     }
     records
