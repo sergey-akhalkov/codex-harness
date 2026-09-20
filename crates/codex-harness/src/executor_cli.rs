@@ -1,6 +1,7 @@
-//! Dispatch a configured executor through native `codex --profile`, and
-//! replace one exact session's CLI process under refreshed instructions
-//! (instruction-refresh succession, OFAP 4.1).
+//! Dispatch a configured executor through native `codex --profile` into a
+//! harness-owned pool slot, release that slot for reuse, and replace one exact
+//! session's CLI process under refreshed instructions (instruction-refresh
+//! succession, OFAP 4.1).
 #![cfg(windows)]
 
 use harness_core::orchestration_config::{
@@ -14,6 +15,8 @@ use harness_core::task_succession::{
     SessionFacts, SuccessorPlan,
 };
 use harness_core::task_view;
+use harness_core::task_worktree::{self, AcquiredSlot, LaneDisposition, SlotDisposition};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     ffi::OsString,
@@ -28,7 +31,7 @@ use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --workspace DIRECTORY [--profile ID] [--mode exec|tui] [--terminal-profile NAME] --exec PROMPT\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible console, and returns so the lead can keep working. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible console, and returns so the lead can keep working. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
 const STARTUP: Duration = Duration::from_secs(20);
 const SUCCESSION_LIMIT: u64 = 4 * 1024 * 1024;
 const INSTRUCTION_READ_LIMIT: u64 = 1024 * 1024;
@@ -63,6 +66,8 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     }
     match args.first().and_then(|arg| arg.to_str()) {
         Some("spawn") => spawn(&args[1..]),
+        Some("release") => release(&args[1..]),
+        Some("pool") => pool_status(&args[1..]),
         Some("steer") => steer(&args[1..]),
         Some("run") => run_exec(&args[1..]),
         Some("succeed") => succeed(&args[1..]),
@@ -78,6 +83,8 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let mut terminal_profile = None;
     let mut mode = None;
     let mut prompt = None;
+    let mut base = None;
+    let mut owner = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
@@ -90,6 +97,8 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
             "--source" => source = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             "--workspace" => workspace = Some(PathBuf::from(value)),
+            "--base" => base = Some(option_text(value)?),
+            "--owner" => owner = Some(option_text(value)?),
             "--profile" => {
                 profile = Some(
                     value
@@ -127,29 +136,65 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     }
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
-    let workspace = required(workspace, "--workspace")?;
     let prompt = prompt.ok_or_else(|| invalid("--exec is required"))?;
-    if !source.is_absolute() || !codex_home.is_absolute() || !workspace.is_absolute() {
+    if !source.is_absolute()
+        || !codex_home.is_absolute()
+        || workspace.as_ref().is_some_and(|path| !path.is_absolute())
+    {
         return Err(invalid("executor spawn paths must be absolute"));
     }
     let config = load(&source)?;
     let profile = executor_profile(&config, profile.as_deref())?.to_owned();
     let mode = SpawnMode::parse(mode.as_deref())?;
-    let audit = harness_core::task_worktree::audit(&source)?;
-    if audit.total >= config.worktree_limit {
-        eprintln!(
-            "worktree warning: {} registered worktrees reach the limit {}; retire finished lanes or reset them for reuse (git worktree list)",
-            audit.total, config.worktree_limit
-        );
-    }
-    dispatch(
-        &codex_home,
-        &workspace,
-        &profile,
-        &prompt,
+    let pool_size = config.max_concurrent_executors;
+    let named_slot = named_slot(&source, pool_size, workspace.as_deref())?;
+    let owner = owner
+        .filter(|owner| !owner.trim().is_empty())
+        .unwrap_or_else(|| format!("exec-{profile}-{}", std::process::id()));
+    dispatch(&Dispatch {
+        codex_home: &codex_home,
+        source: &source,
+        pool_size,
+        named_slot,
+        owner: &owner,
+        base: base.as_deref(),
+        profile: &profile,
+        prompt: &prompt,
         mode,
-        terminal_profile.as_deref(),
-    )
+        terminal_profile: terminal_profile.as_deref(),
+    })
+}
+
+/// `--workspace` is no longer the isolation mechanism: it may name the source
+/// checkout, whose pool then selects the slot, or one of that checkout's pool
+/// slots. Ad-hoc task-named worktree paths are refused with a migration hint
+/// instead of recreating unbounded lanes; the pool always picks the free slot.
+fn named_slot(source: &Path, pool_size: u32, workspace: Option<&Path>) -> io::Result<Option<u32>> {
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+    let checkout = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    let named = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    if checkout == named {
+        return Ok(None);
+    }
+    match task_worktree::slot_index(source, workspace)? {
+        Some(index) if index <= pool_size => Ok(Some(index)),
+        Some(index) => Err(invalid(&format!(
+            "executor isolation comes from the harness pool: {} is slot {index}, outside the configured pool of {pool_size} (max_concurrent_executors); dispatch with --source {} instead of the extra lane",
+            workspace.display(),
+            source.display()
+        ))),
+        None => Err(invalid(&format!(
+            "executor isolation comes from the harness pool: --workspace must be the source checkout {} or one of its slots (<repository>-wt1..{pool_size}); drop the ad-hoc worktree path {} and let the dispatch select and synchronize the slot",
+            source.display(),
+            workspace.display()
+        ))),
+    }
 }
 
 /// `exec` streams the assignment in a visible tab and exits on completion, so
@@ -181,43 +226,514 @@ impl SpawnMode {
     }
 }
 
-fn dispatch(
-    codex_home: &Path,
-    workspace: &Path,
-    profile: &str,
-    prompt: &str,
+/// One pooled dispatch. The slot is selected, synchronized and bound before any
+/// launcher process starts, so the session never runs from a stale base.
+struct Dispatch<'a> {
+    codex_home: &'a Path,
+    source: &'a Path,
+    pool_size: u32,
+    named_slot: Option<u32>,
+    owner: &'a str,
+    base: Option<&'a str>,
+    profile: &'a str,
+    prompt: &'a str,
     mode: SpawnMode,
-    terminal_profile: Option<&str>,
-) -> io::Result<i32> {
-    let bound = orchestration_config::binding(codex_home, profile)?;
-    fs::create_dir_all(workspace)?;
-    ensure_workspace_trust(codex_home, workspace)?;
-    let isolation = harness_core::task_worktree::exec_isolation_args(codex_home, workspace)?;
-    let launcher = codex_home.join("harness/bin/codex.exe");
+    terminal_profile: Option<&'a str>,
+}
+
+/// Recorded session binding of one pool slot: the mapping the lead reloads
+/// after an interruption through the kit-local task state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SlotBinding {
+    index: u32,
+    path: PathBuf,
+    source: PathBuf,
+    owner: String,
+    base: String,
+    remote: String,
+    branch: Option<String>,
+}
+
+fn dispatch(request: &Dispatch) -> io::Result<i32> {
+    let bound = orchestration_config::binding(request.codex_home, request.profile)?;
+    let slot = acquire_pool_slot(request)?;
+    let binding = SlotBinding {
+        index: slot.index,
+        path: slot.path.clone(),
+        source: request.source.to_path_buf(),
+        owner: request.owner.to_owned(),
+        base: slot.base.clone(),
+        remote: slot.remote.clone(),
+        branch: slot.branch.clone(),
+    };
+    println!("{}", slot_summary(&binding, request.named_slot));
+    report_inventory(request)?;
+    ensure_workspace_trust(request.codex_home, &binding.path)?;
+    let receipt = receipt_path(request.codex_home, request.source, binding.index)?;
+    let launcher = request.codex_home.join("harness/bin/codex.exe");
     if !launcher.is_file() {
-        return Err(invalid("installed Codex launcher is missing"));
+        return Err(invalid(&format!(
+            "installed Codex launcher is missing: {} does not exist; slot {} stays bound to {} and is reused by the next dispatch",
+            launcher.display(),
+            binding.index,
+            binding.owner
+        )));
     }
-    let args = child_args(profile, workspace, prompt, &isolation, mode)?;
-    let title = format!("Codex executor ({profile})");
+    let args = child_args(request.profile, &binding.path, request.prompt, request.mode)?;
+    let title = format!("Codex executor ({})", request.profile);
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
     if prefers_terminal_tab(session.as_deref(), client.as_deref()) {
         dispatch_terminal_tab(
             client.as_ref().expect("terminal client"),
             &launcher,
-            workspace,
-            profile,
-            mode,
-            terminal_profile,
+            request,
+            &binding,
+            &receipt,
             &title,
             &args,
             &bound,
-            codex_home,
         )
     } else {
-        dispatch_owned_console(
-            &launcher, workspace, profile, mode, &args, &bound, codex_home,
-        )
+        dispatch_owned_console(&launcher, request, &binding, &receipt, &bound, &args)
+    }
+}
+
+/// The observable outcome of slot allocation: the lead reads the mapping here
+/// and reloads the same fields from `executor pool` or the kit-local record.
+fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
+    let mut line = format!(
+        "executor slot: index={} path={} base={} owner={} remote={}{} source={}",
+        binding.index,
+        binding.path.display(),
+        binding.base,
+        binding.owner,
+        binding.remote,
+        binding
+            .branch
+            .as_deref()
+            .map(|branch| format!("/{branch}"))
+            .unwrap_or_default(),
+        binding.source.display()
+    );
+    if let Some(named) = named.filter(|named| *named != binding.index) {
+        line.push_str(&format!(
+            " (--workspace named slot {named}; the pool bound the free slot {})",
+            binding.index
+        ));
+    }
+    line
+}
+
+/// Report the inventory the pool invariant covers: dispatch allocates only
+/// inside the configured pool and never absorbs or deletes foreign or legacy
+/// trees, so the lead reviews them.
+fn report_inventory(request: &Dispatch) -> io::Result<()> {
+    let audit = task_worktree::audit_pool(request.source, request.pool_size)?;
+    if !audit.foreign.is_empty() {
+        println!(
+            "pool inventory (lead review): foreign worktrees: {}",
+            display_paths(&audit.foreign)
+        );
+    }
+    if !audit.beyond_pool.is_empty() {
+        println!(
+            "pool inventory (lead review): worktrees beyond the configured pool of {}: {}",
+            request.pool_size,
+            display_paths(&audit.beyond_pool)
+        );
+    }
+    Ok(())
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The pool core owns selection, claims, synchronization and slot records; the
+/// CLI supplies the session identity and the process-level liveness of its host.
+fn acquire_pool_slot(request: &Dispatch) -> io::Result<AcquiredSlot> {
+    let live = |owner: &str| owner_live(request.codex_home, request.source, owner);
+    refuse_a_live_owner(request.codex_home, request.source, request.owner)?;
+    task_worktree::acquire_slot(
+        request.codex_home,
+        request.source,
+        request.pool_size,
+        request.owner,
+        request.base,
+        &live,
+    )
+}
+
+/// A dispatch never shares its slot with a live session that already claims
+/// that identity: an interrupted session ends before its slot can be reclaimed,
+/// while a running one must be stopped or given another identity.
+fn refuse_a_live_owner(codex_home: &Path, source: &Path, owner: &str) -> io::Result<()> {
+    match live_lease(codex_home, source, owner) {
+        Some(lease) => Err(invalid(&format!(
+            "session {owner} is already live in slot {} ({}); stop it or dispatch with another --owner instead of sharing one checkout",
+            lease.index,
+            lease.path.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Process identity of the session host that holds a slot. The lease is what
+/// reconciles slot occupancy with executor session liveness: a claim whose host
+/// process is gone is no longer an occupied slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionLease {
+    schema: u32,
+    owner: String,
+    index: u32,
+    path: PathBuf,
+    pid: u32,
+    /// Windows FILETIME of the host process creation; a reused pid differs.
+    created: u64,
+    program: PathBuf,
+}
+
+fn lease_path(codex_home: &Path, source: &Path, index: u32) -> io::Result<PathBuf> {
+    Ok(task_worktree::pool_state_dir(codex_home, source)?.join(format!("lease-{index}.json")))
+}
+
+/// The dispatch receipt is kit-local session state: writing it into the slot
+/// would make the harness's own bookkeeping look like unreviewed executor work
+/// and would travel with the executor's next commit.
+fn receipt_path(codex_home: &Path, source: &Path, index: u32) -> io::Result<PathBuf> {
+    Ok(task_worktree::pool_state_dir(codex_home, source)?.join(format!("spawn-{index}.json")))
+}
+
+/// Record this process as the live host of a bound slot. A slot that was
+/// rebound to another session is refused instead of sharing the tree.
+fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
+    let record = task_worktree::load_slot_record(codex_home, &binding.source, binding.index)?
+        .ok_or_else(|| {
+            invalid(&format!(
+                "slot {} has no recorded session binding",
+                binding.index
+            ))
+        })?;
+    if record.owner.as_deref() != Some(binding.owner.as_str()) {
+        return Err(invalid(&format!(
+            "slot {} is bound to session {} instead of {}; dispatch again instead of sharing one checkout",
+            binding.index,
+            record.owner.as_deref().unwrap_or("no session"),
+            binding.owner
+        )));
+    }
+    let program = std::env::current_exe()
+        .map_err(|error| invalid(&format!("executor session host path: {error}")))?;
+    let user = harness_core::process_service::current_user()?;
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)?.identity();
+    let lease = SessionLease {
+        schema: 1,
+        owner: binding.owner.clone(),
+        index: binding.index,
+        path: binding.path.clone(),
+        pid: identity.pid,
+        created: identity.creation_time,
+        program,
+    };
+    let path = lease_path(codex_home, &binding.source, binding.index)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&lease)?)
+}
+
+/// Drop the lease this process recorded and leave another session's lease alone.
+fn remove_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
+    let path = lease_path(codex_home, &binding.source, binding.index)?;
+    match read_lease(&path) {
+        Some(lease) if lease.owner == binding.owner && lease.pid == std::process::id() => {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn read_lease(path: &Path) -> Option<SessionLease> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// A recorded host is live while its exact process identity is running; an
+/// exited host, a missing image or a reused pid is stale. Unverifiable
+/// identity preserves the slot instead of reclaiming it.
+fn lease_live(lease: &SessionLease) -> bool {
+    if !lease.program.is_file() {
+        return false;
+    }
+    let Ok(user) = harness_core::process_service::current_user() else {
+        return true;
+    };
+    match ServiceProcess::inspect(
+        harness_core::process::ProcessIdentity {
+            pid: lease.pid,
+            creation_time: lease.created,
+        },
+        &lease.program,
+        &user,
+    ) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// The live lease of one owner, if a host process holds it: the pool core asks
+/// liveness per owner, so every lease in the kit-local state directory counts.
+fn live_lease(codex_home: &Path, source: &Path, owner: &str) -> Option<SessionLease> {
+    let dir = task_worktree::pool_state_dir(codex_home, source).ok()?;
+    let entries = fs::read_dir(&dir).ok()?;
+    entries
+        .flatten()
+        .filter_map(|entry| read_lease(&entry.path()))
+        .find(|lease| lease.owner == owner && lease_live(lease))
+}
+
+/// Is the recorded owner's host process still running?
+fn owner_live(codex_home: &Path, source: &Path, owner: &str) -> bool {
+    live_lease(codex_home, source, owner).is_some()
+}
+
+/// Explicit slot release for the lead: record the merged or discarded
+/// disposition with its reason, then reset the slot for reuse under the
+/// existing reset-for-reuse rules or preserve it with its limitation.
+fn release(args: &[OsString]) -> io::Result<i32> {
+    let mut source = None;
+    let mut codex_home = None;
+    let mut slot = None;
+    let mut disposition = None;
+    let mut reason = None;
+    let mut base = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            "--slot" => slot = Some(option_text(value)?),
+            "--disposition" => disposition = Some(option_text(value)?),
+            "--reason" => reason = Some(option_text(value)?),
+            "--base" => base = Some(option_text(value)?),
+            _ => return Err(invalid("invalid native executor options")),
+        }
+    }
+    let source = required(source, "--source")?;
+    let codex_home = required(codex_home, "--codex-home")?;
+    let index: u32 = slot
+        .ok_or_else(|| invalid("--slot is required"))?
+        .parse()
+        .map_err(|_| invalid("--slot must be a positive pool slot index"))?;
+    let disposition = match disposition.as_deref() {
+        Some("merged") => SlotDisposition::Merged,
+        Some("discarded") => SlotDisposition::Discarded,
+        Some(other) => {
+            return Err(invalid(&format!(
+                "unknown release disposition {other}; use merged or discarded"
+            )));
+        }
+        None => return Err(invalid("--disposition merged|discarded is required")),
+    };
+    let reason = reason
+        .filter(|reason| !reason.trim().is_empty())
+        .ok_or_else(|| invalid("--reason TEXT is required"))?;
+    let config = load(&source)?;
+    let layout = task_worktree::pool(&source, config.max_concurrent_executors)?;
+    layout.slot(index)?;
+    let base = match base {
+        Some(base) => base,
+        None => committed_head(&source)?,
+    };
+    let live = |owner: &str| owner_live(&codex_home, &source, owner);
+    match task_worktree::release_slot(
+        &codex_home,
+        &layout,
+        index,
+        disposition,
+        &reason,
+        &base,
+        &live,
+    )? {
+        LaneDisposition::Reused { base } => {
+            println!(
+                "executor slot {index} released as {}: reset to {base} and free for the next dispatch",
+                disposition_name(disposition)
+            );
+            Ok(0)
+        }
+        LaneDisposition::Preserved { limitation } => {
+            println!(
+                "executor slot {index} release recorded as {} but the slot is preserved: {limitation}",
+                disposition_name(disposition)
+            );
+            Ok(2)
+        }
+    }
+}
+
+fn disposition_name(disposition: SlotDisposition) -> &'static str {
+    match disposition {
+        SlotDisposition::Merged => "merged",
+        SlotDisposition::Discarded => "discarded",
+    }
+}
+
+/// The merged committed base of the source checkout, used when the lead does
+/// not name the base explicitly.
+fn committed_head(source: &Path) -> io::Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .current_dir(source)
+        .output()
+        .map_err(|error| invalid(&format!("release base: {error}")))?;
+    if !out.status.success() {
+        return Err(invalid(&format!(
+            "release base: {} is not a Git checkout with a committed HEAD; pass --base REV",
+            source.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// The lead's read path for the recorded slot mapping: index, path, state,
+/// owner, base, disposition and reason, beside the tree and lease state and the
+/// foreign or legacy worktrees that only the lead retires.
+fn pool_status(args: &[OsString]) -> io::Result<i32> {
+    let mut source = None;
+    let mut codex_home = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            _ => return Err(invalid("invalid native executor options")),
+        }
+    }
+    let source = required(source, "--source")?;
+    let codex_home = required(codex_home, "--codex-home")?;
+    let size = load(&source)?.max_concurrent_executors;
+    println!(
+        "executor worktree pool: source={} size={size} (max_concurrent_executors)",
+        source.display()
+    );
+    match task_worktree::pool(&source, size) {
+        Ok(layout) => {
+            for slot in &layout.slots {
+                println!("{}", slot_report(&codex_home, &source, slot));
+            }
+        }
+        Err(error) => println!("pool layout unavailable: {error}"),
+    }
+    let audit = task_worktree::audit_pool(&source, size)?;
+    for path in &audit.foreign {
+        println!("foreign worktree (lead review): {}", path.display());
+    }
+    for path in &audit.beyond_pool {
+        println!(
+            "worktree beyond the configured pool (lead review): {}",
+            path.display()
+        );
+    }
+    Ok(0)
+}
+
+fn slot_report(codex_home: &Path, source: &Path, slot: &task_worktree::PoolSlot) -> String {
+    let presence = match slot.presence {
+        task_worktree::SlotPresence::Absent => "absent",
+        task_worktree::SlotPresence::Registered => "registered",
+        task_worktree::SlotPresence::RegisteredMissing => "registered-missing",
+    };
+    let (state, owner, base, disposition, reason): (String, String, String, String, String) =
+        match task_worktree::load_slot_record(codex_home, source, slot.index) {
+            Ok(Some(record)) => (
+                slot_state_name(record.state).to_owned(),
+                record.owner.unwrap_or_else(|| "-".into()),
+                record.base.unwrap_or_else(|| "-".into()),
+                record
+                    .disposition
+                    .map(|disposition| disposition_name(disposition).to_owned())
+                    .unwrap_or_else(|| "-".into()),
+                record.reason.unwrap_or_else(|| "-".into()),
+            ),
+            Ok(None) => (
+                "free".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+            ),
+            Err(error) => (
+                "unreadable".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                error.to_string(),
+            ),
+        };
+    let lease = match lease_path(codex_home, source, slot.index) {
+        Ok(path) => read_lease(&path),
+        Err(_) => None,
+    };
+    let lease_state = match &lease {
+        Some(lease) if lease_live(lease) => "live",
+        Some(_) => "stale",
+        None => "none",
+    };
+    format!(
+        "slot {} {} presence={presence} state={state} tree={} lease={lease_state} owner={owner} base={base} disposition={disposition} reason={reason}",
+        slot.index,
+        slot.path.display(),
+        tree_state(&slot.path)
+    )
+}
+
+fn slot_state_name(state: task_worktree::SlotState) -> &'static str {
+    match state {
+        task_worktree::SlotState::Free => "free",
+        task_worktree::SlotState::Synchronizing => "synchronizing",
+        task_worktree::SlotState::Occupied => "occupied",
+        task_worktree::SlotState::AwaitingReview => "awaiting-review",
+        task_worktree::SlotState::Released => "released",
+    }
+}
+
+fn tree_state(path: &Path) -> &'static str {
+    if !path.is_dir() {
+        return "missing";
+    }
+    match Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(path)
+        .output()
+    {
+        Ok(out) if !out.status.success() => "unknown",
+        Ok(out) if String::from_utf8_lossy(&out.stdout).trim().is_empty() => "clean",
+        Ok(_) => "dirty",
+        Err(_) => "unknown",
     }
 }
 
@@ -256,7 +772,46 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
                 .collect::<Vec<_>>()
         })
         .ok_or_else(|| invalid("executor run receipt args are missing"))?;
-    run_child(&launcher, &rest)
+    // The tab host is the process that stays alive for the whole session, so
+    // it records the slot's liveness for exactly as long as the session runs.
+    let binding = receipt_binding(&value)?;
+    let codex_home = match &binding {
+        Some(binding) => Some(receipt_codex_home(binding)?),
+        None => None,
+    };
+    if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
+        record_lease(codex_home, binding)?;
+    }
+    let outcome = run_child(&launcher, &rest);
+    if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
+        let _ = remove_lease(codex_home, binding);
+    }
+    outcome
+}
+
+/// The recorded pool slot binding of a receipt; receipts written before the
+/// pool existed carry none and run without a lease.
+fn receipt_binding(value: &serde_json::Value) -> io::Result<Option<SlotBinding>> {
+    let slot = &value["slot"];
+    if slot.is_null() {
+        return Ok(None);
+    }
+    let binding: SlotBinding = serde_json::from_value(slot.clone())
+        .map_err(|error| invalid(&format!("executor run receipt slot binding: {error}")))?;
+    Ok(Some(binding))
+}
+
+fn receipt_codex_home(binding: &SlotBinding) -> io::Result<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            invalid(&format!(
+                "executor run receipt: CODEX_HOME is required to bind slot {} to session {}",
+                binding.index, binding.owner
+            ))
+        })?;
+    Ok(home)
 }
 
 fn run_child(launcher: &str, rest: &[OsString]) -> io::Result<i32> {
@@ -402,36 +957,41 @@ fn ensure_workspace_trust(codex_home: &Path, workspace: &Path) -> io::Result<()>
 fn dispatch_terminal_tab(
     wt: &Path,
     launcher: &Path,
-    workspace: &Path,
-    profile: &str,
-    mode: SpawnMode,
-    terminal_profile: Option<&str>,
+    request: &Dispatch,
+    binding: &SlotBinding,
+    receipt: &Path,
     title: &str,
     tui: &[String],
     bound: &ProfileBinding,
-    codex_home: &Path,
 ) -> io::Result<i32> {
+    let workspace = binding.path.as_path();
     let wrapper = std::env::current_exe()
         .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
-    let receipt = workspace.join("executor-spawn.json");
-    let args = terminal_tab_args(title, workspace, &wrapper, &receipt, terminal_profile)?;
-    save_receipt(
+    let args = terminal_tab_args(
+        title,
         workspace,
+        &wrapper,
+        receipt,
+        request.terminal_profile,
+    )?;
+    save_receipt(
+        receipt,
         launcher,
-        profile,
-        mode,
+        request.profile,
+        request.mode,
         tui,
         bound,
         None,
         "windows-terminal-tab",
         Some(&args),
+        Some(binding),
     )?;
     task_view::preserve_foreground(|| {
         suppress_loader_dialogs();
         let mut cmd = Command::new(wt);
         cmd.args(&args)
             .current_dir(workspace)
-            .env("CODEX_HOME", codex_home)
+            .env("CODEX_HOME", request.codex_home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -451,79 +1011,95 @@ fn dispatch_terminal_tab(
     })?;
     println!(
         "{}",
-        spawn_summary(profile, bound, title, workspace, "windows-terminal-tab",)
+        spawn_summary(
+            request.profile,
+            bound,
+            title,
+            receipt,
+            "windows-terminal-tab",
+        )
     );
     Ok(0)
 }
 
 fn dispatch_owned_console(
     launcher: &Path,
-    workspace: &Path,
-    profile: &str,
-    mode: SpawnMode,
-    args: &[String],
+    request: &Dispatch,
+    binding: &SlotBinding,
+    receipt: &Path,
     bound: &ProfileBinding,
-    codex_home: &Path,
+    args: &[String],
 ) -> io::Result<i32> {
-    save_receipt(
-        workspace,
-        launcher,
-        profile,
-        mode,
-        args,
-        bound,
-        None,
-        "owned-console",
-        None,
-    )?;
-    println!(
-        "{}",
-        spawn_summary(
+    let workspace = binding.path.as_path();
+    let profile = request.profile;
+    // This process hosts the session for as long as the view runs, so it is
+    // the recorded liveness of the slot.
+    record_lease(request.codex_home, binding)?;
+    let outcome = (|| -> io::Result<i32> {
+        save_receipt(
+            receipt,
+            launcher,
             profile,
+            request.mode,
+            args,
             bound,
-            &format!("Codex executor ({profile})"),
-            workspace,
+            None,
             "owned-console",
-        )
-    );
-    let view = task_view::preserve_foreground(|| {
-        let mut spec = CommandSpec::new(launcher);
-        spec.args = args.iter().map(OsString::from).collect();
-        spec.current_dir = Some(workspace.to_path_buf());
-        spec.new_console = Some(format!("Opening Codex executor ({profile})").into());
-        apply_executor_env(&mut spec, codex_home);
-        let placements = task_view::layout(1)?;
-        let bounds = placements
-            .first()
-            .copied()
-            .ok_or_else(|| invalid("executor window layout is empty"))?;
-        let view = task_view::View::spawn(&spec, bounds, STARTUP)?;
-        let _ = view.snapshot()?;
-        Ok(view)
-    })?;
-    let snapshot = view.snapshot()?;
-    save_receipt(
-        workspace,
-        launcher,
-        profile,
-        mode,
-        args,
-        bound,
-        Some(&snapshot),
-        "owned-console",
-        None,
-    )?;
-    while view.is_running()? {
-        thread::sleep(Duration::from_millis(200));
-    }
-    Ok(view.exit_code()?.unwrap_or(1) as i32)
+            None,
+            Some(binding),
+        )?;
+        println!(
+            "{}",
+            spawn_summary(
+                profile,
+                bound,
+                &format!("Codex executor ({profile})"),
+                receipt,
+                "owned-console",
+            )
+        );
+        let view = task_view::preserve_foreground(|| {
+            let mut spec = CommandSpec::new(launcher);
+            spec.args = args.iter().map(OsString::from).collect();
+            spec.current_dir = Some(workspace.to_path_buf());
+            spec.new_console = Some(format!("Opening Codex executor ({profile})").into());
+            apply_executor_env(&mut spec, request.codex_home);
+            let placements = task_view::layout(1)?;
+            let bounds = placements
+                .first()
+                .copied()
+                .ok_or_else(|| invalid("executor window layout is empty"))?;
+            let view = task_view::View::spawn(&spec, bounds, STARTUP)?;
+            let _ = view.snapshot()?;
+            Ok(view)
+        })?;
+        let snapshot = view.snapshot()?;
+        save_receipt(
+            receipt,
+            launcher,
+            profile,
+            request.mode,
+            args,
+            bound,
+            Some(&snapshot),
+            "owned-console",
+            None,
+            Some(binding),
+        )?;
+        while view.is_running()? {
+            thread::sleep(Duration::from_millis(200));
+        }
+        Ok(view.exit_code()?.unwrap_or(1) as i32)
+    })();
+    let _ = remove_lease(request.codex_home, binding);
+    outcome
 }
 
 fn spawn_summary(
     profile: &str,
     bound: &ProfileBinding,
     title: &str,
-    workspace: &Path,
+    receipt: &Path,
     host: &str,
 ) -> String {
     let model = bound.model.as_deref().unwrap_or("unknown");
@@ -531,24 +1107,13 @@ fn spawn_summary(
     let effort = bound.reasoning_effort.as_deref().unwrap_or("default");
     format!(
         "executor started: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\"\nreceipt: {}",
-        workspace.join("executor-spawn.json").display()
+        receipt.display()
     )
 }
 
-fn tui_args(
-    profile: &str,
-    workspace: &Path,
-    prompt: &str,
-    isolation: &[String],
-) -> io::Result<Vec<String>> {
-    let mut args = isolation.to_vec();
-    args.extend(profile_args(profile)?);
+fn tui_args(profile: &str, workspace: &Path, prompt: &str) -> io::Result<Vec<String>> {
+    let mut args = profile_args(profile)?;
     args.extend(["-C".into(), native_path(workspace)?, prompt.to_owned()]);
-    if args.iter().any(|arg| arg == "--remote") && args.iter().any(|arg| arg == "--worktree") {
-        return Err(invalid(
-            "native CLI rejects --worktree with --remote; attach the view to the managed cwd",
-        ));
-    }
     if args.iter().any(|arg| arg == "exec" || arg == "--json") {
         return Err(invalid(
             "executor spawn must open a visible TUI, not headless exec",
@@ -561,7 +1126,6 @@ fn child_args(
     profile: &str,
     workspace: &Path,
     prompt: &str,
-    isolation: &[String],
     mode: SpawnMode,
 ) -> io::Result<Vec<String>> {
     match mode {
@@ -576,14 +1140,17 @@ fn child_args(
             ]);
             Ok(args)
         }
-        SpawnMode::Tui => tui_args(profile, workspace, prompt, isolation),
+        // The pooled slot is the isolation: no native --worktree flag is
+        // passed on this path.
+        SpawnMode::Tui => tui_args(profile, workspace, prompt),
     }
 }
 
-// The receipt records every dispatch input the watcher and resume path need.
+// The receipt records every dispatch input the watcher, the tab host and the
+// resume path need; it is kit-local state beside the slot records.
 #[allow(clippy::too_many_arguments)]
 fn save_receipt(
-    workspace: &Path,
+    receipt: &Path,
     launcher: &Path,
     profile: &str,
     mode: SpawnMode,
@@ -592,14 +1159,23 @@ fn save_receipt(
     window: Option<&task_view::Snapshot>,
     host: &str,
     terminal: Option<&[String]>,
+    slot: Option<&SlotBinding>,
 ) -> io::Result<()> {
     let window = match window {
         Some(snapshot) => serde_json::to_value(snapshot)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         None => json!(null),
     };
+    let slot = match slot {
+        Some(binding) => serde_json::to_value(binding)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        None => json!(null),
+    };
+    if let Some(dir) = receipt.parent() {
+        fs::create_dir_all(dir)?;
+    }
     fs::write(
-        workspace.join("executor-spawn.json"),
+        receipt,
         serde_json::to_vec_pretty(&json!({
             "schema": 1,
             "launcher": native_path(launcher)?,
@@ -610,6 +1186,7 @@ fn save_receipt(
             "host": host,
             "terminal": terminal,
             "isolation": args.iter().any(|arg| arg == "--worktree"),
+            "slot": slot,
             "model": bound.model,
             "modelProvider": bound.model_provider,
             "reasoningEffort": bound.reasoning_effort,
@@ -634,6 +1211,13 @@ fn filter_windowsapps_path(path: std::ffi::OsString) -> Option<std::ffi::OsStrin
 
 fn required(value: Option<PathBuf>, name: &str) -> io::Result<PathBuf> {
     value.ok_or_else(|| invalid(&format!("{name} is required")))
+}
+
+fn option_text(value: &std::ffi::OsStr) -> io::Result<String> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("invalid native executor options"))
 }
 
 fn unicode(path: &Path) -> io::Result<String> {
@@ -1505,7 +2089,7 @@ mod tests {
 
     #[test]
     fn tui_args_open_a_profile_session_not_headless_exec() {
-        let args = tui_args("xai", Path::new(r"D:\wt\xai"), "do the work", &[]).unwrap();
+        let args = tui_args("xai", Path::new(r"D:\wt\xai"), "do the work").unwrap();
         assert_eq!(args[0], "--profile");
         assert_eq!(args[1], "xai");
         assert!(args.contains(&"-C".to_string()));
@@ -1516,15 +2100,19 @@ mod tests {
     }
 
     #[test]
-    fn remote_tui_cannot_take_worktree_flag() {
-        let error = tui_args(
-            "xai",
-            Path::new(r"D:\wt\xai"),
-            "do the work",
-            &["--remote".into(), "--worktree".into()],
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("--worktree"));
+    fn pooled_dispatch_keeps_native_worktree_isolation_out_of_the_arguments() {
+        let slot = Path::new(r"D:\wt\proj-wt1");
+        for args in [
+            child_args("xai", slot, "do the work", SpawnMode::Exec).unwrap(),
+            child_args("xai", slot, "do the work", SpawnMode::Tui).unwrap(),
+        ] {
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "--worktree" || arg == "--enable" || arg == "worktrees"),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
@@ -1605,7 +2193,7 @@ mod tests {
             "ds",
             &bound,
             "Codex executor (ds)",
-            Path::new(r"D:\wt\ds"),
+            Path::new(r"C:\home\harness\executor-pool\proj-0123456789ab\spawn-1.json"),
             "windows-terminal-tab",
         );
         assert!(summary.contains("profile=ds"));
@@ -1614,7 +2202,7 @@ mod tests {
         assert!(summary.contains("effort=max"));
         assert!(summary.contains("host=windows-terminal-tab"));
         assert!(summary.contains("title=\"Codex executor (ds)\""));
-        assert!(summary.contains(r"D:\wt\ds\executor-spawn.json"));
+        assert!(summary.contains(r"C:\home\harness\executor-pool\proj-0123456789ab\spawn-1.json"));
     }
 
     #[test]
@@ -1660,7 +2248,6 @@ mod tests {
             "ds",
             Path::new(r"D:\wt\ds"),
             "Complete the outcome in ASSIGNMENT.md.",
-            &[],
             SpawnMode::Exec,
         )
         .unwrap();
@@ -1740,5 +2327,251 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_is_restricted_to_the_source_checkout_or_a_pool_slot() {
+        let root = std::env::temp_dir().join(format!("executor-workspace-{}", std::process::id()));
+        let source = root.join("proj");
+        fs::create_dir_all(source.join("global")).unwrap();
+        fs::create_dir_all(root.join("proj-wt1")).unwrap();
+        fs::create_dir_all(root.join("proj-wt3")).unwrap();
+        let lane = root.join("task-legacy-lane");
+        fs::create_dir_all(&lane).unwrap();
+        assert_eq!(named_slot(&source, 2, None).unwrap(), None);
+        assert_eq!(
+            named_slot(&source, 2, Some(&source)).unwrap(),
+            None,
+            "the source checkout means the pool"
+        );
+        assert_eq!(
+            named_slot(&source, 2, Some(&root.join("proj-wt1"))).unwrap(),
+            Some(1)
+        );
+        let error = named_slot(&source, 2, Some(&lane)).unwrap_err().to_string();
+        assert!(
+            error.contains("executor isolation comes from the harness pool")
+                && error.contains("--workspace must be the source checkout")
+                && error.contains("task-legacy-lane"),
+            "{error}"
+        );
+        let error = named_slot(&source, 2, Some(&root.join("proj-wt3")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outside the configured pool of 2"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slot_summary_reports_the_mapping_and_the_selected_slot() {
+        let binding = SlotBinding {
+            index: 1,
+            path: PathBuf::from(r"D:\lanes\proj-wt1"),
+            source: PathBuf::from(r"D:\lanes\proj"),
+            owner: "exec-ds-7".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+        };
+        let line = slot_summary(&binding, None);
+        for expected in [
+            "index=1",
+            r"D:\lanes\proj-wt1",
+            "base=abc123",
+            "owner=exec-ds-7",
+            "remote=origin/main",
+            r"source=D:\lanes\proj",
+        ] {
+            assert!(line.contains(expected), "{line}");
+        }
+        assert!(!line.contains("--workspace named slot"), "{line}");
+        let named = slot_summary(&binding, Some(2));
+        assert!(
+            named.contains("--workspace named slot 2; the pool bound the free slot 1"),
+            "{named}"
+        );
+    }
+
+    #[test]
+    fn lease_marks_the_host_live_and_a_rebound_slot_is_refused() {
+        let root = std::env::temp_dir().join(format!("executor-lease-{}", std::process::id()));
+        let source = root.join("proj");
+        let home = root.join("home");
+        fs::create_dir_all(&source).unwrap();
+        let binding = SlotBinding {
+            index: 1,
+            path: source.parent().unwrap().join("proj-wt1"),
+            source: source.clone(),
+            owner: "exec-ds-7".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+        };
+        assert!(
+            record_lease(&home, &binding).is_err(),
+            "a slot without a recorded binding cannot host a session"
+        );
+        write_test_slot_record(&home, &source, &binding);
+        record_lease(&home, &binding).unwrap();
+        assert!(
+            owner_live(&home, &source, "exec-ds-7"),
+            "this test process is the recorded live host"
+        );
+        assert!(!owner_live(&home, &source, "exec-other"));
+        let mut rebind = binding.clone();
+        rebind.owner = "exec-other".into();
+        let error = record_lease(&home, &rebind).unwrap_err().to_string();
+        assert!(error.contains("bound to session exec-ds-7"), "{error}");
+        // A live identity is never dispatched again, so two sessions cannot
+        // share one checkout; after the host exits the slot is reclaimable.
+        let error = refuse_a_live_owner(&home, &source, "exec-ds-7")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is already live in slot 1"), "{error}");
+        refuse_a_live_owner(&home, &source, "exec-other").unwrap();
+        assert!(remove_lease(&home, &binding).is_ok());
+        assert!(!owner_live(&home, &source, "exec-ds-7"));
+        refuse_a_live_owner(&home, &source, "exec-ds-7").unwrap();
+        // A host that cannot own the slot has no live owner either.
+        let path = lease_path(&home, &source, 1).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&SessionLease {
+                schema: 1,
+                owner: "exec-ds-7".into(),
+                index: 1,
+                path: binding.path.clone(),
+                pid: 999_999_999,
+                created: 0,
+                program: std::env::current_exe().unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!owner_live(&home, &source, "exec-ds-7"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_test_slot_record(home: &Path, source: &Path, binding: &SlotBinding) {
+        let path = task_worktree::slot_record_path(home, source, binding.index).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "source": binding.source,
+                "index": binding.index,
+                "path": binding.path,
+                "state": "occupied",
+                "owner": binding.owner,
+                "base": binding.base,
+                "disposition": null,
+                "reason": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pool_report_lists_the_recorded_mapping_and_tree_state() {
+        let root = std::env::temp_dir().join(format!("executor-report-{}", std::process::id()));
+        let source = root.join("proj");
+        let home = root.join("home");
+        let slot_path = root.join("proj-wt1");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&slot_path).unwrap();
+        let binding = SlotBinding {
+            index: 1,
+            path: slot_path.clone(),
+            source: source.clone(),
+            owner: "exec-ds-9".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+        };
+        write_test_slot_record(&home, &source, &binding);
+        let report = slot_report(
+            &home,
+            &source,
+            &task_worktree::PoolSlot {
+                index: 1,
+                path: slot_path.clone(),
+                presence: task_worktree::SlotPresence::Registered,
+            },
+        );
+        for expected in [
+            "presence=registered",
+            "state=occupied",
+            "owner=exec-ds-9",
+            "base=abc123",
+            "lease=none",
+        ] {
+            assert!(report.contains(expected), "{report}");
+        }
+        assert!(report.contains("proj-wt1"), "{report}");
+        // A slot position without a record reads as free, and a missing tree
+        // is reported instead of guessed.
+        let free = slot_report(
+            &home,
+            &source,
+            &task_worktree::PoolSlot {
+                index: 2,
+                path: root.join("proj-wt2"),
+                presence: task_worktree::SlotPresence::Absent,
+            },
+        );
+        assert!(
+            free.contains("state=free") && free.contains("tree=missing"),
+            "{free}"
+        );
+        assert_eq!(tree_state(&source), "unknown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_state_stays_out_of_the_slot_checkout() {
+        let root = std::env::temp_dir().join(format!("executor-state-{}", std::process::id()));
+        let home = root.join("home");
+        let source = root.join("proj");
+        fs::create_dir_all(&source).unwrap();
+        let receipt = receipt_path(&home, &source, 2).unwrap();
+        assert!(receipt.starts_with(&home), "{}", receipt.display());
+        assert!(receipt.ends_with("spawn-2.json"), "{}", receipt.display());
+        let lease = lease_path(&home, &source, 2).unwrap();
+        assert!(lease.starts_with(&home), "{}", lease.display());
+        assert!(lease.ends_with("lease-2.json"), "{}", lease.display());
+        assert!(
+            receipt.to_string_lossy().contains("harness/executor-pool")
+                || receipt.to_string_lossy().contains(r"harness\executor-pool"),
+            "{}",
+            receipt.display()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_binding_is_optional_for_older_receipts() {
+        assert!(receipt_binding(&json!({"schema": 1})).unwrap().is_none());
+        let binding = receipt_binding(&json!({
+            "slot": {
+                "index": 2,
+                "path": r"D:\lanes\proj-wt2",
+                "source": r"D:\lanes\proj",
+                "owner": "exec-ds-7",
+                "base": "abc123",
+                "remote": "origin",
+                "branch": "main",
+            }
+        }))
+        .unwrap()
+        .expect("recorded slot binding");
+        assert_eq!(binding.index, 2);
+        assert_eq!(binding.owner, "exec-ds-7");
+        assert!(receipt_binding(&json!({"slot": {"index": "two"}})).is_err());
     }
 }

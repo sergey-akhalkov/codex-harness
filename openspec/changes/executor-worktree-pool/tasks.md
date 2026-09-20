@@ -8,10 +8,10 @@
 
 ## 2. Executor CLI integration
 
-- [ ] 2.1 Change `executor spawn` to derive and synchronize a pool slot from `--source` before launch, make `--workspace` optional and restricted to the source checkout or a pool slot, and stop passing native `--worktree` isolation flags on the pooled path; verify with CLI tests using the existing mock-launcher fixtures
-- [ ] 2.2 Record the slot mapping (path, slot index, owner session identity, base revision) at dispatch and expose it through existing task-state load paths; verify with CLI tests that interruption preserves the mapping and reuses the same slot
-- [ ] 2.3 Add the explicit slot release path (record merged/discarded disposition with reason, then reset or preserve per `reset_for_reuse`); verify with CLI tests that released slots re-enter the pool and preserved slots report their limitation
-- [ ] 2.4 Replace the `worktree_limit` warning path with the pool-invariant refusal and keep the config field accepted for compatibility; verify with CLI tests that exhausted pools abort with a concrete cause and no new tree
+- [x] 2.1 Change `executor spawn` to derive and synchronize a pool slot from `--source` before launch, make `--workspace` optional and restricted to the source checkout or a pool slot, and stop passing native `--worktree` isolation flags on the pooled path; verify with CLI tests using the existing mock-launcher fixtures
+- [x] 2.2 Record the slot mapping (path, slot index, owner session identity, base revision) at dispatch and expose it through existing task-state load paths; verify with CLI tests that interruption preserves the mapping and reuses the same slot
+- [x] 2.3 Add the explicit slot release path (record merged/discarded disposition with reason, then reset or preserve per `reset_for_reuse`); verify with CLI tests that released slots re-enter the pool and preserved slots report their limitation
+- [x] 2.4 Replace the `worktree_limit` warning path with the pool-invariant refusal and keep the config field accepted for compatibility; verify with CLI tests that exhausted pools abort with a concrete cause and no new tree
 
 ## 3. Skill and documentation
 
