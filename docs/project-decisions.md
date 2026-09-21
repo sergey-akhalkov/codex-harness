@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-21**.
+Last updated: **2026-09-22**.
 
 ## Public pack
 
@@ -578,6 +578,19 @@ delegation - a wording conflict is reported while dispatch proceeds, and only
 a launcher- or installation-check-reported dispatch failure blocks it. A user
 request to use executors for the current work activates the lead role for
 that work. Change: [unblock executor delegation](../openspec/changes/unblock-executor-delegation/proposal.md).
+
+**2026-09-22, confirmed:** executor dispatch starts from a committed
+snapshot of the source checkout. Before each dispatch the lead commits
+assignment-relevant main-worktree changes locally (pushing stays a separate
+authorized step) and names that revision with `--base`, or verifies that
+committed HEAD already contains every input; executors verify their slot HEAD
+equals the named base before substantive edits and report a mismatch instead
+of repairing it. Copying files into a live executor slot is not
+synchronization - changed tracked inputs travel as a new commit and a
+redispatch with the same owner id; slices depending on state the user
+forbade committing stay in the lead, and unrelated dirty work is never
+committed just to form a base. Change:
+[committed dispatch snapshot](../openspec/changes/committed-dispatch-snapshot/proposal.md).
 
 ## Recording further decisions
 

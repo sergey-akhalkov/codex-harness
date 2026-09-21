@@ -107,7 +107,7 @@ Promotion confers eligibility for planning, never silent implementation.
 Brief executors through harness commands, not by automating TUI keystrokes:
 
 ```powershell
-codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --exec "assignment"
+codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --base REV --exec "assignment"
 ```
 
 `--source` is the repository checkout, and `executor spawn` is the sole
@@ -122,6 +122,19 @@ fetched upstream default branch; `--owner ID` labels the session binding
 (default `exec-<profile>-<pid>`), and dispatching again with the same owner id
 rebinds the same slot - including after an interruption - instead of creating
 another tree.
+
+Fix a committed snapshot before every dispatch. Commit assignment-relevant
+changes in the source checkout - a local commit is enough, and pushing stays
+a separate authorized step - then pass that exact revision as `--base`; when
+nothing relevant is dirty, verify that committed HEAD contains every
+assignment input and name that. The fetched upstream default is a correct
+base only for assignments with no dependency on local lead state. Never make
+a running executor current by copying files into its slot: changed tracked
+inputs travel as a new commit and a redispatch with the same owner id, which
+rebinds and resynchronizes the same slot. If commits are not authorized, a
+slice that depends on uncommitted state is not delegated - keep it in the
+lead or ask for snapshot-commit authorization - and never commit unrelated
+dirty work just to form a base.
 
 Before the first dispatch, probe the installed launcher:
 `codex-harness executor --help` must print the executor usage. An
@@ -140,8 +153,12 @@ terminal tab or window, and a synchronized pool slot before the first model
 request. Freshness is mechanical, not an executor obligation: dispatch fetches
 the configured remote and resets the slot to the resolved base (untracked files
 removed, ignored build caches kept) before that request, so no executor-side
-synchronization step is needed or accepted in its place. Executors never create
-an additional worktree: when every slot is held by a live session, wait or stop
+synchronization step is needed or accepted in its place. The brief names the
+exact base revision; the executor verifies its slot HEAD is that revision
+before substantive edits and stops with a report on mismatch instead of
+repairing synchronization itself - redispatch with the same owner id corrects
+the slot. Executors never create an additional worktree: when every slot is
+held by a live session, wait or stop
 a running assignment instead of allocating another tree. `executor spawn`
 establishes the view itself: inside the lead's Windows terminal it opens a
 titled tab of the same terminal. Do not resize, move or arrange desktop windows

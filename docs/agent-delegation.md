@@ -67,7 +67,7 @@ max_concurrent_executors = 2
 Dispatch an executor with the installed launcher:
 
 ```powershell
-codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --exec "assignment"
+codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --base REV --exec "assignment"
 ```
 
 Skills and `orchestration.toml` are live links into the kit checkout, while the
@@ -256,6 +256,18 @@ first model request, spawn fetches the configured remote (the remote named
 `origin`, or the single configured remote), resolves that remote's default
 branch - or the explicit `--base` override - runs `git reset --hard <base>` and
 `git clean -fd` (ignored build caches stay warm) and verifies a clean HEAD.
+The base is the lead's committed snapshot: before dispatch the lead commits
+assignment-relevant source-checkout changes locally (pushing stays a separate
+authorized step) and names that revision with `--base`, or verifies that
+committed HEAD already contains every input. The upstream default branch is
+the base only for assignments with no dependency on local lead state; if
+commits are not authorized, a slice depending on uncommitted state stays in
+the lead instead of being dispatched from a stale base. Copying files into a
+live slot is not synchronization: changed tracked inputs travel as a new
+commit and a redispatch with the same owner id, which rebinds and
+resynchronizes the same slot. Executor briefs name the exact base; the
+executor verifies its slot HEAD equals that base before substantive edits and
+reports a mismatch instead of repairing it.
 Fail-closed applies throughout: a failed fetch, an unresolvable base, a missing
 slot, an occupied dirty slot or unreviewed changes in a free slot aborts
 dispatch with the concrete cause and leaves the slot untouched, so a stale base
