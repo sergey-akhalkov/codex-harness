@@ -25,5 +25,5 @@
 
 ## 5. Real-entry verification and migration
 
-- [ ] 5.1 Rebuild and update the installed launcher through the installation lifecycle; verify `codex-harness executor --help` reflects the pooled spawn surface and the version identity matches this source
-- [ ] 5.2 On a real consuming repository, review and retire legacy task-named worktrees through authorized lead merge/removal plus `git worktree prune`, then run repeated real dispatches through the installed entry point; verify privately that the same `<repo-name>-wtN` paths are reused, `git worktree list` shows the source plus exactly the pool slots, and private evidence stays outside the repository
+- [x] 5.1 Rebuild and update the installed launcher through the installation lifecycle; verify `codex-harness executor --help` reflects the pooled spawn surface and the version identity matches this source
+- [x] 5.2 On a real consuming repository, review and retire legacy task-named worktrees through authorized lead merge/removal plus `git worktree prune`, then run repeated real dispatches through the installed entry point; verify privately that the same `<repo-name>-wtN` paths are reused, `git worktree list` shows the source plus exactly the pool slots, and private evidence stays outside the repository
