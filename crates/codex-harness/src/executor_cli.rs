@@ -301,7 +301,7 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         )));
     }
     let args = child_args(request.profile, &binding.path, request.prompt, request.mode)?;
-    let title = format!("Codex executor ({})", request.profile);
+    let title = executor_title(request.profile, &binding.owner);
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
     if prefers_terminal_tab(session.as_deref(), client.as_deref()) {
@@ -344,6 +344,10 @@ fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
         ));
     }
     line
+}
+
+fn executor_title(profile: &str, owner: &str) -> String {
+    format!("Codex executor ({profile}) - {owner}")
 }
 
 /// Report the inventory the pool invariant covers: dispatch allocates only
@@ -1151,6 +1155,7 @@ fn dispatch_owned_console(
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let profile = request.profile;
+    let title = executor_title(profile, &binding.owner);
     // This process hosts the session for as long as the view runs, so it is
     // the recorded liveness of the slot.
     record_lease(request.codex_home, binding)?;
@@ -1169,19 +1174,13 @@ fn dispatch_owned_console(
         )?;
         println!(
             "{}",
-            spawn_summary(
-                profile,
-                bound,
-                &format!("Codex executor ({profile})"),
-                receipt,
-                "owned-console",
-            )
+            spawn_summary(profile, bound, &title, receipt, "owned-console")
         );
         let view = task_view::preserve_foreground(|| {
             let mut spec = CommandSpec::new(launcher);
             spec.args = args.iter().map(OsString::from).collect();
             spec.current_dir = Some(workspace.to_path_buf());
-            spec.new_console = Some(format!("Opening Codex executor ({profile})").into());
+            spec.new_console = Some(title.clone().into());
             apply_executor_env(&mut spec, request.codex_home);
             let placements = task_view::layout(1)?;
             let bounds = placements
@@ -2579,6 +2578,23 @@ mod tests {
         assert!(summary.contains("host=windows-terminal-tab"));
         assert!(summary.contains("title=\"Codex executor (ds)\""));
         assert!(summary.contains(r"C:\home\harness\executor-pool\proj-0123456789ab\spawn-1.json"));
+    }
+
+    #[test]
+    fn executor_titles_distinguish_assignments_on_the_same_profile() {
+        let first = executor_title("ds", "task-a");
+        let second = executor_title("ds", "task-b");
+        assert_ne!(first, second);
+        let args = terminal_tab_args(
+            "test-window",
+            &first,
+            Path::new(r"C:\work\sample"),
+            Path::new(r"C:\tools\harness.exe"),
+            Path::new(r"C:\state\spawn.json"),
+            None,
+        )
+        .expect("valid terminal arguments");
+        assert!(args.windows(2).any(|pair| pair == ["--title", &first]));
     }
 
     #[test]
