@@ -110,6 +110,7 @@ pub mod profile_state;
 pub mod registration;
 mod registration_native;
 pub mod resource_admission;
+pub mod rollout_reader;
 pub mod scoped_observations;
 #[cfg(windows)]
 pub mod serena;

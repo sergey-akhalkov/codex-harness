@@ -1,11 +1,11 @@
 ## 1. Shared rollout reader
 
-- [ ] 1.1 Extract a tolerant rollout event reader (both usage formats,
+- [x] 1.1 Extract a tolerant rollout event reader (both usage formats,
   response-identity deduplication, turn association, instruction byte
   capture, coverage warnings) into `harness-core` and make
   `delegation_usage` consume it; verify with new reader unit fixtures for
   both event formats
-- [ ] 1.2 Confirm the extraction is behavior-preserving by running
+- [x] 1.2 Confirm the extraction is behavior-preserving by running
   `cargo test -p codex-harness --test delegation_usage` with unchanged
   expectations
 

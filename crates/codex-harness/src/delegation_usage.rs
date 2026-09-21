@@ -1,6 +1,9 @@
-//! Explicit native rollout accounting. Never decodes reasoning/compaction state,
-//! discovers descendants, selects a model, or converts tokens into billing.
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+//! Explicit native rollout accounting over the shared tolerant rollout reader.
+//! Never decodes reasoning/compaction state, discovers descendants, selects a
+//! model, or converts tokens into billing.
+use harness_core::rollout_reader::{
+    self, TOKEN_FIELDS, Usage, list, timestamp, unknown_usage, usage,
+};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,134 +16,6 @@ use std::{
 
 #[path = "delegation_usage_markdown.rs"]
 mod markdown;
-#[path = "delegation_usage_rollout.rs"]
-mod rollout;
-
-const TOKEN_FIELDS: [&str; 5] = [
-    "input_tokens",
-    "cached_input_tokens",
-    "output_tokens",
-    "reasoning_output_tokens",
-    "total_tokens",
-];
-type Usage = BTreeMap<String, Option<u64>>;
-
-fn identifier(value: &Value) -> Option<String> {
-    let text = value.as_str()?;
-    (text.len() <= 128
-        && text
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_./:-".contains(&b)))
-    .then(|| text.to_owned())
-}
-
-fn usage(raw: &Value) -> Usage {
-    TOKEN_FIELDS
-        .iter()
-        .map(|key| ((*key).to_owned(), raw.get(key).and_then(Value::as_u64)))
-        .collect()
-}
-
-fn unknown_usage() -> Usage {
-    usage(&Value::Null)
-}
-fn list(value: &Value) -> &[Value] {
-    value.as_array().map_or(&[], Vec::as_slice)
-}
-fn only(values: &BTreeSet<String>) -> Option<String> {
-    (values.len() == 1).then(|| values.first().unwrap().clone())
-}
-
-fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    let text = value.as_str()?;
-    if text.len() > 128 {
-        return None;
-    }
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-        return Some(parsed.with_timezone(&Utc));
-    }
-    for format in [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y%m%dT%H%M%S%.f",
-    ] {
-        if let Ok(parsed) = NaiveDateTime::parse_from_str(text, format) {
-            return Some(parsed.and_utc());
-        }
-    }
-    NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(0, 0, 0)
-        .map(|v| v.and_utc())
-}
-
-fn message_text(payload: &Value) -> String {
-    if let Some(text) = payload["content"].as_str() {
-        return text.to_owned();
-    }
-    let mut result = String::new();
-    for item in list(&payload["content"]) {
-        for key in ["text", "input_text"] {
-            if let Some(text) = item[key].as_str() {
-                result.push_str(text);
-            }
-        }
-    }
-    result
-}
-
-fn prefix(text: &str, count: usize) -> String {
-    text.trim_start()
-        .chars()
-        .take(count)
-        .collect::<String>()
-        .to_lowercase()
-}
-
-fn continuations(triggers: &[Value], turns: &[Value], users: &[Value]) -> usize {
-    let triggers: BTreeSet<_> = triggers.iter().filter_map(timestamp).collect();
-    let turns: BTreeSet<_> = turns.iter().filter_map(timestamp).collect();
-    let users: BTreeSet<_> = users.iter().filter_map(timestamp).collect();
-    let mut claimed = BTreeSet::new();
-    for trigger in triggers {
-        let Some(turn) = turns
-            .range((
-                std::ops::Bound::Excluded(trigger),
-                std::ops::Bound::Unbounded,
-            ))
-            .next()
-        else {
-            continue;
-        };
-        let user = users
-            .range((
-                std::ops::Bound::Excluded(trigger),
-                std::ops::Bound::Unbounded,
-            ))
-            .next();
-        if user.is_none_or(|user| user >= turn) {
-            claimed.insert(*turn);
-        }
-    }
-    claimed.len()
-}
-
-fn project_label(value: &str) -> Option<String> {
-    if value.trim().is_empty() {
-        return None;
-    }
-    Some(
-        Path::new(value)
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("workspace")
-            .to_owned(),
-    )
-}
 
 fn resolved(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
@@ -278,17 +153,17 @@ pub(crate) fn summarize(paths: &[PathBuf]) -> (Value, Vec<File>) {
         if !seen.insert(path.clone()) {
             continue;
         }
-        let (row, fingerprint, problems, held) = rollout::read(&path);
-        if let Some(file) = held.or_else(|| metadata_file(&path).ok()) {
+        let session = rollout_reader::read(&path);
+        if let Some(file) = session.source.or_else(|| metadata_file(&path).ok()) {
             inputs.push(file);
         }
-        for code in problems {
-            warnings.push(json!({"code":code,"input":input,"thread_id":row["id"]}));
+        for code in session.warnings {
+            warnings.push(json!({"code":code,"input":input,"thread_id":session.row["id"]}));
         }
-        if let Some(id) = row["id"].as_str() {
+        if let Some(id) = session.row["id"].as_str() {
             if let Some(&index) = ids.get(id) {
-                if fingerprints.get(id) != Some(&fingerprint) {
-                    merge_duplicate(&mut threads[index], &row);
+                if fingerprints.get(id) != Some(&session.fingerprint) {
+                    merge_duplicate(&mut threads[index], &session.row);
                     warnings.push(
                         json!({"code":"conflicting_duplicate_id","input":input,"thread_id":id}),
                     );
@@ -296,9 +171,9 @@ pub(crate) fn summarize(paths: &[PathBuf]) -> (Value, Vec<File>) {
                 continue;
             }
             ids.insert(id.to_owned(), threads.len());
-            fingerprints.insert(id.to_owned(), fingerprint);
+            fingerprints.insert(id.to_owned(), session.fingerprint);
         }
-        threads.push(row);
+        threads.push(session.row);
     }
     if paths.is_empty() {
         warnings.push(json!({"code":"no_inputs"}));
