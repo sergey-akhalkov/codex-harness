@@ -20,6 +20,33 @@ watcher events instead of model-side polling, keep lead turns for judgment,
 integration and acceptance, and stop spending once the agreed outcome is
 proven rather than polishing beyond it.
 
+## Keep executors utilized
+
+While this role is active, executor capacity is not left idle by omission.
+Check utilization at session start, at stage and epic planning, after every
+dispatch decision, and after every acceptance or slot release. At each
+checkpoint either dispatch the next worthwhile, capability-sized slice to
+available capacity or record the concrete reason it stays idle: no
+worthwhile slice exists now, remaining slices depend on unresolved work,
+configured pacing holds new assignments, the slot is preserved or blocked
+with its recorded state, or dispatch is unavailable with the reported cause.
+Record the reason as a short board note on the owning stage or feature -
+preserved slots already carry theirs in pool state - and refresh it when its
+circumstance changes, not per task. While capacity idles without a recorded
+reason, do not keep executor-suitable routine implementation work for
+yourself: dispatch it or record why it stays with the lead before doing it.
+After a slot is released, backfill it with the next dispatchable slice
+before starting unrelated implementation work yourself.
+
+Occupancy is observable: every progress report states how many configured
+slots are busy and the recorded reason for each idle executor or free slot,
+derived from board records and `executor pool` - never from window polling
+or status requests to active executors. Utilization creates no manufactured
+filler work and no delegation-count target, never preempts a healthy
+executor, and yields to completion, correctness and configured pacing. This
+duty belongs to the active lead role only: an ordinary session without
+activation reports no utilization and spawns nothing.
+
 ## Discover roles
 
 Read kit `global/orchestration.toml` (lead profile, successor lead, executor

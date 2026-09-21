@@ -117,6 +117,25 @@ tasks.
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
 stop. Ordinary sessions without that activation spawn nothing.
 
+## Executor utilization
+
+While the lead role is active, configured executor capacity is not left idle
+by omission. At each checkpoint - session start, stage and epic planning,
+after every dispatch decision, and after every acceptance or slot release -
+the lead either dispatches the next worthwhile, capability-sized slice or
+records the concrete reason the capacity stays idle: no worthwhile slice, an
+unresolved dependency, configured pacing, a preserved slot, or dispatch being
+unavailable with its reported cause. A released slot is backfilled with the
+next dispatchable slice before the lead starts unrelated implementation work.
+Lead progress reports state busy slots against the configured concurrency
+limit with each idle reason, taken from board and pool records rather than
+window polling. Idle capacity without a recorded reason is a lead workflow
+defect; manufactured filler work and delegation-count targets are not
+remedies. Requirements live in the
+[delegation](../openspec/specs/agent-delegation/spec.md) and
+[orchestration](../openspec/specs/lead-agent-orchestration/spec.md)
+specifications; the `team-lead` skill owns the live workflow wording.
+
 ## Instruction-refresh succession
 
 When an accepted instruction or skill change must reach an active executor
