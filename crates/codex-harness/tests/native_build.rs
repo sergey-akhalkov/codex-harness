@@ -611,7 +611,11 @@ fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules
         String::from_utf8_lossy(&lock.stderr)
     );
     let identity_path = source.join("crates/harness-core/src/build_identity.rs");
-    let current_identity = fs::read_to_string(&identity_path).unwrap();
+    // Git may smudge the checked-out source to CRLF; the fixture edits exact
+    // lines, so normalize endings instead of matching a checkout artifact.
+    let current_identity = fs::read_to_string(&identity_path)
+        .unwrap()
+        .replace("\r\n", "\n");
     assert!(current_identity.contains("    \"harness-observe.exe\",\n"));
     let old_identity = current_identity.replacen("    \"harness-observe.exe\",\n", "", 1)
         .replacen("    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);",
