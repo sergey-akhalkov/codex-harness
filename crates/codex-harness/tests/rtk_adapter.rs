@@ -1,12 +1,19 @@
-//! Native harness-rtk acceptance against real child processes in an owned TEMP copy.
+//! Native harness-rtk acceptance against real child processes in an owned TEMP
+//! copy. The console-stdout bypass runs under a native ConPTY session, so it
+//! needs no interactive terminal of its own.
 #![cfg(windows)]
 
+use harness_core::{
+    console::{ConsoleSession, ConsoleSpec},
+    process::{Cancellation, CommandSpec, Deadline, StopReason},
+};
 use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 fn adapter() -> PathBuf {
@@ -131,6 +138,16 @@ fn pack_file(home: &Path, handle: &str) -> PathBuf {
     home.join("harness/rtk/pack").join(format!("{handle}.log"))
 }
 
+/// The single retained raw archive, which is what a whole-file raw re-read emits.
+fn only_raw_archive(home: &Path) -> PathBuf {
+    let mut entries: Vec<PathBuf> = fs::read_dir(home.join("harness/rtk/raw"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one retained raw archive");
+    entries.remove(0)
+}
+
 fn present_locator(stdout: &[u8]) -> bool {
     let text = String::from_utf8_lossy(stdout);
     text.contains("[rtk pack:") || text.contains("[rtk raw:")
@@ -189,6 +206,13 @@ fn exec_preserves_child_identity_and_runs_once() {
     let stdout = String::from_utf8_lossy(&first.stdout);
     assert!(stdout.contains("проверка-файл"), "{stdout}");
     assert!(!first.stdout.windows(9).any(|window| window == b"[rtk raw:"));
+    assert!(
+        !first
+            .stdout
+            .windows(10)
+            .any(|window| window == b"[rtk pack:"),
+        "exec is a raw passthrough and mints no observation handle"
+    );
     let second = invoke(
         &adapter(),
         &[
@@ -590,6 +614,27 @@ fn bypass_paths_never_present_a_handle() {
     assert_eq!(failed.stdout, payload);
     assert!(!present_locator(&failed.stdout));
     assert!(String::from_utf8_lossy(&failed.stderr).contains("raw passthrough"));
+    // Oversize output on the compact path (30000 fixture lines = 4830000 bytes)
+    // passes raw as well, retaining nothing at all.
+    let bulk = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "30000"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        bulk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bulk.stderr)
+    );
+    assert_eq!(bulk.stdout.len(), 30000 * 161);
+    assert!(!present_locator(&bulk.stdout));
+    assert!(
+        String::from_utf8_lossy(&bulk.stderr).contains("stdout exceeds 4 MiB"),
+        "{}",
+        String::from_utf8_lossy(&bulk.stderr)
+    );
     assert!(
         !home.join("harness/rtk/pack/index.json").exists(),
         "bypass paths must not mint observations"
@@ -824,4 +869,248 @@ fn recall_reports_usage_and_unknown_handles_with_exit_codes() {
         assert!(output.stdout.is_empty(), "{args:?}: {}", output.status);
         assert!(stderr.contains(needle), "{args:?}: {stderr}");
     }
+}
+
+#[test]
+fn terminal_stdout_bypasses_compression_and_retention() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let log = command_output(&command, &["log", "-n", "40"], &workspace);
+    // A real console on stdout: ConPTY hands the adapter a terminal, so the
+    // compact entry must pass the output through without retaining anything.
+    let mut spec = CommandSpec::new(&binary);
+    spec.args = vec![
+        "compact".into(),
+        command.clone().into_os_string(),
+        "log".into(),
+        "-n".into(),
+        "40".into(),
+    ];
+    spec.current_dir = Some(workspace.clone());
+    spec.env
+        .insert("CODEX_HOME".into(), Some(home.clone().into_os_string()));
+    spec.env.insert("HARNESS_RTK_DISABLE".into(), None);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let outcome = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(outcome.outcome.reason, StopReason::Exited);
+    assert_eq!(outcome.outcome.exit_code, 0);
+    let transcript = outcome.transcript;
+    assert!(
+        transcript.contains("fixture-log line 1 of 40")
+            && transcript.contains("fixture-log line 40 of 40"),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("fixture-pipe"),
+        "a terminal stdout stays raw: {transcript}"
+    );
+    assert!(!transcript.contains("[rtk pack:"), "{transcript}");
+    assert!(!transcript.contains("[rtk raw:"), "{transcript}");
+    assert!(
+        !home.join("harness/rtk").exists(),
+        "a terminal stdout retains neither raw archives nor observations"
+    );
+    // Control: the same run with a piped stdout compresses and packs, so the
+    // difference is the terminal rather than the fixture setup.
+    let piped = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "40"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        piped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    let piped = String::from_utf8(piped.stdout).unwrap();
+    assert!(piped.contains("fixture-pipe git-log: 40 lines"), "{piped}");
+    assert!(piped.contains("[rtk pack:"), "{piped}");
+    let handle = packed_handle(&piped);
+    assert_eq!(fs::read(pack_file(&home, &handle)).unwrap(), log);
+}
+
+#[test]
+fn packed_observation_outlives_its_process_and_the_raw_keep_window() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "12"], &workspace);
+    let first = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let text = String::from_utf8(first.stdout).unwrap();
+    let handle = packed_handle(&text);
+    let locator = text
+        .lines()
+        .find(|line| line.starts_with("[rtk raw: "))
+        .expect("the raw locator stays present next to the handle");
+    let raw = PathBuf::from(&locator["[rtk raw: ".len()..locator.len() - 1]);
+    assert!(raw.is_file());
+    let packed = pack_file(&home, &handle);
+    assert_eq!(fs::read(&packed).unwrap(), expected);
+    // A later session: 33 further compressed runs push this observation out of
+    // the 32-file raw keep window while pack retention is untouched.
+    for _ in 0..33 {
+        let later = invoke(
+            &binary,
+            &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+            &workspace,
+            &home,
+            None,
+        );
+        assert!(later.status.success());
+    }
+    assert!(
+        !raw.is_file(),
+        "the raw locator of the first footer is pruned by its own keep window"
+    );
+    assert_eq!(
+        fs::read(&packed).unwrap(),
+        expected,
+        "pack retention is independent of the raw keep window"
+    );
+    let recalled = invoke(
+        &binary,
+        &["recall", &handle, "--offset", "3", "--limit", "2"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    let recalled = String::from_utf8(recalled.stdout).unwrap();
+    assert!(
+        recalled.contains(&format!("[rtk pack: {handle}]")),
+        "{recalled}"
+    );
+    assert!(recalled.contains("source: "), "{recalled}");
+    assert!(recalled.contains("stored: 12 lines"), "{recalled}");
+    assert!(recalled.contains("window: lines 3-4 of 12"), "{recalled}");
+    let expected = String::from_utf8(expected).unwrap();
+    for (position, line) in expected.lines().enumerate().skip(2).take(2) {
+        assert!(
+            recalled.contains(&format!("{}: {line}", position + 1)),
+            "{recalled}"
+        );
+    }
+}
+
+/// Paired measurement behind the adoption evidence: the added footer line, the
+/// bounded recall windows and the whole-file raw re-read they replace. Run with
+/// `--nocapture` to read the numbers recorded in the change notes; only bytes
+/// and avoided reruns are claimed, never tokens or quota.
+#[test]
+fn byte_accounting_for_bounded_recall_and_footer_overhead() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "3000"], &workspace);
+    assert_eq!(
+        expected.len(),
+        3000 * 161,
+        "the fixture observation keeps a byte-stable width"
+    );
+    let compact = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "3000"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        compact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let text = String::from_utf8(compact.stdout).unwrap();
+    let handle = packed_handle(&text);
+    let raw = only_raw_archive(&home);
+    let raw_bytes = fs::metadata(&raw).unwrap().len();
+    assert_eq!(
+        raw_bytes,
+        expected.len() as u64,
+        "a whole-file raw re-read emits exactly the retained archive"
+    );
+    assert!(
+        text.contains(&format!("[rtk raw: {}]", raw.display())),
+        "{text}"
+    );
+    let overhead = text
+        .lines()
+        .find(|line| line.starts_with("[rtk pack: "))
+        .expect("the compressed footer carries the pack line")
+        .len()
+        + 1;
+    assert!(overhead < 256, "one extra footer line: {overhead} bytes");
+    // The source command double is gone before the recall windows, so serving
+    // content there means no rerun happened.
+    fs::remove_file(&command).unwrap();
+    let first = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_window = first.stdout.len();
+    let first_text = String::from_utf8(first.stdout).unwrap();
+    assert_eq!(window_bounds(&first_text), (1, 200, 3000), "{first_text}");
+    assert_eq!(numbered_lines(&first_text).len(), 200);
+    let second = invoke(
+        &binary,
+        &["recall", &handle, "--offset", "201"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(second.status.code(), Some(0));
+    let second_window = second.stdout.len();
+    let second_text = String::from_utf8(second.stdout).unwrap();
+    assert_eq!(
+        window_bounds(&second_text),
+        (201, 400, 3000),
+        "{second_text}"
+    );
+    assert!(first_window <= 256 * 1024 && second_window <= 256 * 1024);
+    assert!(
+        raw_bytes as usize >= 8 * first_window,
+        "bounded recall must stay materially smaller than the whole-file re-read: \
+         {first_window} bytes of {raw_bytes}"
+    );
+    println!(
+        "rtk pack byte accounting: raw re-read {raw_bytes} B; added footer line {overhead} B; \
+         recall windows {first_window} B and {second_window} B for 200 lines each, served with \
+         the source command double removed (0 reruns)"
+    );
 }

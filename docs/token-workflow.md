@@ -11,8 +11,20 @@ calls, for example, `harness-rtk.exe exec git log -n 80`; the selected
 runs once with actual arguments, cwd and environment; only stdout is filtered.
 Stderr and exit code are preserved. CLI 0.153.4 does not pass the selected shell
 to the hook, so ordinary commands are not rewritten. Details remain available
-through `rtk raw`; a rerun is not required. Ambiguous shell syntax, unsupported
-or machine formats and `HARNESS_RTK_DISABLE=1` bypass compression.
+without a rerun: a compressed run also prints an observation handle beside the
+unchanged `[rtk raw: <path>]` locator, and
+`harness-rtk.exe recall <handle> [--offset N] [--limit M]` returns a
+digest-verified, bounded window of the retained output. Recover missing detail
+with that window first (default 200 lines, `--limit` clamped to 2000, at most
+256 KiB per response, with provenance, numbered lines and the next window) and
+read the whole raw archive only when complete content is genuinely required.
+Packed observations stay local and bounded to 64 entries or 128 MiB, evicted
+oldest first; an unknown or evicted handle exits 2 with the rerun/raw remedy, a
+digest mismatch exits 3 without content, and recall never reruns the command,
+starts a model or opens the network. The mechanism follows the published
+NVlabs/SoL-Pi ObservationPack design (MIT; ideas only, no SoL-Pi code, runtime
+or dependency). Ambiguous shell syntax, unsupported or machine formats and
+`HARNESS_RTK_DISABLE=1` bypass compression.
 `global/hooks.json` and the former diagnostic handler stay inactive; the RTK
 definition lives separately in `global/rtk-hooks.json`.
 
@@ -137,6 +149,14 @@ Measured output-byte reductions on supported commands (git log 80 commits
 counts, not tokenizer or weekly-quota measurements. Additional native hook
 dispatch of about 250–313 ms was accepted in the measured setup. No
 end-to-end raw-versus-optimized model-task speedup is claimed.
+
+Packed-observation accounting in the adapter acceptance suite
+(`cargo test -p codex-harness --test rtk_adapter`) measures a 3000-line fixture
+observation at 483,000 B for a whole-file raw re-read against 33,405 B for one
+bounded 200-line recall window, plus 152 B of added footer line per compressed
+run, with both windows served after the source command was removed. Those are
+output bytes and avoided reruns of a local fixture, not token or weekly-quota
+measurements.
 
 Serena/CBM retrieval on an owned fixture needed 2728 B of tool responses against
 4204 B of source. After both indexes, coverage reported `metadata_changed` with

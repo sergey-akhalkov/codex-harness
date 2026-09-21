@@ -11,10 +11,10 @@
 
 ## 3. Acceptance suite
 
-- [ ] 3.1 Extend `crates/codex-harness/tests/rtk_adapter.rs` with pack emission, no-handle bypass (disable, unsupported, filter failure, oversize, terminal stdout), exact-window, clamping, eviction and session-end-survival tests; verify `cargo test -p codex-harness --test rtk_adapter` passes
-- [ ] 3.2 Add a byte-accounting fixture comparing footer overhead and bounded recall output against whole-file raw re-read, and record the measured numbers in the change evidence without token or quota claims
+- [x] 3.1 Extend `crates/codex-harness/tests/rtk_adapter.rs` with pack emission, no-handle bypass (disable, unsupported, filter failure, oversize, terminal stdout), exact-window, clamping, eviction and session-end-survival tests; verify `cargo test -p codex-harness --test rtk_adapter` passes
+- [x] 3.2 Add a byte-accounting fixture comparing footer overhead and bounded recall output against whole-file raw re-read, and record the measured numbers in the change evidence without token or quota claims
 
 ## 4. Documentation and delivery
 
-- [ ] 4.1 Update `docs/token-workflow.md` and `.agents/skills/token-efficient-workflow/references/tool-results.md` to teach bounded recall before whole-file raw reads, with the NVlabs/SoL-Pi inspiration attribution and honest retention limits; verify local links and factual consistency with implemented behavior
+- [x] 4.1 Update `docs/token-workflow.md` and `.agents/skills/token-efficient-workflow/references/tool-results.md` to teach bounded recall before whole-file raw reads, with the NVlabs/SoL-Pi inspiration attribution and honest retention limits; verify local links and factual consistency with implemented behavior
 - [ ] 4.2 Rebuild and install the adapter through the existing `--token-workflow-only` lifecycle and verify handle emission and paged recall from a consumer session outside this checkout, including `check` passing
