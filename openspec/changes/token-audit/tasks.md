@@ -48,14 +48,14 @@
 
 ## 5. Skill, delivery and documentation
 
-- [ ] 5.1 Add the `tokenomics` diagnostic skill (analyzer invocation, owner
+- [x] 5.1 Add the `tokenomics` diagnostic skill (analyzer invocation, owner
   mapping, decision recording in existing records, no parallel efficiency
   instructions); verify the kit skill inventory includes it and its
   description stays disjoint from `token-efficient-workflow`
 - [ ] 5.2 Verify delivery through the kit installation lifecycle against an
   installed consumer outside the checkout, following the native check routes
   in `docs/rust-native.md`
-- [ ] 5.3 Update executable-ownership accounting, `docs/rust-native.md`, the
+- [x] 5.3 Update executable-ownership accounting, `docs/rust-native.md`, the
   memory index and the owning audit-loop record; verify
   `codex-harness ownership-check` and local-link checks pass
 
