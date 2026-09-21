@@ -739,7 +739,10 @@ fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules
     let updated: Value = serde_json::from_slice(&updated.stdout).unwrap();
     let new_build = Path::new(updated["build"].as_str().unwrap());
     let new_record = harness_core::build_identity::read_record(new_build).unwrap();
-    assert_eq!(new_record.binaries.len(), 5);
+    assert_eq!(
+        new_record.binaries.len(),
+        harness_core::build_identity::BINARIES.len()
+    );
     assert!(new_build.join("harness-observe.exe").is_file());
     assert!(
         !new_record
