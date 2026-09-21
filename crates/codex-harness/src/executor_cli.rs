@@ -31,8 +31,17 @@ use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the current Windows terminal when WT_SESSION is set, otherwise a visible console, and returns so the lead can keep working. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers visible turn/start with no status polling. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
 const STARTUP: Duration = Duration::from_secs(20);
+/// Windows Terminal activates the receiving window asynchronously around the
+/// launcher exit; this bounds how long dispatch keeps undoing that activation.
+const TERMINAL_TAB_SETTLE: Duration = Duration::from_millis(1500);
+/// The lead window must stay foreground until the terminal resolves the tab's
+/// destination; its titled selection is the observable completion signal.
+const TERMINAL_TAB_TITLE_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Bounded wait for the lead window to actually reach the foreground before a
+/// targeted dispatch falls back to the named per-checkout window.
+const ACTIVATION_WAIT: Duration = Duration::from_millis(400);
 const SUCCESSION_LIMIT: u64 = 4 * 1024 * 1024;
 const INSTRUCTION_READ_LIMIT: u64 = 1024 * 1024;
 const BOUNDARY_POLL: Duration = Duration::from_millis(500);
@@ -81,6 +90,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let mut workspace = None;
     let mut profile = None;
     let mut terminal_profile = None;
+    let mut terminal_window = None;
     let mut mode = None;
     let mut prompt = None;
     let mut base = None;
@@ -109,6 +119,14 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
             }
             "--terminal-profile" => {
                 terminal_profile = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                )
+            }
+            "--terminal-window" => {
+                terminal_window = Some(
                     value
                         .to_str()
                         .ok_or_else(|| invalid("invalid native executor options"))?
@@ -162,6 +180,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         prompt: &prompt,
         mode,
         terminal_profile: terminal_profile.as_deref(),
+        terminal_window: terminal_window.as_deref(),
     })
 }
 
@@ -239,6 +258,7 @@ struct Dispatch<'a> {
     prompt: &'a str,
     mode: SpawnMode,
     terminal_profile: Option<&'a str>,
+    terminal_window: Option<&'a str>,
 }
 
 /// Recorded session binding of one pool slot: the mapping the lead reloads
@@ -871,7 +891,72 @@ fn escape_wt_commandline(arg: &str) -> String {
     arg.replace(';', r"\;")
 }
 
+/// Windows Terminal exposes no supported address for the window of the calling
+/// process: `wt -w 0` resolves to the most recently used window on the current
+/// desktop (where the user works, not the calling lead), and numeric window ids
+/// are internal to the terminal. A stable window name bound to the source
+/// checkout is the supported precise target, and the terminal creates that
+/// window on first use, so an executor tab can never land in the user's
+/// focused window of another project.
+fn terminal_window_name(source: &Path, requested: Option<&str>) -> io::Result<String> {
+    let fallback = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let mut slug = String::with_capacity(fallback.len() + 16);
+    for ch in fallback.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            slug.push(ch);
+        } else {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let derived = if slug.is_empty() { "workspace" } else { slug };
+    match requested {
+        Some(name) => validate_terminal_window_name(name),
+        None => validate_terminal_window_name(&format!("codex-harness-{derived}")),
+    }
+}
+
+/// The lead's own terminal window, when it can be safely held foreground for
+/// targeted dispatch. A window on another virtual desktop is skipped: forcing
+/// it foreground would switch the user's desktop.
+fn lead_terminal_target() -> Option<usize> {
+    let window = task_view::console_terminal_window()?;
+    task_view::window_on_current_virtual_desktop(window).then_some(window)
+}
+
+fn activate_lead_window(window: usize) -> bool {
+    if !task_view::activate_window(window) {
+        return false;
+    }
+    let deadline = Instant::now() + ACTIVATION_WAIT;
+    while Instant::now() < deadline {
+        if task_view::foreground_window() == Some(window) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    task_view::foreground_window() == Some(window)
+}
+
+fn validate_terminal_window_name(name: &str) -> io::Result<String> {
+    if name.trim().is_empty() || name.len() > 128 {
+        return Err(invalid(
+            "terminal window name must be 1-128 characters of non-whitespace text",
+        ));
+    }
+    if name.chars().any(|ch| ch == ';' || ch.is_control()) {
+        return Err(invalid(
+            "terminal window name must not contain ';' or control characters",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
 fn terminal_tab_args(
+    window: &str,
     title: &str,
     workspace: &Path,
     wrapper: &Path,
@@ -880,7 +965,7 @@ fn terminal_tab_args(
 ) -> io::Result<Vec<String>> {
     let mut args = vec![
         "-w".into(),
-        "0".into(),
+        window.to_owned(),
         "new-tab".into(),
         "--title".into(),
         title.to_owned(),
@@ -967,7 +1052,31 @@ fn dispatch_terminal_tab(
     let workspace = binding.path.as_path();
     let wrapper = std::env::current_exe()
         .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
+    let named_window = terminal_window_name(request.source, request.terminal_window)?;
+    // Windows Terminal cannot address the lead's window by name or id, so hold
+    // that window foreground briefly: `-w 0` then resolves to it as the most
+    // recently used window of the current desktop. When that is impossible
+    // (explicit name requested, unknown window, other virtual desktop, or a
+    // failed activation), the stable per-checkout window name keeps the tab out
+    // of the user's focused window of another project.
+    let lead_window = if request.terminal_window.is_some() {
+        None
+    } else {
+        lead_terminal_target()
+    };
+    let previous = task_view::foreground_window();
+    let mut target_lead_window = lead_window;
+    if let Some(window) = lead_window.filter(|window| previous != Some(*window))
+        && !activate_lead_window(window)
+    {
+        target_lead_window = None;
+    }
+    let target = match target_lead_window {
+        Some(_) => "0",
+        None => named_window.as_str(),
+    };
     let args = terminal_tab_args(
+        target,
         title,
         workspace,
         &wrapper,
@@ -986,29 +1095,39 @@ fn dispatch_terminal_tab(
         Some(&args),
         Some(binding),
     )?;
-    task_view::preserve_foreground(|| {
-        suppress_loader_dialogs();
-        let mut cmd = Command::new(wt);
-        cmd.args(&args)
-            .current_dir(workspace)
-            .env("CODEX_HOME", request.codex_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000);
-        if let Some(path) = filtered_path() {
-            cmd.env("PATH", path);
-        }
-        for name in INHERITED_SESSION_ENV {
-            cmd.env_remove(name);
-        }
-        cmd.env("COLORTERM", "truecolor");
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(invalid("windows terminal tab spawn failed"));
-        }
-        Ok(())
-    })?;
+    suppress_loader_dialogs();
+    let mut cmd = Command::new(wt);
+    cmd.args(&args)
+        .current_dir(workspace)
+        .env("CODEX_HOME", request.codex_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000);
+    if let Some(path) = filtered_path() {
+        cmd.env("PATH", path);
+    }
+    for name in INHERITED_SESSION_ENV {
+        cmd.env_remove(name);
+    }
+    cmd.env("COLORTERM", "truecolor");
+    let status = match target_lead_window {
+        Some(window) => task_view::run_terminal_tab_in_window(
+            &mut cmd,
+            window,
+            title,
+            TERMINAL_TAB_TITLE_TIMEOUT,
+        )?,
+        None => task_view::run_restoring_foreground(
+            &mut cmd,
+            TERMINAL_TAB_SETTLE,
+            previous.unwrap_or(0),
+        )?,
+    };
+    task_view::restore_foreground_to(previous.unwrap_or(0));
+    if !status.success() {
+        return Err(invalid("windows terminal tab spawn failed"));
+    }
     println!(
         "{}",
         spawn_summary(
@@ -1231,6 +1350,7 @@ fn steer(args: &[OsString]) -> io::Result<i32> {
     let mut worktree = None;
     let mut text = None;
     let mut out = None;
+    let mut state = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
@@ -1244,13 +1364,49 @@ fn steer(args: &[OsString]) -> io::Result<i32> {
             "--worktree" => worktree = Some(PathBuf::from(value)),
             "--text" => text = Some(value.to_string_lossy().into_owned()),
             "--out" => out = Some(PathBuf::from(value)),
+            "--state" => state = Some(PathBuf::from(value)),
             _ => return Err(invalid("invalid native executor options")),
         }
     }
     let thread = thread.ok_or_else(|| invalid("--thread is required"))?;
     let worktree = worktree.ok_or_else(|| invalid("--worktree is required"))?;
     let text = text.ok_or_else(|| invalid("--text is required"))?;
-    let payload = harness_core::task_orchestrate::steer(&thread, &text, &worktree);
+    let Some(state) = state else {
+        eprintln!(
+            "codex-harness: executor steer needs --state DIRECTORY with the session's task-control endpoint.json; a plain pooled exec session has no control channel, so wait for it to finish and continue it with `codex exec resume SESSION_ID`"
+        );
+        return Ok(2);
+    };
+    let Ok(Some(endpoint)) = read_json::<serde_json::Value>(&state.join("endpoint.json")) else {
+        eprintln!(
+            "codex-harness: no task-control endpoint at {}; steering was not delivered. Start the session under task control, or wait and continue it with `codex exec resume SESSION_ID`",
+            state.display()
+        );
+        return Ok(2);
+    };
+    let (Some(port), Some(token)) = (endpoint["port"].as_u64(), endpoint["token"].as_str()) else {
+        return Err(invalid("task-control endpoint is malformed"));
+    };
+    let mut connection = ControlConnection::connect(port as u16, token, Duration::from_secs(5))?;
+    native_call(
+        &mut connection,
+        1,
+        "initialize",
+        json!({"clientInfo":{"name":"harness-steer","version":"1"},"capabilities":{"experimentalApi":true}}),
+    )?;
+    connection.send(&json!({"method":"initialized"}), Duration::from_secs(5))?;
+    let params = json!({"threadId":thread,"input":[{"type":"text","text":text}]});
+    let response = native_call(&mut connection, 2, "turn/start", params.clone())?;
+    let payload = json!({
+        "schema": 1,
+        "delivered": true,
+        "method": "turn/start",
+        "hiddenModelCall": false,
+        "statusPoll": false,
+        "worktree": worktree,
+        "params": params,
+        "response": response,
+    });
     if payload["hiddenModelCall"] != false || payload["statusPoll"] != false {
         return Err(invalid("steering must not hide model calls or poll status"));
     }
@@ -2130,8 +2286,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_tab_args_open_last_window_without_focus_flags() {
+    fn terminal_tab_args_target_a_named_window_without_focus_flags() {
         let args = terminal_tab_args(
+            "codex-harness-proj",
             "Codex executor (xai)",
             Path::new(r"D:\wt\xai"),
             Path::new(r"C:\harness\codex-harness.exe"),
@@ -2140,7 +2297,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args[0], "-w");
-        assert_eq!(args[1], "0");
+        assert_eq!(args[1], "codex-harness-proj");
         assert_eq!(args[2], "new-tab");
         assert!(args.contains(&"--suppressApplicationTitle".to_string()));
         let wrapper = args
@@ -2159,26 +2316,245 @@ mod tests {
     }
 
     #[test]
-    fn steer_writes_visible_turn_without_polling() {
-        let out = std::env::temp_dir().join(format!("steer-{}.json", std::process::id()));
+    fn terminal_window_name_is_bound_to_the_source_checkout() {
+        let derived = terminal_window_name(Path::new(r"D:\home\Proj Studio!"), None).unwrap();
+        assert_eq!(derived, "codex-harness-Proj-Studio");
+        let requested =
+            terminal_window_name(Path::new(r"D:\home\Proj Studio!"), Some("lead-window")).unwrap();
+        assert_eq!(requested, "lead-window");
+        assert_eq!(
+            terminal_window_name(Path::new(r"D:\home\###"), None).unwrap(),
+            "codex-harness-workspace"
+        );
+    }
+
+    #[test]
+    fn terminal_window_name_rejects_terminal_metacharacters() {
+        let error = terminal_window_name(Path::new(r"D:\home\proj"), Some("left;right"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("';'"), "{error}");
+        assert!(terminal_window_name(Path::new(r"D:\home\proj"), Some("  ")).is_err());
+        assert!(terminal_window_name(Path::new(r"D:\home\proj"), Some(&"x".repeat(129))).is_err());
+    }
+
+    #[test]
+    #[ignore = "opens and closes a real Windows Terminal window; requires an interactive desktop and no user window switching during the run"]
+    fn terminal_tab_dispatch_targets_its_named_window_and_restores_foreground() {
+        let Some(client) = windows_terminal_client() else {
+            eprintln!("skipped: Windows Terminal is not installed");
+            return;
+        };
+        let name = format!("codex-harness-probe-{}", std::process::id());
+        let before = task_view::terminal_windows().len();
+        let previous = task_view::foreground_window();
+        let dispatch = |tab_seconds: u64| {
+            let mut cmd = Command::new(&client);
+            cmd.args([
+                "-w",
+                &name,
+                "new-tab",
+                "--title",
+                "harness window targeting probe",
+                "--suppressApplicationTitle",
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep",
+                "-Seconds",
+                &tab_seconds.to_string(),
+            ]);
+            let status = task_view::run_restoring_foreground(
+                &mut cmd,
+                TERMINAL_TAB_SETTLE,
+                previous.unwrap_or(0),
+            )
+            .expect("terminal dispatch");
+            assert!(status.success(), "terminal dispatch failed: {status}");
+            task_view::restore_foreground_to(previous.unwrap_or(0));
+        };
+
+        dispatch(12);
+        let opened = Instant::now();
+        while task_view::terminal_windows().len() <= before
+            && opened.elapsed() < Duration::from_secs(3)
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let first = task_view::terminal_windows().len();
+        assert!(first > before, "probe window was not created");
+        if let Some(previous) = previous {
+            assert_eq!(
+                task_view::foreground_window(),
+                Some(previous),
+                "the user's foreground window must survive the dispatch"
+            );
+        }
+
+        dispatch(12);
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            task_view::terminal_windows().len(),
+            first,
+            "the second tab must reuse the named window, not create or take another one"
+        );
+        if let Some(previous) = previous {
+            assert_eq!(
+                task_view::foreground_window(),
+                Some(previous),
+                "the user's foreground window must survive the second dispatch"
+            );
+        }
+
+        let closed = Instant::now();
+        while task_view::terminal_windows().len() > before
+            && closed.elapsed() < Duration::from_secs(20)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            task_view::terminal_windows().len(),
+            before,
+            "the probe window must close itself after its tabs exit"
+        );
+    }
+
+    #[test]
+    #[ignore = "opens a short-lived tab in this session's real Windows Terminal window; requires an interactive desktop and no user window switching during the run"]
+    fn terminal_tab_dispatch_targets_the_leads_own_window_and_restores_foreground() {
+        let Some(client) = windows_terminal_client() else {
+            eprintln!("skipped: Windows Terminal is not installed");
+            return;
+        };
+        if let Some(window) = task_view::console_terminal_window() {
+            eprintln!(
+                "lead window {window:x} on current desktop: {}",
+                task_view::window_on_current_virtual_desktop(window)
+            );
+        } else {
+            eprintln!("lead window: console is not parented to a terminal window");
+        }
+        if let Some(foreground) = task_view::foreground_window() {
+            eprintln!(
+                "foreground {foreground:x} on current desktop: {}",
+                task_view::window_on_current_virtual_desktop(foreground)
+            );
+        }
+        let Some(lead) = lead_terminal_target() else {
+            eprintln!(
+                "skipped: this session's console is not attached to a Windows Terminal window on the current desktop"
+            );
+            return;
+        };
+        let before = task_view::terminal_windows().len();
+        let previous = task_view::foreground_window();
+        // A targeted dispatch must be able to activate the lead window while
+        // another terminal window holds the foreground; exercise that
+        // mechanism in both directions when a second terminal window exists.
+        if let Some(other) = task_view::terminal_windows()
+            .into_iter()
+            .find(|window| Some(*window) != Some(lead))
+        {
+            assert!(
+                task_view::activate_window(other),
+                "cross-window activation into another terminal window must work"
+            );
+            assert!(
+                activate_lead_window(lead),
+                "cross-window activation back into the lead window must work"
+            );
+            task_view::restore_foreground_to(previous.unwrap_or(0));
+        }
+        if previous != Some(lead) {
+            assert!(
+                activate_lead_window(lead),
+                "the lead window must become foreground for targeted dispatch"
+            );
+        }
+        let title = format!("harness lead-window probe {}", std::process::id());
+        let mut cmd = Command::new(&client);
+        cmd.args([
+            "-w",
+            "0",
+            "new-tab",
+            "--title",
+            &title,
+            "--suppressApplicationTitle",
+            "pwsh",
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep",
+            "-Seconds",
+            "6",
+        ]);
+        let status = task_view::run_terminal_tab_in_window(
+            &mut cmd,
+            lead,
+            &title,
+            TERMINAL_TAB_TITLE_TIMEOUT,
+        )
+        .expect("terminal dispatch");
+        assert!(status.success(), "terminal dispatch failed: {status}");
+        assert!(
+            task_view::window_title(lead).contains(&title),
+            "the tab must open in the lead's own window, not another window"
+        );
+        task_view::restore_foreground_to(previous.unwrap_or(0));
+        assert_eq!(
+            task_view::terminal_windows().len(),
+            before,
+            "a targeted dispatch must not create a new terminal window"
+        );
+        if let Some(previous) = previous {
+            assert_eq!(
+                task_view::foreground_window(),
+                Some(previous),
+                "the user's foreground window must be restored after the tab opens"
+            );
+        }
+        let closed = Instant::now();
+        while task_view::window_title(lead).contains(&title)
+            && closed.elapsed() < Duration::from_secs(12)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !task_view::window_title(lead).contains(&title),
+            "the probe tab must close itself after its command exits"
+        );
+    }
+
+    #[test]
+    fn steer_refuses_without_an_endpoint_instead_of_pretending() {
+        let root = tempfile::tempdir().unwrap();
         let code = run(&[
             OsString::from("steer"),
             OsString::from("--thread"),
             OsString::from("exec-xai"),
             OsString::from("--worktree"),
-            OsString::from(r"D:\wt\xai"),
+            OsString::from(root.path().join("wt").as_os_str()),
             OsString::from("--text"),
             OsString::from("use the fixture"),
-            OsString::from("--out"),
-            OsString::from(out.as_os_str()),
+            OsString::from("--state"),
+            OsString::from(root.path().join("missing-state").as_os_str()),
         ])
         .unwrap();
-        assert_eq!(code, 0);
-        let payload: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
-        assert_eq!(payload["method"], "turn/start");
-        assert_eq!(payload["hiddenModelCall"], false);
-        assert_eq!(payload["statusPoll"], false);
-        let _ = fs::remove_file(out);
+        // A missing endpoint must refuse loudly: the old stub printed a
+        // turn/start payload and exited 0 while nothing was delivered.
+        assert_eq!(code, 2);
+        let with_state_only = run(&[
+            OsString::from("steer"),
+            OsString::from("--thread"),
+            OsString::from("exec-xai"),
+            OsString::from("--worktree"),
+            OsString::from(root.path().join("wt").as_os_str()),
+            OsString::from("--text"),
+            OsString::from("use the fixture"),
+        ])
+        .unwrap();
+        assert_eq!(with_state_only, 2);
     }
 
     #[test]
@@ -2275,16 +2651,17 @@ mod tests {
     fn forward_slash_launcher_paths_are_normalized() {
         assert_eq!(
             normalize_launcher(std::ffi::OsStr::new(
-                r"C:/Users/noilw/.codex/harness/bin/codex.exe"
+                r"C:/Users/dev/.codex/harness/bin/codex.exe"
             ))
             .unwrap(),
-            r"C:\Users\noilw\.codex\harness\bin\codex.exe"
+            r"C:\Users\dev\.codex\harness\bin\codex.exe"
         );
     }
 
     #[test]
     fn terminal_tab_paths_use_native_separators() {
         let args = terminal_tab_args(
+            "codex-harness-xai",
             "t",
             Path::new(r"D:/wt/xai"),
             Path::new(r"D:/harness/codex-harness.exe"),
