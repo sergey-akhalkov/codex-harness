@@ -14,5 +14,5 @@
 
 ## 4. Verification and delivery
 
-- [ ] 4.1 Run the workspace checks (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings`, `cargo test --workspace --locked --jobs 1 -- --test-threads=1`, `harness-source-check`) and fix failures
+- [x] 4.1 Run the workspace checks (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings`, `cargo test --workspace --locked --jobs 1 -- --test-threads=1`, `harness-source-check`) and fix failures
 - [x] 4.2 Deliver with the standard one-action deploy from the kit checkout, then with a deliberate source edit make the checkout source-ahead and verify through the installed manager that a gated runtime command still launches while Check reports the stale relationship; revert the edit afterwards

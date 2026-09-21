@@ -20,7 +20,7 @@
 
 ## 4. Native checks and hygiene
 
-- [ ] 4.1 Run the full affected native suites (`cargo test -p harness-core -p codex-harness`) and the launcher/installation checks from `docs/rust-native.md`; record any unrelated pre-existing failures separately from this change
+- [x] 4.1 Run the full affected native suites (`cargo test -p harness-core -p codex-harness`) and the launcher/installation checks from `docs/rust-native.md`; record any unrelated pre-existing failures separately from this change
 - [x] 4.2 Run `codex-harness ownership-check` and the documentation source-hygiene checks for edited public files; fix only issues introduced by this change
 
 ## 5. Real-entry verification and migration
