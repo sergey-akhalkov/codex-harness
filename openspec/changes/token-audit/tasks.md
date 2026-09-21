@@ -61,6 +61,6 @@
 
 ## 6. Final acceptance
 
-- [ ] 6.1 Run the applicable native check suite and `openspec validate
+- [x] 6.1 Run the applicable native check suite and `openspec validate
   --change token-audit --strict`; record the exercised commands and results
   in the change notes before archive
