@@ -15,5 +15,5 @@
 
 - [x] 3.1 Unit tests: named targeting args without focus flags, native separators, name derivation and validation
 - [x] 3.2 Ignored interactive tests: lead-window dispatch (tab in the lead's own window, no new window, foreground restored, tab closes itself) and named-window fallback (window reused by the second tab, foreground restored)
-- [ ] 3.3 Run the affected native suites, fmt/clippy and the source/ownership checks; record environment-dependent unrelated failures separately
-- [ ] 3.4 Rebuild and update the installed launcher through the installation lifecycle and verify `executor --help` reports `--terminal-window`; leave the user's next real spawn as the final acceptance path
+- [x] 3.3 Run the affected native suites, fmt/clippy and the source/ownership checks; record environment-dependent unrelated failures separately
+- [x] 3.4 Rebuild and update the installed launcher through the installation lifecycle and verify `executor --help` reports `--terminal-window`; leave the user's next real spawn as the final acceptance path
