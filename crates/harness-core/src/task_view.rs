@@ -2,6 +2,7 @@
 use crate::process::{CommandSpec, Job, Limits, OwnedProcess, ProcessIdentity};
 use crate::process_service::ServiceProcess;
 use serde::{Deserialize, Serialize};
+use std::process::{Command, ExitStatus};
 use std::{
     io,
     path::Path,
@@ -9,18 +10,36 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use windows::Win32::Foundation::HWND as ComHWND;
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::UI::Shell::IVirtualDesktopManager;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_MENU, keybd_event};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
     Graphics::{
         Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
         Gdi::ClientToScreen,
     },
+    System::Console::GetConsoleWindow,
+    System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::WindowsAndMessaging::{
-        EnumWindows, GW_HWNDPREV, GetClientRect, GetForegroundWindow, GetWindow, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SPI_GETWORKAREA,
-        SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SystemParametersInfoW,
+        EnumWindows, GW_HWNDPREV, GetClassNameW, GetClientRect, GetForegroundWindow, GetParent,
+        GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, SPI_GETWORKAREA, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER,
+        SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, SystemParametersInfoW,
     },
 };
+
+/// The COM coclass behind `IVirtualDesktopManager`, which the `windows` crate
+/// does not publish as a constant.
+const CLSID_VIRTUAL_DESKTOP_MANAGER: windows::core::GUID = windows::core::GUID::from_values(
+    0xaa509086,
+    0x5ca9,
+    0x4c25,
+    [0x8f, 0x95, 0x58, 0x9d, 0x3c, 0x07, 0xb4, 0x8a],
+);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Bounds {
@@ -114,6 +133,334 @@ pub fn preserve_foreground<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T
         }
     }
     result
+}
+
+/// The top-level window class Windows Terminal uses for every terminal window.
+/// Foreground moving to one of these while a terminal command runs is the
+/// terminal summoning the window that received the commandline, not the user
+/// switching applications.
+const TERMINAL_WINDOW_CLASS: &str = "CASCADIA_HOSTING_WINDOW_CLASS";
+
+pub fn foreground_window() -> Option<usize> {
+    let window = unsafe { GetForegroundWindow() };
+    (!window.is_null()).then_some(window as usize)
+}
+
+/// The Windows Terminal window that hosts this process's console. Windows
+/// Terminal parents the pseudo console window it reports through
+/// `GetConsoleWindow` to the terminal window of that session, which is the one
+/// supported identity of the calling process's own terminal window.
+pub fn console_terminal_window() -> Option<usize> {
+    unsafe {
+        let console = GetConsoleWindow();
+        if console.is_null() {
+            return None;
+        }
+        let parent = GetParent(console);
+        (!parent.is_null() && terminal_window(parent)).then_some(parent as usize)
+    }
+}
+
+/// Best-effort virtual-desktop membership check. A window on another desktop
+/// must not be activated to receive a tab: that would switch the user's
+/// desktop, and `wt -w 0` resolves only within the current desktop anyway.
+pub fn window_on_current_virtual_desktop(window: usize) -> bool {
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let owned = initialized.is_ok();
+        let on_current = CoCreateInstance(&CLSID_VIRTUAL_DESKTOP_MANAGER, None, CLSCTX_ALL)
+            .ok()
+            .and_then(|manager: IVirtualDesktopManager| {
+                manager
+                    .IsWindowOnCurrentVirtualDesktop(ComHWND(window as *mut core::ffi::c_void))
+                    .ok()
+                    .map(|on_current| on_current.as_bool())
+            });
+        if owned {
+            CoUninitialize();
+        }
+        on_current.unwrap_or(false)
+    }
+}
+
+/// Every visible top-level Windows Terminal window, for dispatch diagnostics
+/// and verification.
+pub fn terminal_windows() -> Vec<usize> {
+    struct Found {
+        windows: Vec<usize>,
+    }
+    unsafe extern "system" fn collect(window: HWND, parameter: LPARAM) -> i32 {
+        let found = unsafe { &mut *(parameter as *mut Found) };
+        if unsafe { IsWindowVisible(window) } != 0 && terminal_window(window) {
+            found.windows.push(window as usize);
+        }
+        1
+    }
+    let mut found = Found {
+        windows: Vec::new(),
+    };
+    unsafe {
+        EnumWindows(Some(collect), (&mut found as *mut Found) as LPARAM);
+    }
+    found.windows
+}
+
+/// Activate `window` even though this background process lacks activation
+/// rights, by borrowing the foreground input queue for the call. Returns once
+/// the window is foreground or the attempt failed; the caller restores the
+/// user's previous foreground window afterwards.
+pub fn activate_window(window: usize) -> bool {
+    let window = window as HWND;
+    unsafe {
+        let trace = std::env::var_os("HARNESS_TAB_TRACE").is_some();
+        if IsIconic(window) != 0 {
+            ShowWindow(window, SW_RESTORE);
+        }
+        let direct = SetForegroundWindow(window);
+        if trace {
+            eprintln!(
+                "tab trace: direct activation of {:x} returned {}, foreground is {:x}",
+                window as usize,
+                direct,
+                GetForegroundWindow() as usize
+            );
+        }
+        if direct != 0 && GetForegroundWindow() == window {
+            return true;
+        }
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return false;
+        }
+        let own_thread = GetCurrentThreadId();
+        let foreground_thread = GetWindowThreadProcessId(foreground, std::ptr::null_mut());
+        let target_thread = GetWindowThreadProcessId(window, std::ptr::null_mut());
+        let attached_foreground =
+            foreground_thread != 0 && AttachThreadInput(own_thread, foreground_thread, 1) != 0;
+        let attached_target = target_thread != 0
+            && target_thread != foreground_thread
+            && AttachThreadInput(own_thread, target_thread, 1) != 0;
+        if trace {
+            eprintln!(
+                "tab trace: attach foreground {:x}/thread {} ok={}, target thread {} ok={}, last error {}",
+                foreground as usize,
+                foreground_thread,
+                attached_foreground,
+                target_thread,
+                attached_target,
+                std::io::Error::last_os_error()
+            );
+        }
+        if IsIconic(window) != 0 {
+            ShowWindow(window, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(window);
+        if GetForegroundWindow() == window {
+            if attached_target {
+                let _ = AttachThreadInput(own_thread, target_thread, 0);
+            }
+            if attached_foreground {
+                let _ = AttachThreadInput(own_thread, foreground_thread, 0);
+            }
+            return true;
+        }
+        // AttachThreadInput alone is not enough on current Windows: the shell
+        // still refuses foreground transfer to a background process. The
+        // legacy switch call and a momentary Alt press are the two remaining
+        // escalation paths; both activate the window without synthetic clicks
+        // or keys reaching the terminal content.
+        SwitchToThisWindow(window, 0);
+        if GetForegroundWindow() != window {
+            keybd_event(VK_MENU as u8, 0, 0, 0);
+            let _ = SetForegroundWindow(window);
+            keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        if attached_target {
+            let _ = AttachThreadInput(own_thread, target_thread, 0);
+        }
+        if attached_foreground {
+            let _ = AttachThreadInput(own_thread, foreground_thread, 0);
+        }
+        GetForegroundWindow() == window
+    }
+}
+
+/// Dispatch a terminal command whose tab is expected in `window`, and report
+/// once that tab is observably created there.
+///
+/// The receiving window must stay foreground while the terminal resolves where
+/// the commandline goes: `wt -w 0` picks the most recently used window at
+/// resolution time, so restoring the user's window earlier would redirect the
+/// tab back into it. A fixed tab title makes creation observable through the
+/// window title, which follows the newly selected tab.
+pub fn run_terminal_tab_in_window(
+    command: &mut Command,
+    window: usize,
+    expected_title: &str,
+    timeout: Duration,
+) -> io::Result<ExitStatus> {
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    let mut exited: Option<ExitStatus> = None;
+    loop {
+        if exited.is_none()
+            && let Some(status) = child.try_wait()?
+        {
+            exited = Some(status);
+        }
+        if let Some(status) = exited
+            && !status.success()
+        {
+            // A failed launcher run creates no tab; waiting for one only
+            // delays the error.
+            break;
+        }
+        if window_title(window).contains(expected_title) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    match exited {
+        Some(status) => Ok(status),
+        None => child.wait(),
+    }
+}
+
+/// The current title of a top-level window, for targeted dispatch completion
+/// checks and verification.
+pub fn window_title(window: usize) -> String {
+    let mut buffer = [0u16; 512];
+    let copied =
+        unsafe { GetWindowTextW(window as HWND, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..copied as usize])
+}
+
+/// Restore `window` as the foreground window after a dispatch that had to hold
+/// the terminal window foreground for correct targeting.
+pub fn restore_foreground_to(window: usize) {
+    let window = window as HWND;
+    if window.is_null() {
+        return;
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    if !foreground.is_null() && foreground != window {
+        restore_foreground(foreground, window);
+    }
+}
+
+/// Run a terminal command and undo the terminal's activation of the window that
+/// received it, without touching a deliberate user switch; `previous` is the
+/// foreground window the user must be left in.
+///
+/// Windows Terminal applies a dispatched commandline asynchronously and always
+/// summons the receiving window, which can be a background window of another
+/// project. Restoring only after the command exits loses that race, so watch
+/// from launch: the moment a Windows Terminal window other than the previous
+/// foreground window takes the foreground, restore the previous foreground
+/// window. Foreground moving to any other window is the user's own switch and
+/// is left alone.
+pub fn run_restoring_foreground(
+    command: &mut Command,
+    settle: Duration,
+    previous: usize,
+) -> io::Result<ExitStatus> {
+    let previous = previous as HWND;
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + settle;
+    // The terminal can activate the receiving window more than once for one
+    // commandline (the summon and the created tab). Stay armed until its
+    // activations go quiet instead of stopping after the first restore.
+    const QUIET_AFTER_EVENT: Duration = Duration::from_millis(600);
+    const MAX_RESTORES: u32 = 8;
+    let mut restores = 0;
+    let mut exited: Option<ExitStatus> = None;
+    let mut last_event = Instant::now();
+    loop {
+        let foreground = unsafe { GetForegroundWindow() };
+        if !previous.is_null() && foreground != previous {
+            if std::env::var_os("HARNESS_TAB_TRACE").is_some() {
+                eprintln!(
+                    "tab trace: foreground changed to {:x} (previous {:x}), terminal={}, restores={restores}",
+                    foreground as usize,
+                    previous as usize,
+                    terminal_window(foreground)
+                );
+            }
+            if terminal_window(foreground) && restores < MAX_RESTORES {
+                restore_foreground(foreground, previous);
+                restores += 1;
+                last_event = Instant::now();
+                if std::env::var_os("HARNESS_TAB_TRACE").is_some() {
+                    eprintln!("tab trace: after restore foreground is {:x}", unsafe {
+                        GetForegroundWindow()
+                    }
+                        as usize);
+                }
+            } else {
+                // Either the user moved to their own window or the activation
+                // keeps winning; stop fighting and keep that state.
+                break;
+            }
+        }
+        if exited.is_none()
+            && let Some(status) = child.try_wait()?
+        {
+            exited = Some(status);
+            last_event = Instant::now();
+        }
+        if exited.is_some() && last_event.elapsed() >= QUIET_AFTER_EVENT {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    match exited {
+        Some(status) => Ok(status),
+        None => child.wait(),
+    }
+}
+
+fn terminal_window(window: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let copied = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+    copied > 0
+        && TERMINAL_WINDOW_CLASS
+            .encode_utf16()
+            .eq(class[..copied as usize].iter().copied())
+}
+
+/// Restore `previous` after another window took the foreground. A background
+/// process lacks activation rights even to undo a steal caused by its own
+/// child, so borrow the involved input queues for the duration of the call.
+fn restore_foreground(current: HWND, previous: HWND) {
+    unsafe {
+        if SetForegroundWindow(previous) != 0 && GetForegroundWindow() == previous {
+            return;
+        }
+        let own_thread = GetCurrentThreadId();
+        let current_thread = GetWindowThreadProcessId(current, std::ptr::null_mut());
+        let previous_thread = GetWindowThreadProcessId(previous, std::ptr::null_mut());
+        let attached_current =
+            current_thread != 0 && AttachThreadInput(own_thread, current_thread, 1) != 0;
+        let attached_previous = previous_thread != 0
+            && previous_thread != current_thread
+            && AttachThreadInput(own_thread, previous_thread, 1) != 0;
+        let _ = SetForegroundWindow(previous);
+        if attached_previous {
+            let _ = AttachThreadInput(own_thread, previous_thread, 0);
+        }
+        if attached_current {
+            let _ = AttachThreadInput(own_thread, current_thread, 0);
+        }
+    }
 }
 
 /// Conservatively require the conversation client area to be unobscured.

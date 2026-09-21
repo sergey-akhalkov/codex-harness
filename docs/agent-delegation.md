@@ -84,12 +84,22 @@ precedence over role configuration. Quota succession looks up the successor
 profile's model in the native catalog; the verified handoff seed remains a
 configured `zai/glm-5.3` binding, not a hardcoded provider role.
 
-Spawn opens the assignment in a new tab of the current Windows terminal when
-the lead already runs there (`WT_SESSION`, `wt -w 0 new-tab`). It does not pass
-`--focus` / maximized / fullscreen, and it restores the previous foreground
-window so another app is not yanked forward. If the lead is not in that
-terminal, it falls back to a visible native TUI (`CREATE_NEW_CONSOLE`) with the
-same restore. It does not use headless `codex exec --json`. Do not pass
+Spawn opens the assignment in a new tab of the lead's own Windows Terminal
+window when the lead already runs there (`WT_SESSION`). Windows Terminal has no
+supported address for the calling process's window - `wt -w 0` resolves to the
+most recently used window of the current desktop, which is the user's focused
+window, not the lead's - so dispatch finds the lead's window through the
+console parenting of its pseudo console window, briefly holds it foreground,
+resolves the tab there, and restores the user's previous foreground window and
+selected tab once the titled tab is observably open; the lead window never
+stays stolen. When that window cannot be addressed (another virtual desktop or
+a blocked activation), the tab opens in the stable per-checkout window
+`codex-harness-<repository>`, which the terminal creates on first use, and
+`--terminal-window` targets an explicitly named window for setups that prefer
+one. Spawn does not pass `--focus` / maximized / fullscreen and never sends
+synthetic input into a conversation. If the lead is not in a terminal at all,
+it falls back to a visible native TUI (`CREATE_NEW_CONSOLE`) with the same
+restore. It does not use headless `codex exec --json`. Do not pass
 `--worktree` together with `--remote`; attach with `-C` at the bound pool slot.
 Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.

@@ -634,11 +634,13 @@ fn run() -> io::Result<i32> {
     // Check keeps its nonzero verdict for any non-healthy relationship so the
     // stale report stays visible, even though launches follow the delivered
     // build and no longer degrade.
-    Ok(if report.status == harness_core::build_identity::Health::Healthy {
-        0
-    } else {
-        1
-    })
+    Ok(
+        if report.status == harness_core::build_identity::Health::Healthy {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 fn main() {
