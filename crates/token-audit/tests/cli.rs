@@ -181,24 +181,8 @@ fn invalid_options_fail_without_output() {
 }
 
 #[test]
-fn findings_and_baseline_are_explicit_skeletons() {
+fn baseline_stays_an_explicit_skeleton() {
     let fixture = Fixture::new();
-    let output = fixture.run(&["findings"]);
-    assert_eq!(output.status.code(), Some(3));
-    let marker: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(marker["status"], "not_implemented");
-    assert_eq!(marker["command"], "findings");
-    assert!(
-        marker["section"].as_str().unwrap().contains("section 3"),
-        "{marker}"
-    );
-
-    let output = fixture.run(&["findings", "--days", "7", "--format", "text"]);
-    assert_eq!(output.status.code(), Some(3));
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("not implemented"), "{text}");
-    assert!(text.contains("section 3"), "{text}");
-
     for command in [
         vec!["baseline", "save"],
         vec!["baseline", "diff", "--format", "text"],

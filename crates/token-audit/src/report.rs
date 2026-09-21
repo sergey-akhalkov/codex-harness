@@ -425,6 +425,7 @@ impl FileScan<'_> {
             usage_basis,
             usage,
             context,
+            tool_output_bytes: self.summary.tool_output_bytes.clone(),
             elapsed_seconds: self.summary.row["elapsed_seconds"].as_i64(),
             partial: !warnings.is_empty(),
             warnings: warnings.into_iter().collect(),

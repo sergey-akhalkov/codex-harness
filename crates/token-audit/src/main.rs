@@ -1,20 +1,19 @@
 //! Thin binary over the `token-audit` library.
 use std::{env, io, io::Write, path::PathBuf, process::ExitCode};
 use token_audit::{
-    Format, SCHEMA_VERSION, ScanOptions, default_sessions_root, now, render_json, render_text,
-    scan, write_private_sources,
+    Format, SCHEMA_VERSION, ScanOptions, analyze, default_sessions_root, now, render_findings_json,
+    render_findings_text, render_json, render_text, scan, write_private_sources,
 };
 
 const USAGE: &str = "\
 token-audit report [--sessions DIR] [--days N] [--format json|text] [--private-sources PATH]
-token-audit findings [--days N] [--format json|text]
+token-audit findings [--sessions DIR] [--days N] [--format json|text] [--all-bases]
 token-audit baseline save|diff [--days N] [--format json|text]
 Measured token-usage reports over local Codex rollout sessions: recorded counters, instruction bytes and coverage. No currency, quota or transcript content.
 Project identities are hashed; --private-sources PATH records local source digests and raw project names there instead, outside tracked sources.
 --days N bounds the scan to sessions with recorded activity within N days.
 Exit codes: 0 success, 2 usage or input error, 3 command not implemented.";
 
-const SECTION_FINDINGS: &str = "section 3 (findings)";
 const SECTION_BASELINE: &str = "section 4 (baseline)";
 
 fn main() -> ExitCode {
@@ -33,7 +32,7 @@ fn run(args: &[String]) -> io::Result<ExitCode> {
     };
     match command.as_str() {
         "report" => report(&args[1..]),
-        "findings" => skeleton("findings", SECTION_FINDINGS, &args[1..]),
+        "findings" => findings(&args[1..]),
         "baseline" => baseline(&args[1..]),
         "-h" | "--help" | "help" => emit(USAGE).map(|()| ExitCode::SUCCESS),
         other => Err(invalid(format!("unknown command {other}\n{USAGE}"))),
@@ -45,6 +44,9 @@ fn report(args: &[String]) -> io::Result<ExitCode> {
         return emit(USAGE).map(|()| ExitCode::SUCCESS);
     }
     let options = Options::parse(args)?;
+    if options.all_bases {
+        return Err(invalid("--all-bases applies to findings only"));
+    }
     let root = match &options.sessions {
         Some(root) => root.clone(),
         None => default_sessions_root().ok_or_else(|| {
@@ -99,6 +101,40 @@ fn skeleton(command: &str, section: &str, args: &[String]) -> io::Result<ExitCod
     Ok(ExitCode::from(3))
 }
 
+fn findings(args: &[String]) -> io::Result<ExitCode> {
+    if requests_help(args) {
+        return emit(USAGE).map(|()| ExitCode::SUCCESS);
+    }
+    let mut options = Options::parse(args)?;
+    let all_bases = options.take_all_bases();
+    let root = match &options.sessions {
+        Some(root) => root.clone(),
+        None => default_sessions_root().ok_or_else(|| {
+            invalid("CODEX_HOME or USERPROFILE is required; pass --sessions DIRECTORY")
+        })?,
+    };
+    if !root.exists() {
+        return Err(invalid(format!(
+            "sessions directory not found: {}; pass --sessions DIRECTORY or set CODEX_HOME",
+            root.display()
+        )));
+    }
+    let scanned = scan(&ScanOptions {
+        sessions_root: root,
+        days: options.days,
+        generated_at: now(),
+    })?;
+    if let Some(path) = &options.private_sources {
+        write_private_sources(path, &scanned)?;
+    }
+    let analyzed = analyze(&scanned.report, !all_bases);
+    let rendered = match options.format() {
+        Format::Json => render_findings_json(&analyzed),
+        Format::Text => render_findings_text(&analyzed),
+    };
+    emit(&rendered).map(|()| ExitCode::SUCCESS)
+}
+
 fn baseline(args: &[String]) -> io::Result<ExitCode> {
     match args.first().map(String::as_str) {
         Some("save") => skeleton("baseline save", SECTION_BASELINE, &args[1..]),
@@ -132,6 +168,7 @@ struct Options {
     days: Option<u32>,
     format: Option<Format>,
     private_sources: Option<PathBuf>,
+    all_bases: bool,
 }
 
 impl Options {
@@ -158,6 +195,7 @@ impl Options {
             match flag {
                 "--sessions" => options.sessions = Some(PathBuf::from(value()?)),
                 "--private-sources" => options.private_sources = Some(PathBuf::from(value()?)),
+                "--all-bases" => options.all_bases = true,
                 "--days" => {
                     let raw = value()?;
                     options.days = Some(
@@ -178,6 +216,11 @@ impl Options {
             }
         }
         Ok(options)
+    }
+
+    /// Extracts the findings-only flag before shared validation runs.
+    fn take_all_bases(&mut self) -> bool {
+        std::mem::take(&mut self.all_bases)
     }
 
     fn format(&self) -> Format {

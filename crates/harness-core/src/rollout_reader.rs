@@ -95,10 +95,23 @@ pub struct SessionSummary {
     pub coverage: Coverage,
     /// Sizes of recorded instructions.
     pub instructions: InstructionBytes,
+    /// Recorded output bytes per tool name, matched through call identity.
+    pub tool_output_bytes: BTreeMap<String, u64>,
     /// Deduplicated responses in recorded order with turn association.
     pub turns: Vec<TurnUsage>,
     /// Open source handle retained for caller-side identity checks.
     pub source: Option<File>,
+}
+
+/// Byte size of one recorded tool output: the string length when the record
+/// carries text, otherwise the serialized size of the structured value.
+fn output_bytes(value: &Value) -> u64 {
+    if let Some(text) = value.as_str() {
+        return text.len() as u64;
+    }
+    serde_json::to_string(value)
+        .map(|text| text.len() as u64)
+        .unwrap_or(0)
 }
 
 /// Recorded token counters of a value; missing or unusable fields stay unknown.
@@ -163,14 +176,24 @@ fn text_parts(value: &Value) -> String {
         return text.to_owned();
     }
     let mut result = String::new();
-    for item in list(value) {
-        for key in ["text", "input_text"] {
-            if let Some(text) = item[key].as_str() {
-                result.push_str(text);
-            }
+    if value.is_object() {
+        // Current session records carry nested instruction objects such as
+        // `{"text": "..."}` instead of a bare string or a content list.
+        item_text(value, &mut result);
+    } else {
+        for item in list(value) {
+            item_text(item, &mut result);
         }
     }
     result
+}
+
+fn item_text(item: &Value, result: &mut String) {
+    for key in ["text", "input_text"] {
+        if let Some(text) = item[key].as_str() {
+            result.push_str(text);
+        }
+    }
 }
 
 fn message_text(payload: &Value) -> String {
@@ -250,6 +273,8 @@ struct Reader {
     triggers: Vec<Value>,
     turns: Vec<Value>,
     users: Vec<Value>,
+    tool_calls: BTreeMap<String, String>,
+    tool_output_bytes: BTreeMap<String, u64>,
     usage: Usage,
     previous: Option<Usage>,
     saw_meta: bool,
@@ -419,7 +444,21 @@ impl Reader {
                 self.warn("reasoning_not_included_in_output");
             }
         } else if kind == "response_item" {
-            if p["type"] == "message" {
+            if p["type"] == "function_call" {
+                if let (Some(call), Some(name)) = (p["call_id"].as_str(), p["name"].as_str()) {
+                    self.tool_calls.insert(call.to_owned(), name.to_owned());
+                }
+            } else if p["type"] == "function_call_output" {
+                if let Some(call) = p["call_id"].as_str() {
+                    let name = self
+                        .tool_calls
+                        .get(call)
+                        .cloned()
+                        .unwrap_or_else(|| "unmatched_call".to_owned());
+                    let bytes = output_bytes(&p["output"]);
+                    *self.tool_output_bytes.entry(name).or_default() += bytes;
+                }
+            } else if p["type"] == "message" {
                 let text = message_text(p);
                 if p["role"] == "developer" {
                     self.instructions.developer_bytes = self
@@ -596,6 +635,7 @@ impl Reader {
             warnings: self.warnings,
             coverage: self.coverage,
             instructions: self.instructions,
+            tool_output_bytes: self.tool_output_bytes,
             turns: self.turn_usages,
             source: None,
         }
@@ -825,6 +865,39 @@ mod tests {
         assert_eq!(session.instructions.base_bytes, 11);
         assert_eq!(session.instructions.developer_bytes, 15);
         assert!(!format!("{:?}", session.row).contains("developer block"));
+    }
+
+    #[test]
+    fn nested_base_instruction_objects_are_measured_like_strings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut meta = meta("thread_nested");
+        meta["payload"]["base_instructions"] = json!({"text": "nested base prompt"});
+        let path = write(root.path(), "nested.jsonl", &[meta, context()]);
+        let session = read(&path);
+        assert_eq!(session.instructions.base_bytes, 18);
+    }
+
+    #[test]
+    fn tool_output_bytes_are_matched_through_call_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "tools.jsonl",
+            &[
+                meta("thread_tools"),
+                context(),
+                json!({"type":"response_item","payload":{"type":"function_call",
+                    "call_id":"call-1","name":"exec_command"}}),
+                json!({"type":"response_item","payload":{"type":"function_call_output",
+                    "call_id":"call-1","output":"0123456789"}}),
+                json!({"type":"response_item","payload":{"type":"function_call_output",
+                    "call_id":"call-2","output":{"rows":[1,2,3]}}}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.tool_output_bytes["exec_command"], 10);
+        assert!(session.tool_output_bytes.contains_key("unmatched_call"));
+        assert!(session.tool_output_bytes["unmatched_call"] > 0);
     }
 
     #[test]

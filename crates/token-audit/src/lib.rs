@@ -6,17 +6,19 @@
 //! day. Every reported quantity is a recorded rollout value: token counters,
 //! byte sizes or coverage counters. Project identities are hashed by default,
 //! and conversation content is never retained or reported.
+mod findings;
 mod identity;
 mod model;
 mod render;
 mod report;
 
+pub use findings::{Finding, FindingEvidence, FindingsReport, ValidationPlan, analyze};
 pub use identity::write_private_sources;
 pub use model::{
     Bucket, ContextAggregate, CoverageReport, Format, Report, Scan, SessionContext, SessionRow,
     TokenTotals,
 };
-pub use render::{render_json, render_text};
+pub use render::{render_findings_json, render_findings_text, render_json, render_text};
 pub use report::{ScanOptions, default_sessions_root, discover, now, scan};
 
 /// Schema version of the JSON report and of the private-source record.

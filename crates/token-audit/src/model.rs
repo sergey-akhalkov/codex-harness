@@ -150,6 +150,8 @@ pub struct SessionRow {
     pub usage_basis: Option<&'static str>,
     pub usage: TokenTotals,
     pub context: SessionContext,
+    /// Recorded tool output bytes per tool name of this session.
+    pub tool_output_bytes: BTreeMap<String, u64>,
     pub elapsed_seconds: Option<i64>,
     pub partial: bool,
     pub warnings: Vec<String>,

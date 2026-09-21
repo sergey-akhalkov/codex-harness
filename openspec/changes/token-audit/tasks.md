@@ -29,10 +29,10 @@
 
 ## 3. Findings
 
-- [ ] 3.1 Implement the versioned finding contract (id, basis, mass_tokens,
+- [x] 3.1 Implement the versioned finding contract (id, basis, mass_tokens,
   evidence locators, owner, validation plan) with the measured-only default
   filter and hidden-basis counts; verify with contract tests
-- [ ] 3.2 Implement the first detectors (context repayment, low-worth
+- [x] 3.2 Implement the first detectors (context repayment, low-worth
   sessions, session outliers, tool output mass, effort mix) with per-detector
   fixtures; verify ranking by measured mass and suppression of zero-mass
   findings

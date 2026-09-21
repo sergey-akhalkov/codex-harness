@@ -1,4 +1,5 @@
 //! JSON and text renderers for the report.
+use crate::findings::FindingsReport;
 use crate::model::{Bucket, CoverageReport, Report, SessionContext, SessionRow, TokenTotals};
 use std::collections::BTreeMap;
 
@@ -45,6 +46,60 @@ pub fn render_text(report: &Report) -> String {
             ));
         }
     }
+    out
+}
+
+/// Pretty JSON findings report, newline terminated.
+pub fn render_findings_json(report: &FindingsReport) -> String {
+    serde_json::to_string_pretty(report).map_or_else(
+        |error| format!("{{\"error\":\"{error}\"}}\n"),
+        |rendered| format!("{rendered}\n"),
+    )
+}
+
+/// Line-oriented findings text for interactive reading.
+pub fn render_findings_text(report: &FindingsReport) -> String {
+    let mut out = String::new();
+    let window = report
+        .window_days
+        .map_or_else(|| "all".to_owned(), |days| format!("last {days} days"));
+    out.push_str(&format!(
+        "token-audit findings  generated={}  window={window}  basis={}\n",
+        report.generated_at,
+        if report.measured_only {
+            "measured only"
+        } else {
+            "all bases"
+        }
+    ));
+    out.push_str(&format!("sessions-root {}\n", report.sessions_root));
+    if report.findings.is_empty() {
+        out.push_str("findings none\n");
+    }
+    for finding in &report.findings {
+        out.push_str(&format!(
+            "{}  basis={}  mass_tokens={}  owner={}\n",
+            finding.id, finding.basis, finding.mass_tokens, finding.owner
+        ));
+        out.push_str(&format!(
+            "  evidence sessions={} projects={}\n",
+            finding.evidence.session_ids.len(),
+            finding.evidence.projects.len()
+        ));
+        out.push_str(&format!(
+            "  validation {} | {} | {}\n",
+            finding.validation.method, finding.validation.metric, finding.validation.command
+        ));
+    }
+    if !report.hidden_by_basis.is_empty() {
+        let hidden: Vec<String> = report
+            .hidden_by_basis
+            .iter()
+            .map(|(basis, count)| format!("{basis}={count}"))
+            .collect();
+        out.push_str(&format!("hidden {}\n", hidden.join(" ")));
+    }
+    out.push_str(&format!("limitation {}\n", report.limitation));
     out
 }
 
