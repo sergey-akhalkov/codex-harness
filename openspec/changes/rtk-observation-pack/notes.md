@@ -49,3 +49,22 @@ command again.
 Retention and failure behavior were observed through the adapter's own entry
 points on this fixture only; the installed consumer route is verified by the
 delivery task (4.2), not here.
+
+## Installed consumer verification (task 4.2)
+
+Delivered through `install --token-workflow-only` (source identity
+`7a784680826c328f2b15e734c683610ac856a4016691a873cc4961161ccebedf7`,
+`check --token-workflow-only` passing). From a temporary directory outside the
+kit checkout, a real compact of `git -C <kit> log -n 400` emitted 464 B of
+compressed output where the raw log is 25,443 B, with both the unchanged
+`[rtk raw: ...]` locator and the `[rtk pack: ...]` handle line. Recall of that
+handle with `--offset 5 --limit 3` returned the exact numbered window with a
+`digest: verified` provenance header and a next-window hint (exit 0); an
+unknown handle failed with the rerun/raw remedy (exit 2).
+
+This route found two defects the fixture suite could not see, both fixed before
+delivery: the pinned `rtk.exe` prints a `[rtk] No hook installed` startup notice
+to stderr in the kit configuration, which disabled compression everywhere
+outside fixtures (only that banner is ignored now); and a non-shrinking filter
+output packed an observation whose handle was never presented (packing now
+happens only on the emitted compact result).

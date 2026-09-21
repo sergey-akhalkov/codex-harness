@@ -17,4 +17,4 @@
 ## 4. Documentation and delivery
 
 - [x] 4.1 Update `docs/token-workflow.md` and `.agents/skills/token-efficient-workflow/references/tool-results.md` to teach bounded recall before whole-file raw reads, with the NVlabs/SoL-Pi inspiration attribution and honest retention limits; verify local links and factual consistency with implemented behavior
-- [ ] 4.2 Rebuild and install the adapter through the existing `--token-workflow-only` lifecycle and verify handle emission and paged recall from a consumer session outside this checkout, including `check` passing
+- [x] 4.2 Rebuild and install the adapter through the existing `--token-workflow-only` lifecycle and verify handle emission and paged recall from a consumer session outside this checkout, including `check` passing
