@@ -52,7 +52,7 @@
   mapping, decision recording in existing records, no parallel efficiency
   instructions); verify the kit skill inventory includes it and its
   description stays disjoint from `token-efficient-workflow`
-- [ ] 5.2 Verify delivery through the kit installation lifecycle against an
+- [x] 5.2 Verify delivery through the kit installation lifecycle against an
   installed consumer outside the checkout, following the native check routes
   in `docs/rust-native.md`
 - [x] 5.3 Update executable-ownership accounting, `docs/rust-native.md`, the
