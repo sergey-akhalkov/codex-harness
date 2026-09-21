@@ -174,7 +174,14 @@ pub fn source_identity(source: &Path) -> io::Result<SourceIdentity> {
 
 fn result(status: Health, management: bool, action: &str) -> BuildCheck {
     BuildCheck {
-        runtime_allowed: status == Health::Healthy,
+        // Launch admission follows recorded binary integrity: a stale or
+        // unreachable checkout reports status and the deploy action while the
+        // delivered build keeps serving ordinary launches. Only damaged or
+        // unsupported inputs refuse runtime with their corrective action.
+        runtime_allowed: matches!(
+            status,
+            Health::Healthy | Health::SourceStale | Health::SourceUnavailable
+        ),
         serving_allowed: matches!(
             status,
             Health::Healthy | Health::SourceStale | Health::SourceUnavailable
@@ -316,12 +323,12 @@ pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
         Ok(_) => result(
             Health::SourceStale,
             true,
-            "Run explicit native build/update to pick up native adapter changes. Integrity-verified management and CodeGraph serving remain available; source-consuming runtime is disabled.",
+            "The checkout differs from the delivered build; launches continue on the integrity-verified delivered build. Run explicit native build/update (deploy) to move new processes to the newer source.",
         ),
         Err(_) => result(
             Health::SourceUnavailable,
             true,
-            "Select the accessible checkout for explicit recovery. Integrity-verified management and CodeGraph serving remain available; source-consuming runtime is disabled.",
+            "The recorded checkout is unavailable; launches continue on the integrity-verified delivered build. Select the accessible checkout for explicit recovery or deploy.",
         ),
     }
 }
@@ -421,7 +428,21 @@ mod tests {
         assert_eq!(stale.status, Health::SourceStale);
         assert!(stale.management_allowed);
         assert!(stale.serving_allowed);
-        assert!(!stale.runtime_allowed);
+        assert!(
+            stale.runtime_allowed,
+            "a stale checkout keeps launches on the verified delivered build"
+        );
+        assert!(
+            stale.action.contains("delivered build") && stale.action.contains("deploy"),
+            "{}",
+            stale.action
+        );
+        drop(fs::rename(&root, temp.path().join("moved")));
+        let unavailable = check(&build, None);
+        assert_eq!(unavailable.status, Health::SourceUnavailable);
+        assert!(unavailable.runtime_allowed);
+        assert!(unavailable.action.contains("delivered build"));
+        drop(fs::rename(temp.path().join("moved"), &root));
         fs::write(build.join("codex-harness.exe"), "altered").unwrap();
         let altered = check(&build, None);
         assert_eq!(altered.status, Health::Altered);

@@ -28,7 +28,9 @@ fn manager_source(program: &str) -> String {
         let build = args.windows(2).find(|w| w[0] == "--build").unwrap();
         let report = harness_core::build_identity::check(std::path::Path::new(&build[1]), source);
         println!("{}", serde_json::to_string(&report).unwrap());
-        std::process::exit(if report.runtime_allowed { 0 } else { 1 });
+        std::process::exit(i32::from(
+            report.status != harness_core::build_identity::Health::Healthy,
+        ));
     }
     if args.first().is_some_and(|a| a == "activate-build") {
         let state = args.windows(2).find(|w| w[0] == "--state").unwrap();
@@ -247,7 +249,7 @@ fn cli_build_reuse_source_staleness_integrity_and_failed_update() {
     assert_eq!(stale["status"], "source-stale");
     assert_eq!(stale["management_allowed"], true);
     assert_eq!(stale["serving_allowed"], true);
-    assert_eq!(stale["runtime_allowed"], false);
+    assert_eq!(stale["runtime_allowed"], true);
     let failed = cli(&arguments);
     assert!(!failed.status.success());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("Candidate build failed"));
@@ -255,7 +257,18 @@ fn cli_build_reuse_source_staleness_integrity_and_failed_update() {
     assert_eq!(fs::read_dir(state.join("builds")).unwrap().count(), 1);
     assert_eq!(fs::read(state.join("active-build.json")).unwrap(), pointer);
     let stale_activation = cli(&activation_args);
-    assert!(!stale_activation.status.success());
+    // Activation follows recorded binary integrity, so re-selecting the
+    // delivered build still succeeds after its checkout moves ahead; deploy
+    // remains the path that builds the newer source.
+    assert!(
+        stale_activation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_activation.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stale_activation.stdout).unwrap()["changed"],
+        false
+    );
     assert_eq!(fs::read(state.join("active-build.json")).unwrap(), pointer);
     let recovery = cli(&["recover-build", "--state", state.to_str().unwrap()]);
     assert!(recovery.status.success());

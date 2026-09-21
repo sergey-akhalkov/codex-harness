@@ -413,15 +413,15 @@ fn serving_status(
                 note: "Owned CodeGraph command is not admitted for serving; configuration was not changed.".into(),
             });
         }
-        if !check.runtime_allowed {
+        if check.status != build_identity::Health::Healthy {
             return Ok(ServingStatus {
                 admitted: true,
                 callable: Value::Bool(true),
                 reason: Some(format!(
-                    "CodeGraph serving remains available; rebuild to pick up native adapter changes: {}",
+                    "CodeGraph remains callable while Check reports the source relationship; launches follow the integrity-verified delivered build: {}",
                     check.action
                 )),
-                note: "Owned CodeGraph remains callable after later source edits; source-consuming runtime still requires a healthy build.".into(),
+                note: "Owned CodeGraph stays callable after source edits; explicit deploy switches new processes to a newer build.".into(),
             });
         }
         return Ok(ServingStatus {

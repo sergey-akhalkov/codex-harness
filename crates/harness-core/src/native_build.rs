@@ -366,7 +366,8 @@ fn freshest_for_source(state: &Path, source: &Path) -> io::Result<Option<PathBuf
                 .ok()
                 .and_then(|record| record.source_root.canonicalize().ok())
                 .is_some_and(|root| root == source)
-                && build_identity::check(path, Some(&source)).runtime_allowed
+                && build_identity::check(path, Some(&source)).status
+                    == build_identity::Health::Healthy
         }))
 }
 
@@ -427,7 +428,9 @@ fn find_reusable(
         {
             continue;
         }
-        if consumer_check(&path, Some(source)).is_ok_and(|check| check.runtime_allowed) {
+        if consumer_check(&path, Some(source))
+            .is_ok_and(|check| check.status == build_identity::Health::Healthy)
+        {
             return Ok(Some(PreparedBuild {
                 build: path,
                 reused: true,
@@ -470,8 +473,14 @@ pub fn consumer_check(
         let report: build_identity::BuildCheck =
             serde_json::from_slice(&handoff::bounded_bytes(&output)?)?;
         if result.reason != StopReason::Exited
-            || result.exit_code != if report.runtime_allowed { 0 } else { 1 }
-            || report.runtime_allowed != (report.status == build_identity::Health::Healthy)
+            || result.exit_code != u32::from(report.status != build_identity::Health::Healthy)
+            || report.runtime_allowed
+                != matches!(
+                    report.status,
+                    build_identity::Health::Healthy
+                        | build_identity::Health::SourceStale
+                        | build_identity::Health::SourceUnavailable
+                )
             || (report.runtime_allowed && !report.management_allowed)
             || receipt_hash != build_identity::hash_file(&build.join("build.json"))?
             || build_identity::verify_record_integrity(build)?.binaries != before.binaries

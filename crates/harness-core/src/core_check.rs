@@ -311,9 +311,17 @@ fn require_path(scope: PathScope, bin: &Path) -> io::Result<()> {
 
 fn require_current_source(build: &Path, source: &Path) -> io::Result<()> {
     let check = build_identity::check(build, Some(source));
+    // Check stays the currency signal even though launches no longer degrade:
+    // a stale or unreachable checkout still fails this verification with the
+    // deploy action, while damaged or unsupported builds keep their refusal.
     if !check.runtime_allowed {
         return Err(disconnected(
             "current source is unavailable or the native build is not healthy",
+        ));
+    }
+    if check.status != build_identity::Health::Healthy {
+        return Err(disconnected(
+            "the checkout differs from the delivered build; run explicit deploy to switch new processes to it",
         ));
     }
     let record = build_identity::read_record(build)?;

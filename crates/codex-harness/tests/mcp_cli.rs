@@ -149,15 +149,13 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
     );
     fs::write(source.join("crates/one/src/lib.rs"), "changed owned source").unwrap();
     let stale = invoke();
-    assert_eq!(
-        stale.status.code(),
-        Some(2),
-        "source-stale source-consuming MCP runtime was admitted"
-    );
-    assert!(stale.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&stale.stderr).contains("source-consuming runtime is disabled")
+        stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
     );
+    assert_eq!(stale.stdout, healthy.stdout);
+    assert!(stale.stderr.is_empty());
     let served = Command::new(&manager)
         .current_dir(root.path())
         .args(["mcp", "codegraph", "--help"])
@@ -192,7 +190,7 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
     let checked: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(checked["status"], "source-stale");
     assert_eq!(checked["management_allowed"], true);
-    assert_eq!(checked["runtime_allowed"], false);
+    assert_eq!(checked["runtime_allowed"], true);
     assert_eq!(checked["serving_allowed"], true);
     let prepared = harness_core::broker_state::BrokerRoot::prepare().unwrap();
     let retired = Command::new(&manager)
@@ -210,11 +208,13 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
     // Source loss has the same runtime gate and cannot trigger acquisition.
     fs::rename(&source, root.path().join("moved-source")).unwrap();
     let missing = invoke();
-    assert_eq!(missing.status.code(), Some(2));
-    assert!(missing.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&missing.stderr).contains("source-consuming runtime is disabled")
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
     );
+    assert_eq!(missing.stdout, healthy.stdout);
+    assert!(missing.stderr.is_empty());
     let still_served = Command::new(&manager)
         .current_dir(root.path())
         .args(["mcp", "codegraph", "--help"])
@@ -302,11 +302,13 @@ fn source_stale_manager_still_emits_shared_config_overrides() {
         .args(["mcp", "codebase-memory", "--help"])
         .output()
         .unwrap();
-    assert_eq!(stale_runtime.status.code(), Some(2));
     assert!(
+        stale_runtime.status.success(),
+        "{}",
         String::from_utf8_lossy(&stale_runtime.stderr)
-            .contains("source-consuming runtime is disabled")
     );
+    assert!(!stale_runtime.stdout.is_empty());
+    assert!(stale_runtime.stderr.is_empty());
     let overrides = Command::new(&manager)
         .current_dir(root.path())
         .args([
