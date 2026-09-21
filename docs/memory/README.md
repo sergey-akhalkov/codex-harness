@@ -13,6 +13,7 @@ do not certify that historical checks apply to current source or dirty changes.
 | Subscriptions | OpenCodex routing, xAI OAuth, Z.AI key login and proxy stop isolation | [Subscription models](../subscription-models.md) |
 | Delegation | Direct model/effort selection, visible conversations, preset migration and usage limits | [Agent delegation](../agent-delegation.md) |
 | Token workflow | RTK exception, Code Mode, raw recovery and task effort | [Token workflow](../token-workflow.md) |
+| Token audit | Measured rollout analysis loop, findings bases and baselines | [Token audit](token-audit.md) |
 | Native commands | Current Rust CLI, provenance and unfinished cutover | [Rust native](../rust-native.md) |
 | Rust migration | Ownership map, remaining tasks and current limitations | [Rust migration](../evidence/rust-migration.md) |
 | Working principles | Portable philosophy and publication boundary | [global/principles-of-work.md](../../global/principles-of-work.md) |

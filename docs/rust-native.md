@@ -29,6 +29,7 @@ The retired script interface and its native equivalent. Selectors, preview
 | `tools/mcp.ps1 <server>` | `codex-harness mcp serena` / `nuphus` / `codegraph-control` (plus `codebase-memory` only as documented rollback) |
 | `tools/hook.ps1` | Retired no-op compatibility entry; the accepted RTK exception runs native `harness-rtk.exe` |
 | `tools/delegation-usage.py` | `codex-harness delegation-usage` |
+| First-party usage analyzer | `token-audit report` / `findings` / `baseline save|diff` (crate `crates/token-audit`, operated by the `tokenomics` skill) |
 | `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
 | Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
 | Skill evolution helpers | `codex-harness skills isolate` / `usage` / `publish` / `identity` |
@@ -769,6 +770,11 @@ contents, excluded runtime cache and preserved conflicting versions.
 `codex-harness.exe outcome-report --input <private-json> [--markdown]` formats
 local attempt accounting without executing anything.
 `delegation-usage` reads explicit local telemetry without model calls.
+`token-audit` scans rollout sessions through the shared reader with
+`cargo test --locked -p token-audit --jobs 1 -- --test-threads=1`; its
+reader changes also rerun
+`cargo test --locked -p codex-harness --test delegation_usage --jobs 1 -- --test-threads=1`
+because both consumers share `harness-core::rollout_reader`.
 `outcome-run --request PATH --run-model-probes` executes one explicit native
 launcher in an isolated temporary case/home and defaults to a model-free skip.
 `outcome-prepare`, `outcome-oracle`, `outcome-discover` and `outcome-arm`
