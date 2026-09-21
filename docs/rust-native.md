@@ -563,6 +563,12 @@ Every compilation uses a fresh owned temporary target with a short path for
 MSVC; unchanged candidates reuse verified immutable binaries. Explicit release
 compilation has a 30-minute deadline, a 2 GiB Job and a 50% CPU cap. This is
 separate from CodeGraph's 600-second indexing deadline and 25% CPU cap.
+Abandoned management scratch (the `hcb-`/`hcc-`/`hca-` temp prefixes) is
+reclaimed at the next explicit build once older than 48 hours; only ordinary
+prefixed directories are removed and reparse points are skipped. Retained
+verification targets from soak or long checks are removed after their
+conclusions are recorded (for example `cargo clean`), so verification state
+does not accumulate on the system drive.
 Reusing Cargo's
 mtime cache across changed source hashes is unsafe even if the manifest uses
 content hashes. Changing native source/lock inputs makes Check stale while

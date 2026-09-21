@@ -15,6 +15,8 @@ use std::{
 
 pub(crate) const OWNER: &[u8] = b"codex-harness-native-state-v1\n";
 const TARGET: &str = "x86_64-pc-windows-msvc";
+const SCRATCH_PREFIXES: &[&str] = &["hcb-", "hcc-", "hca-"];
+const SCRATCH_SWEEP_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 
 #[path = "native_handoff.rs"]
 mod handoff;
@@ -251,6 +253,49 @@ fn directory(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Reclaim scratch trees abandoned by interrupted explicit management.
+///
+/// `TempDir` cleanup only runs when the manager unwinds normally, so a killed
+/// install/update leaks its build/evidence tree into the process temp root.
+/// The owned prefixes identify this manager's scratch; the age gate protects
+/// fresh evidence from a concurrent management operation, and every removal
+/// stays best-effort so hygiene can never fail the build.
+fn sweep_stale_scratch(root: &Path, min_age: Duration) {
+    let Some(threshold) = SystemTime::now().checked_sub(min_age) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !SCRATCH_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        // Directory metadata from read_dir does not traverse reparse points;
+        // skipping them keeps the sweep from deleting or following a link.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if modified > threshold {
+            continue;
+        }
+        let _ = fs::remove_dir_all(entry.path());
+    }
 }
 
 pub(crate) fn owner_root(state: &Path) -> io::Result<()> {
@@ -617,6 +662,7 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     }
     owner_root(&state)?;
     let lock = lock_owned_state(&state)?;
+    sweep_stale_scratch(&std::env::temp_dir(), SCRATCH_SWEEP_AGE);
     if let Some(reused) = find_reusable(&state, &source, &rustc, &cargo_version)? {
         return Ok(reused);
     }
@@ -909,5 +955,59 @@ mod tests {
             error.to_string().contains("matches the selected source"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn stale_owned_scratch_is_swept_and_fresh_or_foreign_entries_survive() {
+        let root = tempfile::tempdir().unwrap();
+        let stale_build = root.path().join("hcb-stale");
+        fs::create_dir_all(stale_build.join("x86_64-pc-windows-msvc/release")).unwrap();
+        fs::write(
+            stale_build.join("x86_64-pc-windows-msvc/release/artifact.bin"),
+            b"x",
+        )
+        .unwrap();
+        let stale_check = root.path().join("hcc-stale");
+        fs::create_dir_all(&stale_check).unwrap();
+        fs::write(stale_check.join("stdout.json"), b"{}").unwrap();
+
+        std::thread::sleep(Duration::from_millis(250));
+
+        let fresh = root.path().join("hcb-fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("in-flight"), b"y").unwrap();
+        let foreign = root.path().join("unrelated-dir");
+        fs::create_dir_all(&foreign).unwrap();
+        let foreign_prefixed_file = root.path().join("hcb-not-a-directory");
+        fs::write(&foreign_prefixed_file, b"z").unwrap();
+
+        sweep_stale_scratch(root.path(), Duration::from_millis(100));
+
+        assert!(!stale_build.exists());
+        assert!(!stale_check.exists());
+        assert!(fresh.is_dir());
+        assert!(foreign.is_dir());
+        assert!(foreign_prefixed_file.is_file());
+    }
+
+    #[test]
+    fn scratch_sweep_skips_reparse_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = root.path().join("hcb-link");
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+        #[cfg(not(windows))]
+        let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+        if !created {
+            // Link creation is privilege-restricted on some Windows setups.
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        sweep_stale_scratch(root.path(), Duration::from_millis(100));
+        assert!(link.is_dir());
+        assert!(target.join("keep.txt").exists());
     }
 }
