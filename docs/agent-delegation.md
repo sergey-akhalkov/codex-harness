@@ -1,11 +1,18 @@
 # Agent selection and visible conversations
 
-Use ordinary native agents with explicit `model` and supported `reasoning_effort`
-parameters. Choose from task complexity, risk and the full cost of the accepted
-result; a separate TOML file per effort or activity is unnecessary. GPT normally
-leads, Z.AI handles substantial text/code execution, and Grok handles visual and
-suitable routine work. Supported efforts differ by model; verify the effective
-binding instead of assuming every level exists on every route.
+Selection has two paths; never mix them. Ordinary in-session subagents take
+explicit `model` and supported `reasoning_effort` parameters per assignment;
+GPT normally leads, Z.AI handles substantial text/code execution, and Grok
+handles visual and suitable routine work. Kit executor dispatch takes no
+per-assignment model or effort: it runs exactly the configured executor
+profiles, and the profile's configured model and reasoning effort are that
+assignment's complete explicit selection. The kit configures one executor,
+`ds`, binding DeepSeek V4.1-Flash (`deepseek-flash`) at `max`; one executor
+profile is normal full capacity, not a delegation limit. Choose from task
+complexity, risk and the full cost of the accepted result; a separate TOML
+file per effort or activity is unnecessary. Supported efforts differ by
+model; verify the effective binding instead of assuming every level exists on
+every route.
 
 The removed Astra names migrate to these direct arguments. This table preserves
 their former meaning; it does not prescribe an effort for every new assignment.
@@ -80,7 +87,16 @@ is identifiable without guessing.
 
 That command uses `codex --profile xai` from the example above. An unlisted
 `--profile` is an error. Explicit user `codex --profile <id>` keeps native
-precedence over role configuration. Quota succession looks up the successor
+precedence over role configuration. The live kit routes every executor
+through `ds` (DeepSeek V4.1-Flash, `max`) and accepts no per-assignment model
+or effort override by design: the profile is the selection. If any
+instruction appears to demand per-assignment model/effort for executor
+dispatch, that demand belongs to ordinary in-session agents; dispatch the
+configured profile and report the discrepancy. Only a launcher- or
+installation-check-reported failure - missing profile, stale build, no free
+slot, fetch failure - blocks dispatch, with its exact cause and remedy;
+never a routing-rule interpretation, the single executor profile or unknown
+quota. Quota succession looks up the successor
 profile's model in the native catalog; the verified handoff seed remains a
 configured `zai/glm-5.3` binding, not a hardcoded provider role.
 
@@ -125,7 +141,10 @@ after every dispatch decision, and after every acceptance or slot release -
 the lead either dispatches the next worthwhile, capability-sized slice or
 records the concrete reason the capacity stays idle: no worthwhile slice, an
 unresolved dependency, configured pacing, a preserved slot, or dispatch being
-unavailable with its reported cause. A released slot is backfilled with the
+unavailable with its reported cause. A routing-rule conflict, the single
+configured executor profile, a model preference or unknown quota is not an
+idle reason: dispatch proceeds and the discrepancy is reported. A released
+slot is backfilled with the
 next dispatchable slice before the lead starts unrelated implementation work.
 Lead progress reports state busy slots against the configured concurrency
 limit with each idle reason, taken from board and pool records rather than
@@ -278,8 +297,11 @@ in the repository.
 
 ## How selection works
 
-For independent substantial text/code work prefer Z.AI; for visual and suitable
-routine work prefer Grok. A short edit,
+Kit executor assignments go to the configured executor profile - currently
+the single `ds` profile (DeepSeek V4.1-Flash, `max`) - with no substitution:
+in-session routing preferences never override it and never justify
+withholding a dispatch; report a wording conflict and dispatch anyway. A
+short edit,
 tightly coupled slice or expensive context handoff is often cheaper to do
 directly. Count briefing, execution, waiting, checking, integration and rework.
 The number of children is not a savings metric.

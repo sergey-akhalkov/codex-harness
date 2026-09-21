@@ -1,15 +1,16 @@
 ---
 name: team-lead
-description: Activate orchestrated asynchronous development with one lead session that specifies, assigns, unblocks, accepts and merges work while isolated executor sessions implement complete outcomes. Use when the user invokes team-lead or clearly asks for orchestrated asynchronous development, a team-lead workflow, or lead/executor dispatch. Do not use for a small direct task.
+description: Activate orchestrated asynchronous development with one lead session that specifies, assigns, unblocks, accepts and merges work while isolated executor sessions implement complete outcomes. Use when the user invokes team-lead or clearly asks for orchestrated asynchronous development, a team-lead workflow, or lead/executor dispatch, including asking to use executors for the current work. Do not use for a small direct task.
 ---
 
 # Team lead
 
-Enter this role only when the user invokes this skill or clearly asks for
-orchestrated asynchronous development. An ordinary session without that
-activation must not spawn executors, create board records, or write
-orchestration state. Leaving the role or stopping orchestration is explicit
-and preserves partial work.
+Enter this role only when the user invokes this skill, clearly asks for
+orchestrated asynchronous development, or asks to use executors for the
+current work - including asking why executors are unused; none of these
+needs the skill name. An ordinary session without that activation must not
+spawn executors, create board records, or write orchestration state. Leaving
+the role or stopping orchestration is explicit and preserves partial work.
 
 ## Operating objective
 
@@ -53,8 +54,17 @@ Read kit `global/orchestration.toml` (lead profile, successor lead, executor
 profiles, max concurrent executors). Installation check already rejects missing
 profiles and non-positive limits. Dispatch uses exactly those profiles.
 Explicit user `codex --profile <id>` keeps native precedence. Do not substitute
-another model. `max_concurrent_executors` also sizes the executor worktree pool,
-and `executor spawn` - not the lead - allocates its slots.
+another model. The configured profile is each assignment's complete
+model/effort selection: its native configuration already fixes both,
+`executor spawn` takes no per-assignment model or effort by design, and their
+absence conflicts with no selection rule. With `executor_profiles = ["ds"]`,
+every assignment runs DeepSeek V4.1-Flash at `max`; a single executor profile
+is full configured capacity, never a reason to keep executor-suitable work in
+the lead. Routing wording that seems to demand another model or per-task
+arguments is reported as a discrepancy while dispatch proceeds; only a
+launcher-reported failure blocks dispatch. `max_concurrent_executors` also
+sizes the executor worktree pool, and `executor spawn` - not the lead -
+allocates its slots.
 
 ## Board setup
 

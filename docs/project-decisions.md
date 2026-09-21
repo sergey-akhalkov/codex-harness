@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-20**.
+Last updated: **2026-09-21**.
 
 ## Public pack
 
@@ -566,6 +566,18 @@ recommendation; after a heard objection, the user's chosen route is implemented
 faithfully unless it risks serious harm. Routine taste choices proceed with
 disclosure, and silence means no material objection was found, not obedience.
 Canonical rule: [portable principles](../global/principles-of-work.md#partnership-and-dissent).
+
+**2026-09-21, confirmed:** the kit's only executor is the configured `ds`
+profile binding DeepSeek V4.1-Flash (`deepseek-flash`) at `max` reasoning
+effort, and executor dispatch stays profile-only. The configured profile is
+each assignment's complete explicit model/effort selection: per-assignment
+model/effort arguments belong to ordinary in-session agents, a single
+executor profile is full delegation capacity, and no instruction wording,
+routing preference or unknown quota may be used as a reason to withhold
+delegation - a wording conflict is reported while dispatch proceeds, and only
+a launcher- or installation-check-reported dispatch failure blocks it. A user
+request to use executors for the current work activates the lead role for
+that work. Change: [unblock executor delegation](../openspec/changes/unblock-executor-delegation/proposal.md).
 
 ## Recording further decisions
 
