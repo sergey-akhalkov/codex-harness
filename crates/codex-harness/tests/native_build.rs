@@ -99,7 +99,9 @@ fn fixture(source: &Path) {
     for (directory, name) in [
         ("crates/manager", "codex-harness"),
         ("tools/rtk-adapter", "harness-rtk"),
+        ("crates/token-audit", "token-audit"),
     ] {
+        fs::create_dir_all(source.join(directory).join("src")).unwrap();
         fs::write(
             source.join(directory).join("Cargo.toml"),
             format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n{}", if name == "codex-harness" { "[dependencies]\nharness-core={path='../harness-core'}\nserde_json.workspace=true\n" } else { "" }),

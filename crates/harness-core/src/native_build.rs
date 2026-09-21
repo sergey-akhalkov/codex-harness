@@ -657,6 +657,8 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         "codex-harness",
         "-p",
         "harness-rtk",
+        "-p",
+        "token-audit",
         "--bins",
         "--manifest-path",
     ]
