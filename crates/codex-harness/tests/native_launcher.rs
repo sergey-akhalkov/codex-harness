@@ -520,10 +520,8 @@ fn missing_stale_source_and_shared_toml_fail_open_to_verified_upstream() {
         "$() `literal` ; &"
     ]);
     for mode in [
-        "stale-source",
         "missing-source",
         "shared-toml",
-        "schema2-stale",
         "companion-altered",
         "companion-missing",
     ] {
@@ -533,9 +531,6 @@ fn missing_stale_source_and_shared_toml_fail_open_to_verified_upstream() {
         }
         let before = fs::read(f.state.join("active-build.json")).unwrap();
         match mode {
-            "stale-source" | "schema2-stale" => {
-                fs::write(f.source.join("crates/one/src/lib.rs"), "changed").unwrap()
-            }
             "missing-source" => fs::remove_dir_all(&f.source).unwrap(),
             "shared-toml" => fs::write(
                 f.source.join("global/harness.config.toml"),
@@ -596,6 +591,41 @@ fn missing_stale_source_and_shared_toml_fail_open_to_verified_upstream() {
         assert!(
             !f.state.join("staging").exists(),
             "ordinary launch compiled: {mode}"
+        );
+    }
+}
+
+#[test]
+fn stale_source_keeps_delivered_overrides_instead_of_degrading() {
+    let args = ["--harness-effort", "routine", "exec", "", "still shared"];
+    for mode in ["stale-source", "schema2-stale"] {
+        let f = Fixture::new();
+        if mode == "schema2-stale" {
+            f.register_immutable();
+        }
+        fs::write(f.source.join("crates/one/src/lib.rs"), "changed").unwrap();
+        let mut child = f
+            .command()
+            .args(args)
+            .env("CARGO", "must-not-run")
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all("первая строка\nsecond line\n".as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(19), "{mode}");
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            !stderr.contains("launching registered Codex without harness overrides"),
+            "{mode}: {stderr}"
         );
     }
 }

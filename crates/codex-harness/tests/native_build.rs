@@ -619,7 +619,9 @@ fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules
         .unwrap()
         .replace("\r\n", "\n");
     assert!(current_identity.contains("    \"harness-observe.exe\",\n"));
-    let old_identity = current_identity.replacen("    \"harness-observe.exe\",\n", "", 1)
+    let old_identity = current_identity
+        .replacen("    \"token-audit.exe\",\n", "", 1)
+        .replacen("    \"harness-observe.exe\",\n", "", 1)
         .replacen("    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);",
             "    collect(&root, &root.join(INSPECTION_SCHEMA), &mut files)?;\n    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);", 1);
     assert_ne!(old_identity, current_identity);

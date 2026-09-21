@@ -91,10 +91,10 @@ fn registered_runtime(registration: &Registration) -> io::Result<(PathBuf, bool)
         _ => return Err(fail("unsupported native launch registration")),
     };
     if launcher_identity_matches(&selected)? {
-        let shared = matches!(
-            build_identity::check(&selected, None).status,
-            build_identity::Health::Healthy
-        );
+        // Launch admission follows recorded binary integrity: a stale or
+        // unreachable checkout keeps the harness overrides of the delivered
+        // build, and only damaged or unsupported inputs degrade to upstream.
+        let shared = build_identity::check(&selected, None).runtime_allowed;
         Ok((selected.canonicalize()?, shared))
     } else {
         Err(fail(
