@@ -40,7 +40,12 @@ impl Fixture {
 
     fn baseline(&self, subcommand: &str, extra: &[&str]) -> Output {
         let sessions = self.sessions();
-        let mut args = vec!["baseline", subcommand, "--sessions", sessions.to_str().unwrap()];
+        let mut args = vec![
+            "baseline",
+            subcommand,
+            "--sessions",
+            sessions.to_str().unwrap(),
+        ];
         args.extend_from_slice(extra);
         self.run(&args)
     }
@@ -86,8 +91,7 @@ fn save_records_hashed_aggregates_and_latest_pointer() {
     let directory = PathBuf::from(receipt["directory"].as_str().unwrap());
     let pointer = fs::read_to_string(directory.join("latest")).unwrap();
     assert!(pointer.starts_with("baseline-"), "{pointer}");
-    let snapshot =
-        fs::read_to_string(directory.join(pointer.trim())).unwrap();
+    let snapshot = fs::read_to_string(directory.join(pointer.trim())).unwrap();
     assert!(snapshot.contains("\"sessions_root\""), "{snapshot}");
     assert!(!snapshot.contains("D:/work"), "raw paths must stay private");
     assert!(!snapshot.contains("base prompt"), "no transcript content");
@@ -140,15 +144,20 @@ fn diff_reports_movement_and_marks_incompatible_snapshots() {
             )
         })
         .collect();
-    assert!(sessions.contains(&"session-one=same".to_string()), "{sessions:?}");
-    assert!(sessions.contains(&"session-two=new".to_string()), "{sessions:?}");
+    assert!(
+        sessions.contains(&"session-one=same".to_string()),
+        "{sessions:?}"
+    );
+    assert!(
+        sessions.contains(&"session-two=new".to_string()),
+        "{sessions:?}"
+    );
 
     // A foreign schema version is an explicit incompatibility, never a guess.
     let receipt: Value = serde_json::from_slice(&saved.stdout).unwrap();
     let directory = PathBuf::from(receipt["directory"].as_str().unwrap());
     let latest = directory.join(fs::read_to_string(directory.join("latest")).unwrap().trim());
-    let mut snapshot: Value =
-        serde_json::from_str(&fs::read_to_string(&latest).unwrap()).unwrap();
+    let mut snapshot: Value = serde_json::from_str(&fs::read_to_string(&latest).unwrap()).unwrap();
     snapshot["schema_version"] = json!(999);
     fs::write(&latest, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
     let incompatible = fixture.baseline("diff", &[]);
@@ -156,10 +165,7 @@ fn diff_reports_movement_and_marks_incompatible_snapshots() {
     let diff: Value = serde_json::from_slice(&incompatible.stdout).unwrap();
     assert_eq!(diff["compatible"], false);
     assert!(
-        diff["incompatibility"]
-            .as_str()
-            .unwrap()
-            .contains("999"),
+        diff["incompatibility"].as_str().unwrap().contains("999"),
         "{diff}"
     );
 }
