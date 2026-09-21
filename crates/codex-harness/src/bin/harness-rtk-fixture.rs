@@ -42,6 +42,13 @@ fn run(role: &str, args: &[String]) -> io::Result<()> {
             let mut input = Vec::new();
             io::stdin().read_to_end(&mut input)?;
             let lines = input.iter().filter(|byte| **byte == b'\n').count();
+            if std::env::var_os("HARNESS_RTK_FIXTURE_INFLATE").is_some() {
+                // Deliberately larger than the input, so the adapter's
+                // "smaller compressed result" gate rejects the filter output.
+                let mut inflated = input.clone();
+                inflated.extend_from_slice(b"\nfixture-pipe inflation tail that makes the filter output larger than the raw command output\n");
+                return io::stdout().write_all(&inflated);
+            }
             writeln!(
                 io::stdout().lock(),
                 "fixture-pipe {name}: {lines} lines, {} bytes",

@@ -566,6 +566,42 @@ fn compact_tolerates_the_pinned_rtk_startup_banner_but_not_other_stderr() {
 }
 
 #[test]
+fn a_filter_output_that_does_not_shrink_stays_raw_without_packing() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "300"], &workspace);
+
+    let output = invoke_with_env(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_INFLATE", "1")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("[rtk pack:"), "{text}");
+    // No observation was packed and no orphaned handle reached the index.
+    let pack_root = home.join("harness/rtk/pack");
+    assert!(!pack_root.join("index.json").is_file());
+    let orphaned = pack_root
+        .read_dir()
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(orphaned, 0);
+}
+
+#[test]
 fn compact_falls_back_to_todays_output_when_packing_is_unavailable() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

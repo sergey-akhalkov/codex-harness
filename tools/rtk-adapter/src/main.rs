@@ -518,7 +518,10 @@ fn filter(mut input: impl Read, name: &str, source: Option<&str>) -> io::Result<
         }
     };
     match compressed(&raw, name) {
-        Ok(mut result) => {
+        // Packing belongs to the emitted compact result: when the filter does
+        // not shrink the output, the run stays plain raw and must not leave an
+        // orphaned pack entry whose handle was never presented.
+        Ok(mut result) if result.len() < raw.len() => {
             let mut footer = format!("\n[rtk raw: {}]\n", path.display());
             // A handle is minted only here: the compressed path where
             // `save_raw` already succeeded. The raw locator stays unchanged.
@@ -528,10 +531,9 @@ fn filter(mut input: impl Read, name: &str, source: Option<&str>) -> io::Result<
                 footer.push_str(&packed);
             }
             result.extend_from_slice(footer.as_bytes());
-            if result.len() < raw.len() {
-                return output.write_all(&result);
-            }
+            return output.write_all(&result);
         }
+        Ok(_) => {}
         Err(error) => eprintln!("rtk: {error}; raw passthrough"),
     }
     output.write_all(&raw)
