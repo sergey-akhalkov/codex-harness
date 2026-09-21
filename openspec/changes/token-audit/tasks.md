@@ -39,10 +39,10 @@
 
 ## 4. Baseline loop
 
-- [ ] 4.1 Implement `baseline save` under `CODEX_HOME/harness/token-audit`
+- [x] 4.1 Implement `baseline save` under `CODEX_HOME/harness/token-audit`
   with a latest pointer; verify saved snapshots contain aggregates and
   hashed identities only
-- [ ] 4.2 Implement `baseline diff` against latest or named baselines with
+- [x] 4.2 Implement `baseline diff` against latest or named baselines with
   movement per session, project, model and day, and an explicit marker for
   incompatible snapshots; verify with before/after fixture tests
 

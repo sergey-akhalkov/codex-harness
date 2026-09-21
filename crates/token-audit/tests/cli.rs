@@ -181,21 +181,6 @@ fn invalid_options_fail_without_output() {
 }
 
 #[test]
-fn baseline_stays_an_explicit_skeleton() {
-    let fixture = Fixture::new();
-    for command in [
-        vec!["baseline", "save"],
-        vec!["baseline", "diff", "--format", "text"],
-    ] {
-        let output = fixture.run(&command);
-        assert_eq!(output.status.code(), Some(3), "{command:?}");
-        let rendered = String::from_utf8(output.stdout).unwrap();
-        assert!(rendered.contains("not implemented"), "{rendered}");
-        assert!(rendered.contains("section 4"), "{rendered}");
-    }
-}
-
-#[test]
 fn default_sessions_root_follows_codex_home() {
     let fixture = Fixture::new();
     fixture.rollout(

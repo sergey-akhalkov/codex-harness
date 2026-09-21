@@ -1,20 +1,21 @@
 //! Thin binary over the `token-audit` library.
 use std::{env, io, io::Write, path::PathBuf, process::ExitCode};
 use token_audit::{
-    Format, SCHEMA_VERSION, ScanOptions, analyze, default_sessions_root, now, render_findings_json,
-    render_findings_text, render_json, render_text, scan, write_private_sources,
+    BaselineDiff, Format, SCHEMA_VERSION, ScanOptions, analyze, baseline_diff,
+    default_baseline_directory, default_sessions_root, now, render_findings_json,
+    render_findings_text, render_json, render_text, resolve_baseline, save_baseline, scan,
+    write_private_sources,
 };
 
 const USAGE: &str = "\
 token-audit report [--sessions DIR] [--days N] [--format json|text] [--private-sources PATH]
 token-audit findings [--sessions DIR] [--days N] [--format json|text] [--all-bases]
-token-audit baseline save|diff [--days N] [--format json|text]
+token-audit baseline save [--sessions DIR] [--days N] [--format json|text]
+token-audit baseline diff [--sessions DIR] [--days N] [--format json|text] [--baseline NAME|latest]
 Measured token-usage reports over local Codex rollout sessions: recorded counters, instruction bytes and coverage. No currency, quota or transcript content.
 Project identities are hashed; --private-sources PATH records local source digests and raw project names there instead, outside tracked sources.
 --days N bounds the scan to sessions with recorded activity within N days.
 Exit codes: 0 success, 2 usage or input error, 3 command not implemented.";
-
-const SECTION_BASELINE: &str = "section 4 (baseline)";
 
 fn main() -> ExitCode {
     match run(&env::args().skip(1).collect::<Vec<_>>()) {
@@ -74,31 +75,16 @@ fn report(args: &[String]) -> io::Result<ExitCode> {
     emit(&rendered).map(|()| ExitCode::SUCCESS)
 }
 
-fn skeleton(command: &str, section: &str, args: &[String]) -> io::Result<ExitCode> {
-    if requests_help(args) {
-        return emit(USAGE).map(|()| ExitCode::SUCCESS);
+fn baseline(args: &[String]) -> io::Result<ExitCode> {
+    match args.first().map(String::as_str) {
+        Some("save") => baseline_run(&args[1..], false),
+        Some("diff") => baseline_run(&args[1..], true),
+        Some("-h" | "--help" | "help") => emit(USAGE).map(|()| ExitCode::SUCCESS),
+        Some(other) => Err(invalid(format!(
+            "unknown baseline subcommand {other}\n{USAGE}"
+        ))),
+        None => Err(invalid(format!("baseline requires save or diff\n{USAGE}"))),
     }
-    let options = Options::parse(args)?;
-    let message =
-        format!("{command} is not implemented in this build (change token-audit {section})");
-    let rendered = match options.format() {
-        Format::Json => format!(
-            "{}\n",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
-                "command": command,
-                "status": "not_implemented",
-                "section": section,
-                "message": message,
-            }))
-            .map_err(io::Error::other)?
-        ),
-        Format::Text => {
-            format!("token-audit {command}: not implemented ({section}); no results produced\n")
-        }
-    };
-    emit(&rendered)?;
-    Ok(ExitCode::from(3))
 }
 
 fn findings(args: &[String]) -> io::Result<ExitCode> {
@@ -107,6 +93,9 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
     }
     let mut options = Options::parse(args)?;
     let all_bases = options.take_all_bases();
+    if options.baseline.is_some() {
+        return Err(invalid("--baseline applies to baseline diff only"));
+    }
     let root = match &options.sessions {
         Some(root) => root.clone(),
         None => default_sessions_root().ok_or_else(|| {
@@ -135,16 +124,119 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
     emit(&rendered).map(|()| ExitCode::SUCCESS)
 }
 
-fn baseline(args: &[String]) -> io::Result<ExitCode> {
-    match args.first().map(String::as_str) {
-        Some("save") => skeleton("baseline save", SECTION_BASELINE, &args[1..]),
-        Some("diff") => skeleton("baseline diff", SECTION_BASELINE, &args[1..]),
-        Some("-h" | "--help" | "help") => emit(USAGE).map(|()| ExitCode::SUCCESS),
-        Some(other) => Err(invalid(format!(
-            "unknown baseline subcommand {other}\n{USAGE}"
-        ))),
-        None => Err(invalid(format!("baseline requires save or diff\n{USAGE}"))),
+fn baseline_run(args: &[String], diff_mode: bool) -> io::Result<ExitCode> {
+    if requests_help(args) {
+        return emit(USAGE).map(|()| ExitCode::SUCCESS);
     }
+    let mut options = Options::parse(args)?;
+    if options.all_bases {
+        return Err(invalid("--all-bases applies to findings only"));
+    }
+    let requested = options.take_baseline();
+    let root = match &options.sessions {
+        Some(root) => root.clone(),
+        None => default_sessions_root().ok_or_else(|| {
+            invalid("CODEX_HOME or USERPROFILE is required; pass --sessions DIRECTORY")
+        })?,
+    };
+    if !root.exists() {
+        return Err(invalid(format!(
+            "sessions directory not found: {}; pass --sessions DIRECTORY or set CODEX_HOME",
+            root.display()
+        )));
+    }
+    let directory = default_baseline_directory().ok_or_else(|| {
+        invalid("CODEX_HOME or USERPROFILE is required for the baseline directory")
+    })?;
+    let scanned = scan(&ScanOptions {
+        sessions_root: root,
+        days: options.days,
+        generated_at: now(),
+    })?;
+    if !diff_mode {
+        let name = save_baseline(&directory, &scanned)?;
+        let rendered = match options.format() {
+            Format::Json => serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "command": "baseline save",
+                "baseline": name,
+                "directory": directory.display().to_string(),
+            }))
+            .map_err(io::Error::other)?,
+            Format::Text => format!(
+                "token-audit baseline save  {}\n  directory {}\n",
+                name,
+                directory.display()
+            ),
+        };
+        return emit(&rendered).map(|()| ExitCode::SUCCESS);
+    }
+    let requested = requested.as_deref().or(Some("latest"));
+    let path = resolve_baseline(&directory, requested)?;
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("baseline")
+        .to_owned();
+    let analyzed = baseline_diff(&path, &name, &scanned)?;
+    let rendered = match options.format() {
+        Format::Json => serde_json::to_string_pretty(&analyzed)
+            .map(|rendered| format!("{rendered}\n"))
+            .map_err(io::Error::other)?,
+        Format::Text => render_baseline_text(&analyzed),
+    };
+    emit(&rendered).map(|()| ExitCode::SUCCESS)
+}
+
+fn render_baseline_text(diff: &BaselineDiff) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "token-audit baseline diff  generated={}  baseline={}\n",
+        diff.generated_at, diff.baseline
+    ));
+    if !diff.compatible {
+        out.push_str(&format!(
+            "incompatible snapshot: {}\n",
+            diff.incompatibility.as_deref().unwrap_or("unknown")
+        ));
+    }
+    out.push_str(&format!(
+        "totals sessions {} -> {}  total_tokens {:?} -> {:?}  delta {:?}\n",
+        diff.totals.baseline_sessions,
+        diff.totals.current_sessions,
+        diff.totals.baseline_total_tokens,
+        diff.totals.current_total_tokens,
+        diff.totals.delta_total_tokens
+    ));
+    for movement in &diff.sessions {
+        out.push_str(&format!(
+            "session {} status={} total {:?} -> {:?} delta {:?}\n",
+            movement.session_id,
+            movement.status,
+            movement.baseline_total_tokens,
+            movement.current_total_tokens,
+            movement.delta_total_tokens
+        ));
+    }
+    for (label, buckets) in [
+        ("project", &diff.by_project),
+        ("model", &diff.by_model),
+        ("day", &diff.by_day),
+    ] {
+        for movement in buckets {
+            out.push_str(&format!(
+                "{label} {} sessions {} -> {} total {:?} -> {:?} delta {:?}\n",
+                movement.key,
+                movement.baseline_sessions,
+                movement.current_sessions,
+                movement.baseline_total_tokens,
+                movement.current_total_tokens,
+                movement.delta_total_tokens
+            ));
+        }
+    }
+    out.push_str(&format!("limitation {}\n", diff.limitation));
+    out
 }
 
 fn requests_help(args: &[String]) -> bool {
@@ -169,6 +261,7 @@ struct Options {
     format: Option<Format>,
     private_sources: Option<PathBuf>,
     all_bases: bool,
+    baseline: Option<String>,
 }
 
 impl Options {
@@ -196,6 +289,7 @@ impl Options {
                 "--sessions" => options.sessions = Some(PathBuf::from(value()?)),
                 "--private-sources" => options.private_sources = Some(PathBuf::from(value()?)),
                 "--all-bases" => options.all_bases = true,
+                "--baseline" => options.baseline = Some(value()?),
                 "--days" => {
                     let raw = value()?;
                     options.days = Some(
@@ -221,6 +315,11 @@ impl Options {
     /// Extracts the findings-only flag before shared validation runs.
     fn take_all_bases(&mut self) -> bool {
         std::mem::take(&mut self.all_bases)
+    }
+
+    /// Extracts the baseline-selection flag shared by the diff subcommand.
+    fn take_baseline(&mut self) -> Option<String> {
+        self.baseline.take()
     }
 
     fn format(&self) -> Format {

@@ -1,6 +1,6 @@
 //! Report data model shared by the analyzer, the renderers and the tests.
 use harness_core::rollout_reader::Usage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Recorded cumulative thread snapshot, either older `event_msg` counts or the
@@ -43,7 +43,7 @@ impl Format {
 }
 
 /// Recorded token counters of one session, response set or aggregate.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenTotals {
     pub input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
@@ -116,7 +116,7 @@ pub struct SessionContext {
 }
 
 /// Context economics of an aggregate bucket, summed over its sessions.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextAggregate {
     pub cached_input_ratio: Option<f64>,
     pub summed_turn_input_tokens: Option<u64>,
@@ -163,7 +163,7 @@ pub struct SessionRow {
 /// counter stays `null` when no session in the bucket recorded it. Sessions
 /// whose recorded totals come from different bases are summed together, which
 /// `usage_basis` makes visible per bucket.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bucket {
     pub key: String,
     pub sessions: usize,

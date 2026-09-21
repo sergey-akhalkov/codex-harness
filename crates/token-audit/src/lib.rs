@@ -6,12 +6,18 @@
 //! day. Every reported quantity is a recorded rollout value: token counters,
 //! byte sizes or coverage counters. Project identities are hashed by default,
 //! and conversation content is never retained or reported.
+mod baseline;
 mod findings;
 mod identity;
 mod model;
 mod render;
 mod report;
 
+pub use baseline::{
+    BASELINE_SCHEMA_VERSION, BaselineDiff, BaselineSnapshot,
+    default_directory as default_baseline_directory, diff as baseline_diff,
+    resolve as resolve_baseline, save as save_baseline, snapshot as baseline_snapshot,
+};
 pub use findings::{Finding, FindingEvidence, FindingsReport, ValidationPlan, analyze};
 pub use identity::write_private_sources;
 pub use model::{
