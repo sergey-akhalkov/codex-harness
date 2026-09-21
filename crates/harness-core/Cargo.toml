@@ -10,6 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 toml = { version = "=0.9.11", default-features = false, features = ["std", "serde", "parse", "display"] }
 base64 = "=0.22.1"
 flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
