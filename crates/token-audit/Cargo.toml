@@ -1,0 +1,18 @@
+[package]
+name = "token-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Measured token-usage reports over local Codex rollout sessions"
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }

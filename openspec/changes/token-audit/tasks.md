@@ -11,18 +11,18 @@
 
 ## 2. Analyzer report
 
-- [ ] 2.1 Add the `crates/token-audit` workspace member (library plus thin
+- [x] 2.1 Add the `crates/token-audit` workspace member (library plus thin
   binary) with `report`/`findings`/`baseline` command skeletons, JSON and
   text output, and `--days`/`--format` options; verify `cargo test -p
   token-audit` runs the skeleton CLI tests
-- [ ] 2.2 Implement sessions-directory discovery and streaming aggregation
+- [x] 2.2 Implement sessions-directory discovery and streaming aggregation
   per session, project, model, effort and day with response deduplication
   and coverage warnings; verify with synthetic mixed-format fixtures whose
   golden aggregates are asserted
-- [ ] 2.3 Hash project/workspace identities by default and honor
+- [x] 2.3 Hash project/workspace identities by default and honor
   `--private-sources`; verify with a redaction test asserting that default
   output contains no raw local paths and no transcript content
-- [ ] 2.4 Add context economics metrics (cache efficiency, context
+- [x] 2.4 Add context economics metrics (cache efficiency, context
   repayment multiplier, instruction-floor bytes, unavailable marker for
   missing turn identity); verify with fixture tests including a marathon
   session and a session without turn-identified usage
