@@ -467,7 +467,11 @@ fn compressed(raw: &[u8], filter: &str) -> io::Result<Vec<u8>> {
     let error = errors
         .join()
         .map_err(|_| io::Error::other("filter stderr reader failed"))??;
-    if timed_out || !status.success() || !error.is_empty() || output.len() > RAW_LIMIT {
+    if timed_out
+        || !status.success()
+        || stderr_reports_diagnostics(&error)
+        || output.len() > RAW_LIMIT
+    {
         return Err(io::Error::other(if timed_out {
             "filter timed out"
         } else {
@@ -475,6 +479,20 @@ fn compressed(raw: &[u8], filter: &str) -> io::Result<Vec<u8>> {
         }));
     }
     Ok(output)
+}
+
+/// The pinned `rtk.exe` prints a startup notice to stderr when its own global
+/// hook is absent - the normal kit configuration, because the kit owns the
+/// Codex hook instead of running `rtk init -g`. That one notice is not a filter
+/// diagnostic: only lines carrying it are ignored, so every other stderr byte
+/// keeps the compression path fail-closed.
+fn stderr_reports_diagnostics(error: &[u8]) -> bool {
+    String::from_utf8_lossy(error)
+        .lines()
+        .map(str::trim)
+        .any(|line| {
+            !line.is_empty() && !(line.starts_with("[rtk]") && line.contains("No hook installed"))
+        })
 }
 
 fn filter(mut input: impl Read, name: &str, source: Option<&str>) -> io::Result<()> {

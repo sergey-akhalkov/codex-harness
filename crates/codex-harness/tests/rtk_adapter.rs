@@ -515,6 +515,57 @@ fn compact_mints_a_handle_and_recall_returns_the_exact_window() {
 }
 
 #[test]
+fn compact_tolerates_the_pinned_rtk_startup_banner_but_not_other_stderr() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+
+    // The real pinned `rtk.exe` announces on stderr that its own global hook
+    // is absent; the kit configuration never installs that hook, so a banner
+    // like this must not disable compression or handle minting.
+    let compact = invoke_with_env(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_BANNER", "1")],
+    );
+    assert!(
+        compact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let text = String::from_utf8(compact.stdout.clone()).unwrap();
+    assert!(text.starts_with("fixture-pipe git-log:"), "{text}");
+    let handle = packed_handle(&text);
+    assert!(pack_file(&home, &handle).is_file());
+
+    // Any other stderr content stays a filter diagnostic: the run keeps the
+    // raw locator and mints no handle.
+    let diagnostics = invoke_with_env(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_STDERR", "filter diagnostics")],
+    );
+    assert!(
+        diagnostics.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diagnostics.stderr)
+    );
+    let raw = String::from_utf8(diagnostics.stdout.clone()).unwrap();
+    let expected = command_output(&command, &["log", "-n", "300"], &workspace);
+    assert_eq!(raw.as_bytes(), expected.as_slice());
+    assert!(!raw.contains("[rtk pack:"), "{raw}");
+}
+
+#[test]
 fn compact_falls_back_to_todays_output_when_packing_is_unavailable() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

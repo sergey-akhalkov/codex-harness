@@ -31,6 +31,14 @@ fn run(role: &str, args: &[String]) -> io::Result<()> {
             if name == "fixture-fail" {
                 return Err(io::Error::other("requested filter failure"));
             }
+            if std::env::var_os("HARNESS_RTK_FIXTURE_BANNER").is_some() {
+                eprintln!(
+                    "[rtk] /!\\ No hook installed — run `rtk init -g` for automatic token savings"
+                );
+            }
+            if let Some(message) = std::env::var_os("HARNESS_RTK_FIXTURE_STDERR") {
+                eprintln!("{}", message.to_string_lossy());
+            }
             let mut input = Vec::new();
             io::stdin().read_to_end(&mut input)?;
             let lines = input.iter().filter(|byte| **byte == b'\n').count();
