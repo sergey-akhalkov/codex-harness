@@ -175,10 +175,18 @@ settings; they never acquire packages. Missing packages remain explicit and are
 provisioned through the explicit [dependency lifecycle](code-tools.md).
 
 Source data is read live by a new Codex process without another install.
-Executable changes require an explicit `build` plus `update`; a source-stale
-build is reported by Check with its update action, and ordinary launch never
-compiles. After adding or removing a top-level skill directory, rerun `update`
-to reconcile its registration; repeated installation is idempotent.
+Launch admission follows recorded binary integrity only: while the delivered
+build's binaries and metadata verify, ordinary launches keep using it even
+after the checkout moves ahead or becomes unavailable, and nothing recompiles,
+downloads or rewrites configuration at consumer startup. Check, diagnose and
+deploy receipts still state the source-stale or source-unavailable
+relationship with its action, and an explicit `build` plus `update` (or
+`deploy`) remains the only mechanism that moves new processes to a newer
+build; running sessions keep their immutable build until they finish. A
+missing, altered or metadata-incompatible build still refuses the affected
+runtime with its corrective action. After adding or removing a top-level skill
+directory, rerun `update` to reconcile its registration; repeated installation
+is idempotent.
 
 Core Install/Update deliver the freshest integrity-verified build of the owned
 state when `--build` is omitted; an explicit `--build` still selects exactly

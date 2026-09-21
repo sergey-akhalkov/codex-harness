@@ -565,9 +565,12 @@ compilation has a 30-minute deadline, a 2 GiB Job and a 50% CPU cap. This is
 separate from CodeGraph's 600-second indexing deadline and 25% CPU cap.
 Reusing Cargo's
 mtime cache across changed source hashes is unsafe even if the manifest uses
-content hashes. Changing native source/lock inputs makes Check stale;
-documentation-only changes do not require compilation. Missing or altered
-manager binaries require explicit Cargo bootstrap. Executable text resources
+content hashes. Changing native source/lock inputs makes Check stale while
+launches keep following the integrity-verified delivered build; an explicit
+build/update (deploy) switches new processes to the newer source.
+Documentation-only changes do not require compilation. Missing or altered
+manager binaries require explicit Cargo bootstrap and still refuse runtime.
+Executable text resources
 belong under crate `src`; source-owned skill/configuration data remains live
 filesystem input and must not be embedded in a deployed binary. Source
 subdirectories named `tests` or `examples` are included. Root documentation
@@ -686,8 +689,9 @@ operations. A cache held by another daemon is refused before launch. Missing
 CBM UI JSON is treated as enabled for the audited embedded-UI binary,
 regardless of SQLite settings. `mcp codebase-memory` connects explicit CBM
 paths and a saved catalogue report to a bounded native stdio connection. The
-installed MCP entry requires the build receipt's `runtime_allowed` decision;
-source-stale runtimes are rejected. The optional `--broker-root` route passed
+installed MCP entry requires the build receipt's `runtime_allowed` decision,
+which follows recorded binary integrity and stays true for a stale or
+unavailable checkout. The optional `--broker-root` route passed
 an actual two-client index/query/EOF scenario outside the checkout and requires
 a fresh private broker root for each service lifetime. Keep these CBM commands
 for rollback of the retired registration. Do not continue a CBM port; retire
