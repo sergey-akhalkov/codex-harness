@@ -152,6 +152,21 @@ fn run_fixture(args: &[std::ffi::OsString]) -> io::Result<i32> {
             fs::write(path, "mutated during execution\n")?;
             Ok(0)
         }
+        "repoint-input" => {
+            let link = extra
+                .first()
+                .ok_or_else(|| io::Error::other("link path required"))?;
+            let target = extra
+                .get(1)
+                .ok_or_else(|| io::Error::other("new target path required"))?;
+            signal_ready()?;
+            fs::remove_file(link)?;
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(target, link)?;
+            #[cfg(not(windows))]
+            std::os::unix::fs::symlink(target, link)?;
+            Ok(0)
+        }
         other => Err(io::Error::other(format!("unknown fixture role {other}"))),
     }
 }

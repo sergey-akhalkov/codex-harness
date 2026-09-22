@@ -30,6 +30,20 @@ fn declared_input(root: &Path) -> (PathBuf, PathBuf) {
     (cwd, input)
 }
 
+fn link_file(target: &Path, link: &Path) {
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
 /// Invokes `harness-observe` with the given flags and fixture role.
 fn invoke(cwd: &Path, extra: &[&str], role: &str, role_args: &[&str]) -> (i32, Value) {
     let observe = observe();
@@ -77,21 +91,31 @@ fn success_records_scope_executable_inputs_and_explicit_non_git_identity() {
         verification["cwd"],
         fs::canonicalize(&cwd).unwrap().to_string_lossy().as_ref()
     );
-    assert_eq!(verification["argv0"], observe().to_string_lossy().as_ref());
+    assert_eq!(
+        verification["argv"][0],
+        observe().to_string_lossy().as_ref()
+    );
+    assert_eq!(verification["argv"][1], "--fixture");
     let executable = &verification["executable"];
     assert!(
-        executable["resolved"]
+        executable["resolved_before"]
             .as_str()
             .unwrap()
             .to_lowercase()
             .ends_with("harness-observe.exe"),
         "{executable}"
     );
+    assert_eq!(executable["resolved_after"], executable["resolved_before"]);
     assert_eq!(executable["sha256_before"].as_str().unwrap().len(), 64);
     assert_eq!(executable["sha256_after"], executable["sha256_before"]);
     assert_eq!(executable["state"], "unchanged");
     let recorded = &verification["inputs"][0];
     assert_eq!(recorded["path"], input.to_string_lossy().as_ref());
+    assert_eq!(
+        recorded["resolved_before"],
+        fs::canonicalize(&input).unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(recorded["resolved_after"], recorded["resolved_before"]);
     assert_eq!(recorded["bytes_before"], "declared input\n".len());
     assert_eq!(recorded["state"], "unchanged");
     assert!(recorded["unavailable"].is_null());
@@ -155,7 +179,89 @@ fn mutated_input_keeps_the_natural_exit_without_claiming_unchanged_verification(
 }
 
 #[test]
-fn missing_linked_or_empty_declarations_fail_before_any_case_state_exists() {
+fn linked_inputs_resolve_to_their_target_and_record_a_repointed_link() {
+    let root = evidence("linked");
+    let (cwd, _unused) = declared_input(&root);
+
+    // A declared input may be a link: installed skills and consumer paths use
+    // links and junctions, so a read-only capture resolves them to the target.
+    let target = root.join("target.txt");
+    fs::write(&target, "target content\n").unwrap();
+    let link = root.join("linked.txt");
+    link_file(&target, &link);
+    // A linked parent directory is equally ordinary for a declared input.
+    let real_dir = root.join("real-dir");
+    fs::create_dir(&real_dir).unwrap();
+    let dir_input = real_dir.join("input.txt");
+    fs::write(&dir_input, "through a directory link\n").unwrap();
+    let linked_dir = root.join("linked-dir");
+    link_dir(&real_dir, &linked_dir);
+    let linked_input = linked_dir.join("input.txt");
+
+    let (code, result) = invoke(
+        &cwd,
+        &[
+            "--timeout",
+            "10",
+            "--scope",
+            "linked input check",
+            "--input",
+            link.to_str().unwrap(),
+            "--input",
+            linked_input.to_str().unwrap(),
+        ],
+        "ok",
+        &[],
+    );
+    assert_eq!(code, 0, "{result}");
+    let records = result["verification"]["inputs"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["path"], link.to_string_lossy().as_ref());
+    assert_eq!(
+        records[0]["resolved_before"],
+        fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(records[0]["state"], "unchanged");
+    assert_eq!(records[1]["path"], linked_input.to_string_lossy().as_ref());
+    assert_eq!(
+        records[1]["resolved_before"],
+        fs::canonicalize(&dir_input)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(records[1]["state"], "unchanged");
+
+    // A link repointed during execution is a changed input identity even
+    // though the declared path itself is unchanged.
+    let replacement = root.join("replacement.txt");
+    fs::write(&replacement, "replacement content\n").unwrap();
+    let (code, result) = invoke(
+        &cwd,
+        &[
+            "--timeout",
+            "10",
+            "--scope",
+            "repointed link check",
+            "--input",
+            link.to_str().unwrap(),
+        ],
+        "repoint-input",
+        &[link.to_str().unwrap(), replacement.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "{result}");
+    let record = &result["verification"]["inputs"][0];
+    assert_eq!(record["state"], "changed", "{record}");
+    assert_ne!(record["resolved_before"], record["resolved_after"]);
+    assert_ne!(record["sha256_before"], record["sha256_after"]);
+    assert_eq!(fs::read_to_string(&link).unwrap(), "replacement content\n");
+}
+
+#[test]
+fn missing_or_non_file_declarations_fail_before_any_case_state_exists() {
     let root = evidence("refusal");
     let (cwd, input) = declared_input(&root);
 
@@ -185,23 +291,18 @@ fn missing_linked_or_empty_declarations_fail_before_any_case_state_exists() {
         "a refused declaration creates no case state"
     );
 
-    let foreign = root.join("foreign.txt");
-    fs::write(&foreign, "foreign").unwrap();
-    let link = root.join("linked.txt");
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&foreign, &link).unwrap();
-    #[cfg(not(windows))]
-    std::os::unix::fs::symlink(&foreign, &link).unwrap();
-    let case = root.join("case-linked");
+    let directory = root.join("directory-input");
+    fs::create_dir(&directory).unwrap();
+    let case = root.join("case-directory");
     let (code, result) = invoke(
         &cwd,
         &[
             "--timeout",
             "5",
             "--scope",
-            "escaped input",
+            "directory input",
             "--input",
-            link.to_str().unwrap(),
+            directory.to_str().unwrap(),
             "--root",
             case.to_str().unwrap(),
         ],
@@ -210,8 +311,7 @@ fn missing_linked_or_empty_declarations_fail_before_any_case_state_exists() {
     );
     assert_eq!(code, 2, "{result}");
     let error = result["cli_error"].as_str().unwrap();
-    assert!(error.contains("is a link"), "{error}");
-    assert_eq!(fs::read_to_string(&foreign).unwrap(), "foreign");
+    assert!(error.contains("is a directory"), "{error}");
     assert!(
         !case.exists(),
         "a refused declaration creates no case state"
@@ -313,6 +413,51 @@ fn git_identity_records_head_and_bounded_status_inside_a_repository() {
         "{git}"
     );
     assert_eq!(git["status_truncated"], false);
+}
+
+#[test]
+fn infrastructure_failure_keeps_argv_and_declared_inputs() {
+    let root = evidence("infra");
+    let (cwd, input) = declared_input(&root);
+    let missing = root.join("missing.exe");
+    let observe = observe();
+    let output = Command::new(&observe)
+        .args([
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--timeout",
+            "5",
+            "--scope",
+            "missing executable check",
+            "--input",
+            input.to_str().unwrap(),
+            "--",
+        ])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "infrastructure-failure");
+    let verification = &result["verification"];
+    assert_eq!(verification["argv"][0], missing.to_string_lossy().as_ref());
+    assert_eq!(verification["executable"]["state"], "unavailable");
+    assert!(
+        !verification["executable"]["unavailable"]
+            .as_str()
+            .unwrap()
+            .is_empty(),
+        "{verification}"
+    );
+    assert_eq!(verification["inputs"][0]["state"], "unchanged");
+    // The written receipt keeps the upfront argv even though the launch failed.
+    let case = PathBuf::from(result["root"].as_str().unwrap());
+    let observed: Value =
+        serde_json::from_slice(&fs::read(case.join("observed.json")).unwrap()).unwrap();
+    assert_eq!(
+        observed["verification"]["argv"][0],
+        missing.to_string_lossy().as_ref()
+    );
 }
 
 #[test]

@@ -81,7 +81,7 @@ pub fn run_case(request: CaseRequest) -> io::Result<Value> {
     let capture = verification_record::Capture::begin(
         request.scope.as_deref(),
         &request.cwd,
-        Path::new(&request.argv[0]),
+        &request.argv,
         &request.inputs,
     )?;
     let started = Instant::now();

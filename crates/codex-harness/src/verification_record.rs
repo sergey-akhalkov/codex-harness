@@ -1,12 +1,15 @@
 //! Optional verification records for `harness-observe`.
 //!
-//! A record documents one execution: the declared scope, the actual
+//! A record documents one execution: the declared scope, the actual argv,
 //! executable and working directory, bounded Git HEAD/status, and content
 //! identities of explicitly declared input files before and after the child
 //! ran. It never accepts a task, never reuses a previous pass and never claims
 //! coverage of unlisted files or external runtime state.
+//!
+//! Declared inputs are read-only: a link or junction resolves to its target,
+//! and the record keeps both the requested path and the resolved identity.
 
-use harness_core::{build_identity, inventory};
+use harness_core::build_identity;
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs;
@@ -40,8 +43,9 @@ pub fn validate_scope(scope: Option<&str>) -> io::Result<()> {
 }
 
 /// Validates declared inputs before any case state exists. A declared input
-/// must be an ordinary regular file at an absolute, link-free path, so a
-/// missing or escaped declaration fails before the command is launched.
+/// must be an absolute path resolving to an existing regular file; links and
+/// junctions are followed to their target, so a missing or non-file
+/// declaration fails before the command is launched.
 pub fn validate_inputs(inputs: &[PathBuf]) -> io::Result<()> {
     for path in inputs {
         if !path.is_absolute() {
@@ -50,41 +54,27 @@ pub fn validate_inputs(inputs: &[PathBuf]) -> io::Result<()> {
                 path.display()
             )));
         }
-        let metadata = fs::symlink_metadata(path).map_err(|error| {
+        let metadata = fs::metadata(path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 invalid(format!(
-                    "declared input is missing: {}; declare an existing regular file",
+                    "declared input is missing or links to nothing: {}; declare an existing regular file",
                     path.display()
                 ))
             } else {
                 error
             }
         })?;
-        if !metadata.file_type().is_file() {
-            let kind = if metadata.file_type().is_symlink() {
-                "a link"
-            } else if metadata.is_dir() {
-                "a directory"
-            } else {
-                "not a regular file"
-            };
+        if !metadata.is_file() {
             return Err(invalid(format!(
-                "declared input must be a regular file, but {} is {kind}",
-                path.display()
+                "declared input must be a regular file, but {} is {}",
+                path.display(),
+                if metadata.is_dir() {
+                    "a directory"
+                } else {
+                    "not a regular file"
+                }
             )));
         }
-        build_identity::ordinary(path).map_err(|error| {
-            invalid(format!(
-                "declared input must be an ordinary file ({}): {error}",
-                path.display()
-            ))
-        })?;
-        inventory::ordinary_parents(path).map_err(|error| {
-            invalid(format!(
-                "declared input must not travel through a link or reparse point ({}): {error}",
-                path.display()
-            ))
-        })?;
     }
     Ok(())
 }
@@ -94,6 +84,7 @@ pub fn validate_inputs(inputs: &[PathBuf]) -> io::Result<()> {
 pub struct Capture {
     scope: Option<String>,
     cwd: PathBuf,
+    argv: Vec<String>,
     executable: PathBuf,
     inputs: Vec<PathBuf>,
     before: Snapshot,
@@ -101,11 +92,12 @@ pub struct Capture {
 
 impl Capture {
     /// Starts a capture when the caller declared a scope or inputs. Requests
-    /// without a declaration keep their previous receipt unchanged.
+    /// without a declaration keep their previous receipt unchanged. The full
+    /// argv is captured upfront so it survives an infrastructure failure.
     pub fn begin(
         scope: Option<&str>,
         cwd: &Path,
-        executable: &Path,
+        argv: &[String],
         inputs: &[PathBuf],
     ) -> io::Result<Option<Self>> {
         if scope.is_none() && inputs.is_empty() {
@@ -113,13 +105,17 @@ impl Capture {
         }
         validate_scope(scope)?;
         validate_inputs(inputs)?;
+        let executable = argv
+            .first()
+            .ok_or_else(|| invalid("verification capture needs the command argv"))?;
         let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned());
-        let executable = executable.to_owned();
+        let executable = PathBuf::from(executable);
         let inputs = inputs.to_vec();
         let before = Snapshot::capture(&executable, &inputs, &cwd);
         Ok(Some(Self {
             scope: scope.map(str::to_owned),
             cwd,
+            argv: argv.to_vec(),
             executable,
             inputs,
             before,
@@ -132,7 +128,7 @@ impl Capture {
         json!({
             "scope": self.scope,
             "cwd": path_string(&self.cwd),
-            "argv0": path_string(&self.executable),
+            "argv": self.argv,
             "executable": self.before.executable.merged(&after.executable),
             "inputs": self
                 .before
@@ -194,20 +190,26 @@ impl Identity {
     }
 
     /// Before/after identities with an explicit unchanged, changed or
-    /// unavailable state.
+    /// unavailable state. A repointed link changes the resolved identity even
+    /// when both targets hold equal content.
     fn merged(&self, after: &Self) -> Value {
-        let state = match (&self.sha256, &after.sha256) {
-            (Some(before), Some(after)) if before == after => "unchanged",
-            (Some(_), Some(_)) => "changed",
+        let state = match (&self.sha256, &after.sha256, &self.resolved, &after.resolved) {
+            (Some(before), Some(after), Some(resolved_before), Some(resolved_after))
+                if before == after && resolved_before == resolved_after =>
+            {
+                "unchanged"
+            }
+            (Some(_), Some(_), Some(_), Some(_)) => "changed",
             _ => "unavailable",
         };
         json!({
             "path": path_string(&self.path),
-            "resolved": self.resolved.as_deref().or(after.resolved.as_deref()),
+            "resolved_before": self.resolved.as_deref(),
+            "resolved_after": after.resolved.as_deref(),
             "bytes_before": self.bytes,
             "bytes_after": after.bytes,
-            "sha256_before": self.sha256,
-            "sha256_after": after.sha256,
+            "sha256_before": self.sha256.as_deref(),
+            "sha256_after": after.sha256.as_deref(),
             "state": state,
             "unavailable": self.unavailable.as_deref().or(after.unavailable.as_deref()),
         })
