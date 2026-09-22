@@ -77,11 +77,7 @@ fn report(args: &[String]) -> io::Result<ExitCode> {
     let rendered = match options.format() {
         Format::Json => render_json(&scanned.report),
         Format::Text => {
-            let detail = retain_complete(
-                RetainedKind::Report,
-                &scanned.report.generated_at,
-                &render_json(&scanned.report),
-            );
+            let detail = retain_complete(RetainedKind::Report, &render_json(&scanned.report));
             render_text(&scanned.report, &detail)
         }
     };
@@ -133,11 +129,7 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
     let rendered = match options.format() {
         Format::Json => render_findings_json(&analyzed),
         Format::Text => {
-            let detail = retain_complete(
-                RetainedKind::Findings,
-                &analyzed.generated_at,
-                &render_findings_json(&analyzed),
-            );
+            let detail = retain_complete(RetainedKind::Findings, &render_findings_json(&analyzed));
             render_findings_text(&analyzed, &detail)
         }
     };
@@ -145,13 +137,13 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
 }
 
 /// Retains the complete same-scan JSON that a bounded presentation summarizes.
-fn retain_complete(kind: RetainedKind, generated_at: &str, complete_json: &str) -> Detail {
+fn retain_complete(kind: RetainedKind, complete_json: &str) -> Detail {
     let Some(directory) = default_retention_directory() else {
         return Detail::Unavailable(
             "CODEX_HOME or USERPROFILE is required to retain the complete report".to_owned(),
         );
     };
-    retain_detail(&directory, kind, generated_at, complete_json)
+    retain_detail(&directory, kind, complete_json)
         .unwrap_or_else(|error| Detail::Unavailable(error.to_string()))
 }
 

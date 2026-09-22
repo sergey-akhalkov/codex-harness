@@ -7,19 +7,49 @@
 //! [`RETENTION_LIMIT`] files per kind; an evicted or expired record is an
 //! explicit error. A detail read selects records from a retained file only:
 //! it never rescans rollout sessions, calls a model or touches the network.
+//!
+//! Every run's locator carries that run's unique creation identity, so a name
+//! is never reused: an evicted locator stays missing instead of resolving to a
+//! later scan, and the scan timestamp lives only inside the record.
 
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Newest retained files kept per kind (`report` and `findings`).
 pub const RETENTION_LIMIT: usize = 20;
 
-/// Upper bound of same-timestamp locator collisions resolved by suffixing.
-const SAME_STAMP_LIMIT: u32 = 1000;
+/// Create-new attempts before a locator conflict is reported.
+const IDENTITY_ATTEMPTS: u32 = 1000;
+
+/// Digits of a zero-padded identity: epoch seconds plus nanoseconds.
+const IDENTITY_WIDTH: usize = 19;
+
+/// Unique identity of one retained run: epoch nanoseconds. Names sort by
+/// identity, so retention order is creation order and an evicted name is never
+/// reused.
+fn run_identity() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    elapsed
+        .as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(elapsed.subsec_nanos()))
+}
+
+/// Locator file name carrying one run's unique identity.
+fn locator_name(kind: Kind, identity: u64) -> String {
+    format!(
+        "{}-{identity:0width$}.json",
+        kind.name(),
+        width = IDENTITY_WIDTH
+    )
+}
 
 /// Kind of complete same-scan JSON retained for detail reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,45 +137,37 @@ pub fn default_directory() -> Option<PathBuf> {
 }
 
 /// Writes one complete same-scan JSON record and prunes older files of the
-/// same kind beyond [`RETENTION_LIMIT`]. Pruning only ever removes files whose
-/// name this module created; unrelated files stay untouched. `generated_at`
-/// has second resolution, so every run reserves its own create-new locator and
-/// never overwrites another run's record.
-pub fn retain(directory: &Path, kind: Kind, generated_at: &str, json: &str) -> io::Result<Detail> {
+/// same kind beyond [`RETENTION_LIMIT`]. Each run reserves its own create-new
+/// locator named by that run's unique identity, so no run overwrites or evicts
+/// another run's record. Pruning only ever removes files whose name this
+/// module created; unrelated files stay untouched.
+pub fn retain(directory: &Path, kind: Kind, json: &str) -> io::Result<Detail> {
     fs::create_dir_all(directory)?;
-    let stamp: String = generated_at.chars().filter(char::is_ascii_digit).collect();
-    if stamp.is_empty() {
-        return Err(io::Error::other(
-            "generated_at carries no timestamp digits for retention",
-        ));
-    }
-    let path = reserve(directory, kind, &stamp)?;
+    let path = reserve(directory, kind)?;
     if let Err(error) = write_complete(&path, json) {
         let _ = fs::remove_file(&path);
         return Err(error);
     }
-    let warning = prune(directory, kind)?;
+    let warning = prune(directory, kind, &path)?;
     Ok(Detail::Retained { path, warning })
 }
 
-/// Reserves the first create-new locator for this run, suffixing the sequence
-/// when another run already used the same timestamp.
-fn reserve(directory: &Path, kind: Kind, stamp: &str) -> io::Result<PathBuf> {
-    for sequence in 0..SAME_STAMP_LIMIT {
-        let name = if sequence == 0 {
-            format!("{}-{stamp}.json", kind.name())
-        } else {
-            format!("{}-{stamp}-{sequence}.json", kind.name())
-        };
-        let path = directory.join(name);
+/// Reserves this run's own create-new locator. A concurrent run that already
+/// holds the identity steps it forward until a free name is created.
+fn reserve(directory: &Path, kind: Kind) -> io::Result<PathBuf> {
+    let mut identity = run_identity();
+    for _ in 0..IDENTITY_ATTEMPTS {
+        let path = directory.join(locator_name(kind, identity));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(_) => return Ok(path),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                identity = identity.saturating_add(1);
+            }
             Err(error) => return Err(error),
         }
     }
     Err(io::Error::other(format!(
-        "no free retained name for {} among {SAME_STAMP_LIMIT} locators of stamp {stamp} in {}",
+        "no free retained name for {} among {IDENTITY_ATTEMPTS} identities in {}",
         kind.name(),
         directory.display()
     )))
@@ -171,64 +193,51 @@ fn write_complete(path: &Path, json: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes the oldest retained files of `kind` beyond [`RETENTION_LIMIT`].
-/// Returns a warning for the first file that could not be removed.
-fn prune(directory: &Path, kind: Kind) -> io::Result<Option<String>> {
-    let files = retained_files(directory, kind)?;
-    let excess = files.len().saturating_sub(RETENTION_LIMIT);
+/// Removes the oldest retained files of `kind` beyond [`RETENTION_LIMIT`],
+/// always keeping the run that just wrote `protected`. Returns a warning for
+/// the first file that could not be removed.
+fn prune(directory: &Path, kind: Kind, protected: &Path) -> io::Result<Option<String>> {
+    let older: Vec<PathBuf> = retained_files(directory, kind)?
+        .into_iter()
+        .filter(|(_, path)| path.as_path() != protected)
+        .map(|(_, path)| path)
+        .collect();
+    let excess = older.len().saturating_sub(RETENTION_LIMIT - 1);
     let mut warning = None;
-    for file in files.iter().take(excess) {
-        if let Err(error) = fs::remove_file(&file.path)
+    for path in older.iter().take(excess) {
+        if let Err(error) = fs::remove_file(path)
             && warning.is_none()
         {
-            warning = Some(format!("could not evict {}: {error}", file.path.display()));
+            warning = Some(format!("could not evict {}: {error}", path.display()));
         }
     }
     Ok(warning)
 }
 
-/// One retained file name parsed into its deterministic ordering key.
-struct RetainedFile {
-    path: PathBuf,
-    stamp: String,
-    sequence: u64,
-}
-
-/// Retained files of `kind`, oldest first by timestamp and collision sequence.
-fn retained_files(directory: &Path, kind: Kind) -> io::Result<Vec<RetainedFile>> {
+/// Retained files of `kind`, oldest first by creation identity.
+fn retained_files(directory: &Path, kind: Kind) -> io::Result<Vec<(u64, PathBuf)>> {
     let prefix = format!("{}-", kind.name());
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some((stamp, sequence)) = retained_name(&name, &prefix) {
-            files.push(RetainedFile {
-                path: entry.path(),
-                stamp,
-                sequence,
-            });
+        if let Some(identity) = retained_name(&name, &prefix) {
+            files.push((identity, entry.path()));
         }
     }
-    files.sort_by(|left, right| {
-        left.stamp
-            .cmp(&right.stamp)
-            .then(left.sequence.cmp(&right.sequence))
-    });
+    files.sort_by_key(|(identity, _)| *identity);
     Ok(files)
 }
 
-/// A retained name is `<kind>-<timestamp digits>.json`, or
-/// `<kind>-<timestamp digits>-<sequence>.json` after a collision.
-fn retained_name(name: &str, prefix: &str) -> Option<(String, u64)> {
-    let rest = name.strip_prefix(prefix)?.strip_suffix(".json")?;
-    let (stamp, sequence) = match rest.split_once('-') {
-        Some((stamp, sequence)) => (stamp, sequence.parse().ok()?),
-        None => (rest, 0),
-    };
-    if stamp.is_empty() || !stamp.chars().all(|c| c.is_ascii_digit()) {
+/// A retained name is `<kind>-<identity digits>.json` with the zero-padded
+/// identity width; any other name in the directory belongs to someone else and
+/// is never touched.
+fn retained_name(name: &str, prefix: &str) -> Option<u64> {
+    let identity = name.strip_prefix(prefix)?.strip_suffix(".json")?;
+    if identity.len() < IDENTITY_WIDTH || !identity.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some((stamp.to_owned(), sequence))
+    identity.parse().ok()
 }
 
 /// Resolves a retained detail path, failing explicitly when the record has
@@ -320,50 +329,6 @@ mod tests {
         names
     }
 
-    #[test]
-    fn retention_keeps_newest_files_per_kind_and_ignores_foreign_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let foreign = directory.path().join("notes.json");
-        fs::write(&foreign, "keep").unwrap();
-        let stamps: Vec<String> = (0..RETENTION_LIMIT + 3)
-            .map(|index| format!("2026-09-22T10:00:{index:02}.000000000Z"))
-            .collect();
-        for generated_at in &stamps {
-            retain(directory.path(), Kind::Report, generated_at, "{}").unwrap();
-        }
-        retain(
-            directory.path(),
-            Kind::Findings,
-            "2026-09-22T10:00:00.000000000Z",
-            "{}",
-        )
-        .unwrap();
-        let retained = names(directory.path());
-        let reports: Vec<&String> = retained
-            .iter()
-            .filter(|name| name.starts_with("report-"))
-            .collect();
-        assert_eq!(reports.len(), RETENTION_LIMIT);
-        assert_eq!(
-            retained
-                .iter()
-                .filter(|name| name.starts_with("findings-"))
-                .count(),
-            1
-        );
-        assert!(retained.contains(&"notes.json".to_owned()));
-        for evicted in &stamps[..3] {
-            let name = format!("report-{}.json", digits(evicted));
-            assert!(!retained.contains(&name), "{name} should be evicted");
-        }
-        let oldest_kept = format!("report-{}.json", digits(&stamps[3]));
-        assert!(retained.contains(&oldest_kept), "{oldest_kept} missing");
-    }
-
-    fn digits(value: &str) -> String {
-        value.chars().filter(char::is_ascii_digit).collect()
-    }
-
     fn retained_path(detail: Detail) -> PathBuf {
         match detail {
             Detail::Retained { path, .. } => path,
@@ -372,77 +337,89 @@ mod tests {
     }
 
     #[test]
-    fn identical_timestamps_keep_both_exact_records_with_distinct_locators() {
+    fn retention_keeps_newest_files_per_kind_and_ignores_foreign_files() {
         let directory = tempfile::tempdir().unwrap();
-        let stamp = "2026-09-22T10:00:00Z";
-        let first = retained_path(
-            retain(
-                directory.path(),
-                Kind::Report,
-                stamp,
-                "{\"scan\":\"first\"}",
-            )
-            .unwrap(),
-        );
-        let second = retained_path(
-            retain(
-                directory.path(),
-                Kind::Report,
-                stamp,
-                "{\"scan\":\"second\"}",
-            )
-            .unwrap(),
-        );
-        assert_ne!(first, second, "each run needs its own create-new locator");
-        assert_eq!(
-            fs::read_to_string(&first).unwrap(),
-            "{\"scan\":\"first\"}",
-            "the first locator keeps its own scan"
-        );
-        assert_eq!(
-            fs::read_to_string(&second).unwrap(),
-            "{\"scan\":\"second\"}",
-            "the second locator keeps its own scan"
-        );
-        let retained: Vec<String> = names(directory.path())
-            .into_iter()
+        let foreign = directory.path().join("notes.json");
+        fs::write(&foreign, "keep").unwrap();
+        let mut written = Vec::new();
+        for index in 0..RETENTION_LIMIT + 3 {
+            let payload = format!("{{\"scan\":{index}}}");
+            let path = retained_path(retain(directory.path(), Kind::Report, &payload).unwrap());
+            // A new locator is readable immediately: retention never evicts
+            // the run that just wrote its record.
+            assert_eq!(fs::read_to_string(&path).unwrap(), payload);
+            written.push(path);
+        }
+        retain(directory.path(), Kind::Findings, "{}").unwrap();
+        let retained = names(directory.path());
+        let reports: Vec<&String> = retained
+            .iter()
             .filter(|name| name.starts_with("report-"))
             .collect();
-        assert_eq!(retained.len(), 2, "{retained:?}");
-        assert!(retained.contains(&format!("report-{}.json", digits(stamp))));
-        assert!(retained.contains(&format!("report-{}-1.json", digits(stamp))));
+        assert_eq!(reports.len(), RETENTION_LIMIT, "{reports:?}");
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|name| name.starts_with("findings-"))
+                .count(),
+            1
+        );
+        assert!(retained.contains(&"notes.json".to_owned()));
+        for (index, path) in written.iter().enumerate() {
+            // The three oldest runs were evicted and stay evicted.
+            assert_eq!(path.exists(), index >= 3, "{} at {index}", path.display());
+        }
     }
 
     #[test]
-    fn same_timestamp_collisions_stay_bounded_and_evict_in_creation_order() {
+    fn identical_scan_timestamps_keep_each_run_until_its_locator_expires() {
         let directory = tempfile::tempdir().unwrap();
-        let stamp = "2026-09-22T10:00:00Z";
-        let total = RETENTION_LIMIT + 3;
-        let mut last = PathBuf::new();
-        for index in 0..total {
-            let payload = format!("{{\"scan\":{index}}}");
-            last = retained_path(retain(directory.path(), Kind::Report, stamp, &payload).unwrap());
+        let payload = |index: usize| {
+            format!("{{\"generated_at\":\"2026-09-22T10:00:00Z\",\"scan\":{index}}}")
+        };
+        let mut written = Vec::new();
+        for index in 0..RETENTION_LIMIT + 5 {
+            let path =
+                retained_path(retain(directory.path(), Kind::Report, &payload(index)).unwrap());
+            assert!(
+                !written.contains(&path),
+                "locator names are never reused: {}",
+                path.display()
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                payload(index),
+                "each run reads its own exact scan immediately"
+            );
+            written.push(path);
         }
-        let retained: Vec<String> = names(directory.path())
-            .into_iter()
-            .filter(|name| name.starts_with("report-"))
+        for (index, path) in written.iter().enumerate() {
+            if index < 5 {
+                // An evicted locator stays missing instead of resolving to a
+                // later scan.
+                assert!(!path.exists(), "{} at {index}", path.display());
+                assert_eq!(resolve(path).unwrap_err().kind(), io::ErrorKind::NotFound);
+            } else {
+                assert_eq!(
+                    fs::read_to_string(path).unwrap(),
+                    payload(index),
+                    "surviving locators keep their own scan"
+                );
+            }
+        }
+        // Name order is creation order, so eviction always removes the oldest
+        // retained run.
+        let created: Vec<String> = written
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(retained.len(), RETENTION_LIMIT, "{retained:?}");
-        assert_eq!(
-            fs::read_to_string(&last).unwrap(),
-            format!("{{\"scan\":{}}}", total - 1),
-            "the newest scan survives eviction"
-        );
-        let base = format!("report-{}.json", digits(stamp));
-        assert!(!retained.contains(&base), "oldest locator stays evicted");
-        let oldest_kept = format!("report-{}-3.json", digits(stamp));
-        assert!(retained.contains(&oldest_kept), "{retained:?}");
+        assert_eq!(created, names(directory.path()));
     }
 
     #[test]
     fn expired_detail_is_an_explicit_error() {
         let directory = tempfile::tempdir().unwrap();
-        let missing = directory.path().join("report-20260922100000000000000.json");
+        let missing = directory.path().join("report-1789000000000000000.json");
         let error = resolve(&missing).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         let message = error.to_string();

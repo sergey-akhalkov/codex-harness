@@ -231,8 +231,8 @@ fn successive_scans_keep_distinct_locators_and_their_own_records() {
     fixture.measured_sessions(&[10_000]);
     let first = locator(&fixture.report_text());
     // The recorded session grows and a second session appears in the next
-    // scan. Timestamps have second resolution, so the two runs may share a
-    // stamp; in every case each run keeps its own create-new locator.
+    // scan. Each run keeps its own create-new locator regardless of how close
+    // the two recorded timestamps are.
     fixture.measured_sessions(&[20_000, 30_000]);
     let second = locator(&fixture.report_text());
     assert_ne!(first, second, "each retained run needs its own locator");
@@ -245,6 +245,65 @@ fn successive_scans_keep_distinct_locators_and_their_own_records() {
         second_record["sessions"][0]["usage"]["input_tokens"],
         20_000
     );
+}
+
+#[test]
+fn more_than_twenty_runs_keep_their_own_locators_and_expire_old_ones() {
+    let fixture = Fixture::new();
+    let mut written: Vec<(PathBuf, u64)> = Vec::new();
+    for index in 0..token_audit::RETENTION_LIMIT + 1 {
+        let amount = 10_000 * (index as u64 + 1);
+        fixture.measured_sessions(&[amount]);
+        let retained = locator(&fixture.report_text());
+        assert!(
+            !written.iter().any(|(path, _)| path == &retained),
+            "locator reuse: {}",
+            retained.display()
+        );
+        // Each new locator reads its own exact scan immediately, even though
+        // runs within one second share the recorded timestamp.
+        let complete: Value =
+            serde_json::from_str(&fs::read_to_string(&retained).unwrap()).unwrap();
+        assert_eq!(complete["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(complete["sessions"][0]["usage"]["input_tokens"], amount);
+        written.push((retained, amount));
+    }
+
+    // The oldest run is evicted for good, and its detail stays missing instead
+    // of resolving to a later scan through a reused name.
+    let (evicted, _) = &written[0];
+    assert!(!evicted.exists(), "{}", evicted.display());
+    let output = fixture.run(&[
+        "detail",
+        "--report",
+        evicted.to_str().unwrap(),
+        "--session",
+        "session-00",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("retained detail not found"),
+        "an evicted locator is an explicit error"
+    );
+
+    // The newest run still reads back its own scan.
+    let (newest, amount) = &written[written.len() - 1];
+    let output = fixture.run(&[
+        "detail",
+        "--report",
+        newest.to_str().unwrap(),
+        "--session",
+        "session-00",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], *amount);
 }
 
 #[test]
