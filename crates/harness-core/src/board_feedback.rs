@@ -2224,10 +2224,10 @@ mod tests {
     fn board_and_lead_skills_keep_feedback_off_chat() {
         let board = include_str!("../../../.agents/skills/board-workflow/SKILL.md");
         let lead = include_str!("../../../.agents/skills/team-lead/SKILL.md");
-        assert!(board.contains("kind: lead|executor|diagnostic"));
+        assert!(board.contains("codex-harness feedback record"));
         assert!(board.contains("Do not use `bd find-duplicates`"));
-        assert!(board.contains("feedback-route v1"));
-        assert!(board.contains("feedback-promote v1"));
+        assert!(board.contains("codex-harness feedback triage"));
+        assert!(board.contains("codex-harness feedback promote"));
         assert!(board.contains("feedback-archive v1"));
         assert!(board.contains("feedback-restore v1"));
         assert!(board.contains("vote_threshold"));
