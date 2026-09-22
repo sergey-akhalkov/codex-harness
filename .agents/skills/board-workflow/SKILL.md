@@ -83,7 +83,7 @@ never both an incubator vote and a skill candidate.
 
 | Observation | Intake route |
 | --- | --- |
-| verified reusable procedure in owned skill scope | hand to `autonomous-skill-evolution` as a reference |
+| verified reusable procedure in owned skill scope | hand to `skill-evolution` as a reference |
 | process, orchestration, requirement, tool, unclear or material | incubator item |
 | kit instruction, skill or tool demand | incubator item, then the kit backlog at promotion |
 

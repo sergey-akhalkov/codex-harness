@@ -570,7 +570,7 @@ fn ancestor_cargo_configuration_changes_invalidate_build_identity() {
 }
 
 #[test]
-fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules() {
+fn older_producer_finalizes_expanded_consumer_with_new_input_rules() {
     use harness_core::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
     use std::time::Duration;
     let temp = tempfile::Builder::new()
@@ -620,6 +620,7 @@ fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules
         .replace("\r\n", "\n");
     assert!(current_identity.contains("    \"harness-observe.exe\",\n"));
     let old_identity = current_identity
+        .replacen("    \"harness-source-check.exe\",\n", "", 1)
         .replacen("    \"token-audit.exe\",\n", "", 1)
         .replacen("    \"harness-observe.exe\",\n", "", 1)
         .replacen("    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);",
@@ -748,6 +749,7 @@ fn real_four_binary_producer_finalizes_five_binary_consumer_with_new_input_rules
         harness_core::build_identity::BINARIES.len()
     );
     assert!(new_build.join("harness-observe.exe").is_file());
+    assert!(new_build.join("harness-source-check.exe").is_file());
     assert!(
         !new_record
             .source

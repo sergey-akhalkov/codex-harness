@@ -14,3 +14,7 @@ Executor dispatch SHALL accept a structured assignment as an alternative to exis
 #### Scenario: New output and existing input
 - **WHEN** inputs exist and an owned output is new
 - **THEN** dispatch produces a brief naming the actual checkout, base, inputs, outputs and acceptance
+
+#### Scenario: Read-only rendering uses the actual committed base
+- **WHEN** a caller supplies a base to the validation/render command
+- **THEN** it resolves a full commit and refuses an invalid or mismatching base without changing the checkout

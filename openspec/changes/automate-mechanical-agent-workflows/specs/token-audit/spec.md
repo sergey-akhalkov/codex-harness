@@ -15,3 +15,7 @@ Interactive report and findings output SHALL present bounded ranked records, tot
 #### Scenario: Existing machine consumer
 - **WHEN** a caller explicitly requests full JSON or a baseline operation
 - **THEN** its complete existing data contract is preserved
+
+#### Scenario: Two scans finish with the same timestamp
+- **WHEN** two reports share a generated timestamp but contain different observations
+- **THEN** each returned locator retains its own complete scan without overwriting the other

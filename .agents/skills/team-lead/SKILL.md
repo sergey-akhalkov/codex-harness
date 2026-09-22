@@ -90,7 +90,7 @@ channel; the incubator carries durable demand.
 
 Route each observation by kind before it competes as an incubator vote: a
 verified reusable procedure in owned skill scope is handed to
-`autonomous-skill-evolution` as a reference (no skill package writes, `SKILL.md`
+`skill-evolution` as a reference (no skill package writes, `SKILL.md`
 untouched), while process, orchestration, requirement, tool, unclear and
 material observations stay in the incubator. Promote at `vote_threshold` from
 kit `global/orchestration.toml` by consequence: small improvements to backlog

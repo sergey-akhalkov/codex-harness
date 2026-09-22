@@ -14,3 +14,7 @@ An installed command SHALL expose feedback recording, agent-selected triage, led
 #### Scenario: Real consumer board
 - **WHEN** the globally delivered command is used on an isolated outside-checkout bd board
 - **THEN** its observable ledger and issue state agree with the native command results
+
+#### Scenario: Consumer uses customized installed limits
+- **WHEN** a consumer has no kit configuration of its own and the caller supplies no source override
+- **THEN** the command uses the installed kit's limits and identifies that configuration source

@@ -14,3 +14,7 @@ The installed process observer SHALL optionally record the selected verification
 #### Scenario: Verification outside a Git repository
 - **WHEN** a caller runs a valid verification command outside Git
 - **THEN** Git identity is explicitly unavailable while executable, inputs and process results remain recorded
+
+#### Scenario: An explicitly selected input uses a link
+- **WHEN** a declared input resolves through an existing link or junction to a regular file
+- **THEN** capture records its requested and resolved identity, including a target change during execution
