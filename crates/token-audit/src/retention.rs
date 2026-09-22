@@ -138,8 +138,8 @@ pub fn default_directory() -> Option<PathBuf> {
 
 /// Writes one complete same-scan JSON record and prunes older files of the
 /// same kind beyond [`RETENTION_LIMIT`]. Each run reserves its own create-new
-/// locator named by that run's unique identity, so no run overwrites or evicts
-/// another run's record. Pruning only ever removes files whose name this
+/// locator named by that run's unique identity, so no run overwrites another
+/// run's record. Pruning only ever removes files whose name this
 /// module created; unrelated files stay untouched.
 pub fn retain(directory: &Path, kind: Kind, json: &str) -> io::Result<Detail> {
     fs::create_dir_all(directory)?;
@@ -173,8 +173,7 @@ fn reserve(directory: &Path, kind: Kind) -> io::Result<PathBuf> {
     )))
 }
 
-/// Fills a reserved locator atomically, so the visible name only ever carries
-/// a complete record.
+/// Publishes complete bytes atomically before returning the reserved locator.
 fn write_complete(path: &Path, json: &str) -> io::Result<()> {
     let name = path
         .file_name()

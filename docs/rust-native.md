@@ -151,6 +151,25 @@ unlisted files/external state is made. See the installed verification skill's
 [command records](../.agents/skills/project-verification/references/command-records.md)
 for ordinary use and interpretation.
 
+## Feedback operations
+
+`codex-harness feedback` uses the consumer's existing `bd` board. `record`
+creates a bounded observation; `list`, `ledger` and `candidates` inspect it.
+`triage --decisions FILE` applies caller-selected grouping/kinds, counts distinct
+reporter/episode votes, excludes diagnostic votes and enforces the configured
+batch limit. Every command identifies its limits; an explicit `--source KIT`
+overrides the installed kit's configuration.
+
+`promote` records an explicit backlog, OpenSpec or sanitized kit-backlog route.
+The OpenSpec route validates an existing change created through the project's
+OpenSpec workflow (`--openspec-change NAME`, default `feedback-<item-id>`);
+it preserves planning artifacts. Consequence overrides require a stated reason.
+Partial operations report the applied prefix and failing action with nonzero
+status, and retries preserve counted votes and promotion history. Grouping,
+consequence, authorization and acceptance remain agent decisions. Command
+examples and routing rules live in
+[board workflow](../.agents/skills/board-workflow/SKILL.md).
+
 ## Native task-control contract
 
 The [subscription orchestration change](../openspec/changes/orchestrate-subscription-agents/tasks.md)

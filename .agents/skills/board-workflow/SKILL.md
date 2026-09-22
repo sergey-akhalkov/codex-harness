@@ -110,6 +110,11 @@ actual limits and their source; `--source <kit>` explicitly selects another kit.
 | Behavior or requirement change | `codex-harness feedback promote --project <project> --item <id> --route openspec-change` |
 | Kit concern | `codex-harness feedback promote --project <project> --item <id> --route kit-backlog --kit-project <kit> --summary "kit-level summary" --scope "kit scope"` |
 
+For the OpenSpec route, first create the intended change through the project's
+OpenSpec workflow. Promotion validates/references it and preserves its artifacts;
+it does not author a proposal or modify external workflows. The default name is
+`feedback-<item-id>`; `--openspec-change <name>` selects an existing intended change.
+
 Route by consequence, never by habit: small improvements become backlog tasks,
 changes to accepted behavior or requirements enter OpenSpec instead of being
 implemented directly from the backlog, and items about kit instructions, skills
