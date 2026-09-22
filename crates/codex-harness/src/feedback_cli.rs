@@ -172,7 +172,7 @@ fn resolve_limits(options: &Options, project: &Path) -> io::Result<Limits> {
     }
     let kit_note = match &installed {
         Some(kit) => format!("{} is absent too", config_of(kit).display()),
-        None => "no installed kit checkout is recorded".to_owned(),
+        None => "no readable installation record was found".to_owned(),
     };
     Ok(Limits {
         checkout: project.to_path_buf(),
@@ -180,12 +180,15 @@ fn resolve_limits(options: &Options, project: &Path) -> io::Result<Limits> {
     })
 }
 
-/// The kit source root recorded by the normal installation. Reading is
-/// bounded and executes nothing the record names; an absent, unreadable or
-/// relocated record simply means no installed kit source is available.
+/// The kit source root recorded by the normal installation. The CODEX_HOME
+/// location comes from the launcher's own resolution (`CODEX_HOME`, else
+/// `USERPROFILE\.codex`), so an unset variable still finds installed custom
+/// limits. Reading is bounded and executes nothing the record names; an
+/// absent, unreadable or relocated record simply means no installed kit
+/// source is available.
 fn installed_kit_source() -> Option<PathBuf> {
-    let codex_home = std::env::var_os("CODEX_HOME")?;
-    let path = PathBuf::from(codex_home).join("harness/installation.json");
+    let codex_home = harness_core::native_launcher::codex_home().ok()?;
+    let path = codex_home.join("harness/installation.json");
     let metadata = fs::metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_INSTALLATION_BYTES {
         return None;

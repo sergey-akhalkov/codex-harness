@@ -140,6 +140,28 @@ impl Board {
     /// The same, with an explicit CODEX_HOME (an installed kit record lives
     /// there or does not).
     fn feedback_with_home(&self, home: &Path, args: &[&str]) -> std::process::Output {
+        self.run_feedback(args, &[("CODEX_HOME", home)])
+    }
+
+    /// Runs one feedback verb with CODEX_HOME removed and a synthetic user
+    /// profile, so the launcher's own `CODEX_HOME`, else `USERPROFILE\.codex`
+    /// resolution is exercised instead of an explicit home.
+    fn feedback_with_user_profile(&self, profile: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = self.feedback_command(args);
+        command.env_remove("CODEX_HOME");
+        command.env("USERPROFILE", profile);
+        command.output().unwrap()
+    }
+
+    fn run_feedback(&self, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
+        let mut command = self.feedback_command(args);
+        for &(name, value) in env {
+            command.env(name, value);
+        }
+        command.output().unwrap()
+    }
+
+    fn feedback_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(manager());
         command.arg("feedback").args(args);
         command.args([
@@ -148,8 +170,7 @@ impl Board {
             "--project",
             self.project.to_str().unwrap(),
         ]);
-        command.env("CODEX_HOME", home);
-        command.output().unwrap()
+        command
     }
 
     fn record(&self, observation: &str, reporter: &str, episode: &str, kind: &str) -> String {
@@ -518,6 +539,50 @@ fn promotion_is_explicit_recorded_and_never_repeated() {
     let ledger = board.feedback(&["ledger", "--item", &item]);
     let text = output_text(&ledger);
     assert!(text.contains("promotions=1"), "{text}");
+    board.drop();
+}
+
+/// Ordinary CLI users may leave CODEX_HOME unset and rely on
+/// `USERPROFILE\.codex`, so the installed kit limits must still apply.
+#[test]
+fn installed_kit_limits_apply_without_codex_home() {
+    let board = Board::new("user-profile");
+    fs::remove_file(board.project.join("global/orchestration.toml")).unwrap();
+    let kit = board.root.join("kit");
+    fs::create_dir_all(kit.join("global")).unwrap();
+    fs::write(
+        kit.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 5\nincubator_size_cap = 11\nfeedback_batch_limit = 7\n",
+    )
+    .unwrap();
+    let profile = board.root.join("profile");
+    fs::create_dir_all(profile.join(".codex/harness")).unwrap();
+    fs::write(
+        profile.join(".codex/harness/installation.json"),
+        serde_json::to_vec(&json!({"schemaVersion": 1, "sourceRoot": kit})).unwrap(),
+    )
+    .unwrap();
+
+    let listed = board.feedback_with_user_profile(&profile, &["list"]);
+    let text = output_text(&listed);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("batch_limit=7"), "{text}");
+    assert!(text.contains("limits=configured(installed kit "), "{text}");
+    assert!(text.contains(&kit.display().to_string()), "{text}");
+
+    let candidates = board.feedback_with_user_profile(&profile, &["candidates"]);
+    let text = output_text(&candidates);
+    assert!(candidates.status.success(), "{text}");
+    assert!(text.contains("at threshold=5"), "{text}");
+
+    // A profile without an installation record states the defaults.
+    let bare = board.root.join("bare-profile");
+    fs::create_dir_all(bare.join(".codex")).unwrap();
+    let listed = board.feedback_with_user_profile(&bare, &["list"]);
+    let text = output_text(&listed);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("batch_limit=8"), "{text}");
+    assert!(text.contains("limits=defaults("), "{text}");
     board.drop();
 }
 

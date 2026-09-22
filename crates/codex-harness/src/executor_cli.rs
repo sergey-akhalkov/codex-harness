@@ -912,6 +912,34 @@ fn committed_head(source: &Path) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Resolves an explicit `executor assignment --base REV` inside the inspected
+/// slot. This route never synchronizes: the revision must be a commit of that
+/// slot and must equal its current HEAD, so the brief can only ever name the
+/// base the session will really find. A revision the slot would have to move
+/// to is refused with the dispatch that performs that move.
+fn slot_base(slot: &Path, revision: &str) -> io::Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
+        .current_dir(slot)
+        .output()
+        .map_err(|error| invalid(&format!("executor assignment --base: {error}")))?;
+    if !out.status.success() {
+        return Err(invalid(&format!(
+            "executor assignment --base {revision} is not a commit in {}; this check never synchronizes the slot: name the slot's current HEAD or dispatch `codex-harness executor spawn --base {revision}` first",
+            slot.display()
+        )));
+    }
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let head = committed_head(slot)?;
+    if commit != head {
+        return Err(invalid(&format!(
+            "executor assignment --base {revision} resolves to {commit} but {} is at {head}; this check never synchronizes the slot: name the current HEAD, or dispatch `codex-harness executor spawn --base {revision}` to synchronize it and rerun this check",
+            slot.display()
+        )));
+    }
+    Ok(commit)
+}
+
 /// The lead's read path for the recorded slot mapping: index, path, state,
 /// owner, base, disposition and reason, beside the tree and lease state and the
 /// foreign or legacy worktrees that only the lead retires.
@@ -1000,13 +1028,14 @@ fn assignment_check(args: &[OsString]) -> io::Result<i32> {
     let slot = pool.slot(index)?;
     if !slot.path.is_dir() {
         return Err(invalid(&format!(
-            "slot {index} directory {} is missing; run `git worktree prune` in {} and retry",
+            "slot {index} directory {} is missing; this check never creates or synchronizes a slot: dispatch `codex-harness executor spawn --source {}` to create and synchronize it (a removed slot whose registration is stale needs `git worktree prune` in {} first), then run this check again",
             slot.path.display(),
+            source.display(),
             source.display()
         )));
     }
     let base = match base {
-        Some(base) => base,
+        Some(revision) => slot_base(&slot.path, &revision)?,
         None => committed_head(&slot.path)?,
     };
     let owner = owner

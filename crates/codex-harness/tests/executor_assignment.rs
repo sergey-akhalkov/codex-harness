@@ -147,6 +147,92 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// An explicit `--base REV` must name the commit the inspected slot is really
+/// at: this check never synchronizes, so a short revision is resolved in the
+/// slot and anything the slot would have to move to is refused without writes.
+#[test]
+fn explicit_base_resolves_in_the_slot_and_rejects_other_revisions() {
+    let fixture = Fixture::new("base");
+    fs::write(fixture.slot.join("input.txt"), "declared input\n").unwrap();
+    let assignment = fixture.assignment("assignment.json", &["input.txt"], &["out.txt"]);
+    let head = fixture.head();
+    let short = &head[..8];
+    let before = git_output(
+        &fixture.slot,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+
+    let out = fixture.check(&assignment, &["--base", short]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains(&format!("base={head}")), "{text}");
+    assert!(text.contains(&format!("base: {head}")), "{text}");
+    // The short revision appears only as the prefix of the emitted full one.
+    assert_eq!(text.matches(&format!("base: {short}")).count(), 1, "{text}");
+    assert_eq!(
+        git_output(
+            &fixture.slot,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        before
+    );
+
+    // A revision that exists in the repository but is not this slot's HEAD is
+    // refused: the route does not synchronize the slot.
+    fs::write(fixture.source.join("moved.txt"), "moved on\n").unwrap();
+    git(&fixture.source, &["add", "moved.txt"]);
+    git(
+        &fixture.source,
+        &["commit", "-qm", "move the source checkout on"],
+    );
+    let moved = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    assert_ne!(moved, head);
+    let out = fixture.check(&assignment, &["--base", &moved]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("never synchronizes"), "{text}");
+    assert!(text.contains(&moved), "{text}");
+    assert!(text.contains(&head), "{text}");
+
+    // An unknown revision is refused the same way.
+    let unknown = "0".repeat(40);
+    let out = fixture.check(&assignment, &["--base", &unknown]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("is not a commit in"), "{text}");
+
+    // Neither refusal wrote anything.
+    assert_eq!(
+        git_output(
+            &fixture.slot,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        before
+    );
+    assert!(!fixture.slot.join("out.txt").exists());
+    assert!(!fixture.root.join("home").exists());
+    fixture.drop();
+}
+
+/// A missing slot cannot be inspected: the remedy must name the dispatch that
+/// creates and synchronizes it, because pruning a stale registration alone
+/// cannot bring the slot back.
+#[test]
+fn missing_slot_names_the_dispatch_that_creates_it() {
+    let fixture = Fixture::new("missing-slot");
+    let assignment = fixture.assignment("assignment.json", &[], &["out.txt"]);
+    fs::remove_dir_all(&fixture.slot).unwrap();
+    let out = fixture.check(&assignment, &[]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("is missing"), "{text}");
+    assert!(text.contains("executor spawn --source"), "{text}");
+    assert!(text.contains("create and synchronize"), "{text}");
+    assert!(!fixture.slot.exists());
+    assert!(!fixture.root.join("home").exists());
+    fixture.drop();
+}
+
 #[test]
 fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
     let fixture = Fixture::new("render");
@@ -185,6 +271,14 @@ fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
     assert!(text.contains("- existing_child.rs"), "{text}");
     assert!(text.contains("- crates/new/module.rs"), "{text}");
     assert!(text.contains("- the synthetic check passes"), "{text}");
+    assert!(
+        text.contains("verify the checkout is at the base above"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Choose the installed skills this assignment needs"),
+        "{text}"
+    );
     // The check is read-only: the slot keeps exactly the state it had and no
     // state root is written.
     assert_eq!(

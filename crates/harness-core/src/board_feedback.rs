@@ -1575,12 +1575,12 @@ fn require_openspec_change(project: &Path, name: &str) -> io::Result<()> {
 
 /// Creates the sanitized kit-backlog task from explicit kit-level wording.
 fn create_kit_item(bd: &Path, kit_project: &Path, concern: &KitConcern) -> io::Result<String> {
-    let title = format!("Kit feedback: {}", bounded_title(&concern.summary));
-    if let Some(existing) = find_kit_item(bd, kit_project, &title)? {
-        // A previous run created the kit task and stopped before recording the
-        // promotion; reuse it instead of creating a second item.
+    if let Some(existing) = find_kit_item(bd, kit_project, concern)? {
+        // A previous run created this concern's kit task and stopped before
+        // recording the promotion; reuse it instead of duplicating it.
         return Ok(existing);
     }
+    let title = format!("Kit feedback: {}", bounded_title(&concern.summary));
     let description = format!(
         "summary: {}\nscope: {}\nkind: kit-concern\n",
         concern.summary, concern.scope
@@ -1604,10 +1604,17 @@ fn create_kit_item(bd: &Path, kit_project: &Path, concern: &KitConcern) -> io::R
     string_field(&created, "id")
 }
 
-/// Finds an open kit item carrying the exact bounded title a retry would
-/// create. Kit items are created with kit-level wording only, so an identical
-/// open title is the same concern.
-fn find_kit_item(bd: &Path, kit_project: &Path, title: &str) -> io::Result<Option<String>> {
+/// Finds the open kit item a retry of this exact concern would have created.
+/// Kit items are created with kit-level wording only, and the bounded title is
+/// a prefix of the summary: two different concerns can share one title, so the
+/// recorded sanitized summary and scope must match exactly as well. Reusing a
+/// task that only shares the title would silently misroute the other concern.
+fn find_kit_item(
+    bd: &Path,
+    kit_project: &Path,
+    concern: &KitConcern,
+) -> io::Result<Option<String>> {
+    let title = format!("Kit feedback: {}", bounded_title(&concern.summary));
     let listed = json_ok(
         bd,
         kit_project,
@@ -1625,11 +1632,45 @@ fn find_kit_item(bd: &Path, kit_project: &Path, title: &str) -> io::Result<Optio
         Value::Array(rows) => rows.as_slice(),
         _ => &[],
     };
-    Ok(rows
-        .iter()
-        .find(|row| row.get("title").and_then(Value::as_str) == Some(title))
-        .and_then(|row| row.get("id").and_then(Value::as_str))
-        .map(str::to_owned))
+    for row in rows {
+        if row.get("title").and_then(Value::as_str) != Some(title.as_str()) {
+            continue;
+        }
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if kit_item_is_concern(bd, kit_project, id, concern)? {
+            return Ok(Some(id.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether one open kit item records exactly this sanitized concern. The
+/// description carries only the kit-level summary, scope and kind; nothing
+/// private is read or compared.
+fn kit_item_is_concern(
+    bd: &Path,
+    kit_project: &Path,
+    id: &str,
+    concern: &KitConcern,
+) -> io::Result<bool> {
+    let shown = json_ok(bd, kit_project, &["show", id, "--json"])?;
+    let issue = issue_object(&shown, id)?;
+    let mut summary = None;
+    let mut scope = None;
+    for line in issue_description(issue).lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "summary" => summary = Some(value.trim().to_owned()),
+            "scope" => scope = Some(value.trim().to_owned()),
+            _ => {}
+        }
+    }
+    Ok(summary.as_deref() == Some(concern.summary.as_str())
+        && scope.as_deref() == Some(concern.scope.as_str()))
 }
 
 fn bounded_slug(value: &str) -> String {
@@ -2261,6 +2302,42 @@ mod tests {
         .unwrap();
         let feature_id = string_field(&feature, "id").unwrap();
         (root, project, feature_id)
+    }
+
+    /// Classifies one recorded observation as an incubator kit concern, the
+    /// precondition of a kit-backlog promotion.
+    fn incubate_kit_concern(bd: &Path, project: &Path, item: &str) {
+        apply_routed_triage(
+            bd,
+            project,
+            &[RoutedAction {
+                feedback_id: item.to_owned(),
+                kind: ObservationKind::KitConcern,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+    }
+
+    /// The open kit-backlog items of the kit board, as the retry lookup sees
+    /// them.
+    fn kit_feedback_ids(bd: &Path, kit_project: &Path) -> Vec<String> {
+        let listed = json_ok(
+            bd,
+            kit_project,
+            &[
+                "list",
+                "--label",
+                KIT_FEEDBACK_LABEL,
+                "--status",
+                "open",
+                "--json",
+                "--brief",
+            ],
+        )
+        .unwrap();
+        issue_ids(&listed).unwrap()
     }
 
     #[test]
@@ -3204,6 +3281,100 @@ mod tests {
             error.to_string().contains("must be one path name"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn kit_retry_reuses_only_the_exact_sanitized_concern() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let (_kit_root, kit_project, _kit_parent) = isolated_feature(&bd);
+        // Two different concerns whose bounded titles are identical: only the
+        // full sanitized summary and scope distinguish them.
+        let shared = "s".repeat(80);
+        let first = KitConcern {
+            summary: format!("{shared} first concern"),
+            scope: "kit skill: board-workflow".to_owned(),
+        };
+        let second = KitConcern {
+            summary: format!("{shared} second concern"),
+            scope: "kit skill: board-workflow".to_owned(),
+        };
+        assert_eq!(
+            bounded_title(&first.summary),
+            bounded_title(&second.summary)
+        );
+        let existing = json_ok(
+            &bd,
+            &kit_project,
+            &[
+                "create",
+                &format!("Kit feedback: {}", bounded_title(&first.summary)),
+                "--type",
+                "task",
+                "--labels",
+                KIT_FEEDBACK_LABEL,
+                "--description",
+                &format!(
+                    "summary: {}\nscope: {}\nkind: kit-concern\n",
+                    first.summary, first.scope
+                ),
+                "--json",
+            ],
+        )
+        .unwrap();
+        let existing_id = string_field(&existing, "id").unwrap();
+
+        // A previous partial run of a different concern left that one task:
+        // promoting the second concern must add its own task instead of
+        // adopting a task that only shares the bounded title.
+        let item = record(
+            &bd,
+            &project,
+            "second kit concern",
+            "lead-1",
+            "e1",
+            ReporterKind::Lead,
+            &parent,
+        );
+        incubate_kit_concern(&bd, &project, &item);
+        let evidence = PromotionEvidence::ConsequenceOverride {
+            consequence: "kit-level wording must stay distinguishable".to_owned(),
+            reason: "synthetic counterexample".to_owned(),
+        };
+        let outcome =
+            promote_kit_concern(&bd, &project, &kit_project, &item, &second, &evidence).unwrap();
+        let second_id = outcome
+            .target
+            .as_deref()
+            .unwrap()
+            .strip_prefix("kit:")
+            .unwrap()
+            .to_owned();
+        assert_ne!(second_id, existing_id);
+        let listed = kit_feedback_ids(&bd, &kit_project);
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.contains(&existing_id) && listed.contains(&second_id));
+
+        // An exact retry of the same concern reuses the task it created.
+        let retry = record(
+            &bd,
+            &project,
+            "second kit concern again",
+            "lead-1",
+            "e2",
+            ReporterKind::Lead,
+            &parent,
+        );
+        incubate_kit_concern(&bd, &project, &retry);
+        let outcome =
+            promote_kit_concern(&bd, &project, &kit_project, &retry, &second, &evidence).unwrap();
+        assert_eq!(
+            outcome.target.as_deref(),
+            Some(format!("kit:{second_id}").as_str())
+        );
+        assert_eq!(kit_feedback_ids(&bd, &kit_project).len(), 2);
     }
 
     #[test]

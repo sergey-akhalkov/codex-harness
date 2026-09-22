@@ -149,7 +149,7 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     push_list(&mut text, "invariants", &assignment.invariants);
     push_list(&mut text, "acceptance", &assignment.acceptance);
     text.push_str(
-        "Keep every change inside the checkout above. When the outcome is complete, report what changed, the exact files touched and how each acceptance item was verified.\n",
+        "Before editing, verify the checkout is at the base above (git rev-parse HEAD) and report a mismatch instead of editing. Choose the installed skills this assignment needs and announce their first use. Keep every change inside the checkout. When the outcome is complete, report what changed, the exact files touched and how each acceptance item was verified.\n",
     );
     if text.len() > MAX_BRIEF_BYTES {
         return Err(invalid(&format!(
@@ -511,6 +511,14 @@ mod tests {
         assert!(text.contains("- the named check passes"));
         assert!(text.contains(&format!("source: {}", source.display())));
         assert_eq!(text.matches("source:").count(), 1, "{text}");
+        assert!(
+            text.contains("verify the checkout is at the base above"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Choose the installed skills this assignment needs"),
+            "{text}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
