@@ -16,4 +16,4 @@
 ## 3. Docs and delivery
 
 - [x] 3.1 `docs/agent-delegation.md` and `.agents/skills/team-lead/SKILL.md`: executors run single-agent, nested dispatch is refused, helpers stay lead-only.
-- [ ] 3.2 Update the installed harness from this checkout and verify the refusal and launcher behavior outside the checkout.
+- [x] 3.2 Update the installed harness from this checkout and verify the refusal and launcher behavior outside the checkout.
