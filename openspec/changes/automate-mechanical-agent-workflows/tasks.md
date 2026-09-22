@@ -18,11 +18,11 @@
 
 ## 5. Feedback command
 
-- [x] 5.1 Connect existing bd algorithms to installed feedback commands; verify read-only inspection, repeated/diagnostic votes, configured bounds, promotion and partial failure recovery using synthetic boards.
+- [ ] 5.1 Connect existing bd algorithms to installed feedback commands; verify read-only inspection, repeated/diagnostic votes, configured bounds, promotion and partial failure recovery using synthetic boards.
 
 ## 6. Integration and global delivery
 
 - [x] 6.1 Update owning docs and workflow guidance for all five paths, preserving protected external workflows; verify links, instruction limits and CLI examples.
-- [x] 6.2 Integrate executor commits and run affected native regression suites, formatting, clippy, ownership and source checks; retain failure evidence and resolve introduced defects.
+- [ ] 6.2 Integrate executor commits and run affected native regression suites, formatting, clippy, ownership and source checks; retain failure evidence and resolve introduced defects.
 - [ ] 6.3 Deploy the immutable build and exercise all five installed paths from outside the checkout with synthetic inputs; verify global links and receipt identities.
 - [ ] 6.4 Reconcile specifications and close accepted board tasks; report measured output/step changes without claiming unmeasured token or quota savings.

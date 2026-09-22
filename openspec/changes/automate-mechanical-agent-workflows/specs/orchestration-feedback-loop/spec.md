@@ -18,3 +18,11 @@ An installed command SHALL expose feedback recording, agent-selected triage, led
 #### Scenario: Consumer uses customized installed limits
 - **WHEN** a consumer has no kit configuration of its own and the caller supplies no source override
 - **THEN** the command uses the installed kit's limits and identifies that configuration source
+
+#### Scenario: Completed promotion is retried
+- **WHEN** the same promotion is requested after its history and labels are already complete
+- **THEN** the command successfully confirms the recorded outcome without adding history or changing labels
+
+#### Scenario: Retry requests a different promotion
+- **WHEN** a retry explicitly requests a different route or OpenSpec target from the recorded promotion
+- **THEN** the command returns a conflict and preserves the recorded outcome without board writes
