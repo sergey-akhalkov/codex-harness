@@ -183,9 +183,9 @@ fn resolve_limits(options: &Options, project: &Path) -> io::Result<Limits> {
 /// The kit source root recorded by the normal installation. The CODEX_HOME
 /// location comes from the launcher's own resolution (`CODEX_HOME`, else
 /// `USERPROFILE\.codex`), so an unset variable still finds installed custom
-/// limits. Reading is bounded and executes nothing the record names; an
-/// absent, unreadable or relocated record simply means no installed kit
-/// source is available.
+/// limits; the current schema keeps the root at `settings.sourceRoot`. Reading
+/// is bounded and executes nothing the record names; an absent, unreadable or
+/// relocated record simply means no installed kit source is available.
 fn installed_kit_source() -> Option<PathBuf> {
     let codex_home = harness_core::native_launcher::codex_home().ok()?;
     let path = codex_home.join("harness/installation.json");
@@ -195,7 +195,16 @@ fn installed_kit_source() -> Option<PathBuf> {
     }
     let bytes = fs::read(&path).ok()?;
     let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let root = PathBuf::from(record.get("sourceRoot")?.as_str()?);
+    // Current metadata keeps every owner inside `settings`; the legacy
+    // PowerShell import schema kept `sourceRoot` at the top level. Only these
+    // two documented locations are read: discovery is read-only and validates
+    // nothing beyond the path it needs.
+    let root = record
+        .get("settings")
+        .and_then(|settings| settings.get("sourceRoot"))
+        .or_else(|| record.get("sourceRoot"))
+        .and_then(|value| value.as_str())?;
+    let root = PathBuf::from(root);
     root.is_dir().then_some(root)
 }
 

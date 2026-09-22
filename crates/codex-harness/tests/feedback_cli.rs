@@ -321,6 +321,34 @@ fn bd_failed(op: &str, out: &std::process::Output) -> String {
     )
 }
 
+/// The current `harness/installation.json` shape: the owners live under
+/// `settings` (sourceRoot, codexHome, userHome, dependencyUserHome,
+/// codexCommand, pathScope, pathAdded, versions) beside `metadataIdentity`,
+/// `links` and `checksum`. Limits discovery reads only `settings.sourceRoot`.
+fn installation_record(source_root: &Path) -> Vec<u8> {
+    serde_json::to_vec_pretty(&json!({
+        "schemaVersion": 2,
+        "settings": {
+            "sourceRoot": source_root,
+            "codexHome": source_root.join("synthetic-codex-home"),
+            "userHome": source_root.join("synthetic-user-home"),
+            "dependencyUserHome": source_root.join("synthetic-user-home"),
+            "codexCommand": source_root.join("synthetic-codex.exe"),
+            "pathScope": "User",
+            "pathAdded": true,
+            "versions": {},
+        },
+        "metadataIdentity": {
+            "volume_serial_number": 1,
+            "file_id": 2,
+            "creation_time": 3,
+        },
+        "links": [],
+        "checksum": "0".repeat(64),
+    }))
+    .unwrap()
+}
+
 #[test]
 fn read_only_verbs_leave_the_board_unchanged() {
     let board = Board::new("readonly");
@@ -559,7 +587,7 @@ fn installed_kit_limits_apply_without_codex_home() {
     fs::create_dir_all(profile.join(".codex/harness")).unwrap();
     fs::write(
         profile.join(".codex/harness/installation.json"),
-        serde_json::to_vec(&json!({"schemaVersion": 1, "sourceRoot": kit})).unwrap(),
+        installation_record(&kit),
     )
     .unwrap();
 
@@ -605,7 +633,7 @@ fn installed_kit_limits_apply_without_a_source_flag() {
     fs::create_dir_all(board.home.join("harness")).unwrap();
     fs::write(
         board.home.join("harness/installation.json"),
-        serde_json::to_vec(&json!({"schemaVersion": 1, "sourceRoot": kit})).unwrap(),
+        installation_record(&kit),
     )
     .unwrap();
 
@@ -620,6 +648,19 @@ fn installed_kit_limits_apply_without_a_source_flag() {
     let text = output_text(&candidates);
     assert!(candidates.status.success(), "{text}");
     assert!(text.contains("at threshold=5"), "{text}");
+
+    // The legacy top-level `sourceRoot` record is still read while an
+    // installation migrates, so the supported fallback is not lost.
+    fs::write(
+        board.home.join("harness/installation.json"),
+        serde_json::to_vec(&json!({"schemaVersion": 1, "sourceRoot": kit})).unwrap(),
+    )
+    .unwrap();
+    let listed = board.feedback(&["list"]);
+    let text = output_text(&listed);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("batch_limit=7"), "{text}");
+    assert!(text.contains("limits=configured(installed kit "), "{text}");
 
     // An explicit --source overrides the installed kit.
     let other = board.root.join("other-kit");
