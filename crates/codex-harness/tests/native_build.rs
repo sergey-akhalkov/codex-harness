@@ -583,7 +583,7 @@ fn older_producer_finalizes_expanded_consumer_with_new_input_rules() {
     let state = root.join("state");
     fixture(&source);
     // Exercise the real manager and its current dependencies, while retaining
-    // the fixture's inert auxiliary binaries and deliberate four/five split.
+    // the fixture's inert auxiliary binaries and four-command producer split.
     let manager = Path::new(env!("CARGO_MANIFEST_DIR"));
     for entry in fs::read_dir(manager.join("src")).unwrap() {
         let entry = entry.unwrap();
