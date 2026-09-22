@@ -26,5 +26,5 @@
 
 - [x] 4.1 Update `docs/agent-delegation.md` and the live team-lead skill to
       route interrupted executors through `executor resume`.
-- [ ] 4.2 Update the installed harness from this checkout and verify the
+- [x] 4.2 Update the installed harness from this checkout and verify the
       subcommand is available outside the checkout.
