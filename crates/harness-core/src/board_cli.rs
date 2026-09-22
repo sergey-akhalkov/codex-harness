@@ -538,16 +538,19 @@ mod tests {
     #[test]
     fn team_lead_skill_requires_explicit_activation() {
         let text = include_str!("../../../.agents/skills/team-lead/SKILL.md");
-        assert!(text.contains("name: team-lead"));
-        assert!(text.contains("orchestrated asynchronous development"));
-        assert!(text.contains("must not spawn executors"));
-        assert!(text.contains("board-workflow"));
-        assert!(text.contains("executor spawn"));
-        assert!(text.contains("codex-harness executor --help"));
-        assert!(text.contains("stale harness build"));
-        assert!(text.contains("launcher stale"));
-        assert!(text.contains("installation.json"));
-        assert!(text.contains("Do not use for a small direct task"));
+        // The contract is wording, not line wrapping: normalize before the
+        // phrase checks so a wrapped paragraph cannot break them silently.
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("name: team-lead"));
+        assert!(normalized.contains("orchestrated asynchronous development"));
+        assert!(normalized.contains("must not spawn executors"));
+        assert!(normalized.contains("board-workflow"));
+        assert!(normalized.contains("executor spawn"));
+        assert!(normalized.contains("codex-harness executor --help"));
+        assert!(normalized.contains("stale harness build"));
+        assert!(normalized.contains("launcher stale"));
+        assert!(normalized.contains("installation.json"));
+        assert!(normalized.contains("Do not use for a small direct task"));
     }
 
     #[test]

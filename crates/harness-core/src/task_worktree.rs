@@ -588,7 +588,10 @@ pub fn claim_slot(
                     &record_path,
                     &SlotRecord {
                         state: SlotState::AwaitingReview,
-                        owner: None,
+                        // The last owner stays recorded so the interrupted
+                        // session can resume this exact slot; only the lead's
+                        // release or a clean return to the pool clears it.
+                        owner: existing.owner.clone(),
                         disposition: None,
                         reason: Some(reason.clone()),
                         ..existing
@@ -626,6 +629,80 @@ pub fn bind_slot(
     let bound = SlotRecord {
         state: SlotState::Occupied,
         base: Some(base.to_owned()),
+        disposition: None,
+        reason: None,
+        ..record
+    };
+    write_slot_record(&slot_record_path(codex_home, &pool.source, index)?, &bound)?;
+    Ok(bound)
+}
+
+/// Rebind one exact slot to its interrupted session. Resume is the one
+/// allocation path that must not resynchronize: partial work stays in the
+/// tree, so a missing record or directory, a foreign source, a missing base,
+/// a live owner or another owner's claim is refused instead of being repaired
+/// by a reset. A clean slot whose owner was cleared back to the pool is
+/// adopted for the explicitly named owner; a slot left awaiting review keeps
+/// its interrupted owner recorded, so only that owner resumes it.
+pub fn adopt_slot(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    owner: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<SlotRecord> {
+    if owner.trim().is_empty() {
+        return Err(pool_error(
+            "a slot resume requires the executor session identity",
+        ));
+    }
+    reconcile_slots(codex_home, pool, is_live)?;
+    let slot = pool.slot(index)?;
+    let record = load_slot_record(codex_home, &pool.source, index)?.ok_or_else(|| {
+        pool_error(&format!(
+            "slot {index} has no recorded binding to resume; dispatch executor spawn first"
+        ))
+    })?;
+    if !same_path(&record.source, &pool.source) {
+        return Err(pool_error(&format!(
+            "slot record {index} belongs to another source checkout {}; the lead resolves it",
+            record.source.display()
+        )));
+    }
+    if !slot.path.is_dir() {
+        return Err(pool_error(&format!(
+            "slot {index} directory {} is missing; run `git worktree prune` in {} and retry",
+            slot.path.display(),
+            pool.source.display()
+        )));
+    }
+    match record.owner.as_deref() {
+        Some(existing) if existing == owner => (),
+        Some(other) => {
+            return Err(pool_error(&format!(
+                "slot {index} is bound to session {other} instead of {owner}; resume that owner's session or release the slot instead of sharing one checkout"
+            )));
+        }
+        None => (),
+    }
+    if record.owner.as_deref().is_some_and(is_live) {
+        return Err(pool_error(&format!(
+            "session {owner} is already live in slot {index}; stop it before resuming"
+        )));
+    }
+    let base = record
+        .base
+        .clone()
+        .filter(|base| !base.trim().is_empty())
+        .ok_or_else(|| {
+            pool_error(&format!(
+                "slot {index} has no synchronized base to resume; dispatch executor spawn first"
+            ))
+        })?;
+    let bound = SlotRecord {
+        state: SlotState::Occupied,
+        owner: Some(owner.to_owned()),
+        base: Some(base),
         disposition: None,
         reason: None,
         ..record
@@ -707,7 +784,8 @@ pub fn release_slot(
 
 /// Reconcile recorded occupancy with executor session liveness. Only slots
 /// whose recorded session is gone change state: a clean slot returns to the
-/// pool, a slot holding work becomes awaiting review with its reason.
+/// pool without an owner, while a slot holding work becomes awaiting review
+/// with its reason and its interrupted owner still recorded for resume.
 pub fn reconcile_slots(
     codex_home: &Path,
     pool: &Pool,
@@ -734,7 +812,8 @@ pub fn reconcile_slots(
             },
             SlotContent::Unreviewed(reason) | SlotContent::Missing(reason) => SlotRecord {
                 state: SlotState::AwaitingReview,
-                owner: None,
+                // Preserve the interrupted session's identity for resume.
+                owner: record.owner.clone(),
                 reason: Some(reason),
                 ..record.clone()
             },
@@ -1154,8 +1233,9 @@ fn slot_status(path: &Path) -> io::Result<String> {
 }
 
 /// Remote and default branch of the checkout, resolved instead of hardcoded:
-/// `origin` when present, otherwise the only configured remote.
-fn upstream(path: &Path) -> io::Result<(String, Option<String>)> {
+/// `origin` when present, otherwise the only configured remote. Resume reads
+/// the same pair for its slot binding without resynchronizing the tree.
+pub fn upstream(path: &Path) -> io::Result<(String, Option<String>)> {
     let remote_list = git(path, &["remote"])?;
     let remotes: Vec<&str> = remote_list
         .lines()
@@ -1827,6 +1907,54 @@ mod tests {
             SlotClaim::Claimed(_)
         ));
         let error = claim_slot(&home, &layout, 1, "", &dead).unwrap_err();
+        assert!(error.to_string().contains("session identity"), "{error}");
+    }
+
+    #[test]
+    fn adopt_slot_resumes_without_reset_and_refuses_foreign_or_live_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let up = upstream(root.path());
+        let home = root.path().join("home");
+        let layout = pool(&up.source, 1).unwrap();
+        let dead = |_: &str| false;
+        let acquired = acquire_slot(&home, &up.source, 1, "exec-1", None, &dead).unwrap();
+        // The interrupted session leaves partial work in its slot.
+        let partial = acquired.path.join("partial.txt");
+        fs::write(&partial, "partial work\n").unwrap();
+        let head = rev(&acquired.path);
+        // Reconciliation keeps the interrupted owner recorded on the dirty
+        // slot; adoption rebinds it without fetch, reset or clean.
+        let adopted = adopt_slot(&home, &layout, 1, "exec-1", &dead).unwrap();
+        assert_eq!(adopted.state, SlotState::Occupied);
+        assert_eq!(adopted.owner.as_deref(), Some("exec-1"));
+        assert_eq!(adopted.base.as_deref(), Some(acquired.base.as_str()));
+        assert!(partial.is_file(), "resume must not clean partial work");
+        assert_eq!(rev(&acquired.path), head);
+        // The same owner resumes again after another interruption.
+        assert!(adopt_slot(&home, &layout, 1, "exec-1", &dead).is_ok());
+        assert!(partial.is_file());
+        // Another owner's claim is refused with both identities named.
+        let error = adopt_slot(&home, &layout, 1, "exec-2", &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("bound to session exec-1 instead of exec-2"),
+            "{error}"
+        );
+        assert!(partial.is_file());
+        // A live owner never resumes over its own running host.
+        let live = |session: &str| session == "exec-1";
+        let error = adopt_slot(&home, &layout, 1, "exec-1", &live)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already live"), "{error}");
+        // A slot without a record has nothing to resume.
+        let wider = pool(&up.source, 2).unwrap();
+        let error = adopt_slot(&home, &wider, 2, "exec-1", &dead)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no recorded binding to resume"), "{error}");
+        let error = adopt_slot(&home, &layout, 1, "", &dead).unwrap_err();
         assert!(error.to_string().contains("session identity"), "{error}");
     }
 

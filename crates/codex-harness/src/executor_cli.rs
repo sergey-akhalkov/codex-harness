@@ -31,7 +31,7 @@ use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] --exec PROMPT\ncodex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session SESSION_ID [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; it adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
 const STARTUP: Duration = Duration::from_secs(20);
 /// Windows Terminal activates the receiving window asynchronously around the
 /// launcher exit; this bounds how long dispatch keeps undoing that activation.
@@ -75,6 +75,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     }
     match args.first().and_then(|arg| arg.to_str()) {
         Some("spawn") => spawn(&args[1..]),
+        Some("resume") => resume(&args[1..]),
         Some("release") => release(&args[1..]),
         Some("pool") => pool_status(&args[1..]),
         Some("steer") => steer(&args[1..]),
@@ -184,6 +185,130 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     })
 }
 
+/// Resume one exact interrupted pooled session on its recorded slot. The slot
+/// is adopted without resynchronization so partial work survives, and the
+/// session continues through the verified non-interactive resume path in the
+/// same visible hosts as a fresh dispatch.
+fn resume(args: &[OsString]) -> io::Result<i32> {
+    let mut source = None;
+    let mut codex_home = None;
+    let mut profile = None;
+    let mut terminal_profile = None;
+    let mut terminal_window = None;
+    let mut slot = None;
+    let mut owner = None;
+    let mut session = None;
+    let mut prompt = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            "--slot" => {
+                let text = value
+                    .to_str()
+                    .ok_or_else(|| invalid("executor resume --slot must be a slot number"))?;
+                slot = Some(
+                    text.parse::<u32>()
+                        .map_err(|_| invalid("executor resume --slot must be a slot number"))?,
+                );
+            }
+            "--owner" => owner = Some(option_text(value)?),
+            "--session" => {
+                session = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                );
+            }
+            "--profile" => {
+                profile = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                );
+            }
+            "--terminal-profile" => {
+                terminal_profile = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                );
+            }
+            "--terminal-window" => {
+                terminal_window = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                );
+            }
+            "--exec" => {
+                prompt = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid native executor options"))?
+                        .to_owned(),
+                );
+            }
+            _ => return Err(invalid("invalid native executor options")),
+        }
+    }
+    let source = required(source, "--source")?;
+    let codex_home = required(codex_home, "--codex-home")?;
+    let slot = slot.ok_or_else(|| invalid("executor resume --slot is required"))?;
+    let owner = owner
+        .filter(|owner| !owner.trim().is_empty())
+        .ok_or_else(|| invalid("executor resume --owner is required"))?;
+    let session_text = session.ok_or_else(|| invalid("executor resume --session is required"))?;
+    let prompt = prompt.ok_or_else(|| invalid("--exec is required"))?;
+    if !source.is_absolute() || !codex_home.is_absolute() {
+        return Err(invalid("executor resume paths must be absolute"));
+    }
+    let session = task_succession::exact_session_id(&session_text)?.to_owned();
+    let config = load(&source)?;
+    let profile = executor_profile(&config, profile.as_deref())?.to_owned();
+    let request = Dispatch {
+        codex_home: &codex_home,
+        source: &source,
+        pool_size: config.max_concurrent_executors,
+        named_slot: None,
+        owner: &owner,
+        base: None,
+        profile: &profile,
+        prompt: &prompt,
+        mode: SpawnMode::Exec,
+        terminal_profile: terminal_profile.as_deref(),
+        terminal_window: terminal_window.as_deref(),
+    };
+    let bound = orchestration_config::binding(&codex_home, &profile)?;
+    refuse_a_live_owner(&codex_home, &source, &owner)?;
+    let live = |owner: &str| owner_live(&codex_home, &source, owner);
+    let pool = task_worktree::pool(&source, config.max_concurrent_executors)?;
+    let record = task_worktree::adopt_slot(&codex_home, &pool, slot, &owner, &live)?;
+    let (remote, branch) = task_worktree::upstream(&record.path)?;
+    let binding = SlotBinding {
+        index: record.index,
+        path: record.path.clone(),
+        source: source.to_path_buf(),
+        owner: owner.clone(),
+        base: record.base.clone().unwrap_or_default(),
+        remote,
+        branch,
+    };
+    let args = resume_child_args(&profile, &binding.path, &session, &prompt)?;
+    launch_bound(&request, &binding, args, &bound)
+}
+
 /// `--workspace` is no longer the isolation mechanism: it may name the source
 /// checkout, whose pool then selects the slot, or one of that checkout's pool
 /// slots. Ad-hoc task-named worktree paths are refused with a migration hint
@@ -287,7 +412,20 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         remote: slot.remote.clone(),
         branch: slot.branch.clone(),
     };
-    println!("{}", slot_summary(&binding, request.named_slot));
+    let args = child_args(request.profile, &binding.path, request.prompt, request.mode)?;
+    launch_bound(request, &binding, args, &bound)
+}
+
+/// Shared launch tail of fresh and resumed dispatches: report the mapping,
+/// trust the workspace, persist the receipt, then host the session with the
+/// slot's lease in the lead's terminal tab or an owned console.
+fn launch_bound(
+    request: &Dispatch,
+    binding: &SlotBinding,
+    args: Vec<String>,
+    bound: &ProfileBinding,
+) -> io::Result<i32> {
+    println!("{}", slot_summary(binding, request.named_slot));
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
     let receipt = receipt_path(request.codex_home, request.source, binding.index)?;
@@ -300,7 +438,6 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
             binding.owner
         )));
     }
-    let args = child_args(request.profile, &binding.path, request.prompt, request.mode)?;
     let title = executor_title(request.profile, &binding.owner);
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
@@ -309,14 +446,14 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
             client.as_ref().expect("terminal client"),
             &launcher,
             request,
-            &binding,
+            binding,
             &receipt,
             &title,
             &args,
-            &bound,
+            bound,
         )
     } else {
-        dispatch_owned_console(&launcher, request, &binding, &receipt, &bound, &args)
+        dispatch_owned_console(&launcher, request, binding, &receipt, bound, &args)
     }
 }
 
@@ -446,11 +583,19 @@ fn record_lease(codex_home: &Path, binding: &SlotBinding) -> io::Result<()> {
             ))
         })?;
     if record.owner.as_deref() != Some(binding.owner.as_str()) {
+        let recorded = record.owner.as_deref().unwrap_or("no session");
+        let remedy = record.owner.is_none().then(|| {
+            format!(
+                "; slot {} became unbound when its session ended: dispatch `executor spawn`, or `executor resume --slot {} --owner {} --session SESSION_ID` for that interrupted session, instead of a hand-edited receipt",
+                binding.index, binding.index, binding.owner
+            )
+        });
         return Err(invalid(&format!(
-            "slot {} is bound to session {} instead of {}; dispatch again instead of sharing one checkout",
+            "slot {} is bound to session {} instead of {}; dispatch again instead of sharing one checkout{}",
             binding.index,
-            record.owner.as_deref().unwrap_or("no session"),
-            binding.owner
+            recorded,
+            binding.owner,
+            remedy.unwrap_or_default()
         )));
     }
     let program = std::env::current_exe()
@@ -1262,6 +1407,29 @@ fn child_args(
         // passed on this path.
         SpawnMode::Tui => tui_args(profile, workspace, prompt),
     }
+}
+
+/// The verified non-interactive resume order shared with instruction-refresh
+/// succession: profile flags, then `exec --skip-git-repo-check -C <slot>
+/// resume <SESSION_ID> <PROMPT>`. The exact session id is never a picker or
+/// `--last`.
+fn resume_child_args(
+    profile: &str,
+    workspace: &Path,
+    session: &str,
+    prompt: &str,
+) -> io::Result<Vec<String>> {
+    let mut args = profile_args(profile)?;
+    args.extend([
+        "exec".into(),
+        "--skip-git-repo-check".into(),
+        "-C".into(),
+        native_path(workspace)?,
+        "resume".into(),
+        session.to_owned(),
+        prompt.to_owned(),
+    ]);
+    Ok(args)
 }
 
 // The receipt records every dispatch input the watcher, the tab host and the
@@ -2847,6 +3015,108 @@ mod tests {
         .unwrap();
         assert!(!owner_live(&home, &source, "exec-ds-7"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_lease_names_the_pooled_remedy_for_an_unbound_slot() {
+        let root = std::env::temp_dir().join(format!("executor-unbound-{}", std::process::id()));
+        let source = root.join("proj");
+        let home = root.join("home");
+        fs::create_dir_all(&source).unwrap();
+        let binding = SlotBinding {
+            index: 1,
+            path: source.parent().unwrap().join("proj-wt1"),
+            source: source.clone(),
+            owner: "exec-ds-7".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+        };
+        // A hand-edited receipt meets the slot state reconciliation leaves
+        // behind: no owner, so no ownership comparison can ever succeed.
+        let path = task_worktree::slot_record_path(&home, &source, 1).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "source": binding.source,
+                "index": 1,
+                "path": binding.path,
+                "state": "awaitingReview",
+                "owner": null,
+                "base": "abc123",
+                "disposition": null,
+                "reason": "untracked files",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = record_lease(&home, &binding).unwrap_err().to_string();
+        assert!(error.contains("no session"), "{error}");
+        assert!(error.contains("executor spawn"), "{error}");
+        assert!(
+            error.contains("executor resume --slot 1 --owner exec-ds-7 --session SESSION_ID"),
+            "{error}"
+        );
+        assert!(error.contains("hand-edited receipt"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_child_args_resume_the_exact_session_in_the_slot() {
+        let args = resume_child_args(
+            "ds",
+            Path::new(r"D:\wt\ds"),
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+            "Continue the interrupted assignment.",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--profile".to_owned(),
+                "ds".to_owned(),
+                "exec".to_owned(),
+                "--skip-git-repo-check".to_owned(),
+                "-C".to_owned(),
+                r"D:\wt\ds".to_owned(),
+                "resume".to_owned(),
+                "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4".to_owned(),
+                "Continue the interrupted assignment.".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_requires_explicit_slot_owner_and_exact_session() {
+        let base = [
+            OsString::from("--source"),
+            OsString::from(r"C:\proj"),
+            OsString::from("--codex-home"),
+            OsString::from(r"C:\home"),
+            OsString::from("--slot"),
+            OsString::from("1"),
+            OsString::from("--exec"),
+            OsString::from("continue"),
+        ];
+        let missing_owner = resume(&base).unwrap_err().to_string();
+        assert!(
+            missing_owner.contains("--owner is required"),
+            "{missing_owner}"
+        );
+        let picker: Vec<OsString> = base
+            .iter()
+            .cloned()
+            .chain([
+                OsString::from("--owner"),
+                OsString::from("exec-ds-7"),
+                OsString::from("--session"),
+                OsString::from("--last"),
+            ])
+            .collect();
+        let error = resume(&picker).unwrap_err().to_string();
+        assert!(error.contains("one exact session id"), "{error}");
     }
 
     fn write_test_slot_record(home: &Path, source: &Path, binding: &SlotBinding) {

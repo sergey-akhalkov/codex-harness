@@ -108,6 +108,28 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    fn resume(&self, extra: &[&str]) -> std::process::Output {
+        let mut command = Command::new(manager());
+        command.args([
+            "executor",
+            "resume",
+            "--source",
+            self.source.to_str().unwrap(),
+            "--codex-home",
+            self.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            "exec-ds-52",
+            "--session",
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+            "--exec",
+            "continue the interrupted assignment",
+        ]);
+        command.args(extra);
+        command.output().unwrap()
+    }
+
     fn release(&self, extra: &[&str]) -> std::process::Output {
         let mut command = Command::new(manager());
         command.args([
@@ -421,6 +443,64 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     assert!(!next.status.success());
     assert_eq!(fixture.record(1)["owner"], "exec-other");
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+    fixture.drop();
+}
+
+#[test]
+fn resume_rebinds_the_interrupted_slot_without_resetting_partial_work() {
+    let fixture = Fixture::new("resume", 1);
+    let spawned = fixture.spawn(&["--owner", "exec-ds-52"]);
+    let text = output_text(&spawned);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let slot = fixture.slot(1);
+    let head = git_output(&slot, &["rev-parse", "HEAD"]);
+    // The interrupted session leaves partial work in its slot; after its host
+    // is gone, reconciliation clears the recorded owner.
+    let partial = slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let pool = fixture.pool();
+    assert!(pool.contains("owner=exec-ds-52"), "{pool}");
+    // Resume adopts the reconciled slot for the same owner and the exact
+    // session without fetch, reset or clean.
+    let resumed = fixture.resume(&[]);
+    let text = output_text(&resumed);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains("owner=exec-ds-52"), "{text}");
+    assert!(partial.is_file(), "resume must preserve partial work");
+    assert_eq!(
+        git_output(&slot, &["rev-parse", "HEAD"]),
+        head,
+        "resume must not resynchronize the slot"
+    );
+    let record = fixture.record(1);
+    assert_eq!(record["state"], "occupied");
+    assert_eq!(record["owner"], "exec-ds-52");
+    assert_eq!(record["base"], head.as_str());
+    // The same owner resumes repeatedly after further interruptions.
+    let again = fixture.resume(&[]);
+    assert!(
+        output_text(&again).contains("owner=exec-ds-52"),
+        "{}",
+        output_text(&again)
+    );
+    assert!(partial.is_file());
+    // Another owner is refused with both identities named, and the tree keeps
+    // its partial work.
+    let other = fixture.resume(&["--owner", "exec-ds-9"]);
+    let text = output_text(&other);
+    assert!(!other.status.success(), "{text}");
+    assert!(
+        text.contains("bound to session exec-ds-52 instead of exec-ds-9"),
+        "{text}"
+    );
+    assert!(partial.is_file());
+    assert_eq!(fixture.record(1)["owner"], "exec-ds-52");
     fixture.drop();
 }
 

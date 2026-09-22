@@ -122,6 +122,10 @@ fetched upstream default branch; `--owner ID` labels the session binding
 (default `exec-<profile>-<pid>`), and dispatching again with the same owner id
 rebinds the same slot - including after an interruption - instead of creating
 another tree.
+An interrupted session continues with `codex-harness executor resume --slot N
+--owner ID --session SESSION_ID` on its recorded slot: the rebind skips fetch,
+reset and clean so partial work survives, the owner and slot stay explicit,
+and hand-edited `executor run` receipts are never the resume path.
 
 Fix a committed snapshot before every dispatch. Commit assignment-relevant
 changes in the source checkout - a local commit is enough, and pushing stays
@@ -186,7 +190,8 @@ its issue (done, next, blockers in at most three lines) instead of waiting
 for the lead to ask.
 The default exec mode streams the assignment in a visible tab and exits on
 completion, closing the tab; a mid-work stop is detected by the watcher and
-the exact session continues through `codex exec resume SESSION_ID`. Do not
+the exact session continues through `codex-harness executor resume --slot N
+--owner ID --session SESSION_ID`. Do not
 prefix prompts with `/goal`: the CLI has no argv goal hook and the prefix
 would be inert text. Accept only against the assignment, not effort spent.
 Spawn returns after the executor window/tab is open so the lead can keep
@@ -272,8 +277,8 @@ mapping per slot (index, path, presence, tree state, state, lease, owner, base)
 and lists foreign or legacy worktrees for your review; `git worktree list` stays
 the authoritative tree inventory, and slot purpose lives in kit-local task state
 and board records, never in tracked files. An interruption keeps the recorded
-mapping, so reusing the owner id rebinds the same slot after re-synchronization,
-while a second live owner of one slot is refused instead of sharing a checkout.
+mapping; resume the exact session on its slot to keep partial work, while a
+second live owner of one slot is refused instead of sharing a checkout.
 Legacy task-named or CLI-named executor trees in a consuming repository are
 never adopted or deleted by dispatch: merge accepted work, retire the rest with
 authorized `git worktree remove`, and prune stale entries afterwards.
@@ -284,8 +289,9 @@ conversations are not, and a fresh session must not inherit another
 assignment's context. Exec mode closes the tab when the assignment finishes;
 nothing lingers and nobody has to remember to close it.
 To return defects or continue after a stop, resume the exact session
-(`codex resume SESSION_ID` interactively, `codex exec resume SESSION_ID` for a
-bounded continuation) and state the acceptance conditions there.
+(`codex-harness executor resume --slot N --owner ID --session SESSION_ID` for
+a pooled executor, `codex resume SESSION_ID` interactively otherwise) and
+state the acceptance conditions there.
 
 ## Recovery
 
