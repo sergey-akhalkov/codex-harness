@@ -32,6 +32,7 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_token-audit"))
             .args(args)
+            .env("CODEX_HOME", self.root().join("codex-home"))
             .output()
             .unwrap()
     }

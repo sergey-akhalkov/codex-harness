@@ -144,6 +144,14 @@ fn run_fixture(args: &[std::ffi::OsString]) -> io::Result<i32> {
             echo_stdin()?;
             Ok(0)
         }
+        "mutate-input" => {
+            let path = extra
+                .first()
+                .ok_or_else(|| io::Error::other("input path required"))?;
+            signal_ready()?;
+            fs::write(path, "mutated during execution\n")?;
+            Ok(0)
+        }
         other => Err(io::Error::other(format!("unknown fixture role {other}"))),
     }
 }

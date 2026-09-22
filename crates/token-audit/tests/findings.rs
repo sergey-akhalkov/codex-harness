@@ -7,15 +7,26 @@ use std::{
     process::{Command, Output},
 };
 
-struct Fixture(tempfile::TempDir);
+struct Fixture {
+    root: tempfile::TempDir,
+    /// Isolated CODEX_HOME so retained detail never touches real local state.
+    home: tempfile::TempDir,
+}
 
 impl Fixture {
     fn new() -> Self {
-        Self(tempfile::tempdir().unwrap())
+        Self {
+            root: tempfile::tempdir().unwrap(),
+            home: tempfile::tempdir().unwrap(),
+        }
     }
 
     fn sessions(&self) -> PathBuf {
-        self.0.path().join("sessions")
+        self.root.path().join("sessions")
+    }
+
+    fn home(&self) -> PathBuf {
+        self.home.path().to_path_buf()
     }
 
     fn rollout(&self, relative: &str, events: &[Value]) {
@@ -31,6 +42,7 @@ impl Fixture {
         args.extend_from_slice(extra);
         Command::new(env!("CARGO_BIN_EXE_token-audit"))
             .args(args)
+            .env("CODEX_HOME", self.home())
             .output()
             .unwrap()
     }

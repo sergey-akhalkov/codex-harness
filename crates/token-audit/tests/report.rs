@@ -8,15 +8,26 @@ use std::{
     process::{Command, Output},
 };
 
-struct Fixture(tempfile::TempDir);
+struct Fixture {
+    root: tempfile::TempDir,
+    /// Isolated CODEX_HOME so retained detail never touches real local state.
+    home: tempfile::TempDir,
+}
 
 impl Fixture {
     fn new() -> Self {
-        Self(tempfile::tempdir().unwrap())
+        Self {
+            root: tempfile::tempdir().unwrap(),
+            home: tempfile::tempdir().unwrap(),
+        }
     }
 
     fn root(&self) -> PathBuf {
-        self.0.path().to_path_buf()
+        self.root.path().to_path_buf()
+    }
+
+    fn home(&self) -> PathBuf {
+        self.home.path().to_path_buf()
     }
 
     fn sessions(&self) -> PathBuf {
@@ -34,6 +45,7 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_token-audit"))
             .args(args)
+            .env("CODEX_HOME", self.home())
             .output()
             .unwrap()
     }

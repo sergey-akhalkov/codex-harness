@@ -1,10 +1,11 @@
 //! Thin binary over the `token-audit` library.
 use std::{env, io, io::Write, path::PathBuf, process::ExitCode};
 use token_audit::{
-    BaselineDiff, Format, SCHEMA_VERSION, ScanOptions, analyze, baseline_diff,
-    default_baseline_directory, default_sessions_root, now, render_findings_json,
-    render_findings_text, render_json, render_text, resolve_baseline, save_baseline, scan,
-    write_private_sources,
+    BaselineDiff, Detail, Format, RETENTION_LIMIT, RetainedKind, SCHEMA_VERSION, ScanOptions,
+    analyze, baseline_diff, default_baseline_directory, default_retention_directory,
+    default_sessions_root, now, render_findings_json, render_findings_text, render_json,
+    render_text, resolve_baseline, retain_detail, save_baseline, scan, select_finding,
+    select_session, write_private_sources,
 };
 
 const USAGE: &str = "\
@@ -12,9 +13,13 @@ token-audit report [--sessions DIR] [--days N] [--format json|text] [--private-s
 token-audit findings [--sessions DIR] [--days N] [--format json|text] [--all-bases]
 token-audit baseline save [--sessions DIR] [--days N] [--format json|text]
 token-audit baseline diff [--sessions DIR] [--days N] [--format json|text] [--baseline NAME|latest]
+token-audit detail --report PATH --session ID
+token-audit detail --findings PATH --finding ID
 Measured token-usage reports over local Codex rollout sessions: recorded counters, instruction bytes and coverage. No currency, quota or transcript content.
 Project identities are hashed; --private-sources PATH records local source digests and raw project names there instead, outside tracked sources.
 --days N bounds the scan to sessions with recorded activity within N days.
+--format json prints the complete machine contract. --format text prints a bounded ranked summary and retains its complete same-scan JSON under CODEX_HOME/harness/token-audit/reports (newest 20 per kind); the summary names that path.
+detail reads one session or finding record from the retained JSON named by a summary: no session rescan, no model call, no network. An expired or evicted record is an explicit error.
 Exit codes: 0 success, 2 usage or input error, 3 command not implemented.";
 
 fn main() -> ExitCode {
@@ -35,6 +40,7 @@ fn run(args: &[String]) -> io::Result<ExitCode> {
         "report" => report(&args[1..]),
         "findings" => findings(&args[1..]),
         "baseline" => baseline(&args[1..]),
+        "detail" => detail(&args[1..]),
         "-h" | "--help" | "help" => emit(USAGE).map(|()| ExitCode::SUCCESS),
         other => Err(invalid(format!("unknown command {other}\n{USAGE}"))),
     }
@@ -70,7 +76,14 @@ fn report(args: &[String]) -> io::Result<ExitCode> {
     }
     let rendered = match options.format() {
         Format::Json => render_json(&scanned.report),
-        Format::Text => render_text(&scanned.report),
+        Format::Text => {
+            let detail = retain_complete(
+                RetainedKind::Report,
+                &scanned.report.generated_at,
+                &render_json(&scanned.report),
+            );
+            render_text(&scanned.report, &detail)
+        }
     };
     emit(&rendered).map(|()| ExitCode::SUCCESS)
 }
@@ -119,9 +132,85 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
     let analyzed = analyze(&scanned.report, !all_bases);
     let rendered = match options.format() {
         Format::Json => render_findings_json(&analyzed),
-        Format::Text => render_findings_text(&analyzed),
+        Format::Text => {
+            let detail = retain_complete(
+                RetainedKind::Findings,
+                &analyzed.generated_at,
+                &render_findings_json(&analyzed),
+            );
+            render_findings_text(&analyzed, &detail)
+        }
     };
     emit(&rendered).map(|()| ExitCode::SUCCESS)
+}
+
+/// Retains the complete same-scan JSON that a bounded presentation summarizes.
+fn retain_complete(kind: RetainedKind, generated_at: &str, complete_json: &str) -> Detail {
+    let Some(directory) = default_retention_directory() else {
+        return Detail::Unavailable(
+            "CODEX_HOME or USERPROFILE is required to retain the complete report".to_owned(),
+        );
+    };
+    retain_detail(&directory, kind, generated_at, complete_json)
+        .unwrap_or_else(|error| Detail::Unavailable(error.to_string()))
+}
+
+/// One bounded record read over a retained complete report.
+enum DetailRequest {
+    Session { path: PathBuf, id: String },
+    Finding { path: PathBuf, id: String },
+}
+
+fn detail(args: &[String]) -> io::Result<ExitCode> {
+    if requests_help(args) {
+        return emit(USAGE).map(|()| ExitCode::SUCCESS);
+    }
+    let record = match parse_detail(args)? {
+        DetailRequest::Session { path, id } => select_session(&path, &id)?,
+        DetailRequest::Finding { path, id } => select_finding(&path, &id)?,
+    };
+    let rendered = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
+    emit(&format!("{rendered}\n")).map(|()| ExitCode::SUCCESS)
+}
+
+fn parse_detail(args: &[String]) -> io::Result<DetailRequest> {
+    let mut report = None;
+    let mut findings = None;
+    let mut session = None;
+    let mut finding = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        index += 1;
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        let mut value = || -> io::Result<String> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            let value = args
+                .get(index)
+                .ok_or_else(|| invalid(format!("{flag} needs a value")))?;
+            index += 1;
+            Ok(value.clone())
+        };
+        match flag {
+            "--report" => report = Some(PathBuf::from(value()?)),
+            "--findings" => findings = Some(PathBuf::from(value()?)),
+            "--session" => session = Some(value()?),
+            "--finding" => finding = Some(value()?),
+            other => return Err(invalid(format!("unknown argument {other}\n{USAGE}"))),
+        }
+    }
+    match (report, findings, session, finding) {
+        (Some(path), None, Some(id), None) => Ok(DetailRequest::Session { path, id }),
+        (None, Some(path), None, Some(id)) => Ok(DetailRequest::Finding { path, id }),
+        _ => Err(invalid(format!(
+            "detail needs --report PATH with --session ID, or --findings PATH with --finding ID; retention keeps the newest {RETENTION_LIMIT} files per kind\n{USAGE}"
+        ))),
+    }
 }
 
 fn baseline_run(args: &[String], diff_mode: bool) -> io::Result<ExitCode> {

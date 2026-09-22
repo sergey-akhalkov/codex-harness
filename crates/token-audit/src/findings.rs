@@ -69,10 +69,10 @@ const OUTLIER_MIN_SESSIONS: usize = 5;
 const TOOL_MASS_MIN_BYTES: u64 = 1024 * 1024;
 const HIGH_EFFORTS: [&str; 2] = ["max", "xhigh"];
 
-const OWNER_RUNTIME: &str = "docs/memory/token-workflow.md";
-const OWNER_DELEGATION: &str = "docs/memory/agent-delegation.md";
-const OWNER_SUBSCRIPTIONS: &str = "docs/memory/subscription-models.md";
-const OWNER_TOOLING: &str = ".agents/skills/token-efficient-workflow/SKILL.md";
+const OWNER_RUNTIME: &str = harness_core::report_owners::TOKEN_WORKFLOW;
+const OWNER_DELEGATION: &str = harness_core::report_owners::AGENT_DELEGATION;
+const OWNER_SUBSCRIPTIONS: &str = harness_core::report_owners::SUBSCRIPTION_MODELS;
+const OWNER_TOOLING: &str = harness_core::report_owners::TOKEN_EFFICIENT_WORKFLOW;
 
 /// Runs every detector, then ranks by measured mass and applies the basis
 /// filter. Zero-mass findings never surface.

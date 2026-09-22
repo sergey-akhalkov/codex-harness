@@ -1,7 +1,16 @@
 //! JSON and text renderers for the report.
+//!
+//! The JSON renderers emit the complete machine contract. The text renderers
+//! are the bounded interactive presentation: they keep totals, coverage and
+//! warnings complete, rank records by recorded total tokens, state how many
+//! records the presentation omitted and name the retained complete JSON.
 use crate::findings::FindingsReport;
 use crate::model::{Bucket, CoverageReport, Report, SessionContext, SessionRow, TokenTotals};
+use crate::retention::{Detail, Kind};
 use std::collections::BTreeMap;
+
+/// Ranked records shown per group in the interactive presentation.
+pub const PRESENTATION_LIMIT: usize = 12;
 
 /// Pretty JSON report, newline terminated.
 pub fn render_json(report: &Report) -> String {
@@ -11,8 +20,9 @@ pub fn render_json(report: &Report) -> String {
     )
 }
 
-/// Line-oriented text report for interactive reading.
-pub fn render_text(report: &Report) -> String {
+/// Bounded line-oriented report for interactive reading. `detail` names the
+/// retained complete same-scan JSON that `token-audit detail` reads.
+pub fn render_text(report: &Report, detail: &Detail) -> String {
     let mut out = String::new();
     let window = report
         .window_days
@@ -30,7 +40,14 @@ pub fn render_text(report: &Report) -> String {
         "warnings {}\n",
         counts_text(&report.coverage.warning_counts)
     ));
-    for row in &report.sessions {
+    let sessions = ranked_sessions(&report.sessions);
+    out.push_str(&ranking_text(
+        "sessions",
+        "recorded total tokens",
+        sessions.len().min(PRESENTATION_LIMIT),
+        sessions.len(),
+    ));
+    for row in sessions.iter().take(PRESENTATION_LIMIT) {
         out.push_str(&session_text(row));
     }
     for (label, buckets) in [
@@ -39,13 +56,22 @@ pub fn render_text(report: &Report) -> String {
         ("effort", &report.by_effort),
         ("day", &report.by_day),
     ] {
-        for bucket in buckets {
+        let ranked = ranked_buckets(buckets);
+        out.push_str(&ranking_text(
+            &format!("{label}s"),
+            "recorded total tokens",
+            ranked.len().min(PRESENTATION_LIMIT),
+            ranked.len(),
+        ));
+        for bucket in ranked.iter().take(PRESENTATION_LIMIT) {
             out.push_str(&format!(
                 "{label} {}\n",
                 bucket_text(bucket, Some(&bucket.key))
             ));
         }
     }
+    out.push_str(&format!("{}\n", detail.note(Kind::Report)));
+    out.push_str(&format!("limitation {}\n", report.limitation));
     out
 }
 
@@ -57,8 +83,9 @@ pub fn render_findings_json(report: &FindingsReport) -> String {
     )
 }
 
-/// Line-oriented findings text for interactive reading.
-pub fn render_findings_text(report: &FindingsReport) -> String {
+/// Bounded line-oriented findings text for interactive reading. `detail` names
+/// the retained complete same-scan findings JSON for record reads.
+pub fn render_findings_text(report: &FindingsReport, detail: &Detail) -> String {
     let mut out = String::new();
     let window = report
         .window_days
@@ -76,7 +103,13 @@ pub fn render_findings_text(report: &FindingsReport) -> String {
     if report.findings.is_empty() {
         out.push_str("findings none\n");
     }
-    for finding in &report.findings {
+    out.push_str(&ranking_text(
+        "findings",
+        "measured mass",
+        report.findings.len().min(PRESENTATION_LIMIT),
+        report.findings.len(),
+    ));
+    for finding in report.findings.iter().take(PRESENTATION_LIMIT) {
         out.push_str(&format!(
             "{}  basis={}  mass_tokens={}  owner={}\n",
             finding.id, finding.basis, finding.mass_tokens, finding.owner
@@ -99,8 +132,51 @@ pub fn render_findings_text(report: &FindingsReport) -> String {
             .collect();
         out.push_str(&format!("hidden {}\n", hidden.join(" ")));
     }
+    out.push_str(&format!("{}\n", detail.note(Kind::Findings)));
     out.push_str(&format!("limitation {}\n", report.limitation));
     out
+}
+
+/// Sessions ranked by recorded total tokens, then by identity. Sessions
+/// without a recorded total stay last and are never counted as zero.
+fn ranked_sessions(sessions: &[SessionRow]) -> Vec<&SessionRow> {
+    let mut ranked: Vec<&SessionRow> = sessions.iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    ranked
+}
+
+/// Buckets ranked by recorded total tokens, then by key.
+fn ranked_buckets(buckets: &[Bucket]) -> Vec<&Bucket> {
+    let mut ranked: Vec<&Bucket> = buckets.iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    ranked
+}
+
+/// One ranked-group header stating the ranking basis and presented count.
+fn ranking_text(label: &str, basis: &str, shown: usize, total: usize) -> String {
+    if total == 0 {
+        return format!("{label} ranked by {basis}, none recorded\n");
+    }
+    if total > shown {
+        format!(
+            "{label} ranked by {basis}, showing {shown} of {total}; {} omitted from this presentation\n",
+            total - shown
+        )
+    } else {
+        format!("{label} ranked by {basis}, all {total} presented\n")
+    }
 }
 
 fn coverage_text(coverage: &CoverageReport) -> String {

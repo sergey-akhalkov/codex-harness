@@ -12,6 +12,7 @@ mod identity;
 mod model;
 mod render;
 mod report;
+mod retention;
 
 pub use baseline::{
     BASELINE_SCHEMA_VERSION, BaselineDiff, BaselineSnapshot,
@@ -24,8 +25,20 @@ pub use model::{
     Bucket, ContextAggregate, CoverageReport, Format, Report, Scan, SessionContext, SessionRow,
     TokenTotals,
 };
-pub use render::{render_findings_json, render_findings_text, render_json, render_text};
+pub use render::{
+    PRESENTATION_LIMIT, render_findings_json, render_findings_text, render_json, render_text,
+};
 pub use report::{ScanOptions, default_sessions_root, discover, now, scan};
+pub use retention::{
+    Detail, Kind as RetainedKind, RETENTION_LIMIT,
+    default_directory as default_retention_directory, retain as retain_detail, select_finding,
+    select_session,
+};
+
+/// Repository-relative documentation routes that findings may name, shared
+/// with the native source check that verifies each route resolves in current
+/// source (`harness_core::report_owners`).
+pub use harness_core::report_owners::TOKEN_AUDIT_OWNERS;
 
 /// Schema version of the JSON report and of the private-source record.
 pub const SCHEMA_VERSION: u32 = 1;

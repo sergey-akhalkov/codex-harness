@@ -109,6 +109,7 @@ pub mod process_service;
 pub mod profile_state;
 pub mod registration;
 mod registration_native;
+pub mod report_owners;
 pub mod resource_admission;
 pub mod rollout_reader;
 pub mod scoped_observations;

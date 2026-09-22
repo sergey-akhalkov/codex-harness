@@ -3,6 +3,7 @@
 //! A fresh anonymous job is assigned before resume. Cleanup never looks up a
 //! process by name or PID. Child stdout and stderr stay in the case root.
 
+use crate::verification_record;
 use harness_core::analysis_samples;
 use harness_core::inventory;
 use harness_core::process::{
@@ -36,6 +37,10 @@ pub struct CaseRequest {
     pub output_limit: u64,
     pub stdin: Option<PathBuf>,
     pub root: Option<PathBuf>,
+    /// Selected verification scope; declaring it records a verification receipt.
+    pub scope: Option<String>,
+    /// Declared input/provenance files recorded by content identity.
+    pub inputs: Vec<PathBuf>,
     pub cancellation: Cancellation,
 }
 
@@ -49,6 +54,8 @@ impl Default for CaseRequest {
             output_limit: DEFAULT_OUTPUT_LIMIT,
             stdin: None,
             root: None,
+            scope: None,
+            inputs: Vec::new(),
             cancellation: Cancellation::default(),
         }
     }
@@ -71,6 +78,12 @@ pub fn run_cli(args: &[OsString]) -> io::Result<i32> {
 /// receipt as infrastructure-failure, matching the Python helper.
 pub fn run_case(request: CaseRequest) -> io::Result<Value> {
     validate(&request)?;
+    let capture = verification_record::Capture::begin(
+        request.scope.as_deref(),
+        &request.cwd,
+        Path::new(&request.argv[0]),
+        &request.inputs,
+    )?;
     let started = Instant::now();
     let root = allocate_root(request.root.as_deref())?;
     let mut result = match execute(&request, &root) {
@@ -82,6 +95,9 @@ pub fn run_case(request: CaseRequest) -> io::Result<Value> {
             "error": error.to_string(),
         }),
     };
+    if let Some(capture) = capture {
+        result["verification"] = capture.finish();
+    }
     finish(&mut result, &root, started, request.output_limit)?;
     Ok(result)
 }
@@ -137,6 +153,8 @@ fn validate(request: &CaseRequest) -> io::Result<()> {
     if request.output_limit < 1 {
         return Err(invalid("output_limit must be positive"));
     }
+    verification_record::validate_scope(request.scope.as_deref())?;
+    verification_record::validate_inputs(&request.inputs)?;
     Ok(())
 }
 
@@ -178,6 +196,12 @@ fn execute_windows(request: &CaseRequest, root: &Path) -> io::Result<Value> {
             "memoryLimitMiB": 512,
             "environment": {"PROCESS_CASE_ROOT": path_string(root)},
             "stdinPath": request.stdin.as_ref().map(|path| path_string(path)),
+            "scope": request.scope.as_deref(),
+            "declaredInputs": request
+                .inputs
+                .iter()
+                .map(|path| path_string(path))
+                .collect::<Vec<String>>(),
         }),
     )?;
     let mut spec = CommandSpec::new(&program);
@@ -370,7 +394,7 @@ fn parse_args(args: &[OsString]) -> io::Result<CaseRequest> {
         let name = arg.to_str().ok_or_else(|| invalid("non-utf8 argument"))?;
         if name == "--help" {
             return Err(invalid(
-                "harness-observe --cwd DIR --timeout SECONDS [--ready-timeout SECONDS] [--output-limit BYTES] [--stdin FILE] [--root DIR] -- <absolute-exe> [args...]",
+                "harness-observe --cwd DIR --timeout SECONDS [--ready-timeout SECONDS] [--output-limit BYTES] [--stdin FILE] [--root DIR] [--scope TEXT] [--input FILE]... -- <absolute-exe> [args...]",
             ));
         }
         if name == "--" {
@@ -395,6 +419,8 @@ fn parse_args(args: &[OsString]) -> io::Result<CaseRequest> {
             "--output-limit" => request.output_limit = parse_u64(&value, "--output-limit")?,
             "--stdin" => request.stdin = Some(PathBuf::from(value)),
             "--root" => request.root = Some(PathBuf::from(value)),
+            "--scope" => request.scope = Some(value),
+            "--input" => request.inputs.push(PathBuf::from(value)),
             other => return Err(invalid(&format!("unknown argument {other}"))),
         }
     }
