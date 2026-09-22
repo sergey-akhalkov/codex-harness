@@ -406,10 +406,12 @@ mod tests {
                 );
             }
         }
-        // Name order is creation order, so eviction always removes the oldest
-        // retained run.
+        // Name order is creation order, so the surviving suffix of the written
+        // locators is exactly what the directory still holds.
+        let retained_from = written.len().saturating_sub(RETENTION_LIMIT);
         let created: Vec<String> = written
             .iter()
+            .skip(retained_from)
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(created, names(directory.path()));
