@@ -125,8 +125,10 @@ implementation authority; it never writes a skill package.
 
 Lead consequence override: with material correctness, integrity or safety
 evidence, pass both `--override-consequence TEXT` and `--override-reason TEXT`.
-The command records the override, preserves vote history and reconciles a
-completed promotion on retry; it does not infer the consequence or authority.
+The command records the override and preserves vote history. A completed retry
+successfully confirms the recorded promotion without rewriting history; partial
+retries reconcile missing labels. A different route or OpenSpec target is a
+conflict. The command does not infer the consequence or authority.
 
 ## Incubator hygiene (lead-owned)
 
