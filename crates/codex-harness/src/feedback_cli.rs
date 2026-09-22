@@ -5,10 +5,12 @@
 //! observation, `list`, `ledger` and `candidates` only read, `triage` applies
 //! caller-selected semantic decisions in one configured batch, and `promote`
 //! performs one explicit recorded promotion. Similarity, merging and
-//! consequence stay caller decisions; thresholds and batch size come from the
-//! orchestration configuration of the checkout (`--source`, the project by
-//! default) with the kit defaults when it is absent. No operation calls a
-//! model, and read-only verbs never mutate the board.
+//! consequence stay caller decisions. Thresholds and batch size come from the
+//! owning orchestration configuration: the installed kit checkout recorded by
+//! the normal CODEX_HOME installation, else the project's own checkout, else
+//! the kit defaults; `--source` names an explicit override and every verb
+//! prints the configuration source it used. No operation calls a model, and
+//! read-only verbs never mutate the board.
 
 use harness_core::board_feedback::{
     self, BatchFailure, BoundedFeedback, FeedbackDraft, KitConcern, ObservationKind,
@@ -23,12 +25,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml (the project directory by default) with kit defaults when that file is absent; the verb prints which limits it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
 /// Bound on one batch document; larger sets are split by the caller.
 const MAX_DECISIONS: usize = 512;
+/// Bound on the installation record read for the installed kit source.
+const MAX_INSTALLATION_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,35 +97,23 @@ fn resolve_board(options: &Options) -> io::Result<Board> {
             bd.display()
         )));
     }
-    let source = options
-        .get("--source")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| project.clone());
-    if !source.is_dir() {
-        return Err(invalid(&format!(
-            "source checkout {} is missing; --source names the checkout whose global/orchestration.toml supplies limits",
-            source.display()
-        )));
-    }
-    let config_path = source.join("global/orchestration.toml");
-    let (batch_limit, vote_threshold, incubator_cap, limits) =
-        match harness_core::orchestration_config::load(&source) {
+    let limits = resolve_limits(options, &project)?;
+    let (batch_limit, vote_threshold, incubator_cap) =
+        match harness_core::orchestration_config::load(&limits.checkout) {
             Ok(config) => (
                 config.feedback_batch_limit as usize,
                 config.vote_threshold,
                 config.incubator_size_cap as usize,
-                format!("configured({})", config_path.display()),
             ),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (
                 board_feedback::DEFAULT_FEEDBACK_BATCH_LIMIT,
                 board_feedback::DEFAULT_VOTE_THRESHOLD,
                 board_feedback::DEFAULT_INCUBATOR_SIZE_CAP,
-                format!("defaults({} is absent)", config_path.display()),
             ),
             Err(error) => {
                 return Err(invalid(&format!(
                     "orchestration configuration {} is unusable: {error}",
-                    config_path.display()
+                    limits.checkout.join("global/orchestration.toml").display()
                 )));
             }
         };
@@ -131,8 +123,82 @@ fn resolve_board(options: &Options) -> io::Result<Board> {
         batch_limit,
         vote_threshold,
         incubator_cap,
-        limits,
+        limits: limits.account,
     })
+}
+
+/// The owning orchestration configuration and the account of how it was
+/// found. `--source` is the explicit override; otherwise the installed kit
+/// checkout the normal installation recorded under CODEX_HOME owns the
+/// thresholds, then the project's own checkout (a source checkout carrying the
+/// kit configuration), then the kit defaults.
+fn resolve_limits(options: &Options, project: &Path) -> io::Result<Limits> {
+    let config_of = |checkout: &Path| checkout.join("global/orchestration.toml");
+    if let Some(source) = options.get("--source") {
+        let checkout = PathBuf::from(source);
+        if !checkout.is_dir() {
+            return Err(invalid(&format!(
+                "source checkout {} is missing; --source names the checkout whose global/orchestration.toml supplies the limits",
+                checkout.display()
+            )));
+        }
+        let config = config_of(&checkout);
+        let account = if config.is_file() {
+            format!("configured({})", config.display())
+        } else {
+            format!(
+                "defaults({} is absent; --source named no configuration)",
+                config.display()
+            )
+        };
+        return Ok(Limits { checkout, account });
+    }
+    let installed = installed_kit_source();
+    if let Some(kit) = &installed {
+        let config = config_of(kit);
+        if config.is_file() {
+            return Ok(Limits {
+                checkout: kit.clone(),
+                account: format!("configured(installed kit {})", config.display()),
+            });
+        }
+    }
+    let config = config_of(project);
+    if config.is_file() {
+        return Ok(Limits {
+            checkout: project.to_path_buf(),
+            account: format!("configured(project {})", config.display()),
+        });
+    }
+    let kit_note = match &installed {
+        Some(kit) => format!("{} is absent too", config_of(kit).display()),
+        None => "no installed kit checkout is recorded".to_owned(),
+    };
+    Ok(Limits {
+        checkout: project.to_path_buf(),
+        account: format!("defaults({} is absent and {kit_note})", config.display()),
+    })
+}
+
+/// The kit source root recorded by the normal installation. Reading is
+/// bounded and executes nothing the record names; an absent, unreadable or
+/// relocated record simply means no installed kit source is available.
+fn installed_kit_source() -> Option<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")?;
+    let path = PathBuf::from(codex_home).join("harness/installation.json");
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INSTALLATION_BYTES {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let root = PathBuf::from(record.get("sourceRoot")?.as_str()?);
+    root.is_dir().then_some(root)
+}
+
+struct Limits {
+    checkout: PathBuf,
+    account: String,
 }
 
 fn board_cli_unavailable(detail: &str) -> io::Error {
@@ -370,6 +436,7 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         "--source",
         "--item",
         "--route",
+        "--openspec-change",
         "--kit-project",
         "--summary",
         "--scope",
@@ -435,7 +502,16 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         Some(route) => route,
         None => default_route(&board, item)?,
     };
-    let outcome = run_promotion(&board, item, route, &options, &evidence)?;
+    let openspec_change = options
+        .get("--openspec-change")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if openspec_change.is_some() && route != PromotionRoute::OpenSpecChange {
+        return Err(invalid(
+            "--openspec-change applies only to a promotion whose route is openspec-change",
+        ));
+    }
+    let outcome = run_promotion(&board, item, route, &options, &evidence, openspec_change)?;
     println!(
         "promoted {} route={} basis={} counted={} threshold={} target={} limits={}",
         outcome.item_id,
@@ -476,6 +552,7 @@ fn run_promotion(
     route: PromotionRoute,
     options: &Options,
     evidence: &PromotionEvidence,
+    openspec_change: Option<&str>,
 ) -> io::Result<PromotionOutcome> {
     let outcome = match route {
         PromotionRoute::KitBacklog => {
@@ -493,7 +570,14 @@ fn run_promotion(
                 evidence,
             )
         }
-        route => board_feedback::promote_item(&board.bd, &board.project, item, route, evidence),
+        route => board_feedback::promote_item(
+            &board.bd,
+            &board.project,
+            item,
+            route,
+            evidence,
+            openspec_change,
+        ),
     };
     outcome.map_err(|error| {
         invalid(&format!(

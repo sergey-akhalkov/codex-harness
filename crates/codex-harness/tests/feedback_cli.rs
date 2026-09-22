@@ -58,6 +58,9 @@ struct Board {
     project: PathBuf,
     feature: String,
     bd: PathBuf,
+    /// Controlled CODEX_HOME: no installation record unless a check writes
+    /// one, so limits resolution never depends on the machine's own install.
+    home: PathBuf,
 }
 
 impl Board {
@@ -118,16 +121,25 @@ impl Board {
             "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 2\nincubator_size_cap = 32\nfeedback_batch_limit = 2\n",
         )
         .unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
         Self {
             root,
             project,
             feature: feature["id"].as_str().unwrap().to_owned(),
             bd,
+            home,
         }
     }
 
     /// Runs one feedback verb against this board with the explicit bd path.
     fn feedback(&self, args: &[&str]) -> std::process::Output {
+        self.feedback_with_home(&self.home, args)
+    }
+
+    /// The same, with an explicit CODEX_HOME (an installed kit record lives
+    /// there or does not).
+    fn feedback_with_home(&self, home: &Path, args: &[&str]) -> std::process::Output {
         let mut command = Command::new(manager());
         command.arg("feedback").args(args);
         command.args([
@@ -136,6 +148,7 @@ impl Board {
             "--project",
             self.project.to_str().unwrap(),
         ]);
+        command.env("CODEX_HOME", home);
         command.output().unwrap()
     }
 
@@ -508,6 +521,178 @@ fn promotion_is_explicit_recorded_and_never_repeated() {
     board.drop();
 }
 
+/// The owning orchestration configuration is the installed kit, not the
+/// consumer project: an ordinary command must pick up the installed custom
+/// limits without being told where the kit lives, while an explicit --source
+/// still overrides them.
+#[test]
+fn installed_kit_limits_apply_without_a_source_flag() {
+    let board = Board::new("limits");
+    // The consumer project carries no kit configuration of its own.
+    fs::remove_file(board.project.join("global/orchestration.toml")).unwrap();
+    let kit = board.root.join("kit");
+    fs::create_dir_all(kit.join("global")).unwrap();
+    fs::write(
+        kit.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 5\nincubator_size_cap = 11\nfeedback_batch_limit = 7\n",
+    )
+    .unwrap();
+    fs::create_dir_all(board.home.join("harness")).unwrap();
+    fs::write(
+        board.home.join("harness/installation.json"),
+        serde_json::to_vec(&json!({"schemaVersion": 1, "sourceRoot": kit})).unwrap(),
+    )
+    .unwrap();
+
+    let listed = board.feedback(&["list"]);
+    let text = output_text(&listed);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("batch_limit=7"), "{text}");
+    assert!(text.contains("limits=configured(installed kit "), "{text}");
+    assert!(text.contains(&kit.display().to_string()), "{text}");
+
+    let candidates = board.feedback(&["candidates"]);
+    let text = output_text(&candidates);
+    assert!(candidates.status.success(), "{text}");
+    assert!(text.contains("at threshold=5"), "{text}");
+
+    // An explicit --source overrides the installed kit.
+    let other = board.root.join("other-kit");
+    fs::create_dir_all(other.join("global")).unwrap();
+    fs::write(
+        other.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 2\nincubator_size_cap = 32\nfeedback_batch_limit = 3\n",
+    )
+    .unwrap();
+    let listed = board.feedback(&["list", "--source", other.to_str().unwrap()]);
+    let text = output_text(&listed);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("batch_limit=3"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "limits=configured({})",
+            other.join("global/orchestration.toml").display()
+        )),
+        "{text}"
+    );
+
+    // No installed kit and no project configuration: the kit defaults are
+    // stated instead of being silently assumed.
+    let bare = board.root.join("bare-home");
+    fs::create_dir_all(&bare).unwrap();
+    let listed = board.feedback_with_home(&bare, &["list"]);
+    let text = output_text(&listed);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("batch_limit=8"), "{text}");
+    assert!(text.contains("limits=defaults("), "{text}");
+    board.drop();
+}
+
+/// A requirement promotion enters the OpenSpec workflow's own change: the
+/// command validates the intended change, records its reference and never
+/// writes into openspec/, so an existing draft survives every retry.
+#[test]
+fn openspec_change_promotion_validates_the_change_and_preserves_its_draft() {
+    let board = Board::new("openspec");
+    let item = board.record("accepted behavior must change", "lead-1", "e1", "lead");
+    let admitted = board.decisions("admit.json", &[(&item, "requirement", None)]);
+    let out = board.feedback(&["triage", "--decisions", admitted.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+
+    // Without an intended change the promotion records nothing and names the
+    // OpenSpec route that creates it.
+    let out = board.feedback(&["promote", "--item", &item, "--route", "openspec-change"]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("does not exist at"), "{text}");
+    assert!(text.contains("openspec new change feedback-"), "{text}");
+    assert!(text.contains("nothing was recorded"), "{text}");
+    let ledger = board.feedback(&["ledger", "--item", &item]);
+    assert!(
+        output_text(&ledger).contains("promotions=0"),
+        "{}",
+        output_text(&ledger)
+    );
+    assert!(board.labels(&item).iter().any(|label| label == "incubator"));
+
+    // The OpenSpec workflow created the intended change; the promotion records
+    // its reference and leaves the draft exactly as it was.
+    let change = board.project.join("openspec/changes/lead-intent");
+    fs::create_dir_all(&change).unwrap();
+    let draft = change.join("proposal.md");
+    fs::write(&draft, "# Lead intent\n\n## Why\n\nsynthetic draft\n").unwrap();
+    let draft_before = fs::read(&draft).unwrap();
+    let out = board.feedback(&[
+        "promote",
+        "--item",
+        &item,
+        "--route",
+        "openspec-change",
+        "--openspec-change",
+        "lead-intent",
+        "--override-consequence",
+        "accepted behavior would silently change",
+        "--override-reason",
+        "synthetic material evidence",
+    ]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "promoted {item} route=openspec-change basis=override counted=1 threshold=none target=openspec:lead-intent"
+        )),
+        "{text}"
+    );
+    assert_eq!(fs::read(&draft).unwrap(), draft_before);
+    let labels = board.labels(&item);
+    assert!(labels.iter().any(|label| label == "openspec"), "{labels:?}");
+    assert!(
+        !labels.iter().any(|label| label == "incubator"),
+        "{labels:?}"
+    );
+
+    // A retry preserves the draft, keeps one promotion record and reports the
+    // retained outcome.
+    let out = board.feedback(&[
+        "promote",
+        "--item",
+        &item,
+        "--route",
+        "openspec-change",
+        "--openspec-change",
+        "lead-intent",
+    ]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("already promoted"), "{text}");
+    assert!(text.contains("openspec:lead-intent"), "{text}");
+    assert_eq!(fs::read(&draft).unwrap(), draft_before);
+    let ledger = board.feedback(&["ledger", "--item", &item]);
+    assert!(
+        output_text(&ledger).contains("promotions=1"),
+        "{}",
+        output_text(&ledger)
+    );
+
+    // The reference is refused with a route that is not the OpenSpec one.
+    let out = board.feedback(&[
+        "promote",
+        "--item",
+        &item,
+        "--route",
+        "backlog-task",
+        "--openspec-change",
+        "lead-intent",
+    ]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("applies only to a promotion whose route is openspec-change"),
+        "{text}"
+    );
+    board.drop();
+}
+
 #[test]
 fn consequence_override_promotes_without_votes_and_kit_route_needs_its_wording() {
     let board = Board::new("override");
@@ -536,7 +721,7 @@ fn consequence_override_promotes_without_votes_and_kit_route_needs_its_wording()
     assert!(out.status.success(), "{text}");
     assert!(
         text.contains(&format!(
-            "promoted {item} route=backlog-task basis=override counted=0 threshold=none target=none"
+            "promoted {item} route=backlog-task basis=override counted=1 threshold=none target=none"
         )),
         "{text}"
     );

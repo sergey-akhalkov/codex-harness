@@ -10,7 +10,7 @@
 //! skill packages.
 use crate::board_cli::{FEEDBACK_LABEL, INCUBATOR_LABEL, json_ok, json_ok_actor, string_field};
 use serde_json::Value;
-use std::{fs, io, path::Path};
+use std::{io, path::Path};
 
 pub const DEFAULT_FEEDBACK_BATCH_LIMIT: usize = 8;
 pub const MAX_OBSERVATION: usize = 512;
@@ -42,6 +42,8 @@ const RESTORE_PREFIX: &str = "feedback-restore v1";
 /// consuming-project identity.
 const KIT_ROUTING_ACTOR: &str = "feedback-routing";
 const MAX_TITLE_BYTES: usize = 72;
+/// One OpenSpec change name is a single path segment, never a path.
+const MAX_CHANGE_NAME: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReporterKind {
@@ -1097,14 +1099,20 @@ pub fn promotion_candidates(
     Ok(candidates)
 }
 
-/// Promotes an incubator item into the local backlog or an OpenSpec change
-/// entry. History (votes, merges, classifications) stays on the item.
+/// Promotes an incubator item into the local backlog or an existing OpenSpec
+/// change entry. History (votes, merges, classifications) stays on the item.
+/// `openspec_change` names the intended change for the OpenSpec route; `None`
+/// derives the `feedback-<item>` name. The OpenSpec workflow owns change
+/// creation and its artifacts: this loop validates and records the reference
+/// instead of writing unscaffolded entries, so a retry preserves an existing
+/// draft and only reconciles the board.
 pub fn promote_item(
     bd: &Path,
     project: &Path,
     item_id: &str,
     route: PromotionRoute,
     evidence: &PromotionEvidence,
+    openspec_change: Option<&str>,
 ) -> io::Result<PromotionOutcome> {
     if route == PromotionRoute::KitBacklog {
         return Err(invalid(
@@ -1122,20 +1130,19 @@ pub fn promote_item(
     require_open_incubator_snapshot(&snapshot, item_id)?;
     let kinds = incubator_kinds(&ledger);
     check_promotion_route(&kinds, route)?;
-    let (counted, override_note) = validate_evidence(&ledger, evidence)?;
-    let feedback = snapshot.feedback.as_ref().ok_or_else(|| {
-        invalid(format!(
-            "incubator item {item_id} is missing bounded fields"
-        ))
-    })?;
+    // The route's structural precondition is caller input: the intended
+    // OpenSpec change is validated before the vote evidence, so a missing or
+    // malformed reference is reported exactly and nothing is recorded.
     let target = match route {
         PromotionRoute::BacklogTask => None,
-        PromotionRoute::OpenSpecChange => Some(format!(
-            "openspec:{}",
-            create_openspec_entry(project, item_id, feedback)?
-        )),
+        PromotionRoute::OpenSpecChange => {
+            let name = openspec_change_name(item_id, openspec_change)?;
+            require_openspec_change(project, &name)?;
+            Some(format!("openspec:{name}"))
+        }
         PromotionRoute::KitBacklog => unreachable!(),
     };
+    let (counted, override_note) = validate_evidence(&ledger, evidence)?;
     let comment = PromotionComment {
         route,
         counted,
@@ -1502,32 +1509,68 @@ fn reconcile_promotion(
     })
 }
 
-fn create_openspec_entry(
-    project: &Path,
-    item_id: &str,
-    feedback: &BoundedFeedback,
-) -> io::Result<String> {
-    let name = format!("feedback-{}", bounded_slug(item_id));
-    if name == "feedback-" {
-        return Err(invalid(
-            "incubator item id has no usable OpenSpec change name",
-        ));
+/// The OpenSpec change a requirement promotion enters: the caller's explicit
+/// reference, or the derived `feedback-<item>` name the same item would have
+/// recorded before. A single path segment only.
+fn openspec_change_name(item_id: &str, requested: Option<&str>) -> io::Result<String> {
+    match requested {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(invalid("the OpenSpec change reference is empty"));
+            }
+            if name.len() > MAX_CHANGE_NAME {
+                return Err(invalid(format!(
+                    "OpenSpec change reference {name} is {} bytes; the limit is {MAX_CHANGE_NAME}",
+                    name.len()
+                )));
+            }
+            if name == "."
+                || name == ".."
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Err(invalid(format!(
+                    "OpenSpec change reference {name} must be one path name of ASCII letters, digits, '-', '_' or '.'"
+                )));
+            }
+            Ok(name.to_owned())
+        }
+        None => {
+            let name = format!("feedback-{}", bounded_slug(item_id));
+            if name == "feedback-" {
+                return Err(invalid(
+                    "incubator item id has no usable OpenSpec change name; name the intended change explicitly",
+                ));
+            }
+            Ok(name)
+        }
     }
-    let directory = project.join("openspec/changes").join(&name);
-    if directory.exists() {
+}
+
+/// Validates the change directory a promotion records. Change creation and
+/// its artifacts belong to the OpenSpec workflow, so this loop never writes
+/// into `openspec/` and never touches templates, configuration or skills; an
+/// existing draft is preserved, which is what makes a promotion that stopped
+/// after the board read recoverable by rerunning it.
+fn require_openspec_change(project: &Path, name: &str) -> io::Result<()> {
+    let directory = project.join("openspec/changes").join(name);
+    if !directory.is_dir() {
         return Err(invalid(format!(
-            "OpenSpec entry {name} already exists; preserving it"
+            "OpenSpec change {name} does not exist at {}; create it through the OpenSpec workflow (for example `openspec new change {name}`) and rerun this promotion: nothing was recorded and no artifact was written",
+            directory.display()
         )));
     }
-    fs::create_dir_all(&directory)?;
-    let proposal = format!(
-        "# Feedback promotion: {observation}\n\nPromoted from incubator item `{item_id}` as a behavior or requirement change.\nThis draft entry opens the OpenSpec workflow; complete the planning artifacts before implementation.\n\n## Why\n\n{observation}\n\n## What Changes\n\n- {scope}\n",
-        observation = feedback.observation,
-        scope = feedback.scope,
-        item_id = item_id
-    );
-    fs::write(directory.join("proposal.md"), proposal)?;
-    Ok(name)
+    let recognized =
+        directory.join(".openspec.yaml").is_file() || directory.join("proposal.md").is_file();
+    if !recognized {
+        return Err(invalid(format!(
+            "{} exists but is not an OpenSpec change directory (no .openspec.yaml or proposal.md); resolve it before promoting",
+            directory.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Creates the sanitized kit-backlog task from explicit kit-level wording.
@@ -1930,6 +1973,7 @@ fn bounded_title(observation: &str) -> &str {
 mod tests {
     use super::*;
     use crate::board_cli::{self, seed_git};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2838,6 +2882,7 @@ mod tests {
             &PromotionEvidence::Votes {
                 threshold: threshold + 1,
             },
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("below the configured threshold"));
@@ -2848,6 +2893,7 @@ mod tests {
             &first,
             PromotionRoute::BacklogTask,
             &PromotionEvidence::Votes { threshold },
+            None,
         )
         .unwrap();
         assert_eq!(outcome.counted, 3);
@@ -2876,6 +2922,7 @@ mod tests {
             &first,
             PromotionRoute::BacklogTask,
             &PromotionEvidence::Votes { threshold },
+            None,
         )
         .unwrap_err();
         // A repeat of a completed promotion is refused with the retained
@@ -2924,9 +2971,39 @@ mod tests {
             &item,
             PromotionRoute::BacklogTask,
             &PromotionEvidence::Votes { threshold: 2 },
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("enters OpenSpec"));
+
+        // The OpenSpec workflow owns the change: promoting without an
+        // existing intended change records nothing and names the remedy.
+        let derived = format!("feedback-{}", bounded_slug(&item));
+        let error = promote_item(
+            &bd,
+            &project,
+            &item,
+            PromotionRoute::OpenSpecChange,
+            &PromotionEvidence::Votes { threshold: 2 },
+            None,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&derived), "{message}");
+        assert!(message.contains("openspec new change"), "{message}");
+        assert!(message.contains("nothing was recorded"), "{message}");
+        let ledger = inspect_ledger(&bd, &project, &item).unwrap();
+        assert!(ledger.promotions.is_empty());
+        let snapshot = load_snapshot(&bd, &project, &item).unwrap().unwrap();
+        assert!(snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+
+        // The OpenSpec workflow creates the intended change; promotion
+        // validates it and preserves the draft exactly.
+        let change = project.join("openspec/changes").join(&derived);
+        fs::create_dir_all(&change).unwrap();
+        let draft = change.join("proposal.md");
+        fs::write(&draft, format!("# Draft for {item}\n")).unwrap();
+        let draft_before = fs::read(&draft).unwrap();
 
         let evidence = PromotionEvidence::ConsequenceOverride {
             consequence: "accepted behavior would silently change".to_owned(),
@@ -2938,18 +3015,16 @@ mod tests {
             &item,
             PromotionRoute::OpenSpecChange,
             &evidence,
+            None,
         )
         .unwrap();
         assert!(outcome.override_used);
         assert_eq!(outcome.counted, 1);
-
-        let proposal = project
-            .join("openspec/changes")
-            .join(format!("feedback-{}", bounded_slug(&item)))
-            .join("proposal.md");
-        let text = fs::read_to_string(&proposal).unwrap();
-        assert!(text.contains(&item));
-        assert!(text.contains("backlog must record the promotion rationale"));
+        assert_eq!(
+            outcome.target.as_deref(),
+            Some(format!("openspec:{derived}").as_str())
+        );
+        assert_eq!(fs::read(&draft).unwrap(), draft_before);
 
         let snapshot = load_snapshot(&bd, &project, &item).unwrap().unwrap();
         assert!(snapshot.labels.iter().any(|label| label == OPENSPEC_LABEL));
@@ -2958,12 +3033,9 @@ mod tests {
         assert_eq!(ledger.counted(), 1);
         assert_eq!(ledger.promotions.len(), 1);
         assert!(ledger.promotions[0].override_used);
-        assert!(
-            ledger.promotions[0]
-                .target
-                .as_deref()
-                .unwrap()
-                .starts_with("openspec:feedback-")
+        assert_eq!(
+            ledger.promotions[0].target.as_deref(),
+            Some(format!("openspec:{derived}").as_str())
         );
         let comments = list_comments(&bd, &project, &item).unwrap();
         assert!(comments.iter().any(|comment| {
@@ -2971,6 +3043,167 @@ mod tests {
                 && comment.contains("consequence=accepted behavior would silently change")
                 && comment.contains("reason=material correctness evidence")
         }));
+
+        // A completed promotion is never repeated, and the draft it recorded
+        // stays exactly as the OpenSpec workflow wrote it.
+        let error = promote_item(
+            &bd,
+            &project,
+            &item,
+            PromotionRoute::OpenSpecChange,
+            &evidence,
+            None,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("already promoted"), "{message}");
+        assert!(message.contains(&derived), "{message}");
+        assert_eq!(
+            inspect_ledger(&bd, &project, &item)
+                .unwrap()
+                .promotions
+                .len(),
+            1
+        );
+        assert_eq!(fs::read(&draft).unwrap(), draft_before);
+    }
+
+    #[test]
+    fn interrupted_openspec_promotion_reconciles_without_rewriting_the_draft() {
+        let Some(bd) = bd_executable() else {
+            panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+        };
+        let (_root, project, parent) = isolated_feature(&bd);
+        let item = record(
+            &bd,
+            &project,
+            "requirement needs an OpenSpec change",
+            "lead-1",
+            "e1",
+            ReporterKind::Lead,
+            &parent,
+        );
+        apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: item.clone(),
+                kind: ObservationKind::Requirement,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+
+        // The OpenSpec workflow created the intended change before the
+        // promotion ran; its draft must survive every retry untouched.
+        let change = project.join("openspec/changes/lead-intent");
+        fs::create_dir_all(&change).unwrap();
+        fs::write(change.join("proposal.md"), "# Lead intent\n").unwrap();
+
+        // A run that recorded the promotion and then failed before its label
+        // steps leaves exactly this comment; a retry reads it as the applied
+        // prefix and only reconciles the board.
+        json_ok(
+            &bd,
+            &project,
+            &[
+                "comment",
+                &item,
+                "--json",
+                "feedback-promote v1 route=openspec-change basis=votes counted=1 threshold=2 target=openspec:lead-intent",
+            ],
+        )
+        .unwrap();
+        let snapshot = load_snapshot(&bd, &project, &item).unwrap().unwrap();
+        assert!(snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+
+        let outcome = promote_item(
+            &bd,
+            &project,
+            &item,
+            PromotionRoute::OpenSpecChange,
+            &PromotionEvidence::Votes { threshold: 2 },
+            Some("lead-intent"),
+        )
+        .unwrap();
+        assert_eq!(outcome.target.as_deref(), Some("openspec:lead-intent"));
+        let ledger = inspect_ledger(&bd, &project, &item).unwrap();
+        assert_eq!(
+            ledger.promotions.len(),
+            1,
+            "the retry must not record the promotion twice"
+        );
+        let snapshot = load_snapshot(&bd, &project, &item).unwrap().unwrap();
+        assert!(snapshot.labels.iter().any(|label| label == OPENSPEC_LABEL));
+        assert!(!snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
+        assert_eq!(
+            fs::read_to_string(change.join("proposal.md")).unwrap(),
+            "# Lead intent\n"
+        );
+
+        // A reference that names no change is refused before any board write.
+        let other = record(
+            &bd,
+            &project,
+            "another requirement",
+            "lead-1",
+            "e2",
+            ReporterKind::Lead,
+            &parent,
+        );
+        apply_routed_triage(
+            &bd,
+            &project,
+            &[RoutedAction {
+                feedback_id: other.clone(),
+                kind: ObservationKind::Requirement,
+                merge_into: None,
+            }],
+            DEFAULT_FEEDBACK_BATCH_LIMIT,
+        )
+        .unwrap();
+        let error = promote_item(
+            &bd,
+            &project,
+            &other,
+            PromotionRoute::OpenSpecChange,
+            &PromotionEvidence::Votes { threshold: 2 },
+            Some("absent-change"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("absent-change"), "{message}");
+        assert!(message.contains("nothing was recorded"), "{message}");
+        assert!(
+            inspect_ledger(&bd, &project, &other)
+                .unwrap()
+                .promotions
+                .is_empty()
+        );
+        assert!(
+            load_snapshot(&bd, &project, &other)
+                .unwrap()
+                .unwrap()
+                .labels
+                .iter()
+                .any(|label| label == INCUBATOR_LABEL)
+        );
+
+        // A reference that is a path instead of one name is rejected too.
+        let error = promote_item(
+            &bd,
+            &project,
+            &other,
+            PromotionRoute::OpenSpecChange,
+            &PromotionEvidence::Votes { threshold: 2 },
+            Some("../escape"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("must be one path name"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3044,6 +3277,7 @@ mod tests {
             &first,
             PromotionRoute::KitBacklog,
             &PromotionEvidence::Votes { threshold },
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("promote_kit_concern"));

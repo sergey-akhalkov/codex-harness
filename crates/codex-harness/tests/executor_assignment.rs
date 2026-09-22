@@ -157,6 +157,10 @@ fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
         &["input.txt", "existing_child.rs"],
         &["crates/new/module.rs"],
     );
+    let before = git_output(
+        &fixture.slot,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
     let out = fixture.check(&assignment, &["--owner", "exec-ds-9"]);
     let text = output_text(&out);
     assert!(out.status.success(), "{text}");
@@ -181,13 +185,18 @@ fn dry_run_renders_the_bound_checkout_base_and_exact_paths() {
     assert!(text.contains("- existing_child.rs"), "{text}");
     assert!(text.contains("- crates/new/module.rs"), "{text}");
     assert!(text.contains("- the synthetic check passes"), "{text}");
-    // The check is read-only: the slot stays clean and no state is written.
-    assert!(
+    // The check is read-only: the slot keeps exactly the state it had and no
+    // state root is written.
+    assert_eq!(
         git_output(
             &fixture.slot,
             &["status", "--porcelain=v1", "--untracked-files=all"]
-        )
-        .is_empty(),
+        ),
+        before,
+        "the dry run must not change the slot"
+    );
+    assert!(
+        !fixture.slot.join("crates/new/module.rs").exists(),
         "the dry run must not create the declared output"
     );
     assert!(!fixture.root.join("home").exists());

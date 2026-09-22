@@ -17,6 +17,16 @@ fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
 }
 
+/// A dispatch invocation that does not inherit the caller's session identity:
+/// an executor running this suite (the normal case) sets
+/// `HARNESS_EXECUTOR_SESSION`, and the kit refuses nested dispatch, so the
+/// fixture must dispatch as the lead's own shell would.
+fn lead_command() -> Command {
+    let mut command = Command::new(manager());
+    command.env_remove("HARNESS_EXECUTOR_SESSION");
+    command
+}
+
 /// Owned temporary checkout of a local `file://` upstream plus a Codex home
 /// without an installed launcher, so a dispatch performs its whole pool
 /// allocation and stops before any launcher process starts.
@@ -100,7 +110,7 @@ impl Fixture {
     /// The spawn options an assignment check supplies itself, without the
     /// default free-text assignment every existing check relies on.
     fn spawn_command(&self) -> Command {
-        let mut command = Command::new(manager());
+        let mut command = lead_command();
         command.args([
             "executor",
             "spawn",
@@ -122,7 +132,7 @@ impl Fixture {
     }
 
     fn resume_command(&self) -> Command {
-        let mut command = Command::new(manager());
+        let mut command = lead_command();
         command.args([
             "executor",
             "resume",
@@ -141,7 +151,7 @@ impl Fixture {
     }
 
     fn release(&self, extra: &[&str]) -> std::process::Output {
-        let mut command = Command::new(manager());
+        let mut command = lead_command();
         command.args([
             "executor",
             "release",
@@ -155,7 +165,7 @@ impl Fixture {
     }
 
     fn pool(&self) -> String {
-        let out = Command::new(manager())
+        let out = lead_command()
             .args([
                 "executor",
                 "pool",
@@ -296,7 +306,7 @@ fn configured_executor_rejects_unlisted_profile() {
         include_str!("../../../global/orchestration.toml"),
     )
     .unwrap();
-    let out = Command::new(manager())
+    let out = lead_command()
         .args([
             "executor",
             "spawn",
@@ -414,7 +424,7 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
         .unwrap(),
     )
     .unwrap();
-    let mut host = Command::new(manager())
+    let mut host = lead_command()
         .args(["executor", "run", "--file", receipt.to_str().unwrap()])
         .env("CODEX_HOME", &fixture.home)
         .spawn()
@@ -961,7 +971,7 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
     let home = PathBuf::from(std::env::var_os("HARNESS_LIVE_CODEX_HOME").expect("live Codex home"));
     assert!(home.is_absolute());
     let source = source.canonicalize().unwrap();
-    let mut child = Command::new(manager());
+    let mut child = lead_command();
     child
         .args([
             "executor",
@@ -1022,7 +1032,7 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
 #[test]
 fn executor_dispatch_is_refused_inside_an_executor_session() {
     for command in ["spawn", "resume", "run", "succeed"] {
-        let output = Command::new(manager())
+        let output = lead_command()
             .args(["executor", command])
             .env("HARNESS_EXECUTOR_SESSION", "1")
             .output()
@@ -1056,7 +1066,7 @@ fn executor_host_marks_the_session_environment() {
         .unwrap(),
     )
     .unwrap();
-    let output = Command::new(manager())
+    let output = lead_command()
         .args(["executor", "run", "--file", receipt.to_str().unwrap()])
         .output()
         .unwrap();
