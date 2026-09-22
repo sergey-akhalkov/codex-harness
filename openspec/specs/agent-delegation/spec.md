@@ -94,11 +94,15 @@ The lead and task runtime SHALL distinguish unavailable access from insufficient
 
 ### Requirement: Bounded collaboration and verification
 
-Each workstream SHALL receive a concise objective, sufficient inputs, dependencies, ownership of files and mutable runtime resources, constraints, acceptance checks, an integration consumer and a completion or return condition. Independent edits SHALL use disjoint scopes or Codex-managed worktrees recorded by the controller; ordinary Git worktrees from `isolated-worktree-workflow` SHALL NOT substitute for executor isolation. Shared desktop sessions, services, installed directories and devices SHALL have one interaction owner, isolated allocation or serialized use; a separate checkout SHALL NOT imply runtime isolation. Executors SHALL report changed files or other concrete results, relevant decisions, checks, validity conditions, restoration state and unresolved issues concisely, with details available on demand under the owning retention policy. The active lead SHALL verify important risks and the combined result without routinely repeating completed investigation or every worker check. A supporting result SHALL count as delivered only after its intended consumer uses it and applicable integrated acceptance passes. The task-wide concurrency limit SHALL come from the orchestration configuration; leadership changes SHALL NOT multiply that limit. Workers SHALL NOT create unsolicited recursive agent trees. Executor sessions SHALL run as single-agent workers: dispatch, resume and instruction-refresh succession SHALL launch them with Codex CLI's built-in agent-capability switch disabled (`agents.enabled = false`), so the session tool set contains no agent-spawning or agent-messaging tools and the session receives no multi-agent usage instructions, whatever the selected model catalog advertises. The installed launcher SHALL apply the same switch to any Codex process started in an executor-marked environment, including a raw nested `codex` invocation. The kit's executor dispatch commands SHALL refuse to run inside an executor session with a concrete error that names the lead as the owner of further delegation. An executor that needs another agent or executor SHALL report that need to the lead instead of creating one. Configured controls SHALL be distinguished from advisory time/token budgets; unsupported hard reasoning-token caps SHALL NOT be claimed.
+Each workstream SHALL receive a concise objective, sufficient inputs, dependencies, ownership of files and mutable runtime resources, constraints, acceptance checks, an integration consumer, a completion or return condition, and the synchronized base revision of its checkout. Independent edits SHALL use disjoint scopes or Codex-managed worktrees recorded by the controller; ordinary Git worktrees from `isolated-worktree-workflow` SHALL NOT substitute for executor isolation. An executor SHALL verify that its checkout HEAD equals the base named in its brief before substantive edits and SHALL stop and report a mismatch instead of repairing synchronization, copying files from another checkout or creating a substitute worktree; changed tracked inputs reach an assignment through a new committed base and a redispatch. Shared desktop sessions, services, installed directories and devices SHALL have one interaction owner, isolated allocation or serialized use; a separate checkout SHALL NOT imply runtime isolation. Executors SHALL report changed files or other concrete results, relevant decisions, checks, validity conditions, restoration state and unresolved issues concisely, with details available on demand under the owning retention policy. The active lead SHALL verify important risks and the combined result without routinely repeating completed investigation or every worker check. A supporting result SHALL count as delivered only after its intended consumer uses it and applicable integrated acceptance passes. The task-wide concurrency limit SHALL come from the orchestration configuration; leadership changes SHALL NOT multiply that limit. Workers SHALL NOT create unsolicited recursive agent trees. Executor sessions SHALL run as single-agent workers: dispatch, resume and instruction-refresh succession SHALL launch them with Codex CLI's built-in agent-capability switch disabled (`agents.enabled = false`), so the session tool set contains no agent-spawning or agent-messaging tools and the session receives no multi-agent usage instructions, whatever the selected model catalog advertises. The installed launcher SHALL apply the same switch to any Codex process started in an executor-marked environment, including a raw nested `codex` invocation. The kit's executor dispatch commands SHALL refuse to run inside an executor session with a concrete error that names the lead as the owner of further delegation. An executor that needs another agent or executor SHALL report that need to the lead instead of creating one. Configured controls SHALL be distinguished from advisory time/token budgets; unsupported hard reasoning-token caps SHALL NOT be claimed.
 
 #### Scenario: Parallel work is integrated
 - **WHEN** two executors handle independent workstreams
 - **THEN** execution overlaps without conflicting resource ownership, evidence is returned, and the active lead verifies the consumed combined outcome
+
+#### Scenario: An executor starts from the named base
+- **WHEN** an executor receives a brief that names the synchronized base revision of its pool slot
+- **THEN** it verifies its checkout HEAD equals that revision before substantive edits, and on mismatch returns the exact observed and expected revisions to the lead instead of editing
 
 #### Scenario: A worker discovers an out-of-scope issue
 - **WHEN** an executor observes unrelated diagnostics or a change outside its assignment
@@ -111,7 +115,6 @@ Each workstream SHALL receive a concise objective, sufficient inputs, dependenci
 #### Scenario: An isolated investigation needs a parent dependency
 - **WHEN** an executor finishes its investigation but cannot exercise integration because a named prerequisite is unavailable
 - **THEN** it returns the verified result, unmet prerequisite and validity conditions, and the lead preserves pending integration without restarting the investigation or claiming full completion
-
 
 #### Scenario: An executor has no agent tools
 - **WHEN** an executor session starts under a profile whose model catalog advertises multi-agent support
@@ -200,3 +203,70 @@ Elapsed time, an expired observation wait, an intermediate answer or missing fin
 #### Scenario: Review finds a defect in the assigned work
 - **WHEN** a concrete defect can be corrected within the executor's capabilities and scope
 - **THEN** the lead returns the finding and acceptance condition to that executor rather than routinely rewriting its work
+
+### Requirement: Profile-fixed executor routing never blocks delegation
+
+Kit executor dispatch SHALL route every assignment through the executor
+profiles configured in `orchestration.toml`, and a profile's configured model
+and reasoning effort SHALL be that assignment's complete explicit selection.
+The absence of per-assignment model or effort arguments on executor dispatch
+SHALL NOT be treated as a conflict with any selection rule, capability ceiling
+or session instruction; explicit per-task model and effort selection applies
+to ordinary in-session agents, not to kit executor dispatch. The configured
+executor set - currently the single `ds` profile binding DeepSeek V4.1-Flash
+at `max` - SHALL be dispatched exactly as configured with no substitute
+model, effort or profile, and a single configured executor profile SHALL be
+treated as normal full delegation capacity, not as reduced capability that
+justifies keeping executor-suitable work with the lead. Instruction or
+preference wording that appears to restrict delegation (model preferences,
+effort rules, routing guidance, unknown quota) SHALL bound only which
+configured session runs the work and SHALL NOT justify withholding a
+dispatch; the discrepancy SHALL be reported while dispatch proceeds. Only a
+concrete dispatch failure reported by the launcher or installation check
+SHALL block dispatch, and it SHALL be reported with its exact cause and
+remedy instead of silent solo continuation.
+
+#### Scenario: Profile dispatch satisfies explicit selection
+- **WHEN** an instruction requires explicit model and reasoning effort per assignment and a lead dispatches a kit executor with its configured profile
+- **THEN** the profile's configured model and effort are the assignment's explicit selection, the dispatch proceeds without per-assignment model or effort arguments, and no rule conflict is reported
+
+#### Scenario: A single executor profile is full capacity
+- **WHEN** `orchestration.toml` configures exactly one executor profile (`ds`, DeepSeek V4.1-Flash, `max`) and executor-suitable work exists
+- **THEN** the lead dispatches that work to the configured profile and does not treat the single profile, its model or its effort as a reason to keep the work solo or to wait for another route
+
+#### Scenario: Conflicting routing wording is reported, not obeyed
+- **WHEN** other instruction text appears to prescribe a different executor model, per-task model/effort arguments or a capability ceiling for delegation
+- **THEN** the lead dispatches the configured executor profile anyway and reports the wording discrepancy, instead of classifying executors as blocked and continuing solo
+
+#### Scenario: Only a verified dispatch failure blocks
+- **WHEN** executor dispatch is withheld
+- **THEN** the blocking cause is a concrete launcher- or installation-check-reported failure (for example a missing profile, a stale build, an occupied pool or a fetch failure) with its exact cause and remedy reported, and unverified quota, routing or rule-conflict interpretations are not blockers
+
+### Requirement: Interrupted pooled executors resume through the pooled command
+
+The kit SHALL provide an executor dispatch that continues one exact
+interrupted pooled session on its recorded pool slot without resynchronizing
+that slot: no fetch, reset, clean or base change SHALL occur between the
+interruption and the resumed session. The command SHALL require the exact
+session id, the explicit slot index and the owner id; it SHALL refuse a live
+owner and any slot claimed by a different owner, and it SHALL adopt a slot
+whose owner was cleared by reconciliation only for the explicitly named slot
+and owner. The resumed session SHALL run through the same receipt, lease,
+terminal and console hosts as a fresh dispatch, and its child invocation
+SHALL use the verified non-interactive resume argument order.
+
+#### Scenario: Partial work survives the resume
+- **WHEN** an interrupted executor slot holds uncommitted partial work and the lead resumes its exact session on that slot
+- **THEN** the slot is rebound without reset or clean, the partial work is still present when the resumed session starts, and the recorded base is unchanged
+
+#### Scenario: A reconciled slot is adopted explicitly
+- **WHEN** the interrupted session's host is gone and reconciliation cleared the slot record's owner
+- **THEN** resume with that slot index and owner id rebinds the slot and records the lease, instead of failing an ownership comparison
+
+#### Scenario: Another owner's claim is refused
+- **WHEN** the named slot is bound to a different owner or the requested owner is already live
+- **THEN** resume refuses with both identities named and no tree state changes
+
+#### Scenario: Hand-edited receipts fail with a remedy
+- **WHEN** `executor run --file` receives a receipt whose owner differs from an unowned slot record
+- **THEN** the failure names the pooled spawn or resume command for that slot instead of only the owner mismatch

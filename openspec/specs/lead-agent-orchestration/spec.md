@@ -23,14 +23,31 @@ The kit SHALL provide reusable orchestration configuration that names the lead s
 
 ### Requirement: Explicit lead activation through the team-lead skill
 
-The kit SHALL provide a `team-lead` skill, delivered through its installation lifecycle, that activates the lead role in an ordinary Codex session of a consuming project. The role SHALL be entered explicitly by skill invocation or by a user request that clearly asks for orchestrated asynchronous development; an ordinary session SHALL NOT spawn executors or create orchestration state without that activation. The skill SHALL own the lead workflow instructions: role configuration discovery, board setup and inspection, specification creation, executor briefs through harness commands, steering, acceptance, merge and explicit stop. Global instructions SHALL point to the skill without duplicating its workflow. Leaving the role or stopping orchestration SHALL remain explicit and preserve partial work.
+The kit SHALL provide a `team-lead` skill, delivered through its installation
+lifecycle, that activates the lead role in an ordinary Codex session of a
+consuming project. The role SHALL be entered explicitly by skill invocation,
+by a user request that clearly asks for orchestrated asynchronous
+development, or by a user request to use executors or lead/executor dispatch
+for the current work - including a user question about why executors are
+unused; such requests SHALL NOT require the skill name. An ordinary session
+SHALL NOT spawn executors or create orchestration state without one of those
+activations. The skill SHALL own the lead workflow instructions: role
+configuration discovery, board setup and inspection, specification creation,
+executor briefs through harness commands, steering, acceptance, merge and
+explicit stop. Global instructions SHALL point to the skill without
+duplicating its workflow. Leaving the role or stopping orchestration SHALL
+remain explicit and preserve partial work.
 
 #### Scenario: A lead session is activated
 - **WHEN** the user invokes the `team-lead` skill with a stage goal in a consuming project
 - **THEN** the session reads the validated role configuration, prepares the board records and dispatches executors through harness commands, while sessions without activation behave as before
 
+#### Scenario: A user executor request activates the role
+- **WHEN** the user asks to use executors for the current work, or asks why executors are unused, without naming the `team-lead` skill
+- **THEN** the session activates the lead role for that work through the skill and dispatches executor-suitable slices instead of reporting a rule conflict
+
 #### Scenario: An ordinary session is not hijacked
-- **WHEN** a user asks for a small direct task in a session where the role was never activated
+- **WHEN** a user asks for a small direct task in a session where the role was never activated and no executor use was requested
 - **THEN** the request is served directly, with no executors, board records or orchestration state created
 
 #### Scenario: The skill is selected from a clear request
@@ -227,7 +244,7 @@ Before the first executor dispatch in an activated lead session, the `team-lead`
 
 ### Requirement: Executor worktree pool with deterministic slots and upstream freshness
 
-For each source checkout used by an activated lead, executor dispatch SHALL maintain a fixed pool of ordinary Git worktrees sized to the configured maximum concurrent executor count, created as sibling directories of the source checkout and named `<repository-name>-wt1` through `<repository-name>-wtN` in stable slot order. The dispatch command SHALL be the sole pool allocator: it selects a free slot, creating it only when its pool position does not yet exist, and MUST NOT register or create executor worktrees beyond the configured pool size; when every slot is occupied by a live executor session, dispatch SHALL abort with a concrete cause instead of allocating another tree. Before binding a session to a slot, the dispatch command SHALL synchronize the slot with upstream by fetching the configured remote and resetting the slot to the resolved base while removing untracked files and keeping ignored build caches; synchronization SHALL complete before the first model request. The default base SHALL be the upstream default branch, and an explicit base override SHALL be supported for assignments that must start from another revision. Failed upstream fetch, an occupied dirty slot, a free slot holding unreviewed changes, or a missing or unusable slot SHALL abort dispatch with the concrete cause before any model request, instead of degrading to a stale base, an extra tree or silent data loss. Slot occupancy SHALL be reconciled with executor session liveness, and the worktree inventory check SHALL enforce the pool invariant instead of warning: harness dispatch never creates beyond the pool, reports preserved slots with their reasons, and reports non-pool trees as foreign or legacy items for lead review rather than silently absorbing them.
+For each source checkout used by an activated lead, executor dispatch SHALL maintain a fixed pool of ordinary Git worktrees sized to the configured maximum concurrent executor count, created as sibling directories of the source checkout and named `<repository-name>-wt1` through `<repository-name>-wtN` in stable slot order. The dispatch command SHALL be the sole pool allocator: it selects a free slot, creating it only when its pool position does not yet exist, and MUST NOT register or create executor worktrees beyond the configured pool size; when every slot is occupied by a live executor session, dispatch SHALL abort with a concrete cause instead of allocating another tree. Before binding a session to a slot, the dispatch command SHALL synchronize the slot with upstream by fetching the configured remote and resetting the slot to the resolved base while removing untracked files and keeping ignored build caches; synchronization SHALL complete before the first model request. The default base SHALL be the upstream default branch, and an explicit base override SHALL be supported for assignments that must start from another revision. The lead SHALL fix a committed snapshot before dispatch: an assignment that depends on source-checkout state SHALL name, through the explicit base override, a revision that contains every assignment input - changes committed in the source checkout before dispatch (a local commit; pushing remains a separate authorized step) or verified committed HEAD - while unrelated dirty work SHALL NOT be committed just to form a base, and an assignment whose required inputs cannot be committed within authorization SHALL NOT be dispatched from a stale base. Executor briefs SHALL name the synchronized base revision; an executor SHALL verify that its slot HEAD equals that base before substantive edits and SHALL stop and report a mismatch instead of repairing synchronization or creating a substitute tree. Copying files into a live executor slot SHALL NOT be accepted as synchronization: changed tracked inputs SHALL travel as a new commit and a redispatch, and reusing the owner id SHALL rebind and resynchronize the same slot. Failed upstream fetch, an occupied dirty slot, a free slot holding unreviewed changes, or a missing or unusable slot SHALL abort dispatch with the concrete cause before any model request, instead of degrading to a stale base, an extra tree or silent data loss. Slot occupancy SHALL be reconciled with executor session liveness, and the worktree inventory check SHALL enforce the pool invariant instead of warning: harness dispatch never creates beyond the pool, reports preserved slots with their reasons, and reports non-pool trees as foreign or legacy items for lead review rather than silently absorbing them.
 
 #### Scenario: Pool size matches configured concurrency
 - **WHEN** the maximum concurrent executor count is configured as two and executor dispatch first runs for a repository checkout
@@ -242,8 +259,20 @@ For each source checkout used by an activated lead, executor dispatch SHALL main
 - **THEN** the next dispatch binds the same slot path after reset, and `git worktree list` shows no additional executor tree for that dispatch
 
 #### Scenario: Upstream freshness is mechanical, not prompt-side
-- **WHEN** a slot is selected for dispatch and the upstream default branch has advanced beyond the slot's previous base
-- **THEN** the slot reaches the fetched upstream base before the first model request, and no obligation on the executor to synchronize the checkout is needed for freshness
+- **WHEN** a slot is selected for dispatch and the resolved base is beyond the slot's previous base
+- **THEN** the slot reaches that base before the first model request, and no obligation on the executor to synchronize the checkout is needed for freshness
+
+#### Scenario: Dependent lead work is committed before dispatch
+- **WHEN** an assignment depends on uncommitted changes in the source checkout
+- **THEN** the lead commits those changes locally before dispatch and names the new revision as the explicit base, and no files are copied into the live executor slot
+
+#### Scenario: Commits are not authorized
+- **WHEN** the user has not authorized commits and a slice depends on uncommitted source state
+- **THEN** the lead keeps that slice or asks for snapshot-commit authorization instead of dispatching it from a stale base or transferring files into a live slot
+
+#### Scenario: The executor verifies the named base
+- **WHEN** an executor begins work and its slot HEAD differs from the base named in its brief
+- **THEN** it stops dependent edits and reports the mismatch, and the lead corrects the slot by redispatching with the same owner id
 
 #### Scenario: Upstream fetch failure blocks dispatch
 - **WHEN** the configured remote cannot be fetched during slot synchronization

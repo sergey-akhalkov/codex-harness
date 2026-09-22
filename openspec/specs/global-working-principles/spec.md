@@ -243,7 +243,6 @@ The portable principles SHALL establish Rust as the default programming language
 - **WHEN** a task requires another language or shell to preserve a concrete integration or platform contract
 - **THEN** the agent explains the constraint and preserves the required contract without starting an unrelated migration
 
-
 ### Requirement: Workflow reassessment responds to the cost of learning
 
 Main and delegated agents SHALL assess the next useful result, unresolved dependencies and cost of obtaining feedback when planning substantive work. They SHALL reassess the approach before consequential expensive repetition, after an unexpected failure, or when increasing scope, coupled fixes or recurring difficulty makes progress inefficient. Reassessment SHALL consider recurring classes of difficulty even when each attempt produces a different error or a new fact. Agents SHALL choose a smaller independently verifiable problem, optimize a justified repeated operation, or continue the existing path when current evidence supports it. They SHALL communicate material changes of approach concisely without requiring a fixed retry count, timer, per-tool report, additional approval or separate reflection agent.
@@ -511,3 +510,44 @@ The native source check SHALL enforce the existing 24 KiB portable-principles li
 #### Scenario: A declared report owner disappears
 - **WHEN** a declared documentation owner is missing or outside the source root
 - **THEN** the source check fails with the invalid owner route
+
+### Requirement: Assigned work delegates executor-suitable slices by default
+
+The portable principles SHALL make executor delegation the default for
+substantive assigned work whenever executors are configured, requested or
+active: the lead or main agent decomposes executor-suitable slices and
+dispatches them, retaining judgment, integration, acceptance and only slices
+that genuinely exceed executor capability. Solo or sequential execution SHALL
+require a recorded concrete reason - no executor-suitable slice exists, a
+slice exceeds executor capability with no useful decomposition, or a verified
+dispatch failure with its reported cause. The principles SHALL state that no
+instruction wording withholds delegation: a user request to use executors is
+sufficient activation, executor routing comes from the owning configuration
+with the configured profile as the complete model/effort selection, apparent
+routing conflicts are reported while dispatch proceeds, and only a
+launcher-reported dispatch failure blocks dispatch. These rules SHALL NOT
+create manufactured filler work or a delegation-count target.
+
+#### Scenario: The default is delegation, not an option
+- **WHEN** assigned work contains executor-suitable slices and executors are configured, requested or active
+- **THEN** the lead or main agent dispatches those slices and keeps only judgment, integration, acceptance and genuinely over-capability work for itself
+
+#### Scenario: Solo work carries its reason
+- **WHEN** an agent keeps executor-suitable work solo or stays sequential while executors are available
+- **THEN** it records the concrete reason from the allowed set instead of citing convenience, a routing-rule interpretation or unknown quota
+
+#### Scenario: Wording does not block dispatch
+- **WHEN** instruction text could be read to require per-assignment model/effort arguments or a different executor model
+- **THEN** the agent dispatches the configured executor profile, treats the profile as the explicit selection, and reports the discrepancy rather than classifying delegation as blocked
+
+### Requirement: Executor dispatch starts from a committed snapshot
+
+The portable principles SHALL require the lead to fix a committed snapshot of the source checkout before dispatching an executor: assignment-relevant changes are committed locally (pushing remains a separate authorized step) and named as the assignment base, or committed HEAD is verified to contain every input and named instead. The principles SHALL state that copying files into a live executor checkout is not synchronization - changed tracked inputs travel as a new commit and a redispatch - and that slices depending on state the user forbade committing stay with the lead instead of being dispatched from a stale base. Executors SHALL verify their checkout is at the named base before substantive edits and report a mismatch instead of repairing it.
+
+#### Scenario: The main worktree is committed before dispatch
+- **WHEN** assignment inputs exist as uncommitted changes in the source checkout
+- **THEN** the lead commits them locally, names that revision in the dispatch, and the executor slot starts exactly there without post-launch file copying
+
+#### Scenario: The user forbids commits
+- **WHEN** a slice depends on uncommitted state and commits are not authorized
+- **THEN** the lead keeps the slice or asks for authorization rather than dispatching a stale base or hand-carrying files into the live checkout
