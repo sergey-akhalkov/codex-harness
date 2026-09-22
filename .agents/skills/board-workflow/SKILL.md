@@ -6,7 +6,8 @@ description: Coordinate asynchronous lead/executor work on the consuming project
 # Board workflow
 
 The consuming project's `bd` CLI is the durable assignment and feedback record.
-The harness controller does not parse it. Do not invent a replacement tracker
+`codex-harness feedback` performs deterministic bookkeeping on that same board.
+Do not invent a replacement tracker
 when `bd` is missing or broken: report `board unavailable` and continue only
 work whose acceptance does not depend on the board.
 
@@ -42,37 +43,36 @@ does not erase it.
 
 ## Bounded feedback
 
-Lead and executor observations are tasks labeled `feedback`, not chat. Keep the
-description bounded and structured:
+Lead and executor observations are tasks labeled `feedback`, not chat. Record
+them through the installed command; it bounds and structures the description:
 
-```
-observation: dispatch waits after tools
-scope: dispatch
-reporter: exec-a
-episode: e1
-kind: lead|executor|diagnostic
+```powershell
+codex-harness feedback record --project <project> --parent <feature> --observation "dispatch waits after tools" --scope dispatch --reporter exec-a --episode e1 --kind executor
 ```
 
-Do not paste transcripts. `kind: diagnostic` records the observation but must
+Do not paste transcripts. `--kind diagnostic` records the observation but must
 not count as a vote.
 
 ## Batch triage
 
-The lead applies merges at a safe boundary. Listing, merging and voting are
-`bd` commands and make no model calls:
+The lead selects similarity and kind at a safe boundary. Inspect
+`codex-harness feedback list --project <project>`, then supply a decisions file:
 
-| Step | Command |
-| --- | --- |
-| List | `bd list --label feedback --status open --json --brief` |
-| Admit unique item | `bd label add <id> incubator --json` then `bd label remove <id> feedback --json` |
-| Merge similar | `bd duplicate <id> --of <canonical> --json` |
-| Record vote | `bd comment <canonical> --json "feedback-vote v1 episode=<id> reporter=<id> kind=executor counted=true reason=counted"` |
-| Record merge | `bd comment <canonical> --json "feedback-merge v1 from=<id> into=<canonical>"` |
-| Inspect provenance | `bd comments <canonical> --json` |
+```json
+{"schema":1,"decisions":[{"feedback":"sample-17","kind":"process","merge_into":null}]}
+```
+
+`codex-harness feedback triage --project <project> --decisions <file>` applies
+the declared routing, merges and votes. Use a canonical item id in `merge_into`
+for an agent-selected duplicate. `feedback ledger --project <project> --item
+<id>` reads retained provenance. These commands make no model calls.
 
 One counted vote per distinct episode and reporter. Same-reporter repeats use
 `counted=false reason=repeat`. Diagnostics use `counted=false reason=automated-diagnostic`.
-Cap a batch at `feedback_batch_limit` from kit `global/orchestration.toml`.
+The command enforces `feedback_batch_limit` from kit `global/orchestration.toml`.
+Partial failures report applied operations and the failed action with a nonzero
+exit. Resolve the cause and retry the same decisions; recorded votes stay counted
+once. Read the result instead of reconstructing this bookkeeping in prose.
 Do not use `bd find-duplicates`; it may call a model. Similarity is lead
 judgment, then these mechanics.
 
@@ -90,10 +90,8 @@ never both an incubator vote and a skill candidate.
 Kinds: `skill-procedure`, `process`, `orchestration`, `requirement`, `tool`,
 `unclear`, `material`, `kit-concern`.
 
-| Step | Command |
-| --- | --- |
-| Admit with kind | `bd label add <id> incubator --json`; `bd label remove <id> feedback --json`; `bd comment <id> --json "feedback-route v1 kind=<kind> target=incubator item=<id>"` |
-| Hand off a procedure | `bd label add <id> skill-evolution --json`; `bd label remove <id> feedback --json`; `bd comment <id> --json "feedback-route v1 kind=skill-procedure target=skill-evolution item=<id>"` |
+The selected `kind` in the triage file determines these mechanical labels and
+route records. Do not recreate them with separate label/comment calls.
 
 The handoff is a reference only: it writes no skill package and leaves
 `SKILL.md` untouched. An item handed off is never voted into the incubator, and
@@ -101,16 +99,16 @@ an incubating item is never handed off.
 
 ## Promotion
 
-Read `vote_threshold` and `incubator_size_cap` from kit
-`global/orchestration.toml` (default `vote_threshold = 3`: promote after more
-than two counted votes). Counting uses `bd comments` only.
+`codex-harness feedback candidates --project <project>` reads eligibility and
+incubator size using configured `vote_threshold` and `incubator_size_cap`.
+The default threshold is three distinct counted votes. Commands print the
+actual limits and their source; `--source <kit>` explicitly selects another kit.
 
 | Step | Command |
 | --- | --- |
-| Eligible items | `bd list --label incubator --status open --json --brief`, then count `feedback-vote v1 ... counted=true` comments |
-| Promote to backlog | `bd label remove <id> incubator --json`; `bd label add <id> backlog --json`; `bd comment <id> --json "feedback-promote v1 route=backlog-task basis=votes counted=<n> threshold=<t> target=none"` |
-| Behavior or requirement change | create `openspec/changes/feedback-<id>/proposal.md`, then promote with `route=openspec-change target=openspec:feedback-<id>` |
-| Kit concern | create a sanitized kit task (`bd -C <kit> create "Kit feedback: <summary>" --type task --labels kit-feedback --json`), then promote with `route=kit-backlog target=kit:<kit-id>` |
+| Promote to backlog | `codex-harness feedback promote --project <project> --item <id> --route backlog-task` |
+| Behavior or requirement change | `codex-harness feedback promote --project <project> --item <id> --route openspec-change` |
+| Kit concern | `codex-harness feedback promote --project <project> --item <id> --route kit-backlog --kit-project <kit> --summary "kit-level summary" --scope "kit scope"` |
 
 Route by consequence, never by habit: small improvements become backlog tasks,
 changes to accepted behavior or requirements enter OpenSpec instead of being
@@ -121,9 +119,9 @@ route comment as history and confers eligibility for planning, not
 implementation authority; it never writes a skill package.
 
 Lead consequence override: with material correctness, integrity or safety
-evidence, promote without votes and record
-`basis=override counted=<n> threshold=none consequence=<...> reason=<...>` in
-the promotion comment.
+evidence, pass both `--override-consequence TEXT` and `--override-reason TEXT`.
+The command records the override, preserves vote history and reconciles a
+completed promotion on retry; it does not infer the consequence or authority.
 
 ## Incubator hygiene (lead-owned)
 

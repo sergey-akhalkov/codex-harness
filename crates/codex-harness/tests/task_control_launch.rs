@@ -188,11 +188,18 @@ fn native_entry(case: EntryCase) {
         ("codex-harness.exe", env!("CARGO_BIN_EXE_codex-harness")),
         ("harness-inspect.exe", env!("CARGO_BIN_EXE_harness-inspect")),
         ("harness-observe.exe", env!("CARGO_BIN_EXE_harness-observe")),
+        (
+            "harness-source-check.exe",
+            env!("CARGO_BIN_EXE_harness-source-check"),
+        ),
     ] {
         fs::copy(binary, build.join(name)).unwrap();
     }
     let rtk = Path::new(env!("CARGO_BIN_EXE_codex")).with_file_name("harness-rtk.exe");
     fs::copy(rtk, build.join("harness-rtk.exe"))
+        .expect("build the workspace binaries with --release before this entry-point test");
+    let audit = Path::new(env!("CARGO_BIN_EXE_codex")).with_file_name("token-audit.exe");
+    fs::copy(audit, build.join("token-audit.exe"))
         .expect("build the workspace binaries with --release before this entry-point test");
     let record = BuildRecord {
         schema: build_identity::SCHEMA,

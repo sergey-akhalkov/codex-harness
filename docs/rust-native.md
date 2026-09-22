@@ -29,7 +29,10 @@ The retired script interface and its native equivalent. Selectors, preview
 | `tools/mcp.ps1 <server>` | `codex-harness mcp serena` / `nuphus` / `codegraph-control` (plus `codebase-memory` only as documented rollback) |
 | `tools/hook.ps1` | Retired no-op compatibility entry; the accepted RTK exception runs native `harness-rtk.exe` |
 | `tools/delegation-usage.py` | `codex-harness delegation-usage` |
-| First-party usage analyzer | `token-audit report` / `findings` / `baseline save|diff` (crate `crates/token-audit`, operated by the `tokenomics` skill) |
+| First-party usage analyzer | `token-audit report` / `findings` / `detail` / `baseline save|diff` (crate `crates/token-audit`, operated by the `tokenomics` skill) |
+| Instruction/source audit | Installed `harness-source-check --root CHECKOUT` |
+| Verification evidence | `harness-observe --scope TEXT --input FILE ... -- EXE ARGS` |
+| Feedback mechanics | `codex-harness feedback record|list|ledger|triage|candidates|promote` |
 | `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
 | Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
 | Skill evolution helpers | `codex-harness skills isolate` / `usage` / `publish` / `identity` |
@@ -69,6 +72,13 @@ configuration, shared `[projects.*]` records and inline Markdown local
 targets/anchors, skipping fenced examples, templates and URLs. It does not
 inspect Git history.
 
+Core delivery also installs `harness-source-check` on PATH. From any directory,
+run `harness-source-check --root <kit-checkout>` to audit that checkout without
+compiling or starting a model. The checker enforces the portable principles'
+24 KiB byte limit. For a kit root identified by `global/kit.json`, it also
+checks token-audit's declared documentation owners. These mechanical checks
+do not certify semantic completeness or inspect Git history.
+
 Current-path baselines for the Rust migration are captured by
 `cargo test --locked -p codex-harness --test migration_baseline --jobs 1 -- --test-threads=1 --nocapture`
 after `cargo build --locked -p harness-rtk --jobs 1`. The comparison method
@@ -87,6 +97,59 @@ when a retained test binary could occupy the default target. That is a Cargo
 output choice, not an ambient `CARGO_TARGET_DIR` override for native build
 identity. Custom compiler wrappers and ambient Rust build overrides are
 rejected before creating build state.
+
+## Structured executor assignments
+
+`codex-harness executor spawn` and `resume` accept `--assignment FILE` as an
+alternative to `--exec PROMPT`. Keep the file local or in the owning project;
+do not put consumer details into this pack. Example schema:
+
+```json
+{
+  "schema": 1,
+  "objective": "Implement board item sample-17: validate parser input",
+  "inputs": ["Cargo.toml", "src/parser.rs"],
+  "outputs": ["src/parser.rs", "tests/parser.rs"],
+  "invariants": ["Preserve the public result type"],
+  "acceptance": ["Run the parser tests and report actual results"]
+}
+```
+
+Paths are relative to the allocated checkout. Inputs must exist as files;
+outputs may be new. Absolute paths, traversal and links escaping the checkout
+are rejected before a model starts. The generated brief names the real checkout
+and full committed base, preserving the caller's objective and acceptance.
+Schema/path checks cannot establish semantic completeness or execution success.
+Resume retains partial work. Free text remains supported.
+
+For an existing pool slot, `codex-harness executor assignment --source CHECKOUT
+--slot N --base REV --assignment FILE` validates/renders without allocating,
+resetting, writing or launching a conversation. Normal dispatch still uses the
+installed profile and visible terminal contract.
+
+## Bounded token reports
+
+Use `token-audit report --format text` and `token-audit findings --format text`
+for ranked summaries. They state omitted counts and retain complete coverage,
+warnings and limitations. Full same-scan JSON is retained locally (newest 20
+files per kind); the summary prints its locator. `token-audit detail --report
+PATH --session ID` or `detail --findings PATH --finding ID` reads just the
+requested record without rescanning sessions. Missing/evicted evidence is an
+error. `--format json` preserves the complete contract; baselines are unchanged.
+The [audit owner](memory/token-audit.md) describes interpretation and limits.
+
+## Verification capture
+
+The optional `harness-observe --scope TEXT --input ABSOLUTE-FILE ... --
+ABSOLUTE-EXE ARGS` path records executable and declared input identities before
+and after execution, cwd, command arguments and Git identity when available.
+Select source, command-definition and build inputs relevant to the check.
+Evidence remains in the observer's existing local case directory. Missing
+inputs fail before launch; failure, timeout, changed inputs and unavailable
+identity remain distinct. No automatic acceptance, cache reuse or claim about
+unlisted files/external state is made. See the installed verification skill's
+[command records](../.agents/skills/project-verification/references/command-records.md)
+for ordinary use and interpretation.
 
 ## Native task-control contract
 

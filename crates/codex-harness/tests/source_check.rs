@@ -124,3 +124,67 @@ fn detects_shared_state_and_tracked_caches_but_allows_deleted_caches() {
     assert!(output.contains("shared-project-trust"));
     assert!(output.contains("machine-home-path"));
 }
+
+#[test]
+fn principles_limit_checks_bytes_at_the_exact_boundary() {
+    let f = Fixture::new();
+    let limit = 24 * 1024;
+    // Multi-byte text makes a character-count implementation insufficient.
+    f.write("global/principles-of-work.md", &"é".repeat(limit / 2));
+    assert!(f.check(None).status.success());
+    let oversized = format!("{}x", "é".repeat(limit / 2));
+    f.write("global/principles-of-work.md", &oversized);
+    let bad = f.check(None);
+    assert_eq!(bad.status.code(), Some(1));
+    let output = String::from_utf8_lossy(&bad.stdout);
+    assert!(output.contains("principles-size-limit actual=24577 allowed=24576"));
+    assert_eq!(
+        fs::read_to_string(f.repo().join("global/principles-of-work.md")).unwrap(),
+        oversized
+    );
+}
+
+fn kit_fixture() -> Fixture {
+    let f = Fixture::new();
+    f.write("global/kit.json", "{}");
+    f.write("global/principles-of-work.md", "# Working principles\n");
+    for owner in harness_core::report_owners::TOKEN_AUDIT_OWNERS {
+        f.write(owner, "# Owner\n");
+    }
+    f
+}
+
+#[test]
+fn kit_requires_principles_and_existing_report_owners() {
+    let f = kit_fixture();
+    assert!(f.check(None).status.success());
+    let owner = harness_core::report_owners::TOKEN_AUDIT_OWNERS[0];
+    fs::remove_file(f.repo().join(owner)).unwrap();
+    let missing = f.check(None);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("missing-report-owner"));
+    f.write(owner, "# Restored\n");
+    fs::remove_file(f.repo().join("global/principles-of-work.md")).unwrap();
+    let missing = f.check(None);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("missing-principles"));
+}
+
+#[test]
+fn kit_refuses_an_owner_link_outside_the_checkout() {
+    let f = kit_fixture();
+    let owner = f
+        .repo()
+        .join(harness_core::report_owners::TOKEN_AUDIT_OWNERS[0]);
+    let outside = f.0.path().join("outside.md");
+    fs::write(&outside, "# Outside\n").unwrap();
+    fs::remove_file(&owner).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside, &owner).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &owner).unwrap();
+    let bad = f.check(None);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stdout).contains("invalid-report-owner"));
+    assert_eq!(fs::read_to_string(outside).unwrap(), "# Outside\n");
+}

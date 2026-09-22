@@ -110,6 +110,18 @@ Brief executors through harness commands, not by automating TUI keystrokes:
 codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --base REV --exec "assignment"
 ```
 
+For file-specific work, prefer `--assignment FILE` instead of `--exec`.
+The schema-1 JSON contains `objective` (include the board id), `inputs` and
+`outputs` as checkout-relative file paths, and string arrays `invariants` and
+`acceptance`. Dispatch validates existing inputs and path containment, allows
+new output files, and generates the actual checkout and full committed base
+before starting a model. It cannot decide whether the declared scope is complete.
+The same option works with `resume` while preserving partial work.
+`executor assignment --source CHECKOUT --slot N --base REV --assignment FILE`
+validates and renders against an existing pool checkout without dispatch.
+The complete example and limits live in the kit's
+[native commands](../../../docs/rust-native.md#structured-executor-assignments).
+
 `--source` is the repository checkout, and `executor spawn` is the sole
 allocator of executor isolation: it selects a free slot of the harness-owned
 pool (sibling worktrees `<repository-name>-wt1` .. `-wtN`, where `N` is
@@ -189,7 +201,8 @@ dispatch-synchronized base, disjoint file and system ownership per slice,
 complete outcomes each. Sequence only genuinely dependent slices; respect
 `max_concurrent_executors` and shared accounts or machines; the lead owns
 integration and acceptance conflicts.
-The `--exec` prompt points at board ids; the beads issue is the assignment.
+The free-text prompt or structured objective points at board ids; the beads
+issue remains the durable assignment.
 Assignments require bounded milestone self-reports: after each numbered
 outcome inside the assignment, the executor posts a short board comment on
 its issue (done, next, blockers in at most three lines) instead of waiting

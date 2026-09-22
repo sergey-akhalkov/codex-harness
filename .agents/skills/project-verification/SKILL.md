@@ -21,7 +21,7 @@ Identify the actual source entrypoint or resolved executable, runtime version, b
 
 Establish a coherent prepared path, including the test driver and its required support artifacts. A pin on one product artifact does not justify suppressing preparation of other required dependencies. Follow the current native dependency boundary, refresh affected outputs and reuse still-valid ones before running the consuming check; do not discover each stale prerequisite through another full run.
 
-When recording commands or resuming saved work, read [command records](references/command-records.md). Use the consuming project's existing documentation home; create a small local validation document only if useful knowledge has no existing home. Keep detailed or sensitive logs in appropriate local evidence storage.
+When recording commands or resuming saved work, read [command records](references/command-records.md). Its optional `harness-observe --scope ... --input ...` path captures command and selected input identities mechanically; it does not select tests or certify acceptance. Use the consuming project's existing documentation home; create a small local validation document only if useful knowledge has no existing home. Keep detailed or sensitive logs in appropriate local evidence storage.
 
 ## Choose the feedback boundary
 

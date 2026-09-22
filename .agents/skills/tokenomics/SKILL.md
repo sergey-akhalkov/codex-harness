@@ -13,7 +13,7 @@ subscription savings.
 1. **Report**: `token-audit report --days N --format text` for the measured
    overview (sessions, projects, models, efforts, days, cache efficiency,
    context repayment, instruction floors, coverage warnings).
-2. **Findings**: `token-audit findings --days N` ranks measured-mass findings
+2. **Findings**: `token-audit findings --days N --format text` ranks measured-mass findings
    with evidence locators and owning records; `--all-bases` also shows
    inferred or estimated findings, which the default filter hides on purpose.
 3. **Map, do not duplicate**: each finding names its owner (for example the
@@ -25,6 +25,14 @@ subscription savings.
    `token-audit baseline diff` and compare movement per session, project,
    model and day. Record the accept/reject decision and its evidence in the
    owning record, not in a new report.
+
+Text reports retain complete same-scan JSON and print its local path, ranked
+records and omitted counts. Read only the needed record with
+`token-audit detail --report PATH --session ID` or
+`token-audit detail --findings PATH --finding ID`; these do not rescan sessions.
+Retention keeps the newest 20 files per kind. Expired evidence is an explicit
+error; a new scan is a new observation. Use `--format json` for a complete
+machine-consumed contract, not as the ordinary human overview.
 
 Findings are eligibility for planning, not implementation authority: an
 adopted change still needs its normal OpenSpec or owning-record route. The

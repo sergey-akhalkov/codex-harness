@@ -26,6 +26,26 @@ Record only fields useful to rerun or interpret the check:
 
 Recheck the inputs when continuing after interruption or when a manifest, lockfile, runtime, generated input, preparation or executable changes. Unchanged command knowledge avoids rediscovery, but does not certify the current change. Reuse a current-task result only if its tested inputs and scope still apply, and identify it as prior execution.
 
+## Native capture
+
+When the installed harness is available, capture the mechanical evidence with
+its process observer. Choose the scope and relevant source, manifest, lockfile
+and generated inputs; pass each existing file as an absolute `--input` path:
+
+```powershell
+harness-observe --cwd <PROJECT> --timeout 60 --scope "parser regression" --input <MANIFEST> --input <SOURCE-FILE> -- <ABSOLUTE-TEST-EXE> <ARGUMENTS>
+```
+
+The existing local case directory holds the command, output and `report.json`.
+The optional verification record includes resolved executable identity, hashes
+before/after and Git identity when available. Missing declared inputs fail
+before launch. Changed/unavailable identity, failure and timeout remain visible;
+exit zero does not prove unchanged inputs or task acceptance. Keep this evidence
+local and reference it from the project's existing record instead of manually
+recreating hashes and command receipts. Unlisted inputs and external state are
+not covered; command selection, provenance meaning, knowledge state and acceptance
+still require judgment. Without the observer, retain equivalent native evidence.
+
 ## Concrete records
 
 Illustrative `docs/validation.md` entry in a consuming repository:

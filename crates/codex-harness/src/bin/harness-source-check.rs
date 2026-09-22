@@ -1,6 +1,10 @@
 //! Model-free working-tree audit. Private audit inputs never belong in the pack.
+use harness_core::report_owners::TOKEN_AUDIT_OWNERS;
 use regex::Regex;
 use std::{collections::BTreeSet, env, fs, path::Path, process::Command};
+
+const PRINCIPLES_PATH: &str = "global/principles-of-work.md";
+const PRINCIPLES_LIMIT: usize = 24 * 1024;
 
 fn visible(path: &str, terms: &[String]) -> String {
     if terms.iter().any(|term| path.to_lowercase().contains(term)) {
@@ -93,6 +97,37 @@ fn has_anchor(source: &str, wanted: &str) -> bool {
     slugs.contains(wanted)
 }
 
+fn kit_invariants(root: &Path, report: &mut impl FnMut(&str, usize, &str)) {
+    // Ordinary consumer repositories retain the generic source-audit contract.
+    if !root.join("global/kit.json").is_file() {
+        return;
+    }
+    if !root.join(PRINCIPLES_PATH).is_file() {
+        report(PRINCIPLES_PATH, 1, "missing-principles");
+    }
+    for owner in TOKEN_AUDIT_OWNERS {
+        let path = Path::new(owner);
+        let relative = !path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)));
+        let resolved = root.join(path).canonicalize();
+        match resolved {
+            Ok(target) if relative && target.starts_with(root) && target.is_file() => {}
+            Ok(_) => report(
+                owner,
+                1,
+                "invalid-report-owner; keep the owner inside the kit",
+            ),
+            Err(_) => report(
+                owner,
+                1,
+                "missing-report-owner; restore or update the declared owner",
+            ),
+        }
+    }
+}
+
 fn run() -> Result<bool, &'static str> {
     let mut args = env::args().skip(1);
     let mut root = env::current_dir().map_err(|_| "working directory unavailable")?;
@@ -105,7 +140,7 @@ fn run() -> Result<bool, &'static str> {
             }
             "--help" | "-h" => {
                 println!(
-                    "harness-source-check [--root REPOSITORY] [--private-terms LOCAL_FILE]\nChecks existing tracked and non-ignored new files, caches, shared trust settings,\nmachine home paths in documentation/configuration, caller-supplied private terms,\nand local inline Markdown file/heading links. Skips fenced examples, template\ntargets and non-text assets. Terms are one per line in a file outside the repository.\nDiagnostics omit matched text. Exit: 0 clean, 1 findings, 2 audit unavailable.\nThis is a working-tree check, not a secret detector or Git-history audit."
+                    "harness-source-check [--root REPOSITORY] [--private-terms LOCAL_FILE]\nChecks existing tracked and non-ignored new files, caches, shared trust settings,\nmachine home paths in documentation/configuration, caller-supplied private terms,\nlocal inline Markdown links and the 24 KiB portable-principles limit. Kit roots\nalso require principles and valid token-audit documentation owners.\nSkips fenced examples, template targets and non-text assets. Terms are one per\nline in a file outside the repository. Diagnostics omit matched text.\nExit: 0 clean, 1 findings, 2 audit unavailable.\nThis is a working-tree check, not a secret detector or Git-history audit."
                 );
                 return Ok(true);
             }
@@ -173,6 +208,7 @@ fn run() -> Result<bool, &'static str> {
         findings += 1;
         println!("{}:{line}: {category}", visible(name, &terms));
     };
+    kit_invariants(&root, &mut report);
     for name in files {
         let path = root.join(name);
         if !path.exists() {
@@ -211,6 +247,16 @@ fn run() -> Result<bool, &'static str> {
             report(name, 1, "private-path");
         }
         let bytes = fs::read(&path).map_err(|_| "source file unreadable")?;
+        if normalized == PRINCIPLES_PATH && bytes.len() > PRINCIPLES_LIMIT {
+            report(
+                name,
+                1,
+                &format!(
+                    "principles-size-limit actual={} allowed={PRINCIPLES_LIMIT}; shorten without weakening requirements",
+                    bytes.len()
+                ),
+            );
+        }
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };

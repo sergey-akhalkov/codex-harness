@@ -167,6 +167,7 @@ impl Settings {
                     "harness-rtk",
                     "harness-inspect",
                     "harness-observe",
+                    "harness-source-check",
                     "token-audit",
                 ]
                 .contains(&name) =>

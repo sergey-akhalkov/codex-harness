@@ -14,6 +14,7 @@ pub const BINARIES: &[&str] = &[
     "harness-rtk.exe",
     "harness-inspect.exe",
     "harness-observe.exe",
+    "harness-source-check.exe",
     "token-audit.exe",
 ];
 // Live source data resolved by native consumers; never embedded in a binary.
