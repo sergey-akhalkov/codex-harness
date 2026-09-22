@@ -184,6 +184,70 @@ fn small_reports_present_every_record_without_an_omitted_count() {
 }
 
 #[test]
+fn retention_falls_back_to_the_codex_home_under_the_user_profile() {
+    let fixture = Fixture::new();
+    fixture.measured_sessions(&[10_000]);
+    let profile = fixture.home();
+    let sessions = fixture.sessions();
+    // An isolated child without CODEX_HOME must use the same
+    // USERPROFILE/.codex convention as the session root.
+    let output = Command::new(env!("CARGO_BIN_EXE_token-audit"))
+        .args([
+            "report",
+            "--sessions",
+            sessions.to_str().unwrap(),
+            "--format",
+            "text",
+        ])
+        .env_remove("CODEX_HOME")
+        .env("USERPROFILE", &profile)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let retained = locator(&text);
+    let expected = profile
+        .join(".codex")
+        .join("harness")
+        .join("token-audit")
+        .join("reports");
+    assert!(
+        retained.starts_with(&expected),
+        "retained {} must sit under {}",
+        retained.display(),
+        expected.display()
+    );
+    let complete: Value = serde_json::from_str(&fs::read_to_string(&retained).unwrap()).unwrap();
+    assert_eq!(complete["sessions"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn successive_scans_keep_distinct_locators_and_their_own_records() {
+    let fixture = Fixture::new();
+    fixture.measured_sessions(&[10_000]);
+    let first = locator(&fixture.report_text());
+    // The recorded session grows and a second session appears in the next
+    // scan. Timestamps have second resolution, so the two runs may share a
+    // stamp; in every case each run keeps its own create-new locator.
+    fixture.measured_sessions(&[20_000, 30_000]);
+    let second = locator(&fixture.report_text());
+    assert_ne!(first, second, "each retained run needs its own locator");
+    let first_record: Value = serde_json::from_str(&fs::read_to_string(&first).unwrap()).unwrap();
+    let second_record: Value = serde_json::from_str(&fs::read_to_string(&second).unwrap()).unwrap();
+    assert_eq!(first_record["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(second_record["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(first_record["sessions"][0]["usage"]["input_tokens"], 10_000);
+    assert_eq!(
+        second_record["sessions"][0]["usage"]["input_tokens"],
+        20_000
+    );
+}
+
+#[test]
 fn detail_recalls_an_omitted_session_without_rescanning_sessions() {
     let fixture = Fixture::new();
     let amounts: Vec<u64> = (0..15).map(|index| 10_000 * (index + 1)).collect();
