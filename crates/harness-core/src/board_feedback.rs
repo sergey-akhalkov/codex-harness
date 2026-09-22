@@ -59,7 +59,8 @@ impl ReporterKind {
         }
     }
 
-    fn parse(value: &str) -> io::Result<Self> {
+    /// Parses the caller-supplied reporter kind used by the installed CLI.
+    pub fn parse(value: &str) -> io::Result<Self> {
         match value {
             "lead" => Ok(Self::Lead),
             "executor" => Ok(Self::Executor),
@@ -220,7 +221,8 @@ impl ObservationKind {
         }
     }
 
-    fn parse(value: &str) -> io::Result<Self> {
+    /// Parses the caller-supplied observation kind used by the installed CLI.
+    pub fn parse(value: &str) -> io::Result<Self> {
         match value {
             "skill-procedure" => Ok(Self::SkillProcedure),
             "process" => Ok(Self::Process),
@@ -267,7 +269,8 @@ impl PromotionRoute {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    /// Parses the caller-supplied promotion route used by the installed CLI.
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "backlog-task" => Some(Self::BacklogTask),
             "openspec-change" => Some(Self::OpenSpecChange),
@@ -618,6 +621,76 @@ pub fn apply_routed_triage(
     Ok(RoutedReport { applied, deferred })
 }
 
+/// The action a bounded batch stopped on and why. The operation text is the
+/// exact identity the caller reissues for recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFailure {
+    pub operation: String,
+    pub error: String,
+}
+
+/// A bounded batch that keeps the applied prefix when a later action fails.
+/// Recovery reissues the remaining actions: admitted observations keep one
+/// counted vote, an existing merge or route record is not repeated, and a
+/// non-open merge whose duplicate dependency is already recorded continues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialRoutedReport {
+    pub applied: Vec<RoutedOutcome>,
+    pub deferred: usize,
+    pub failure: Option<BatchFailure>,
+}
+
+/// Applies classified triage actions in one bounded batch and reports a
+/// partial failure instead of discarding the applied prefix.
+pub fn apply_routed_triage_recovering(
+    bd: &Path,
+    project: &Path,
+    actions: &[RoutedAction],
+    batch_limit: usize,
+) -> io::Result<PartialRoutedReport> {
+    if batch_limit == 0 {
+        return Err(invalid("feedback batch limit must be positive"));
+    }
+    let deferred = actions.len().saturating_sub(batch_limit);
+    let mut applied = Vec::new();
+    for action in actions.iter().take(batch_limit) {
+        match apply_routed_action(bd, project, action) {
+            Ok(outcome) => applied.push(outcome),
+            Err(error) => {
+                return Ok(PartialRoutedReport {
+                    applied,
+                    deferred,
+                    failure: Some(BatchFailure {
+                        operation: routed_operation(action),
+                        error: error.to_string(),
+                    }),
+                });
+            }
+        }
+    }
+    Ok(PartialRoutedReport {
+        applied,
+        deferred,
+        failure: None,
+    })
+}
+
+/// One triage action as the recovery report and the caller identify it.
+pub fn routed_operation(action: &RoutedAction) -> String {
+    match action.merge_into.as_deref() {
+        Some(canonical) => format!(
+            "feedback {} kind={} merge_into={canonical}",
+            action.feedback_id,
+            action.kind.as_str()
+        ),
+        None => format!(
+            "feedback {} kind={}",
+            action.feedback_id,
+            action.kind.as_str()
+        ),
+    }
+}
+
 fn apply_routed_action(
     bd: &Path,
     project: &Path,
@@ -746,7 +819,14 @@ fn apply_action_kind(
             action.feedback_id
         ))
     })?;
-    if kind.is_some() && snapshot.status != "open" {
+    // A retry after the duplicate step of a merge must continue, not fail on
+    // the closed incoming item: the recorded duplicate dependency proves the
+    // merge was already applied.
+    let already_merged = action
+        .merge_into
+        .as_deref()
+        .is_some_and(|canonical| snapshot.duplicates.as_deref() == Some(canonical));
+    if kind.is_some() && snapshot.status != "open" && !already_merged {
         return Err(invalid(format!(
             "feedback {} is not open",
             action.feedback_id
@@ -782,7 +862,7 @@ fn apply_action_kind(
                     "--json",
                 ],
             )?;
-            let vote = record_vote(bd, project, &action.feedback_id, &candidate)?;
+            let (vote, ledger) = record_vote(bd, project, &action.feedback_id, &candidate)?;
             let applied = AppliedAction {
                 feedback_id: action.feedback_id.clone(),
                 incubator_id: action.feedback_id.clone(),
@@ -790,12 +870,13 @@ fn apply_action_kind(
                 vote,
             };
             if let Some(kind) = kind {
-                record_route(
+                record_route_once(
                     bd,
                     project,
                     &applied.incubator_id,
                     kind,
                     &applied.feedback_id,
+                    &ledger,
                 )?;
             }
             Ok(applied)
@@ -810,28 +891,37 @@ fn apply_action_kind(
                     ))
                 })?;
             reject_skill_handoff(bd, project, &action.feedback_id, &incoming_snapshot.labels)?;
-            json_ok(
-                bd,
-                project,
-                &[
-                    "duplicate",
-                    &action.feedback_id,
-                    "--of",
-                    canonical,
-                    "--json",
-                ],
-            )?;
-            json_ok(
-                bd,
-                project,
-                &[
-                    "comment",
-                    canonical,
-                    "--json",
-                    &format_merge_comment(&action.feedback_id, canonical),
-                ],
-            )?;
-            let vote = record_vote(bd, project, canonical, &candidate)?;
+            let ledger = inspect_ledger(bd, project, canonical)?;
+            // A retry converges instead of duplicating the merge or its
+            // record: the recorded merge is the applied prefix of this action.
+            if !ledger
+                .merges
+                .iter()
+                .any(|merge| merge.from == action.feedback_id)
+            {
+                json_ok(
+                    bd,
+                    project,
+                    &[
+                        "duplicate",
+                        &action.feedback_id,
+                        "--of",
+                        canonical,
+                        "--json",
+                    ],
+                )?;
+                json_ok(
+                    bd,
+                    project,
+                    &[
+                        "comment",
+                        canonical,
+                        "--json",
+                        &format_merge_comment(&action.feedback_id, canonical),
+                    ],
+                )?;
+            }
+            let (vote, ledger) = record_vote(bd, project, canonical, &candidate)?;
             let applied = AppliedAction {
                 feedback_id: action.feedback_id.clone(),
                 incubator_id: canonical.to_owned(),
@@ -839,12 +929,13 @@ fn apply_action_kind(
                 vote,
             };
             if let Some(kind) = kind {
-                record_route(
+                record_route_once(
                     bd,
                     project,
                     &applied.incubator_id,
                     kind,
                     &applied.feedback_id,
+                    &ledger,
                 )?;
             }
             Ok(applied)
@@ -894,6 +985,25 @@ fn record_route(
         ],
     )?;
     Ok(())
+}
+
+/// Records an incubator classification once. A retried action that already
+/// recorded its route record converges without a duplicate comment.
+fn record_route_once(
+    bd: &Path,
+    project: &Path,
+    item_id: &str,
+    kind: ObservationKind,
+    source_id: &str,
+    ledger: &VoteLedger,
+) -> io::Result<()> {
+    let recorded = ledger.routes.iter().any(|route| {
+        route.target == RouteTarget::Incubator && route.kind == kind && route.item == source_id
+    });
+    if recorded {
+        return Ok(());
+    }
+    record_route(bd, project, item_id, kind, source_id)
 }
 
 /// Default consequence route for the recorded observation kinds: a kit concern
@@ -1001,13 +1111,15 @@ pub fn promote_item(
             "kit concerns promote through promote_kit_concern so private consuming-project data stays off the kit board",
         ));
     }
-    let snapshot = require_open_incubator(bd, project, item_id)?;
+    let snapshot = load_snapshot(bd, project, item_id)?
+        .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
-    if !ledger.promotions.is_empty() {
-        return Err(invalid(format!(
-            "incubator item {item_id} is already promoted"
-        )));
+    if let Some(record) = ledger.promotions.first() {
+        // A recorded promotion is never repeated: reconcile any label step a
+        // partial run left behind and return the retained outcome.
+        return reconcile_promotion(bd, project, item_id, &snapshot.labels, record, Some(route));
     }
+    require_open_incubator_snapshot(&snapshot, item_id)?;
     let kinds = incubator_kinds(&ledger);
     check_promotion_route(&kinds, route)?;
     let (counted, override_note) = validate_evidence(&ledger, evidence)?;
@@ -1066,13 +1178,22 @@ pub fn promote_kit_concern(
     concern: &KitConcern,
     evidence: &PromotionEvidence,
 ) -> io::Result<PromotionOutcome> {
-    require_open_incubator(bd, project, item_id)?;
+    let snapshot = load_snapshot(bd, project, item_id)?
+        .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
-    if !ledger.promotions.is_empty() {
-        return Err(invalid(format!(
-            "incubator item {item_id} is already promoted"
-        )));
+    if let Some(record) = ledger.promotions.first() {
+        // The kit task was already created and recorded; repeating the run
+        // reconciles labels without creating a second kit item.
+        return reconcile_promotion(
+            bd,
+            project,
+            item_id,
+            &snapshot.labels,
+            record,
+            Some(PromotionRoute::KitBacklog),
+        );
     }
+    require_open_incubator_snapshot(&snapshot, item_id)?;
     let kinds = incubator_kinds(&ledger);
     check_promotion_route(&kinds, PromotionRoute::KitBacklog)?;
     let (counted, override_note) = validate_evidence(&ledger, evidence)?;
@@ -1314,13 +1435,71 @@ fn list_incubator(bd: &Path, project: &Path) -> io::Result<Vec<String>> {
 fn require_open_incubator(bd: &Path, project: &Path, item_id: &str) -> io::Result<IssueSnapshot> {
     let snapshot = load_snapshot(bd, project, item_id)?
         .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
+    require_open_incubator_snapshot(&snapshot, item_id)?;
+    Ok(snapshot)
+}
+
+/// The open-incubator precondition, shared with callers that already loaded
+/// the issue so one board read serves the whole operation.
+fn require_open_incubator_snapshot(snapshot: &IssueSnapshot, item_id: &str) -> io::Result<()> {
     if snapshot.status != "open" {
         return Err(invalid(format!("item {item_id} is not open")));
     }
     if !snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL) {
         return Err(invalid(format!("item {item_id} is not an incubator item")));
     }
-    Ok(snapshot)
+    Ok(())
+}
+
+/// Completes a promotion whose record is already on the board. The recorded
+/// history is authoritative: the outcome is returned as recorded and only the
+/// label operations a partial run may have missed are reconciled, so a retry
+/// never writes a second promotion record or a second kit task.
+fn reconcile_promotion(
+    bd: &Path,
+    project: &Path,
+    item_id: &str,
+    labels: &[String],
+    record: &PromotionRecord,
+    requested: Option<PromotionRoute>,
+) -> io::Result<PromotionOutcome> {
+    if let Some(requested) = requested.filter(|requested| *requested != record.route) {
+        return Err(invalid(format!(
+            "incubator item {item_id} is already promoted with route={}; repeat that route instead of {}",
+            record.route.as_str(),
+            requested.as_str()
+        )));
+    }
+    let incubating = labels.iter().any(|label| label == INCUBATOR_LABEL);
+    let routed = labels.iter().any(|label| label == record.route.label());
+    if !incubating && routed {
+        return Err(invalid(format!(
+            "incubator item {item_id} is already promoted with route={} target={}; the recorded promotion is retained",
+            record.route.as_str(),
+            record.target.as_deref().unwrap_or("none")
+        )));
+    }
+    if incubating {
+        json_ok(
+            bd,
+            project,
+            &["label", "remove", item_id, INCUBATOR_LABEL, "--json"],
+        )?;
+    }
+    if !routed {
+        json_ok(
+            bd,
+            project,
+            &["label", "add", item_id, record.route.label(), "--json"],
+        )?;
+    }
+    Ok(PromotionOutcome {
+        item_id: item_id.to_owned(),
+        route: record.route,
+        target: record.target.clone(),
+        counted: record.counted,
+        override_used: record.override_used,
+    })
 }
 
 fn create_openspec_entry(
@@ -1354,6 +1533,11 @@ fn create_openspec_entry(
 /// Creates the sanitized kit-backlog task from explicit kit-level wording.
 fn create_kit_item(bd: &Path, kit_project: &Path, concern: &KitConcern) -> io::Result<String> {
     let title = format!("Kit feedback: {}", bounded_title(&concern.summary));
+    if let Some(existing) = find_kit_item(bd, kit_project, &title)? {
+        // A previous run created the kit task and stopped before recording the
+        // promotion; reuse it instead of creating a second item.
+        return Ok(existing);
+    }
     let description = format!(
         "summary: {}\nscope: {}\nkind: kit-concern\n",
         concern.summary, concern.scope
@@ -1377,6 +1561,34 @@ fn create_kit_item(bd: &Path, kit_project: &Path, concern: &KitConcern) -> io::R
     string_field(&created, "id")
 }
 
+/// Finds an open kit item carrying the exact bounded title a retry would
+/// create. Kit items are created with kit-level wording only, so an identical
+/// open title is the same concern.
+fn find_kit_item(bd: &Path, kit_project: &Path, title: &str) -> io::Result<Option<String>> {
+    let listed = json_ok(
+        bd,
+        kit_project,
+        &[
+            "list",
+            "--label",
+            KIT_FEEDBACK_LABEL,
+            "--status",
+            "open",
+            "--json",
+            "--brief",
+        ],
+    )?;
+    let rows = match &listed {
+        Value::Array(rows) => rows.as_slice(),
+        _ => &[],
+    };
+    Ok(rows
+        .iter()
+        .find(|row| row.get("title").and_then(Value::as_str) == Some(title))
+        .and_then(|row| row.get("id").and_then(Value::as_str))
+        .map(str::to_owned))
+}
+
 fn bounded_slug(value: &str) -> String {
     let mut slug = String::new();
     for character in value.chars() {
@@ -1394,7 +1606,7 @@ fn record_vote(
     project: &Path,
     item_id: &str,
     candidate: &VoteCandidate,
-) -> io::Result<VoteDecision> {
+) -> io::Result<(VoteDecision, VoteLedger)> {
     let ledger = inspect_ledger(bd, project, item_id)?;
     let decision = decide_vote(&ledger.votes, candidate);
     json_ok(
@@ -1407,7 +1619,7 @@ fn record_vote(
             &format_vote_comment(candidate, &decision),
         ],
     )?;
-    Ok(decision)
+    Ok((decision, ledger))
 }
 
 fn load_feedback(bd: &Path, project: &Path, id: &str) -> io::Result<Option<BoundedFeedback>> {
@@ -1418,6 +1630,10 @@ struct IssueSnapshot {
     status: String,
     labels: Vec<String>,
     feedback: Option<BoundedFeedback>,
+    /// The canonical item this issue is recorded as a duplicate of, when the
+    /// board carries that dependency. A retried merge uses it to recognize the
+    /// duplicate step that already ran.
+    duplicates: Option<String>,
 }
 
 fn load_snapshot(bd: &Path, project: &Path, id: &str) -> io::Result<Option<IssueSnapshot>> {
@@ -1428,7 +1644,20 @@ fn load_snapshot(bd: &Path, project: &Path, id: &str) -> io::Result<Option<Issue
         status: issue_status(issue),
         labels: issue_labels(issue),
         feedback,
+        duplicates: duplicate_dependency(issue),
     }))
+}
+
+fn duplicate_dependency(issue: &Value) -> Option<String> {
+    issue
+        .get("dependencies")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|dependency| {
+            dependency.get("dependency_type").and_then(Value::as_str) == Some("duplicates")
+        })
+        .and_then(|dependency| dependency.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn issue_status(issue: &Value) -> String {
@@ -2649,7 +2878,17 @@ mod tests {
             &PromotionEvidence::Votes { threshold },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not an incubator item"));
+        // A repeat of a completed promotion is refused with the retained
+        // outcome instead of writing a second record.
+        assert!(error.to_string().contains("already promoted"));
+        assert!(error.to_string().contains("route=backlog-task"));
+        assert_eq!(
+            inspect_ledger(&bd, &project, &first)
+                .unwrap()
+                .promotions
+                .len(),
+            1
+        );
     }
 
     #[test]

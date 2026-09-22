@@ -91,6 +91,15 @@ impl Fixture {
     }
 
     fn spawn(&self, extra: &[&str]) -> std::process::Output {
+        let mut command = self.spawn_command();
+        command.args(["--exec", "assignment text"]);
+        command.args(extra);
+        command.output().unwrap()
+    }
+
+    /// The spawn options an assignment check supplies itself, without the
+    /// default free-text assignment every existing check relies on.
+    fn spawn_command(&self) -> Command {
         let mut command = Command::new(manager());
         command.args([
             "executor",
@@ -101,14 +110,18 @@ impl Fixture {
             self.home.to_str().unwrap(),
             "--profile",
             "ds",
-            "--exec",
-            "assignment text",
         ]);
+        command
+    }
+
+    fn resume(&self, extra: &[&str]) -> std::process::Output {
+        let mut command = self.resume_command();
+        command.args(["--exec", "continue the interrupted assignment"]);
         command.args(extra);
         command.output().unwrap()
     }
 
-    fn resume(&self, extra: &[&str]) -> std::process::Output {
+    fn resume_command(&self) -> Command {
         let mut command = Command::new(manager());
         command.args([
             "executor",
@@ -123,11 +136,8 @@ impl Fixture {
             "exec-ds-52",
             "--session",
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
-            "--exec",
-            "continue the interrupted assignment",
         ]);
-        command.args(extra);
-        command.output().unwrap()
+        command
     }
 
     fn release(&self, extra: &[&str]) -> std::process::Output {
@@ -443,6 +453,186 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     assert!(!next.status.success());
     assert_eq!(fixture.record(1)["owner"], "exec-other");
     assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"]);
+    fixture.drop();
+}
+
+fn assignment_document(objective: &str, inputs: &[&str], outputs: &[&str]) -> Vec<u8> {
+    serde_json::to_vec_pretty(&json!({
+        "schema": 1,
+        "objective": objective,
+        "inputs": inputs,
+        "outputs": outputs,
+        "invariants": ["keep the change inside the checkout"],
+        "acceptance": ["the synthetic check passes"],
+    }))
+    .unwrap()
+}
+
+/// A structured assignment is validated against the allocated slot before the
+/// launcher starts; the rejected dispatch returns its unused claim to the pool
+/// instead of leaving an occupied position behind.
+#[test]
+fn structured_assignment_rejection_releases_the_unused_slot_claim() {
+    let fixture = Fixture::new("assignment-reject", 1);
+    let assignment = fixture.root.join("assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document(
+            "Use an input that the slot does not have",
+            &["missing/input.txt"],
+            &["out/result.txt"],
+        ),
+    )
+    .unwrap();
+    let out = fixture
+        .spawn_command()
+        .args(["--assignment", assignment.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    // The declared input, not the launcher, is the reported cause.
+    assert!(text.contains("missing/input.txt"), "{text}");
+    assert!(text.contains("is missing from the checkout"), "{text}");
+    assert!(!text.contains("launcher"), "{text}");
+    assert!(text.contains("was returned to the pool"), "{text}");
+    let record = fixture.record(1);
+    assert_eq!(record["state"], "released");
+    assert_eq!(record["disposition"], "discarded", "{record}");
+    assert!(record["owner"].is_null(), "{record}");
+
+    // The released position is reclaimed by the next dispatch: a valid
+    // assignment (an existing input and a new output) reaches the launcher.
+    let valid = fixture.root.join("valid.json");
+    fs::write(
+        &valid,
+        assignment_document(
+            "Extend the synthetic checkout",
+            &["README.md"],
+            &["out/result.txt"],
+        ),
+    )
+    .unwrap();
+    let out = fixture
+        .spawn_command()
+        .args(["--assignment", valid.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains("executor slot: index=1 path="), "{text}");
+    fixture.drop();
+}
+
+/// A rejected structured resume keeps its claim and the interrupted session's
+/// partial work: the brief is never rendered against a reset slot, and the
+/// same owner resumes the same slot once the assignment is corrected.
+#[test]
+fn resume_with_a_rejected_assignment_keeps_the_slot_and_partial_work() {
+    let fixture = Fixture::new("resume-assignment", 1);
+    let spawned = fixture.spawn(&["--owner", "exec-ds-52"]);
+    assert!(
+        output_text(&spawned).contains("installed Codex launcher is missing"),
+        "{}",
+        output_text(&spawned)
+    );
+    let slot = fixture.slot(1);
+    let partial = slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+
+    let rejected = fixture.root.join("rejected.json");
+    fs::write(
+        &rejected,
+        assignment_document("Continue with a missing input", &["gone.txt"], &[]),
+    )
+    .unwrap();
+    let out = fixture
+        .resume_command()
+        .args(["--assignment", rejected.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("gone.txt"), "{text}");
+    assert!(text.contains("is missing from the checkout"), "{text}");
+    assert!(text.contains("stays bound to exec-ds-52"), "{text}");
+    assert!(text.contains("its partial work"), "{text}");
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    let record = fixture.record(1);
+    assert_eq!(record["state"], "occupied");
+    assert_eq!(record["owner"], "exec-ds-52");
+
+    // The corrected assignment resumes the recorded slot with the brief that
+    // names that slot; the dispatch stops at the missing launcher, not at
+    // validation, and the partial work is still in place.
+    let corrected = fixture.root.join("corrected.json");
+    fs::write(
+        &corrected,
+        assignment_document(
+            "Finish the interrupted outcome",
+            &["partial-work.txt"],
+            &["out/final.txt"],
+        ),
+    )
+    .unwrap();
+    let out = fixture
+        .resume_command()
+        .args(["--assignment", corrected.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    fixture.drop();
+}
+
+/// Free-text dispatch is unchanged, and exactly one assignment source is
+/// accepted by both dispatch paths.
+#[test]
+fn spawn_and_resume_take_exactly_one_assignment_source() {
+    let fixture = Fixture::new("prompt-source", 1);
+    let assignment = fixture.root.join("assignment.json");
+    fs::write(
+        &assignment,
+        assignment_document("Do the work", &[], &["out.txt"]),
+    )
+    .unwrap();
+    let both = fixture.spawn(&["--assignment", assignment.to_str().unwrap()]);
+    let text = output_text(&both);
+    assert!(!both.status.success(), "{text}");
+    assert!(text.contains("mutually exclusive"), "{text}");
+
+    let neither = fixture.spawn_command().output().unwrap();
+    let text = output_text(&neither);
+    assert!(!neither.status.success(), "{text}");
+    assert!(
+        text.contains("--exec PROMPT or --assignment FILE is required"),
+        "{text}"
+    );
+
+    let neither = fixture.resume_command().output().unwrap();
+    let text = output_text(&neither);
+    assert!(!neither.status.success(), "{text}");
+    assert!(
+        text.contains("--exec PROMPT or --assignment FILE is required"),
+        "{text}"
+    );
+    let both = fixture
+        .resume_command()
+        .args(["--exec", "free text", "--assignment"])
+        .arg(&assignment)
+        .output()
+        .unwrap();
+    let text = output_text(&both);
+    assert!(!both.status.success(), "{text}");
+    assert!(text.contains("mutually exclusive"), "{text}");
     fixture.drop();
 }
 

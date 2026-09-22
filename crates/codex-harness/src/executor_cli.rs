@@ -31,7 +31,9 @@ use harness_core::process::{CommandSpec, suppress_loader_dialogs};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] --exec PROMPT\ncodex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session SESSION_ID [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; it adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
+use crate::executor_assignment::{self, Assignment, AssignmentContext};
+
+const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\ncodex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session SESSION_ID [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\ncodex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; it adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
 const STARTUP: Duration = Duration::from_secs(20);
 /// Windows Terminal activates the receiving window asynchronously around the
 /// launcher exit; this bounds how long dispatch keeps undoing that activation.
@@ -84,6 +86,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         }
         Some("release") => release(&args[1..]),
         Some("pool") => pool_status(&args[1..]),
+        Some("assignment") => assignment_check(&args[1..]),
         Some("steer") => steer(&args[1..]),
         Some("run") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
@@ -119,6 +122,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
     let mut terminal_window = None;
     let mut mode = None;
     let mut prompt = None;
+    let mut assignment_file = None;
     let mut base = None;
     let mut owner = None;
     let mut iter = args.iter();
@@ -175,12 +179,13 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
                         .to_owned(),
                 )
             }
+            "--assignment" => assignment_file = Some(PathBuf::from(value)),
             _ => return Err(invalid("invalid native executor options")),
         }
     }
     let source = required(source, "--source")?;
     let codex_home = required(codex_home, "--codex-home")?;
-    let prompt = prompt.ok_or_else(|| invalid("--exec is required"))?;
+    let prompt = parse_prompt(prompt, assignment_file)?;
     if !source.is_absolute()
         || !codex_home.is_absolute()
         || workspace.as_ref().is_some_and(|path| !path.is_absolute())
@@ -203,7 +208,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         owner: &owner,
         base: base.as_deref(),
         profile: &profile,
-        prompt: &prompt,
+        prompt,
         mode,
         terminal_profile: terminal_profile.as_deref(),
         terminal_window: terminal_window.as_deref(),
@@ -224,6 +229,7 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
     let mut owner = None;
     let mut session = None;
     let mut prompt = None;
+    let mut assignment_file = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
@@ -285,6 +291,7 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
                         .to_owned(),
                 );
             }
+            "--assignment" => assignment_file = Some(PathBuf::from(value)),
             _ => return Err(invalid("invalid native executor options")),
         }
     }
@@ -295,7 +302,7 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
         .filter(|owner| !owner.trim().is_empty())
         .ok_or_else(|| invalid("executor resume --owner is required"))?;
     let session_text = session.ok_or_else(|| invalid("executor resume --session is required"))?;
-    let prompt = prompt.ok_or_else(|| invalid("--exec is required"))?;
+    let prompt = parse_prompt(prompt, assignment_file)?;
     if !source.is_absolute() || !codex_home.is_absolute() {
         return Err(invalid("executor resume paths must be absolute"));
     }
@@ -310,7 +317,7 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
         owner: &owner,
         base: None,
         profile: &profile,
-        prompt: &prompt,
+        prompt,
         mode: SpawnMode::Exec,
         terminal_profile: terminal_profile.as_deref(),
         terminal_window: terminal_window.as_deref(),
@@ -329,6 +336,17 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
         base: record.base.clone().unwrap_or_default(),
         remote,
         branch,
+    };
+    // The slot is adopted without a reset, so a rejected structured
+    // assignment keeps its claim and its partial work for the next resume.
+    let prompt = match resolve_prompt(&request, &binding) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            return Err(invalid(&format!(
+                "{error}; the resumed session did not start, so slot {} stays bound to {owner} with its partial work and can be resumed again after the assignment file is corrected",
+                binding.index
+            )));
+        }
     };
     let args = resume_child_args(&profile, &binding.path, &session, &prompt)?;
     launch_bound(&request, &binding, args, &bound)
@@ -405,10 +423,37 @@ struct Dispatch<'a> {
     owner: &'a str,
     base: Option<&'a str>,
     profile: &'a str,
-    prompt: &'a str,
+    prompt: PromptSource,
     mode: SpawnMode,
     terminal_profile: Option<&'a str>,
     terminal_window: Option<&'a str>,
+}
+
+/// Either the unchanged free-text assignment or a validated structured one.
+/// The structured variant is rendered into the brief against the bound slot
+/// after allocation, so the model never sees a checkout it is not running in.
+enum PromptSource {
+    FreeText(String),
+    Structured(executor_assignment::Assignment),
+}
+
+/// Splits `--exec PROMPT` from `--assignment FILE`: exactly one carries the
+/// assignment, and a structured file is loaded and schema-checked before any
+/// pool slot is touched.
+fn parse_prompt(
+    prompt: Option<String>,
+    assignment_file: Option<PathBuf>,
+) -> io::Result<PromptSource> {
+    match (prompt, assignment_file) {
+        (Some(_), Some(_)) => Err(invalid(
+            "--exec and --assignment are mutually exclusive: pass free text or one structured assignment file",
+        )),
+        (None, None) => Err(invalid("--exec PROMPT or --assignment FILE is required")),
+        (Some(prompt), None) => Ok(PromptSource::FreeText(prompt)),
+        (None, Some(path)) => Ok(PromptSource::Structured(
+            executor_assignment::Assignment::load(&path)?,
+        )),
+    }
 }
 
 /// Recorded session binding of one pool slot: the mapping the lead reloads
@@ -437,8 +482,68 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         remote: slot.remote.clone(),
         branch: slot.branch.clone(),
     };
-    let args = child_args(request.profile, &binding.path, request.prompt, request.mode)?;
+    // A structured assignment is validated against the checkout that was
+    // actually allocated, before any launcher process starts.
+    let prompt = match resolve_prompt(request, &binding) {
+        Ok(prompt) => prompt,
+        Err(error) => return Err(release_unused_claim(request, &binding, error)),
+    };
+    let args = child_args(request.profile, &binding.path, &prompt, request.mode)?;
     launch_bound(request, &binding, args, &bound)
+}
+
+/// The dispatch text for the bound slot: free text passes through unchanged,
+/// while a structured assignment is validated and rendered with the actual
+/// checkout, the committed base and the exact relative paths.
+fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<String> {
+    match &request.prompt {
+        PromptSource::FreeText(text) => Ok(text.clone()),
+        PromptSource::Structured(assignment) => executor_assignment::brief(
+            assignment,
+            &executor_assignment::AssignmentContext {
+                checkout: &binding.path,
+                base: &binding.base,
+                owner: &binding.owner,
+                source: request.source,
+            },
+        ),
+    }
+}
+
+/// A structured assignment rejected after allocation never reached a model
+/// conversation, so the unused claim is returned to the pool through the
+/// normal reset-for-reuse rules: the just-synchronized slot returns to its
+/// base, or is preserved with its recorded limitation, and unreviewed work is
+/// never destroyed. Resume deliberately does not release its claim, because
+/// that slot holds the interrupted session's partial work.
+fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Error) -> io::Error {
+    let released = task_worktree::pool(request.source, request.pool_size).and_then(|pool| {
+        let live = |owner: &str| owner_live(request.codex_home, request.source, owner);
+        task_worktree::release_slot(
+            request.codex_home,
+            &pool,
+            binding.index,
+            SlotDisposition::Discarded,
+            "structured assignment was rejected before the model started",
+            &binding.base,
+            &live,
+        )
+    });
+    let note = match released {
+        Ok(LaneDisposition::Reused { base }) => format!(
+            "; slot {} was returned to the pool at {base}",
+            binding.index
+        ),
+        Ok(LaneDisposition::Preserved { limitation }) => format!(
+            "; slot {} is preserved for lead review: {limitation}",
+            binding.index
+        ),
+        Err(release_error) => format!(
+            "; releasing slot {} also failed: {release_error}",
+            binding.index
+        ),
+    };
+    io::Error::new(error.kind(), format!("{error}{note}"))
 }
 
 /// Shared launch tail of fresh and resumed dispatches: report the mapping,
@@ -852,6 +957,77 @@ fn pool_status(args: &[OsString]) -> io::Result<i32> {
             path.display()
         );
     }
+    Ok(0)
+}
+
+/// `executor assignment` is the model-free validation and render path: it
+/// names one pool slot of the source checkout, checks the structured
+/// assignment against that slot's tree and prints the exact brief a session
+/// would receive. Nothing is claimed, reset, written or launched, so a lead
+/// can rehearse the installed route without a model request.
+fn assignment_check(args: &[OsString]) -> io::Result<i32> {
+    let mut source = None;
+    let mut slot = None;
+    let mut assignment_path = None;
+    let mut base = None;
+    let mut owner = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--slot" => slot = Some(option_text(value)?),
+            "--assignment" => assignment_path = Some(PathBuf::from(value)),
+            "--base" => base = Some(option_text(value)?),
+            "--owner" => owner = Some(option_text(value)?),
+            _ => return Err(invalid("invalid native executor options")),
+        }
+    }
+    let source = required(source, "--source")?;
+    let index: u32 = slot
+        .ok_or_else(|| invalid("executor assignment --slot is required"))?
+        .parse()
+        .map_err(|_| invalid("executor assignment --slot must be a pool slot index"))?;
+    let assignment_path = required(assignment_path, "--assignment")?;
+    let assignment = Assignment::load(&assignment_path)?;
+    let size = load(&source)?.max_concurrent_executors;
+    let pool = task_worktree::pool(&source, size)?;
+    let slot = pool.slot(index)?;
+    if !slot.path.is_dir() {
+        return Err(invalid(&format!(
+            "slot {index} directory {} is missing; run `git worktree prune` in {} and retry",
+            slot.path.display(),
+            source.display()
+        )));
+    }
+    let base = match base {
+        Some(base) => base,
+        None => committed_head(&slot.path)?,
+    };
+    let owner = owner
+        .filter(|owner| !owner.trim().is_empty())
+        .unwrap_or_else(|| "exec-assignment-check".to_owned());
+    let brief = executor_assignment::brief(
+        &assignment,
+        &AssignmentContext {
+            checkout: &slot.path,
+            base: &base,
+            owner: &owner,
+            source: &source,
+        },
+    )?;
+    println!(
+        "executor assignment valid: slot={index} checkout={} base={base} inputs={} outputs={} (nothing claimed, written or launched)",
+        slot.path.display(),
+        assignment.inputs.len(),
+        assignment.outputs.len()
+    );
+    println!("{brief}");
     Ok(0)
 }
 

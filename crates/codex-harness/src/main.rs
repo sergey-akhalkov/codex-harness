@@ -9,7 +9,10 @@ mod dependency_cli;
 #[cfg(windows)]
 mod dependency_selection_cli;
 #[cfg(windows)]
+mod executor_assignment;
+#[cfg(windows)]
 mod executor_cli;
+mod feedback_cli;
 #[cfg(windows)]
 mod install_cli;
 #[cfg(windows)]
@@ -303,7 +306,10 @@ fn run() -> io::Result<i32> {
         println!("codex-harness xai-responses-shim [--port N] [--upstream https://api.x.ai]");
         println!("codex-harness xai-token --codex-home DIRECTORY");
         println!(
-            "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--base REV] [--owner ID] --exec PROMPT\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor succeed --request PATH"
+            "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--base REV] [--owner ID] (--exec PROMPT | --assignment FILE)\ncodex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --thread ID --worktree DIRECTORY --text TEXT [--out FILE]\ncodex-harness executor succeed --request PATH"
+        );
+        println!(
+            "codex-harness feedback record|list|ledger|triage|candidates|promote --project DIRECTORY [--bd FILE] [--source CHECKOUT] ... (bd-backed feedback loop; no model calls)"
         );
         println!("codex-harness skills isolate --request PATH");
         println!("codex-harness skills usage [--user-home DIRECTORY] [--codex-home DIRECTORY]");
@@ -446,6 +452,10 @@ fn run() -> io::Result<i32> {
     if args[0] == "executor" {
         verify_runtime()?;
         return executor_cli::run(&args[1..]);
+    }
+    if args[0] == "feedback" {
+        verify_runtime()?;
+        return feedback_cli::run(&args[1..]);
     }
     if args[0] == "outcome-report" {
         return outcome_report_cli::run(&args[1..]);
