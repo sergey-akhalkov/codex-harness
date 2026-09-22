@@ -24,5 +24,5 @@
 
 - [x] 6.1 Update owning docs and workflow guidance for all five paths, preserving protected external workflows; verify links, instruction limits and CLI examples.
 - [x] 6.2 Integrate executor commits and run affected native regression suites, formatting, clippy, ownership and source checks; retain failure evidence and resolve introduced defects.
-- [ ] 6.3 Deploy the immutable build and exercise all five installed paths from outside the checkout with synthetic inputs; verify global links and receipt identities.
-- [ ] 6.4 Reconcile specifications and close accepted board tasks; report measured output/step changes without claiming unmeasured token or quota savings.
+- [x] 6.3 Deploy the immutable build and exercise all five installed paths from outside the checkout with synthetic inputs; verify global links and receipt identities.
+- [x] 6.4 Reconcile specifications and close accepted board tasks; report measured output/step changes without claiming unmeasured token or quota savings.
