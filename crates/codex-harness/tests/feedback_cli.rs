@@ -255,6 +255,19 @@ impl Board {
         )
     }
 
+    /// Comment texts in board order: a completed retry must add nothing.
+    fn comment_texts(&self, id: &str) -> Vec<String> {
+        let comments = bd_json(&self.bd, &self.project, &["comments", id, "--json"]);
+        comments
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["text"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn drop(self) {
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -557,16 +570,61 @@ fn promotion_is_explicit_recorded_and_never_repeated() {
         "{labels:?}"
     );
 
-    // A completed promotion is refused with the retained outcome and is not
-    // written a second time.
+    // The second same-route invocation succeeds and confirms the recorded
+    // outcome: no second promotion record and no comment changes.
+    let comments_before = board.comment_texts(&item);
     let out = board.feedback(&["promote", "--item", &item]);
     let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("already promoted"), "{text}");
-    assert!(text.contains("route=backlog-task"), "{text}");
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "promotion already recorded: {item} route=backlog-task basis=votes counted=2 threshold=2 target=none"
+        )),
+        "{text}"
+    );
+    assert_eq!(board.comment_texts(&item), comments_before);
     let ledger = board.feedback(&["ledger", "--item", &item]);
     let text = output_text(&ledger);
     assert!(text.contains("promotions=1"), "{text}");
+    board.drop();
+}
+
+/// Two identical successful promotions: the completed retry confirms the
+/// recorded outcome with exactly one promotion record and no comment writes.
+#[test]
+fn completed_promotion_retry_confirms_without_writes() {
+    let board = Board::new("retry");
+    let item = board.record("dispatch waits after tools", "exec-a", "e1", "executor");
+    let second = board.record("same wait, second reporter", "exec-b", "e2", "executor");
+    let admitted = board.decisions(
+        "admit.json",
+        &[(&item, "process", None), (&second, "process", Some(&item))],
+    );
+    let out = board.feedback(&["triage", "--decisions", admitted.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", output_text(&out));
+
+    let first_run = board.feedback(&["promote", "--item", &item]);
+    let text = output_text(&first_run);
+    assert!(first_run.status.success(), "{text}");
+    assert!(text.contains("promoted "), "{text}");
+    let comments_after_promotion = board.comment_texts(&item);
+
+    let retry = board.feedback(&["promote", "--item", &item]);
+    let text = output_text(&retry);
+    assert!(retry.status.success(), "{text}");
+    assert!(text.contains("promotion already recorded: "), "{text}");
+    assert_eq!(board.comment_texts(&item), comments_after_promotion);
+
+    let ledger = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&ledger);
+    assert!(text.contains("promotions=1"), "{text}");
+    assert!(text.contains("counted=2"), "{text}");
+    let labels = board.labels(&item);
+    assert!(labels.iter().any(|label| label == "backlog"), "{labels:?}");
+    assert!(
+        !labels.iter().any(|label| label == "incubator"),
+        "{labels:?}"
+    );
     board.drop();
 }
 
@@ -757,8 +815,9 @@ fn openspec_change_promotion_validates_the_change_and_preserves_its_draft() {
         "{labels:?}"
     );
 
-    // A retry preserves the draft, keeps one promotion record and reports the
-    // retained outcome.
+    // A retry confirms the recorded outcome, preserves the draft, keeps one
+    // promotion record and adds no comment.
+    let comments_before = board.comment_texts(&item);
     let out = board.feedback(&[
         "promote",
         "--item",
@@ -769,10 +828,41 @@ fn openspec_change_promotion_validates_the_change_and_preserves_its_draft() {
         "lead-intent",
     ]);
     let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "promotion already recorded: {item} route=openspec-change basis=override counted=1 threshold=none target=openspec:lead-intent"
+        )),
+        "{text}"
+    );
+    assert_eq!(board.comment_texts(&item), comments_before);
+    assert_eq!(fs::read(&draft).unwrap(), draft_before);
+    let ledger = board.feedback(&["ledger", "--item", &item]);
+    assert!(
+        output_text(&ledger).contains("promotions=1"),
+        "{}",
+        output_text(&ledger)
+    );
+
+    // A different intended change is a different consequence: the completed
+    // retry stays refused and names the recorded target.
+    let other = board.project.join("openspec/changes/other-intent");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("proposal.md"), "# Other intent\n").unwrap();
+    let out = board.feedback(&[
+        "promote",
+        "--item",
+        &item,
+        "--route",
+        "openspec-change",
+        "--openspec-change",
+        "other-intent",
+    ]);
+    let text = output_text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("already promoted"), "{text}");
     assert!(text.contains("openspec:lead-intent"), "{text}");
-    assert_eq!(fs::read(&draft).unwrap(), draft_before);
+    assert!(text.contains("other-intent"), "{text}");
     let ledger = board.feedback(&["ledger", "--item", &item]);
     assert!(
         output_text(&ledger).contains("promotions=1"),

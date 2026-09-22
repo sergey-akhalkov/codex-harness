@@ -357,6 +357,10 @@ pub struct PromotionOutcome {
     pub target: Option<String>,
     pub counted: usize,
     pub override_used: bool,
+    /// True when the board already recorded this exact promotion and the
+    /// outcome is confirmed from that history: no promotion record was
+    /// written, and only labels a partial run missed may have been reconciled.
+    pub already_recorded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1123,9 +1127,25 @@ pub fn promote_item(
         .ok_or_else(|| invalid(format!("item {item_id} is missing")))?;
     let ledger = inspect_ledger(bd, project, item_id)?;
     if let Some(record) = ledger.promotions.first() {
-        // A recorded promotion is never repeated: reconcile any label step a
-        // partial run left behind and return the retained outcome.
-        return reconcile_promotion(bd, project, item_id, &snapshot.labels, record, Some(route));
+        // A recorded promotion is never repeated: confirm the recorded outcome,
+        // reconcile any label step a partial run left behind, and refuse a
+        // different consequence the caller now asks for.
+        let requested_target = match route {
+            PromotionRoute::OpenSpecChange => Some(format!(
+                "openspec:{}",
+                openspec_change_name(item_id, openspec_change)?
+            )),
+            _ => None,
+        };
+        return reconcile_promotion(
+            bd,
+            project,
+            item_id,
+            &snapshot.labels,
+            record,
+            Some(route),
+            requested_target.as_deref(),
+        );
     }
     require_open_incubator_snapshot(&snapshot, item_id)?;
     let kinds = incubator_kinds(&ledger);
@@ -1171,6 +1191,7 @@ pub fn promote_item(
         target,
         counted,
         override_used: override_note.is_some(),
+        already_recorded: false,
     })
 }
 
@@ -1190,7 +1211,8 @@ pub fn promote_kit_concern(
     let ledger = inspect_ledger(bd, project, item_id)?;
     if let Some(record) = ledger.promotions.first() {
         // The kit task was already created and recorded; repeating the run
-        // reconciles labels without creating a second kit item.
+        // confirms the recorded outcome and reconciles labels without creating
+        // a second kit item.
         return reconcile_promotion(
             bd,
             project,
@@ -1198,6 +1220,7 @@ pub fn promote_kit_concern(
             &snapshot.labels,
             record,
             Some(PromotionRoute::KitBacklog),
+            None,
         );
     }
     require_open_incubator_snapshot(&snapshot, item_id)?;
@@ -1241,6 +1264,7 @@ pub fn promote_kit_concern(
         target: Some(target),
         counted,
         override_used: override_note.is_some(),
+        already_recorded: false,
     })
 }
 
@@ -1461,7 +1485,9 @@ fn require_open_incubator_snapshot(snapshot: &IssueSnapshot, item_id: &str) -> i
 /// Completes a promotion whose record is already on the board. The recorded
 /// history is authoritative: the outcome is returned as recorded and only the
 /// label operations a partial run may have missed are reconciled, so a retry
-/// never writes a second promotion record or a second kit task.
+/// never writes a second promotion record or a second kit task. A completed
+/// retry confirms that recorded outcome successfully; a different route or a
+/// different OpenSpec target is a different consequence and stays refused.
 fn reconcile_promotion(
     bd: &Path,
     project: &Path,
@@ -1469,6 +1495,7 @@ fn reconcile_promotion(
     labels: &[String],
     record: &PromotionRecord,
     requested: Option<PromotionRoute>,
+    requested_target: Option<&str>,
 ) -> io::Result<PromotionOutcome> {
     if let Some(requested) = requested.filter(|requested| *requested != record.route) {
         return Err(invalid(format!(
@@ -1477,15 +1504,16 @@ fn reconcile_promotion(
             requested.as_str()
         )));
     }
-    let incubating = labels.iter().any(|label| label == INCUBATOR_LABEL);
-    let routed = labels.iter().any(|label| label == record.route.label());
-    if !incubating && routed {
+    if let Some(requested_target) = requested_target
+        && record.target.as_deref() != Some(requested_target)
+    {
         return Err(invalid(format!(
-            "incubator item {item_id} is already promoted with route={} target={}; the recorded promotion is retained",
-            record.route.as_str(),
+            "incubator item {item_id} is already promoted into {}; the recorded consequence is retained: repeat that target instead of {requested_target}",
             record.target.as_deref().unwrap_or("none")
         )));
     }
+    let incubating = labels.iter().any(|label| label == INCUBATOR_LABEL);
+    let routed = labels.iter().any(|label| label == record.route.label());
     if incubating {
         json_ok(
             bd,
@@ -1506,6 +1534,7 @@ fn reconcile_promotion(
         target: record.target.clone(),
         counted: record.counted,
         override_used: record.override_used,
+        already_recorded: true,
     })
 }
 
@@ -2993,7 +3022,10 @@ mod tests {
             comment.contains("route=backlog-task basis=votes counted=3 threshold=3 target=none")
         }));
 
-        let error = promote_item(
+        // A repeat of a completed promotion confirms the recorded outcome
+        // instead of writing a second record or a comment.
+        let comments_before = list_comments(&bd, &project, &first).unwrap();
+        let repeat = promote_item(
             &bd,
             &project,
             &first,
@@ -3001,11 +3033,12 @@ mod tests {
             &PromotionEvidence::Votes { threshold },
             None,
         )
-        .unwrap_err();
-        // A repeat of a completed promotion is refused with the retained
-        // outcome instead of writing a second record.
-        assert!(error.to_string().contains("already promoted"));
-        assert!(error.to_string().contains("route=backlog-task"));
+        .unwrap();
+        assert!(repeat.already_recorded);
+        assert_eq!(repeat.route, PromotionRoute::BacklogTask);
+        assert_eq!(repeat.target, None);
+        assert_eq!(repeat.counted, 3);
+        assert!(!repeat.override_used);
         assert_eq!(
             inspect_ledger(&bd, &project, &first)
                 .unwrap()
@@ -3013,6 +3046,13 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            list_comments(&bd, &project, &first).unwrap(),
+            comments_before
+        );
+        let snapshot = load_snapshot(&bd, &project, &first).unwrap().unwrap();
+        assert!(snapshot.labels.iter().any(|label| label == BACKLOG_LABEL));
+        assert!(!snapshot.labels.iter().any(|label| label == INCUBATOR_LABEL));
     }
 
     #[test]
@@ -3121,9 +3161,11 @@ mod tests {
                 && comment.contains("reason=material correctness evidence")
         }));
 
-        // A completed promotion is never repeated, and the draft it recorded
-        // stays exactly as the OpenSpec workflow wrote it.
-        let error = promote_item(
+        // A completed promotion confirms its recorded outcome instead of
+        // writing another record, and the draft stays exactly as the OpenSpec
+        // workflow wrote it.
+        let comments_before = list_comments(&bd, &project, &item).unwrap();
+        let repeat = promote_item(
             &bd,
             &project,
             &item,
@@ -3131,10 +3173,12 @@ mod tests {
             &evidence,
             None,
         )
-        .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("already promoted"), "{message}");
-        assert!(message.contains(&derived), "{message}");
+        .unwrap();
+        assert!(repeat.already_recorded);
+        assert_eq!(
+            repeat.target.as_deref(),
+            Some(format!("openspec:{derived}").as_str())
+        );
         assert_eq!(
             inspect_ledger(&bd, &project, &item)
                 .unwrap()
@@ -3142,7 +3186,41 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            list_comments(&bd, &project, &item).unwrap(),
+            comments_before
+        );
         assert_eq!(fs::read(&draft).unwrap(), draft_before);
+
+        // A different intended change is a different consequence: it stays
+        // refused even when that change exists, and the refusal names the
+        // recorded target.
+        let other = project.join("openspec/changes/other-intent");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("proposal.md"), "# Other intent\n").unwrap();
+        let error = promote_item(
+            &bd,
+            &project,
+            &item,
+            PromotionRoute::OpenSpecChange,
+            &evidence,
+            Some("other-intent"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("already promoted"), "{message}");
+        assert!(
+            message.contains(&format!("openspec:{derived}")),
+            "{message}"
+        );
+        assert!(message.contains("other-intent"), "{message}");
+        assert_eq!(
+            inspect_ledger(&bd, &project, &item)
+                .unwrap()
+                .promotions
+                .len(),
+            1
+        );
     }
 
     #[test]

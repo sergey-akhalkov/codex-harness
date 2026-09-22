@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion: a completed promotion retry confirms the recorded outcome, while a different route or OpenSpec target is refused.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
@@ -524,6 +524,27 @@ fn promote(args: &[OsString]) -> io::Result<i32> {
         ));
     }
     let outcome = run_promotion(&board, item, route, &options, &evidence, openspec_change)?;
+    if outcome.already_recorded {
+        println!(
+            "promotion already recorded: {} route={} basis={} counted={} threshold={} target={} limits={} (no promotion record was written; any missing labels are reconciled)",
+            outcome.item_id,
+            outcome.route.as_str(),
+            if outcome.override_used {
+                "override"
+            } else {
+                "votes"
+            },
+            outcome.counted,
+            if outcome.override_used {
+                "none".to_owned()
+            } else {
+                board.vote_threshold.to_string()
+            },
+            outcome.target.as_deref().unwrap_or("none"),
+            board.limits
+        );
+        return Ok(0);
+    }
     println!(
         "promoted {} route={} basis={} counted={} threshold={} target={} limits={}",
         outcome.item_id,
