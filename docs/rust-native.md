@@ -812,6 +812,11 @@ registered upstream still launches without a compatibility warning. The actual
 global launcher still uses its existing script. Native profile/config
 precedence follows the
 [official configuration contract](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence).
+The launcher also keeps executor sessions single-agent: while the harness
+executor marker is present in the environment, it adds
+`-c agents.enabled=false` before forwarding, so every Codex process started
+from an executor - including a raw nested `codex` invocation - runs without
+the agent tool set.
 
 ## Compatibility during concurrent changes
 

@@ -5,7 +5,7 @@
 #![cfg(windows)]
 
 use harness_core::orchestration_config::{
-    self, ProfileBinding, executor_profile, load, profile_args,
+    self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, executor_session_args, load,
 };
 use harness_core::process::{Job, Limits, StopReason};
 use harness_core::process_service::ServiceProcess;
@@ -74,15 +74,40 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         return Ok(0);
     }
     match args.first().and_then(|arg| arg.to_str()) {
-        Some("spawn") => spawn(&args[1..]),
-        Some("resume") => resume(&args[1..]),
+        Some("spawn") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            spawn(&args[1..])
+        }
+        Some("resume") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            resume(&args[1..])
+        }
         Some("release") => release(&args[1..]),
         Some("pool") => pool_status(&args[1..]),
         Some("steer") => steer(&args[1..]),
-        Some("run") => run_exec(&args[1..]),
-        Some("succeed") => succeed(&args[1..]),
+        Some("run") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            run_exec(&args[1..])
+        }
+        Some("succeed") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            succeed(&args[1..])
+        }
         _ => Err(invalid("invalid native executor options")),
     }
+}
+
+/// Executor sessions are single-agent workers: the kit's dispatch commands
+/// refuse to originate anywhere inside an executor's process tree, so nested
+/// executor conversations cannot be created through the harness. The installed
+/// launcher independently keeps the native agent tools off for that tree.
+fn refuse_executor_dispatch(marker: Option<OsString>) -> io::Result<()> {
+    if marker.is_some() {
+        return Err(invalid(
+            "executor sessions cannot dispatch executors: this process runs inside an executor (HARNESS_EXECUTOR_SESSION is set); finish the assignment and return the need to the lead instead of creating another executor",
+        ));
+    }
+    Ok(())
 }
 
 fn spawn(args: &[OsString]) -> io::Result<i32> {
@@ -991,6 +1016,10 @@ fn run_child(launcher: &str, rest: &[OsString]) -> io::Result<i32> {
     }
     let mut command = Command::new(launcher);
     command.args(rest);
+    // The hosted Codex process and everything it starts are an executor tree:
+    // the installed launcher reads this marker to keep the agent tools off, and
+    // the kit's dispatch commands refuse to originate under it.
+    command.env(EXECUTOR_SESSION_ENV, "1");
     // Optional diagnostics: capture the child's stderr without touching its
     // terminal stdout, so launch failures under a tab host stay observable.
     if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_RUN_LOG") {
@@ -1155,6 +1184,8 @@ fn native_path(path: &Path) -> io::Result<String> {
 fn apply_executor_env(spec: &mut CommandSpec, codex_home: &Path) {
     spec.env
         .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
+    spec.env
+        .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
     if let Some(path) = filtered_path() {
         spec.env.insert("PATH".into(), Some(path));
     }
@@ -1375,7 +1406,7 @@ fn spawn_summary(
 }
 
 fn tui_args(profile: &str, workspace: &Path, prompt: &str) -> io::Result<Vec<String>> {
-    let mut args = profile_args(profile)?;
+    let mut args = executor_session_args(profile)?;
     args.extend(["-C".into(), native_path(workspace)?, prompt.to_owned()]);
     if args.iter().any(|arg| arg == "exec" || arg == "--json") {
         return Err(invalid(
@@ -1393,7 +1424,7 @@ fn child_args(
 ) -> io::Result<Vec<String>> {
     match mode {
         SpawnMode::Exec => {
-            let mut args = profile_args(profile)?;
+            let mut args = executor_session_args(profile)?;
             args.extend([
                 "exec".into(),
                 "--skip-git-repo-check".into(),
@@ -1419,7 +1450,7 @@ fn resume_child_args(
     session: &str,
     prompt: &str,
 ) -> io::Result<Vec<String>> {
-    let mut args = profile_args(profile)?;
+    let mut args = executor_session_args(profile)?;
     args.extend([
         "exec".into(),
         "--skip-git-repo-check".into(),
@@ -2255,6 +2286,8 @@ fn spawn_successor(
 fn apply_successor_env(spec: &mut CommandSpec, codex_home: &Path) {
     spec.env
         .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
+    spec.env
+        .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
     if let Some(path) = filtered_path() {
         spec.env.insert("PATH".into(), Some(path));
     }
@@ -2415,6 +2448,8 @@ mod tests {
         let args = tui_args("xai", Path::new(r"D:\wt\xai"), "do the work").unwrap();
         assert_eq!(args[0], "--profile");
         assert_eq!(args[1], "xai");
+        assert_eq!(args[2], "-c");
+        assert_eq!(args[3], "agents.enabled=false");
         assert!(args.contains(&"-C".to_string()));
         assert!(args.contains(&r"D:\wt\xai".to_string()));
         assert!(!args.iter().any(|arg| arg == "exec" || arg == "--json"));
@@ -2776,6 +2811,19 @@ mod tests {
             spec.env.get(std::ffi::OsStr::new("CODEX_HOME")),
             Some(&Some(PathBuf::from(r"C:\codex-home").into_os_string()))
         );
+        assert_eq!(
+            spec.env.get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
+            Some(&Some("1".into()))
+        );
+    }
+
+    #[test]
+    fn executor_dispatch_is_refused_inside_an_executor_session() {
+        refuse_executor_dispatch(None).unwrap();
+        let error = refuse_executor_dispatch(Some("1".into())).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cannot dispatch executors"), "{message}");
+        assert!(message.contains("return the need to the lead"), "{message}");
     }
 
     #[test]
@@ -2813,7 +2861,9 @@ mod tests {
         .unwrap();
         assert_eq!(args[0], "--profile");
         assert_eq!(args[1], "ds");
-        assert_eq!(args[2], "exec");
+        assert_eq!(args[2], "-c");
+        assert_eq!(args[3], "agents.enabled=false");
+        assert_eq!(args[4], "exec");
         assert!(args.contains(&"--skip-git-repo-check".to_string()));
         assert!(args.contains(&r"D:\wt\ds".to_string()));
         assert_eq!(
@@ -3077,6 +3127,8 @@ mod tests {
             vec![
                 "--profile".to_owned(),
                 "ds".to_owned(),
+                "-c".to_owned(),
+                "agents.enabled=false".to_owned(),
                 "exec".to_owned(),
                 "--skip-git-repo-check".to_owned(),
                 "-C".to_owned(),

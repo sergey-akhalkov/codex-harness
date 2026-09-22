@@ -170,6 +170,12 @@ titled tab of the same terminal. Do not resize, move or arrange desktop windows
 sufficient and simultaneous tiling is not required. Do not write to the shared
 checkout. Do not solve delegated work in parallel. A small or tightly coupled
 task stays with the lead.
+Executors are single-agent workers: the harness disables Codex's agent tool
+set for the whole executor process tree, and `executor spawn`, `resume`, `run`
+and `succeed` refuse to run inside an executor. Never brief or prompt an
+executor to spawn helpers or nested executors; a worker that needs another
+agent reports the need to you, and ephemeral `spawn_agent` helpers stay
+lead-only.
 Before dispatch, do the analysis a slice needs to become sufficiently
 specified for its executor profile: requirement interpretation, risk and
 consequence decisions, approach direction and acceptance conditions. Size each

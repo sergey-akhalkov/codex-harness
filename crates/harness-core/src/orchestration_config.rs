@@ -74,6 +74,25 @@ pub fn profile_args(profile: &str) -> io::Result<Vec<String>> {
     Ok(vec!["--profile".into(), profile.to_owned()])
 }
 
+/// Executor sessions run as single-agent workers. This environment marker
+/// lets the installed launcher recognize every Codex process started inside an
+/// executor and keep the agent capability off.
+pub const EXECUTOR_SESSION_ENV: &str = "HARNESS_EXECUTOR_SESSION";
+
+/// Codex CLI's built-in configuration switch that forces the session's
+/// multi-agent version to `Disabled`: it removes the agent tool set and its
+/// usage instructions even when the selected model catalog advertises
+/// multi-agent support.
+pub const EXECUTOR_AGENT_TOOLS_OFF: [&str; 2] = ["-c", "agents.enabled=false"];
+
+/// Executor session arguments: profile selection plus the single-agent limit,
+/// in the order Codex requires (global options before the subcommand).
+pub fn executor_session_args(profile: &str) -> io::Result<Vec<String>> {
+    let mut args = profile_args(profile)?;
+    args.extend(EXECUTOR_AGENT_TOOLS_OFF.map(str::to_owned));
+    Ok(args)
+}
+
 pub fn executor_profile(config: &Orchestration, requested: Option<&str>) -> io::Result<String> {
     match requested {
         None => config
@@ -413,6 +432,14 @@ mod tests {
         assert_eq!(profile, "ds");
         assert_eq!(profile_args(&profile).unwrap(), ["--profile", "ds"]);
         assert!(profile_args("default").unwrap().is_empty());
+        assert_eq!(
+            executor_session_args(&profile).unwrap(),
+            ["--profile", "ds", "-c", "agents.enabled=false"]
+        );
+        assert_eq!(
+            executor_session_args("default").unwrap(),
+            ["-c", "agents.enabled=false"]
+        );
         let error = executor_profile(&config, Some("gpt")).unwrap_err();
         assert!(error.to_string().contains("is not an executor"));
         assert!(!error.to_string().contains("substitut"));

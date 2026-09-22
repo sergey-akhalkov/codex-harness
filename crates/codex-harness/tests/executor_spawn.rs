@@ -805,6 +805,8 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
     assert_eq!(receipt["profile"], "xai");
     assert_eq!(receipt["args"][0], "--profile");
     assert_eq!(receipt["args"][1], "xai");
+    assert_eq!(receipt["args"][2], "-c");
+    assert_eq!(receipt["args"][3], "agents.enabled=false");
     assert_eq!(receipt["model"], "grok-4.6");
     assert_eq!(receipt["modelProvider"], "xai");
     assert_eq!(receipt["reasoningEffort"], "xhigh");
@@ -825,6 +827,56 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
         "orch-xai"
     );
     let _ = Duration::from_secs(1);
+}
+
+#[test]
+fn executor_dispatch_is_refused_inside_an_executor_session() {
+    for command in ["spawn", "resume", "run", "succeed"] {
+        let output = Command::new(manager())
+            .args(["executor", command])
+            .env("HARNESS_EXECUTOR_SESSION", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{command} must refuse");
+        let text = output_text(&output);
+        assert!(
+            text.contains("cannot dispatch executors"),
+            "{command}: {text}"
+        );
+        assert!(
+            text.contains("return the need to the lead"),
+            "{command}: {text}"
+        );
+    }
+}
+
+#[test]
+fn executor_host_marks_the_session_environment() {
+    let root = std::env::temp_dir().join(format!("executor-run-marker-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let receipt = root.join("receipt.json");
+    fs::write(
+        &receipt,
+        serde_json::to_vec(&json!({
+            "launcher": r"C:\Windows\System32\cmd.exe",
+            "args": ["/c", "set HARNESS_EXECUTOR_SESSION"],
+            "slot": Value::Null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(manager())
+        .args(["executor", "run", "--file", receipt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        output_text(&output).contains("HARNESS_EXECUTOR_SESSION=1"),
+        "{}",
+        output_text(&output)
+    );
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Slot path of the first recorded pool slot, read from the kit-local state

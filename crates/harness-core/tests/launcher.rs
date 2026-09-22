@@ -1,11 +1,27 @@
 //! Accepted script-launcher dispatch cases, ported as argument-vector oracles.
 use harness_core::launcher::{
-    additional_roots, per_model_effort, profile_arguments, task_arguments, xai_shim_requested,
+    additional_roots, executor_limited, per_model_effort, profile_arguments, task_arguments,
+    xai_shim_requested,
 };
 use std::ffi::OsString;
 
 fn argv(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn executor_launches_keep_the_agent_capability_off() {
+    let plain = argv(&["exec", "hello"]);
+    assert_eq!(executor_limited(plain.clone(), false), plain);
+    assert_eq!(
+        executor_limited(plain, true),
+        argv(&["-c", "agents.enabled=false", "exec", "hello"])
+    );
+    let already_limited = argv(&["-c", "agents.enabled=false", "exec", "hello"]);
+    assert_eq!(
+        executor_limited(already_limited.clone(), true),
+        already_limited
+    );
 }
 
 #[test]

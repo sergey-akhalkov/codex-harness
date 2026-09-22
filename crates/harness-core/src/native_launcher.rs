@@ -245,6 +245,13 @@ fn prepared_command(
     let task_args = launcher::task_arguments(args)?;
     let default_model = session_model(&selected, home);
     let task_args = launcher::per_model_effort(&task_args, default_model.as_deref());
+    // Executor sessions must stay single-agent: the marker is inherited by
+    // every Codex process an executor starts, including a raw nested `codex`
+    // invocation, so the agent capability stays off for the whole tree.
+    let task_args = launcher::executor_limited(
+        task_args,
+        env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some(),
+    );
     let roots = launcher::additional_roots(&task_args, &env::current_dir()?);
     let mut command = Command::new(target);
     let classified = launcher::profile_arguments(&task_args);

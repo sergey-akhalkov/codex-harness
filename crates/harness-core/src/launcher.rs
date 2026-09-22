@@ -379,6 +379,28 @@ pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
     result
 }
 
+/// Executor sessions are single-agent workers. Any launch that inherits the
+/// executor marker receives Codex CLI's built-in agent-capability switch, so a
+/// raw nested `codex` invocation stays a single-agent session as well. The
+/// switch is a global option and must precede the subcommand.
+pub fn executor_limited(args: Vec<OsString>, executor: bool) -> Vec<OsString> {
+    if !executor || has_executor_limit(&args) {
+        return args;
+    }
+    let [key, value] = crate::orchestration_config::EXECUTOR_AGENT_TOOLS_OFF;
+    let mut limited = Vec::with_capacity(args.len() + 2);
+    limited.push(OsString::from(key));
+    limited.push(OsString::from(value));
+    limited.extend(args);
+    limited
+}
+
+fn has_executor_limit(args: &[OsString]) -> bool {
+    let [key, value] = crate::orchestration_config::EXECUTOR_AGENT_TOOLS_OFF;
+    args.windows(2)
+        .any(|pair| pair[0].to_str() == Some(key) && pair[1].to_str() == Some(value))
+}
+
 pub fn additional_roots(args: &[OsString], cwd: &Path) -> Vec<PathBuf> {
     let mut directory = cwd.to_path_buf();
     let mut roots = Vec::new();

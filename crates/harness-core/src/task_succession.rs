@@ -480,7 +480,7 @@ pub fn successor_plan(
     request: &Request,
     binding: Option<&SessionBinding>,
 ) -> io::Result<SuccessorPlan> {
-    let profile_args = crate::orchestration_config::profile_args(&request.profile)?;
+    let profile_args = crate::orchestration_config::executor_session_args(&request.profile)?;
     let sandbox = binding
         .and_then(|binding| binding.sandbox.clone())
         .or_else(|| request.sandbox.clone());
@@ -980,12 +980,18 @@ mod tests {
         let plan = successor_plan(&request, Some(&binding)).unwrap();
         assert_eq!(plan.args[0], "--profile");
         assert_eq!(plan.args[1], "ds");
-        assert_eq!(plan.args[2], "exec");
+        assert_eq!(plan.args[2], "-c");
+        assert_eq!(plan.args[3], "agents.enabled=false");
+        assert_eq!(plan.args[4], "exec");
         assert!(plan.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(plan.args.contains(&"--json".to_string()));
         let sandbox = plan.args.iter().position(|arg| arg == "--sandbox").unwrap();
         assert_eq!(plan.args[sandbox + 1], "read-only");
-        let approval = plan.args.iter().position(|arg| arg == "-c").unwrap();
+        let approval = plan
+            .args
+            .windows(2)
+            .position(|pair| pair[0] == "-c" && pair[1].starts_with("approval_policy="))
+            .unwrap();
         assert_eq!(plan.args[approval + 1], "approval_policy=never");
         let resume = plan.args.iter().position(|arg| arg == "resume").unwrap();
         assert_eq!(plan.args[resume + 1], request.session);
@@ -1001,7 +1007,9 @@ mod tests {
         let mut default_profile = request.clone();
         default_profile.profile = "default".into();
         let plan = successor_plan(&default_profile, None).unwrap();
-        assert_eq!(plan.args[0], "exec");
+        assert_eq!(plan.args[0], "-c");
+        assert_eq!(plan.args[1], "agents.enabled=false");
+        assert_eq!(plan.args[2], "exec");
 
         let mut substituted = binding.clone();
         substituted.model = Some("other-model".into());

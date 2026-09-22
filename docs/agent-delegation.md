@@ -132,6 +132,21 @@ Assignments live on the beads board; executors set `lead_review` when done
 instead of closing. The lead reviews that inbox and its own `assignee=lead`
 tasks.
 
+Every executor session runs as a single-agent worker. Dispatch, resume and
+instruction-refresh succession pass Codex CLI's built-in
+`agents.enabled=false` configuration, so the session's tool set contains no
+agent-spawning or agent-messaging tools and its instructions contain no
+multi-agent usage guidance - even though the `ds` model catalog advertises
+multi-agent v2. The installed launcher applies the same setting to every Codex
+process started inside an executor, so a raw nested `codex` invocation is
+still single-agent, and `executor spawn`, `resume`, `run` and `succeed` refuse
+to run under the executor environment marker with an error naming the lead as
+the owner of further delegation. Ephemeral `spawn_agent` helpers are
+therefore lead-only: an executor that needs another agent or executor reports
+the need instead of creating one. Clearing the marker and calling the
+registered upstream Codex executable directly is outside the supported entry
+points; the guards are not a sandbox.
+
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
 stop. Ordinary sessions without that activation spawn nothing.
 
