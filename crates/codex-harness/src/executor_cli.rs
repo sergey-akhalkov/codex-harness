@@ -1958,6 +1958,15 @@ fn tree_state(path: &Path) -> &'static str {
 /// status, so an autonomous dispatch observes the real outcome instead of a
 /// fabricated success. Windows Terminal observes that code too, so a failed
 /// session stays visible instead of closing as if it had succeeded.
+///
+/// The host is the process that lives for one dispatched session - a terminal
+/// tab started by the terminal, or the owned console of a dispatch - and it is
+/// started outside the account allowance, so it joins the shared account CPU
+/// allowance here, before its payload tree exists. The launcher, the native
+/// server it hosts and every tool they start inherit the ceiling, while the
+/// terminal tab, the lead's own session and sibling tabs stay outside it.
+/// Admission failure keeps the visible fail-open contract: the session still
+/// starts once, outside verified coverage.
 fn run_exec(args: &[OsString]) -> io::Result<i32> {
     if args.len() == 2 && args[0] == "--file" {
         return run_receipt(&args[1]);
@@ -1966,6 +1975,8 @@ fn run_exec(args: &[OsString]) -> io::Result<i32> {
         return Err(invalid("executor run requires the launcher path"));
     };
     let launcher = normalize_launcher(launcher)?;
+    let _allowance =
+        harness_core::task_runtime::SessionCpuAllowance::join("this executor session host");
     run_child(&launcher, rest, None)
 }
 
@@ -1990,6 +2001,13 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
                 .collect::<Vec<_>>()
         })
         .ok_or_else(|| invalid("executor run receipt args are missing"))?;
+    // One dispatched session is hosted by this process for as long as it runs,
+    // so the tab host joins the shared account CPU allowance before its payload
+    // tree exists. The ceiling covers the launcher and the session it hosts,
+    // while the terminal that dispatched the tab stays outside it. The handle is
+    // retained for the whole hosted session.
+    let _allowance =
+        harness_core::task_runtime::SessionCpuAllowance::join("this executor session host");
     // The tab host is the process that stays alive for the whole session, so
     // it records the slot's liveness for exactly as long as the session runs.
     let binding = receipt_binding(&value)?;
