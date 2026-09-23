@@ -1,6 +1,7 @@
 //! Explicit candidate preparation. This module never changes active registrations.
 //! Compiler concurrency stays within the installation's fixed resource budget.
 use crate::build_identity::{self, BINARIES};
+use crate::heavy_command;
 use crate::process::{
     Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, StopReason,
 };
@@ -243,7 +244,7 @@ fn state_path(path: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other("Native state has no accessible ancestor."))
 }
 
-fn directory(path: &Path) -> io::Result<()> {
+pub(crate) fn directory(path: &Path) -> io::Result<()> {
     ordinary_ancestors(path)?;
     fs::create_dir_all(path)?;
     build_identity::ordinary(path)?;
@@ -660,6 +661,21 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
             )));
         }
     }
+    // One global order for every native caller that both queues heavy work and
+    // mutates build state: account admission first, then the state lock. A
+    // nested native caller inside an admitted tree shares the live lease, so
+    // this order cannot deadlock with the shared queue. Compilation consumes the
+    // same machine-local budget as every other heavy command.
+    let account = heavy_command::account_dir(None)?;
+    let budget = heavy_command::Budget::read(&account)?;
+    let _admission = heavy_command::Admission::acquire(
+        &account,
+        &budget,
+        &format!("native build {}", source.display()),
+        &Cancellation::default(),
+    )?;
+    let (memory_bytes, cpu_percent) = (budget.memory_bytes, budget.cpu_percent);
+    let deadline = budget.deadline()?;
     owner_root(&state)?;
     let lock = lock_owned_state(&state)?;
     sweep_stale_scratch(&std::env::temp_dir(), SCRATCH_SWEEP_AGE);
@@ -719,11 +735,12 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     command.current_dir = Some(source.clone());
     command.stdout = Some(log.try_clone()?);
     command.stderr = Some(log);
+    // Release LTO of every manager binary exceeds a 4 GiB Job; the compiler
+    // uses the same machine-local heavy-command budget as every other heavy
+    // command, whose defaults keep the installed 8 GiB / 50% / 30 minutes.
     let job = Job::new(Limits {
-        // Release LTO of every manager binary exceeds a 4 GiB Job; keep the
-        // compiler bounded without killing the candidate compile.
-        memory_bytes: Some(8 * 1024 * 1024 * 1024),
-        cpu_percent: Some(50.0),
+        memory_bytes: Some(memory_bytes),
+        cpu_percent: Some(cpu_percent),
     })?;
     let child = job
         .spawn(&command)
@@ -733,7 +750,7 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         // A cold release build includes optimized manager variants and native
         // dependencies. Keep it finite without applying an indexing deadline
         // to compilation; the compiler Job still bounds memory and CPU.
-        Deadline::after(Duration::from_secs(1800))?,
+        deadline,
         &Cancellation::default(),
         Duration::from_secs(5),
     )?;

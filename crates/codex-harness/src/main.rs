@@ -16,6 +16,8 @@ mod executor_cli;
 mod executor_shell;
 mod feedback_cli;
 #[cfg(windows)]
+mod heavy_command_cli;
+#[cfg(windows)]
 mod install_cli;
 #[cfg(windows)]
 mod mcp_cli;
@@ -313,6 +315,12 @@ fn run() -> io::Result<i32> {
         println!(
             "codex-harness feedback record|list|ledger|triage|candidates|promote --project DIRECTORY [--bd FILE] [--source CHECKOUT] ... (bd-backed feedback loop; no model calls)"
         );
+        println!(
+            "codex-harness heavy [--account DIRECTORY] -- PROGRAM [ARGS...] (account-wide serialized heavy command; see heavy --help)"
+        );
+        println!(
+            "codex-harness heavy budget [--account DIRECTORY] [--json] [--memory-bytes N --cpu-percent P --deadline-seconds N --queue-wait-seconds N] [--preview]"
+        );
         println!("codex-harness skills isolate --request PATH");
         println!("codex-harness skills usage [--user-home DIRECTORY] [--codex-home DIRECTORY]");
         println!("codex-harness skills publish --request PATH");
@@ -454,6 +462,11 @@ fn run() -> io::Result<i32> {
     if args[0] == "executor" {
         verify_runtime()?;
         return executor_cli::run(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "heavy" {
+        verify_manager()?;
+        return heavy_command_cli::run(&args[1..]);
     }
     if args[0] == "feedback" {
         verify_runtime()?;

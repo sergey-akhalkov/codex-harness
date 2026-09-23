@@ -17,6 +17,7 @@ pub enum Resource {
     BrokerStartup,
     BrokerInstance,
     Desktop,
+    HeavyCommand,
 }
 
 impl Resource {
@@ -27,6 +28,7 @@ impl Resource {
             Self::BrokerStartup => "startup.lock",
             Self::BrokerInstance => "instance.lock",
             Self::Desktop => "desktop.lock",
+            Self::HeavyCommand => "heavy-command.lock",
         }
     }
 }
@@ -56,13 +58,31 @@ impl Lease {
         deadline: Deadline,
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
+        Self::acquire_reporting(directory, resource, deadline, cancellation, || {})
+    }
+
+    /// Same accounting and lock semantics as `acquire`, but reports the first
+    /// busy observation exactly once so a caller can print one queue diagnostic
+    /// before it blocks.
+    pub fn acquire_reporting(
+        directory: &Path,
+        resource: Resource,
+        deadline: Deadline,
+        cancellation: &Cancellation,
+        mut waiting: impl FnMut(),
+    ) -> io::Result<Self> {
         check_stop(deadline, cancellation)?;
         let guard = Self::open(directory, resource)?;
+        let mut reported = false;
         loop {
             check_stop(deadline, cancellation)?;
             match guard.file.try_lock() {
                 Ok(()) => return Ok(Self { _guard: guard }),
                 Err(TryLockError::WouldBlock) => {
+                    if !reported {
+                        reported = true;
+                        waiting();
+                    }
                     std::thread::sleep(Duration::from_millis(20).min(deadline.remaining()));
                 }
                 Err(TryLockError::Error(error)) => return Err(error),
@@ -202,5 +222,36 @@ mod tests {
         fs::hard_link(&sentinel, root.path().join("cbm-index.lock")).unwrap();
         assert!(acquire(root.path(), Resource::CodebaseIndex).is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"PRIVATE-SENTINEL");
+    }
+
+    #[test]
+    fn heavy_command_slot_serializes_and_reports_the_first_busy_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let held = acquire(root.path(), Resource::HeavyCommand).unwrap();
+        assert!(root.path().join("heavy-command.lock").is_file());
+        let cancellation = Cancellation::default();
+        let mut reported = 0;
+        let waited = Lease::acquire_reporting(
+            root.path(),
+            Resource::HeavyCommand,
+            Deadline::after(Duration::from_millis(120)).unwrap(),
+            &cancellation,
+            || reported += 1,
+        );
+        assert!(matches!(waited, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(reported, 1);
+        drop(held);
+        let mut reported = 0;
+        assert!(
+            Lease::acquire_reporting(
+                root.path(),
+                Resource::HeavyCommand,
+                Deadline::after(Duration::from_secs(1)).unwrap(),
+                &cancellation,
+                || reported += 1,
+            )
+            .is_ok()
+        );
+        assert_eq!(reported, 0);
     }
 }

@@ -15,6 +15,25 @@ use std::{
     time::Duration,
 };
 
+fn number(name: &str, fallback: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
+/// Millisecond wall clock, so ordering between two callers is observable
+/// without sharing the fixture process.
+fn marker(name: &str) {
+    if let Some(path) = env::var_os(name) {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default();
+        let _ = std::fs::write(path, millis.to_string());
+    }
+}
+
 fn main() -> io::Result<()> {
     // A separate native bridge mode avoids leaking the fixture behavior into
     // the eventual upstream CLI, which receives the user's original arguments.
@@ -66,6 +85,59 @@ fn main() -> io::Result<()> {
         "outcome" => return outcome_fixture::run(),
         "discovery" => return discovery_fixture::run(),
         "outcome-process-checker" => return outcome_process_checker_fixture::run(),
+        // Owned heavy-command targets. The account queue, its budget and its
+        // process-tree cleanup stay in the real CLI; these only produce
+        // observable ordering, exit and descendant evidence.
+        "heavy-hold" => {
+            let millis = number("HARNESS_HEAVY_FIXTURE_MS", 500);
+            marker("HARNESS_HEAVY_FIXTURE_STARTED");
+            std::thread::sleep(Duration::from_millis(millis));
+            marker("HARNESS_HEAVY_FIXTURE_ENDED");
+            return Ok(());
+        }
+        "heavy-exit" => std::process::exit(number("HARNESS_HEAVY_FIXTURE_EXIT", 1) as i32),
+        "heavy-tree" => {
+            // Start a descendant that holds an exclusive file lock, wait until
+            // it really holds it, then exit. Only the owned Job may clear it.
+            let lock = env::var_os("HARNESS_HEAVY_FIXTURE_LOCK").unwrap();
+            let ready = env::var_os("HARNESS_HEAVY_FIXTURE_READY").unwrap();
+            marker("HARNESS_HEAVY_FIXTURE_STARTED");
+            let mut holder = Command::new(env::current_exe()?)
+                .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-holder")
+                .env("HARNESS_HEAVY_FIXTURE_LOCK", &lock)
+                .env("HARNESS_HEAVY_FIXTURE_READY", &ready)
+                .env_remove("HARNESS_LAUNCH_FIXTURE_STARTED")
+                .env_remove("HARNESS_HEAVY_FIXTURE_STARTED")
+                .env_remove("HARNESS_HEAVY_FIXTURE_ENDED")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !std::path::Path::new(&ready).exists() {
+                if std::time::Instant::now() > deadline || holder.try_wait()?.is_some() {
+                    return Err(io::Error::other("heavy descendant did not become ready"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(Duration::from_millis(number("HARNESS_HEAVY_FIXTURE_MS", 0)));
+            marker("HARNESS_HEAVY_FIXTURE_ENDED");
+            return Ok(());
+        }
+        "heavy-holder" => {
+            let lock = env::var_os("HARNESS_HEAVY_FIXTURE_LOCK").unwrap();
+            let ready = env::var_os("HARNESS_HEAVY_FIXTURE_READY").unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)?;
+            file.lock()?;
+            std::fs::write(&ready, std::process::id().to_string())?;
+            std::thread::sleep(Duration::from_secs(300));
+            return Ok(());
+        }
         "background" => {
             let child = Command::new(env::current_exe()?)
                 .env("HARNESS_LAUNCH_FIXTURE_MODE", "delayed")
