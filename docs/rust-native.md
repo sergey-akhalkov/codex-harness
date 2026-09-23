@@ -131,10 +131,10 @@ The brief also carries the executor's own work cycle - read the declared
 inputs, investigate the current source and callers before editing, implement
 the owned outcome, run the applicable checks, correct local errors and repeat
 - and the compact result the consumer expects back: done and remaining work,
-the exact files touched, how each acceptance item was verified with the checks
-actually run, limitations, the decision needed from the consumer and where the
-full detail lives. Source bodies are supplied only as an explicit fallback
-when reading is unavailable.
+the checkout and base worked from, the exact files touched, how each acceptance
+item was verified with the checks actually run, limitations, the decision
+needed from the consumer and where the full detail lives. Source bodies are
+supplied only as an explicit fallback when reading is unavailable.
 
 Paths are relative to the allocated checkout. Inputs must exist as files;
 outputs may be new. Absolute paths, traversal and links escaping the checkout

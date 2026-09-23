@@ -137,11 +137,11 @@ tasks.
 A structured assignment's brief carries the result consumer, the standing
 escalation boundaries, the executor's own investigate, implement, check and
 self-correct cycle, and the compact result expected back: done and remaining
-work, files, actual checks, limitations, required decision and detail locator.
-A declared `consumer` or `escalate` trigger extends that contract instead of
-replacing it, and an executor resolves ordinary implementation errors -
-syntax, API names, failing checks - itself. The schema, optional fields,
-defaults and limits live in
+work, the checkout and base worked from, files, actual checks, limitations,
+required decision and detail locator. A declared `consumer` or `escalate`
+trigger extends that contract instead of replacing it, and an executor resolves
+ordinary implementation errors - syntax, API names, failing checks - itself.
+The schema, optional fields, defaults and limits live in
 [native commands](rust-native.md#structured-executor-assignments).
 
 Every executor session runs as a single-agent worker. Dispatch, resume and

@@ -120,10 +120,10 @@ triggers that return the decision to that consumer. The rendered brief always
 carries the standing boundaries - a change to the agreed outcome or scope, a
 material architecture change, missing authority, an unobtainable dependency -
 together with the executor's own work cycle and the compact result expected
-back (done and remaining work, files, actual checks, limitations, required
-decision, detail locator), so do not restate those in the objective. Ordinary
-implementation errors stay with the executor: it investigates, corrects and
-re-runs them itself.
+back (done and remaining work, checkout and base, files, actual checks,
+limitations, required decision, detail locator), so do not restate those in the
+objective. Ordinary implementation errors stay with the executor: it
+investigates, corrects and re-runs them itself.
 `executor assignment --source CHECKOUT --slot N --base REV --assignment FILE`
 validates and renders that brief against an existing pool checkout without
 dispatch; the same option works with `resume` while preserving partial work.
@@ -269,14 +269,15 @@ rejected, the improvement stays unadopted.
 ## Accept and merge
 
 Review each completed assignment against requirements and applicable checks,
-using the returned compact result - files, actual checks and outcomes,
-limitations, required decision, detail locator - and treat a completion claim
-as evidence of state, not proof that the named checks passed. Merge accepted
-branches yourself. Return in-scope defects with acceptance conditions to the
-original executor. Record acceptance on the board and in task state. Reconcile
-planning artifacts explicitly on integration: an executor's tasks.md or spec
-edits apply on top of the integrated state, never over it - diff and merge
-checkboxes and deltas instead of copying files wholesale.
+using the returned compact result - done and remaining work, checkout and base,
+files, actual checks and outcomes, limitations, required decision, detail
+locator - and treat a completion claim as evidence of state, not proof that the
+named checks passed. Merge accepted branches yourself. Return in-scope defects
+with acceptance conditions to the original executor. Record acceptance on the
+board and in task state. Reconcile planning artifacts explicitly on
+integration: an executor's tasks.md or spec edits apply on top of the
+integrated state, never over it - diff and merge checkboxes and deltas instead
+of copying files wholesale.
 
 Executor slots are pool-owned, not task-owned: the pool never grows past
 `max_concurrent_executors`, and slots are reused while conversations are not.

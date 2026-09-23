@@ -201,7 +201,7 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     );
     text.push_str(
         &format!(
-            "When the outcome is complete, report a compact result: done and remaining work, the exact files touched, how each acceptance item was verified with the checks actually run, limitations, the decision you need from {consumer}, and where the full detail lives.\n"
+            "When the outcome is complete, report a compact result: done and remaining work, the checkout and base you worked from, the exact files touched, how each acceptance item was verified with the checks actually run, limitations, the decision you need from {consumer}, and where the full detail lives.\n"
         ),
     );
     if text.len() > MAX_BRIEF_BYTES {
