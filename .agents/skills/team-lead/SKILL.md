@@ -1,25 +1,37 @@
 ---
 name: team-lead
-description: Activate orchestrated asynchronous development with one lead session that specifies, assigns, unblocks, accepts and merges work while isolated executor sessions implement complete outcomes. Use when the user invokes team-lead or clearly asks for orchestrated asynchronous development, a team-lead workflow, or lead/executor dispatch, including asking to use executors for the current work. Do not use for a small direct task.
+description: Activate orchestrated asynchronous development with one lead session that specifies, assigns, unblocks, accepts and merges work while isolated executor sessions implement complete outcomes. Use when the user invokes team-lead or clearly asks for orchestrated asynchronous development, a team-lead workflow, or lead/executor dispatch, including asking to use executors for the current work. The main session also uses it on its own judgement when the user's task decomposes into parallel, independently verifiable slices that repay orchestration. Do not use for a small direct task, read-only analysis, or a correction smaller than its own brief, and never from an executor or helper agent.
 ---
 
 # Team lead
 
-Enter this role only when the user invokes this skill, clearly asks for
+Enter this role when the user invokes this skill, clearly asks for
 orchestrated asynchronous development, or asks to use executors for the
 current work - including asking why executors are unused; none of these
-needs the skill name. An ordinary session without that activation must not
-spawn executors, create board records, or write orchestration state. Leaving
-the role or stopping orchestration is explicit and preserves partial work.
+needs the skill name. The main session may also enter it on its own
+judgement, without a user request, when the user's task decomposes into
+parallel, independently verifiable implementation slices whose orchestration
+cost the task repays; state that activation and its basis before spawning
+anything. Only the main session makes this decision: an executor or
+ephemeral helper agent must not activate this role, spawn agents or spawn
+further executors - it reports the need to the lead instead. A session that
+has not entered the role must not spawn executors, create board records, or
+write orchestration state. Leaving the role or stopping orchestration is
+explicit and preserves partial work.
 
 ## Operating objective
 
-Maximize delivery speed of the verified result while minimizing token spend,
-and never sacrifice quality, correctness or acceptance for either. In
-practice: delegate bounded parallelizable work to executors, wait on native
-watcher events instead of model-side polling, keep lead turns for judgment,
-integration and acceptance, and stop spending once the agreed outcome is
-proven rather than polishing beyond it.
+Maximize delivery speed of the accepted result while minimizing the lead's
+own token spend, and never sacrifice quality, correctness or acceptance for
+either. Lead tokens are the most expensive in the loop and the lead is
+normally the strongest model: keep for yourself judgment, decomposition,
+integration and acceptance, work that genuinely exceeds executor capability,
+and work whose delegation overhead - brief, board record, review, merge -
+exceeds the work itself, such as a one-line correction. Delegate every other
+parallelizable implementation slice. In practice: delegate bounded
+parallelizable work to executors, wait on native watcher events instead of
+model-side polling, and stop spending once the agreed outcome is proven
+rather than polishing beyond it.
 
 ## Keep executors utilized
 
@@ -36,6 +48,9 @@ preserved slots already carry theirs in pool state - and refresh it when its
 circumstance changes, not per task. While capacity idles without a recorded
 reason, do not keep executor-suitable routine implementation work for
 yourself: dispatch it or record why it stays with the lead before doing it.
+Work whose delegation overhead exceeds the work itself - typically a
+one-line correction, a direct answer or a quick read - is not
+executor-suitable: do it directly, with no task, assignment or board note.
 After a slot is released, backfill it with the next dispatchable slice
 before starting unrelated implementation work yourself.
 

@@ -578,7 +578,7 @@ routing preference or unknown quota may be used as a reason to withhold
 delegation - a wording conflict is reported while dispatch proceeds, and only
 a launcher- or installation-check-reported dispatch failure blocks it. A user
 request to use executors for the current work activates the lead role for
-that work. Change: [unblock executor delegation](../openspec/changes/unblock-executor-delegation/proposal.md).
+that work. Change: [unblock executor delegation](../openspec/changes/archive/2026-09-23-unblock-executor-delegation/proposal.md).
 
 **2026-09-22, confirmed:** executor dispatch starts from a committed
 snapshot of the source checkout. Before each dispatch the lead commits
@@ -591,7 +591,21 @@ synchronization - changed tracked inputs travel as a new commit and a
 redispatch with the same owner id; slices depending on state the user
 forbade committing stay in the lead, and unrelated dirty work is never
 committed just to form a base. Change:
-[committed dispatch snapshot](../openspec/changes/committed-dispatch-snapshot/proposal.md).
+[committed dispatch snapshot](../openspec/changes/archive/2026-09-23-committed-dispatch-snapshot/proposal.md).
+
+**2026-09-23, confirmed:** only the main session may decide to use the
+`team-lead` skill autonomously, and it does so when the user's task
+decomposes into parallel, independently verifiable slices that repay
+orchestration; the main session states that activation and its basis before
+spawning anything. Explicit user requests for executors or orchestrated
+development remain direct triggers. Executors and ephemeral helper agents
+never activate the role or originate further agents or executors and report
+such needs to the lead. While the role is active, the lead minimizes its own
+token spend and the time to the accepted result, keeps judgment,
+decomposition, integration, acceptance and capability-exceeding work, and
+does work whose delegation overhead exceeds the work itself - typically a
+one-line correction - directly, with no task or board note. Change:
+[autonomous lead activation](../openspec/changes/autonomous-lead-activation/proposal.md).
 
 ## Recording further decisions
 

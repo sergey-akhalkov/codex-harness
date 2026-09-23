@@ -536,13 +536,16 @@ mod tests {
     }
 
     #[test]
-    fn team_lead_skill_requires_explicit_activation() {
+    fn team_lead_skill_bounds_activation() {
         let text = include_str!("../../../.agents/skills/team-lead/SKILL.md");
         // The contract is wording, not line wrapping: normalize before the
         // phrase checks so a wrapped paragraph cannot break them silently.
         let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains("name: team-lead"));
         assert!(normalized.contains("orchestrated asynchronous development"));
+        assert!(normalized.contains("on its own judgement"));
+        assert!(normalized.contains("Only the main session makes this decision"));
+        assert!(normalized.contains("must not activate this role"));
         assert!(normalized.contains("must not spawn executors"));
         assert!(normalized.contains("board-workflow"));
         assert!(normalized.contains("executor spawn"));

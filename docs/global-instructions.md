@@ -37,9 +37,11 @@ cannot identify what an older session loaded. Use that session's retained
 native evidence where available, and otherwise preserve the uncertainty. The
 [delegation guide](agent-delegation.md#how-selection-works) owns workstream
 handoff and shared-runtime ownership. Orchestrated asynchronous development is
-activated through the `team-lead` skill, and a user request to use executors
-for the current work activates it for that work; ordinary sessions otherwise
-spawn no executors.
+activated through the `team-lead` skill by a user request to use executors
+for the current work or by the main session's own judgement when the task
+decomposes into parallel, independently verifiable slices that repay
+orchestration; a session that has not activated the role spawns no executors,
+and executors never originate further agents or executors.
 
 A later global `AGENTS.override.md` would take precedence over global
 `AGENTS.md`. Project instructions add to the hierarchy and may refine the

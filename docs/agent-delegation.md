@@ -165,7 +165,10 @@ registered upstream Codex executable directly is outside the supported entry
 points; the guards are not a sandbox.
 
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
-stop. Ordinary sessions without that activation spawn nothing.
+stop. Activation comes from a user request or from the main session's own
+judgement for parallelizable work that repays orchestration; ordinary
+sessions without that activation spawn nothing, and an executor reports a
+further delegation need to the lead instead of widening orchestration.
 
 ## Executor utilization
 
