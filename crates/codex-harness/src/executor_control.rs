@@ -578,10 +578,12 @@ pub struct ControlEvent {
     /// rendered; [`Self::render`] skips it so one delivered message shows once
     /// even when the server announces it both as started and as completed.
     pub repeat: bool,
-    /// True for a token-level `*/*delta` record. Its content is fully
-    /// derivable from the completed item, so it is neither rendered on the
-    /// visible surface nor retained in the bounded detail file; one such
-    /// record per model token would otherwise flood both.
+    /// True for a token-level delta record (`…/delta`, `…textDelta`) or a
+    /// repeated MCP startup progress record. Its content is fully derivable
+    /// from the completed item or from the server's subsequent behavior, so it
+    /// is neither rendered on the visible surface nor retained in the bounded
+    /// detail file; one such record per model token or per server would
+    /// otherwise flood both.
     pub transient: bool,
 }
 
@@ -642,10 +644,19 @@ impl ControlEvent {
             Some(method @ ("item/started" | "item/updated" | "item/completed")) => {
                 item_line(method, &params["item"])
             }
-            Some(method) => Some(format!("event: {method}")),
+            // A method this driver does not interpret is not surface noise:
+            // it stays in the bounded detail record (unless transient), and
+            // the readable surface keeps only the records it can name.
+            Some(_) => None,
             None => None,
         }
     }
+}
+
+fn is_transient(method: &str) -> bool {
+    method.ends_with("/delta")
+        || method.ends_with("Delta")
+        || method == "mcpServer/startupStatus/updated"
 }
 
 fn item_line(method: &str, item: &Value) -> Option<String> {
@@ -1117,9 +1128,7 @@ impl Conversation {
             lifecycle: None,
             deviation: None,
             repeat: false,
-            transient: method
-                .as_deref()
-                .is_some_and(|name| name.ends_with("/delta")),
+            transient: method.as_deref().is_some_and(is_transient),
         };
         let Some(method) = method else {
             // A response that no request awaits is a deviation from the

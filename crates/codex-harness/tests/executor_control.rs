@@ -213,6 +213,13 @@ fn completion_burst(server: &Server) {
         json!({"method":"item/agentMessage/delta","params":{"threadId":THREAD,"turnId":TURN,"itemId":"m1","delta":"IGNORED_DELTA"}}),
     );
     server.push(
+        json!({"method":"item/reasoning/textDelta","params":{"threadId":THREAD,"turnId":TURN,"itemId":"r1","delta":"IGNORED_REASONING_DELTA"}}),
+    );
+    server.push(
+        json!({"method":"mcpServer/startupStatus/updated","params":{"serverId":"fixture","status":"starting"}}),
+    );
+    server.push(json!({"method":"remoteControl/status/changed","params":{"attached":false}}));
+    server.push(
         json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":TURN,"status":"completed"}}}),
     );
     server.push(
@@ -635,7 +642,7 @@ fn lifecycle_mapping_follows_the_thread_records() {
     let mut fixture = fixture();
     let mut conversation = fixture.start().unwrap();
     completion_burst(&fixture.server);
-    let events = drain(&mut conversation, 8);
+    let events = drain(&mut conversation, 11);
     let states: Vec<Option<Lifecycle>> = events.iter().map(|event| event.lifecycle).collect();
     assert_eq!(
         states,
@@ -645,6 +652,9 @@ fn lifecycle_mapping_follows_the_thread_records() {
             Some(Lifecycle::Running),
             Some(Lifecycle::Running),
             Some(Lifecycle::Running),
+            None,
+            None,
+            None,
             None,
             Some(Lifecycle::Completed),
             None
@@ -1277,8 +1287,12 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
     assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
     assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
     assert!(!detail.contains("agentMessage/delta"), "{detail}");
+    assert!(!detail.contains("textDelta"), "{detail}");
+    assert!(!detail.contains("mcpServer"), "{detail}");
     assert!(!text.contains("event: item/agentMessage/delta"), "{text}");
+    assert!(!text.contains("event: "), "{text}");
     assert!(!text.contains("IGNORED_DELTA"), "{text}");
+    assert!(!text.contains("IGNORED_REASONING_DELTA"), "{text}");
 
     // The endpoint record is the address `executor stop` and
     // `executor message` read: beside the dispatch receipt, under the name the
