@@ -9,7 +9,7 @@ use std::{
     fs,
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -1086,6 +1086,100 @@ fn executor_host_marks_the_session_environment() {
         output_text(&output)
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// Owned native child double: the launch fixture is a Rust binary, so these
+/// checks never put a shell program into a dispatch receipt.
+fn launch_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"))
+}
+
+/// The child's own outcome must reach the runner unchanged in both directions:
+/// a successful launcher stays success, and a failed launcher is not reported
+/// as a completed repair.
+#[test]
+fn executor_run_reports_the_child_outcome() {
+    let success = lead_command()
+        .args(["executor", "run"])
+        .arg(launch_fixture())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(success.status.code(), Some(0), "{}", output_text(&success));
+    let failure = lead_command()
+        .args(["executor", "run"])
+        .arg(launch_fixture())
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        failure.status.code(),
+        Some(19),
+        "the child exit code must reach the caller: {}",
+        output_text(&failure)
+    );
+}
+
+/// The installed dispatch path runs the tab host as `executor run --file`, so
+/// a failed session must not be recorded as a successful one there either.
+#[test]
+fn executor_run_receipt_propagates_a_failed_child() {
+    let root = std::env::temp_dir().join(format!("executor-run-failed-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let receipt = root.join("receipt.json");
+    fs::write(
+        &receipt,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "launcher": launch_fixture(),
+            "args": [],
+            "slot": Value::Null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = lead_command()
+        .args(["executor", "run", "--file", receipt.to_str().unwrap()])
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(19),
+        "the tab host must forward the failed session: {}",
+        output_text(&output)
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A launcher that cannot start is a failure with a named cause, never a
+/// silent success.
+#[test]
+fn executor_run_startup_error_stays_a_failure() {
+    let relative = lead_command()
+        .args(["executor", "run", "harness-absent-launcher.exe"])
+        .output()
+        .unwrap();
+    assert!(!relative.status.success());
+    assert!(
+        output_text(&relative).contains("launcher must be absolute"),
+        "{}",
+        output_text(&relative)
+    );
+    let missing = std::env::temp_dir().join("harness-absent-launcher.exe");
+    let absent = lead_command()
+        .args(["executor", "run"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(
+        !absent.status.success(),
+        "a launcher that cannot start must not report success: {}",
+        output_text(&absent)
+    );
 }
 
 /// Slot path of the first recorded pool slot, read from the kit-local state

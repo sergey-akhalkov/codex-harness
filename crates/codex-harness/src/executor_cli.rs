@@ -1150,9 +1150,10 @@ fn tree_state(path: &Path) -> &'static str {
     }
 }
 
-/// Tab host: forward argv to the launcher and exit successfully regardless of
-/// the child outcome, so Windows Terminal closes the tab on any exit instead
-/// of leaving a dead tab that someone must remember to close.
+/// Tab host: forward argv to the launcher and exit with the child's own
+/// status, so an autonomous dispatch observes the real outcome instead of a
+/// fabricated success. Windows Terminal observes that code too, so a failed
+/// session stays visible instead of closing as if it had succeeded.
 fn run_exec(args: &[OsString]) -> io::Result<i32> {
     if args.len() == 2 && args[0] == "--file" {
         return run_receipt(&args[1]);
@@ -1269,8 +1270,14 @@ fn run_child(
             .map_err(|error| invalid(&format!("executor run log: {error}")))?;
         command.stderr(file);
     }
-    command.status()?;
-    Ok(0)
+    // The launcher's own status is the session outcome. Reporting success for
+    // a failed child made `executor run` pass an unsuccessful repair to the
+    // caller as done, which is exactly what the caller must never see.
+    let status = command.status()?;
+    let code = status
+        .code()
+        .ok_or_else(|| io::Error::other("executor run launcher terminated without an exit code"))?;
+    Ok(code)
 }
 
 /// Forward-slash launcher paths reach `CreateProcess` through a path that
