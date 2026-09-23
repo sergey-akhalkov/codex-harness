@@ -19,12 +19,32 @@
 //! aggregate budget exactly once for the whole tree. That keeps the order
 //! deadlock-free and the allowance single; a heavy command must not nest a
 //! different account directory.
+//!
+//! Composition with the shared account CPU owner: an admitted heavy tree joins
+//! one account-wide CPU budget as its outer Job and keeps its own lifecycle Job
+//! as the inner Job, so the batch keeps its memory, deadline, cancellation and
+//! cleanup contracts while the account ceiling covers it. Lock order is always
+//! the heavy-queue lease first and the shared budget lock second: a caller that
+//! waits for the account slot holds no budget lock, the budget lock itself is
+//! bounded, and no path takes the two owners in the opposite order, so admission
+//! cannot deadlock.
+//!
+//! The retired per-batch CPU default (50%) is not a second default. With no
+//! explicit per-operation limit the shared ceiling is the CPU policy and the
+//! batch Job carries no CPU rate; a deliberately configured lower limit keeps
+//! its documented host-relative meaning by being translated against the
+//! kernel-verified parent rate, rounding down, and is reported. Membership is
+//! never taken from a marker: this owner asks the kernel whether this process
+//! and the payload it created really belong to the account budget object.
 #![cfg(windows)]
 
 use crate::{
     build_identity,
     native_build::{directory, ordinary_ancestors, resolve_tool},
-    process::{Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, ProcessIdentity},
+    process::{
+        Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, ProcessIdentity,
+        SHARED_CPU_PERCENT, SharedCpuBudget, cpu_budget_directory,
+    },
     resource_admission::{Lease, Resource},
 };
 use serde::{Deserialize, Serialize};
@@ -41,7 +61,7 @@ use windows_sys::Win32::{
     Foundation::{FILETIME, HANDLE, WAIT_TIMEOUT},
     System::{
         Console::SetConsoleCtrlHandler,
-        JobObjects::{IsProcessInJob, OpenJobObjectW},
+        JobObjects::{AssignProcessToJobObject, IsProcessInJob, OpenJobObjectW},
         Threading::{
             GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -68,11 +88,14 @@ const MAX_LABEL: usize = 400;
 /// job access rights; a query handle can neither terminate nor assign, so a
 /// verified member never receives cleanup authority over the admitted tree.
 const JOB_OBJECT_QUERY: u32 = 0x0004;
+/// Documented JOB_OBJECT_ASSIGN_PROCESS right (winnt.h), used only to admit
+/// this process into the CPU-only account budget. Assigning carries no
+/// termination or configuration authority over the object or its members.
+const JOB_OBJECT_ASSIGN_PROCESS: u32 = 0x0001;
 /// Session-local Job object name prefix for one admitted tree.
 const JOB_NAME_PREFIX: &str = "CodingAgentsHarness.HeavyCommand.";
 const MIB: usize = 1024 * 1024;
 const DEFAULT_MEMORY_BYTES: usize = 8 * 1024 * MIB;
-const DEFAULT_CPU_PERCENT: f64 = 50.0;
 const DEFAULT_DEADLINE_SECONDS: u64 = 1800;
 const DEFAULT_QUEUE_WAIT_SECONDS: u64 = 3600;
 const MIN_MEMORY_BYTES: usize = 16 * MIB;
@@ -80,6 +103,16 @@ const MAX_MEMORY_BYTES: usize = 1024 * 1024 * MIB;
 const MAX_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Cleanup budget after the root exits or the command is stopped.
 const CLEANUP: Duration = Duration::from_secs(10);
+/// Bounded wait for the account CPU budget lock. The budget owner creates or
+/// verifies one small object and holds its lock for that work alone.
+const CPU_BUDGET_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Rate units for "no rate-controlled ancestor": an inner rate is then a
+/// percentage of total host CPU capacity.
+const HOST_RATE: u32 = 10_000;
+/// The retired per-batch CPU default. A policy that still records exactly this
+/// value cannot be distinguished from an intentional override, so the value is
+/// preserved, reported and never silently changed into a second default.
+const LEGACY_DEFAULT_CPU_PERCENT: f64 = 50.0;
 
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -92,10 +125,15 @@ fn foreign(message: &str) -> io::Error {
 /// The one machine budget. Memory and CPU are enforced by one Windows Job per
 /// admitted command, `deadline_seconds` bounds the command and
 /// `queue_wait_seconds` bounds how long a caller waits for the account slot.
+/// An absent `cpu_percent` is the installed default: no per-operation CPU limit
+/// exists, so the shared account ceiling is the CPU policy and the command's Job
+/// must not add a second rate. A present value is a deliberate per-operation
+/// ceiling in percent of total host CPU capacity; it is translated against the
+/// kernel-verified parent rate before it reaches a nested Job.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budget {
     pub memory_bytes: usize,
-    pub cpu_percent: f64,
+    pub cpu_percent: Option<f64>,
     pub deadline_seconds: u64,
     pub queue_wait_seconds: u64,
 }
@@ -104,7 +142,7 @@ impl Default for Budget {
     fn default() -> Self {
         Self {
             memory_bytes: DEFAULT_MEMORY_BYTES,
-            cpu_percent: DEFAULT_CPU_PERCENT,
+            cpu_percent: None,
             deadline_seconds: DEFAULT_DEADLINE_SECONDS,
             queue_wait_seconds: DEFAULT_QUEUE_WAIT_SECONDS,
         }
@@ -135,9 +173,11 @@ impl Budget {
                 "{source}: memory_bytes must be within {MIN_MEMORY_BYTES}..={MAX_MEMORY_BYTES}"
             )));
         }
-        if !self.cpu_percent.is_finite() || !(0.01..=100.0).contains(&self.cpu_percent) {
+        if let Some(percent) = self.cpu_percent
+            && (!percent.is_finite() || !(0.01..=100.0).contains(&percent))
+        {
             return Err(invalid(format!(
-                "{source}: cpu_percent must be finite and within 0.01..=100"
+                "{source}: cpu_percent must be finite and within 0.01..=100 when present"
             )));
         }
         for (name, value) in [
@@ -178,7 +218,7 @@ impl Budget {
         }
         let budget = Self {
             memory_bytes: policy.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES),
-            cpu_percent: policy.cpu_percent.unwrap_or(DEFAULT_CPU_PERCENT),
+            cpu_percent: policy.cpu_percent,
             deadline_seconds: policy.deadline_seconds.unwrap_or(DEFAULT_DEADLINE_SECONDS),
             queue_wait_seconds: policy
                 .queue_wait_seconds
@@ -201,7 +241,7 @@ impl Budget {
         let policy = Policy {
             schema: SCHEMA,
             memory_bytes: Some(budget.memory_bytes),
-            cpu_percent: Some(budget.cpu_percent),
+            cpu_percent: budget.cpu_percent,
             deadline_seconds: Some(budget.deadline_seconds),
             queue_wait_seconds: Some(budget.queue_wait_seconds),
         };
@@ -221,6 +261,70 @@ impl Budget {
 
     pub fn queue_deadline(&self) -> io::Result<Deadline> {
         Deadline::after(Duration::from_secs(self.queue_wait_seconds))
+    }
+}
+
+/// Translate a host-relative ceiling into the rate units of one inner Job whose
+/// nearest rate-controlled ancestor is `parent_rate` (0.01% units of host CPU;
+/// `HOST_RATE` when no rate-controlled ancestor was verified). Rounding is
+/// downwards, so the translated cap never exceeds the documented host-relative
+/// ceiling. `None` means the requested ceiling is not lower than its parent's,
+/// so the inner Job must carry no rate at all.
+fn translate_ceiling(percent: f64, parent_rate: u32) -> Option<u32> {
+    let target = (percent * 100.0).floor() as u64;
+    if target >= u64::from(parent_rate) {
+        return None;
+    }
+    let inner = target * 10_000 / u64::from(parent_rate);
+    u32::try_from(inner.max(1)).ok()
+}
+
+/// The percent that the Job owner's rate control floors to exactly this rate:
+/// the intent stays in rate units, so no float drift can shave the cap.
+fn percent_of_rate(rate: u32) -> f64 {
+    (f64::from(rate) + 0.5) / 100.0
+}
+
+/// Effective host-relative ceiling of one translated inner rate, in percent of
+/// total host CPU capacity.
+fn effective_percent(inner_rate: u32, parent_rate: u32) -> f64 {
+    f64::from(inner_rate) * f64::from(parent_rate) / 1_000_000.0
+}
+
+/// Percent of host CPU as a compact, stable decimal (`75`, `24.9975`).
+fn percent_text(percent: f64) -> String {
+    format!("{percent}")
+}
+
+fn legacy_default_note() -> String {
+    format!(
+        "; this value equals the retired {LEGACY_DEFAULT_CPU_PERCENT}% batch default, so a legacy policy file and an intentional override cannot be told apart: the limit is preserved and reported (set --cpu-percent shared to use the shared ceiling)"
+    )
+}
+
+/// True when the effective policy records a value that cannot be told apart
+/// from the retired per-batch default: such a value is preserved and reported
+/// rather than silently dropped.
+pub fn legacy_default_cpu_percent(budget: &Budget) -> bool {
+    budget.cpu_percent == Some(LEGACY_DEFAULT_CPU_PERCENT)
+}
+
+/// One line describing the effective per-operation CPU policy in host-relative
+/// terms, for inspection. Inspection never joins the budget, so the shared
+/// ceiling is named by the installed policy value, not by a readback.
+pub fn cpu_policy_summary(budget: &Budget) -> String {
+    match budget.cpu_percent {
+        None => format!(
+            "no per-operation CPU limit; the shared account {SHARED_CPU_PERCENT}% ceiling is the CPU policy"
+        ),
+        Some(percent) => format!(
+            "per-operation CPU limit {percent}% of host CPU, translated against the shared account {SHARED_CPU_PERCENT}% ceiling when this command runs{}",
+            if percent == LEGACY_DEFAULT_CPU_PERCENT {
+                legacy_default_note()
+            } else {
+                String::new()
+            }
+        ),
     }
 }
 
@@ -361,6 +465,159 @@ struct HolderRecord {
     job: String,
 }
 
+/// The account-wide shared CPU budget as this process verified it: the
+/// established object, the parent rate the kernel reports for it, and whether
+/// the kernel confirms that this process belongs to it. A missing object or a
+/// missing membership is reported as degraded coverage; it is never silently
+/// treated as a capped start and never breaks the heavy-command contracts.
+struct SharedCpu {
+    budget: Option<SharedCpuBudget>,
+    parent_rate: u32,
+    admitted: bool,
+}
+
+impl SharedCpu {
+    /// Join the account budget and admit this process before any payload
+    /// exists. Called after the account heavy-command queue, so the documented
+    /// lock order (queue first, budget second) always holds.
+    fn join(cancellation: &Cancellation) -> Self {
+        let directory = match cpu_budget_directory(None) {
+            Ok(directory) => directory,
+            Err(error) => return Self::degraded(&error),
+        };
+        let deadline = match Deadline::after(CPU_BUDGET_LOCK_WAIT) {
+            Ok(deadline) => deadline,
+            Err(error) => return Self::degraded(&error),
+        };
+        let budget = match SharedCpuBudget::acquire_within(
+            &directory,
+            SHARED_CPU_PERCENT,
+            deadline,
+            cancellation,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => return Self::degraded(&error),
+        };
+        let mut state = Self {
+            budget: Some(budget),
+            parent_rate: HOST_RATE,
+            admitted: false,
+        };
+        state.read_back();
+        state.admit();
+        state
+    }
+
+    /// Degraded state: the heavy-command contracts stay in force, the CPU
+    /// policy does not, and the cause is on the diagnostic channel.
+    fn degraded(error: &io::Error) -> Self {
+        eprintln!(
+            "heavy: warning: the shared account CPU budget is unavailable ({error}); this command runs outside the shared {SHARED_CPU_PERCENT}% ceiling and its coverage is degraded"
+        );
+        Self {
+            budget: None,
+            parent_rate: HOST_RATE,
+            admitted: false,
+        }
+    }
+
+    /// Kernel readback of the object this process joined: the rate an inner Job
+    /// would be relative to, and the containment flags that must stay off.
+    fn read_back(&mut self) {
+        let Some(budget) = &self.budget else { return };
+        match budget.snapshot() {
+            Ok(snapshot) if snapshot.cpu_rate > 0 => {
+                self.parent_rate = snapshot.cpu_rate;
+                eprintln!(
+                    "heavy: shared account CPU budget job=\"{}\" cpu_rate={} hard_cap={} members={}",
+                    budget.name(),
+                    snapshot.cpu_rate,
+                    snapshot.cpu_hard_cap,
+                    snapshot.active_processes
+                );
+            }
+            Ok(_) => eprintln!(
+                "heavy: warning: the shared account CPU budget job=\"{}\" carries no enabled rate; this command has no verified parent ceiling",
+                budget.name()
+            ),
+            Err(error) => {
+                eprintln!("heavy: warning: the shared account CPU budget readback failed ({error})")
+            }
+        }
+    }
+
+    /// Kernel membership, never a copied marker: ask the object that the
+    /// verified account directory names whether this process belongs to it, and
+    /// admit the process only while the kernel says it does not.
+    fn admit(&mut self) {
+        let Some(budget) = &self.budget else { return };
+        if in_job(budget.name()) {
+            self.admitted = true;
+            eprintln!(
+                "heavy: this process is a kernel-verified member of the shared account CPU budget"
+            );
+            return;
+        }
+        match admit_current_process(budget.name()) {
+            Ok(()) => {
+                self.admitted = true;
+                eprintln!(
+                    "heavy: this process joined the shared account CPU budget before any payload starts"
+                );
+            }
+            Err(error) => eprintln!(
+                "heavy: warning: this process could not join the shared account CPU budget ({error}); a payload created by a consumer-owned spawn may run outside it"
+            ),
+        }
+    }
+
+    fn budget(&self) -> Option<&SharedCpuBudget> {
+        self.budget.as_ref()
+    }
+
+    /// Kernel-verified parent rate in 0.01% units that an inner rate would be
+    /// relative to (host rate when no rate-controlled ancestor was verified).
+    fn parent_rate(&self) -> u32 {
+        self.parent_rate
+    }
+
+    /// Inner rate for one owned lifecycle Job: `None` while no per-operation
+    /// limit is configured or the limit is not lower than the verified parent
+    /// ceiling, so the shared ceiling stays the only cap.
+    fn inner_rate(&self, budget: &Budget) -> Option<u32> {
+        translate_ceiling(budget.cpu_percent?, self.parent_rate)
+    }
+}
+
+/// Admit this process into the named CPU-only budget when the kernel allows it,
+/// then confirm membership with the kernel. Assigning needs only the documented
+/// JOB_OBJECT_ASSIGN_PROCESS right and grants no termination or configuration
+/// authority over the object or its members.
+fn admit_current_process(name: &str) -> io::Result<()> {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    };
+    let object: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let raw = unsafe { OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS, 0, object.as_ptr()) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    if unsafe { AssignProcessToJobObject(handle.as_raw_handle(), GetCurrentProcess()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if !in_job(name) {
+        return Err(io::Error::other(
+            "the kernel did not observe the account budget assignment",
+        ));
+    }
+    Ok(())
+}
+
 /// A held account slot. Drop clears the diagnostic holder record while the slot
 /// is still owned and then releases the lease.
 pub struct Holder {
@@ -368,6 +625,7 @@ pub struct Holder {
     account: PathBuf,
     identity: ProcessIdentity,
     job: String,
+    cpu: SharedCpu,
 }
 
 impl Holder {
@@ -398,6 +656,7 @@ impl Holder {
             account: account.to_owned(),
             identity,
             job,
+            cpu: SharedCpu::join(cancellation),
         };
         if let Err(error) = write_holder(account, identity, label, &holder.job) {
             eprintln!("heavy: holder record not written: {error}");
@@ -412,21 +671,27 @@ impl Drop for Holder {
     }
 }
 
+/// A verified nested admission: the kernel confirmed this process belongs to
+/// the admitted Job the inherited marker names, so that tree already applies the
+/// aggregate heavy-command budget.
+pub struct Inherited {
+    job: String,
+    holder: ProcessIdentity,
+    cpu: SharedCpu,
+}
+
 /// Account admission for one native operation.
 pub enum Admission {
     /// This process holds the account slot and releases it when dropped.
     Held(Holder),
-    /// The kernel confirmed this process belongs to the admitted Job named in
-    /// the inherited marker, so that tree already applies the aggregate budget.
-    Inherited {
-        job: String,
-        holder: ProcessIdentity,
-    },
+    Inherited(Inherited),
 }
 
 impl Admission {
     /// Queue for the account slot, or join the live lease this process tree
-    /// already inherited from an admitted Job.
+    /// already inherited from an admitted Job. The account heavy-command queue
+    /// is taken first and the shared CPU budget second; a caller that waits for
+    /// the slot holds no budget lock, so the two owners cannot deadlock.
     pub fn acquire(
         account: &Path,
         budget: &Budget,
@@ -439,10 +704,11 @@ impl Admission {
                 "heavy: inheriting the aggregate heavy-command budget through admitted Job \"{}\" (holder pid={}); this process is a verified member",
                 marker.job, marker.holder.pid
             );
-            return Ok(Self::Inherited {
+            return Ok(Self::Inherited(Inherited {
                 job: marker.job,
                 holder: marker.holder,
-            });
+                cpu: SharedCpu::join(cancellation),
+            }));
         }
         Ok(Self::Held(Holder::acquire(
             account,
@@ -452,10 +718,67 @@ impl Admission {
         )?))
     }
 
+    fn cpu(&self) -> &SharedCpu {
+        match self {
+            Self::Held(holder) => &holder.cpu,
+            Self::Inherited(inherited) => &inherited.cpu,
+        }
+    }
+
+    /// The verified shared account CPU budget, when this run has one.
+    pub fn budget(&self) -> Option<&SharedCpuBudget> {
+        self.cpu().budget()
+    }
+
+    /// One line describing the CPU policy this admitted tree will apply, in
+    /// host-relative terms. The parent rate is the kernel readback, never the
+    /// requested value.
+    pub fn cpu_report(&self, budget: &Budget) -> String {
+        if matches!(self, Self::Inherited(_)) {
+            return "heavy: cpu policy: the admitted tree already applies the aggregate CPU policy; this nested call adds no second CPU cap".into();
+        }
+        let parent = self.cpu().parent_rate();
+        match self.cpu().budget() {
+            None => match budget.cpu_percent {
+                None => "heavy: cpu policy: the shared account ceiling was not established (degraded); no per-operation limit is configured".into(),
+                Some(percent) => format!(
+                    "heavy: cpu policy: the shared account ceiling was not established (degraded); per-operation limit {percent}% of host CPU applies against host capacity{}",
+                    if percent == LEGACY_DEFAULT_CPU_PERCENT {
+                        legacy_default_note()
+                    } else {
+                        String::new()
+                    }
+                ),
+            },
+            Some(_) => match (budget.cpu_percent, self.cpu().inner_rate(budget)) {
+                (None, _) => "heavy: cpu policy: no per-operation limit; the shared account CPU ceiling is the CPU policy for this batch".into(),
+                (Some(percent), None) => format!(
+                    "heavy: cpu policy: per-operation limit {percent}% of host CPU is not lower than the shared account ceiling {}%; the shared ceiling governs and no inner rate is applied{}",
+                    percent_text(f64::from(parent) / 100.0),
+                    if percent == LEGACY_DEFAULT_CPU_PERCENT {
+                        legacy_default_note()
+                    } else {
+                        String::new()
+                    }
+                ),
+                (Some(percent), Some(inner)) => format!(
+                    "heavy: cpu policy: per-operation limit {percent}% of host CPU; inner cpu_rate={inner} against the verified parent rate {} (effective {}% of host CPU){}",
+                    percent_text(f64::from(parent) / 100.0),
+                    percent_text(effective_percent(inner, parent)),
+                    if percent == LEGACY_DEFAULT_CPU_PERCENT {
+                        legacy_default_note()
+                    } else {
+                        String::new()
+                    }
+                ),
+            },
+        }
+    }
+
     pub fn holder(&self) -> ProcessIdentity {
         match self {
             Self::Held(holder) => holder.identity,
-            Self::Inherited { holder, .. } => *holder,
+            Self::Inherited(inherited) => inherited.holder,
         }
     }
 
@@ -463,7 +786,7 @@ impl Admission {
     pub fn job_name(&self) -> &str {
         match self {
             Self::Held(holder) => holder.job.as_str(),
-            Self::Inherited { job, .. } => job.as_str(),
+            Self::Inherited(inherited) => inherited.job.as_str(),
         }
     }
 
@@ -472,7 +795,7 @@ impl Admission {
     pub fn scope(&self) -> &'static str {
         match self {
             Self::Held(_) => "aggregate",
-            Self::Inherited { .. } => "containment",
+            Self::Inherited(_) => "containment",
         }
     }
 
@@ -480,30 +803,60 @@ impl Admission {
     /// aggregate machine budget once for the whole tree; a verified nested
     /// caller adds containment only, because Windows applies a nested Job's CPU
     /// rate as a proportion of its parent's rate
-    /// (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION Remarks).
+    /// (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION Remarks). With no explicit
+    /// per-operation limit the shared outer ceiling is the CPU policy, so the
+    /// Job carries no rate at all.
     pub fn limits(&self, budget: &Budget) -> Limits {
         match self {
             Self::Held(_) => Limits {
                 memory_bytes: Some(budget.memory_bytes),
-                cpu_percent: Some(budget.cpu_percent),
+                cpu_percent: self.inner_percent(budget),
             },
-            Self::Inherited { .. } => Limits {
+            Self::Inherited(_) => Limits {
                 memory_bytes: None,
                 cpu_percent: None,
             },
         }
     }
 
+    /// The translated inner rate for this tree, if any.
+    fn inner_rate(&self, budget: &Budget) -> Option<u32> {
+        match self {
+            Self::Held(_) => self.cpu().inner_rate(budget),
+            Self::Inherited(_) => None,
+        }
+    }
+
+    fn inner_percent(&self, budget: &Budget) -> Option<f64> {
+        self.inner_rate(budget).map(percent_of_rate)
+    }
+
     /// The one owned Job every consumer of this owner runs its children in,
     /// together with the marker those children inherit. The lease holder names
     /// the Job and applies the aggregate limits; a verified nested caller adds
-    /// an anonymous kill-on-close Job with no second cap.
+    /// an anonymous kill-on-close Job with no second cap. The kernel readback of
+    /// the created Job must carry exactly the intended rate: a translated limit
+    /// is never assumed, and an accidental second cap is refused.
     pub fn owned_job(&self, budget: &Budget, account: &Path) -> io::Result<(Job, OsString)> {
         let limits = self.limits(budget);
         let job = match self {
             Self::Held(holder) => Job::new_named(limits, &holder.job)?,
-            Self::Inherited { .. } => Job::new(limits)?,
+            Self::Inherited(_) => Job::new(limits)?,
         };
+        let rate = job.snapshot()?.cpu_rate;
+        match self.inner_rate(budget) {
+            Some(intended) if rate != intended => {
+                return Err(io::Error::other(format!(
+                    "the per-operation CPU limit did not reach the admitted Job (kernel readback {rate}, intended {intended}); refusing to run with an unverified CPU policy"
+                )));
+            }
+            None if rate != 0 => {
+                return Err(io::Error::other(format!(
+                    "the admitted Job carries an unexpected CPU rate {rate} while no per-operation limit applies"
+                )));
+            }
+            _ => {}
+        }
         Ok((job, self.marker(account)?))
     }
 
@@ -536,11 +889,16 @@ impl Admission {
 
 /// Verified containment, not identity: the marker is honored only while its
 /// recorded holder still runs and the kernel confirms that this process belongs
-/// to the Job the marker names. A live peer PID, a stale marker or a copied Job
-/// name therefore cannot claim the aggregate allowance.
+/// to the Job the marker names, and only while that name is one of this owner's
+/// admitted-tree names. A live peer PID, a stale marker, a copied Job name or a
+/// marker that names an unrelated Job this process happens to be in therefore
+/// cannot claim the aggregate allowance.
 fn inherited(value: Option<&OsStr>, account: &Path) -> Option<LeaseMarker> {
     let marker: LeaseMarker = serde_json::from_str(&value?.to_string_lossy()).ok()?;
-    if marker.schema != SCHEMA || !same_directory(&marker.account, account) {
+    if marker.schema != SCHEMA
+        || !same_directory(&marker.account, account)
+        || !marker.job.starts_with(JOB_NAME_PREFIX)
+    {
         return None;
     }
     if !live_process(marker.holder) || !in_job(&marker.job) {
@@ -678,6 +1036,14 @@ pub fn label(program: &OsStr, args: &[OsString]) -> String {
 /// Run one command inside a fresh bounded Job under the account budget. The
 /// command tree is cleaned before this returns; only a cleanup deadline failure
 /// is reported as `Cleanup`.
+///
+/// The payload is created while it is still suspended, in the shared account
+/// CPU budget (outer) and this operation's lifecycle Job (inner) whenever the
+/// account budget is available, and the kernel is asked whether the payload
+/// really belongs to that budget before any payload code runs. A nested call
+/// inside an admitted tree keeps an anonymous containment Job instead: its
+/// ancestors already carry the aggregate budget, and a second inner rate is
+/// never applied because a nested Job's rate is a proportion of its parent's.
 pub fn execute(
     budget: &Budget,
     account: &Path,
@@ -697,12 +1063,51 @@ pub fn execute(
         .map_err(RunError::Start)?;
     command.env.insert(OsString::from(LEASE_ENV), Some(marker));
     eprintln!("{}", admission.job_line(&job).map_err(RunError::Start)?);
-    let child = job.spawn(&command).map_err(RunError::Start)?;
+    eprintln!("{}", admission.cpu_report(budget));
+    let suspended = match admission.budget() {
+        // The declared order creates the payload in the account budget and the
+        // lifecycle Job at once; the process owner verifies the whole list
+        // before this call returns.
+        Some(shared) => shared
+            .spawn_suspended(&job, &command)
+            .map_err(RunError::Start)?,
+        // Without an established account budget the tree keeps the lifecycle
+        // Job and its inherited ancestry; the degraded state is already warned.
+        None => job.spawn_suspended(&command).map_err(RunError::Start)?,
+    };
+    // Kernel membership of the actual payload, asked while it is still
+    // suspended: a marker or a copied name is never the evidence.
+    match admission.budget() {
+        Some(shared)
+            if shared
+                .contains(suspended.process())
+                .map_err(RunError::Start)? =>
+        {
+            eprintln!(
+                "heavy: payload pid={} is a kernel-verified member of the shared account CPU budget job=\"{}\"",
+                suspended.process().identity().pid,
+                shared.name()
+            );
+        }
+        Some(shared) => eprintln!(
+            "heavy: warning: payload pid={} is outside the shared account CPU budget job=\"{}\"; this command runs without the shared CPU ceiling",
+            suspended.process().identity().pid,
+            shared.name()
+        ),
+        None => {}
+    }
+    let child = suspended.resume().map_err(RunError::Start)?;
     eprintln!(
         "heavy: started pid={} memory_limit_bytes={} cpu_percent={} deadline_seconds={}",
         child.identity().pid,
         budget.memory_bytes,
-        budget.cpu_percent,
+        match budget.cpu_percent {
+            Some(percent) => percent_text(percent),
+            None => format!(
+                "shared({})",
+                percent_text(f64::from(admission.cpu().parent_rate()) / 100.0)
+            ),
+        },
         budget.deadline_seconds
     );
     let started = Instant::now();
@@ -813,7 +1218,10 @@ mod tests {
     fn defaults_are_the_installed_values_and_validate() {
         let budget = Budget::default();
         assert_eq!(budget.memory_bytes, 8 * 1024 * MIB);
-        assert_eq!(budget.cpu_percent, 50.0);
+        assert_eq!(
+            budget.cpu_percent, None,
+            "the installed default is no per-operation CPU limit"
+        );
         assert_eq!(budget.deadline_seconds, 1800);
         assert_eq!(budget.queue_wait_seconds, 3600);
         budget.validate("default").unwrap();
@@ -823,11 +1231,15 @@ mod tests {
                 ..budget
             },
             Budget {
-                cpu_percent: 0.0,
+                cpu_percent: Some(0.0),
                 ..budget
             },
             Budget {
-                cpu_percent: f64::NAN,
+                cpu_percent: Some(f64::NAN),
+                ..budget
+            },
+            Budget {
+                cpu_percent: Some(100.5),
                 ..budget
             },
             Budget {
@@ -841,6 +1253,14 @@ mod tests {
         ] {
             assert!(invalid.validate("fixture").is_err(), "{invalid:?}");
         }
+        assert!(
+            Budget {
+                cpu_percent: Some(100.0),
+                ..budget
+            }
+            .validate("fixture")
+            .is_ok()
+        );
     }
 
     #[test]
@@ -853,7 +1273,7 @@ mod tests {
         assert_eq!(Budget::read(&account).unwrap(), Budget::default());
         let adjusted = Budget {
             memory_bytes: 1024 * MIB,
-            cpu_percent: 25.0,
+            cpu_percent: Some(25.0),
             ..Budget::default()
         };
         assert_eq!(
@@ -861,6 +1281,25 @@ mod tests {
             policy_path(&account)
         );
         assert_eq!(Budget::read(&account).unwrap(), adjusted);
+        // The installed default is representable and round-trips: an absent
+        // field and an explicit reset both mean "the shared ceiling governs".
+        fs::write(policy_path(&account), b"{\"schema\":1}").unwrap();
+        assert_eq!(Budget::read(&account).unwrap(), Budget::default());
+        fs::write(
+            policy_path(&account),
+            b"{\"schema\":1,\"cpu_percent\":null}",
+        )
+        .unwrap();
+        assert_eq!(Budget::read(&account).unwrap().cpu_percent, None);
+        // A legacy file recording the retired default stays an effective limit.
+        fs::write(
+            policy_path(&account),
+            b"{\"schema\":1,\"cpu_percent\":50.0}",
+        )
+        .unwrap();
+        let legacy = Budget::read(&account).unwrap();
+        assert_eq!(legacy.cpu_percent, Some(50.0));
+        assert!(legacy_default_cpu_percent(&legacy));
         fs::write(policy_path(&account), b"{").unwrap();
         assert!(
             Budget::read(&account)
@@ -897,6 +1336,16 @@ mod tests {
         // A live holder identity and an existing account are not containment:
         // this process is in no such Job, so the marker is refused.
         assert!(inherited(Some(OsStr::new(&value)), &account).is_none());
+        // A marker that names an unrelated Job this process may well be inside
+        // is refused as well: only this owner's admitted-tree names are honored.
+        let unrelated = LeaseMarker {
+            schema: SCHEMA,
+            account: account.clone(),
+            job: "SomeUnrelatedJob".into(),
+            holder: live,
+        };
+        let unrelated = serde_json::to_string(&unrelated).unwrap();
+        assert!(inherited(Some(OsStr::new(&unrelated)), &account).is_none());
         let elsewhere = temp.path().join("elsewhere");
         prepare(&elsewhere).unwrap();
         assert!(inherited(Some(OsStr::new(&value)), &elsewhere).is_none());
@@ -914,41 +1363,52 @@ mod tests {
     }
 
     #[test]
-    fn only_the_lease_holder_applies_the_aggregate_budget_to_its_job() {
-        let temp = tempfile::tempdir().unwrap();
-        let account = temp.path().join("account");
-        prepare(&account).unwrap();
-        let budget = Budget {
-            memory_bytes: 1024 * MIB,
-            cpu_percent: 25.0,
+    fn translated_limits_keep_host_relative_meaning_and_round_down() {
+        // 25% of host CPU below a 75% parent: the inner Job may use a third of
+        // its parent, and the effective host ceiling never exceeds the request.
+        assert_eq!(translate_ceiling(25.0, 7500), Some(3333));
+        assert!(
+            effective_percent(3333, 7500) <= 25.0,
+            "rounding must stay conservative"
+        );
+        // The retired default becomes a host-relative 50%, not a second 50% of
+        // the shared ceiling (which would leave 37.5%).
+        assert_eq!(translate_ceiling(50.0, 7500), Some(6666));
+        assert!(effective_percent(6666, 7500) <= 50.0);
+        // Without a rate-controlled ancestor an inner rate is a host rate.
+        assert_eq!(translate_ceiling(25.0, HOST_RATE), Some(2500));
+        // A ceiling that is not lower than the parent's adds no inner rate at
+        // all, so nothing can multiply.
+        assert_eq!(translate_ceiling(75.0, 7500), None);
+        assert_eq!(translate_ceiling(90.0, 7500), None);
+        // The percent handed to the Job owner floors back to the exact rate.
+        for rate in [1, 100, 2500, 3333, 6666, 9999] {
+            assert_eq!((percent_of_rate(rate) * 100.0).floor() as u32, rate);
+        }
+    }
+
+    #[test]
+    fn policy_summary_names_the_shared_ceiling_and_the_legacy_value() {
+        let summary = cpu_policy_summary(&Budget::default());
+        assert!(summary.contains("no per-operation CPU limit"), "{summary}");
+        assert!(summary.contains("shared account 75% ceiling"), "{summary}");
+        let limited = cpu_policy_summary(&Budget {
+            cpu_percent: Some(25.0),
+            ..Budget::default()
+        });
+        assert!(limited.contains("25% of host CPU"), "{limited}");
+        assert!(!limited.contains("retired"), "{limited}");
+        let legacy = Budget {
+            cpu_percent: Some(LEGACY_DEFAULT_CPU_PERCENT),
             ..Budget::default()
         };
-        let cancellation = Cancellation::default();
-        let held = Admission::acquire(&account, &budget, "fixture", &cancellation).unwrap();
-        let (job, marker) = held.owned_job(&budget, &account).unwrap();
-        // The marker names the Job this owner actually created, so a child of
-        // the tree proves membership in it instead of queueing on it.
-        assert_eq!(held.scope(), "aggregate");
-        assert!(named_job_exists(held.job_name()));
-        let marker: LeaseMarker = serde_json::from_str(&marker.to_string_lossy()).unwrap();
-        assert_eq!(marker.job, held.job_name());
-        let snapshot = job.snapshot().unwrap();
-        assert_eq!(snapshot.memory_limit_bytes, budget.memory_bytes);
-        assert_eq!(snapshot.cpu_rate, 2500);
-        assert!(snapshot.kill_on_close);
-        // A nested Windows Job's CPU rate is a proportion of its parent's, so a
-        // verified nested caller must not apply a second memory or CPU cap.
-        let nested = Admission::Inherited {
-            job: held.job_name().to_owned(),
-            holder: current_identity().unwrap(),
-        };
-        let (containment, _) = nested.owned_job(&budget, &account).unwrap();
-        let snapshot = containment.snapshot().unwrap();
-        assert_eq!(nested.scope(), "containment");
-        assert_eq!(nested.job_name(), held.job_name());
-        assert_eq!(snapshot.memory_limit_bytes, 0);
-        assert_eq!(snapshot.cpu_rate, 0);
-        assert!(snapshot.kill_on_close);
+        assert!(legacy_default_cpu_percent(&legacy));
+        let summary = cpu_policy_summary(&legacy);
+        assert!(
+            summary.contains("retired 50% batch default"),
+            "the ambiguous legacy value must be reported, not silently changed: {summary}"
+        );
+        assert!(!legacy_default_cpu_percent(&Budget::default()));
     }
 
     #[test]
@@ -968,24 +1428,6 @@ mod tests {
         // The name is released with the last handle, so the owner can recreate it.
         let reused = Job::new_named(Limits::default(), &name).unwrap();
         drop(reused);
-    }
-
-    /// Query-only existence probe for the named object a marker points at.
-    fn named_job_exists(name: &str) -> bool {
-        use std::os::windows::{
-            ffi::OsStrExt,
-            io::{FromRawHandle, OwnedHandle},
-        };
-        let object: Vec<u16> = OsStr::new(name)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, object.as_ptr()) };
-        if raw.is_null() {
-            return false;
-        }
-        drop(unsafe { OwnedHandle::from_raw_handle(raw) });
-        true
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 use harness_core::{
     heavy_command,
-    process::{Cancellation, StopReason},
+    process::{Cancellation, SHARED_CPU_PERCENT, StopReason},
 };
 use serde_json::json;
 use std::{
@@ -42,7 +42,16 @@ codex-harness heavy budget [--account DIRECTORY] [--memory-bytes N]
   [--cpu-percent P] [--deadline-seconds N] [--queue-wait-seconds N] [--preview]
   Update the local machine budget. Values not supplied keep their effective
   value; nothing is written with --preview. An invalid policy fails before any
-  command starts. Machine values stay outside tracked configuration.";
+  command starts. Machine values stay outside tracked configuration.
+
+CPU policy: by default no per-operation CPU limit is configured and the shared
+account ceiling (75% of host CPU, shared with every other local agent session)
+is the CPU policy for admitted commands. --cpu-percent P configures a deliberate
+per-operation ceiling in percent of host CPU; a value lower than the shared
+ceiling is translated against the kernel-verified parent rate, rounding down,
+and its effective host-relative value is reported. --cpu-percent shared removes
+that limit and returns the shared ceiling. A recorded value of 50% cannot be
+told apart from the retired batch default and is preserved and reported.";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -110,7 +119,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         "heavy: account={} memory_limit_bytes={} cpu_percent={} deadline_seconds={} queue_wait_seconds={}",
         account.display(),
         budget.memory_bytes,
-        budget.cpu_percent,
+        budget_policy_text(&budget),
         budget.deadline_seconds,
         budget.queue_wait_seconds
     );
@@ -266,9 +275,7 @@ fn budget(args: &[OsString]) -> io::Result<i32> {
                     .map_err(|_| invalid("--memory-bytes requires an integer"))?;
             }
             "--cpu-percent" => {
-                updated.cpu_percent = text
-                    .parse()
-                    .map_err(|_| invalid("--cpu-percent requires a number"))?;
+                updated.cpu_percent = parse_cpu_percent(text)?;
             }
             "--deadline-seconds" => {
                 updated.deadline_seconds = text
@@ -302,6 +309,24 @@ fn budget_source(account: &Path) -> String {
     }
 }
 
+/// `shared` is an explicit "no per-operation limit": the shared account ceiling
+/// is the CPU policy, which is the installed default as well.
+fn parse_cpu_percent(text: &str) -> io::Result<Option<f64>> {
+    if text.eq_ignore_ascii_case("shared") {
+        return Ok(None);
+    }
+    text.parse()
+        .map(Some)
+        .map_err(|_| invalid("--cpu-percent requires a number or 'shared'"))
+}
+
+fn budget_policy_text(budget: &heavy_command::Budget) -> String {
+    match budget.cpu_percent {
+        Some(percent) => format!("{percent}"),
+        None => "shared".to_owned(),
+    }
+}
+
 fn report(
     account: &Path,
     budget: &heavy_command::Budget,
@@ -312,23 +337,28 @@ fn report(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "schema": 1,
+                "schema": 2,
                 "memory_bytes": budget.memory_bytes,
                 "cpu_percent": budget.cpu_percent,
                 "deadline_seconds": budget.deadline_seconds,
                 "queue_wait_seconds": budget.queue_wait_seconds,
+                "shared_cpu_percent": SHARED_CPU_PERCENT,
+                "cpu_policy": heavy_command::cpu_policy_summary(budget),
+                "legacy_default_cpu_percent": heavy_command::legacy_default_cpu_percent(budget),
                 "source": source,
             }))?
         );
     } else {
         println!(
-            "memory_bytes={} cpu_percent={} deadline_seconds={} queue_wait_seconds={} source={source} account={}",
+            "memory_bytes={} cpu_percent={} deadline_seconds={} queue_wait_seconds={} shared_cpu_percent={} source={source} account={}",
             budget.memory_bytes,
-            budget.cpu_percent,
+            budget_policy_text(budget),
             budget.deadline_seconds,
             budget.queue_wait_seconds,
+            SHARED_CPU_PERCENT,
             account.display()
         );
+        println!("cpu_policy: {}", heavy_command::cpu_policy_summary(budget));
     }
     Ok(0)
 }

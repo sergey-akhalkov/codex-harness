@@ -1,18 +1,47 @@
 //! Real heavy-command CLI cases in owned account roots, without models or globals.
 //!
-//! Every case uses a synthetic account directory, so the machine queue and its
-//! budget are exercised through the same owner while unrelated consumer state
-//! stays untouched.
+//! Every case uses a synthetic heavy-command account and a synthetic shared CPU
+//! budget account, so the machine queue, its budget and the account CPU ceiling
+//! are exercised through the same owners while the real machine state and any
+//! unrelated consumer stay untouched. Membership is never taken from the
+//! command's own diagnostics: this file queries the kernel directly for the
+//! named Job objects and for the payload processes that must belong to them.
 #![cfg(windows)]
-use harness_core::heavy_command::{Budget, LEASE_ENV};
+use harness_core::{
+    heavy_command::{Budget, LEASE_ENV},
+    process::SHARED_CPU_PERCENT,
+};
 use serde_json::Value;
 use std::{
+    ffi::OsStr,
     fs,
-    path::Path,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
+    System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+            JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
+            QueryInformationJobObject,
+        },
+        Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    },
+};
+
+/// Documented JOB_OBJECT_QUERY right (winnt.h); windows-sys does not export the
+/// job access rights. A query-only handle can neither assign, configure nor
+/// terminate the object it opens.
+const JOB_OBJECT_QUERY: u32 = 0x0004;
+/// The account CPU budget override: heavy callers must never join the machine's
+/// real budget from a test.
+const CPU_ACCOUNT_ENV: &str = "CODEX_HARNESS_CPU_ACCOUNT";
 
 fn manager() -> &'static str {
     env!("CARGO_BIN_EXE_codex-harness")
@@ -20,6 +49,16 @@ fn manager() -> &'static str {
 
 fn fixture_target() -> &'static str {
     env!("CARGO_BIN_EXE_harness-launch-fixture")
+}
+
+/// Test-local shared CPU budget account for one heavy account directory.
+fn cpu_account(account: &Path) -> PathBuf {
+    account.with_file_name("cpu-budget")
+}
+
+/// The installed shared ceiling in the kernel's 0.01% units.
+fn shared_cpu_rate() -> u32 {
+    (SHARED_CPU_PERCENT * 100.0) as u32
 }
 
 /// A heavy call of the owned fixture target through the real CLI.
@@ -32,8 +71,175 @@ fn heavy(account: &Path, current_dir: &Path) -> Command {
         .arg("--")
         .arg(fixture_target())
         .current_dir(current_dir)
+        .env(CPU_ACCOUNT_ENV, cpu_account(account))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command
+}
+
+/// Query-only handle on a named Job object.
+fn open_job(name: &str) -> HANDLE {
+    let object: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, object.as_ptr()) };
+    assert!(!handle.is_null(), "job object {name} is not observable");
+    handle
+}
+
+fn query_job<T: Copy>(handle: HANDLE, class: i32) -> T {
+    let mut value = std::mem::MaybeUninit::<T>::zeroed();
+    let queried = unsafe {
+        QueryInformationJobObject(
+            handle,
+            class,
+            value.as_mut_ptr().cast(),
+            std::mem::size_of::<T>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(queried, 0, "job object query failed");
+    unsafe { value.assume_init() }
+}
+
+/// Kernel CPU rate of one named Job (0 means no rate control is enabled).
+fn job_cpu_rate(name: &str) -> u32 {
+    let handle = open_job(name);
+    let cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
+        query_job(handle, JobObjectCpuRateControlInformation);
+    unsafe { CloseHandle(handle) };
+    if cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE == 0 {
+        return 0;
+    }
+    assert_ne!(
+        cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        0,
+        "job {name} is not a hard cap"
+    );
+    unsafe { cpu.Anonymous.CpuRate }
+}
+
+/// Kernel containment flags and memory limit of one named Job.
+fn job_limits(name: &str) -> (usize, bool) {
+    let handle = open_job(name);
+    let limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+        query_job(handle, JobObjectExtendedLimitInformation);
+    unsafe { CloseHandle(handle) };
+    (
+        limits.JobMemoryLimit,
+        limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0,
+    )
+}
+
+/// Kernel membership of one live process in one named Job, asked from this test
+/// process: the payload's own evidence, never the wrapper's claim.
+fn process_in_job(process: HANDLE, job: &str) -> bool {
+    let job_handle = open_job(job);
+    let mut member = 0;
+    let queried = unsafe { IsProcessInJob(process, job_handle, &mut member) };
+    unsafe { CloseHandle(job_handle) };
+    assert_ne!(queried, 0, "IsProcessInJob failed");
+    member != 0
+}
+
+/// This test process's own identity, so a forged marker can name a holder that
+/// is unquestionably alive and still be refused on its Job name alone.
+fn current_identity() -> (u32, u64) {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let (mut creation, mut exit, mut kernel, mut user) = unsafe {
+        (
+            std::mem::zeroed::<windows_sys::Win32::Foundation::FILETIME>(),
+            std::mem::zeroed::<windows_sys::Win32::Foundation::FILETIME>(),
+            std::mem::zeroed::<windows_sys::Win32::Foundation::FILETIME>(),
+            std::mem::zeroed::<windows_sys::Win32::Foundation::FILETIME>(),
+        )
+    };
+    let queried = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(queried, 0, "GetProcessTimes failed");
+    let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    (std::process::id(), ticks)
+}
+
+/// Wait until the payload process recorded by `HARNESS_LAUNCH_FIXTURE_STARTED`
+/// (the fixture writes its own pid there) is observable and still running, and
+/// return a query-only handle on it.
+fn wait_for_payload(marker: &Path, timeout: Duration) -> HANDLE {
+    wait_for_path(marker, timeout);
+    let pid: u32 = fs::read_to_string(marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("payload pid");
+    let started = Instant::now();
+    loop {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if !handle.is_null() {
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE as u32
+            {
+                return handle;
+            }
+            unsafe { CloseHandle(handle) };
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "payload pid={pid} was not observable while it was running"
+        );
+        sleep(Duration::from_millis(20));
+    }
+}
+
+/// The text recorded in an owned diagnostic file, read while its writer is
+/// still running.
+fn log_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> String {
+    let started = Instant::now();
+    loop {
+        let text = log_text(path);
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "{needle:?} did not appear in the diagnostics within {timeout:?}: {text}"
+        );
+        sleep(Duration::from_millis(20));
+    }
+}
+
+/// Value of a `prefix=value` or `prefix="value"` diagnostic field.
+fn field(text: &str, prefix: &str) -> String {
+    let start = text
+        .find(prefix)
+        .unwrap_or_else(|| panic!("{prefix:?} is missing from {text}"))
+        + prefix.len();
+    text[start..]
+        .trim_start_matches('"')
+        .split(['"', ' ', '\n'])
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+/// One heavy call whose diagnostics stream into an owned file, so the Job names
+/// and the payload can be observed while the command is still running.
+fn heavy_logged(account: &Path, current_dir: &Path, log: &Path) -> Command {
+    let mut command = heavy(account, current_dir);
+    command
+        .stderr(Stdio::from(fs::File::create(log).unwrap()))
+        .stdout(Stdio::null());
     command
 }
 
@@ -125,20 +331,45 @@ fn two_callers_share_one_account_queue_across_checkouts() {
     for name in ["checkout-one", "checkout-two"] {
         fs::create_dir_all(root.join(name)).unwrap();
     }
+    let first_log = root.join("first.log");
     let first_started = root.join("first.started");
     let first_ended = root.join("first.ended");
+    let first_pid = root.join("first.pid");
     let second_started = root.join("second.started");
     let first_ended_evidence = first_ended.clone();
 
-    let mut first = heavy(&account, &root.join("checkout-one"));
+    let mut first = heavy_logged(&account, &root.join("checkout-one"), &first_log);
     first
         .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
         .env("HARNESS_HEAVY_FIXTURE_MS", "1500")
         .env("HARNESS_HEAVY_FIXTURE_STARTED", &first_started)
         .env("HARNESS_HEAVY_FIXTURE_ENDED", &first_ended)
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &first_pid)
         .env("CODEX_HOME", root.join("home-one"));
     let first = first.spawn().unwrap();
     wait_for_path(&first_started, Duration::from_secs(30));
+    // Kernel evidence while the first payload runs: it belongs to the one
+    // account budget at the installed ceiling, and the batch Job adds no
+    // second rate of its own.
+    let payload = wait_for_payload(&first_pid, Duration::from_secs(30));
+    let first_text = wait_for_log(
+        &first_log,
+        "shared account CPU budget job=",
+        Duration::from_secs(30),
+    );
+    let shared_job = field(&first_text, "shared account CPU budget job=");
+    assert_eq!(job_cpu_rate(&shared_job), shared_cpu_rate());
+    assert!(
+        process_in_job(payload, &shared_job),
+        "the first payload must be a member of the one shared account budget"
+    );
+    let heavy_job = field(&first_text, "job scope=aggregate name=");
+    assert_eq!(
+        job_cpu_rate(&heavy_job),
+        0,
+        "the default policy must not add a per-batch CPU rate"
+    );
+    unsafe { CloseHandle(payload) };
 
     // A second checkout with its own Codex home shares the same queue and the
     // same machine budget instead of multiplying the allowance.
@@ -152,7 +383,7 @@ fn two_callers_share_one_account_queue_across_checkouts() {
 
     let first = finish(first, Duration::from_secs(120));
     let second = finish(second, Duration::from_secs(120));
-    let first_stderr = stderr(&first);
+    let first_stderr = log_text(&first_log);
     let second_stderr = stderr(&second);
     assert_eq!(first.status.code(), Some(0), "{first_stderr}");
     assert_eq!(second.status.code(), Some(0), "{second_stderr}");
@@ -168,6 +399,15 @@ fn two_callers_share_one_account_queue_across_checkouts() {
         second_stderr.contains("holder pid=") && second_stderr.contains("command="),
         "the queued diagnostic must name the running holder: {second_stderr}"
     );
+    assert!(
+        second_stderr.contains(&format!("shared account CPU budget job=\"{shared_job}\"")),
+        "both callers must join one shared account group instead of one per checkout: {second_stderr}"
+    );
+    assert!(
+        second_stderr.contains("kernel-verified member of the shared account CPU budget")
+            || second_stderr.contains("joined the shared account CPU budget"),
+        "the second caller must verify its shared membership with the kernel: {second_stderr}"
+    );
     let budget = Budget::default();
     for (name, text) in [("first", &first_stderr), ("second", &second_stderr)] {
         assert!(
@@ -181,6 +421,10 @@ fn two_callers_share_one_account_queue_across_checkouts() {
         assert!(
             text.contains("kill_on_close=true"),
             "the {name} caller must own a kill-on-close Job: {text}"
+        );
+        assert!(
+            text.contains("cpu_rate=0"),
+            "the {name} caller must not add a per-batch CPU cap by default: {text}"
         );
     }
     let ended = read_number(&first_ended_evidence);
@@ -271,6 +515,14 @@ fn stop_reasons_and_startup_failures_are_distinct_and_release_the_slot() {
         limited_stderr.contains("memory_limit_bytes=1073741824")
             && limited_stderr.contains("cpu_percent=25"),
         "{limited_stderr}"
+    );
+    assert!(
+        limited_stderr.contains("cpu_rate=3333"),
+        "an intentional 25% host limit must be translated against the 75% parent, not applied raw: {limited_stderr}"
+    );
+    assert!(
+        limited_stderr.contains("effective 24.9975% of host CPU"),
+        "the effective host-relative value must be reported: {limited_stderr}"
     );
 
     let deadline = budget_cli(&account, &["--deadline-seconds", "1"]);
@@ -423,10 +675,23 @@ fn invalid_local_policy_fails_before_the_command_starts() {
     assert_eq!(inspection.status.code(), Some(0), "{}", stderr(&inspection));
     let effective: Value = serde_json::from_slice(&inspection.stdout).unwrap();
     let budget = Budget::default();
+    assert_eq!(effective["schema"], 2);
     assert_eq!(effective["memory_bytes"], budget.memory_bytes);
-    assert_eq!(effective["cpu_percent"], budget.cpu_percent);
+    assert!(
+        effective["cpu_percent"].is_null(),
+        "the installed default is no per-operation limit: {effective}"
+    );
+    assert_eq!(effective["shared_cpu_percent"], SHARED_CPU_PERCENT);
     assert_eq!(effective["deadline_seconds"], budget.deadline_seconds);
     assert_eq!(effective["queue_wait_seconds"], budget.queue_wait_seconds);
+    assert_eq!(effective["legacy_default_cpu_percent"], false);
+    assert!(
+        effective["cpu_policy"]
+            .as_str()
+            .unwrap()
+            .contains("no per-operation CPU limit"),
+        "{effective}"
+    );
     assert_eq!(effective["source"], "defaults");
     assert!(!account.exists(), "an inspection creates no account state");
 
@@ -491,6 +756,209 @@ fn invalid_local_policy_fails_before_the_command_starts() {
     let text = stderr(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("deadline_seconds=60"), "{text}");
+
+    // `--cpu-percent shared` returns the batch to the shared ceiling: the
+    // report says so and the admitted Job carries no rate at all.
+    let shared = budget_cli(&account, &["--cpu-percent", "shared", "--json"]);
+    assert_eq!(shared.status.code(), Some(0), "{}", stderr(&shared));
+    let shared: Value = serde_json::from_slice(&shared.stdout).unwrap();
+    assert!(shared["cpu_percent"].is_null(), "{shared}");
+    assert_eq!(shared["legacy_default_cpu_percent"], false);
+    let mut command = heavy(&account, &work);
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let output = run(&mut command, Duration::from_secs(60));
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("cpu_rate=0"), "{text}");
+    assert!(text.contains("no per-operation limit"), "{text}");
+
+    // A deliberate 25% host limit is reported in host-relative terms, and a
+    // legacy 50% recording is preserved but never silently treated as a new
+    // default.
+    let limited = budget_cli(&account, &["--cpu-percent", "25", "--json"]);
+    assert_eq!(limited.status.code(), Some(0), "{}", stderr(&limited));
+    let limited: Value = serde_json::from_slice(&limited.stdout).unwrap();
+    assert_eq!(limited["cpu_percent"], 25.0);
+    assert_eq!(limited["legacy_default_cpu_percent"], false);
+    assert!(
+        limited["cpu_policy"]
+            .as_str()
+            .unwrap()
+            .contains("25% of host CPU"),
+        "{limited}"
+    );
+    fs::write(
+        account.join("budget.json"),
+        b"{\"schema\":1,\"cpu_percent\":50.0}",
+    )
+    .unwrap();
+    let legacy = budget_cli(&account, &["--json"]);
+    assert_eq!(legacy.status.code(), Some(0), "{}", stderr(&legacy));
+    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(legacy["cpu_percent"], 50.0);
+    assert_eq!(legacy["legacy_default_cpu_percent"], true);
+    assert!(
+        legacy["cpu_policy"]
+            .as_str()
+            .unwrap()
+            .contains("retired 50% batch default"),
+        "an ambiguous legacy value must be reported, not silently changed: {legacy}"
+    );
+}
+
+#[test]
+fn direct_heavy_call_joins_the_shared_budget_without_a_second_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let log = root.join("heavy.log");
+    let payload_pid = root.join("payload.pid");
+    let mut command = heavy_logged(&account, &work, &log);
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "4000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &payload_pid);
+    let child = command.spawn().unwrap();
+    let payload = wait_for_payload(&payload_pid, Duration::from_secs(30));
+    let text = wait_for_log(&log, "payload pid=", Duration::from_secs(30));
+    let shared_job = field(&text, "shared account CPU budget job=");
+    let heavy_job = field(&text, "job scope=aggregate name=");
+
+    // Kernel readback asked from this test process: one account budget at the
+    // installed ceiling, one lifecycle Job that keeps the memory and cleanup
+    // contract without adding a CPU rate, and a payload that really belongs to
+    // both instead of merely carrying a marker.
+    assert_eq!(job_cpu_rate(&shared_job), shared_cpu_rate());
+    assert_eq!(
+        job_cpu_rate(&heavy_job),
+        0,
+        "the default policy must not add a second CPU cap"
+    );
+    let (memory, kill_on_close) = job_limits(&heavy_job);
+    assert_eq!(memory, Budget::default().memory_bytes);
+    assert!(kill_on_close);
+    assert!(
+        process_in_job(payload, &shared_job),
+        "the payload must be a member of the shared account CPU budget"
+    );
+    assert!(
+        process_in_job(payload, &heavy_job),
+        "the payload must be a member of the owned lifecycle Job"
+    );
+    unsafe { CloseHandle(payload) };
+
+    let output = finish(child, Duration::from_secs(120));
+    assert_eq!(output.status.code(), Some(0), "{}", log_text(&log));
+    let text = log_text(&log);
+    assert!(text.contains("heavy: exited code=0"), "{text}");
+    assert!(
+        text.contains("kernel-verified member of the shared account CPU budget"),
+        "the shared membership must be verified with the kernel: {text}"
+    );
+    assert!(
+        text.contains("no per-operation limit; the shared account CPU ceiling is the CPU policy for this batch"),
+        "{text}"
+    );
+}
+
+#[test]
+fn intentional_lower_limits_keep_host_relative_meaning() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let policy = budget_cli(&account, &["--cpu-percent", "25"]);
+    assert_eq!(policy.status.code(), Some(0), "{}", stderr(&policy));
+
+    // A deliberately configured 25% of host CPU below the shared 75% ceiling:
+    // the inner Job rate is relative to its verified parent, so the effective
+    // host-relative ceiling is preserved instead of being multiplied into
+    // 18.75% or applied raw as 25% of the parent.
+    let log = root.join("limited.log");
+    let payload_pid = root.join("limited.pid");
+    let mut command = heavy_logged(&account, &work, &log);
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "4000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &payload_pid);
+    let child = command.spawn().unwrap();
+    let payload = wait_for_payload(&payload_pid, Duration::from_secs(30));
+    let text = wait_for_log(&log, "effective ", Duration::from_secs(30));
+    let shared_job = field(&text, "shared account CPU budget job=");
+    let heavy_job = field(&text, "job scope=aggregate name=");
+    assert_eq!(job_cpu_rate(&shared_job), shared_cpu_rate());
+    let inner = job_cpu_rate(&heavy_job);
+    assert_eq!(
+        inner, 3333,
+        "25% of host CPU under a 75% parent is a third of the parent"
+    );
+    assert_ne!(
+        inner, 2500,
+        "the raw percentage must not be used as a parent rate"
+    );
+    assert_ne!(
+        inner, 1875,
+        "the default must not multiply nested percentages"
+    );
+    assert!(
+        u64::from(inner) * u64::from(shared_cpu_rate()) / 10_000 <= 2500,
+        "the translated cap must not exceed the documented host-relative ceiling"
+    );
+    let (memory, _) = job_limits(&heavy_job);
+    assert_eq!(memory, Budget::default().memory_bytes);
+    assert!(process_in_job(payload, &shared_job));
+    unsafe { CloseHandle(payload) };
+    let output = finish(child, Duration::from_secs(120));
+    assert_eq!(output.status.code(), Some(0), "{}", log_text(&log));
+    let text = log_text(&log);
+    assert!(
+        text.contains("per-operation limit 25% of host CPU; inner cpu_rate=3333 against the verified parent rate 75 (effective 24.9975% of host CPU)"),
+        "the reported effective value must stay host-relative: {text}"
+    );
+
+    // A limit that is not lower than the shared ceiling adds no inner rate.
+    let policy = budget_cli(&account, &["--cpu-percent", "90"]);
+    assert_eq!(policy.status.code(), Some(0), "{}", stderr(&policy));
+    let mut command = heavy(&account, &work);
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let output = run(&mut command, Duration::from_secs(60));
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("cpu_rate=0"), "{text}");
+    assert!(
+        text.contains("per-operation limit 90% of host CPU is not lower than the shared account ceiling 75%; the shared ceiling governs"),
+        "{text}"
+    );
+
+    // A legacy 50% recording is preserved as a host-relative limit and
+    // reported as ambiguous; it must not become a second 50% of the ceiling.
+    fs::write(
+        account.join("budget.json"),
+        b"{\"schema\":1,\"cpu_percent\":50.0}",
+    )
+    .unwrap();
+    let mut command = heavy(&account, &work);
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let output = run(&mut command, Duration::from_secs(60));
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("cpu_rate=6666"),
+        "a legacy 50% must be translated to a host-relative 50%: {text}"
+    );
+    assert!(
+        text.contains("retired 50% batch default"),
+        "the ambiguous legacy value must be reported: {text}"
+    );
 }
 
 #[test]
@@ -501,9 +969,12 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
     let work = root.join("work");
     fs::create_dir_all(&work).unwrap();
 
-    // A real nested CLI call: the outer caller owns the lease and applies the
-    // aggregate budget; the inner caller adds containment only, because a
+    // A real nested CLI call: the outer caller owns the lease and joins the
+    // shared account budget; the inner caller adds containment only, because a
     // nested Windows Job's CPU rate is a proportion of its parent's rate.
+    let nested_log = root.join("nested.log");
+    let nested_started = root.join("nested.started");
+    let nested_pid = root.join("nested.pid");
     let mut nested = Command::new(manager());
     nested
         .arg("heavy")
@@ -517,12 +988,51 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
         .arg("--")
         .arg(fixture_target())
         .current_dir(&work)
+        .env(CPU_ACCOUNT_ENV, cpu_account(&account))
         .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "2500")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &nested_started)
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &nested_pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&nested_log).unwrap()));
+    let nested = nested.spawn().unwrap();
+    let payload = wait_for_payload(&nested_pid, Duration::from_secs(30));
+    let text = wait_for_log(&nested_log, "scope=containment", Duration::from_secs(30));
+    let heavy_job = field(&text, "job scope=aggregate name=");
+    let shared_job = field(&text, "shared account CPU budget job=");
+
+    // Kernel evidence for the nested payload itself, asked while it runs: it is
+    // a member of the one account budget and of the outer admitted Job, and the
+    // outer Job adds no rate of its own.
+    assert_eq!(job_cpu_rate(&shared_job), shared_cpu_rate());
+    assert_eq!(
+        job_cpu_rate(&heavy_job),
+        0,
+        "the admitted Job must not add a second CPU cap"
+    );
+    assert!(
+        process_in_job(payload, &shared_job),
+        "the nested payload must stay inside the shared account CPU budget"
+    );
+    assert!(
+        process_in_job(payload, &heavy_job),
+        "the nested payload must stay inside the admitted Job"
+    );
+    unsafe { CloseHandle(payload) };
+
+    // While the admitted tree runs, a peer queues for the one account slot: the
+    // queue and the shared budget lock are taken in one order only, so both the
+    // nested tree and the queued peer make progress and complete.
+    let peer_started = root.join("peer.started");
+    let peer_ended = root.join("peer.ended");
+    let mut peer = heavy(&account, &work);
+    peer.env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
         .env("HARNESS_HEAVY_FIXTURE_MS", "10")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let nested = finish(nested.spawn().unwrap(), Duration::from_secs(120));
-    let text = stderr(&nested);
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &peer_started)
+        .env("HARNESS_HEAVY_FIXTURE_ENDED", &peer_ended);
+    let peer = finish(peer.spawn().unwrap(), Duration::from_secs(120));
+    let nested = finish(nested, Duration::from_secs(120));
+    let text = log_text(&nested_log);
     assert_eq!(nested.status.code(), Some(0), "{text}");
     assert!(text.contains("scope=aggregate"), "{text}");
     assert!(
@@ -532,15 +1042,36 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
         )),
         "{text}"
     );
-    assert!(text.contains("cpu_rate=5000"), "{text}");
+    assert!(
+        text.contains("job scope=aggregate") && text.contains("cpu_rate=0"),
+        "the lease holder must keep the memory contract without a second CPU rate: {text}"
+    );
     assert!(
         text.contains("this process is a verified member"),
         "the nested caller must prove membership in the admitted Job: {text}"
     );
     assert!(
+        text.contains("kernel-verified member of the shared account CPU budget"),
+        "the nested caller must verify its own shared membership with the kernel: {text}"
+    );
+    assert!(
         text.contains("scope=containment")
             && text.contains("memory_limit_bytes=0 cpu_rate=0 kill_on_close=true"),
         "the nested caller must not apply a second memory or CPU cap: {text}"
+    );
+    assert!(
+        text.contains("this nested call adds no second CPU cap"),
+        "{text}"
+    );
+    assert_eq!(peer.status.code(), Some(0), "{}", stderr(&peer));
+    assert!(
+        stderr(&peer).contains("waiting for the account heavy-command slot"),
+        "the peer must queue for the one account slot: {}",
+        stderr(&peer)
+    );
+    assert!(
+        read_number(&peer_started) > read_number(&nested_started),
+        "the queued peer must not start before the admitted tree's payload"
     );
 
     // Knowing a live holder's identity and the real admitted Job name is still
@@ -580,7 +1111,7 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
     assert_eq!(holder.status.code(), Some(0), "{}", stderr(&holder));
     assert_eq!(forger.status.code(), Some(0), "{forged_stderr}");
     assert!(
-        !forged_stderr.contains("verified member"),
+        !forged_stderr.contains("inheriting the aggregate heavy-command budget"),
         "a live peer identity and a copied Job name are not containment: {forged_stderr}"
     );
     assert!(
@@ -590,6 +1121,43 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
     assert!(
         read_number(&holder_ended) < read_number(&forged_started),
         "the forged marker must run only after the real holder released the slot"
+    );
+
+    // A marker that names the shared account CPU budget Job instead of an
+    // admitted heavy tree is refused as well, even with a live holder: the
+    // shared group is not the admitted heavy-command tree.
+    let (holder_pid, holder_creation) = current_identity();
+    let mut shared_forger = heavy(&account, &work);
+    shared_forger
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10")
+        .env(
+            "HARNESS_HEAVY_FIXTURE_STARTED",
+            root.join("shared-forged.started"),
+        )
+        .env(
+            LEASE_ENV,
+            serde_json::json!({
+                "schema": 1,
+                "account": account.display().to_string(),
+                "job": shared_job,
+                "holder": {
+                    "pid": holder_pid,
+                    "creation_time": holder_creation,
+                },
+            })
+            .to_string(),
+        );
+    let shared_forger = run(&mut shared_forger, Duration::from_secs(120));
+    let shared_forged = stderr(&shared_forger);
+    assert_eq!(shared_forger.status.code(), Some(0), "{shared_forged}");
+    assert!(
+        !shared_forged.contains("inheriting the aggregate heavy-command budget"),
+        "naming the shared CPU budget Job is not heavy-command containment: {shared_forged}"
+    );
+    assert!(
+        shared_forged.contains("scope=aggregate"),
+        "a refused marker must take the real account slot: {shared_forged}"
     );
 }
 
@@ -612,13 +1180,21 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
     assert_eq!(policy.status.code(), Some(0), "{}", stderr(&policy));
     let evidence = root.join("nested-heavy.txt");
     let holder_started = root.join("holder.started");
-    let mut holder = heavy(&account, &work);
+    let holder_log = root.join("holder.log");
+    let mut holder = heavy_logged(&account, &work, &holder_log);
     holder
         .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
         .env("HARNESS_HEAVY_FIXTURE_MS", "2500")
         .env("HARNESS_HEAVY_FIXTURE_STARTED", &holder_started);
     let holder = holder.spawn().unwrap();
     wait_for_path(&holder_started, Duration::from_secs(30));
+    let holder_text = wait_for_log(
+        &holder_log,
+        "shared account CPU budget job=",
+        Duration::from_secs(30),
+    );
+    let shared_job = field(&holder_text, "shared account CPU budget job=");
+    assert_eq!(job_cpu_rate(&shared_job), shared_cpu_rate());
 
     let build = Command::new(manager())
         .arg("build")
@@ -627,8 +1203,10 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
         .arg("--state")
         .arg(&state)
         .env("CODEX_HARNESS_HEAVY_ACCOUNT", &account)
+        .env(CPU_ACCOUNT_ENV, cpu_account(&account))
         .env("HARNESS_HEAVY_TEST_NESTED", manager())
         .env("HARNESS_HEAVY_TEST_EVIDENCE", &evidence)
+        .env("HARNESS_HEAVY_TEST_SHARED_JOB", &shared_job)
         .output()
         .unwrap();
     let build_stderr = stderr(&build);
@@ -650,12 +1228,28 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
         build_stderr.contains("job scope=aggregate"),
         "a direct build must own the named aggregate Job: {build_stderr}"
     );
+    assert!(
+        build_stderr.contains("joined the shared account CPU budget before any payload starts"),
+        "a standalone build must join the common account group so its whole tree inherits it: {build_stderr}"
+    );
+    assert!(
+        build_stderr.contains(&format!("shared account CPU budget job=\"{shared_job}\"")),
+        "the build must join the same group as the rest of the account: {build_stderr}"
+    );
     let nested = fs::read_to_string(&evidence).unwrap_or_default();
     assert!(nested.contains("marker=true"), "{nested}");
     assert!(nested.contains("exit=Some(0)"), "{nested}");
     assert!(
         nested.contains("verified member"),
         "the build's child must reuse the build's admission: {nested}"
+    );
+    assert!(
+        nested.contains("shared_member=true"),
+        "the build tree must be inside the shared account CPU budget, verified by the kernel from inside: {nested}"
+    );
+    assert!(
+        nested.contains(&format!("shared_rate={}", shared_cpu_rate())),
+        "the build tree must read the shared ceiling back from the kernel: {nested}"
     );
     assert!(
         !nested.contains("waiting for the account heavy-command slot"),
@@ -832,7 +1426,9 @@ fn fixture(source: &Path) {
         }
     }
     // The manager's build script proves that the compilation tree inherits the
-    // admission marker and can reuse the build's own admission without queueing.
+    // admission marker and can reuse the build's own admission without queueing,
+    // and it asks the kernel whether this build tree really belongs to the
+    // account CPU budget Job the owner printed (a name is not membership).
     fs::write(
         source.join("crates/manager/build.rs"),
         r#"
@@ -843,8 +1439,11 @@ fn main() {
         .args(["heavy", "--", "cargo", "--version"])
         .output()
         .expect("nested heavy command");
+    let shared = std::env::var("HARNESS_HEAVY_TEST_SHARED_JOB");
+    let shared_member = shared.as_deref().map(job_member).unwrap_or(false);
+    let shared_rate = shared.as_deref().map(job_rate).unwrap_or(0);
     let evidence = format!(
-        "marker={marker} exit={:?} stderr={}",
+        "marker={marker} exit={:?} shared_member={shared_member} shared_rate={shared_rate} stderr={}",
         nested.status.code(),
         String::from_utf8_lossy(&nested.stderr).replace('\n', " | ")
     );
@@ -856,6 +1455,79 @@ fn main() {
         nested.status.success(),
         "nested heavy through the build failed: {evidence}"
     );
+}
+
+/// Documented JOB_OBJECT_QUERY right (winnt.h); a query-only handle can neither
+/// assign, configure nor terminate the object it opens.
+const JOB_OBJECT_QUERY: u32 = 0x0004;
+const JOB_OBJECT_CPU_RATE_CONTROL_ENABLE: u32 = 0x1;
+const JOB_OBJECT_CPU_RATE_CONTROL_CLASS: i32 = 15;
+
+#[repr(C)]
+struct CpuRateControl {
+    control_flags: u32,
+    cpu_rate: u32,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
+    fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    fn IsProcessInJob(
+        process: *mut core::ffi::c_void,
+        job: *mut core::ffi::c_void,
+        result: *mut i32,
+    ) -> i32;
+    fn QueryInformationJobObject(
+        job: *mut core::ffi::c_void,
+        class: i32,
+        info: *mut core::ffi::c_void,
+        size: u32,
+        returned: *mut u32,
+    ) -> i32;
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+}
+
+fn open_job(name: &str) -> *mut core::ffi::c_void {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr()) }
+}
+
+fn job_member(name: &str) -> bool {
+    let job = open_job(name);
+    if job.is_null() {
+        return false;
+    }
+    let mut member = 0;
+    let queried = unsafe { IsProcessInJob(GetCurrentProcess(), job, &mut member) };
+    unsafe { CloseHandle(job) };
+    queried != 0 && member != 0
+}
+
+fn job_rate(name: &str) -> u32 {
+    let job = open_job(name);
+    if job.is_null() {
+        return 0;
+    }
+    let mut info = CpuRateControl {
+        control_flags: 0,
+        cpu_rate: 0,
+    };
+    let queried = unsafe {
+        QueryInformationJobObject(
+            job,
+            JOB_OBJECT_CPU_RATE_CONTROL_CLASS,
+            (&raw mut info).cast(),
+            std::mem::size_of::<CpuRateControl>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(job) };
+    if queried == 0 || info.control_flags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE == 0 {
+        return 0;
+    }
+    info.cpu_rate
 }
 "#,
     )
