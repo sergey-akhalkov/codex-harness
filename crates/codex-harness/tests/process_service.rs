@@ -583,3 +583,284 @@ fn service_without_account_storage_starts_degraded_with_a_visible_warning() {
     fs::write(root.path().join("stop"), []).unwrap();
     assert!(service.wait_for_exit(deadline(8)).unwrap());
 }
+
+/// Kernel behavior probe for the service creation path: a payload created with
+/// a creation-time job list belongs to exactly the listed jobs, so a bounded
+/// helper can start a service outside its own job chain without a provider
+/// container.
+#[test]
+#[ignore = "kernel behavior probe, run explicitly"]
+fn creation_time_job_list_places_the_payload_outside_the_creators_job_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    let creator_job = Job::new(Limits::default()).unwrap();
+    let marker = root.path().join("owner.json");
+    let mut spec = CommandSpec::new(fixture);
+    spec.current_dir = Some(root.path().into());
+    spec.args = vec!["owner-running".into(), marker.clone().into_os_string()];
+    let creator = creator_job.spawn(&spec).unwrap();
+    let report = wait_json(&marker.with_extension("child.json"));
+    let child = ServiceProcess::observe(
+        report["pid"].as_u64().unwrap() as u32,
+        fixture,
+        0,
+        &current_user().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["in_job"], true, "the fixture child has its own job");
+    assert!(
+        !creator_job.owns(child.identity()).unwrap(),
+        "a creation-time job list must not inherit the creator's job chain"
+    );
+    child.terminate(0).unwrap();
+    creator_job.terminate(0, Duration::from_secs(3)).unwrap();
+    assert!(creator.wait_for_exit(Duration::from_secs(3)).unwrap());
+}
+
+/// Kernel behavior probe for the account allowance: while a member runs, does
+/// the object keep its name after the last handle closes? The delivered path
+/// lets a bounded helper establish the allowance and exit before the service
+/// holds its own handle, so a released name would let a later caller create a
+/// second allowance instead of rejoining this one.
+#[test]
+#[ignore = "kernel behavior probe, run explicitly"]
+fn allowance_name_survives_the_last_handle_while_a_member_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let holder = Job::new(Limits::default()).unwrap();
+    let marker = root.path().join("member.json");
+    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    spec.args = vec!["hold".into(), marker.clone().into_os_string()];
+    let member = {
+        let budget = SharedCpuBudget::acquire(&account(root.path()), SHARED_CPU_PERCENT).unwrap();
+        let member = budget.spawn(&holder, &spec).unwrap();
+        drop(budget);
+        member
+    };
+    assert_eq!(wait_json(&marker)["in_job"], true);
+    let rejoined = SharedCpuBudget::acquire(&account(root.path()), SHARED_CPU_PERCENT).unwrap();
+    let snapshot = rejoined.snapshot().unwrap();
+    assert!(
+        rejoined.contains(&member).unwrap(),
+        "the allowance name was released with its last handle (members={})",
+        snapshot.active_processes
+    );
+    holder.terminate(0, Duration::from_secs(3)).unwrap();
+    assert!(member.wait_for_exit(Duration::from_secs(3)).unwrap());
+}
+
+/// Owned native oracle for the breakaway probe: independent Win32 declarations
+/// rather than the implementation's job-query wrappers.
+#[allow(dead_code)]
+mod breakaway_probe {
+    use std::ffi::c_void;
+
+    pub const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+    pub const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+    pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    #[repr(C)]
+    pub struct BasicLimitInformation {
+        pub per_process_user_time_limit: i64,
+        pub per_job_user_time_limit: i64,
+        pub limit_flags: u32,
+        pub minimum_working_set_size: usize,
+        pub maximum_working_set_size: usize,
+        pub active_process_limit: u32,
+        pub affinity: usize,
+        pub priority_class: u32,
+        pub scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    pub struct IoCounters {
+        pub read_operation_count: u64,
+        pub write_operation_count: u64,
+        pub other_operation_count: u64,
+        pub read_transfer_count: u64,
+        pub write_transfer_count: u64,
+        pub other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    pub struct ExtendedLimitInformation {
+        pub basic: BasicLimitInformation,
+        pub io: IoCounters,
+        pub process_memory_limit: usize,
+        pub job_memory_limit: usize,
+        pub peak_process_memory_used: usize,
+        pub peak_job_memory_used: usize,
+    }
+
+    #[repr(C)]
+    pub struct StartupInfo {
+        pub cb: u32,
+        pub reserved: *mut u16,
+        pub desktop: *mut u16,
+        pub title: *mut u16,
+        pub x: u32,
+        pub y: u32,
+        pub x_size: u32,
+        pub y_size: u32,
+        pub x_count_chars: u32,
+        pub y_count_chars: u32,
+        pub fill_attribute: u32,
+        pub flags: u32,
+        pub show_window: u16,
+        pub reserved_units: u16,
+        pub reserved_data: *mut u8,
+        pub std_input: *mut c_void,
+        pub std_output: *mut c_void,
+        pub std_error: *mut c_void,
+    }
+
+    #[repr(C)]
+    pub struct ProcessInformation {
+        pub process: *mut c_void,
+        pub thread: *mut c_void,
+        pub process_id: u32,
+        pub thread_id: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetCurrentProcess"]
+        pub fn current_process() -> *mut c_void;
+        #[link_name = "CreateJobObjectW"]
+        pub fn create_job(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        #[link_name = "SetInformationJobObject"]
+        pub fn set_job(job: *mut c_void, class: u32, value: *const c_void, bytes: u32) -> i32;
+        #[link_name = "AssignProcessToJobObject"]
+        pub fn assign_process(job: *mut c_void, process: *mut c_void) -> i32;
+        #[link_name = "IsProcessInJob"]
+        pub fn in_job(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+        #[link_name = "CreateProcessW"]
+        #[allow(clippy::too_many_arguments)]
+        pub fn create_process(
+            application: *const u16,
+            line: *mut u16,
+            process_attributes: *const c_void,
+            thread_attributes: *const c_void,
+            inherit: i32,
+            flags: u32,
+            environment: *const c_void,
+            directory: *const u16,
+            startup: *const StartupInfo,
+            info: *mut ProcessInformation,
+        ) -> i32;
+        #[link_name = "ResumeThread"]
+        pub fn resume_thread(thread: *mut c_void) -> u32;
+        #[link_name = "TerminateProcess"]
+        pub fn terminate_process(process: *mut c_void, code: u32) -> i32;
+        #[link_name = "CloseHandle"]
+        pub fn close_handle(handle: *mut c_void) -> i32;
+    }
+}
+
+/// Kernel behavior probe for the delivered sibling creation path: a payload
+/// created with `CREATE_BREAKAWAY_FROM_JOB` by a member of a breakaway-enabled
+/// job that is itself nested inside a chain without that limit (here the
+/// shared heavy-command job) must belong to no job at all. Only a job-free
+/// payload can join the account allowance unconditionally in either anchoring
+/// order.
+#[test]
+#[ignore = "kernel behavior probe, run explicitly"]
+fn breakaway_payload_escapes_the_whole_nested_chain() {
+    use breakaway_probe::*;
+    use std::os::windows::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("payload.json");
+    let fixture = Path::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    let name: Vec<u16> = "CodingAgentsHarness.Probe.Breakaway"
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let job = unsafe { create_job(std::ptr::null(), name.as_ptr()) };
+    assert!(
+        !job.is_null(),
+        "probe job creation: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut limits: ExtendedLimitInformation = unsafe { std::mem::zeroed() };
+    limits.basic.limit_flags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    assert_ne!(
+        unsafe {
+            set_job(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&limits as *const ExtendedLimitInformation).cast(),
+                size_of::<ExtendedLimitInformation>() as u32,
+            )
+        },
+        0,
+        "probe job limits: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_ne!(
+        unsafe { assign_process(job, current_process()) },
+        0,
+        "probe membership: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut member = 0;
+    assert_ne!(unsafe { in_job(current_process(), job, &mut member) }, 0);
+    assert_ne!(member, 0, "the probe process must be in its breakaway job");
+
+    let mut line: Vec<u16> = std::iter::once(34u16)
+        .chain(fixture.as_os_str().encode_wide())
+        .chain(" hold \"".encode_utf16())
+        .chain(marker.as_os_str().encode_wide())
+        .chain([34, 0])
+        .collect();
+    let application: Vec<u16> = fixture.as_os_str().encode_wide().chain([0]).collect();
+    let directory: Vec<u16> = root.path().as_os_str().encode_wide().chain([0]).collect();
+    let mut startup: StartupInfo = unsafe { std::mem::zeroed() };
+    startup.cb = size_of::<StartupInfo>() as u32;
+    let mut info: ProcessInformation = unsafe { std::mem::zeroed() };
+    let created = unsafe {
+        create_process(
+            application.as_ptr(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_BREAKAWAY_FROM_JOB
+                | CREATE_NO_WINDOW
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_SUSPENDED,
+            std::ptr::null(),
+            directory.as_ptr(),
+            &startup,
+            &mut info,
+        )
+    };
+    assert_ne!(
+        created,
+        0,
+        "breakaway creation was refused: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut inside = 1;
+    assert_ne!(unsafe { in_job(info.process, job, &mut inside) }, 0);
+    assert_eq!(
+        inside, 0,
+        "breakaway kept the payload inside the requesting job"
+    );
+    // ResumeThread reports the previous suspend count, so a successful resume
+    // returns the one suspension this probe requested.
+    assert_eq!(unsafe { resume_thread(info.thread) }, 1);
+    let report = wait_json(&marker);
+    let any_job = report["in_job"].as_bool().unwrap();
+    unsafe {
+        terminate_process(info.process, 0);
+        close_handle(info.thread);
+        close_handle(info.process);
+        close_handle(job);
+    }
+    assert!(
+        !any_job,
+        "the breakaway payload is still inside an inherited job"
+    );
+}
