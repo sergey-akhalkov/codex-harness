@@ -704,4 +704,40 @@ mod tests {
         }
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn a_document_within_field_limits_can_still_exceed_the_brief_budget() {
+        let root = temp_root("brief-budget");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let mut assignment = checked_in(
+            &root,
+            "assignment.json",
+            &document("Ship the outcome", &["input.txt"], &[]),
+        );
+        // Every list and item stays inside its own limit; the rendered brief
+        // still cannot fit the launcher argument budget.
+        let item = format!("keep the change inside the checkout: {}", "x".repeat(400));
+        assignment.invariants = vec![item.clone(); MAX_LIST_ITEMS];
+        assignment.acceptance = vec![item; MAX_LIST_ITEMS];
+        let error = brief(
+            &assignment,
+            &AssignmentContext {
+                checkout: &root,
+                base: "0123456789abcdef0123456789abcdef01234567",
+                owner: "exec-ds-7",
+                source: &root,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("the rendered assignment brief is"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("the limit is {MAX_BRIEF_BYTES}")),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
