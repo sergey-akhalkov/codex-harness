@@ -132,6 +132,16 @@ Assignments live on the beads board; executors set `lead_review` when done
 instead of closing. The lead reviews that inbox and its own `assignee=lead`
 tasks.
 
+A structured assignment's brief carries the result consumer, the standing
+escalation boundaries, the executor's own investigate, implement, check and
+self-correct cycle, and the compact result expected back: done and remaining
+work, files, actual checks, limitations, required decision and detail locator.
+A declared `consumer` or `escalate` trigger extends that contract instead of
+replacing it, and an executor resolves ordinary implementation errors -
+syntax, API names, failing checks - itself. The schema, optional fields,
+defaults and limits live in
+[native commands](rust-native.md#structured-executor-assignments).
+
 Every executor session runs as a single-agent worker. Dispatch, resume and
 instruction-refresh succession pass Codex CLI's built-in
 `agents.enabled=false` configuration, so the session's tool set contains no
@@ -153,24 +163,17 @@ stop. Ordinary sessions without that activation spawn nothing.
 ## Executor utilization
 
 While the lead role is active, configured executor capacity is not left idle
-by omission. At each checkpoint - session start, stage and epic planning,
-after every dispatch decision, and after every acceptance or slot release -
-the lead either dispatches the next worthwhile, capability-sized slice or
-records the concrete reason the capacity stays idle: no worthwhile slice, an
-unresolved dependency, configured pacing, a preserved slot, or dispatch being
-unavailable with its reported cause. A routing-rule conflict, the single
-configured executor profile, a model preference or unknown quota is not an
-idle reason: dispatch proceeds and the discrepancy is reported. A released
-slot is backfilled with the
-next dispatchable slice before the lead starts unrelated implementation work.
-Lead progress reports state busy slots against the configured concurrency
-limit with each idle reason, taken from board and pool records rather than
-window polling. Idle capacity without a recorded reason is a lead workflow
-defect; manufactured filler work and delegation-count targets are not
-remedies. Requirements live in the
+by omission: at each utilization checkpoint the lead dispatches the next
+worthwhile, capability-sized slice or records the concrete reason the capacity
+stays idle, and released capacity is backfilled before unrelated lead work
+starts. Idle capacity without such a reason, or a report that hides it, is a
+lead workflow defect. Requirements live in the
 [delegation](../openspec/specs/agent-delegation/spec.md) and
 [orchestration](../openspec/specs/lead-agent-orchestration/spec.md)
-specifications; the `team-lead` skill owns the live workflow wording.
+specifications, and the live checkpoints, recorded reasons, occupancy
+reporting and priority rules are owned by the
+[`team-lead` skill](../.agents/skills/team-lead/SKILL.md) rather than restated
+here.
 
 ## Instruction-refresh succession
 

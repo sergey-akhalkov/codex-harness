@@ -102,7 +102,7 @@ rejected before creating build state.
 
 `codex-harness executor spawn` and `resume` accept `--assignment FILE` as an
 alternative to `--exec PROMPT`. Keep the file local or in the owning project;
-do not put consumer details into this pack. Example schema:
+do not put private consumer details into this pack. Example schema:
 
 ```json
 {
@@ -111,9 +111,30 @@ do not put consumer details into this pack. Example schema:
   "inputs": ["Cargo.toml", "src/parser.rs"],
   "outputs": ["src/parser.rs", "tests/parser.rs"],
   "invariants": ["Preserve the public result type"],
-  "acceptance": ["Run the parser tests and report actual results"]
+  "acceptance": ["Run the parser tests and report actual results"],
+  "consumer": "the lead session for sample-17",
+  "escalate": ["any change to the public result type"]
 }
 ```
+
+`consumer` and `escalate` are optional, and both are additive. Omission of
+`consumer` names the dispatching lead as the result consumer. The rendered
+brief always carries the standing escalation boundaries - a change to the
+agreed outcome or scope, a material architecture or design change, missing
+authority or access, and a concrete dependency the executor cannot obtain -
+so a declared `escalate` item adds a task-specific trigger instead of
+replacing them, and an omitted field adds nothing. Nothing else escalates:
+ordinary implementation errors (syntax, incorrect API names, failing checks)
+belong to the executor, which investigates, corrects and re-runs them.
+
+The brief also carries the executor's own work cycle - read the declared
+inputs, investigate the current source and callers before editing, implement
+the owned outcome, run the applicable checks, correct local errors and repeat
+- and the compact result the consumer expects back: done and remaining work,
+the exact files touched, how each acceptance item was verified with the checks
+actually run, limitations, the decision needed from the consumer and where the
+full detail lives. Source bodies are supplied only as an explicit fallback
+when reading is unavailable.
 
 Paths are relative to the allocated checkout. Inputs must exist as files;
 outputs may be new. Absolute paths, traversal and links escaping the checkout

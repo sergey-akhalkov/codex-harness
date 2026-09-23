@@ -2,11 +2,14 @@
 //!
 //! An assignment file replaces free-text dispatch with declared facts: the
 //! objective, the existing inputs it may rely on, the output files it owns,
-//! its invariants and its acceptance conditions. Validation is deterministic
-//! and model-free: the document, its limits and every declared path are
-//! checked against the allocated checkout before a launcher process opens a
-//! model conversation, and the rendered brief carries the actual checkout,
-//! the committed base and the exact relative paths.
+//! its invariants, its acceptance conditions, the consumer of the returned
+//! result and the escalation boundaries that return decisions to that
+//! consumer. Validation is deterministic and model-free: the document, its
+//! limits and every declared path are checked against the allocated checkout
+//! before a launcher process opens a model conversation, and the rendered
+//! brief carries the actual checkout, the committed base and the exact
+//! relative paths together with the executor's own work cycle and the compact
+//! evidence result the consumer expects back.
 
 use serde::Deserialize;
 use std::{
@@ -26,6 +29,21 @@ pub const MAX_RELATIVE_PATH_BYTES: usize = 240;
 /// Bound on the rendered brief handed to the launcher process.
 pub const MAX_BRIEF_BYTES: usize = 16 * 1024;
 
+/// Who consumes the returned result when the assignment does not declare a
+/// consumer: the lead that dispatched it is always the direct consumer.
+pub const DEFAULT_CONSUMER: &str = "the lead that dispatched this assignment";
+
+/// Escalation boundaries every assignment carries. Declared `escalate` items
+/// are added to these; they never replace them, because a change to the agreed
+/// outcome, a material architecture change, missing authority and an
+/// unobtainable dependency always return to the consumer.
+pub const STANDING_ESCALATIONS: [&str; 4] = [
+    "a change to the agreed outcome or scope",
+    "a material architecture or design change",
+    "missing authority or access",
+    "a concrete dependency you cannot obtain",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assignment {
@@ -35,6 +53,13 @@ pub struct Assignment {
     pub outputs: Vec<String>,
     pub invariants: Vec<String>,
     pub acceptance: Vec<String>,
+    /// Consumer of the returned result; omitted means the dispatching lead.
+    #[serde(default)]
+    pub consumer: Option<String>,
+    /// Additional triggers that return the decision to the consumer; the
+    /// standing boundaries apply in every case.
+    #[serde(default)]
+    pub escalate: Vec<String>,
 }
 
 /// The actual dispatch context the brief names: the bound checkout, its
@@ -90,6 +115,10 @@ impl Assignment {
         require_text("objective", &self.objective, MAX_OBJECTIVE_BYTES)?;
         require_text_list("invariants", &self.invariants)?;
         require_text_list("acceptance", &self.acceptance)?;
+        require_text_list("escalate", &self.escalate)?;
+        if let Some(consumer) = &self.consumer {
+            require_text("consumer", consumer, MAX_ITEM_BYTES)?;
+        }
         if self.acceptance.is_empty() {
             return Err(invalid(
                 "assignment acceptance is empty; name at least one checkable acceptance item",
@@ -129,6 +158,14 @@ impl Assignment {
 /// path, so a lead can exercise the exact rendering without a model request.
 pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
     assignment.validate_paths(context.checkout)?;
+    let consumer = consumer_text(assignment);
+    let mut escalations = STANDING_ESCALATIONS.map(str::to_owned).to_vec();
+    escalations.extend(
+        assignment
+            .escalate
+            .iter()
+            .map(|item| item.trim().to_owned()),
+    );
     let mut text = String::new();
     text.push_str("Structured executor assignment (schema 1)\n");
     text.push_str(&format!("objective: {}\n", assignment.objective.trim()));
@@ -136,6 +173,7 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     text.push_str(&format!("base: {}\n", context.base));
     text.push_str(&format!("source: {}\n", context.source.display()));
     text.push_str(&format!("owner: {}\n", context.owner));
+    text.push_str(&format!("consumer: {consumer}\n"));
     push_list(
         &mut text,
         "inputs (declared; verified regular files inside the checkout)",
@@ -148,8 +186,23 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     );
     push_list(&mut text, "invariants", &assignment.invariants);
     push_list(&mut text, "acceptance", &assignment.acceptance);
+    push_list(
+        &mut text,
+        &format!(
+            "escalate to {consumer} (everything else, including ordinary implementation errors, is yours to resolve)"
+        ),
+        &escalations,
+    );
     text.push_str(
-        "Before editing, verify the checkout is at the base above (git rev-parse HEAD) and report a mismatch instead of editing. Choose the installed skills this assignment needs and announce their first use. Keep every change inside the checkout. When the outcome is complete, report what changed, the exact files touched and how each acceptance item was verified.\n",
+        "work cycle (yours): read the declared inputs yourself - source bodies are supplied only when reading is unavailable - investigate the current source and callers before editing, implement the outcome you own, run the applicable checks through the real entry point, then correct your own local errors and repeat.\n",
+    );
+    text.push_str(
+        "Before editing, verify the checkout is at the base above (git rev-parse HEAD) and report a mismatch instead of editing. Choose the installed skills this assignment needs and announce their first use. Keep every change inside the checkout and leave partial work resumable for a continuation.\n",
+    );
+    text.push_str(
+        &format!(
+            "When the outcome is complete, report a compact result: done and remaining work, the exact files touched, how each acceptance item was verified with the checks actually run, limitations, the decision you need from {consumer}, and where the full detail lives.\n"
+        ),
     );
     if text.len() > MAX_BRIEF_BYTES {
         return Err(invalid(&format!(
@@ -158,6 +211,18 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
         )));
     }
     Ok(text)
+}
+
+/// The declared consumer, or the dispatching lead when the field is omitted
+/// or blank. `validate` rejects a declared blank value, and the fallback keeps
+/// a directly constructed assignment rendering a named consumer.
+fn consumer_text(assignment: &Assignment) -> &str {
+    assignment
+        .consumer
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CONSUMER)
 }
 
 fn push_list(text: &mut String, title: &str, values: &[String]) {
@@ -519,6 +584,124 @@ mod tests {
             text.contains("Choose the installed skills this assignment needs"),
             "{text}"
         );
+        // The result consumer, the escalation boundaries and the executor's
+        // own cycle are part of the rendered contract, not of the caller's
+        // prose.
+        assert!(
+            text.contains(&format!("consumer: {DEFAULT_CONSUMER}")),
+            "{text}"
+        );
+        assert!(
+            text.contains("escalate to the lead that dispatched this assignment"),
+            "{text}"
+        );
+        for boundary in STANDING_ESCALATIONS {
+            assert!(text.contains(boundary), "{boundary}\n{text}");
+        }
+        assert!(
+            text.contains("work cycle (yours): read the declared inputs yourself"),
+            "{text}"
+        );
+        assert!(
+            text.contains("report a compact result: done and remaining work"),
+            "{text}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn consumer_and_escalation_are_optional_and_validated() {
+        let root = temp_root("contract-fields");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let source = root.join("source");
+        let path = root.join("assignment.json");
+        let context = AssignmentContext {
+            checkout: &root,
+            base: "0123456789abcdef0123456789abcdef01234567",
+            owner: "exec-ds-7",
+            source: &source,
+        };
+
+        // Omission keeps a schema-1 document valid: the dispatching lead
+        // consumes the result and the standing boundaries still apply.
+        let minimal = checked_in(
+            &root,
+            "assignment.json",
+            &document("Ship the outcome", &["input.txt"], &[]),
+        );
+        assert_eq!(minimal.consumer, None);
+        assert!(minimal.escalate.is_empty());
+        let text = brief(&minimal, &context).unwrap();
+        assert!(
+            text.contains("escalate to the lead that dispatched this assignment"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the decision you need from the lead that dispatched this assignment"),
+            "{text}"
+        );
+
+        // A declared consumer and extra triggers are carried into the brief,
+        // and the standing boundaries are not replaced by them.
+        let mut declared: serde_json::Value =
+            serde_json::from_str(&document("Ship the outcome", &["input.txt"], &[])).unwrap();
+        declared["consumer"] = serde_json::json!("the lead of epic sample-3mu");
+        declared["escalate"] = serde_json::json!(["any change to the synthetic crate layout"]);
+        fs::write(&path, serde_json::to_string(&declared).unwrap()).unwrap();
+        let assignment = Assignment::load(&path).unwrap();
+        let text = brief(&assignment, &context).unwrap();
+        assert!(
+            text.contains("consumer: the lead of epic sample-3mu"),
+            "{text}"
+        );
+        assert!(
+            text.contains("escalate to the lead of epic sample-3mu"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- any change to the synthetic crate layout"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- a material architecture or design change"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the decision you need from the lead of epic sample-3mu"),
+            "{text}"
+        );
+
+        // Malformed values fail before any rendering, with the field named.
+        let too_long_consumer = "x".repeat(MAX_ITEM_BYTES + 1);
+        for (field, value, expected) in [
+            (
+                "consumer",
+                serde_json::json!(""),
+                "assignment consumer is empty",
+            ),
+            (
+                "consumer",
+                serde_json::json!(too_long_consumer),
+                "the limit is",
+            ),
+            (
+                "escalate",
+                serde_json::json!([""]),
+                "assignment escalate[0] is empty",
+            ),
+            (
+                "escalate",
+                serde_json::json!(vec!["escalate this"; MAX_LIST_ITEMS + 1]),
+                "the limit is",
+            ),
+        ] {
+            let mut broken: serde_json::Value =
+                serde_json::from_str(&document("Ship the outcome", &["input.txt"], &[])).unwrap();
+            broken[field] = value;
+            fs::write(&path, serde_json::to_string(&broken).unwrap()).unwrap();
+            let error = Assignment::load(&path).unwrap_err().to_string();
+            assert!(error.contains(expected), "{field}: {error}");
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

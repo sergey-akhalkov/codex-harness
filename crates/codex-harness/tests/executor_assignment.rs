@@ -69,20 +69,33 @@ impl Fixture {
     }
 
     fn assignment(&self, name: &str, inputs: &[&str], outputs: &[&str]) -> PathBuf {
+        self.assignment_with(name, &[], inputs, outputs)
+    }
+
+    /// The same schema-1 document with additional top-level fields, so a check
+    /// can declare the optional contract fields or a deliberately malformed
+    /// one without hand-writing JSON in every case.
+    fn assignment_with(
+        &self,
+        name: &str,
+        extra: &[(&str, serde_json::Value)],
+        inputs: &[&str],
+        outputs: &[&str],
+    ) -> PathBuf {
         let path = self.root.join(name);
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&json!({
-                "schema": 1,
-                "objective": "Extend the synthetic module",
-                "inputs": inputs,
-                "outputs": outputs,
-                "invariants": ["keep the change inside the checkout"],
-                "acceptance": ["the synthetic check passes"],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let mut document = json!({
+            "schema": 1,
+            "objective": "Extend the synthetic module",
+            "inputs": inputs,
+            "outputs": outputs,
+            "invariants": ["keep the change inside the checkout"],
+            "acceptance": ["the synthetic check passes"],
+        });
+        let object = document.as_object_mut().unwrap();
+        for (key, value) in extra {
+            object.insert((*key).to_owned(), value.clone());
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
         path
     }
 
@@ -321,6 +334,142 @@ fn missing_inputs_traversal_and_absolute_paths_are_rejected() {
     fixture.drop();
 }
 
+/// The result consumer and the escalation boundaries reach the exact brief
+/// the installed render path prints: an existing schema-1 document keeps
+/// working with the dispatching lead as the consumer, and a declared consumer
+/// or trigger is carried beside the standing boundaries instead of replacing
+/// them.
+#[test]
+fn consumer_and_escalation_reach_the_rendered_brief() {
+    let fixture = Fixture::new("contract");
+    fs::write(fixture.slot.join("input.txt"), "declared input\n").unwrap();
+
+    // No declared contract fields: the schema-1 document still validates.
+    let minimal = fixture.assignment("assignment.json", &["input.txt"], &["out.txt"]);
+    let out = fixture.check(&minimal, &[]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("consumer: the lead that dispatched this assignment"),
+        "{text}"
+    );
+    assert!(
+        text.contains("escalate to the lead that dispatched this assignment"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- a change to the agreed outcome or scope"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- a concrete dependency you cannot obtain"),
+        "{text}"
+    );
+    assert!(
+        text.contains("work cycle (yours): read the declared inputs yourself"),
+        "{text}"
+    );
+    assert!(
+        text.contains("report a compact result: done and remaining work"),
+        "{text}"
+    );
+
+    // Declared consumer and additional triggers travel with the standing ones.
+    let declared = fixture.assignment_with(
+        "declared.json",
+        &[
+            ("consumer", json!("the lead of epic sample-3mu")),
+            (
+                "escalate",
+                json!(["any change to the synthetic fixture layout"]),
+            ),
+        ],
+        &["input.txt"],
+        &["out.txt"],
+    );
+    let out = fixture.check(&declared, &[]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("consumer: the lead of epic sample-3mu"),
+        "{text}"
+    );
+    assert!(
+        text.contains("escalate to the lead of epic sample-3mu"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- any change to the synthetic fixture layout"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- a material architecture or design change"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the decision you need from the lead of epic sample-3mu"),
+        "{text}"
+    );
+    fixture.drop();
+}
+
+/// Malformed contract fields fail before any rendering, with the field named,
+/// and an unknown field beside them is still refused: the optional fields do
+/// not loosen schema-1 validation.
+#[test]
+fn malformed_contract_fields_are_refused_without_writing() {
+    let fixture = Fixture::new("contract-reject");
+    fs::write(fixture.slot.join("input.txt"), "declared input\n").unwrap();
+    let before = git_output(
+        &fixture.slot,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+
+    for (name, field, value, expected) in [
+        (
+            "empty-consumer.json",
+            "consumer",
+            json!(""),
+            "assignment consumer is empty",
+        ),
+        (
+            "long-consumer.json",
+            "consumer",
+            json!("x".repeat(600)),
+            "assignment consumer is",
+        ),
+        (
+            "empty-trigger.json",
+            "escalate",
+            json!([""]),
+            "assignment escalate[0] is empty",
+        ),
+        (
+            "renamed-field.json",
+            "escalations",
+            json!(["any change to the layout"]),
+            "unknown field",
+        ),
+    ] {
+        let assignment =
+            fixture.assignment_with(name, &[(field, value)], &["input.txt"], &["out.txt"]);
+        let out = fixture.check(&assignment, &[]);
+        let text = output_text(&out);
+        assert!(!out.status.success(), "{name}: {text}");
+        assert!(text.contains(expected), "{name}: {text}");
+    }
+
+    // Every refusal happened before anything was rendered, claimed or written.
+    assert_eq!(
+        git_output(
+            &fixture.slot,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        before
+    );
+    assert!(!fixture.slot.join("out.txt").exists());
+    fixture.drop();
+}
 /// A directory junction is the unprivileged Windows reparse point a declared
 /// path could use to leave the checkout; both an input reaching through it and
 /// an output created through it must be rejected before anything is read.

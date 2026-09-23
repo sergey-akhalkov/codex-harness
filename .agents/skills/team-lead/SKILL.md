@@ -110,34 +110,37 @@ Brief executors through harness commands, not by automating TUI keystrokes:
 codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --base REV --exec "assignment"
 ```
 
-For file-specific work, prefer `--assignment FILE` instead of `--exec`.
-The schema-1 JSON contains `objective` (include the board id), `inputs` and
-`outputs` as checkout-relative file paths, and string arrays `invariants` and
-`acceptance`. Dispatch validates existing inputs and path containment, allows
-new output files, and generates the actual checkout and full committed base
-before starting a model. It cannot decide whether the declared scope is complete.
-The same option works with `resume` while preserving partial work.
+For file-specific work, prefer `--assignment FILE` instead of `--exec`. The
+schema-1 document declares `objective` (include the board id), `inputs` and
+`outputs` as checkout-relative file paths, and the string arrays `invariants`
+and `acceptance`; it cannot decide whether the declared scope is complete. Two
+optional fields carry the rest of the contract: `consumer` names who consumes
+the returned result (default: the dispatching lead) and `escalate` adds
+triggers that return the decision to that consumer. The rendered brief always
+carries the standing boundaries - a change to the agreed outcome or scope, a
+material architecture change, missing authority, an unobtainable dependency -
+together with the executor's own work cycle and the compact result expected
+back (done and remaining work, files, actual checks, limitations, required
+decision, detail locator), so do not restate those in the objective. Ordinary
+implementation errors stay with the executor: it investigates, corrects and
+re-runs them itself.
 `executor assignment --source CHECKOUT --slot N --base REV --assignment FILE`
-validates and renders against an existing pool checkout without dispatch.
+validates and renders that brief against an existing pool checkout without
+dispatch; the same option works with `resume` while preserving partial work.
 The complete example and limits live in the kit's
 [native commands](../../../docs/rust-native.md#structured-executor-assignments).
 
 `--source` is the repository checkout, and `executor spawn` is the sole
-allocator of executor isolation: it selects a free slot of the harness-owned
-pool (sibling worktrees `<repository-name>-wt1` .. `-wtN`, where `N` is
-`max_concurrent_executors`), creates that position on first use, synchronizes
-the slot with upstream and binds the session to it before the first model
-request. `--workspace` is optional and no longer the isolation mechanism: it
-must name the source checkout or one of its pool slots, and an ad-hoc worktree
-path is refused. `--base REV` starts the slot from another revision than the
-fetched upstream default branch; `--owner ID` labels the session binding
-(default `exec-<profile>-<pid>`), and dispatching again with the same owner id
-rebinds the same slot - including after an interruption - instead of creating
-another tree.
-An interrupted session continues with `codex-harness executor resume --slot N
---owner ID --session SESSION_ID` on its recorded slot: the rebind skips fetch,
-reset and clean so partial work survives, the owner and slot stay explicit,
-and hand-edited `executor run` receipts are never the resume path.
+allocator of executor isolation: it synchronizes the selected pool slot and
+binds the session to it before the first model request. `--base REV` starts
+the slot from another revision than the upstream default branch; `--owner ID`
+labels the session binding (default `exec-<profile>-<pid>`), and dispatching
+again with the same owner id rebinds the same slot - including after an
+interruption - instead of creating another tree. `--workspace` is not the
+isolation mechanism: it must name the source checkout or one of its pool
+slots, and an ad-hoc worktree path is refused. Slot allocation, resume and
+terminal semantics live in
+[agent delegation](../../../docs/agent-delegation.md#executor-worktrees).
 
 Fix a committed snapshot before every dispatch. Commit assignment-relevant
 changes in the source checkout - a local commit is enough, and pushing stays
@@ -166,19 +169,14 @@ contract.
 
 Each executor gets a complete outcome, its configured profile, its own visible
 terminal tab or window, and a synchronized pool slot before the first model
-request. Freshness is mechanical, not an executor obligation: dispatch fetches
-the configured remote and resets the slot to the resolved base (untracked files
-removed, ignored build caches kept) before that request, so no executor-side
-synchronization step is needed or accepted in its place. The brief names the
-exact base revision; the executor verifies its slot HEAD is that revision
-before substantive edits and stops with a report on mismatch instead of
-repairing synchronization itself - redispatch with the same owner id corrects
-the slot. Executors never create an additional worktree: when every slot is
-held by a live session, wait or stop
-a running assignment instead of allocating another tree. `executor spawn`
-establishes the view itself: inside the lead's Windows terminal it opens a
-titled tab of the same terminal. Do not resize, move or arrange desktop windows
-- including this terminal - so sessions fit the screen; titled tabs are
+request; freshness is dispatch's job, not an executor obligation. The brief
+names the exact base revision, and the executor verifies its slot HEAD is that
+revision before substantive edits and stops with a report on mismatch instead
+of repairing synchronization itself - redispatch with the same owner id
+corrects the slot. Executors never create an additional worktree: when every
+slot is held by a live session, wait or stop a running assignment instead of
+allocating another tree. Do not resize, move or arrange desktop windows -
+including this terminal - so sessions fit the screen; titled tabs are
 sufficient and simultaneous tiling is not required. Do not write to the shared
 checkout. Do not solve delegated work in parallel. A small or tightly coupled
 task stays with the lead.
@@ -208,21 +206,22 @@ outcome inside the assignment, the executor posts a short board comment on
 its issue (done, next, blockers in at most three lines) instead of waiting
 for the lead to ask.
 The default exec mode streams the assignment in a visible tab and exits on
-completion, closing the tab; a mid-work stop is detected by the watcher and
-the exact session continues through `codex-harness executor resume --slot N
---owner ID --session SESSION_ID`. Do not
-prefix prompts with `/goal`: the CLI has no argv goal hook and the prefix
-would be inert text. Accept only against the assignment, not effort spent.
-Spawn returns after the executor window/tab is open so the lead can keep
-working. Executors look at the board and do assigned issues.
+completion, closing the tab; a mid-work stop is continued on the recorded slot
+through the resume path below. Do not prefix prompts with `/goal`: the CLI has
+no argv goal hook and the prefix would be inert text. Accept only against the
+assignment, not effort spent. Spawn returns after the executor window/tab is
+open so the lead can keep working. Executors look at the board and do assigned
+issues.
 
 ## Steer, wait, stop
 
 Deliver steering through the controller session channel into the executor's
 visible conversation. No hidden model calls and no status polling. Wait without
-takeover while an executor remains active. Executors escalate as board feedback
-tasks. `codex-harness` task stop remains the emergency path that works without
-the lead. Explicit stop stays stopped after restart.
+takeover while an executor remains active. An executor that reaches a declared
+escalation boundary returns the needed decision with its result; improvement
+observations arrive as board feedback tasks. `codex-harness` task stop remains
+the emergency path that works without the lead. Explicit stop stays stopped
+after restart.
 Do not poll from model turns or executor PIDs. While an executor runs, keep
 one native watcher process that checks the board review queue, the
 assignment's result artifact and executor liveness on a cheap shell loop and
@@ -268,13 +267,17 @@ rejected, the improvement stays unadopted.
 
 ## Accept and merge
 
-Review completed assignments against requirements and applicable checks. Merge
-accepted branches yourself. Return in-scope defects with acceptance conditions
-to the original executor. Record acceptance on the board and in task state.
-Reconcile planning artifacts explicitly on integration: an executor's
-tasks.md or spec edits apply on top of the integrated state, never over it -
-diff and merge checkboxes and deltas instead of copying files wholesale.
-Executor slots are pool-owned, not task-owned. The pool never grows past
+Review each completed assignment against requirements and applicable checks,
+using the returned compact result - files, actual checks and outcomes,
+limitations, required decision, detail locator - and treat a completion claim
+as evidence of state, not proof that the named checks passed. Merge accepted
+branches yourself. Return in-scope defects with acceptance conditions to the
+original executor. Record acceptance on the board and in task state. Reconcile
+planning artifacts explicitly on integration: an executor's tasks.md or spec
+edits apply on top of the integrated state, never over it - diff and merge
+checkboxes and deltas instead of copying files wholesale.
+
+Executor slots are pool-owned, not task-owned: the pool never grows past
 `max_concurrent_executors`, and slots are reused while conversations are not.
 Return a finished slot to the pool through the explicit release path, which
 records your disposition before anything is destroyed:
@@ -283,31 +286,23 @@ records your disposition before anything is destroyed:
 codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT
 ```
 
-Release resets the slot to the committed base with ignored build caches kept, so
-the next dispatch binds the same path; keep merged branches. A slot that cannot
-be safely reset is preserved with its reason and stays out of the pool until you
-resolve it: never force-reset unreviewed work, force-remove a tree, or count a
-preserved slot as free. Dispatch is fail-closed: no free slot, a failed upstream
-fetch, an occupied dirty slot, unreviewed changes in a free slot or a missing
-slot each abort with the concrete cause - a registered-but-missing slot asks for
-`git worktree prune` - instead of allocating another tree. `codex-harness
-executor pool --source CHECKOUT --codex-home DIRECTORY` reports the recorded
-mapping per slot (index, path, presence, tree state, state, lease, owner, base)
-and lists foreign or legacy worktrees for your review; `git worktree list` stays
-the authoritative tree inventory, and slot purpose lives in kit-local task state
-and board records, never in tracked files. An interruption keeps the recorded
-mapping; resume the exact session on its slot to keep partial work, while a
-second live owner of one slot is refused instead of sharing a checkout.
-Legacy task-named or CLI-named executor trees in a consuming repository are
-never adopted or deleted by dispatch: merge accepted work, retire the rest with
-authorized `git worktree remove`, and prune stale entries afterwards.
+A slot that cannot be safely reset is preserved with its reason and stays out
+of the pool until you resolve it: never force-reset unreviewed work,
+force-remove a tree, or count a preserved slot as free. Dispatch is fail-closed
+and names the concrete cause instead of allocating another tree - a
+registered-but-missing slot asks for `git worktree prune` - and it never
+destroys unreviewed work. `executor pool` reports the recorded mapping, every
+slot awaiting your review and the foreign or legacy worktrees only you retire;
+slot purpose lives in kit-local task state and board records, never in tracked
+files. An interruption keeps the recorded mapping, and a second live owner of
+one slot is refused instead of sharing a checkout. Slot state, release, pool
+and legacy-tree semantics live in
+[agent delegation](../../../docs/agent-delegation.md#executor-worktrees).
 Executors set status `lead_review` instead of closing. The lead closes on
-accept or returns the item to `in_progress` with conditions.
-Executor terminal tabs are per-assignment, never pooled: pool slots are reused,
-conversations are not, and a fresh session must not inherit another
-assignment's context. Exec mode closes the tab when the assignment finishes;
-nothing lingers and nobody has to remember to close it.
-To return defects or continue after a stop, resume the exact session
+accept or returns the item to `in_progress` with conditions. Executor terminal
+tabs are per-assignment, never pooled: a fresh session must not inherit another
+assignment's context, and exec mode closes its tab when the assignment
+finishes. To return defects or continue after a stop, resume the exact session
 (`codex-harness executor resume --slot N --owner ID --session SESSION_ID` for
 a pooled executor, `codex resume SESSION_ID` interactively otherwise) and
 state the acceptance conditions there.
