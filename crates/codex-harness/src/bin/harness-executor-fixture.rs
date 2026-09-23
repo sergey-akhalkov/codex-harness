@@ -8,14 +8,18 @@
 //!
 //! Modes come from `HARNESS_EXECUTOR_FIXTURE_MODE`: `complete` (default),
 //! `empty`, `nofinal`, `error`, `nonzero`, `malformed`, `truncated`, `slow`
-//! (delay from `HARNESS_EXECUTOR_FIXTURE_DELAY_MS`) and `hang` (bounded by
-//! `HARNESS_EXECUTOR_FIXTURE_RELEASE`, a file to create).
+//! (delay from `HARNESS_EXECUTOR_FIXTURE_DELAY_MS`), `hang` and `descendant`
+//! (bounded by `HARNESS_EXECUTOR_FIXTURE_RELEASE`, a file to create) plus the
+//! `child-hold` helper the descendant spawns. `HARNESS_EXECUTOR_FIXTURE_STARTED`
+//! records this process's identity immediately, and
+//! `HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER` records the descendant's.
 
 use serde_json::json;
 use std::{
     env, fs,
     io::{self, Write},
     path::PathBuf,
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
@@ -25,11 +29,60 @@ const FINAL_MESSAGE: &str =
     "FIXTURE_OUTCOME_DONE\nremaining: none\nchecks: fixture event stream verified";
 
 fn main() -> io::Result<()> {
+    if let Some(path) = env::var_os("HARNESS_EXECUTOR_FIXTURE_STARTED") {
+        write_identity(PathBuf::from(path))?;
+    }
     let mode = env::var("HARNESS_EXECUTOR_FIXTURE_MODE").unwrap_or_else(|_| "complete".into());
     let session =
         env::var("HARNESS_EXECUTOR_FIXTURE_SESSION").unwrap_or_else(|_| DEFAULT_SESSION.into());
     let result = last_message_path(env::args_os().skip(1).collect());
     match mode.as_str() {
+        "child-hold" => {
+            if let Some(marker) = env::var_os("HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER") {
+                write_identity(PathBuf::from(marker))?;
+            }
+            wait_for_release();
+            return Ok(());
+        }
+        "descendant" => {
+            // The descendant exists before the first event, so an interruption
+            // or observer failure must reap a real grandchild process. The hold
+            // keeps producing events so a failing observer notices immediately.
+            let _descendant = std::process::Command::new(env::current_exe()?)
+                .env("HARNESS_EXECUTOR_FIXTURE_MODE", "child-hold")
+                // The descendant records its own identity marker only.
+                .env_remove("HARNESS_EXECUTOR_FIXTURE_STARTED")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            event(json!({"type": "thread.started", "thread_id": session}));
+            event(json!({"type": "turn.started"}));
+            event(json!({"type": "item.completed", "item": {
+                "id": "message-1", "type": "agent_message", "text": "descendant fixture is holding"
+            }}));
+            let release = env::var_os("HARNESS_EXECUTOR_FIXTURE_RELEASE").map(PathBuf::from);
+            let until = Instant::now() + Duration::from_secs(60);
+            let mut round = 0;
+            while Instant::now() < until {
+                if release.as_deref().is_some_and(|path| path.is_file()) {
+                    break;
+                }
+                round += 1;
+                event(json!({"type": "item.completed", "item": {
+                    "id": format!("hold-{round}"), "type": "agent_message",
+                    "text": format!("descendant hold {round}")
+                }}));
+                thread::sleep(Duration::from_millis(400));
+            }
+            return exit(3);
+        }
+        "stderr-noise" => {
+            eprintln!("FIXTURE_STDERR_SENTINEL: owned failure detail");
+            event(json!({"type": "thread.started", "thread_id": session}));
+            event(json!({"type": "turn.started"}));
+            return exit(19);
+        }
         "nonzero" => {
             eprintln!("fixture launcher fails before any native event");
             return exit(19);
@@ -100,14 +153,7 @@ fn main() -> io::Result<()> {
             event(json!({"type": "item.started", "item": {
                 "id": "command-1", "type": "command_execution", "command": "fixture long command"
             }}));
-            let release = env::var_os("HARNESS_EXECUTOR_FIXTURE_RELEASE").map(PathBuf::from);
-            let until = Instant::now() + Duration::from_secs(60);
-            while Instant::now() < until {
-                if release.as_deref().is_some_and(|path| path.is_file()) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+            wait_for_release();
             return exit(7);
         }
         _ => {}
@@ -153,6 +199,37 @@ fn usage() -> serde_json::Value {
 fn event(value: serde_json::Value) {
     println!("{value}");
     let _ = io::stdout().flush();
+}
+
+/// Records this process's full identity (pid, creation time) so a check can
+/// verify containment with a real identity instead of a bare pid.
+fn write_identity(path: PathBuf) -> io::Result<()> {
+    let program = env::current_exe()?;
+    let user = harness_core::process_service::current_user()?;
+    let identity = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &program,
+        0,
+        &user,
+    )?
+    .identity();
+    fs::write(
+        path,
+        serde_json::to_vec(&identity).map_err(io::Error::other)?,
+    )
+}
+
+/// Bounded hold used by `hang`/`descendant`: a release file lets the check end
+/// it deterministically, and the 60-second bound prevents a leaked fixture.
+fn wait_for_release() {
+    let release = env::var_os("HARNESS_EXECUTOR_FIXTURE_RELEASE").map(PathBuf::from);
+    let until = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < until {
+        if release.as_deref().is_some_and(|path| path.is_file()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn last_message_path(args: Vec<std::ffi::OsString>) -> Option<PathBuf> {

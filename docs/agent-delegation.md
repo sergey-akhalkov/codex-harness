@@ -357,6 +357,21 @@ it. A created tab is not a native start: only `thread.started` establishes the
 session identity. TUI and legacy receipts record coverage as unavailable
 instead of guessing an identity.
 
+The host owns its launcher tree from birth in a Windows Job: an abnormal host
+death (a closed or killed tab) reaps the launcher and every descendant, while
+an ordinary session exit preserves the CLI's own background members, matching
+the launcher's established policy. Host identity, the transient event spool,
+the bounded detail file and the initial recorded state must all succeed before
+any launcher process starts; a later read, render or record failure terminates
+and drains the owned tree and fails the host, so a failing observer never
+reports a successful run and never leaves a conversation running without its
+visible surface. The launcher's stderr is retained in
+`stderr-<N>.log` beside the receipt and its bounded tail is shown when the run
+fails. One writer at a time updates a receipt (a kit-local lock serializes the
+console dispatcher's window record and the host's lifecycle record, and each
+write replaces the document atomically), so concurrent writers cannot lose
+each other's fields.
+
 The lead waits for an executor through that record; no model polling and no
 rollout search is involved:
 
@@ -368,14 +383,17 @@ codex-harness executor watch --receipt FILE [--json]
 Watch blocks until the run reaches a terminal state and then prints bounded
 review data: state, slot, owner, exact session, checkout, base, changed files,
 the executor's returned message (reported by the executor, not verified
-acceptance), the result and detail locators and the exit code. It exits 0 for
-a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage
-is unavailable (tui or legacy receipt) or the timeout expired while the run
-continued. An interrupted host is reported with its reason and an unknown exit
-code, never as a completion. `executor pool` adds `run=<state> session=<id>`
-per slot, and `executor release` prints the last observed run beside the
-disposition it records while still refusing to reset a live or unreviewed
-slot.
+acceptance), the result, detail and stderr locators and the exit code. Changed
+files are reported in two bounded segments - committed changes compared with
+the recorded base through `git diff <base>..HEAD`, and the current working tree
+including untracked files - so a committed executor result never reads as "no
+changes", and truncation is named. Watch exits 0 for a completed run, 1 for
+failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or
+legacy receipt) or the timeout expired while the run continued. An interrupted
+host is reported with its reason and an unknown exit code, never as a
+completion. `executor pool` adds `run=<state> session=<id>` per slot, and
+`executor release` prints the last observed run beside the disposition it
+records while still refusing to reset a live or unreviewed slot.
 
 An observed `executor run --file` - the process a tab or console hosts - exits
 0 only for a completed turn with a nonempty final message, otherwise propagates

@@ -52,8 +52,8 @@ const USAGE: &str = concat!(
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
     "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default exec mode runs `codex exec --json` with --output-last-message behind the tab host: the host renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal, while the same stream is recorded as an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) in the kit-local dispatch receipt beside the exact native session identity, the returned result locator and a bounded detail file. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
-    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files, the executor's returned message (reported, not verified acceptance), result and detail locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. ",
+    "The default exec mode runs `codex exec --json` with --output-last-message behind the tab host: the host renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal, while the same stream is recorded as an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) in the kit-local dispatch receipt beside the exact native session identity, the returned result locator and a bounded detail file. The launcher tree runs inside the host-owned Windows Job, so an abnormal host death reaps it while an ordinary session exit preserves the CLI's own background members; the launcher's stderr is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the event spool, the bounded detail file and the initial record must all succeed before any launcher starts, and a later read, render or record failure terminates and drains the owned tree and fails the host instead of reporting a successful run. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
+    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
     "Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified."
@@ -1086,7 +1086,7 @@ struct WatchReport {
     session: Option<String>,
     checkout: Option<String>,
     base: Option<String>,
-    changed: Option<(usize, Vec<String>, bool)>,
+    changed: Option<ChangedReport>,
     returned: Option<String>,
     returned_bytes: Option<u64>,
     result: Option<String>,
@@ -1108,7 +1108,9 @@ impl WatchReport {
         let binding = receipt_binding(value).ok().flatten();
         let checkout = binding.as_ref().map(|binding| binding.path.clone());
         let base = binding.as_ref().map(|binding| binding.base.clone());
-        let changed = checkout.as_deref().and_then(changed_files);
+        let changed = checkout
+            .as_deref()
+            .and_then(|checkout| changed_report(checkout, base.as_deref()));
         let returned = run.result.as_deref().and_then(read_returned);
         Self {
             state: state.to_owned(),
@@ -1149,21 +1151,28 @@ impl WatchReport {
             self.base.as_deref().unwrap_or("-")
         ));
         match &self.changed {
-            Some((count, files, truncated)) => {
-                let detail = if files.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " ({}; {})",
-                        files.join("; "),
-                        if *truncated {
-                            "more files than listed"
-                        } else {
-                            "all changed files"
-                        }
-                    )
-                };
-                text.push_str(&format!("changed files: {count}{detail}\n"));
+            Some(changed) => {
+                text.push_str(&format!(
+                    "changed files: {} (committed {} since {}; working tree {}{})\n",
+                    changed.count(),
+                    changed.committed.len(),
+                    changed.base.as_deref().unwrap_or("no recorded base"),
+                    changed.working.len(),
+                    if changed.truncated {
+                        "; list truncated"
+                    } else {
+                        ""
+                    }
+                ));
+                if !changed.committed.is_empty() {
+                    text.push_str(&format!("  committed: {}\n", changed.committed.join("; ")));
+                }
+                if !changed.working.is_empty() {
+                    text.push_str(&format!("  working: {}\n", changed.working.join("; ")));
+                }
+                if let Some(note) = &changed.note {
+                    text.push_str(&format!("  note: {note}\n"));
+                }
             }
             None => text.push_str("changed files: unavailable (no recorded checkout)\n"),
         }
@@ -1211,10 +1220,13 @@ impl WatchReport {
             "session": self.session,
             "checkout": self.checkout,
             "base": self.base,
-            "changedFiles": self.changed.as_ref().map(|(count, files, truncated)| json!({
-                "count": count,
-                "files": files,
-                "truncated": truncated,
+            "changedFiles": self.changed.as_ref().map(|changed| json!({
+                "count": changed.count(),
+                "committed": changed.committed,
+                "working": changed.working,
+                "truncated": changed.truncated,
+                "base": changed.base,
+                "note": changed.note,
             })),
             "returned": self.returned,
             "returnedBytes": self.returned_bytes,
@@ -1247,32 +1259,84 @@ fn read_returned(result: &Path) -> Option<(String, u64, bool)> {
     Some((excerpt, metadata.len(), truncated))
 }
 
-/// Changed files of the recorded checkout, bounded: the lead reviews paths,
-/// not a whole diff.
-fn changed_files(checkout: &Path) -> Option<(usize, Vec<String>, bool)> {
+/// What changed in the recorded checkout relative to the recorded base and in
+/// the current tree. A committed executor result must not read as "no
+/// changes": the committed segment is the base-to-HEAD diff and the working
+/// segment includes untracked files. Both segments are bounded.
+struct ChangedReport {
+    committed: Vec<String>,
+    working: Vec<String>,
+    truncated: bool,
+    base: Option<String>,
+    note: Option<String>,
+}
+
+impl ChangedReport {
+    fn count(&self) -> usize {
+        self.committed.len() + self.working.len()
+    }
+}
+
+fn changed_report(checkout: &Path, base: Option<&str>) -> Option<ChangedReport> {
     if !checkout.is_dir() {
         return None;
     }
+    let mut truncated = false;
+    let mut note = None;
+    let committed = match base.filter(|base| !base.trim().is_empty()) {
+        Some(base) => match git_lines(
+            checkout,
+            &["diff", "--name-status", &format!("{base}..HEAD")],
+        ) {
+            Some(lines) => {
+                truncated |= lines.len() > MAX_CHANGED_FILES;
+                lines.into_iter().take(MAX_CHANGED_FILES).collect()
+            }
+            None => {
+                note = Some(format!(
+                    "base {base} is not a commit in this checkout; committed changes were not compared"
+                ));
+                Vec::new()
+            }
+        },
+        None => {
+            note = Some("no recorded base; committed changes were not compared".into());
+            Vec::new()
+        }
+    };
+    let working = git_lines(
+        checkout,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .unwrap_or_default();
+    truncated |= working.len() > MAX_CHANGED_FILES;
+    Some(ChangedReport {
+        committed,
+        working: working.into_iter().take(MAX_CHANGED_FILES).collect(),
+        truncated,
+        base: base
+            .filter(|base| !base.trim().is_empty())
+            .map(str::to_owned),
+        note,
+    })
+}
+
+fn git_lines(cwd: &Path, args: &[&str]) -> Option<Vec<String>> {
     let out = Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
-        .current_dir(checkout)
+        .args(args)
+        .current_dir(cwd)
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<String> = text
-        .lines()
-        .map(|line| line.trim_end().to_owned())
-        .filter(|line| !line.is_empty())
-        .collect();
-    let truncated = lines.len() > MAX_CHANGED_FILES;
-    Some((
-        lines.len(),
-        lines.into_iter().take(MAX_CHANGED_FILES).collect(),
-        truncated,
-    ))
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim_end().replace('\t', " "))
+            .filter(|line| !line.is_empty())
+            .collect(),
+    )
 }
 
 fn parse_seconds(value: Option<&str>, fallback: u64, name: &str) -> io::Result<Duration> {
@@ -1864,8 +1928,9 @@ fn assignment_excerpt(args: &serde_json::Value) -> Option<String> {
 }
 
 /// Hosts one observed run: the recorded launcher runs with its event stream
-/// piped, so this process renders the session readably and keeps the receipt's
-/// lifecycle current. The child's own exit code stays the outcome.
+/// spooled under an owned job, so this process renders the session readably,
+/// keeps the receipt's lifecycle current and stays the sole cleanup authority
+/// of the launcher tree. The child's own exit code stays the outcome.
 fn run_observed_receipt(
     launcher: &str,
     rest: &[OsString],
@@ -1878,20 +1943,30 @@ fn run_observed_receipt(
     if !Path::new(&launcher).is_absolute() {
         return Err(invalid("executor run launcher must be absolute"));
     }
-    let mut command = Command::new(&launcher);
-    command.args(rest);
+    let mut spec = CommandSpec::new(&launcher);
+    spec.args = rest.to_vec();
     // The hosted Codex process and everything it starts are an executor tree.
-    command.env(EXECUTOR_SESSION_ENV, "1");
+    spec.env
+        .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
     if let Some(shell) = shell {
-        command.env("PATH", &shell.path);
+        spec.env.insert("PATH".into(), Some(shell.path.clone()));
     }
-    if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_RUN_LOG") {
-        let file = fs::File::create(&log)
-            .map_err(|error| invalid(&format!("executor run log: {error}")))?;
-        command.stderr(file);
-    }
+    // The launcher's stderr is retained locally: the visible surface shows a
+    // bounded tail when the run fails, and the locator is always reported.
+    let stderr_log = match std::env::var_os("HARNESS_EXECUTOR_RUN_LOG") {
+        Some(path) => PathBuf::from(path),
+        None => receipt.with_extension("stderr.log"),
+    };
+    spec.stderr = Some(fs::File::create(&stderr_log).map_err(|error| {
+        invalid(&format!(
+            "executor run stderr log {}: {error}",
+            stderr_log.display()
+        ))
+    })?);
+    // The CLI reads its prompt from the argument, so its stdin is NUL.
+    spec.stdin = None;
     let mut tracker = observation::RunTracker::new(run);
-    observation::run_observed(&mut command, receipt, &mut tracker, header)
+    observation::run_observed(spec, receipt, &mut tracker, header, Some(&stderr_log))
 }
 
 /// The recorded pool slot binding of a receipt; receipts written before the
@@ -2359,7 +2434,7 @@ fn spawn_summary(
         ),
     };
     format!(
-        "executor started: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\"\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
+        "executor dispatch accepted: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\" (native start is observed, not implied)\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
         receipt.display(),
         receipt.display()
     )
@@ -2464,9 +2539,12 @@ fn save_receipt(
     if let Some(dir) = receipt.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(
+    // The dispatcher's write goes through the same receipt lock as the host's
+    // lifecycle writes: a previous run's last record cannot collide with this
+    // dispatch, and both fields survive a concurrent writer.
+    observation::write_receipt_document(
         receipt,
-        serde_json::to_vec_pretty(&json!({
+        &json!({
             "schema": 1,
             "launcher": native_path(launcher)?,
             "profile": profile,
@@ -2483,7 +2561,7 @@ fn save_receipt(
             "window": window,
             "shell": shell,
             "observation": run,
-        }))?,
+        }),
     )
 }
 
@@ -3739,6 +3817,11 @@ mod tests {
         assert!(summary.contains("model=deepseek-flash"));
         assert!(summary.contains("provider=deepseek"));
         assert!(summary.contains("effort=max"));
+        assert!(
+            summary.contains("executor dispatch accepted:"),
+            "the summary must not claim a started session before the native start is observed: {summary}"
+        );
+        assert!(!summary.contains("executor started"), "{summary}");
         assert!(summary.contains("host=windows-terminal-tab"));
         assert!(summary.contains("title=\"Codex executor (ds)\""));
         assert!(summary.contains("coverage=native"), "{summary}");

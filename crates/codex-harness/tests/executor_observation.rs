@@ -129,13 +129,40 @@ impl SeededRun {
     }
 
     fn observed(&self, mode: &str) -> Output {
-        lead_command()
+        self.observed_with(mode, &[])
+    }
+
+    fn observed_with(&self, mode: &str, envs: &[(&str, &Path)]) -> Output {
+        let mut command = lead_command();
+        command
+            .args(["executor", "run", "--file"])
+            .arg(&self.receipt)
+            .env("HARNESS_EXECUTOR_FIXTURE_MODE", mode)
+            .stdin(Stdio::null());
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        command.output().unwrap()
+    }
+
+    /// Path the host spools the owned child's raw stdout into.
+    fn spool(&self) -> PathBuf {
+        self.receipt.with_extension("running.jsonl")
+    }
+
+    fn host(&self, mode: &str, envs: &[(&str, &Path)]) -> std::process::Child {
+        let mut command = lead_command();
+        command
             .args(["executor", "run", "--file"])
             .arg(&self.receipt)
             .env("HARNESS_EXECUTOR_FIXTURE_MODE", mode)
             .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        command.spawn().unwrap()
     }
 
     fn watch(&self, extra: &[&str]) -> Output {
@@ -374,9 +401,11 @@ fn watch_blocks_on_a_live_run_and_returns_the_compact_result() {
     );
     assert!(output.contains("base: "), "{output}");
     assert!(
-        output.contains("changed files: 1 (?? partial.rs"),
-        "the review data names the changed files: {output}"
+        output.contains("changed files: 1 (committed 0 since ")
+            && output.contains("; working tree 1)"),
+        "the review data separates committed from working-tree changes: {output}"
     );
+    assert!(output.contains("  working: ?? partial.rs"), "{output}");
     assert!(
         output.contains("returned (reported by the executor, not verified acceptance):"),
         "{output}"
@@ -385,10 +414,46 @@ fn watch_blocks_on_a_live_run_and_returns_the_compact_result() {
     assert!(output.contains("result: "), "{output}");
     assert!(output.contains("receipt: "), "{output}");
     assert!(output.contains("exit: 0"), "{output}");
-    let status = host.wait().unwrap();
+    let status = wait_host(&mut host, "slow fixture host");
     assert_eq!(status.code(), Some(0));
     let receipt = receipt_json(&run.receipt);
     assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert!(
+        !run.spool().exists(),
+        "the transient event spool is removed after the run"
+    );
+    // A committed executor result is not "no changes": the next review
+    // compares the recorded base with HEAD and still reports untracked work.
+    git(&slot, &["add", "partial.rs"]);
+    git(&slot, &["commit", "-qm", "commit the executor result"]);
+    fs::write(slot.join("untracked.rs"), "fn extra() {}\n").unwrap();
+    let out = lead_command()
+        .args([
+            "executor",
+            "watch",
+            "--source",
+            pool.source.to_str().unwrap(),
+            "--codex-home",
+            pool.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--timeout",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    let output = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{output}");
+    assert!(
+        output.contains("changed files: 2 (committed 1 since "),
+        "{output}"
+    );
+    assert!(output.contains("; working tree 1)"), "{output}");
+    assert!(
+        output.contains("  committed: A partial.rs"),
+        "a committed executor result must be reported: {output}"
+    );
+    assert!(output.contains("  working: ?? untracked.rs"), "{output}");
     pool.drop();
 }
 
@@ -883,6 +948,220 @@ impl PoolFixture {
 
 fn file_url(path: &Path) -> String {
     format!("file:///{}", path.to_str().unwrap().replace('\\', "/"))
+}
+
+fn identity_of(value: &Value) -> harness_core::process::ProcessIdentity {
+    harness_core::process::ProcessIdentity {
+        pid: value["pid"].as_u64().unwrap() as u32,
+        creation_time: value["creation_time"].as_u64().unwrap(),
+    }
+}
+
+/// Waits for an owned fixture identity marker (pid plus creation time).
+fn wait_for_marker(path: &Path) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture marker {} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Asserts that the exact recorded process is gone within a bounded wait.
+fn wait_gone(identity: harness_core::process::ProcessIdentity, label: &str) {
+    let program = fixture();
+    let user = harness_core::process_service::current_user().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let alive = matches!(
+            harness_core::process_service::ServiceProcess::inspect(identity, &program, &user),
+            Ok(Some(_)) | Err(_)
+        );
+        if !alive {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} {identity:?} is still running after the owned tree was reaped"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded wait for an owned host process instead of an unbounded wait.
+fn wait_host(host: &mut std::process::Child, label: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = host.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} did not exit within the bound"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn observed_host_fails_before_the_model_without_its_record() {
+    let run = SeededRun::new();
+    let started = run.root.join("fixture-started.json");
+    // An unwritable event spool is a setup failure: no launcher may start.
+    fs::create_dir_all(run.spool()).unwrap();
+    let out = run.observed_with(
+        "complete",
+        &[("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)],
+    );
+    let output = text(&out);
+    assert!(!out.status.success(), "{output}");
+    assert!(output.contains("event spool"), "{output}");
+    assert!(output.contains("before the model starts"), "{output}");
+    assert!(
+        !started.exists(),
+        "no launcher may start when the observation record cannot be prepared"
+    );
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(
+        receipt["observation"]["state"], "dispatch-accepted",
+        "the recorded state stays where it truthfully is: {receipt}"
+    );
+    let lock = run.receipt.with_extension("lock");
+    if lock.exists() {
+        assert!(
+            harness_core::process::ExclusiveFileLock::try_acquire(&lock)
+                .unwrap()
+                .is_some(),
+            "no writer lock may stay held after the setup failure"
+        );
+    }
+    assert!(!run.receipt.with_extension("running.jsonl").is_file());
+    let _ = fs::remove_dir_all(run.spool());
+}
+
+#[test]
+fn observer_failure_terminates_the_owned_tree() {
+    let run = SeededRun::new();
+    let started = run.root.join("fixture-started.json");
+    let child_marker = run.root.join("fixture-child.json");
+    let host_stdout = fs::File::create(run.root.join("host-stdout.txt")).unwrap();
+    let host_stderr = fs::File::create(run.root.join("host-stderr.txt")).unwrap();
+    let mut host = lead_command()
+        .args(["executor", "run", "--file"])
+        .arg(&run.receipt)
+        .env("HARNESS_EXECUTOR_FIXTURE_MODE", "descendant")
+        .env("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)
+        .env("HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER", &child_marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(host_stdout))
+        .stderr(Stdio::from(host_stderr))
+        .spawn()
+        .unwrap();
+    let launcher = identity_of(&wait_for_marker(&started));
+    let descendant = identity_of(&wait_for_marker(&child_marker));
+    // The retained detail file becomes unwritable while the run is live: the
+    // observer must stop the owned tree instead of letting it run unseen.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = fs::remove_file(&run.detail);
+        if fs::create_dir(&run.detail).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "could not replace the detail file {} with a directory",
+            run.detail.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = wait_host(&mut host, "observation host");
+    let stdout = fs::read_to_string(run.root.join("host-stdout.txt")).unwrap();
+    let stderr = fs::read_to_string(run.root.join("host-stderr.txt")).unwrap();
+    assert!(!status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("executor observation failed") && stderr.contains("terminated"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("result: failed") && stdout.contains("observation failed"),
+        "{stdout}"
+    );
+    wait_gone(launcher, "launcher");
+    wait_gone(descendant, "descendant");
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(receipt["observation"]["state"], "failed", "{receipt}");
+    assert!(
+        receipt["observation"]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("executor observation failed"),
+        "{receipt}"
+    );
+    let out = run.watch(&["--timeout", "10"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("state=failed"), "{}", text(&out));
+}
+
+#[test]
+fn killing_the_host_reaps_the_owned_launcher_tree() {
+    let run = SeededRun::new();
+    let started = run.root.join("fixture-started.json");
+    let child_marker = run.root.join("fixture-child.json");
+    let mut host = run.host(
+        "descendant",
+        &[
+            ("HARNESS_EXECUTOR_FIXTURE_STARTED", &started),
+            ("HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER", &child_marker),
+        ],
+    );
+    let launcher = identity_of(&wait_for_marker(&started));
+    let descendant = identity_of(&wait_for_marker(&child_marker));
+    host.kill().unwrap();
+    let _ = host.wait();
+    // Closing the killed host's job is the cleanup authority: both the owned
+    // launcher and its descendant must stop without any PID-name cleanup.
+    wait_gone(launcher, "launcher");
+    wait_gone(descendant, "descendant");
+    // The record then names the interruption instead of a hidden conversation
+    // that still runs without its visible surface.
+    let out = run.watch(&["--timeout", "30"]);
+    let output = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{output}");
+    assert!(output.contains("state=interrupted"), "{output}");
+    assert!(
+        output.contains("no longer running and no terminal event was recorded"),
+        "{output}"
+    );
+}
+
+#[test]
+fn failed_launcher_shows_a_bounded_stderr_tail() {
+    let run = SeededRun::new();
+    let out = run.observed("stderr-noise");
+    let output = text(&out);
+    assert_eq!(out.status.code(), Some(19), "{output}");
+    assert!(
+        output.contains("launcher stderr (bounded tail):"),
+        "{output}"
+    );
+    assert!(
+        output.contains("FIXTURE_STDERR_SENTINEL"),
+        "the launcher's own error stays human-visible: {output}"
+    );
+    assert!(
+        output.contains("stderr log: ") && output.contains("stderr.log"),
+        "{output}"
+    );
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(receipt["observation"]["exitCode"], 19, "{receipt}");
 }
 
 fn git(cwd: &Path, args: &[&str]) {

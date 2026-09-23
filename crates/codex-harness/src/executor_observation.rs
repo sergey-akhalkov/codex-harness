@@ -14,16 +14,17 @@
 //! never selects a session by recency and never inspects opaque reasoning
 //! state.
 
-use harness_core::process::ProcessIdentity;
+use harness_core::process::{
+    Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, ProcessIdentity,
+};
 use harness_core::process_service::ServiceProcess;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs, io,
-    io::{BufRead, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 /// Version of the observation record written into a dispatch receipt.
@@ -38,6 +39,14 @@ pub(crate) const MAX_REVIEW_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_RESULT_READ: u64 = 16 * 1024;
 /// Largest accepted event line; longer lines are dropped as oversize.
 const MAX_EVENT_LINE: usize = 512 * 1024;
+/// Bound on the child's stderr shown on the visible surface after a failure.
+pub(crate) const MAX_STDERR_TAIL: usize = 2 * 1024;
+/// Bound on how long the receipt writer lock waits for another writer.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Poll interval of the spool tail while the owned child runs.
+const TAIL_POLL: Duration = Duration::from_millis(25);
+/// Bounded cleanup budget after the host terminates its owned launcher tree.
+const JOB_CLEANUP: Duration = Duration::from_secs(10);
 
 pub(crate) const STATE_ACCEPTED: &str = "dispatch-accepted";
 pub(crate) const STATE_STARTED: &str = "native-start";
@@ -481,6 +490,15 @@ impl RunTracker {
         self.observation.malformed += 1;
     }
 
+    /// Records that the observer itself failed and terminated the run: the
+    /// state is a named failure with the real cause, never a success.
+    pub(crate) fn observer_failed(&mut self, cause: String) {
+        self.observation.state = STATE_FAILED.into();
+        self.observation.exit_code = None;
+        self.observation.cause = Some(cause);
+        self.observation.updated_ms = now_ms();
+    }
+
     /// Derives the terminal state from the stream and the child's exit code
     /// and final-message file. Returns the exit code the host must return.
     pub(crate) fn finish(&mut self, exit_code: i32, result: Option<&Path>) -> i32 {
@@ -627,27 +645,70 @@ pub(crate) fn host_ended(host: &HostIdentity) -> bool {
 }
 
 /// Updates only the `observation` field of the receipt, preserving every
-/// other dispatch input and updating atomically through a sibling temp file.
+/// other dispatch input. The read/modify/write runs under the kit-local
+/// receipt lock and the replacement is atomic, so the console dispatcher's
+/// `window` write and the host's lifecycle writes cannot lose each other.
 pub(crate) fn update_receipt(receipt: &Path, observation: &RunObservation) -> io::Result<()> {
-    let bytes = fs::read(receipt)?;
-    let mut value: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    value["observation"] = serde_json::to_value(observation).map_err(io::Error::other)?;
-    write_receipt(receipt, &value)
+    with_receipt_lock(receipt, || {
+        let mut value = read_receipt_value(receipt)?;
+        value["observation"] = serde_json::to_value(observation).map_err(io::Error::other)?;
+        write_receipt(receipt, &value)
+    })
 }
 
-/// Replaces one top-level receipt field, preserving the rest.
+/// Replaces one top-level receipt field under the same lock, preserving the
+/// rest of the document (including a lifecycle the host wrote meanwhile).
 pub(crate) fn update_receipt_field(receipt: &Path, name: &str, field: Value) -> io::Result<()> {
+    with_receipt_lock(receipt, || {
+        let mut value = read_receipt_value(receipt)?;
+        value[name] = field;
+        write_receipt(receipt, &value)
+    })
+}
+
+/// Writes a complete receipt document under the same lock: the dispatcher's
+/// initial write replaces the record of any previous run without racing a
+/// still-finishing host.
+pub(crate) fn write_receipt_document(receipt: &Path, value: &Value) -> io::Result<()> {
+    with_receipt_lock(receipt, || write_receipt(receipt, value))
+}
+
+fn read_receipt_value(receipt: &Path) -> io::Result<Value> {
     let bytes = fs::read(receipt)?;
-    let mut value: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    value[name] = field;
-    write_receipt(receipt, &value)
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
 fn write_receipt(receipt: &Path, value: &Value) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
-    let temp = receipt.with_extension("tmp");
+    // A fresh temp name per writer keeps a stale leftover from a killed writer
+    // from being replaced under an unrelated rename.
+    let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&temp, bytes)?;
     fs::rename(&temp, receipt)
+}
+
+/// Serializes one receipt's writers with the kit's stable OS file lock: the
+/// console dispatcher's window write and the host's lifecycle writes preserve
+/// each other's fields, a killed writer's lock is released by the OS, and the
+/// wait is bounded instead of a stale-file heuristic.
+fn with_receipt_lock<T>(receipt: &Path, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let path = receipt.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let deadline = Deadline::after(LOCK_WAIT)?;
+    let _lock =
+        ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default()).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "receipt lock {} was not acquired within {}s: {error}",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                ),
+            )
+        })?;
+    action()
 }
 
 /// Appends one raw event line to the bounded detail stream. Returns false once
@@ -675,14 +736,38 @@ pub(crate) fn append_detail(path: &Path, line: &str) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Runs one observed CLI child: pipes the JSONL stream, renders it readably
-/// onto this process's own visible surface, keeps the receipt's recorded
-/// lifecycle current, and returns the exit code the host must propagate.
+/// Transient spool of the owned child's raw stdout. The child writes here
+/// while the host tails it; it is removed when the run ends, and the retained
+/// bounded detail file is written only by the host.
+pub(crate) fn spool_path(receipt: &Path) -> PathBuf {
+    receipt.with_extension("running.jsonl")
+}
+
+/// Bounded tail of the owned child's stderr log for the visible surface.
+pub(crate) fn stderr_tail(path: &Path, limit: usize) -> Option<String> {
+    let bytes = read_bounded(path, 64 * 1024).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(limit);
+    Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
+/// Runs one observed CLI child under an owned job: the launcher tree is
+/// contained from birth, so an abnormal host death reaps it while an ordinary
+/// exit preserves the CLI's own background members (the launcher's policy).
+///
+/// Setup that matters for honest observation - host identity, the spool, the
+/// bounded detail file and the initial recorded state - happens before the
+/// child exists; any later read, render or persistence failure terminates and
+/// drains the owned tree and fails the host, so a failing observer can never
+/// report successful execution.
 pub(crate) fn run_observed(
-    command: &mut Command,
+    mut command: CommandSpec,
     receipt: &Path,
     tracker: &mut RunTracker,
     header: &str,
+    stderr_log: Option<&Path>,
 ) -> io::Result<i32> {
     let result = tracker
         .observation
@@ -690,88 +775,162 @@ pub(crate) fn run_observed(
         .clone()
         .ok_or_else(|| io::Error::other("observed run has no recorded result file"))?;
     let detail = tracker.observation.detail.clone();
-    if let Err(error) = record_host(tracker) {
-        eprintln!("codex-harness: executor host identity unavailable: {error}");
+    tracker.observation.host = Some(host_identity()?);
+    tracker.observation.updated_ms = now_ms();
+    let spool = spool_path(receipt);
+    if let Some(parent) = spool.parent() {
+        fs::create_dir_all(parent)?;
     }
+    let spool_file = fs::File::create(&spool).map_err(|error| {
+        io::Error::other(format!(
+            "cannot create the event spool {} before the model starts: {error}",
+            spool.display()
+        ))
+    })?;
     // A stale final message from an earlier run must never read as this run's
-    // result, and the detail stream is per run.
+    // result, and the retained detail stream is per run.
     let _ = fs::remove_file(&result);
     if let Some(detail) = &detail {
         if let Some(parent) = detail.parent() {
             fs::create_dir_all(parent)?;
         }
-        let _ = fs::write(detail, b"");
+        fs::File::create(detail).map_err(|error| {
+            io::Error::other(format!(
+                "cannot create the bounded detail file {} before the model starts: {error}",
+                detail.display()
+            ))
+        })?;
     }
-    persist(
-        receipt,
-        tracker,
-        "the run continues without its kit-local record",
-    );
+    update_receipt(receipt, &tracker.observation).map_err(|error| {
+        io::Error::other(format!(
+            "the initial observation record could not be written before the model starts: {error}"
+        ))
+    })?;
     print!("{header}");
     io::stdout().flush()?;
-    command
-        .stdout(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::inherit());
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("observed run stdout is not piped"))?;
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut truncation_noted = false;
-    let mut stdout = io::stdout();
-    loop {
-        match next_line(&mut reader, MAX_EVENT_LINE)? {
-            Line::Eof => break,
-            Line::Oversize(note) => {
-                tracker.count_oversize();
-                writeln!(stdout, "unparsed event: {note}")?;
-                persist(receipt, tracker, "an unparsed event was not recorded");
+
+    command.stdout = Some(spool_file);
+    let job = Job::new(Limits::default())?;
+    let child = job.spawn(&command).map_err(|error| {
+        io::Error::other(format!(
+            "the owned launcher tree did not start: {error}; detail: {}",
+            spool.display()
+        ))
+    })?;
+    let mut tail = SpoolTail::new(fs::File::open(&spool)?);
+    let mut failure = None;
+    {
+        let mut sink = TailSink {
+            receipt,
+            detail: detail.as_deref(),
+            tracker: &mut *tracker,
+            stdout: io::stdout(),
+            truncation_noted: false,
+        };
+        loop {
+            match tail.read_available() {
+                Ok(read) => {
+                    if let Err(error) = sink.drain(&mut tail) {
+                        failure = Some(error);
+                        break;
+                    }
+                    if read == 0 {
+                        match child.wait_for_exit(Duration::from_millis(0)) {
+                            Ok(true) => break,
+                            Ok(false) => std::thread::sleep(TAIL_POLL),
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             }
-            Line::Text(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(detail) = &detail {
-                    match append_detail(detail, &line) {
-                        Ok(true) => {}
-                        Ok(false) if !truncation_noted => {
-                            truncation_noted = true;
-                            writeln!(
-                                stdout,
-                                "note: raw event detail reached the {} byte bound; the detail file stops here while the readable surface continues",
-                                MAX_STREAM_BYTES
-                            )?;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            eprintln!("codex-harness: executor detail log unavailable: {error}")
+        }
+        if failure.is_none() {
+            loop {
+                match tail.read_available() {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Err(error) = sink.drain(&mut tail) {
+                            failure = Some(error);
+                            break;
                         }
                     }
-                }
-                match parse_event(&line) {
-                    Ok(event) => {
-                        let changed = tracker.apply(&event);
-                        render_event(&event, &mut stdout)?;
-                        if changed {
-                            persist(receipt, tracker, "a parsed event was not recorded");
-                        }
-                    }
-                    Err(note) => {
-                        tracker.count_malformed();
-                        writeln!(stdout, "unparsed event: {note}")?;
-                        persist(receipt, tracker, "an unparsed event was not recorded");
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
                     }
                 }
             }
         }
+        if failure.is_none()
+            && let Some(line) = tail.take_line(true)
+            && let Err(error) = sink.line(line)
+        {
+            failure = Some(error);
+        }
     }
+    if let Some(error) = failure {
+        // The observer failed: stop and reap the owned tree, drain what the
+        // child already produced, record the real cause and fail the host.
+        let cleanup = job.terminate(1, JOB_CLEANUP);
+        tail.discard_remaining();
+        let _ = fs::remove_file(&spool);
+        let cause = format!(
+            "executor observation failed: {error}; the owned launcher tree was terminated ({})",
+            match &cleanup {
+                Ok(snapshot) => match snapshot.active_processes {
+                    0 => "no process remained".to_owned(),
+                    remaining => format!("{remaining} processes remained"),
+                },
+                Err(error) => format!("cleanup error: {error}"),
+            }
+        );
+        let mut stdout = io::stdout();
+        let _ = writeln!(stdout, "result: failed: {cause}");
+        let _ = writeln!(
+            stdout,
+            "detail: {} stderr log: {}",
+            locator(detail.as_deref()),
+            locator(stderr_log)
+        );
+        let _ = stdout.flush();
+        tracker.observer_failed(cause);
+        let record = update_receipt(receipt, &tracker.observation);
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "executor observation failed: {error}; the owned launcher tree was terminated; detail: {}",
+                match record {
+                    Ok(()) => format!(
+                        "{}; stderr log: {}",
+                        locator(detail.as_deref()),
+                        locator(stderr_log)
+                    ),
+                    Err(record_error) => format!(
+                        "the failure record could not be written ({record_error}); stderr log: {}",
+                        locator(stderr_log)
+                    ),
+                }
+            ),
+        ));
+    }
+
     let code = child
-        .wait()?
-        .code()
-        .ok_or_else(|| io::Error::other("executor launcher terminated without an exit code"))?;
-    let exit = tracker.finish(code, Some(result.as_path()));
+        .exit_code()?
+        .ok_or_else(|| io::Error::other("owned launcher still running after its spool closed"))?;
+    let exit = tracker.finish(code as i32, Some(result.as_path()));
+    // The terminal record is written before the summary is printed: a visible
+    // output failure below must not lose the true final state.
+    let record = update_receipt(receipt, &tracker.observation);
+    let _ = fs::remove_file(&spool);
     let observation = &tracker.observation;
+    let mut stdout = io::stdout();
     match observation.state.as_str() {
         STATE_COMPLETED => {
             writeln!(
@@ -791,13 +950,18 @@ pub(crate) fn run_observed(
                 observation.cause.as_deref().unwrap_or("no cause recorded"),
                 observation.exit_code.unwrap_or_default()
             )?;
+            if let Some(tail) = stderr_log.and_then(|path| stderr_tail(path, MAX_STDERR_TAIL)) {
+                writeln!(stdout, "launcher stderr (bounded tail):")?;
+                writeln!(stdout, "{tail}")?;
+            }
             writeln!(
                 stdout,
-                "detail: {}",
+                "detail: {} stderr log: {}",
                 detail
                     .as_deref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "unavailable".into())
+                    .unwrap_or_else(|| "unavailable".into()),
+                locator(stderr_log)
             )?;
             if observation.state == STATE_DEFECT {
                 writeln!(
@@ -807,68 +971,181 @@ pub(crate) fn run_observed(
             }
         }
     }
-    persist(receipt, tracker, "the final state was not recorded");
+    // Mirror the launcher's own policy: an ordinary session exit preserves the
+    // CLI's remaining background members, while an abnormal host death still
+    // reaps the tree through kill-on-close.
+    if let Err(error) = job.wait_session_root(&child) {
+        eprintln!(
+            "codex-harness: executor job preservation note: {error}; the tree stays contained"
+        );
+    }
     stdout.flush()?;
+    if let Err(error) = record {
+        return Err(io::Error::other(format!(
+            "the completed run could not be recorded: {error}; stderr log: {}",
+            locator(stderr_log)
+        )));
+    }
     Ok(exit)
 }
 
-fn record_host(tracker: &mut RunTracker) -> io::Result<()> {
-    tracker.observation.host = Some(host_identity()?);
-    tracker.observation.updated_ms = now_ms();
-    Ok(())
+fn locator(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unavailable".into())
 }
 
-fn persist(receipt: &Path, tracker: &RunTracker, note: &str) {
-    if let Err(error) = update_receipt(receipt, &tracker.observation) {
-        eprintln!("codex-harness: executor observation record unavailable: {error}; {note}");
+/// Drains and records the child's event spool while it runs.
+struct TailSink<'a> {
+    receipt: &'a Path,
+    detail: Option<&'a Path>,
+    tracker: &'a mut RunTracker,
+    stdout: io::Stdout,
+    truncation_noted: bool,
+}
+
+impl TailSink<'_> {
+    fn drain(&mut self, tail: &mut SpoolTail) -> io::Result<()> {
+        while let Some(line) = tail.take_line(false) {
+            self.line(line)?;
+        }
+        Ok(())
+    }
+
+    fn line(&mut self, line: Line) -> io::Result<()> {
+        match line {
+            Line::Oversize(note) => {
+                self.tracker.count_oversize();
+                writeln!(self.stdout, "unparsed event: {note}")?;
+                update_receipt(self.receipt, &self.tracker.observation)
+            }
+            Line::Text(line) => {
+                if line.trim().is_empty() {
+                    return Ok(());
+                }
+                if let Some(detail) = self.detail {
+                    match append_detail(detail, &line) {
+                        Ok(true) => {}
+                        Ok(false) if !self.truncation_noted => {
+                            self.truncation_noted = true;
+                            writeln!(
+                                self.stdout,
+                                "note: raw event detail reached the {} byte bound; the detail file stops here while the readable surface continues",
+                                MAX_STREAM_BYTES
+                            )?;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return Err(io::Error::other(format!(
+                                "the bounded detail file {} is not writable: {error}",
+                                detail.display()
+                            )));
+                        }
+                    }
+                }
+                match parse_event(&line) {
+                    Ok(event) => {
+                        let changed = self.tracker.apply(&event);
+                        render_event(&event, &mut self.stdout)?;
+                        if changed {
+                            update_receipt(self.receipt, &self.tracker.observation)?;
+                        }
+                        Ok(())
+                    }
+                    Err(note) => {
+                        self.tracker.count_malformed();
+                        writeln!(self.stdout, "unparsed event: {note}")?;
+                        update_receipt(self.receipt, &self.tracker.observation)
+                    }
+                }
+            }
+        }
     }
 }
 
-/// One line from a bounded reader: `Oversize` means the line exceeded the
-/// accepted event size and the rest of it was dropped.
+/// One complete event line: `Oversize` means the line exceeded the accepted
+/// event size and the rest of it was dropped.
 enum Line {
     Text(String),
     Oversize(String),
-    Eof,
 }
 
-fn next_line<R: io::Read>(reader: &mut io::BufReader<R>, limit: usize) -> io::Result<Line> {
-    let mut collected: Vec<u8> = Vec::new();
-    let mut oversize = false;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            if collected.is_empty() {
-                return Ok(Line::Eof);
-            }
-            break;
+/// Incremental reader of the child's growing event spool: bounded per line, so
+/// a pathological single line cannot grow host memory or the retained detail.
+struct SpoolTail {
+    file: fs::File,
+    buffer: Vec<u8>,
+    oversize: bool,
+}
+
+impl SpoolTail {
+    fn new(file: fs::File) -> Self {
+        Self {
+            file,
+            buffer: Vec::new(),
+            oversize: false,
         }
-        match available.iter().position(|byte| *byte == b'\n') {
-            Some(position) => {
-                if !oversize {
-                    collected.extend_from_slice(&available[..position]);
+    }
+
+    /// Reads whatever the child has produced since the last call; zero means
+    /// the current end of the spool was reached.
+    fn read_available(&mut self) -> io::Result<usize> {
+        let mut chunk = [0u8; 16 * 1024];
+        let read = self.file.read(&mut chunk)?;
+        self.buffer.extend_from_slice(&chunk[..read]);
+        Ok(read)
+    }
+
+    /// Drains whatever remains after the owned tree was stopped, bounded, so
+    /// the spool is not removed while a writer could still hold data.
+    fn discard_remaining(&mut self) {
+        let mut chunk = [0u8; 16 * 1024];
+        let mut discarded = 0usize;
+        while discarded < MAX_STREAM_BYTES as usize {
+            match self.file.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    discarded += read;
+                    self.buffer.clear();
+                    self.oversize = false;
                 }
-                reader.consume(position + 1);
-                break;
-            }
-            None => {
-                let length = available.len();
-                if collected.len() + length > limit {
-                    oversize = true;
-                }
-                if !oversize {
-                    collected.extend_from_slice(available);
-                }
-                reader.consume(length);
             }
         }
     }
-    if oversize {
-        return Ok(Line::Oversize(format!(
-            "event line exceeded {limit} bytes and was dropped"
-        )));
+
+    /// Takes the next complete line. With `eof` set, a trailing unterminated
+    /// line is returned as a partial line so it is parsed (and reported as
+    /// truncated) instead of being silently dropped.
+    fn take_line(&mut self, eof: bool) -> Option<Line> {
+        if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let oversize = self.oversize;
+            let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
+            line.pop();
+            self.oversize = false;
+            return Some(classify_line(line, oversize));
+        }
+        if self.oversize || self.buffer.len() > MAX_EVENT_LINE {
+            // Drop the rest of an over-long line; its newline ends it.
+            self.oversize = true;
+            self.buffer.clear();
+        }
+        if !eof || self.buffer.is_empty() {
+            return None;
+        }
+        let oversize = self.oversize;
+        let line = std::mem::take(&mut self.buffer);
+        self.oversize = false;
+        Some(classify_line(line, oversize))
     }
-    Ok(Line::Text(String::from_utf8_lossy(&collected).into_owned()))
+}
+
+fn classify_line(line: Vec<u8>, oversize: bool) -> Line {
+    if oversize || line.len() > MAX_EVENT_LINE {
+        Line::Oversize(format!(
+            "event line exceeded {MAX_EVENT_LINE} bytes and was dropped"
+        ))
+    } else {
+        Line::Text(String::from_utf8_lossy(&line).into_owned())
+    }
 }
 
 /// Bounded one-line excerpt used in human-readable records.
@@ -1102,17 +1379,135 @@ mod tests {
 
     #[test]
     fn oversize_and_partial_lines_are_bounded() {
-        let mut reader = io::BufReader::new(io::Cursor::new(vec![b'a'; MAX_EVENT_LINE + 10]));
-        match next_line(&mut reader, MAX_EVENT_LINE).unwrap() {
+        let root = tempfile::tempdir().unwrap();
+        let oversized = root.path().join("oversized.jsonl");
+        fs::write(
+            &oversized,
+            [vec![b'a'; MAX_EVENT_LINE + 10], b"\nok\n".to_vec()].concat(),
+        )
+        .unwrap();
+        let mut tail = SpoolTail::new(fs::File::open(&oversized).unwrap());
+        tail.read_available().unwrap();
+        match tail.take_line(false).expect("oversize line") {
             Line::Oversize(note) => assert!(note.contains("exceeded"), "{note}"),
             _ => panic!("oversize line must be dropped"),
         }
+        // The line after the dropped one is still parsed normally.
+        match tail.take_line(true).expect("following line") {
+            Line::Text(line) => assert_eq!(line, "ok"),
+            _ => panic!("the following line must survive"),
+        }
         // A truncated final line (no newline) is still returned for parsing,
         // and the parser reports it as unparsed rather than completion.
-        let mut reader = io::BufReader::new(io::Cursor::new(br#"{"type":"thread.sta"#.to_vec()));
-        match next_line(&mut reader, MAX_EVENT_LINE).unwrap() {
+        let partial = root.path().join("partial.jsonl");
+        fs::write(&partial, br#"{"type":"thread.sta"#).unwrap();
+        let mut tail = SpoolTail::new(fs::File::open(&partial).unwrap());
+        tail.read_available().unwrap();
+        match tail.take_line(true).expect("partial line") {
             Line::Text(line) => assert!(parse_event(&line).is_err()),
             _ => panic!("partial line must be returned"),
         }
+    }
+
+    #[test]
+    fn receipt_writers_preserve_concurrent_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({"schema":1,"slot":null})).unwrap(),
+        )
+        .unwrap();
+        let mut observation = observation();
+        observation.session = Some("01a0c719-f4d4-7880-a9d2-1a96ee0f23f4".into());
+        let writers: Vec<_> = (0..2)
+            .map(|writer| {
+                let receipt = receipt.clone();
+                let observation = observation.clone();
+                std::thread::spawn(move || {
+                    for round in 0..150 {
+                        if writer == 0 {
+                            let mut step = observation.clone();
+                            step.events = round;
+                            update_receipt(&receipt, &step).unwrap();
+                        } else {
+                            update_receipt_field(&receipt, "window", json!({"round": round}))
+                                .unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        // The last observation write survives together with the console's
+        // window field: neither writer erased the other's field.
+        assert_eq!(value["window"]["round"], 149, "{value}");
+        assert_eq!(value["observation"]["events"], 149, "{value}");
+        assert_eq!(
+            value["observation"]["session"],
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4"
+        );
+        // The stable lock file stays on disk unlocked; a killed writer's lock
+        // is released by the OS, so no stale-file takeover is needed.
+        let lock_path = receipt.with_extension("lock");
+        assert!(lock_path.exists());
+        assert!(
+            ExclusiveFileLock::try_acquire(&lock_path)
+                .unwrap()
+                .is_some(),
+            "the writer lock is released when its holder finishes"
+        );
+        assert!(
+            fs::read_dir(root.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "no temp file survives a completed write"
+        );
+    }
+
+    #[test]
+    fn a_receipt_writer_lock_is_waited_out_not_stolen() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        fs::write(&receipt, serde_json::to_vec(&json!({"schema":1})).unwrap()).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
+            let receipt = receipt.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                with_receipt_lock(&receipt, || {
+                    held_tx.send(()).unwrap();
+                    while !release.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let mut value = read_receipt_value(&receipt)?;
+                    value["window"] = json!({"columns": 80});
+                    write_receipt(&receipt, &value)
+                })
+                .unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let waiter = {
+            let receipt = receipt.clone();
+            std::thread::spawn(move || {
+                update_receipt_field(&receipt, "window", json!({"columns": 120}))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !waiter.is_finished(),
+            "a live writer lock must not be stolen"
+        );
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        holder.join().unwrap();
+        waiter.join().unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["window"]["columns"], 120, "{value}");
     }
 }

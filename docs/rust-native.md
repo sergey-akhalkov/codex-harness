@@ -163,7 +163,10 @@ cargo test --locked -p codex-harness --test executor_spawn --jobs 1 -- --test-th
 
 `executor_observation` drives the owned Rust event fixture
 (`crates/codex-harness/src/bin/harness-executor-fixture.rs`) through the real
-host, receipt, watch, resume and release paths and makes no model request. The
+host, receipt, watch, resume and release paths - including setup failure before
+any model process, observer-failure termination of the owned launcher tree,
+containment when the host itself is killed, changed-file comparison against the
+recorded base and concurrent receipt writers - and makes no model request. The
 ignored `installed_native_exec_json_event_shape_stays_observed` check in that
 target is the opt-in installed-CLI shape check: it requires
 `HARNESS_CONTROL_CODEX_EXE` pointing at the native Codex executable and runs it
