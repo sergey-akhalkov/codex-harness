@@ -301,15 +301,33 @@ fn succession_defers_while_the_predecessor_turn_is_in_flight() {
 }
 
 fn owned_session(hold_seed: bool) -> OwnedSession {
-    assert_eq!(
-        Path::new(env!("CARGO_BIN_EXE_codex"))
+    let binaries = if let Some(candidate) = std::env::var_os("HARNESS_ACCEPTANCE_BUILD") {
+        let candidate = PathBuf::from(candidate);
+        assert!(
+            candidate.is_absolute(),
+            "use an absolute immutable build path"
+        );
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .file_name()
-            .unwrap(),
-        "release",
-        "run this installed-entry test with --release"
-    );
+            .parent()
+            .unwrap();
+        let check = build_identity::check(&candidate, Some(source));
+        assert_eq!(check.status, build_identity::Health::Healthy, "{check:?}");
+        eprintln!(
+            "succession verified release candidate: {}",
+            candidate.display()
+        );
+        candidate
+    } else {
+        let binaries = Path::new(env!("CARGO_BIN_EXE_codex")).parent().unwrap();
+        assert_eq!(
+            binaries.file_name().unwrap(),
+            "release",
+            "run with --release or supply HARNESS_ACCEPTANCE_BUILD"
+        );
+        binaries.to_path_buf()
+    };
     let upstream = PathBuf::from(
         std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
     );
@@ -357,24 +375,10 @@ fn owned_session(hold_seed: bool) -> OwnedSession {
         serde_json::to_vec(&json!({"schema":1,"profile_name":"harness","profile":"global/profile.toml","instructions":"global/instructions.md","skills":"skills","agents":"global/agents","hooks":"global/hooks.json","token_hooks":"global/token-hooks.json"})).unwrap(),
     )
     .unwrap();
-    for (name, binary) in [
-        ("codex.exe", env!("CARGO_BIN_EXE_codex")),
-        ("codex-harness.exe", env!("CARGO_BIN_EXE_codex-harness")),
-        ("harness-inspect.exe", env!("CARGO_BIN_EXE_harness-inspect")),
-        ("harness-observe.exe", env!("CARGO_BIN_EXE_harness-observe")),
-        (
-            "harness-source-check.exe",
-            env!("CARGO_BIN_EXE_harness-source-check"),
-        ),
-    ] {
-        fs::copy(binary, build.join(name)).unwrap();
+    for name in build_identity::BINARIES {
+        fs::copy(binaries.join(name), build.join(name))
+            .expect("prepare every workspace binary before this entry-point test");
     }
-    let rtk = Path::new(env!("CARGO_BIN_EXE_codex")).with_file_name("harness-rtk.exe");
-    fs::copy(rtk, build.join("harness-rtk.exe"))
-        .expect("build the workspace binaries with --release before this entry-point test");
-    let audit = Path::new(env!("CARGO_BIN_EXE_codex")).with_file_name("token-audit.exe");
-    fs::copy(audit, build.join("token-audit.exe"))
-        .expect("build the workspace binaries with --release before this entry-point test");
     let record = BuildRecord {
         schema: build_identity::SCHEMA,
         source_root: source.clone(),
@@ -702,7 +706,9 @@ fn run_succession(request: &Value) -> (i32, Value, String) {
                 .unwrap_or(0)
         ));
     fs::write(&path, serde_json::to_vec_pretty(request).unwrap()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+    let manager =
+        Path::new(request["executable"].as_str().unwrap()).with_file_name("codex-harness.exe");
+    let output = Command::new(manager)
         .args(["executor", "succeed", "--request"])
         .arg(&path)
         .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")

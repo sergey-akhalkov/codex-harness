@@ -527,6 +527,12 @@ authorization, successor reload evidence from the session rollout, and the
 `succession not established` report for a stale published revision or a
 missing reload. They cover owned temp sessions only; interactive successor
 views and production resume ingress are not part of this increment.
+Set `HARNESS_CONTROL_CODEX_EXE` to the actual native CLI. Either prepare all
+workspace binaries and run the test with `--release`, or set
+`HARNESS_ACCEPTANCE_BUILD` to a complete immutable candidate from native `build`
+and run the test driver in its ordinary profile. The latter verifies candidate
+integrity and current source identity before copying its release binaries into
+the owned fixture; both predecessor and succession commands use those binaries.
 
 This implementation currently requires an explicit provider base URL and a new
 session; resume/fork and implicit built-in routing return an explicit unsupported
