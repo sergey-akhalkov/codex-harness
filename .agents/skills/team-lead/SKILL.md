@@ -206,12 +206,13 @@ outcome inside the assignment, the executor posts a short board comment on
 its issue (done, next, blockers in at most three lines) instead of waiting
 for the lead to ask.
 The default exec mode streams the assignment in a visible tab and exits on
-completion, closing the tab; a mid-work stop is continued on the recorded slot
-through the resume path below. Do not prefix prompts with `/goal`: the CLI has
-no argv goal hook and the prefix would be inert text. Accept only against the
-assignment, not effort spent. Spawn returns after the executor window/tab is
-open so the lead can keep working. Executors look at the board and do assigned
-issues.
+completion; the tab's lifetime follows the terminal's close-on-exit policy, so
+a successful exit can close it while a failure stays visible for inspection. A
+mid-work stop is continued on the recorded slot through the resume path below.
+Do not prefix prompts with `/goal`: the CLI has no argv goal hook and the
+prefix would be inert text. Accept only against the assignment, not effort
+spent. Spawn returns after the executor window/tab is open so the lead can keep
+working. Executors look at the board and do assigned issues.
 
 ## Steer, wait, stop
 
@@ -301,8 +302,9 @@ and legacy-tree semantics live in
 Executors set status `lead_review` instead of closing. The lead closes on
 accept or returns the item to `in_progress` with conditions. Executor terminal
 tabs are per-assignment, never pooled: a fresh session must not inherit another
-assignment's context, and exec mode closes its tab when the assignment
-finishes. To return defects or continue after a stop, resume the exact session
+assignment's context, and the exec tab's lifetime follows the terminal's
+close-on-exit policy rather than a harness-managed close. To return defects or
+continue after a stop, resume the exact session
 (`codex-harness executor resume --slot N --owner ID --session SESSION_ID` for
 a pooled executor, `codex resume SESSION_ID` interactively otherwise) and
 state the acceptance conditions there.

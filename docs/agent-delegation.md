@@ -120,10 +120,12 @@ restore. It does not use headless `codex exec --json`. Do not pass
 Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.
 The default exec mode streams the assignment in that visible tab and exits on
-completion, so the tab closes itself; a mid-work stop is detected by the lead's
-watcher and the exact session continues through `codex-harness executor resume
---slot N --owner ID --session SESSION_ID` on its recorded slot, which rebinds
-the slot without resetting partial work.
+completion, leaving the tab's lifetime to the terminal's close-on-exit policy
+rather than a harness-managed close: a successful exit can close the tab while
+a failure stays visible for inspection. A mid-work stop is detected by the
+lead's watcher and the exact session continues through `codex-harness executor
+resume --slot N --owner ID --session SESSION_ID` on its recorded slot, which
+rebinds the slot without resetting partial work.
 While an executor runs, one native watcher process checks the board review
 queue, the assignment's result artifact and executor liveness and emits a
 single event; the lead blocks on that event between other work instead of
