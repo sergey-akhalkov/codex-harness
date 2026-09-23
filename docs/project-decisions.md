@@ -417,9 +417,10 @@ Source-stale native identity still admits `config-overrides` on a management-hea
 manager; fallback without developer instructions or experimental context management
 is a degraded session, reported by Check as `shared-defaults-missing`.
 
-Windows sandbox must not launch packaged PowerShell from WindowsApps. Filter
-child PATH entries matching `(?i)\\WindowsApps(?:\\|$)` so native Codex selects
-an already installed desktop PowerShell. Parent and global PATH stay unchanged.
+Windows sandbox must not launch packaged PowerShell from WindowsApps. This
+restriction applies to sandboxed execution; unsandboxed executors preserve the
+owner's installed PowerShell 7. The [installation guide](installation.md)
+owns the preflight and environment propagation contract.
 
 ## Source-kit research
 

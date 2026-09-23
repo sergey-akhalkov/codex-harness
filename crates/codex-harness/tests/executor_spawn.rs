@@ -411,6 +411,15 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
             "schema": 1,
             "launcher": r"C:\Windows\System32\cmd.exe",
             "args": ["/c", "ping -n 4 127.0.0.1 >nul"],
+            // This liveness-only stand-in does not run native Codex or a
+            // shell tool. Supply the prepared environment a real dispatch
+            // records; native shell preflight has its own integration check.
+            "shell": {
+                "path": std::env::var_os("PATH").unwrap(),
+                "executable": "owned-fixture-pwsh.exe",
+                "version": "owned fixture; no shell tool execution",
+                "sandbox_mode": "danger-full-access",
+            },
             "slot": {
                 "index": 1,
                 "path": slot,

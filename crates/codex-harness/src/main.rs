@@ -12,6 +12,8 @@ mod dependency_selection_cli;
 mod executor_assignment;
 #[cfg(windows)]
 mod executor_cli;
+#[cfg(windows)]
+mod executor_shell;
 mod feedback_cli;
 #[cfg(windows)]
 mod install_cli;

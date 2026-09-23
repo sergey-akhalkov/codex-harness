@@ -252,7 +252,11 @@ native `codex-harness-check.exe` alias (`check --diagnose`). Report format,
 native observation limits and restoration order are in
 [source diagnostics](source-diagnostics.md).
 
-Windows sandbox must not launch packaged PowerShell from WindowsApps. Child PATH
-entries matching `(?i)\\WindowsApps(?:\\|$)` are filtered so native Codex
-selects an already installed desktop PowerShell. Parent and global PATH stay
-unchanged.
+Windows sandbox must not launch packaged PowerShell from WindowsApps. Executor
+dispatch reads the native runtime's effective permission policy and filters
+WindowsApps from the child PATH only for sandboxed execution. Unsandboxed
+execution preserves the owner's existing PowerShell 7, including a packaged
+installation. A missing permitted PowerShell 7 fails before model work instead
+of selecting Windows PowerShell 5.1. Dispatch records the prepared child
+environment so an existing terminal process cannot replace it with stale PATH.
+Parent and global PATH stay unchanged; no shell is installed.

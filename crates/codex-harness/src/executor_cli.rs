@@ -568,6 +568,19 @@ fn launch_bound(
             binding.owner
         )));
     }
+    let shell = crate::executor_shell::prepare(
+        &launcher,
+        request.codex_home,
+        request.profile,
+        &binding.path,
+        None,
+    )?;
+    println!(
+        "executor shell: {} ({}) policy={}",
+        shell.version,
+        shell.executable.display(),
+        shell.sandbox_mode
+    );
     let title = executor_title(request.profile, &binding.owner);
     let session = std::env::var_os("WT_SESSION");
     let client = windows_terminal_client();
@@ -581,9 +594,10 @@ fn launch_bound(
             &title,
             &args,
             bound,
+            &shell,
         )
     } else {
-        dispatch_owned_console(&launcher, request, binding, &receipt, bound, &args)
+        dispatch_owned_console(&launcher, request, binding, &receipt, bound, &args, &shell)
     }
 }
 
@@ -1147,7 +1161,7 @@ fn run_exec(args: &[OsString]) -> io::Result<i32> {
         return Err(invalid("executor run requires the launcher path"));
     };
     let launcher = normalize_launcher(launcher)?;
-    run_child(&launcher, rest)
+    run_child(&launcher, rest, None)
 }
 
 fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
@@ -1178,10 +1192,26 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
         Some(binding) => Some(receipt_codex_home(binding)?),
         None => None,
     };
+    let shell: Option<crate::executor_shell::PreparedShell> = value
+        .get("shell")
+        .filter(|shell| !shell.is_null())
+        .map(|shell| serde_json::from_value(shell.clone()))
+        .transpose()
+        .map_err(|error| invalid(&format!("executor receipt shell: {error}")))?;
+    let shell = match (shell, &binding, &codex_home) {
+        (None, Some(binding), Some(home)) => Some(crate::executor_shell::prepare(
+            Path::new(&launcher),
+            home,
+            value["profile"].as_str().unwrap_or("default"),
+            &binding.path,
+            None,
+        )?),
+        (shell, _, _) => shell,
+    };
     if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
         record_lease(codex_home, binding)?;
     }
-    let outcome = run_child(&launcher, &rest);
+    let outcome = run_child(&launcher, &rest, shell.as_ref());
     if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
         let _ = remove_lease(codex_home, binding);
     }
@@ -1213,7 +1243,11 @@ fn receipt_codex_home(binding: &SlotBinding) -> io::Result<PathBuf> {
     Ok(home)
 }
 
-fn run_child(launcher: &str, rest: &[OsString]) -> io::Result<i32> {
+fn run_child(
+    launcher: &str,
+    rest: &[OsString],
+    shell: Option<&crate::executor_shell::PreparedShell>,
+) -> io::Result<i32> {
     let launcher = launcher.replace('/', r"\");
     let launcher = launcher.as_str();
     if !Path::new(launcher).is_absolute() {
@@ -1225,6 +1259,9 @@ fn run_child(launcher: &str, rest: &[OsString]) -> io::Result<i32> {
     // the installed launcher reads this marker to keep the agent tools off, and
     // the kit's dispatch commands refuse to originate under it.
     command.env(EXECUTOR_SESSION_ENV, "1");
+    if let Some(shell) = shell {
+        command.env("PATH", &shell.path);
+    }
     // Optional diagnostics: capture the child's stderr without touching its
     // terminal stdout, so launch failures under a tab host stay observable.
     if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_RUN_LOG") {
@@ -1391,9 +1428,6 @@ fn apply_executor_env(spec: &mut CommandSpec, codex_home: &Path) {
         .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
     spec.env
         .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
-    if let Some(path) = filtered_path() {
-        spec.env.insert("PATH".into(), Some(path));
-    }
     for name in INHERITED_SESSION_ENV {
         spec.env.insert(name.into(), None);
     }
@@ -1433,6 +1467,7 @@ fn dispatch_terminal_tab(
     title: &str,
     tui: &[String],
     bound: &ProfileBinding,
+    shell: &crate::executor_shell::PreparedShell,
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let wrapper = std::env::current_exe()
@@ -1479,6 +1514,7 @@ fn dispatch_terminal_tab(
         "windows-terminal-tab",
         Some(&args),
         Some(binding),
+        shell,
     )?;
     suppress_loader_dialogs();
     let mut cmd = Command::new(wt);
@@ -1489,9 +1525,7 @@ fn dispatch_terminal_tab(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(0x0800_0000);
-    if let Some(path) = filtered_path() {
-        cmd.env("PATH", path);
-    }
+    cmd.env("PATH", &shell.path);
     for name in INHERITED_SESSION_ENV {
         cmd.env_remove(name);
     }
@@ -1526,6 +1560,7 @@ fn dispatch_terminal_tab(
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_owned_console(
     launcher: &Path,
     request: &Dispatch,
@@ -1533,6 +1568,7 @@ fn dispatch_owned_console(
     receipt: &Path,
     bound: &ProfileBinding,
     args: &[String],
+    shell: &crate::executor_shell::PreparedShell,
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let profile = request.profile;
@@ -1552,6 +1588,7 @@ fn dispatch_owned_console(
             "owned-console",
             None,
             Some(binding),
+            shell,
         )?;
         println!(
             "{}",
@@ -1563,6 +1600,7 @@ fn dispatch_owned_console(
             spec.current_dir = Some(workspace.to_path_buf());
             spec.new_console = Some(title.clone().into());
             apply_executor_env(&mut spec, request.codex_home);
+            spec.env.insert("PATH".into(), Some(shell.path.clone()));
             let placements = task_view::layout(1)?;
             let bounds = placements
                 .first()
@@ -1584,6 +1622,7 @@ fn dispatch_owned_console(
             "owned-console",
             None,
             Some(binding),
+            shell,
         )?;
         while view.is_running()? {
             thread::sleep(Duration::from_millis(200));
@@ -1682,6 +1721,7 @@ fn save_receipt(
     host: &str,
     terminal: Option<&[String]>,
     slot: Option<&SlotBinding>,
+    shell: &crate::executor_shell::PreparedShell,
 ) -> io::Result<()> {
     let window = match window {
         Some(snapshot) => serde_json::to_value(snapshot)
@@ -1713,22 +1753,9 @@ fn save_receipt(
             "modelProvider": bound.model_provider,
             "reasoningEffort": bound.reasoning_effort,
             "window": window,
+            "shell": shell,
         }))?,
     )
-}
-
-fn filtered_path() -> Option<std::ffi::OsString> {
-    filter_windowsapps_path(std::env::var_os("PATH")?)
-}
-
-fn filter_windowsapps_path(path: std::ffi::OsString) -> Option<std::ffi::OsString> {
-    std::env::join_paths(std::env::split_paths(&path).filter(|entry| {
-        !entry
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .contains("windowsapps")
-    }))
-    .ok()
 }
 
 fn required(value: Option<PathBuf>, name: &str) -> io::Result<PathBuf> {
@@ -2003,6 +2030,24 @@ fn attempt_succession(
         write_json(&state_record, &handover),
     )?;
     receipt["handover"] = json!({"record": record_path, "stateRecord": state_record});
+    let plan = step(
+        "build the successor invocation",
+        task_succession::successor_plan(request, binding.as_ref()),
+    )?;
+    let cwd = binding
+        .as_ref()
+        .and_then(|binding| binding.cwd.clone())
+        .unwrap_or_else(|| request.workspace.clone());
+    let shell = step(
+        "verify successor shell before stopping predecessor",
+        crate::executor_shell::prepare(
+            &plan.program,
+            &request.codex_home,
+            &request.profile,
+            &cwd,
+            plan.sandbox.as_deref(),
+        ),
+    )?;
     let stop = step(
         "stop the predecessor process",
         stop_predecessor(&state, &upstream, safe.predecessor_running, deadline),
@@ -2029,17 +2074,9 @@ fn attempt_succession(
         );
         return Ok(1);
     }
-    let plan = step(
-        "build the successor invocation",
-        task_succession::successor_plan(request, binding.as_ref()),
-    )?;
-    let cwd = binding
-        .as_ref()
-        .and_then(|binding| binding.cwd.clone())
-        .unwrap_or_else(|| request.workspace.clone());
     let run = step(
         "spawn the successor process",
-        spawn_successor(request, &plan, &cwd),
+        spawn_successor(request, &plan, &cwd, &shell),
     )?;
     receipt["successor"] = json!({
         "argv": task_succession::argv_text(&plan.program, &plan.args),
@@ -2454,6 +2491,7 @@ fn spawn_successor(
     request: &SuccessionRequest,
     plan: &SuccessorPlan,
     cwd: &Path,
+    shell: &crate::executor_shell::PreparedShell,
 ) -> io::Result<SuccessorRun> {
     fs::create_dir_all(&request.evidence)?;
     let stdout_path = request.evidence.join("successor-stdout.jsonl");
@@ -2464,6 +2502,7 @@ fn spawn_successor(
     spec.stdout = Some(fs::File::create(&stdout_path)?);
     spec.stderr = Some(fs::File::create(&stderr_path)?);
     apply_successor_env(&mut spec, &request.codex_home);
+    spec.env.insert("PATH".into(), Some(shell.path.clone()));
     let job = Job::new(Limits {
         memory_bytes: Some(2048 * 1024 * 1024),
         cpu_percent: None,
@@ -2493,9 +2532,6 @@ fn apply_successor_env(spec: &mut CommandSpec, codex_home: &Path) {
         .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
     spec.env
         .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
-    if let Some(path) = filtered_path() {
-        spec.env.insert("PATH".into(), Some(path));
-    }
     for name in INHERITED_SESSION_ENV {
         spec.env.insert(name.into(), None);
     }
@@ -2619,23 +2655,6 @@ mod tests {
     #[test]
     fn help_is_accepted() {
         assert_eq!(run(&[OsString::from("--help")]).unwrap(), 0);
-    }
-
-    #[test]
-    fn windowsapps_path_entries_are_removed() {
-        let filtered = filter_windowsapps_path(
-            std::env::join_paths([
-                PathBuf::from(r"C:\Program Files\PowerShell\7"),
-                PathBuf::from(r"C:\Program Files\WindowsApps\Microsoft.PowerShell_8wekyb3d8bbwe"),
-                PathBuf::from(r"C:\Windows\System32"),
-            ])
-            .unwrap(),
-        )
-        .unwrap();
-        let text = filtered.to_string_lossy().to_ascii_lowercase();
-        assert!(text.contains(r"c:\program files\powershell\7"));
-        assert!(text.contains(r"c:\windows\system32"));
-        assert!(!text.contains("windowsapps"));
     }
 
     #[test]
