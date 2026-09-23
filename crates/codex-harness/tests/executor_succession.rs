@@ -508,16 +508,9 @@ fn launch_predecessor(
     for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
         command.env.insert(key.into(), None);
     }
-    let path = std::env::join_paths(
-        std::env::split_paths(&std::env::var_os("PATH").unwrap()).filter(|path| {
-            !path
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("windowsapps")
-        }),
-    )
-    .unwrap();
-    command.env.insert("PATH".into(), Some(path));
+    // The owned fixture is unsandboxed. Keep the owner's installed PowerShell
+    // discoverable just as real executor dispatch does; removing WindowsApps
+    // can hide the only PowerShell 7 installation and select the legacy shell.
     command.args = vec![
         "--no-alt-screen".into(),
         "Reply with the owned seed acknowledgement and stop.".into(),
