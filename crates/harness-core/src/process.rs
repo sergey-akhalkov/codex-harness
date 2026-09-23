@@ -4,10 +4,14 @@
 //! cleanup authority. Children inherit the environment, accept an explicit cwd
 //! and, unless `inherit_console` is set, inherit only allow-listed standard
 //! file handles. Interactive console inheritance stays inside the same Job.
+//! Besides those exclusive lifecycle jobs, this owner provides one account-wide
+//! CPU-rate-only budget Job: participants join one object, create their payload
+//! with their own lifecycle Job inside it, and gain no termination authority
+//! over peers from the shared allowance.
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -32,6 +36,50 @@ pub fn suppress_loader_dialogs() {
             SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX,
         );
     });
+}
+
+/// Default aggregate CPU ceiling for all local agent work of one Windows
+/// account: 75% of total host CPU capacity, expressed like `Limits::cpu_percent`
+/// and never per session, project, command or thread.
+pub const SHARED_CPU_PERCENT: f64 = 75.0;
+
+/// Optional account directory override for the shared CPU budget, with the same
+/// precedence as the heavy-command account: explicit directory, this variable,
+/// then the machine account location.
+pub const CPU_BUDGET_ACCOUNT_ENV: &str = "CODEX_HARNESS_CPU_ACCOUNT";
+
+/// Account-local storage for the shared CPU budget state. Selection depends on
+/// the Windows account alone: no project, checkout, `CODEX_HOME`, terminal tab
+/// or build directory participates.
+pub fn cpu_budget_directory(explicit: Option<&Path>) -> io::Result<PathBuf> {
+    let directory = match explicit {
+        Some(path) => path.to_owned(),
+        None => match std::env::var_os(CPU_BUDGET_ACCOUNT_ENV).filter(|value| !value.is_empty()) {
+            Some(value) => PathBuf::from(value),
+            None => {
+                let parent = std::env::var_os("LOCALAPPDATA")
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        io::Error::other(
+                            "shared CPU budget account storage is unavailable; LOCALAPPDATA is not set",
+                        )
+                    })?;
+                PathBuf::from(parent)
+                    .join("coding-agents-harness")
+                    .join("cpu-budget")
+            }
+        },
+    };
+    if !directory.is_absolute()
+        || directory
+            .components()
+            .any(|part| part == Component::ParentDir)
+    {
+        return Err(invalid(
+            "the shared CPU budget account directory must be absolute and normalized",
+        ));
+    }
+    Ok(directory)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -230,6 +278,41 @@ pub struct Outcome {
     pub job: JobSnapshot,
 }
 
+/// Kernel readback of the shared account CPU budget. `cpu_rate` is in 0.01%
+/// units of total host CPU capacity, so 7500 is the default 75% ceiling.
+/// Readback proves configuration, not measured consumption.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct SharedCpuSnapshot {
+    pub cpu_rate: u32,
+    pub cpu_hard_cap: bool,
+    /// Always false by contract: the accounting job owns no cleanup.
+    pub kill_on_close: bool,
+    /// Always zero by contract: the accounting job carries no memory limit.
+    pub job_memory_limit_bytes: usize,
+    pub breakaway_ok: bool,
+    pub silent_breakaway_ok: bool,
+    pub active_processes: u32,
+    pub cpu_time: Duration,
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+pub struct SharedCpuBudget;
+
+#[cfg(not(windows))]
+impl SharedCpuBudget {
+    pub fn acquire(_: &Path, _: f64) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows 10+ Job Objects are required",
+        ))
+    }
+
+    pub fn acquire_within(_: &Path, _: f64, _: Deadline, _: &Cancellation) -> io::Result<Self> {
+        Self::acquire(Path::new("."), 0.0)
+    }
+}
+
 #[cfg(not(windows))]
 #[derive(Debug)]
 pub struct Job;
@@ -251,7 +334,7 @@ impl Job {
 #[cfg(windows)]
 pub(crate) use windows::quote as quote_argument;
 #[cfg(windows)]
-pub use windows::{Job, OwnedProcess, SuspendedProcess};
+pub use windows::{Job, OwnedProcess, SharedCpuBudget, SuspendedProcess};
 
 #[cfg(windows)]
 mod windows {
@@ -567,13 +650,7 @@ mod windows {
             if limits.memory_bytes == Some(0) {
                 return Err(invalid("memory limit must be positive"));
             }
-            let rate = match limits.cpu_percent {
-                None => None,
-                Some(p) if p.is_finite() && (0.01..=100.0).contains(&p) => {
-                    Some((p * 100.0).floor() as u32)
-                }
-                Some(_) => return Err(invalid("CPU percent must be finite and within 0.01..=100")),
-            };
+            let rate = limits.cpu_percent.map(rate_control).transpose()?;
             // CreateJobObject opens an existing object of the same name; that
             // would hand this owner a foreign job, so a taken name must fail.
             unsafe { SetLastError(0) };
@@ -614,28 +691,11 @@ mod windows {
 
         // Only fixed Win32 structures are passed from this module.
         fn set<T>(&self, class: JOBOBJECTINFOCLASS, value: &T) -> io::Result<()> {
-            unsafe {
-                checked(SetInformationJobObject(
-                    self.handle.as_raw_handle(),
-                    class,
-                    (value as *const T).cast(),
-                    size_of::<T>() as u32,
-                ))
-            }
+            set_job(self.handle.as_raw_handle(), class, value)
         }
 
         fn query<T: Copy>(&self, class: JOBOBJECTINFOCLASS) -> io::Result<T> {
-            let mut value = std::mem::MaybeUninit::<T>::zeroed();
-            unsafe {
-                checked(QueryInformationJobObject(
-                    self.handle.as_raw_handle(),
-                    class,
-                    value.as_mut_ptr().cast(),
-                    size_of::<T>() as u32,
-                    null_mut(),
-                ))?;
-                Ok(value.assume_init())
-            }
+            query_job(self.handle.as_raw_handle(), class)
         }
 
         pub fn snapshot(&self) -> io::Result<JobSnapshot> {
@@ -718,7 +778,13 @@ mod windows {
         }
 
         pub fn spawn_suspended(&self, command: &CommandSpec) -> io::Result<SuspendedProcess> {
-            self.spawn_suspended_impl(command, None)
+            spawn_suspended_in(&self.owning_jobs(), command, None)
+        }
+
+        /// Outermost job for payload creation. The shared account budget
+        /// supplies an ordered pair instead; a lifecycle job alone stays inner.
+        fn owning_jobs(&self) -> [HANDLE; 1] {
+            [self.handle.as_raw_handle()]
         }
 
         /// Start a bounded process inside an already created pseudoconsole.
@@ -731,194 +797,208 @@ mod windows {
             command: &CommandSpec,
             pseudoconsole: isize,
         ) -> io::Result<OwnedProcess> {
-            self.spawn_suspended_impl(command, Some(pseudoconsole))?
-                .resume()
+            spawn_suspended_in(&self.owning_jobs(), command, Some(pseudoconsole))?.resume()
         }
+    }
 
-        fn spawn_suspended_impl(
-            &self,
-            command: &CommandSpec,
-            pseudoconsole: Option<isize>,
-        ) -> io::Result<SuspendedProcess> {
-            suppress_loader_dialogs();
-            if !command.program.is_absolute() {
-                return Err(invalid("executable must be an absolute path"));
-            }
-            let application = wide(command.program.as_os_str())?;
-            let mut console_title = command
-                .new_console
-                .as_ref()
-                .map(|title| wide(title))
-                .transpose()?;
-            if console_title.is_some()
-                && (command.inherit_console
-                    || pseudoconsole.is_some()
-                    || command.stdin.is_some()
-                    || command.stdout.is_some()
-                    || command.stderr.is_some())
-            {
-                return Err(invalid(
-                    "a new visible console requires its own standard devices",
-                ));
-            }
-            if command.inherit_console
-                && (pseudoconsole.is_some()
-                    || command.stdin.is_some()
-                    || command.stdout.is_some()
-                    || command.stderr.is_some())
-            {
-                return Err(invalid(
-                    "inheriting the parent console cannot be combined with redirected streams",
-                ));
-            }
-            let directory = command
-                .current_dir
-                .as_ref()
-                .map(|p| wide(p.as_os_str()))
-                .transpose()?;
-            let mut line = Vec::new();
-            quote(command.program.as_os_str(), &mut line)?;
-            for arg in &command.args {
-                line.push(32);
-                quote(arg, &mut line)?;
-            }
-            if line.len() >= 32767 {
-                return Err(invalid("Windows command line exceeds 32767 UTF-16 units"));
-            }
-            line.push(0);
-            if pseudoconsole.is_some()
-                && (command.stdin.is_some() || command.stdout.is_some() || command.stderr.is_some())
-            {
-                return Err(invalid(
-                    "pseudoconsole streams cannot be redirected separately",
-                ));
-            }
-            let mut attributes = Attributes::new(2)?;
-            if let Some(console) = pseudoconsole {
-                unsafe {
-                    checked(UpdateProcThreadAttribute(
-                        attributes.pointer(),
-                        0,
-                        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                        console as *const std::ffi::c_void,
-                        size_of::<isize>(),
-                        null_mut(),
-                        null(),
-                    ))?;
-                }
-            }
-            // A pseudoconsole supplies its own console standard handles. Even
-            // without STARTF_USESTDHANDLES, inheriting our NUL handles can replace
-            // them. Only the ordinary redirected process path has HANDLE_LIST.
-            let streams =
-                if !command.inherit_console && pseudoconsole.is_none() && console_title.is_none() {
-                    let nul = OpenOptions::new().read(true).write(true).open("NUL")?;
-                    Some([
-                        inherited_copy(command.stdin.as_ref().unwrap_or(&nul))?,
-                        inherited_copy(command.stdout.as_ref().unwrap_or(&nul))?,
-                        inherited_copy(command.stderr.as_ref().unwrap_or(&nul))?,
-                    ])
-                } else {
-                    None
-                };
-            let inherited = streams
-                .as_ref()
-                .map(|s| s.each_ref().map(AsRawHandle::as_raw_handle));
-            if let Some(inherited) = &inherited {
-                unsafe {
-                    checked(UpdateProcThreadAttribute(
-                        attributes.pointer(),
-                        0,
-                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                        inherited.as_ptr().cast(),
-                        size_of_val(inherited),
-                        null_mut(),
-                        null(),
-                    ))?;
-                }
-            }
-            let mut job_handle = self.handle.as_raw_handle();
+    /// Create one suspended payload in an ordered job list, outermost first, so
+    /// the aggregate ceiling covers the lifecycle job and its descendants. Both
+    /// `Job` and `SharedCpuBudget` create payloads through this one owner; the
+    /// kernel assigns the whole list atomically at creation, before any payload
+    /// code runs.
+    fn spawn_suspended_in(
+        jobs: &[HANDLE],
+        command: &CommandSpec,
+        pseudoconsole: Option<isize>,
+    ) -> io::Result<SuspendedProcess> {
+        if jobs.is_empty() {
+            return Err(invalid("process creation requires at least one owning job"));
+        }
+        suppress_loader_dialogs();
+        if !command.program.is_absolute() {
+            return Err(invalid("executable must be an absolute path"));
+        }
+        let application = wide(command.program.as_os_str())?;
+        let mut console_title = command
+            .new_console
+            .as_ref()
+            .map(|title| wide(title))
+            .transpose()?;
+        if console_title.is_some()
+            && (command.inherit_console
+                || pseudoconsole.is_some()
+                || command.stdin.is_some()
+                || command.stdout.is_some()
+                || command.stderr.is_some())
+        {
+            return Err(invalid(
+                "a new visible console requires its own standard devices",
+            ));
+        }
+        if command.inherit_console
+            && (pseudoconsole.is_some()
+                || command.stdin.is_some()
+                || command.stdout.is_some()
+                || command.stderr.is_some())
+        {
+            return Err(invalid(
+                "inheriting the parent console cannot be combined with redirected streams",
+            ));
+        }
+        let directory = command
+            .current_dir
+            .as_ref()
+            .map(|p| wide(p.as_os_str()))
+            .transpose()?;
+        let mut line = Vec::new();
+        quote(command.program.as_os_str(), &mut line)?;
+        for arg in &command.args {
+            line.push(32);
+            quote(arg, &mut line)?;
+        }
+        if line.len() >= 32767 {
+            return Err(invalid("Windows command line exceeds 32767 UTF-16 units"));
+        }
+        line.push(0);
+        if pseudoconsole.is_some()
+            && (command.stdin.is_some() || command.stdout.is_some() || command.stderr.is_some())
+        {
+            return Err(invalid(
+                "pseudoconsole streams cannot be redirected separately",
+            ));
+        }
+        let mut attributes = Attributes::new(2)?;
+        if let Some(console) = pseudoconsole {
             unsafe {
                 checked(UpdateProcThreadAttribute(
                     attributes.pointer(),
                     0,
-                    PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                    (&mut job_handle as *mut HANDLE).cast(),
-                    size_of::<HANDLE>(),
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    console as *const std::ffi::c_void,
+                    size_of::<isize>(),
                     null_mut(),
                     null(),
                 ))?;
             }
-            let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
-            startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-            // Explicit null handles on ConPTY prevent the parent's redirected
-            // streams from replacing the pseudoconsole's standard devices.
-            // Same contract as the retained real C# console acceptance oracle.
-            startup.StartupInfo.dwFlags = if console_title.is_some() || command.inherit_console {
-                0
+        }
+        // A pseudoconsole supplies its own console standard handles. Even
+        // without STARTF_USESTDHANDLES, inheriting our NUL handles can replace
+        // them. Only the ordinary redirected process path has HANDLE_LIST.
+        let streams =
+            if !command.inherit_console && pseudoconsole.is_none() && console_title.is_none() {
+                let nul = OpenOptions::new().read(true).write(true).open("NUL")?;
+                Some([
+                    inherited_copy(command.stdin.as_ref().unwrap_or(&nul))?,
+                    inherited_copy(command.stdout.as_ref().unwrap_or(&nul))?,
+                    inherited_copy(command.stderr.as_ref().unwrap_or(&nul))?,
+                ])
             } else {
-                STARTF_USESTDHANDLES
+                None
             };
-            if let Some(title) = &mut console_title {
-                startup.StartupInfo.lpTitle = title.as_mut_ptr();
-            }
-            if let Some(inherited) = inherited {
-                startup.StartupInfo.hStdInput = inherited[0];
-                startup.StartupInfo.hStdOutput = inherited[1];
-                startup.StartupInfo.hStdError = inherited[2];
-            }
-            startup.lpAttributeList = attributes.pointer();
-            let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
-            let environment = environment(&command.env)?;
+        let inherited = streams
+            .as_ref()
+            .map(|s| s.each_ref().map(AsRawHandle::as_raw_handle));
+        if let Some(inherited) = &inherited {
             unsafe {
-                checked(CreateProcessW(
-                    application.as_ptr(),
-                    line.as_mut_ptr(),
+                checked(UpdateProcThreadAttribute(
+                    attributes.pointer(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    inherited.as_ptr().cast(),
+                    size_of_val(inherited),
+                    null_mut(),
                     null(),
-                    null(),
-                    i32::from(streams.is_some() || command.inherit_console),
-                    CREATE_SUSPENDED
-                        | EXTENDED_STARTUPINFO_PRESENT
-                        | if console_title.is_some() {
-                            CREATE_NEW_CONSOLE
-                        } else if command.inherit_console || pseudoconsole.is_some() {
-                            0
-                        } else {
-                            CREATE_NO_WINDOW
-                        }
-                        | CREATE_UNICODE_ENVIRONMENT,
-                    environment
-                        .as_ref()
-                        .map_or(null(), |block| block.as_ptr().cast()),
-                    directory.as_ref().map_or(null(), |d| d.as_ptr()),
-                    &startup.StartupInfo,
-                    &mut info,
                 ))?;
             }
-            // Creation/assignment failure above returns no running child. After
-            // success, wrap both handles before any further fallible operation.
-            let process_handle = owned(info.hProcess)?;
-            let thread = owned(info.hThread)?;
-            let mut suspended = SuspendedProcess {
-                process: Some(OwnedProcess {
-                    handle: process_handle,
-                    identity: ProcessIdentity {
-                        pid: info.dwProcessId,
-                        creation_time: 0,
-                    },
-                }),
-                thread,
-            };
-            let process = suspended.process.as_mut().expect("pending process");
-            process.identity.creation_time = times(process.handle.as_raw_handle())?.0;
-            if !self.contains(process)? {
+        }
+        // JOB_LIST order defines nesting: the first handle is outermost, so
+        // a shared budget always stays outside the lifecycle job.
+        unsafe {
+            checked(UpdateProcThreadAttribute(
+                attributes.pointer(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast(),
+                size_of_val(jobs),
+                null_mut(),
+                null(),
+            ))?;
+        }
+        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        // Explicit null handles on ConPTY prevent the parent's redirected
+        // streams from replacing the pseudoconsole's standard devices.
+        // Same contract as the retained real C# console acceptance oracle.
+        startup.StartupInfo.dwFlags = if console_title.is_some() || command.inherit_console {
+            0
+        } else {
+            STARTF_USESTDHANDLES
+        };
+        if let Some(title) = &mut console_title {
+            startup.StartupInfo.lpTitle = title.as_mut_ptr();
+        }
+        if let Some(inherited) = inherited {
+            startup.StartupInfo.hStdInput = inherited[0];
+            startup.StartupInfo.hStdOutput = inherited[1];
+            startup.StartupInfo.hStdError = inherited[2];
+        }
+        startup.lpAttributeList = attributes.pointer();
+        let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+        let environment = environment(&command.env)?;
+        unsafe {
+            checked(CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                null(),
+                null(),
+                i32::from(streams.is_some() || command.inherit_console),
+                CREATE_SUSPENDED
+                    | EXTENDED_STARTUPINFO_PRESENT
+                    | if console_title.is_some() {
+                        CREATE_NEW_CONSOLE
+                    } else if command.inherit_console || pseudoconsole.is_some() {
+                        0
+                    } else {
+                        CREATE_NO_WINDOW
+                    }
+                    | CREATE_UNICODE_ENVIRONMENT,
+                environment
+                    .as_ref()
+                    .map_or(null(), |block| block.as_ptr().cast()),
+                directory.as_ref().map_or(null(), |d| d.as_ptr()),
+                &startup.StartupInfo,
+                &mut info,
+            ))?;
+        }
+        // Creation/assignment failure above returns no running child. After
+        // success, wrap both handles before any further fallible operation.
+        let process_handle = owned(info.hProcess)?;
+        let thread = owned(info.hThread)?;
+        let mut suspended = SuspendedProcess {
+            process: Some(OwnedProcess {
+                handle: process_handle,
+                identity: ProcessIdentity {
+                    pid: info.dwProcessId,
+                    creation_time: 0,
+                },
+            }),
+            thread,
+        };
+        let process = suspended.process.as_mut().expect("pending process");
+        process.identity.creation_time = times(process.handle.as_raw_handle())?.0;
+        // Verify the complete ordered list: creation-time assignment is
+        // atomic, so either every owning job holds this process or none does.
+        for job in jobs {
+            if !in_job(process.handle.as_raw_handle(), *job)? {
                 return Err(io::Error::other(
-                    "created process is outside its required job",
+                    "created process is outside its required job list",
                 ));
             }
-            Ok(suspended)
         }
+        Ok(suspended)
+    }
 
+    impl Job {
         pub fn spawn(&self, command: &CommandSpec) -> io::Result<OwnedProcess> {
             self.spawn_suspended(command)?.resume()
         }
@@ -1080,6 +1160,381 @@ mod windows {
             extended.BasicLimitInformation.LimitFlags &= !JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             self.set(JobObjectExtendedLimitInformation, &extended)?;
             Ok(code)
+        }
+    }
+
+    /// Session-local Job object name prefix for one account's shared budget; the
+    /// suffix is the account-directory hash, so the identity survives any number
+    /// of concurrent launchers of that account.
+    const SHARED_CPU_JOB_PREFIX: &str = "CodingAgentsHarness.SharedCpu.";
+    /// Account-local ownership record and stable lock for that object.
+    const BUDGET_RECORD: &str = "cpu-budget.json";
+    const BUDGET_LOCK: &str = "cpu-budget.lock";
+    const BUDGET_SCHEMA: u32 = 1;
+    const MAX_BUDGET_RECORD: u64 = 64 * 1024;
+    /// One create plus one small record write is the whole critical section, so
+    /// this bound is only reached by a pathological holder; a caller that cannot
+    /// enter it reports the failure instead of silently creating a second
+    /// allowance.
+    const BUDGET_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+    /// Resolve one CPU percentage to the kernel's 0.01% rate units. The exclusive
+    /// `Limits` path and the shared account budget accept exactly the same range,
+    /// so neither can request an unenforceable rate.
+    fn rate_control(percent: f64) -> io::Result<u32> {
+        match percent {
+            p if p.is_finite() && (0.01..=100.0).contains(&p) => Ok((p * 100.0).floor() as u32),
+            _ => Err(invalid("CPU percent must be finite and within 0.01..=100")),
+        }
+    }
+
+    /// FNV-1a over the canonical account directory. The object name therefore
+    /// depends on the Windows account location alone, never on a project,
+    /// `CODEX_HOME`, terminal tab or build directory. Case is folded because
+    /// Windows paths are case-insensitive.
+    fn budget_key(text: &str) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in text.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    fn shared_cpu_job_name(directory: &Path) -> String {
+        let account = directory.to_string_lossy().to_lowercase();
+        format!("{SHARED_CPU_JOB_PREFIX}{:016x}", budget_key(&account))
+    }
+
+    /// Create the account directory when absent and return its canonical form.
+    /// Junction/symlink indirection is refused so two callers cannot reach two
+    /// lock files for one intended account.
+    fn owned_budget_directory(directory: &Path) -> io::Result<PathBuf> {
+        match std::fs::symlink_metadata(directory) {
+            Ok(_) => crate::build_identity::ordinary(directory)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(directory)?
+            }
+            Err(error) => return Err(error),
+        }
+        if !directory.is_dir() {
+            return Err(io::Error::other(
+                "the shared CPU budget account path is not a directory",
+            ));
+        }
+        directory.canonicalize()
+    }
+
+    /// Account ownership record for one shared CPU budget: which canonical
+    /// account directory established the object, under which name, for which
+    /// rate, and by which creator. A record copied into another directory names
+    /// a different account directory and therefore authorizes nothing.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BudgetRecord {
+        schema: u32,
+        account: PathBuf,
+        job: String,
+        cpu_rate: u32,
+        pid: u32,
+        creation_time: u64,
+    }
+
+    fn read_budget_record(
+        path: &Path,
+        directory: &Path,
+        name: &str,
+        rate: u32,
+    ) -> io::Result<Option<BudgetRecord>> {
+        use std::io::Read;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => crate::build_identity::ordinary(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(MAX_BUDGET_RECORD + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BUDGET_RECORD {
+            return Err(io::Error::other(
+                "the shared CPU budget ownership record exceeds its bound",
+            ));
+        }
+        let record: BudgetRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::other(format!(
+                "the shared CPU budget ownership record at {} is unreadable ({error}); preserving the existing budget",
+                path.display()
+            ))
+        })?;
+        if record.schema != BUDGET_SCHEMA
+            || record.account.as_path() != directory
+            || record.job != name
+        {
+            return Err(io::Error::other(format!(
+                "the shared CPU budget ownership record at {} does not describe this account directory; preserving the existing budget",
+                path.display()
+            )));
+        }
+        if record.cpu_rate != rate {
+            return Err(io::Error::other(format!(
+                "the account shared CPU budget is already established at {} percent; preserving it",
+                f64::from(record.cpu_rate) / 100.0
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    fn write_budget_record(path: &Path, directory: &Path, name: &str, rate: u32) -> io::Result<()> {
+        let identity = current_identity()?;
+        let record = BudgetRecord {
+            schema: BUDGET_SCHEMA,
+            account: directory.to_owned(),
+            job: name.to_owned(),
+            cpu_rate: rate,
+            pid: identity.pid,
+            creation_time: identity.creation_time,
+        };
+        let staging = path.with_file_name(format!("{BUDGET_RECORD}.staging"));
+        std::fs::write(&staging, serde_json::to_vec_pretty(&record)?)?;
+        std::fs::rename(&staging, path)
+    }
+
+    fn current_identity() -> io::Result<ProcessIdentity> {
+        let (creation_time, _) = times(unsafe { GetCurrentProcess() })?;
+        Ok(ProcessIdentity {
+            pid: std::process::id(),
+            creation_time,
+        })
+    }
+
+    fn set_job<T>(handle: HANDLE, class: JOBOBJECTINFOCLASS, value: &T) -> io::Result<()> {
+        unsafe {
+            checked(SetInformationJobObject(
+                handle,
+                class,
+                (value as *const T).cast(),
+                size_of::<T>() as u32,
+            ))
+        }
+    }
+
+    fn query_job<T: Copy>(handle: HANDLE, class: JOBOBJECTINFOCLASS) -> io::Result<T> {
+        let mut value = std::mem::MaybeUninit::<T>::zeroed();
+        unsafe {
+            checked(QueryInformationJobObject(
+                handle,
+                class,
+                value.as_mut_ptr().cast(),
+                size_of::<T>() as u32,
+                null_mut(),
+            ))?;
+            Ok(value.assume_init())
+        }
+    }
+
+    fn shared_cpu_snapshot(handle: HANDLE) -> io::Result<SharedCpuSnapshot> {
+        let extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            query_job(handle, JobObjectExtendedLimitInformation)?;
+        let accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+            query_job(handle, JobObjectBasicAccountingInformation)?;
+        let cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
+            query_job(handle, JobObjectCpuRateControlInformation)?;
+        Ok(SharedCpuSnapshot {
+            cpu_rate: if cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0 {
+                unsafe { cpu.Anonymous.CpuRate }
+            } else {
+                0
+            },
+            cpu_hard_cap: cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP != 0,
+            kill_on_close: extended.BasicLimitInformation.LimitFlags
+                & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                != 0,
+            job_memory_limit_bytes: extended.JobMemoryLimit,
+            breakaway_ok: extended.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK
+                != 0,
+            silent_breakaway_ok: extended.BasicLimitInformation.LimitFlags
+                & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+                != 0,
+            active_processes: accounting.ActiveProcesses,
+            cpu_time: Duration::from_nanos(
+                (accounting.TotalKernelTime as u64 + accounting.TotalUserTime as u64)
+                    .saturating_mul(100),
+            ),
+        })
+    }
+
+    /// One named object must be this owner's CPU-only accounting job; a
+    /// lifecycle job, a foreign limit or a different rate is preserved, never
+    /// adopted and never modified.
+    fn verify_shared_cpu(handle: HANDLE, name: &str, rate: u32) -> io::Result<()> {
+        let snapshot = shared_cpu_snapshot(handle)?;
+        if snapshot.cpu_rate == rate
+            && snapshot.cpu_hard_cap
+            && !snapshot.kill_on_close
+            && snapshot.job_memory_limit_bytes == 0
+            && !snapshot.breakaway_ok
+            && !snapshot.silent_breakaway_ok
+        {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "the job object named {name} does not carry the required CPU-only settings; preserving it"
+        )))
+    }
+
+    /// The single account-wide CPU-rate-only budget Job. Participants keep their
+    /// exclusive lifecycle Job as an inner job, so the shared ceiling covers
+    /// every admitted payload while each session retains its own cleanup
+    /// authority. There is deliberately no terminate/wait API: this owner can
+    /// never kill a peer, and closing one participant's handle leaves the object
+    /// and its enforcement in place for every member that remains.
+    #[derive(Debug)]
+    pub struct SharedCpuBudget {
+        handle: OwnedHandle,
+        name: String,
+        directory: PathBuf,
+    }
+
+    impl SharedCpuBudget {
+        /// Join or establish this account's shared CPU budget. `percent` is a
+        /// ceiling in percent of total host CPU capacity; the desktop policy uses
+        /// `SHARED_CPU_PERCENT`. Concurrent first callers converge on one object
+        /// through the account-local `ExclusiveFileLock`, and every caller
+        /// validates the ownership record and the effective kernel settings
+        /// before admitting work.
+        ///
+        /// A job object outlives its handles while members remain, so closing one
+        /// participant's handle never kills peers and never lifts their ceiling.
+        /// The object *name*, however, is released with the last handle: callers
+        /// that must keep one group for the account hold this handle for as long
+        /// as their members run, and a later caller then rejoins the same object.
+        pub fn acquire(directory: &Path, percent: f64) -> io::Result<Self> {
+            Self::acquire_within(
+                directory,
+                percent,
+                Deadline::after(BUDGET_LOCK_WAIT)?,
+                &Cancellation::default(),
+            )
+        }
+
+        /// Bounded form of `acquire`: a caller that cannot enter the account
+        /// critical section within its own deadline reports the failure instead
+        /// of creating a second allowance.
+        pub fn acquire_within(
+            directory: &Path,
+            percent: f64,
+            deadline: Deadline,
+            cancellation: &Cancellation,
+        ) -> io::Result<Self> {
+            let rate = rate_control(percent)?;
+            let directory = owned_budget_directory(directory)?;
+            let name = shared_cpu_job_name(&directory);
+            // The lock file is stable and never deleted: unlinking it would let
+            // two callers lock different objects under one path.
+            let _lock =
+                ExclusiveFileLock::acquire(&directory.join(BUDGET_LOCK), deadline, cancellation)?;
+            Self::establish(&directory, &name, rate)
+        }
+
+        fn establish(directory: &Path, name: &str, rate: u32) -> io::Result<Self> {
+            let record = directory.join(BUDGET_RECORD);
+            let recorded = read_budget_record(&record, directory, name, rate)?;
+            let object = wide(OsStr::new(name))?;
+            unsafe { SetLastError(0) };
+            let handle = owned(unsafe { CreateJobObjectW(null(), object.as_ptr()) })?;
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                // CreateJobObjectW opens a same-named object instead of failing,
+                // so an existing object is adopted only when this account's own
+                // record and its effective settings both describe it.
+                if recorded.is_none() {
+                    return Err(io::Error::other(format!(
+                        "a job object named {name} already exists without this account's ownership record; preserving it"
+                    )));
+                }
+                verify_shared_cpu(handle.as_raw_handle(), name, rate)?;
+            } else {
+                // A fresh object takes the CPU rate and nothing else: no
+                // kill-on-close, no memory limit and no breakaway authority.
+                let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { zeroed() };
+                cpu.ControlFlags =
+                    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+                cpu.Anonymous.CpuRate = rate;
+                set_job(
+                    handle.as_raw_handle(),
+                    JobObjectCpuRateControlInformation,
+                    &cpu,
+                )?;
+                verify_shared_cpu(handle.as_raw_handle(), name, rate)?;
+                // A failed record write drops this handle and therefore destroys
+                // the memberless object instead of leaving an unowned name.
+                write_budget_record(&record, directory, name, rate)?;
+            }
+            Ok(Self {
+                handle,
+                name: name.to_owned(),
+                directory: directory.to_owned(),
+            })
+        }
+
+        /// Session-local kernel name of this budget object. A nested caller can
+        /// verify its own membership against this name without cleanup authority.
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// Canonical account directory that owns this budget.
+        pub fn directory(&self) -> &Path {
+            &self.directory
+        }
+
+        /// Kernel readback of rate, containment flags and current membership.
+        /// Readback proves configuration, not measured consumption.
+        pub fn snapshot(&self) -> io::Result<SharedCpuSnapshot> {
+            shared_cpu_snapshot(self.handle.as_raw_handle())
+        }
+
+        /// Kernel membership check against this exact object.
+        pub fn contains(&self, process: &OwnedProcess) -> io::Result<bool> {
+            in_job(process.handle.as_raw_handle(), self.handle.as_raw_handle())
+        }
+
+        /// Create a payload as a member of this shared budget (outer) and the
+        /// supplied lifecycle Job (inner), atomically before any payload code
+        /// runs. The complete ordered list is verified after creation.
+        pub fn spawn_suspended(
+            &self,
+            lifecycle: &Job,
+            command: &CommandSpec,
+        ) -> io::Result<SuspendedProcess> {
+            spawn_suspended_in(&self.owning_jobs(lifecycle), command, None)
+        }
+
+        pub fn spawn(&self, lifecycle: &Job, command: &CommandSpec) -> io::Result<OwnedProcess> {
+            self.spawn_suspended(lifecycle, command)?.resume()
+        }
+
+        /// Start a bounded process inside an already created pseudoconsole.
+        ///
+        /// # Safety
+        /// `pseudoconsole` must be a live HPCON from CreatePseudoConsole and must
+        /// remain open for the lifetime of this process and its console session.
+        pub unsafe fn spawn_console(
+            &self,
+            lifecycle: &Job,
+            command: &CommandSpec,
+            pseudoconsole: isize,
+        ) -> io::Result<OwnedProcess> {
+            spawn_suspended_in(&self.owning_jobs(lifecycle), command, Some(pseudoconsole))?.resume()
+        }
+
+        /// Outermost first: the shared ceiling must stay outside every lifecycle
+        /// job, so terminating one participant's job cannot reach its peers.
+        fn owning_jobs(&self, lifecycle: &Job) -> [HANDLE; 2] {
+            [
+                self.handle.as_raw_handle(),
+                lifecycle.handle.as_raw_handle(),
+            ]
         }
     }
 }

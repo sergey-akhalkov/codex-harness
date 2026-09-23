@@ -55,7 +55,8 @@ fn jobs_explicitly_reject_non_windows() {
 mod native {
     use super::*;
     use harness_core::process::{
-        CommandSpec, Job, Limits, OwnedProcess, ProcessIdentity, StopReason,
+        CommandSpec, Job, Limits, OwnedProcess, ProcessIdentity, SHARED_CPU_PERCENT,
+        SharedCpuBudget, SharedCpuSnapshot, StopReason,
     };
     use serde_json::{Value, json};
     use std::ffi::OsString;
@@ -873,5 +874,425 @@ mod native {
         let _ = job.terminate(1, Duration::ZERO); // May report pending kernel teardown.
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(child.wait_for_exit(CLEANUP).unwrap());
+    }
+
+    /// One shared-budget participant: its own budget handle, its own lifecycle
+    /// Job, and the member process created through the ordered pair.
+    fn shared_member(
+        account: &Path,
+        root: &Path,
+        index: usize,
+    ) -> (SharedCpuBudget, Job, OwnedProcess, PathBuf) {
+        let budget = SharedCpuBudget::acquire(account, SHARED_CPU_PERCENT).unwrap();
+        let job = Job::new(Limits::default()).unwrap();
+        let marker = root.join(format!("member-{index}.json"));
+        let member = budget.spawn(&job, &spec("hold", &marker)).unwrap();
+        (budget, job, member, marker)
+    }
+
+    fn wait_for_empty(budget: &SharedCpuBudget) -> SharedCpuSnapshot {
+        let deadline = Instant::now() + CLEANUP;
+        loop {
+            let snapshot = budget.snapshot().unwrap();
+            if snapshot.active_processes == 0 {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shared budget still reports {} members",
+                snapshot.active_processes
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn shared_cpu_budget_first_joins_converge_on_one_group() {
+        let root = root("shared-converge");
+        let account = root.join("account");
+        let racers = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(racers));
+        let threads: Vec<_> = (0..racers)
+            .map(|index| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let account = account.clone();
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    shared_member(&account, &root, index)
+                })
+            })
+            .collect();
+        let members: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let name = members[0].0.name().to_owned();
+        assert!(name.starts_with("CodingAgentsHarness.SharedCpu."), "{name}");
+        assert!(name.is_ascii() && name.len() <= 128, "{name}");
+        for (budget, _, _, _) in &members {
+            assert_eq!(
+                budget.name(),
+                name,
+                "simultaneous first joins must converge on one object"
+            );
+        }
+        // Every independently created handle observes every independently
+        // created process in the one shared object.
+        for (index, (_, _, member, marker)) in members.iter().enumerate() {
+            let recorded = receipt(marker);
+            assert_eq!(recorded["in_job"], true);
+            assert_eq!(
+                recorded["pid"].as_u64().unwrap() as u32,
+                member.identity().pid
+            );
+            for (other, (budget, _, _, _)) in members.iter().enumerate() {
+                assert!(
+                    budget.contains(member).unwrap(),
+                    "handle {other} does not see member {index}"
+                );
+            }
+        }
+        let snapshot = members[0].0.snapshot().unwrap();
+        assert_eq!(snapshot.cpu_rate, 7500);
+        assert!(snapshot.cpu_hard_cap);
+        assert!(
+            !snapshot.kill_on_close,
+            "the accounting job owns no cleanup"
+        );
+        assert_eq!(snapshot.job_memory_limit_bytes, 0);
+        assert!(!snapshot.breakaway_ok && !snapshot.silent_breakaway_ok);
+        // Creation with a job list counts each member more than once in the
+        // kernel's active-process accounting, so only a lower bound is claimed;
+        // `contains` above is the exact membership proof.
+        assert!(snapshot.active_processes as usize >= racers);
+        // Lifecycle jobs stay exclusive: each one holds only its own member.
+        for (index, (_, job, member, _)) in members.iter().enumerate() {
+            assert!(job.contains(member).unwrap());
+            for (other, (_, _, peer, _)) in members.iter().enumerate() {
+                if other != index {
+                    assert!(
+                        !job.contains(peer).unwrap(),
+                        "lifecycle jobs must stay exclusive"
+                    );
+                }
+            }
+        }
+        // The exclusive named-job contract still refuses the shared name.
+        let refused = Job::new_named(Limits::default(), &name).unwrap_err();
+        assert!(refused.to_string().contains("already in use"), "{refused}");
+        let mut retained = Vec::new();
+        for (budget, job, member, _) in members {
+            job.terminate(0, CLEANUP).unwrap();
+            assert!(member.wait_for_exit(CLEANUP).unwrap());
+            retained.push((budget, member));
+        }
+        let empty = wait_for_empty(&retained[0].0);
+        assert_eq!(empty.cpu_rate, 7500);
+        record(
+            &root.join("verified.json"),
+            json!({"name": name, "members": retained.iter().map(|(_, member)| member.identity().pid).collect::<Vec<_>>(), "cpu_rate": snapshot.cpu_rate, "kill_on_close": snapshot.kill_on_close, "breakaway_ok": snapshot.breakaway_ok}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_rejoins_existing_group_and_keeps_peer_allowance() {
+        let root = root("shared-rejoin");
+        let account = root.join("account");
+        let first = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let name = first.name().to_owned();
+        let first_job = Job::new(Limits::default()).unwrap();
+        let first_marker = root.join("first.json");
+        let first_member = first
+            .spawn(&first_job, &spec("hold", &first_marker))
+            .unwrap();
+        assert_eq!(receipt(&first_marker)["in_job"], true);
+        let first_observer = Observer::open(first_member.identity().pid);
+        // A later manager joins the same object while a member runs, rather
+        // than creating a second allowance for the account.
+        let second = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        assert_eq!(
+            second.name(),
+            name,
+            "a later caller must rejoin the same object, not create another"
+        );
+        assert!(second.contains(&first_member).unwrap());
+        let second_job = Job::new(Limits::default()).unwrap();
+        let second_marker = root.join("second.json");
+        let second_member = second
+            .spawn(&second_job, &spec("hold", &second_marker))
+            .unwrap();
+        assert_eq!(receipt(&second_marker)["in_job"], true);
+        let second_observer = Observer::open(second_member.identity().pid);
+        assert!(first.contains(&second_member).unwrap());
+        assert!(!first_job.contains(&second_member).unwrap());
+        // Dropping one participant handle kills no peer and lifts no allowance.
+        drop(first);
+        assert!(first_observer.alive() && second_observer.alive());
+        assert!(second.contains(&first_member).unwrap());
+        assert_eq!(second.snapshot().unwrap().cpu_rate, 7500);
+        // While any participant holds a handle the name stays reserved, so a
+        // further manager joins the same object rather than creating a group.
+        let rejoined = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        assert_eq!(rejoined.name(), name);
+        assert!(rejoined.contains(&first_member).unwrap());
+        assert!(rejoined.contains(&second_member).unwrap());
+        let snapshot = rejoined.snapshot().unwrap();
+        assert_eq!(snapshot.cpu_rate, 7500);
+        assert!(
+            snapshot.active_processes >= 2,
+            "one object, two participants"
+        );
+        // A closed participant handle neither kills peers nor lifts the budget.
+        drop(second);
+        assert!(second_observer.alive() && first_observer.alive());
+        assert!(rejoined.contains(&second_member).unwrap());
+        assert_eq!(rejoined.snapshot().unwrap().cpu_rate, 7500);
+        // A replacement manager still joins the surviving object.
+        let latest = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        assert_eq!(latest.name(), name);
+        assert!(latest.contains(&first_member).unwrap());
+        assert!(latest.contains(&second_member).unwrap());
+        drop(rejoined);
+        // One participant's lifecycle cleanup reaps its own member only.
+        first_job.terminate(0, CLEANUP).unwrap();
+        assert!(first_member.wait_for_exit(CLEANUP).unwrap());
+        first_observer.assert_dead();
+        assert!(second_observer.alive(), "peer work must survive its peer");
+        assert!(latest.contains(&second_member).unwrap());
+        assert_eq!(latest.snapshot().unwrap().cpu_rate, 7500);
+        second_job.terminate(0, CLEANUP).unwrap();
+        assert!(second_member.wait_for_exit(CLEANUP).unwrap());
+        second_observer.assert_dead();
+        wait_for_empty(&latest);
+        record(
+            &root.join("verified.json"),
+            json!({"name": name, "members": [first_observer.identity.pid, second_observer.identity.pid], "rejoin_rate": snapshot.cpu_rate, "peer_alive_after_peer_cleanup": true}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_rate_reaches_admitted_payload() {
+        let root = root("shared-rate");
+        let account = root.join("account");
+        // 0.1% is far below the desktop ceiling yet still large enough for
+        // process initialization on a loaded host, so the measured gap from the
+        // uncapped control stays large without hitting the wait deadline.
+        let budget = SharedCpuBudget::acquire(&account, 0.1).unwrap();
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, 10);
+        let capped_job = Job::new(Limits::default()).unwrap();
+        let capped = budget
+            .spawn(&capped_job, &spec("cpu", &root.join("capped.json")))
+            .unwrap();
+        let free_job = Job::new(Limits::default()).unwrap();
+        let free = free_job
+            .spawn(&spec("cpu", &root.join("free.json")))
+            .unwrap();
+        assert!(budget.contains(&capped).unwrap());
+        assert!(capped_job.contains(&capped).unwrap());
+        let capped_result = run(capped_job, &capped);
+        let free_result = run(free_job, &free);
+        assert_eq!((capped_result.exit_code, free_result.exit_code), (0, 0));
+        assert_eq!(
+            capped_result.job.cpu_rate, 0,
+            "the lifecycle job adds no second cap"
+        );
+        let cap_cpu = capped.cpu_time().unwrap().as_secs_f64();
+        let free_cpu = free.cpu_time().unwrap().as_secs_f64();
+        assert!(
+            free_cpu > 0.3,
+            "host too busy for an uncapped control: {free_cpu}"
+        );
+        assert!(
+            cap_cpu < free_cpu * 0.6 + 0.05,
+            "shared allowance not observed: capped={cap_cpu}, control={free_cpu}"
+        );
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, 10);
+        record(
+            &root.join("verified.json"),
+            json!({"capped_cpu_seconds": cap_cpu, "free_cpu_seconds": free_cpu, "cpu_rate": 10, "capped_in_lifecycle": true}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_refuses_conflicts_without_creating_a_second_group() {
+        let root = root("shared-conflict");
+        let account = root.join("account");
+        for percent in [0.0, -1.0, 100.01, f64::INFINITY, f64::NAN] {
+            assert!(
+                SharedCpuBudget::acquire(&account, percent).is_err(),
+                "{percent}"
+            );
+        }
+        assert!(
+            !account.exists(),
+            "an invalid request must not create account state"
+        );
+        let established = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let name = established.name().to_owned();
+        let other_rate = SharedCpuBudget::acquire(&account, 50.0).unwrap_err();
+        assert!(
+            other_rate.to_string().contains("already established"),
+            "{other_rate}"
+        );
+        assert_eq!(established.snapshot().unwrap().cpu_rate, 7500);
+        drop(established);
+        // A same-named object with foreign limits is preserved, never adopted.
+        let foreign = Job::new_named(
+            Limits {
+                memory_bytes: Some(64 * 1024 * 1024),
+                cpu_percent: Some(10.0),
+            },
+            &name,
+        )
+        .unwrap();
+        let refused = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap_err();
+        assert!(
+            refused.to_string().contains("CPU-only settings"),
+            "{refused}"
+        );
+        let foreign_snapshot = foreign.snapshot().unwrap();
+        assert!(foreign_snapshot.kill_on_close && foreign_snapshot.cpu_rate == 1000);
+        drop(foreign);
+        // With the conflicting object gone the same account re-establishes.
+        let recovered = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        assert_eq!(recovered.snapshot().unwrap().cpu_rate, 7500);
+        // A record copied into another directory authorizes nothing there.
+        let copied = root.join("copied-account");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(
+            account.join("cpu-budget.json"),
+            copied.join("cpu-budget.json"),
+        )
+        .unwrap();
+        let copied_refusal = SharedCpuBudget::acquire(&copied, SHARED_CPU_PERCENT).unwrap_err();
+        assert!(
+            copied_refusal
+                .to_string()
+                .contains("does not describe this account directory"),
+            "{copied_refusal}"
+        );
+        std::fs::remove_file(copied.join("cpu-budget.json")).unwrap();
+        assert_eq!(
+            SharedCpuBudget::acquire(&copied, SHARED_CPU_PERCENT)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .cpu_rate,
+            7500
+        );
+        record(
+            &root.join("verified.json"),
+            json!({"name": name, "foreign_rate": foreign_snapshot.cpu_rate, "refusals": ["different rate", "foreign settings", "copied record"]}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_admits_ordered_pair_and_keeps_cleanup_independent() {
+        let root = root("shared-ordered");
+        let account = root.join("account");
+        let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let tree_job = Job::new(Limits::default()).unwrap();
+        let tree = root.join("tree.json");
+        let tree_member = budget.spawn(&tree_job, &spec("tree-hold", &tree)).unwrap();
+        let data = receipt(&tree);
+        let grandchild = Observer::open(data["grandchild"].as_u64().unwrap() as u32);
+        // Creation-time assignment covers the complete ordered pair, and an
+        // ordinary grandchild inherits the shared accounting job too.
+        assert!(budget.contains(&tree_member).unwrap());
+        assert!(tree_job.contains(&tree_member).unwrap());
+        assert!(tree_job.owns(grandchild.identity).unwrap());
+        let snapshot = budget.snapshot().unwrap();
+        assert_eq!(snapshot.cpu_rate, 7500);
+        assert!(snapshot.active_processes >= 2, "{snapshot:?}");
+        // The lifecycle job keeps exclusive cleanup authority over its own tree.
+        assert_eq!(tree_job.terminate(0, CLEANUP).unwrap().active_processes, 0);
+        grandchild.assert_dead();
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+        // Dropping one participant's lifecycle Job reaps only that member.
+        let kept_job = Job::new(Limits::default()).unwrap();
+        let kept_marker = root.join("kept.json");
+        let kept = budget
+            .spawn(&kept_job, &spec("hold", &kept_marker))
+            .unwrap();
+        assert_eq!(receipt(&kept_marker)["in_job"], true);
+        let kept_observer = Observer::open(kept.identity().pid);
+        let dropped_job = Job::new(Limits::default()).unwrap();
+        let dropped_marker = root.join("dropped.json");
+        let dropped = budget
+            .spawn(&dropped_job, &spec("hold", &dropped_marker))
+            .unwrap();
+        assert_eq!(receipt(&dropped_marker)["in_job"], true);
+        let dropped_observer = Observer::open(dropped.identity().pid);
+        drop(dropped_job);
+        dropped_observer.assert_dead();
+        assert!(
+            kept_observer.alive(),
+            "a peer must survive another member's cleanup"
+        );
+        assert!(budget.contains(&kept).unwrap());
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+        kept_job.terminate(0, CLEANUP).unwrap();
+        assert!(kept.wait_for_exit(CLEANUP).unwrap());
+        wait_for_empty(&budget);
+        record(
+            &root.join("verified.json"),
+            json!({"tree": tree_member.identity().pid, "grandchild": grandchild.identity.pid, "kept": kept_observer.identity.pid, "dropped": dropped_observer.identity.pid, "peer_survived": true}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_enforcement_survives_losing_every_handle() {
+        let root = root("shared-detached");
+        let account = root.join("account");
+        // 0.1% leaves a large, independently measured gap from the control.
+        let budget = SharedCpuBudget::acquire(&account, 0.1).unwrap();
+        let hold_job = Job::new(Limits::default()).unwrap();
+        let hold_marker = root.join("hold.json");
+        let hold = budget
+            .spawn(&hold_job, &spec("hold", &hold_marker))
+            .unwrap();
+        assert_eq!(receipt(&hold_marker)["in_job"], true);
+        let hold_observer = Observer::open(hold.identity().pid);
+        let capped_job = Job::new(Limits::default()).unwrap();
+        let capped = budget
+            .spawn(&capped_job, &spec("cpu", &root.join("capped.json")))
+            .unwrap();
+        // Losing every participant handle must not lift the allowance: the
+        // object lives while members do, so its rate still governs them.
+        drop(budget);
+        assert!(hold_observer.alive());
+        let free_job = Job::new(Limits::default()).unwrap();
+        let free = free_job
+            .spawn(&spec("cpu", &root.join("free.json")))
+            .unwrap();
+        assert_eq!(run(capped_job, &capped).exit_code, 0);
+        assert_eq!(run(free_job, &free).exit_code, 0);
+        let cap_cpu = capped.cpu_time().unwrap().as_secs_f64();
+        let free_cpu = free.cpu_time().unwrap().as_secs_f64();
+        assert!(
+            free_cpu > 0.3,
+            "host too busy for an uncapped control: {free_cpu}"
+        );
+        assert!(
+            cap_cpu < free_cpu * 0.6 + 0.05,
+            "allowance was lifted after the last handle closed: capped={cap_cpu}, control={free_cpu}"
+        );
+        // Documented boundary: the name is released with the last handle while
+        // members remain, so a manager starting now establishes a fresh object
+        // instead of rejoining the surviving one. A participant that keeps its
+        // handle for the session lifetime (or a coordinator) is what reserves
+        // one group for the account; the old members keep their old allowance.
+        let later = SharedCpuBudget::acquire(&account, 0.1).unwrap();
+        assert_eq!(later.snapshot().unwrap().cpu_rate, 10);
+        assert!(!later.contains(&hold).unwrap());
+        // Independent lifecycle cleanup still works with no shared handle.
+        hold_job.terminate(0, CLEANUP).unwrap();
+        assert!(hold.wait_for_exit(CLEANUP).unwrap());
+        hold_observer.assert_dead();
+        record(
+            &root.join("verified.json"),
+            json!({"capped_cpu_seconds": cap_cpu, "free_cpu_seconds": free_cpu, "hold": hold_observer.identity.pid, "rejoin_after_last_handle": false}),
+        );
     }
 }
