@@ -4,7 +4,10 @@ use crate::{
     broker_endpoint::random_key,
     broker_state::BrokerRoot,
     build_identity,
-    process::{Cancellation, CommandSpec, Deadline},
+    process::{
+        Cancellation, CommandSpec, Deadline, Job, OwnedProcess, SHARED_CPU_PERCENT,
+        SharedCpuBudget, cpu_budget_directory,
+    },
     process_service::{self, ServiceGuard},
     registration_native::{FileGuard, StagedFile},
     task_control::ControlConnection,
@@ -137,6 +140,215 @@ fn report_closed_views(root: &BrokerRoot, closed: &[String]) -> io::Result<()> {
     )
 }
 
+/// Bounded wait for the account CPU allowance while one session owner starts.
+/// A caller that cannot enter the account critical section in this window
+/// reports the failure instead of holding the session's startup open.
+const CPU_ADMISSION_WAIT: Duration = Duration::from_millis(2000);
+
+/// Membership of one long-lived session owner in the account CPU allowance.
+///
+/// The allowance is scoped to the Windows account: sessions started from
+/// different checkouts, homes or terminal tabs join the same object, and the
+/// owner holds this handle for its whole process lifetime. A Job object
+/// outlives its handles while members remain, so closing one owner's handle
+/// neither lifts a peer's ceiling nor kills a peer's work.
+#[derive(Debug)]
+pub struct SessionCpuAllowance {
+    budget: Option<SharedCpuBudget>,
+    admitted: bool,
+}
+
+impl SessionCpuAllowance {
+    /// Join the account allowance and admit this process before any payload of
+    /// its session exists. Admission happens before the payload is created, so
+    /// nothing useful runs first and no timer has to notice a running process.
+    ///
+    /// Fail-open per the visible contract: a failure reports the failed limit,
+    /// its cause, the affected scope and the recovery step, and the requested
+    /// session still starts once outside verified coverage. Peers keep their
+    /// own allowance, the persistent default is not disabled and no payload is
+    /// started twice.
+    pub fn join(scope: &str) -> Self {
+        let directory = match cpu_budget_directory(None) {
+            Ok(directory) => directory,
+            Err(error) => return Self::degraded(scope, &error),
+        };
+        let deadline = match Deadline::after(CPU_ADMISSION_WAIT) {
+            Ok(deadline) => deadline,
+            Err(error) => return Self::degraded(scope, &error),
+        };
+        let budget = match SharedCpuBudget::acquire_within(
+            &directory,
+            SHARED_CPU_PERCENT,
+            deadline,
+            &Cancellation::default(),
+        ) {
+            Ok(budget) => budget,
+            Err(error) => return Self::degraded(scope, &error),
+        };
+        match budget.snapshot() {
+            Ok(snapshot)
+                if snapshot.cpu_hard_cap
+                    && !snapshot.kill_on_close
+                    && snapshot.job_memory_limit_bytes == 0
+                    && !snapshot.breakaway_ok
+                    && !snapshot.silent_breakaway_ok => {}
+            Ok(_) => {
+                return Self::degraded(
+                    scope,
+                    &io::Error::other(
+                        "the account allowance does not carry the required CPU-only settings; it is preserved unchanged",
+                    ),
+                );
+            }
+            Err(error) => return Self::degraded(scope, &error),
+        }
+        // Kernel membership, never a copied marker. A process that already
+        // belongs to this allowance (a session started inside another admitted
+        // session) is confirmed instead of being assigned again.
+        match member_of_allowance(budget.name()) {
+            Ok(true) => Self {
+                budget: Some(budget),
+                admitted: true,
+            },
+            Ok(false) => match admit_current_process(budget.name()) {
+                Ok(()) => Self {
+                    budget: Some(budget),
+                    admitted: true,
+                },
+                Err(error) => {
+                    // The allowance is retained: payloads this session starts
+                    // are still admitted to it individually before they run,
+                    // which is a real cap even though this process is outside.
+                    eprintln!(
+                        "codex-harness: warning: the shared {SHARED_CPU_PERCENT}% account CPU allowance {} could not admit {scope} itself ({error}); processes this session starts through the harness are admitted to it before they run, while the session owner and anything it starts outside that path run without that ceiling. Other sessions keep their own allowance, and coverage stays degraded until the cause is fixed and this session is restarted into the allowance",
+                        budget.name()
+                    );
+                    Self {
+                        budget: Some(budget),
+                        admitted: false,
+                    }
+                }
+            },
+            Err(error) => Self::degraded(scope, &error),
+        }
+    }
+
+    /// The verified allowance this owner retained for its lifetime; `None`
+    /// means the session runs outside the account allowance, exactly as its
+    /// warning states.
+    pub fn budget(&self) -> Option<&SharedCpuBudget> {
+        self.budget.as_ref()
+    }
+
+    /// Whether the kernel confirmed (or observed) this owner process inside the
+    /// account allowance. `false` with a retained allowance means only the
+    /// payloads this session starts through the harness are admitted.
+    pub fn admitted(&self) -> bool {
+        self.admitted
+    }
+
+    /// Create one payload of this session as a member of the account allowance
+    /// (outer) and the supplied lifecycle Job (inner), before any payload code
+    /// runs. See [`spawn_admitted`].
+    pub fn spawn(
+        &self,
+        lifecycle: &Job,
+        scope: &str,
+        command: &CommandSpec,
+    ) -> io::Result<OwnedProcess> {
+        spawn_admitted(self.budget.as_ref(), lifecycle, scope, command)
+    }
+
+    fn degraded(scope: &str, error: &io::Error) -> Self {
+        eprintln!(
+            "codex-harness: warning: {scope} runs outside the shared {SHARED_CPU_PERCENT}% account CPU allowance for this account ({error}); other sessions keep their allowance and were not affected, and coverage stays degraded until the account allowance is usable and this session is restarted into it"
+        );
+        Self {
+            budget: None,
+            admitted: false,
+        }
+    }
+}
+
+/// Admit one payload to the account allowance and to its owner's lifecycle Job
+/// before it executes. The kernel assigns the complete ordered list at
+/// creation, so a successful return is verified membership instead of an
+/// assumption, and the lifecycle Job keeps its exclusive cleanup authority.
+///
+/// Availability is preserved on an admission failure: the requested payload
+/// still starts once, with its ordinary lifecycle, and the report says that its
+/// ceiling is unverified instead of claiming the shared one.
+pub fn spawn_admitted(
+    budget: Option<&SharedCpuBudget>,
+    lifecycle: &Job,
+    scope: &str,
+    command: &CommandSpec,
+) -> io::Result<OwnedProcess> {
+    let Some(budget) = budget else {
+        // The owner already reported degraded coverage when it joined; the
+        // payload keeps its ordinary lifecycle and is not claimed as capped.
+        return lifecycle.spawn(command);
+    };
+    match budget.spawn(lifecycle, command) {
+        Ok(process) => Ok(process),
+        Err(error) => {
+            eprintln!(
+                "codex-harness: warning: {scope} could not be admitted to the shared {SHARED_CPU_PERCENT}% account CPU allowance {} before it ran ({error}); it starts once with its ordinary lifecycle, so any ceiling it has is unverified. Other sessions keep their allowance, and coverage stays degraded until the cause is fixed and this session is restarted into the allowance",
+                budget.name()
+            );
+            lifecycle.spawn(command)
+        }
+    }
+}
+
+/// Query-only membership of this process in the named allowance. The name is
+/// resolved through the owner's verified object, so a name alone never enrols
+/// or adopts an unrelated process.
+fn member_of_allowance(name: &str) -> io::Result<bool> {
+    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsProcessInJob};
+    let handle = open_allowance(name, JOB_OBJECT_QUERY)?;
+    let mut member = 0;
+    if unsafe { IsProcessInJob(GetCurrentProcess(), handle.as_raw_handle().cast(), &mut member) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(member != 0)
+}
+
+/// Assign this process to the named CPU-only allowance when the kernel allows
+/// it, then confirm the membership. Assignment needs only the documented
+/// assign right and grants no termination or configuration authority over the
+/// object or over peers; a refusal is reported, never retried.
+fn admit_current_process(name: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_ASSIGN_PROCESS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let handle = open_allowance(name, JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY)?;
+    if unsafe { AssignProcessToJobObject(handle.as_raw_handle().cast(), GetCurrentProcess()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if !member_of_allowance(name)? {
+        return Err(io::Error::other(
+            "the kernel did not observe the account allowance assignment",
+        ));
+    }
+    Ok(())
+}
+
+fn open_allowance(name: &str, access: u32) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    let object: Vec<u16> = OsStr::new(name).encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        windows_sys::Win32::System::JobObjects::OpenJobObjectW(access, 0, object.as_ptr())
+    };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle.cast()) })
+}
+
 /// The caller has already verified the registered upstream and runtime. None
 /// preserves the ordinary CLI path for commands outside managed interaction.
 pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<i32>> {
@@ -154,6 +366,11 @@ pub fn run(command: &Command, manager: &Path, home: &Path) -> io::Result<Option<
             return Ok(None);
         }
     };
+    // This session owner is started by the terminal or by a dispatch route
+    // outside any account job, so it joins the shared allowance before the
+    // service, the native server or any visible conversation exists. The handle
+    // is retained for the whole session and its descendants inherit the ceiling.
+    let _allowance = SessionCpuAllowance::join("this task-control session");
     let mut placements = crate::task_view::layout(4)?;
     let root = BrokerRoot::prepare()?.keep();
     let launch = Launch {
@@ -642,7 +859,15 @@ pub fn serve(mut guard: ServiceGuard, expected: &str) -> io::Result<()> {
     ]);
     command.stdout = Some(log.try_clone()?);
     command.stderr = Some(log.try_clone()?);
-    let server = guard.job().spawn(&command)?;
+    // The service itself belongs to the account allowance (its own bootstrap
+    // joined it), so the native server that does the session's work is admitted
+    // to the same object before it can execute anything.
+    let server = spawn_admitted(
+        guard.shared_cpu(),
+        guard.job(),
+        "the task-control native server",
+        &command,
+    )?;
     let until = Instant::now() + STARTUP;
     let mut connection = loop {
         match ControlConnection::connect(port, &token, POLL) {

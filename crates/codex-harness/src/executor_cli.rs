@@ -1881,6 +1881,11 @@ fn run_exec(args: &[OsString]) -> io::Result<i32> {
         return Err(invalid("executor run requires the launcher path"));
     };
     let launcher = normalize_launcher(launcher)?;
+    // An explicit `executor run` starts one launcher tree on this host, so this
+    // host joins the shared allowance first, exactly like the dispatched tab
+    // host, and the tree inherits the ceiling.
+    let _allowance =
+        harness_core::task_runtime::SessionCpuAllowance::join("this executor session host");
     run_child(&launcher, rest, None)
 }
 
@@ -1905,6 +1910,13 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
                 .collect::<Vec<_>>()
         })
         .ok_or_else(|| invalid("executor run receipt args are missing"))?;
+    // The terminal tab or the owning console starts this host outside any
+    // account job, so the host joins the shared CPU allowance before its
+    // payload tree exists; the launcher and everything it starts inherit the
+    // ceiling, while the terminal that dispatched the tab stays outside it. The
+    // handle is retained for the whole hosted session.
+    let _allowance =
+        harness_core::task_runtime::SessionCpuAllowance::join("this executor session host");
     // The tab host is the process that stays alive for the whole session, so
     // it records the slot's liveness for exactly as long as the session runs.
     let binding = receipt_binding(&value)?;

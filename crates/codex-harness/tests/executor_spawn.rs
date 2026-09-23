@@ -1220,3 +1220,43 @@ fn pooled_slot_path(home: &Path) -> PathBuf {
 fn pooled_receipt_path(home: &Path, index: u32) -> PathBuf {
     pooled_state_dir(home).join(format!("spawn-{index}.json"))
 }
+
+#[test]
+fn probe_job_context() {
+    use harness_core::process::{CommandSpec, Job, Limits, SHARED_CPU_PERCENT, SharedCpuBudget};
+    let root = std::env::temp_dir().join(format!("executor-probe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    let plain = root.join("plain.json");
+    let status = Command::new(&fixture)
+        .args(["report"])
+        .arg(&plain)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    eprintln!("probe plain status={status:?}");
+    let recorded: Value = serde_json::from_slice(&fs::read(&plain).unwrap()).unwrap();
+    eprintln!("probe plain in_job={}", recorded["in_job"]);
+
+    let account = root.join("account");
+    let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+    let job = Job::new(Limits::default()).unwrap();
+    let mut spec = CommandSpec::new(&fixture);
+    spec.args = vec!["hold".into(), root.join("member.json").into()];
+    match budget.spawn(&job, &spec) {
+        Ok(child) => {
+            let snapshot = budget.snapshot().unwrap();
+            eprintln!(
+                "probe budget member pid={} contains={:?} rate={} hard={} members={}",
+                child.identity().pid,
+                budget.contains(&child),
+                snapshot.cpu_rate,
+                snapshot.cpu_hard_cap,
+                snapshot.active_processes
+            );
+            job.terminate(0, Duration::from_secs(3)).unwrap();
+        }
+        Err(error) => eprintln!("probe budget.spawn failed: {error}"),
+    }
+}
