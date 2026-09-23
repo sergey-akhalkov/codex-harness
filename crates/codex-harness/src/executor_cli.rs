@@ -3439,13 +3439,8 @@ fn read_text(path: &Path, limit: u64) -> io::Result<String> {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {error}", path.display()),
-            )
-        }),
+    match harness_core::task_runtime::read_json(path) {
+        Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }

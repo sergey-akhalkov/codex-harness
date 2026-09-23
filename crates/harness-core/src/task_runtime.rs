@@ -60,7 +60,9 @@ fn unicode(value: &OsStr) -> io::Result<String> {
     })
 }
 
-pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+/// Read a bounded controller checkpoint, allowing its short exclusive write.
+/// Sharing contention is retried; malformed content and other errors are not.
+pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     retry_checkpoint(|| {
         let mut bytes = Vec::new();
         File::open(path)?

@@ -825,13 +825,7 @@ pub fn read_session_pointer(codex_home: &Path, session: &str) -> io::Result<Opti
 
 /// Reads one bounded JSON artifact.
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
-    let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: {error}", path.display()),
-        )
-    })
+    crate::task_runtime::read_json(path)
 }
 
 fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -1134,6 +1128,33 @@ mod tests {
         assert!(facts.thread_settled);
         assert!(!facts.last_turn_in_progress);
         assert_eq!(facts.active_operations.len(), 0);
+    }
+
+    #[test]
+    fn session_facts_wait_for_a_checkpoint_writer_without_claiming_safety() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let path = owned.path().join("task.json");
+        fs::write(
+            &path,
+            br#"{"threads":{"lead":{"status":{"type":"active"},"turns":[{"status":"inProgress"}]}}}"#,
+        )
+        .unwrap();
+        let writer = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(writer);
+        });
+        let result = read_session_facts(owned.path());
+        release.join().unwrap();
+        let mut facts =
+            result.expect("a brief checkpoint lock must not abort succession observation");
+        facts.predecessor_running = Some(true);
+        assert!(matches!(boundary(&facts, None), Boundary::Deferred(_)));
     }
 
     #[test]
