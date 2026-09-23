@@ -1,0 +1,28 @@
+## 1. Capability baseline
+
+- [ ] 1.1 Verify the installed Codex CLI's app-server contract for this change: second-client `turn/start` on an active thread, `turn/interrupt` during generation and during a tool call, thread config overrides for model/provider/effort, and final-message availability from thread items. Run the existing opt-in task-control contract check (`cargo test --locked -p codex-harness --test task_control_contract ... -- --ignored --nocapture --test-threads=1` with `HARNESS_CONTROL_CODEX_EXE` set to the installed native CLI) plus the smallest supplementary probe needed for interrupt-during-tool-call; record the observed CLI version, outcomes and any protocol differences from 0.154.0 in `openspec/changes/executor-message-stop/design.md` before backend work starts.
+
+## 2. Executor stop
+
+- [ ] 2.1 Implement `codex-harness executor stop --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session ID]` in `crates/codex-harness/src/executor_cli.rs`: resolve the dispatch receipt, verify slot binding/owner/exact session/live host identity, request native interruption when the run has a control endpoint, then boundedly terminate the recorded host's owned tree and verify owned processes ended by recorded identity. Verify with fixture-based tests in `crates/codex-harness/tests/executor_spawn.rs` covering stop during a child command, stale identity refusal, host-death tree reaping and survivor reporting.
+- [ ] 2.2 Record honest stop lifecycle in `crates/codex-harness/src/executor_observation.rs`: a `stopped` state plus stop record (stopped / already-completed / partial / error, timestamps, measured duration, unknown exit codes), pending-message undelivered marking, no release/completion claim, and idempotent repeat. Verify with unit tests for receipt transitions, natural-completion race under the receipt lock, and repeat stop.
+- [ ] 2.3 Close exactly the stopped run's terminal tab through the existing terminal-surface owner using the receipt's recorded window/tab identity, and verify with the existing ignored terminal test extended to assert only the executor tab closes while sibling tabs remain.
+
+## 3. Control-backed exec conversations
+
+- [ ] 3.1 Add the per-run app-server child to the exec-mode tab host in `crates/codex-harness/src/executor_cli.rs` (new helper module if needed): loopback WebSocket + capability-token file in kit-local run state, executor session environment and Job ownership, thread started with `cwd` at the slot and config overrides from the resolved profile binding, thread named with the assignment title, endpoint (port/token/thread id) recorded beside the receipt. Verify binding preservation (model/provider/effort match the configured profile) and fail-closed startup with fixture tests.
+- [ ] 3.2 Drive and render the conversation: submit the assignment through `turn/start`, map thread events to the existing renderer and lifecycle states (native-start/running/completed/failed/defect/interrupted), record the exact session identity and final message/result locator, and keep the stderr log, detail file and lease behavior. Verify with fixture event-stream tests plus the existing observation suite.
+
+## 4. Executor message
+
+- [ ] 4.1 Implement `codex-harness executor message --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session ID] (--text TEXT | --file FILE)` in `crates/codex-harness/src/executor_cli.rs`: literal UTF-8 multiline content without shell evaluation, identity verification against the live run, delivery through the recorded endpoint on the same thread, honest queued/delivered/error classification, retry identity so an indeterminate retry cannot silently double-deliver, and explicit completed/stopped/unsupported results naming the exact-session resume remedy. Fold the legacy `executor steer` path into this addressing or retire it without leaving a parallel command; update `USAGE`. Verify with fixture tests for text/file parity, stale identity, finished run, dedup and classification.
+
+## 5. Instructions and delivery
+
+- [ ] 5.1 Update the owning instructions for both commands and the selection rules: `crates/codex-harness/src/executor_cli.rs` usage text, `docs/rust-native.md`, `docs/agent-delegation.md`, and `.agents/skills/team-lead/SKILL.md` (message for concrete corrections; no status-only nudges or repeats without new facts; brief error alone is not stop; stop only for explicit cancellation or concrete necessity; waiting alone is not stop; standard commands before manual process killing with recorded cause; preserve partial work after stop). Verify help/docs consistency checks and the kit's documentation link/fact checks pass.
+- [ ] 5.2 Build and install through the existing immutable lifecycle without interrupting other active conversations, then verify installed `codex-harness executor --help`/`--version` agreement and a fresh session seeing the updated instructions.
+
+## 6. End-to-end acceptance
+
+- [ ] 6.1 Verify through real dispatch entry points on owned synthetic assignments with the configured executor profile: a working executor receives a concrete correction via message, continues the same session and uses the correction; conversation identity and completed work are preserved; stop during generation and during a child command ends the run, terminates owned processes and closes only its tab; changed/untracked files survive with honest lifecycle and no automatic release; repeated stop, stale identity and natural-completion races behave as specified. Measure actual stop time for both stop scenarios and record the measurement bounds in the change tasks.
+
