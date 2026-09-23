@@ -9,7 +9,7 @@ executor_profiles = ["ds"]
 # synchronizes and binds sibling slots `<repository-name>-wt1` .. `-wtN`, and
 # refuses dispatch when all are held by live sessions instead of allocating
 # another tree.
-max_concurrent_executors = 2
+max_concurrent_executors = 4
 # Promote an incubator item after more than two distinct votes (threshold 3).
 vote_threshold = 3
 incubator_size_cap = 32

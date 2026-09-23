@@ -20,6 +20,18 @@ The existing dispatch and receipt owners SHALL distinguish request acceptance, t
 - **WHEN** the lead accepts and integrates an outcome and records its disposition
 - **THEN** the existing release operation records that decision before resetting the slot for reuse; unreviewed work remains preserved
 
+### Requirement: Concise titles and four executor slots
+
+New executor terminal titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL permit four concurrent executor slots without changing the aggregate heavy-command allowance or explicit executor profile.
+
+#### Scenario: Executor terminal identity
+- **WHEN** dispatch or continuation opens an executor terminal
+- **THEN** its title uses `CEx ({profile}) - {owner}` and remains distinct from another owner's terminal
+
+#### Scenario: Configured four-slot pool is full
+- **WHEN** all four configured slots contain live or unreviewed work and a fifth independent owner requests dispatch
+- **THEN** the existing pool reports capacity exhaustion without creating another slot or replacing held work
+
 ### Requirement: Shared heavy-command admission
 
 Executor heavy commands SHALL use the existing resource and process ownership mechanisms to serialize admission under one installed aggregate budget. Independent reads, analysis and edits SHALL remain concurrent. Executor-specific limits SHALL NOT multiply the aggregate allowance. Queue admission and release SHALL be mechanical, with observable waiting, execution, exit and failure. Machine resource settings SHALL remain local.

@@ -777,24 +777,23 @@ fn pooled_dispatch_records_the_mapping_and_reuses_the_same_slot_after_interrupti
 
 #[test]
 fn exhausted_pool_aborts_with_a_concrete_cause_and_no_new_tree() {
-    let fixture = Fixture::new("exhausted", 2);
-    assert!(!fixture.spawn(&["--owner", "exec-1"]).status.success());
-    fs::write(fixture.slot(1).join("work.txt"), "unreviewed work\n").unwrap();
-    assert!(!fixture.spawn(&["--owner", "exec-2"]).status.success());
-    assert!(fixture.slot(2).is_dir());
-    fs::write(fixture.slot(2).join("work.txt"), "unreviewed work\n").unwrap();
-    let third = fixture.spawn(&["--owner", "exec-3"]);
-    let text = output_text(&third);
-    assert!(!third.status.success());
-    assert!(text.contains("no free slot in the pool of 2"), "{text}");
-    assert!(
-        text.contains("slot 1 holds local or untracked changes"),
-        "{text}"
-    );
-    assert!(
-        text.contains("slot 2 holds local or untracked changes"),
-        "{text}"
-    );
+    let fixture = Fixture::new("exhausted", 4);
+    for index in 1..=4 {
+        let owner = format!("exec-{index}");
+        assert!(!fixture.spawn(&["--owner", &owner]).status.success());
+        assert!(fixture.slot(index).is_dir());
+        fs::write(fixture.slot(index).join("work.txt"), "unreviewed work\n").unwrap();
+    }
+    let fifth = fixture.spawn(&["--owner", "exec-5"]);
+    let text = output_text(&fifth);
+    assert!(!fifth.status.success());
+    assert!(text.contains("no free slot in the pool of 4"), "{text}");
+    for index in 1..=4 {
+        assert!(
+            text.contains(&format!("slot {index} holds local or untracked changes")),
+            "{text}"
+        );
+    }
     assert!(
         text.contains("merge or explicitly discard them before reuse"),
         "{text}"
@@ -803,9 +802,12 @@ fn exhausted_pool_aborts_with_a_concrete_cause_and_no_new_tree() {
         !text.contains("worktree warning"),
         "the limit warning is replaced by the pool-invariant refusal: {text}"
     );
-    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1", "proj-wt2"]);
+    assert_eq!(
+        fixture.checkouts(),
+        ["proj", "proj-wt1", "proj-wt2", "proj-wt3", "proj-wt4"]
+    );
     assert!(
-        !fixture.slot(3).exists(),
+        !fixture.slot(5).exists(),
         "an exhausted pool never registers another tree"
     );
     // Preserved slots report their reason instead of being silently reused.

@@ -8,6 +8,7 @@ Executor assignments should deliver verified outcomes while the lead handles dep
 - Extend the existing assignment, dispatch receipt and observation path with complete outcome briefs, native execution identity, bounded results and explicit lifecycle states.
 - Preserve original sessions and partial work for corrections; make accepted-result release mechanical without discarding unreviewed changes.
 - Reuse the existing resource owner to serialize heavy commands under the installed aggregate limits while independent analysis and edits overlap.
+- Use `CEx` as the executor terminal-title prefix and ship four executor slots, retaining one shared heavy-command budget.
 - Remove confirmed repeated context and verify supported model/effort selection while preserving explicit profiles and billing.
 - Exercise the installed components on an owned Rust task, then concurrent, failure, interruption, continuation and release cases. Compare accepted-result costs only where reliable observations exist.
 

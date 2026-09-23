@@ -694,7 +694,7 @@ fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
 }
 
 fn executor_title(profile: &str, owner: &str) -> String {
-    format!("Codex executor ({profile}) - {owner}")
+    format!("CEx ({profile}) - {owner}")
 }
 
 /// Report the inventory the pool invariant covers: dispatch allocates only
@@ -3521,7 +3521,7 @@ mod tests {
     fn terminal_tab_args_target_a_named_window_without_focus_flags() {
         let args = terminal_tab_args(
             "codex-harness-proj",
-            "Codex executor (xai)",
+            "CEx (xai)",
             Path::new(r"D:\wt\xai"),
             Path::new(r"C:\harness\codex-harness.exe"),
             Path::new(r"C:\wt\xai\executor-spawn.json"),
@@ -3800,7 +3800,7 @@ mod tests {
         let summary = spawn_summary(
             "ds",
             &bound,
-            "Codex executor (ds)",
+            "CEx (ds)",
             Path::new(r"C:\home\harness\executor-pool\proj-0123456789ab\spawn-1.json"),
             "windows-terminal-tab",
             &RunObservation::accepted(
@@ -3818,7 +3818,7 @@ mod tests {
         );
         assert!(!summary.contains("executor started"), "{summary}");
         assert!(summary.contains("host=windows-terminal-tab"));
-        assert!(summary.contains("title=\"Codex executor (ds)\""));
+        assert!(summary.contains("title=\"CEx (ds)\""));
         assert!(summary.contains("coverage=native"), "{summary}");
         assert!(
             summary.contains("message-1.txt"),
@@ -3835,6 +3835,7 @@ mod tests {
     fn executor_titles_distinguish_assignments_on_the_same_profile() {
         let first = executor_title("ds", "task-a");
         let second = executor_title("ds", "task-b");
+        assert_eq!(first, "CEx (ds) - task-a");
         assert_ne!(first, second);
         let args = terminal_tab_args(
             "test-window",

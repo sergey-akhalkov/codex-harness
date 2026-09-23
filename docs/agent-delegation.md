@@ -61,7 +61,7 @@ schema = 1
 lead_profile = "default"
 successor_lead_profile = "xai"
 executor_profiles = ["xai"]
-max_concurrent_executors = 2
+max_concurrent_executors = 4
 ```
 
 Dispatch an executor with the installed launcher:
