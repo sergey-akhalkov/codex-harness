@@ -1352,9 +1352,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut observation = observation();
-        observation.session = Some("s-1".into());
-        update_receipt(&receipt, &observation).unwrap();
+        let mut recorded = observation();
+        recorded.session = Some("s-1".into());
+        update_receipt(&receipt, &recorded).unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         assert_eq!(value["launcher"], r"C:\x\codex.exe");
         let parsed = RunObservation::from_receipt(&value).expect("recorded observation");
@@ -1387,13 +1387,13 @@ mod tests {
         )
         .unwrap();
         let mut tail = SpoolTail::new(fs::File::open(&oversized).unwrap());
-        tail.read_available().unwrap();
+        drain_spool(&mut tail);
         match tail.take_line(false).expect("oversize line") {
             Line::Oversize(note) => assert!(note.contains("exceeded"), "{note}"),
             _ => panic!("oversize line must be dropped"),
         }
         // The line after the dropped one is still parsed normally.
-        match tail.take_line(true).expect("following line") {
+        match tail.take_line(false).expect("following line") {
             Line::Text(line) => assert_eq!(line, "ok"),
             _ => panic!("the following line must survive"),
         }
@@ -1402,10 +1402,20 @@ mod tests {
         let partial = root.path().join("partial.jsonl");
         fs::write(&partial, br#"{"type":"thread.sta"#).unwrap();
         let mut tail = SpoolTail::new(fs::File::open(&partial).unwrap());
-        tail.read_available().unwrap();
+        drain_spool(&mut tail);
         match tail.take_line(true).expect("partial line") {
             Line::Text(line) => assert!(parse_event(&line).is_err()),
             _ => panic!("partial line must be returned"),
+        }
+    }
+
+    /// Reads the whole spool the way the host tail loop does, in bounded
+    /// increments.
+    fn drain_spool(tail: &mut SpoolTail) {
+        let mut reads = 0;
+        while tail.read_available().unwrap() > 0 {
+            reads += 1;
+            assert!(reads < 10_000, "spool never reached its end");
         }
     }
 
@@ -1506,7 +1516,7 @@ mod tests {
         );
         release.store(true, std::sync::atomic::Ordering::Relaxed);
         holder.join().unwrap();
-        waiter.join().unwrap();
+        waiter.join().unwrap().unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         assert_eq!(value["window"]["columns"], 120, "{value}");
     }

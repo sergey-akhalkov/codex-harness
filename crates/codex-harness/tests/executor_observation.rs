@@ -96,6 +96,8 @@ impl SeededRun {
                 "modelProvider": "deepseek",
                 "reasoningEffort": "max",
                 "window": Value::Null,
+                // Receipts written before shell recording fall back to the
+                // launcher preflight, which the owned fixture answers.
                 "shell": Value::Null,
                 "observation": {
                     "schema": 1,

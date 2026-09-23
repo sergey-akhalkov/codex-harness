@@ -29,6 +29,21 @@ const FINAL_MESSAGE: &str =
     "FIXTURE_OUTCOME_DONE\nremaining: none\nchecks: fixture event stream verified";
 
 fn main() -> io::Result<()> {
+    // The installed-launcher shell preflight is a model-free diagnostic; the
+    // fixture answers it so receipts without a recorded shell still exercise
+    // the real preparation path.
+    if env::args().skip(1).any(|arg| arg == "prompt-input") {
+        let block = "<permissions instructions>\n`sandbox_mode` is `danger-full-access`\n</permissions instructions>";
+        println!(
+            "{}",
+            json!([{
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": block}]
+            }])
+        );
+        return Ok(());
+    }
     if let Some(path) = env::var_os("HARNESS_EXECUTOR_FIXTURE_STARTED") {
         write_identity(PathBuf::from(path))?;
     }
