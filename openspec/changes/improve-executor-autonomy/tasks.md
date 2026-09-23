@@ -18,8 +18,8 @@
 ## 4. Integrated acceptance and delivery
 
 - [x] 4.1 Exercise independent concurrent executors, common heavy-command budget, failed start, partial-work recovery, continuation and release through installed components using owned synthetic inputs; retain actual command/process evidence privately.
-- [ ] 4.2 Compare minimal comparable baseline/candidate tasks using existing measurements; report elapsed acceptance time, lead tokens/interventions, executor totals, rework and quality separately, explicitly identifying unavailable quantitative evidence.
-- [ ] 4.3 Run affected native checks, source/link/ownership checks and OpenSpec validation; reconcile documentation and tasks against actual results.
+- [x] 4.2 Compare minimal comparable baseline/candidate tasks using existing measurements; report elapsed acceptance time, lead tokens/interventions, executor totals, rework and quality separately, explicitly identifying unavailable quantitative evidence.
+- [x] 4.3 Run affected native checks, source/link/ownership checks and OpenSpec validation; reconcile documentation and tasks against actual results.
 - [ ] 4.4 Complete normal global deployment and outside-checkout consumption while preserving active consumers, or retain the verified candidate with the exact activation conflict; report remaining requirements honestly.
 
 ## 5. Final interface and capacity refinements

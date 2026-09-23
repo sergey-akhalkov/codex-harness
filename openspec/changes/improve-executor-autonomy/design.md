@@ -22,7 +22,7 @@ Restore the usable installed path first, then make its normal completion loop ob
 - A terminal environment can be stale: propagate the selected environment in the owned dispatch receipt and validate actual executor tool execution after delivery.
 - A stopped host can leave partial source: continuation and release keep existing ownership checks; no automatic reset based on process exit alone.
 - A controller checkpoint can be briefly locked by its writer. Succession readers reuse the runtime's bounded sharing-contention retry; malformed data and persistent locks still fail. The native active-turn case exposed this before delivery, and a locked-file regression preserves the requirement to defer without stopping the predecessor.
-- Quantitative baseline telemetry may be incomplete: use existing rollout accounting and report missing measurements. No subscription-saving inference from output size.
+- A matched quantitative baseline is unavailable. Existing rollout accounting reports partial coverage for compacted lead history and unsupported executor-model accounting; these are measurement limits, not provider failures. Retain observed counters and rework evidence privately, separate overlapping durations, and claim no time, token or subscription savings. Explicit effort selection remains unchanged.
 
 ## Migration Plan
 
