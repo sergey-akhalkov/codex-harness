@@ -22,7 +22,7 @@ do not certify that historical checks apply to current source or dirty changes.
 | Skill evolution | Calibration, catalogue limits and open coverage | [Skill evolution](skill-evolution.md) |
 | Verification workflows | Installed project-verification; quantitative benefit unproven | [project-verification](../../openspec/specs/project-verification/spec.md) |
 | Side questions | `/btw` / `/side` after a main conversation; no file isolation | [Agent delegation](../agent-delegation.md) |
-| Windows sandbox shell | Do not launch packaged WindowsApps PowerShell; select installed desktop PowerShell | [Installation](../installation.md) |
+| Windows executor shell | Preserve owner PowerShell 7 for unsandboxed execution; sandboxed execution requires a permitted shell before dispatch | [Installation](../installation.md) |
 
 Recheck technical commands against current source, runtime and relevant inputs
 before treating past results as current. Save new confirmed decisions in the

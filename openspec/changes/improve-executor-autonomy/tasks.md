@@ -2,7 +2,7 @@
 
 - [x] 1.1 Inspect source, installed identity, pool, retained diagnostics and actual executor tool behavior; classify shell and lifecycle failures with exact owners and native check evidence.
 - [ ] 1.2 Fix executor shell/environment propagation without permission changes or another shell installation; verify actual PowerShell 7 and failure-before-model behavior, including resume/succession paths.
-- [ ] 1.3 Deliver bootstrap through the native lifecycle and complete a real installed Rust repair: independent reading, symbol/caller discovery, edit, check, executor result and lead acceptance without source-body handoff.
+- [x] 1.3 Deliver bootstrap through the native lifecycle and complete a real installed Rust repair: independent reading, symbol/caller discovery, edit, check, executor result and lead acceptance without source-body handoff.
 
 ## 2. Complete outcome and lifecycle ownership
 
