@@ -149,6 +149,63 @@ pub fn binding(codex_home: &Path, profile: &str) -> io::Result<ProfileBinding> {
     })
 }
 
+/// Dotted `-c` overrides that layer one orchestration profile onto a native
+/// process with no `--profile` flag, such as the app-server. The profile is
+/// resolved exactly like [`binding`]: the installed profile file, otherwise
+/// its `profiles.<name>` table in the base configuration; `default` adds
+/// nothing because the base configuration already loads. Leaf values keep
+/// their TOML form so the receiver parses them as the profile file would.
+/// Keys that a dotted path cannot name are skipped: they cannot travel this
+/// route, and the kit establishes their effects (for example slot trust)
+/// through its own owners. A profile that is not installed adds nothing: the
+/// dispatch path validates installation when it resolves the binding, and a
+/// hand-built receipt without one keeps working; unreadable or invalid
+/// configuration still fails instead of silently changing routing.
+pub fn profile_config_overrides(codex_home: &Path, profile: &str) -> io::Result<Vec<String>> {
+    if profile == "default" {
+        return Ok(Vec::new());
+    }
+    let file = codex_home.join(format!("{profile}.config.toml"));
+    let table = if file.is_file() {
+        read_toml(&file)?
+    } else {
+        let base_path = codex_home.join("config.toml");
+        if !base_path.is_file() {
+            return Ok(Vec::new());
+        }
+        let base = read_toml(&base_path)?;
+        base.get("profiles")
+            .and_then(toml::Value::as_table)
+            .and_then(|profiles| profiles.get(profile))
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut overrides = Vec::new();
+    flatten_table("", &table, &mut overrides);
+    Ok(overrides)
+}
+
+fn flatten_table(prefix: &str, table: &toml::Table, overrides: &mut Vec<String>) {
+    for (key, value) in table {
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            continue;
+        }
+        let dotted = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(inner) => flatten_table(&dotted, inner, overrides),
+            leaf => overrides.push(format!("{dotted}={leaf}")),
+        }
+    }
+}
+
 pub fn check_installation(source_root: &Path, codex_home: &Path) -> io::Result<()> {
     let path = source_root.join("global/orchestration.toml");
     match fs::read(&path) {
@@ -417,6 +474,71 @@ mod tests {
         )
         .unwrap();
         check_installation(&source, &home).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_overrides_layer_profiles_for_processes_without_a_profile_flag() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestration-overrides-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("ds.config.toml"),
+            concat!(
+                "model = \"deepseek-flash\"\n",
+                "model_reasoning_effort = \"max\"\n",
+                "[features]\n",
+                "hooks = true\n",
+                "[model_providers.deepseek]\n",
+                "base_url = \"https://api.example.test/v1\"\n",
+                "wire_api = \"responses\"\n",
+                "[projects.'d:/unsafe/key']\n",
+                "trust_level = \"trusted\"\n",
+            ),
+        )
+        .unwrap();
+        let overrides = profile_config_overrides(&root, "ds").unwrap();
+        assert!(overrides.contains(&"model=\"deepseek-flash\"".to_owned()));
+        assert!(overrides.contains(&"model_reasoning_effort=\"max\"".to_owned()));
+        assert!(overrides.contains(&"features.hooks=true".to_owned()));
+        assert!(overrides.contains(
+            &"model_providers.deepseek.base_url=\"https://api.example.test/v1\"".to_owned()
+        ));
+        assert!(overrides.contains(&"model_providers.deepseek.wire_api=\"responses\"".to_owned()));
+        assert!(
+            overrides
+                .iter()
+                .all(|entry| !entry.starts_with("projects.")),
+            "keys a dotted path cannot name must not travel as overrides: {overrides:?}"
+        );
+        assert!(
+            profile_config_overrides(&root, "default")
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_file(root.join("ds.config.toml")).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "[profiles.ds]\nmodel = 'deepseek-flash'\n[profiles.ds.model_providers.deepseek]\nbase_url = 'https://api.example.test/v1'\n",
+        )
+        .unwrap();
+        let table = profile_config_overrides(&root, "ds").unwrap();
+        assert!(table.contains(&"model=\"deepseek-flash\"".to_owned()));
+        assert!(table.contains(
+            &"model_providers.deepseek.base_url=\"https://api.example.test/v1\"".to_owned()
+        ));
+        assert!(
+            profile_config_overrides(&root, "missing")
+                .unwrap()
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

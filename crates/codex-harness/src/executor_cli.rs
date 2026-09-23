@@ -2183,6 +2183,14 @@ fn run_control_receipt(
     // shell reports is pinned with it instead of the config default.
     plan.approval_policy = Some(CONTROL_APPROVAL_POLICY.to_owned());
     plan.sandbox = Some(shell.sandbox_mode.clone());
+    // The profile itself also travels as dotted config overrides: without it
+    // the app-server loads only the base configuration and a provider the
+    // profile defines (for example the executor's) does not exist.
+    for config in harness_core::orchestration_config::profile_config_overrides(codex_home, profile)?
+    {
+        plan.args.push("-c".into());
+        plan.args.push(config.into());
+    }
     plan.env.insert("PATH".into(), Some(shell.path.clone()));
     plan.port = control.port;
     host_control_conversation(receipt, control, &plan, run, result, header)
