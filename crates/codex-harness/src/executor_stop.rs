@@ -231,8 +231,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // One live host, verified by its recorded identity. The dispatch receipt's
     // observation is authoritative; the lease must agree with it when both
     // exist, because a disagreement means the address no longer names one run.
-    let lease = read_lease(&lease_path(&request.codex_home, &request.source, request.slot)?)
-        .filter(|lease| lease.owner == request.owner && lease.index == request.slot);
+    let lease = read_lease(&lease_path(
+        &request.codex_home,
+        &request.source,
+        request.slot,
+    )?)
+    .filter(|lease| lease.owner == request.owner && lease.index == request.slot);
     let receipt_host = recorded_run.as_ref().and_then(|run| run.host.clone());
     if let (Some(receipt_host), Some(lease)) = (&receipt_host, &lease)
         && (lease.pid != receipt_host.pid
@@ -281,7 +285,13 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 host.program.display(),
                 request.slot
             );
-            return finish(&request, &receipt, stop, started, StopTransition::Unobserved);
+            return finish(
+                &request,
+                &receipt,
+                stop,
+                started,
+                StopTransition::Unobserved,
+            );
         }
         Err(error) => {
             stop.detail = format!(
@@ -299,8 +309,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // control-backed host records in its kit-local endpoint file.
     let endpoint = read_endpoint(&receipt, request.slot);
     let mut members = tree::descendants(host.pid, &user);
-    if let Some(identity) = endpoint.as_ref().and_then(|endpoint| endpoint.process.clone())
-        && !members.iter().any(|member| member.identity.pid == identity.pid)
+    if let Some(identity) = endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.process.clone())
+        && !members
+            .iter()
+            .any(|member| member.identity.pid == identity.pid)
     {
         members.push(Member {
             program: identity.program,
@@ -349,7 +363,10 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             .unwrap_or(false)
         {
             ended += 1;
-        } else if survivors.iter().all(|survivor| survivor.pid != Some(host.pid)) {
+        } else if survivors
+            .iter()
+            .all(|survivor| survivor.pid != Some(host.pid))
+        {
             survivors.push(StopSurvivor {
                 kind: "process".into(),
                 pid: Some(host.pid),
@@ -625,11 +642,9 @@ fn survivors_of_previous_stop(value: &Value, user: &str) -> Vec<StopSurvivor> {
     }
     let mut survivors = Vec::new();
     for survivor in stop.survivors {
-        let (Some(pid), Some(created), Some(image)) = (
-            survivor.pid,
-            survivor.created,
-            survivor.image.as_deref(),
-        ) else {
+        let (Some(pid), Some(created), Some(image)) =
+            (survivor.pid, survivor.created, survivor.image.as_deref())
+        else {
             survivors.push(survivor);
             continue;
         };

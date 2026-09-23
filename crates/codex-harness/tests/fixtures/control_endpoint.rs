@@ -189,6 +189,11 @@ impl Bearer {
 
 impl Wire {
     pub fn accept(mut stream: TcpStream, bearer: &Bearer) -> io::Result<Self> {
+        // A stream accepted from the nonblocking listener inherits that mode
+        // on Windows: without an explicit switch back, a read whose bytes
+        // have not arrived yet fails with WSAEWOULDBLOCK instead of waiting,
+        // the handshake is dropped and the client sees an aborted connection.
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut received = Vec::new();
@@ -488,7 +493,12 @@ fn serve(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => return,
+            // A transient accept failure - for example an incoming
+            // connection that was reset before accept on loopback - must not
+            // kill the canned endpoint: the next client would then see a
+            // refused/aborted connect and the check would flake. Poll again
+            // until the owning test stops the server.
+            Err(_) => thread::sleep(Duration::from_millis(5)),
         }
     }
 }

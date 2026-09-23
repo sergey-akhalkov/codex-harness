@@ -1922,7 +1922,10 @@ mod tests {
         assert_eq!(commit.outcome, STOP_STOPPED);
         assert_eq!(commit.state, STATE_STOPPED);
         assert_eq!(stop.undelivered, vec!["m-queued".to_owned()]);
-        assert_eq!(stop.exit_code, None, "an unobserved exit code stays unknown");
+        assert_eq!(
+            stop.exit_code, None,
+            "an unobserved exit code stays unknown"
+        );
         let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         assert_eq!(value["observation"]["state"], STATE_STOPPED, "{value}");
         assert_eq!(value["stop"]["outcome"], STOP_STOPPED);
@@ -1935,7 +1938,10 @@ mod tests {
         // The recorded run is never released, reset or completed by a stop.
         assert_eq!(value["slot"]["owner"], "exec-ds-7", "{value}");
         assert!(value["slot"]["disposition"].is_null(), "{value}");
-        assert_eq!(value["observation"]["session"], "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4");
+        assert_eq!(
+            value["observation"]["session"],
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4"
+        );
         assert_eq!(value["observation"]["result"], r"C:\state\message-1.txt");
         // A partial stop records its named survivor and is not success.
         let mut partial = stop_record(STOP_PARTIAL);
@@ -1954,7 +1960,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         assert_eq!(value["observation"]["state"], STATE_PARTIAL_STOP, "{value}");
         assert_eq!(value["stop"]["survivors"][0]["pid"], 5150);
-        assert_eq!(value["stop"]["survivors"][0]["nextAction"], "terminate pid 5150 yourself");
+        assert_eq!(
+            value["stop"]["survivors"][0]["nextAction"],
+            "terminate pid 5150 yourself"
+        );
         // An error keeps the recorded lifecycle and only reports the refusal.
         let mut refusal = stop_record(STOP_ERROR);
         refusal.detail = "no live process matches the recorded host identity".into();
@@ -1987,8 +1996,7 @@ mod tests {
         let receipt = stop_receipt(root.path(), STATE_RUNNING);
         // The stop read the receipt while the run was still working; the host
         // completed it before the stop outcome was committed.
-        let mut completed: Value =
-            serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        let mut completed: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         completed["observation"]["state"] = json!(STATE_COMPLETED);
         completed["observation"]["exitCode"] = json!(0);
         fs::write(&receipt, serde_json::to_vec_pretty(&completed).unwrap()).unwrap();

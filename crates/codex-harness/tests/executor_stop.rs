@@ -148,10 +148,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "executor-stop-{name}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("executor-stop-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let bare = root.join("remote.git");
@@ -464,10 +462,7 @@ fn stop_terminates_the_owned_tree_and_preserves_the_run() {
     // An exit code that was never observed stays unknown, and the host's own
     // termination request is not presented as the run's result.
     assert!(recorded["stop"]["exitCode"].is_null(), "{recorded}");
-    assert!(
-        recorded["observation"]["exitCode"].is_null(),
-        "{recorded}"
-    );
+    assert!(recorded["observation"]["exitCode"].is_null(), "{recorded}");
     assert_eq!(recorded["messages"][0]["status"], "undelivered");
     assert!(recorded["messages"][0]["undeliveredMs"].is_u64());
     assert_eq!(recorded["messages"][1]["status"], "delivered");
@@ -476,9 +471,18 @@ fn stop_terminates_the_owned_tree_and_preserves_the_run() {
     assert_eq!(record_after["owner"], record_before["owner"]);
     assert!(record_after["disposition"].is_null(), "{record_after}");
     assert_eq!(record_after["state"], record_before["state"]);
-    assert!(fixture.lease().is_file(), "stop leaves the recorded lease alone");
-    assert_eq!(fs::read_to_string(fixture.slot().join("README.md")).unwrap(), "partial work\n");
-    assert_eq!(fs::read_to_string(fixture.slot().join("untracked.txt")).unwrap(), "keep me\n");
+    assert!(
+        fixture.lease().is_file(),
+        "stop leaves the recorded lease alone"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.slot().join("README.md")).unwrap(),
+        "partial work\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.slot().join("untracked.txt")).unwrap(),
+        "keep me\n"
+    );
 
     // A repeated stop reports the recorded state instead of acting again: the
     // first stop's outcome, timestamps and measured duration stand.
@@ -487,7 +491,10 @@ fn stop_terminates_the_owned_tree_and_preserves_the_run() {
     let repeat_text = text(&repeat);
     assert_eq!(repeat.status.code(), Some(0), "{repeat_text}");
     assert!(repeat_text.contains("already-stopped"), "{repeat_text}");
-    assert!(repeat_text.contains("repeated stop request"), "{repeat_text}");
+    assert!(
+        repeat_text.contains("repeated stop request"),
+        "{repeat_text}"
+    );
     let repeated = receipt_json(&fixture.receipt());
     assert_eq!(repeated["stop"]["outcome"], "stopped", "{repeated}");
     assert_eq!(repeated["stop"]["repeats"], 1, "{repeated}");
@@ -523,11 +530,18 @@ fn stale_host_identity_is_refused_and_nothing_is_terminated() {
         "created": identity_of(&identity).creation_time + 1,
         "program": launcher().to_string_lossy()
     });
-    fs::write(fixture.lease(), serde_json::to_vec_pretty(&recorded).unwrap()).unwrap();
+    fs::write(
+        fixture.lease(),
+        serde_json::to_vec_pretty(&recorded).unwrap(),
+    )
+    .unwrap();
 
     // An exact-session address that does not match the recorded session is
     // refused before anything is acted on.
-    let mismatched = fixture.stop(owner, &["--session", "01a0c719-0000-0000-0000-000000000000"]);
+    let mismatched = fixture.stop(
+        owner,
+        &["--session", "01a0c719-0000-0000-0000-000000000000"],
+    );
     let mismatched_text = text(&mismatched);
     assert_eq!(mismatched.status.code(), Some(2), "{mismatched_text}");
     assert!(mismatched_text.contains(SESSION), "{mismatched_text}");
@@ -593,7 +607,10 @@ fn host_death_reaps_the_owned_tree_and_stop_reports_the_unobserved_end() {
     assert!(output.contains("exit code is unknown"), "{output}");
     let recorded = receipt_json(&fixture.receipt());
     assert_eq!(recorded["stop"]["outcome"], "error", "{recorded}");
-    assert_eq!(recorded["observation"]["state"], "interrupted", "{recorded}");
+    assert_eq!(
+        recorded["observation"]["state"], "interrupted",
+        "{recorded}"
+    );
     assert!(recorded["observation"]["exitCode"].is_null(), "{recorded}");
     assert_eq!(fixture.slot_record()["owner"], owner);
     fixture.drop();
@@ -626,10 +643,7 @@ fn a_recorded_member_surviving_the_host_is_terminated_by_identity() {
     )
     .unwrap();
     let started = fixture.root.join("member-launcher.json");
-    let mut host = fixture.host(
-        "hang",
-        &[("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)],
-    );
+    let mut host = fixture.host("hang", &[("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)]);
     let owned = wait_for_marker(&started);
     fixture.wait_recorded_host();
 
@@ -679,10 +693,7 @@ fn an_unverifiable_recorded_member_is_a_partial_stop() {
     )
     .unwrap();
     let started = fixture.root.join("partial-launcher.json");
-    let mut host = fixture.host(
-        "hang",
-        &[("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)],
-    );
+    let mut host = fixture.host("hang", &[("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)]);
     wait_for_marker(&started);
     fixture.wait_recorded_host();
 
@@ -699,7 +710,10 @@ fn an_unverifiable_recorded_member_is_a_partial_stop() {
     );
     let recorded = receipt_json(&fixture.receipt());
     assert_eq!(recorded["stop"]["outcome"], "partial", "{recorded}");
-    assert_eq!(recorded["observation"]["state"], "partial-stop", "{recorded}");
+    assert_eq!(
+        recorded["observation"]["state"], "partial-stop",
+        "{recorded}"
+    );
     assert_eq!(
         recorded["stop"]["survivors"][0]["pid"].as_u64().unwrap() as u32,
         exact.pid
@@ -751,7 +765,10 @@ fn stop_racing_natural_completion_reports_the_completed_result() {
     assert!(is_alive(exact, &launcher()));
     let recorded = receipt_json(&fixture.receipt());
     assert_eq!(recorded["observation"]["state"], "completed", "{recorded}");
-    assert_eq!(recorded["stop"]["outcome"], "already-completed", "{recorded}");
+    assert_eq!(
+        recorded["stop"]["outcome"], "already-completed",
+        "{recorded}"
+    );
     let _ = decoy.kill();
     let _ = decoy.wait();
     fixture.drop();
