@@ -19,11 +19,14 @@
 //! The tab host then submits the assignment with [`Conversation::assign`],
 //! renders what [`Conversation::pump`] returns (each record carries the
 //! [`Lifecycle`] state it establishes and one readable line from
-//! [`ControlEvent::render`]), and records the outcome from
+//! [`ControlEvent::render`], including the lead inputs addressed to the run,
+//! which are rendered once as `input:` lines), and records the outcome from
 //! [`Conversation::final_message`]. `executor message` and `executor stop`
 //! address the same conversation through [`Endpoint::read`] plus
-//! [`Conversation::attach`], and use [`Conversation::call`] for one bounded
-//! native request (`turn/start`, `turn/interrupt`) without inventing state.
+//! [`Conversation::attach`], and use [`Conversation::request`] for one bounded
+//! native request (`turn/start`, `turn/steer`, `turn/interrupt`) without
+//! inventing state; its [`Reply`] distinguishes the server's own refusal from
+//! a request it never answered, which delivery classification depends on.
 //!
 //! Fail-closed rules:
 //!
@@ -64,7 +67,7 @@ use harness_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     fmt, fs,
     io::{self, Read, Write},
@@ -512,6 +515,23 @@ pub struct TurnStart {
     pub status: String,
 }
 
+/// The answer to one bounded native request, exactly as the protocol delivered
+/// it.
+///
+/// A caller that must classify delivery reads this instead of
+/// [`Conversation::call`]: a [`Reply::Rejected`] is the server's own refusal
+/// (nothing was applied), while [`Reply::Unanswered`] or a transport error says
+/// nothing about whether the input reached the conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    /// The server answered with a `result`.
+    Result(Value),
+    /// The server answered with an `error`.
+    Rejected(Value),
+    /// No answer arrived within the request bound.
+    Unanswered,
+}
+
 /// The final assistant message of a thread, or why it is absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalMessage {
@@ -540,6 +560,10 @@ pub struct ControlEvent {
     /// The protocol deviation recorded while mapping this record, when the
     /// record cannot establish a state.
     pub deviation: Option<String>,
+    /// True when this record repeats a lead input the surface already
+    /// rendered; [`Self::render`] skips it so one delivered message shows once
+    /// even when the server announces it both as started and as completed.
+    pub repeat: bool,
 }
 
 impl ControlEvent {
@@ -548,6 +572,9 @@ impl ControlEvent {
     /// Reasoning summaries are intentionally not rendered: the surface carries
     /// decisions, activity and lifecycle, not opaque model state.
     pub fn render(&self, out: &mut dyn Write) -> io::Result<()> {
+        if self.repeat {
+            return Ok(());
+        }
         let Some(line) = self.line() else {
             return Ok(());
         };
@@ -610,6 +637,13 @@ fn item_line(method: &str, item: &Value) -> Option<String> {
             "assistant: {}",
             excerpt(item["text"].as_str().unwrap_or_default(), 4000)
         )),
+        // The addressed `executor message` path delivers lead input into
+        // this conversation; the run's own surface shows it, so the lead
+        // can see that the correction arrived.
+        "userMessage" => Some(format!(
+            "input: {}",
+            excerpt(&user_message_text(item), 4000)
+        )),
         "commandExecution" => Some(format!(
             "command: {}{}",
             excerpt(item["command"].as_str().unwrap_or_default(), 400),
@@ -635,6 +669,24 @@ fn item_line(method: &str, item: &Value) -> Option<String> {
     }
 }
 
+/// The literal text of one `userMessage` item: its `content` parts, or the
+/// `text` field some builds carry directly. Parts this driver does not know
+/// (images, audio) are not invented as text. The addressed-message path
+/// correlates a delivered input through this same reading.
+pub(crate) fn user_message_text(item: &Value) -> String {
+    if let Some(content) = item["content"].as_array() {
+        let text: Vec<&str> = content
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect();
+        if !text.is_empty() {
+            return text.join("\n");
+        }
+    }
+    item["text"].as_str().unwrap_or_default().to_owned()
+}
+
 /// One control-backed executor conversation: the app-server child, its
 /// authenticated connection, the named thread, and the observed state.
 ///
@@ -652,10 +704,18 @@ pub struct Conversation {
     failure: Option<String>,
     turn: Option<TurnStart>,
     pending: VecDeque<Value>,
+    /// Item ids of lead inputs this surface has already rendered, so one
+    /// delivered message is not printed twice when the server announces it as
+    /// both started and completed. Bounded: dedupe is best effort above it.
+    rendered_inputs: BTreeSet<String>,
     next_id: u64,
     bound: Duration,
     poll: Duration,
 }
+
+/// Bound on remembered lead-input item ids; beyond it the surface re-renders
+/// rather than growing without limit.
+const RENDERED_INPUTS_LIMIT: usize = 256;
 
 impl fmt::Debug for Conversation {
     /// Diagnostics carry the conversation identity and the observed state; the
@@ -703,6 +763,7 @@ impl Conversation {
             failure: None,
             turn: None,
             pending: VecDeque::new(),
+            rendered_inputs: BTreeSet::new(),
             next_id: 0,
             bound: plan.bound,
             poll: plan.poll,
@@ -748,6 +809,7 @@ impl Conversation {
             failure: None,
             turn: None,
             pending: VecDeque::new(),
+            rendered_inputs: BTreeSet::new(),
             next_id: 0,
             bound,
             poll: DEFAULT_POLL,
@@ -853,6 +915,31 @@ impl Conversation {
     /// state is invented: an error answer, an answer carrying another request
     /// identity, an answer without a result, or a deadline is an error.
     pub fn call(&mut self, method: &str, params: Value) -> io::Result<Value> {
+        match self.request(method, params)? {
+            Reply::Result(result) => Ok(result),
+            Reply::Rejected(error) => Err(io::Error::other(format!(
+                "the native request {method} was rejected: {}",
+                excerpt(&error.to_string(), 400)
+            ))),
+            Reply::Unanswered => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the native request {method} was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
+                    self.bound
+                ),
+            )),
+        }
+    }
+
+    /// Sends one bounded native request and returns its answer as the protocol
+    /// delivered it, or an error when no answer can be trusted (an answer
+    /// carrying another request identity, a non-object record, a record with
+    /// neither result nor error, or a transport failure).
+    ///
+    /// The distinction matters to a caller that must classify delivery: the
+    /// server's own error answer is a definite refusal, while an unanswered
+    /// request says nothing about whether the input was applied.
+    pub fn request(&mut self, method: &str, params: Value) -> io::Result<Reply> {
         if method.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -868,13 +955,7 @@ impl Conversation {
         let until = Instant::now() + self.bound;
         loop {
             if Instant::now() >= until {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "the native request {method} was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
-                        self.bound
-                    ),
-                ));
+                return Ok(Reply::Unanswered);
             }
             let Some(value) = self.connection.receive(self.poll)? else {
                 continue;
@@ -902,15 +983,12 @@ impl Conversation {
                 )));
             }
             if let Some(error) = value.get("error") {
-                return Err(io::Error::other(format!(
-                    "the native request {method} was rejected: {}",
-                    excerpt(&error.to_string(), 400)
-                )));
+                return Ok(Reply::Rejected(error.clone()));
             }
             if value.get("result").is_none() {
                 return Err(invalid(format!("the answer to {method} carried no result")));
             }
-            return Ok(value["result"].clone());
+            return Ok(Reply::Result(value["result"].clone()));
         }
     }
 
@@ -1019,6 +1097,7 @@ impl Conversation {
             method: method.clone(),
             lifecycle: None,
             deviation: None,
+            repeat: false,
         };
         let Some(method) = method else {
             // A response that no request awaits is a deviation from the
@@ -1028,6 +1107,18 @@ impl Conversation {
             );
             return event;
         };
+        // One lead input arrives as a started and a completed record of the
+        // same item; the surface renders its text once.
+        if method.starts_with("item/")
+            && event.raw["params"]["item"]["type"] == "userMessage"
+            && !user_message_text(&event.raw["params"]["item"]).is_empty()
+            && let Some(id) = event.raw["params"]["item"]["id"].as_str()
+        {
+            if self.rendered_inputs.len() >= RENDERED_INPUTS_LIMIT {
+                self.rendered_inputs.clear();
+            }
+            event.repeat = !self.rendered_inputs.insert(id.to_owned());
+        }
         let (lifecycle, deviation) = self.classify(&method, &event.raw);
         event.lifecycle = lifecycle;
         event.deviation = deviation;

@@ -34,10 +34,12 @@ use std::process::{Command, Stdio};
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
 #[path = "executor_control.rs"]
 mod control;
-#[path = "executor_observation.rs"]
-mod observation;
+#[path = "executor_message.rs"]
+mod executor_message;
 #[path = "executor_stop.rs"]
 mod executor_stop;
+#[path = "executor_observation.rs"]
+mod observation;
 
 use control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
@@ -55,7 +57,7 @@ const USAGE: &str = concat!(
     "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
     "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\n",
     "codex-harness executor stop --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--timeout SECONDS]\n",
-    "codex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\n",
+    "codex-harness executor message --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] (--text TEXT | --file FILE)\n",
     "codex-harness executor run LAUNCHER [ARG...]\n",
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
@@ -65,7 +67,8 @@ const USAGE: &str = concat!(
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
     "`executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifies each by the recorded identity and boundedly terminates survivors so a child command is reported actually terminated instead of assumed ended with the host. The stopped run's tab closes because that run's own host process ends, and the recorded tab identity is verified closed through the terminal-surface owner; no terminal command is ever sent, so the lead's window, sibling tabs and other conversations are untouched. The receipt gets a stop record with outcome stopped, already-stopped, already-completed, partial or error, honest timestamps, the measured duration, the observed exit code (one that was never observed stays unknown), the pending-message undelivered marking, and the named survivor, cause and next action on partial failure; a repeated stop reports the recorded state and keeps the first stop's outcome, timestamps and measured duration, a stop racing natural completion reports the completed result, and nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). ",
-    "Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified."
+    "`executor message` delivers one literal correction into the addressed run's own live conversation: the text of --text or the verbatim content of a UTF-8 --file (no shell evaluation, real line breaks preserved), addressed by --source, --codex-home, --slot, --owner and, when given, the exact --session the dispatch receipt recorded. It verifies the recorded slot binding, the owner, the exact session, the live lease, the recorded host and app-server child, and the live conversation itself - recorded session identity, the addressed slot as its working directory and the receipt's resolved model/provider/reasoning effort - before delivering, so input cannot reach a later occupant of a reused slot and cannot enter a conversation routed differently. Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread, and no new conversation, hidden stop/resume, model/provider/effort change or re-sent task happens. The result distinguishes delivered (the input is observed in the conversation's own items as a user message correlated by the recorded client message id or its exact text), queued (accepted by the recorded turn; its own items do not show it yet), error (the native endpoint refused; nothing was delivered) and indeterminate (the request was not answered, so whether it was applied is unknown); acceptance is never reported as the executor having applied the correction. Every attempt is recorded with its content identity in the receipt's `messages` field, so the same literal text is one input: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat and names the next action, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state and result with the exact-session continuation remedy, and a surface that records no control endpoint (tui mode or a legacy receipt) is reported as unsupported with the same remedy instead of pretending delivery. Exit codes: 0 delivered, queued or already recorded as delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. ",
+    "Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. `executor message` is the kit's steering command. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified."
 );
 const STARTUP: Duration = Duration::from_secs(20);
 /// Windows Terminal activates the receiving window asynchronously around the
@@ -124,8 +127,11 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
             executor_stop::run(&args[1..])
         }
+        Some("message") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            executor_message::run(&args[1..])
+        }
         Some("assignment") => assignment_check(&args[1..]),
-        Some("steer") => steer(&args[1..]),
         Some("run") => {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
             run_exec(&args[1..])
@@ -3180,79 +3186,6 @@ fn unicode(path: &Path) -> io::Result<String> {
         .ok_or_else(|| invalid("executor workspace path must be unicode"))
 }
 
-fn steer(args: &[OsString]) -> io::Result<i32> {
-    let mut thread = None;
-    let mut worktree = None;
-    let mut text = None;
-    let mut out = None;
-    let mut state = None;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        let key = arg
-            .to_str()
-            .ok_or_else(|| invalid("invalid native executor options"))?;
-        let value = iter
-            .next()
-            .ok_or_else(|| invalid("invalid native executor options"))?;
-        match key {
-            "--thread" => thread = Some(value.to_string_lossy().into_owned()),
-            "--worktree" => worktree = Some(PathBuf::from(value)),
-            "--text" => text = Some(value.to_string_lossy().into_owned()),
-            "--out" => out = Some(PathBuf::from(value)),
-            "--state" => state = Some(PathBuf::from(value)),
-            _ => return Err(invalid("invalid native executor options")),
-        }
-    }
-    let thread = thread.ok_or_else(|| invalid("--thread is required"))?;
-    let worktree = worktree.ok_or_else(|| invalid("--worktree is required"))?;
-    let text = text.ok_or_else(|| invalid("--text is required"))?;
-    let Some(state) = state else {
-        eprintln!(
-            "codex-harness: executor steer needs --state DIRECTORY with the session's task-control endpoint.json; a plain pooled exec session has no control channel, so wait for it to finish and continue it with `codex exec resume SESSION_ID`"
-        );
-        return Ok(2);
-    };
-    let Ok(Some(endpoint)) = read_json::<serde_json::Value>(&state.join("endpoint.json")) else {
-        eprintln!(
-            "codex-harness: no task-control endpoint at {}; steering was not delivered. Start the session under task control, or wait and continue it with `codex exec resume SESSION_ID`",
-            state.display()
-        );
-        return Ok(2);
-    };
-    let (Some(port), Some(token)) = (endpoint["port"].as_u64(), endpoint["token"].as_str()) else {
-        return Err(invalid("task-control endpoint is malformed"));
-    };
-    let mut connection = ControlConnection::connect(port as u16, token, Duration::from_secs(5))?;
-    native_call(
-        &mut connection,
-        1,
-        "initialize",
-        json!({"clientInfo":{"name":"harness-steer","version":"1"},"capabilities":{"experimentalApi":true}}),
-    )?;
-    connection.send(&json!({"method":"initialized"}), Duration::from_secs(5))?;
-    let params = json!({"threadId":thread,"input":[{"type":"text","text":text}]});
-    let response = native_call(&mut connection, 2, "turn/start", params.clone())?;
-    let payload = json!({
-        "schema": 1,
-        "delivered": true,
-        "method": "turn/start",
-        "hiddenModelCall": false,
-        "statusPoll": false,
-        "worktree": worktree,
-        "params": params,
-        "response": response,
-    });
-    if payload["hiddenModelCall"] != false || payload["statusPoll"] != false {
-        return Err(invalid("steering must not hide model calls or poll status"));
-    }
-    if let Some(path) = out {
-        fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
-    } else {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    }
-    Ok(0)
-}
-
 const SUCCESSION_HELP: &str = "codex-harness executor succeed --request FILE\nReplace one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary. The request names the session id, profile, workspace, the private session state root (or its recorded pointer), the compact skill revision identity published by skill-evolution, the durable task context and a private evidence directory. The command makes no model calls: it writes the handover record, confirms the predecessor process stopped, spawns the successor, verifies in the session rollout that current instructions and skills were reloaded, and reports 'succession not established' with a non-zero exit when that verification fails.";
 
 fn succeed(args: &[OsString]) -> io::Result<i32> {
@@ -4429,34 +4362,33 @@ mod tests {
     }
 
     #[test]
-    fn steer_refuses_without_an_endpoint_instead_of_pretending() {
-        let root = tempfile::tempdir().unwrap();
-        let code = run(&[
+    fn the_legacy_steer_subcommand_is_retired() {
+        // Steering is `executor message`, which addresses the pooled run's own
+        // recorded conversation; the legacy task-control `--state` form must
+        // not survive as a parallel command that reports "delivered: true"
+        // from a payload it wrote itself.
+        let error = run(&[
             OsString::from("steer"),
             OsString::from("--thread"),
             OsString::from("exec-xai"),
-            OsString::from("--worktree"),
-            OsString::from(root.path().join("wt").as_os_str()),
-            OsString::from("--text"),
-            OsString::from("use the fixture"),
-            OsString::from("--state"),
-            OsString::from(root.path().join("missing-state").as_os_str()),
-        ])
-        .unwrap();
-        // A missing endpoint must refuse loudly: the old stub printed a
-        // turn/start payload and exited 0 while nothing was delivered.
-        assert_eq!(code, 2);
-        let with_state_only = run(&[
-            OsString::from("steer"),
-            OsString::from("--thread"),
-            OsString::from("exec-xai"),
-            OsString::from("--worktree"),
-            OsString::from(root.path().join("wt").as_os_str()),
             OsString::from("--text"),
             OsString::from("use the fixture"),
         ])
-        .unwrap();
-        assert_eq!(with_state_only, 2);
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid native executor options"),
+            "{error}"
+        );
+        assert!(
+            USAGE.contains("executor message --source"),
+            "the usage must name the addressed message command"
+        );
+        assert!(
+            !USAGE.contains("executor steer"),
+            "the usage must not keep the retired steer command"
+        );
     }
 
     #[test]
