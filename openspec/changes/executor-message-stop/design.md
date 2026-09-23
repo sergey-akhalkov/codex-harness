@@ -6,6 +6,25 @@ Pooled exec dispatch currently runs `codex exec --json` behind the executor tab 
 - The native app-server route does: the kit's task-control work already verified `turn/start` from a second client on the same thread, `turn/interrupt`, thread naming/resume and event observation on real Codex CLI builds; `codex app-server` accepts `--listen ws://IP:PORT --ws-auth capability-token --ws-token-file PATH` and config overrides via `-c`, but has no `-p/--profile` flag.
 - The dispatch receipt already records the resolved profile binding (model, provider, reasoning effort), slot binding, terminal window snapshot, host identity and lifecycle states; `executor steer` exists but requires a hand-supplied task-control state directory, which pooled exec sessions do not have.
 
+### Verified baseline (2026-09-23)
+
+Ran the opt-in contract checks against the installed native CLI (`codex-cli 0.156.1`, native binary sha256 `70bcb05f9bf1a4e7306edd0cd1b57d02af3267ad02a34b26f45c8c4bb20a3301`), model-free with the owned synthetic provider:
+
+```powershell
+cargo test --locked -p codex-harness --test task_control_contract native_two_clients_reconnect_tool_result_and_tui --jobs 1 -- --ignored --exact --nocapture --test-threads=1
+cargo test --locked -p codex-harness --test task_control_contract native_executor_control --jobs 1 -- --ignored --nocapture --test-threads=1
+```
+
+The second command runs the two probes added with this change (`native_executor_control_active_turn_and_tool_interrupt`, `native_executor_control_generation_interrupt`); all three checks passed and retain raw responses, provider requests, terminal inventory and item records in their printed private evidence root. Findings:
+
+- **Second-client `turn/start` on an active thread**: accepted without error, and the response carries the already-active turn (same turn id, status `inProgress`) rather than a new turn. When the turn continues, the input reaches the model in that turn's next provider request (observed). When the turn is interrupted first, the accepted input never reaches the model, no follow-up turn is created, and the sender still received a success response - transport acceptance is not delivery, so `message` must classify delivery from observed conversation evidence, not from the start response.
+- **`turn/interrupt` during a tool call**: accepted; the turn completes with status `interrupted` (observed 195-439 ms after the request across probe runs). The running child command is not terminated: it stays listed by `thread/backgroundTerminals/list`, runs to natural completion (observed exit code 0 after the command's full duration, 3.1-5.5 s under concurrent load) and then completes its item against the already-interrupted turn, while the model-visible history records the interruption as `aborted by user` with the elapsed wall time. Ending owned work therefore remains the stop path's tree termination, not interrupt alone.
+- **`turn/interrupt` during generation** (provider request in flight against a hung owned provider): accepted; the turn completes `interrupted` (observed 68-188 ms); no tool item is created.
+- **`thread/start` config overrides**: explicit `model`/`modelProvider` and `config` map overrides are honored; `config: {"model_reasoning_effort": "high"}` is reflected in the start response (`reasoningEffort`) and in the first provider request, and the same map carries per-thread provider route overrides (already used by the existing checks).
+- **Final message from thread items**: `thread/read` with `includeTurns` returns the completed turn's final assistant message (existing check and both probes).
+
+Protocol differences from the documented 0.154.0 baseline observed on 0.156.1: full-history `thread/read includeTurns` now emits a deprecation notice pointing at paginated `thread/turns/list` and `thread/items/list` reads (it still returns the final message); the surface additionally exposes a per-turn `effort` field, `reasoningEffort` in the thread start response, a dedicated active-turn steering call (`turn/steer`, carrying `expectedTurnId`), and a thread input queue (`thread/queue/add|start|list|...`). Everything the 0.154.0 notes record for this route (second clients, reconnect, native child survival, route overrides, background terminal inventory, naming/resume, `-c` overrides, no `-p/--profile`) still holds in the re-run checks.
+
 ## Goals / Non-Goals
 
 Goals:

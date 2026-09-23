@@ -14,9 +14,13 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -63,20 +67,61 @@ impl Client {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let value = self.raw_request(method, params);
+        assert!(value.get("error").is_none(), "{method}: {value}");
+        value["result"].clone()
+    }
+
+    /// Returns the complete response record so contract probes can classify
+    /// result versus error instead of assuming either one.
+    fn raw_request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params);
+        self.await_response(id)
+    }
+
+    /// Sends a request and returns its id without waiting, so an independent
+    /// action such as an interrupt is not delayed by the response.
+    fn send_request(&mut self, method: &str, params: Value) -> u64 {
         self.id += 1;
         self.connection
             .send(&json!({"id":self.id,"method":method,"params":params}), WAIT)
             .unwrap();
+        self.id
+    }
+
+    fn await_response(&mut self, id: u64) -> Value {
         let until = Instant::now() + WAIT;
         loop {
             let value = self.receive(until);
-            if value["id"] == self.id {
-                assert!(value.get("error").is_none(), "{method}: {value}");
-                return value["result"].clone();
+            if value["id"] == id {
+                return value;
             }
             assert!(self.pending.len() < 512, "contract pending-event bound");
             self.pending.push_back(value);
         }
+    }
+
+    /// Bounded event search that returns None instead of panicking when the
+    /// optional contract observation does not happen.
+    fn find(&mut self, until: Instant, predicate: impl Fn(&Value) -> bool) -> Option<Value> {
+        if let Some(index) = self.pending.iter().position(&predicate) {
+            return Some(self.pending.remove(index).unwrap());
+        }
+        while Instant::now() < until {
+            match self.connection.receive(Duration::from_millis(200)) {
+                Ok(Some(value)) => {
+                    writeln!(self.log, "{value}").unwrap();
+                    if predicate(&value) {
+                        return Some(value);
+                    }
+                    assert!(self.pending.len() < 512, "contract pending-event bound");
+                    self.pending.push_back(value);
+                }
+                Ok(None) => {}
+                Err(error) => panic!("control receive: {error}"),
+            }
+        }
+        None
     }
 
     fn event(&mut self, predicate: impl Fn(&Value) -> bool) -> Value {
@@ -136,6 +181,22 @@ fn capture(exe: &Path, home: &Path, workspace: &Path, root: &Path, args: &[&str]
         .unwrap();
     assert_eq!(outcome.reason, StopReason::Exited);
     assert_eq!(outcome.exit_code, 0);
+}
+
+/// Provider request files in the owned root whose body carries the marker.
+fn requests_containing(root: &Path, marker: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("provider-")
+            && fs::read_to_string(entry.path()).unwrap().contains(marker)
+        {
+            found.push(name);
+        }
+    }
+    found.sort();
+    found
 }
 
 #[test]
@@ -729,6 +790,336 @@ fn native_thread_route_override_reaches_only_selected_upstream() {
         fs::read(fixture.home.join("config.toml")).unwrap(),
         original
     );
+}
+
+/// Executor-control probe: how a second client's `turn/start` behaves while the
+/// thread is already executing a tool call, and what `turn/interrupt` does to
+/// that call and its child process. The accepted/queued/error classification is
+/// recorded from the raw response instead of being assumed.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native model-free executor-control probe"]
+fn native_executor_control_active_turn_and_tool_interrupt() {
+    let fixture = native_fixture(true);
+    let root = fixture.root.path();
+    let mut owner = Client::connect(fixture.port, &fixture.token, root, "active-owner");
+    let started = owner.request(
+        "thread/start",
+        json!({"cwd":fixture.workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access",
+            "config":{"model_reasoning_effort":"high"}}),
+    );
+    assert_eq!(started["model"], "gpt-6-astra");
+    assert_eq!(started["modelProvider"], "control_fixture");
+    assert_eq!(
+        started["reasoningEffort"], "high",
+        "thread/start config override must pin the reasoning effort: {started}"
+    );
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    let baseline = fixture.job.snapshot().unwrap().active_processes;
+    let interrupted = owner.request(
+        "turn/start",
+        json!({"threadId":thread,"input":[{"type":"text","text":"Perform the owned proof command and return its consumed result."}]}),
+    )["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    owner.event(|value| {
+        value["method"] == "item/started"
+            && value["params"]["threadId"] == thread
+            && value["params"]["item"]["type"] == "commandExecution"
+    });
+    let during_tool = fixture.job.snapshot().unwrap().active_processes;
+    let first_request: Value =
+        serde_json::from_slice(&fs::read(root.join("provider-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        first_request["reasoning"]["effort"], "high",
+        "thread effort override must reach the provider: {first_request}"
+    );
+    // A second client's `turn/start` while this turn runs the tool call. Its
+    // response is awaited after the interrupt so it delays nothing.
+    let mut second = Client::connect(fixture.port, &fixture.token, root, "active-second");
+    let busy_id = second.send_request(
+        "turn/start",
+        json!({"threadId":thread,"input":[{"type":"text","text":"CONTROL_EXECUTOR_CORRECTION: preserve partial work and report the current tool result."}]}),
+    );
+    let prompted = Instant::now();
+    let interrupt = owner.raw_request(
+        "turn/interrupt",
+        json!({"threadId":thread,"turnId":interrupted}),
+    );
+    fs::write(
+        root.join("tool-call-interrupt.json"),
+        serde_json::to_vec_pretty(&interrupt).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        interrupt.get("error").is_none(),
+        "tool-call interrupt: {interrupt}"
+    );
+    let completed = owner.event(|value| {
+        value["method"] == "turn/completed"
+            && value["params"]["threadId"] == thread
+            && value["params"]["turn"]["id"] == interrupted
+    });
+    let interrupt_latency_ms = prompted.elapsed().as_millis() as u64;
+    let status = completed["params"]["turn"]["status"].clone();
+    let after_interrupt = fixture.job.snapshot().unwrap().active_processes;
+    let terminals = owner.request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId":thread,"limit":5}),
+    );
+    // The interrupted command's process fate is observed through the item's own
+    // completion and the terminal inventory instead of being assumed.
+    let tool_item = owner.find(Instant::now() + Duration::from_secs(10), |value| {
+        value["method"] == "item/completed"
+            && value["params"]["threadId"] == thread
+            && value["params"]["item"]["id"] == "control-tool-1"
+    });
+    let after_tool = fixture.job.snapshot().unwrap().active_processes;
+    let mut terminals_settled = owner.request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId":thread,"limit":5}),
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while !terminals_settled["data"].as_array().unwrap().is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+        terminals_settled = owner.request(
+            "thread/backgroundTerminals/list",
+            json!({"threadId":thread,"limit":5}),
+        );
+    }
+    let read = owner.request("thread/read", json!({"threadId":thread}));
+    let busy = second.await_response(busy_id);
+    fs::write(
+        root.join("busy-turn-start.json"),
+        serde_json::to_vec_pretty(&busy).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("tool-interrupt-result.json"),
+        serde_json::to_vec_pretty(
+            &json!({"threadId":thread,"turnId":interrupted,"turnStatus":status,
+            "interruptLatencyMs":interrupt_latency_ms,"jobProcessesBaseline":baseline,
+            "jobProcessesDuringTool":during_tool,"jobProcessesAfterInterrupt":after_interrupt,
+            "jobProcessesAfterToolItem":after_tool,"backgroundTerminalsAfterInterrupt":terminals,
+            "backgroundTerminalsSettled":terminals_settled,"toolItemCompletion":tool_item,
+            "threadState":read}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, "interrupted", "{completed}");
+
+    // A queued follow-up turn (if the second client's input was accepted while
+    // the thread was busy) runs after the interrupted turn; record its fate and
+    // whether the correction reached the provider.
+    let mut follow_up = Value::Null;
+    if let Some(queued) = busy["result"]["turn"]["id"].as_str()
+        && queued != interrupted
+    {
+        let until = Instant::now() + WAIT;
+        if let Some(value) = owner.find(until, |value| {
+            value["method"] == "turn/completed"
+                && value["params"]["threadId"] == thread
+                && value["params"]["turn"]["id"] == queued
+        }) {
+            follow_up = value["params"]["turn"].clone();
+        }
+    }
+    let correction_requests = requests_containing(root, "CONTROL_EXECUTOR_CORRECTION");
+    // Whether an accepted active-turn input reaches the model is observed on a
+    // second thread whose turn is allowed to finish.
+    let fresh = owner.request(
+        "thread/start",
+        json!({"cwd":fixture.workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access"}),
+    );
+    let fresh_thread = fresh["thread"]["id"].as_str().unwrap().to_owned();
+    let fresh_turn = owner.request(
+        "turn/start",
+        json!({"threadId":fresh_thread,"input":[{"type":"text","text":"Perform the owned proof command and return its consumed result."}]}),
+    )["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    owner.event(|value| {
+        value["method"] == "item/started"
+            && value["params"]["threadId"] == fresh_thread
+            && value["params"]["item"]["type"] == "commandExecution"
+    });
+    let correction = second.raw_request(
+        "turn/start",
+        json!({"threadId":fresh_thread,"input":[{"type":"text","text":"CONTROL_EXECUTOR_FOLLOWUP: preserve the partial proof and report it."}]}),
+    );
+    fs::write(
+        root.join("active-correction-delivery.json"),
+        serde_json::to_vec_pretty(&correction).unwrap(),
+    )
+    .unwrap();
+    let fresh_completion = owner.event(|value| {
+        value["method"] == "turn/completed"
+            && value["params"]["threadId"] == fresh_thread
+            && value["params"]["turn"]["id"] == fresh_turn
+    });
+    assert_eq!(
+        fresh_completion["params"]["turn"]["status"], "completed",
+        "{fresh_completion}"
+    );
+    let delivered_requests = requests_containing(root, "CONTROL_EXECUTOR_FOLLOWUP");
+    let until_idle = Instant::now() + WAIT;
+    while owner.request("thread/read", json!({"threadId":thread}))["thread"]["status"]["type"]
+        != "idle"
+    {
+        assert!(
+            Instant::now() < until_idle,
+            "thread must settle after the interrupted turn"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let final_turn = owner.request(
+        "turn/start",
+        json!({"threadId":thread,"input":[{"type":"text","text":"Report the owned proof result."}]}),
+    )["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let completion = owner.event(|value| {
+        value["method"] == "turn/completed"
+            && value["params"]["threadId"] == thread
+            && value["params"]["turn"]["id"] == final_turn
+    });
+    let saved = owner.request(
+        "thread/read",
+        json!({"threadId":thread,"includeTurns":true}),
+    );
+    let final_in_items = saved.to_string().contains(control_responses::FINAL);
+    fs::write(
+        root.join("active-turn-result.json"),
+        serde_json::to_vec_pretty(&json!({"threadId":thread,"interruptedTurn":interrupted,
+            "busyTurnStart":busy,"busyFollowUpTurn":follow_up,
+            "activeTurnId":fresh_turn,
+            "correctionReachedProviderRequests":correction_requests,
+            "correctionAcceptedIntoActiveTurn":correction,
+            "activeTurnCompletionStatus":fresh_completion["params"]["turn"]["status"],
+            "activeTurnCorrectionRequests":delivered_requests,
+            "finalTurnStatus":completion["params"]["turn"]["status"],
+            "finalMessageInThreadItems":final_in_items}))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        completion["params"]["turn"]["status"], "completed",
+        "{completion}"
+    );
+    assert!(
+        final_in_items,
+        "the final message must be available from thread items"
+    );
+}
+
+/// Executor-control probe: `turn/interrupt` while the turn waits on an
+/// in-flight provider request, with a hung owned provider so no tool call or
+/// model output exists yet.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned hung-provider executor-control probe"]
+fn native_executor_control_generation_interrupt() {
+    let hang = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    hang.set_nonblocking(true).unwrap();
+    let hang_port = hang.local_addr().unwrap().port();
+    let base_url =
+        format!("model_providers.control_fixture.base_url=\"http://127.0.0.1:{hang_port}/v1\"");
+    let fixture = native_fixture_with_arguments(true, false, &["-c", base_url.as_str()]);
+    let root = fixture.root.path();
+    let release = Arc::new(AtomicBool::new(false));
+    let holding = release.clone();
+    let evidence_root = root.to_path_buf();
+    let recorder = std::thread::spawn(move || {
+        while !holding.load(Ordering::Relaxed) {
+            match hang.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(20)))
+                        .unwrap();
+                    let mut buffer = [0u8; 8192];
+                    let captured = match stream.read(&mut buffer) {
+                        Ok(count) => buffer[..count].to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    fs::write(evidence_root.join("hung-provider-request.bin"), &captured).unwrap();
+                    while !holding.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut owner = Client::connect(fixture.port, &fixture.token, root, "generation-owner");
+    let started = owner.request(
+        "thread/start",
+        json!({"cwd":fixture.workspace,"model":"gpt-6-astra","modelProvider":"control_fixture","allowProviderModelFallback":false,"approvalPolicy":"never","sandbox":"danger-full-access"}),
+    );
+    assert_eq!(started["model"], "gpt-6-astra");
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    let turn = owner.request(
+        "turn/start",
+        json!({"threadId":thread,"input":[{"type":"text","text":"Perform the owned proof command and return its consumed result."}]}),
+    )["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let until = Instant::now() + WAIT;
+    while !root.join("hung-provider-request.bin").is_file() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        root.join("hung-provider-request.bin").is_file(),
+        "the active turn must hold an in-flight provider request"
+    );
+    let state = owner.request("thread/read", json!({"threadId":thread}));
+    let prompted = Instant::now();
+    let interrupt = owner.raw_request("turn/interrupt", json!({"threadId":thread,"turnId":turn}));
+    fs::write(
+        root.join("generation-interrupt.json"),
+        serde_json::to_vec_pretty(
+            &json!({"turnId":turn,"threadState":state,"interrupt":interrupt}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        interrupt.get("error").is_none(),
+        "generation interrupt: {interrupt}"
+    );
+    let completed = owner.event(|value| {
+        value["method"] == "turn/completed"
+            && value["params"]["threadId"] == thread
+            && value["params"]["turn"]["id"] == turn
+    });
+    let interrupt_latency_ms = prompted.elapsed().as_millis() as u64;
+    let status = completed["params"]["turn"]["status"].clone();
+    let saved = owner.request(
+        "thread/read",
+        json!({"threadId":thread,"includeTurns":true}),
+    );
+    fs::write(
+        root.join("generation-interrupt-result.json"),
+        serde_json::to_vec_pretty(
+            &json!({"threadId":thread,"turnStatus":status,"interruptLatencyMs":interrupt_latency_ms,"threadRead":saved}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, "interrupted", "{completed}");
+    let captured = fs::read(root.join("hung-provider-request.bin")).unwrap();
+    assert!(
+        !captured.is_empty(),
+        "the hung provider must have received the in-flight request"
+    );
+    release.store(true, Ordering::Relaxed);
+    recorder.join().unwrap();
+    fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
 }
 
 fn native_fixture_with_arguments(

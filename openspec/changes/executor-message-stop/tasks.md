@@ -1,6 +1,6 @@
 ## 1. Capability baseline
 
-- [ ] 1.1 Verify the installed Codex CLI's app-server contract for this change: second-client `turn/start` on an active thread, `turn/interrupt` during generation and during a tool call, thread config overrides for model/provider/effort, and final-message availability from thread items. Run the existing opt-in task-control contract check (`cargo test --locked -p codex-harness --test task_control_contract ... -- --ignored --nocapture --test-threads=1` with `HARNESS_CONTROL_CODEX_EXE` set to the installed native CLI) plus the smallest supplementary probe needed for interrupt-during-tool-call; record the observed CLI version, outcomes and any protocol differences from 0.154.0 in `openspec/changes/executor-message-stop/design.md` before backend work starts.
+- [x] 1.1 Verify the installed Codex CLI's app-server contract for this change: second-client `turn/start` on an active thread, `turn/interrupt` during generation and during a tool call, thread config overrides for model/provider/effort, and final-message availability from thread items. Run the existing opt-in task-control contract check (`cargo test --locked -p codex-harness --test task_control_contract ... -- --ignored --nocapture --test-threads=1` with `HARNESS_CONTROL_CODEX_EXE` set to the installed native CLI) plus the smallest supplementary probe needed for interrupt-during-tool-call; record the observed CLI version, outcomes and any protocol differences from 0.154.0 in `openspec/changes/executor-message-stop/design.md` before backend work starts.
 
 ## 2. Executor stop
 
