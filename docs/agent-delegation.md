@@ -121,7 +121,7 @@ assignment header, actual profile/model/provider/effort, assistant messages,
 tool activity and lifecycle state - so the raw event log is never the visible
 surface. Do not pass
 `--worktree` together with `--remote`; attach with `-C` at the bound pool slot.
-Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
+Steering stays `executor message` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.
 The default exec mode streams the assignment in that visible tab and exits on
 completion, leaving the tab's lifetime to the terminal's close-on-exit policy
@@ -405,6 +405,37 @@ missing final message (an output defect, not model, authentication or quota
 unavailability) and exits 1 for failed, defect or interrupted streams. A
 completion record is evidence of execution state, not proof that the
 executor's claimed checks passed.
+
+## Steering and stopping executors
+
+Steer a continuing run with `codex-harness executor message` and stop one with
+`codex-harness executor stop`; both address the recorded checkout, slot, owner
+and exact session and verify that identity against the live run before
+acting, so input cannot reach a later occupant of a reused slot. The exact
+flag surface and result classes live in
+[native commands](rust-native.md#structured-executor-assignments); the rules
+below say when each command is justified.
+
+Message a continuing executor for a concrete correction, a relevant fact or a
+requirement change: steering adds facts, resolves a request or corrects an
+established mistake. Do not send status-only nudges, hurry demands or repeats
+without new facts, and do not ask a healthy executor what it is doing -
+waiting is not a reason to steer. Delivery preserves the same conversation
+with its context and its model, provider and effort selection, so a
+correction continues in place instead of a new conversation, a stop/resume
+cycle or a re-sent task. A completed, stopped or unavailable run is reported
+with its actual state and the exact-session resume remedy, never revived.
+
+Stop only for an explicit cancellation request or a concrete necessity - a
+demonstrated wrong direction, a run that cannot make progress, or a resource
+conflict the executor cannot resolve. A brief error, a slow or silent stream,
+waiting or silence alone does not justify stop; inspect the recorded state
+and the current work first. Use the kit's stop command rather than killing
+processes by hand: manual process killing has no identity check, tab closure
+or honest receipt and needs a recorded cause. A stop preserves the files,
+checkout, slot and partial work and claims no completion; continue by
+resuming the exact session, not by restarting the assignment, and release
+the slot only as its own explicit decision.
 
 ## How selection works
 

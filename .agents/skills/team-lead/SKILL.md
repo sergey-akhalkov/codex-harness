@@ -231,13 +231,29 @@ working. Executors look at the board and do assigned issues.
 
 ## Steer, wait, stop
 
-Deliver steering through the controller session channel into the executor's
-visible conversation. No hidden model calls and no status polling. Wait without
-takeover while an executor remains active. An executor that reaches a declared
-escalation boundary returns the needed decision with its result; improvement
-observations arrive as board feedback tasks. `codex-harness` task stop remains
-the emergency path that works without the lead. Explicit stop stays stopped
-after restart.
+Steer an active executor with `codex-harness executor message`: it addresses
+the run's checkout, slot, owner and exact recorded session, so input cannot
+reach a later occupant of a reused slot, and it appears in that executor's
+visible conversation. Message only for a concrete correction of continuing
+work: steering adds relevant facts, resolves a request or corrects an
+established mistake, and no status-only nudges, hurry demands or repeats
+without new facts go out. Wait without takeover while an executor remains
+active; an executor that reaches a declared escalation boundary returns the
+needed decision with its result, and improvement observations arrive as board
+feedback tasks.
+Stop a run with `codex-harness executor stop` only for an explicit
+cancellation request or a concrete necessity such as a demonstrated wrong
+direction or a run that cannot progress: a brief error, a slow stream, waiting
+or silence alone is not a reason to stop. Use the kit commands before killing
+processes manually; manual killing needs a recorded cause. After a stop,
+preserve the files, slot and partial work and continue by resuming the exact
+session instead of restarting; a stop neither releases the slot nor restarts
+work.
+Command flags and result classes live in
+[native commands](../../../docs/rust-native.md#structured-executor-assignments),
+lifecycle and steering semantics in
+[agent delegation](../../../docs/agent-delegation.md#steering-and-stopping-executors).
+No hidden model calls and no status polling.
 Do not poll from model turns or executor PIDs. While an executor runs, keep
 one native watcher process for the board review queue, and wait for the run
 itself through its recorded lifecycle: `codex-harness executor watch --source
@@ -250,8 +266,8 @@ the timeout - a reason to inspect, not a result. Watch output is the
 executor's report, still not verified acceptance.
 Track session-file growth in the same loop: a live executor whose rollout is
 silent beyond a bounded threshold (about 15 minutes) is a stuck-suspect -
-then read its recent reasoning and diff, and only for a confirmed anomaly ask
-one bounded question through an exact-session resume (status, blockers, next
+then read its recent reasoning and diff, and only for a confirmed anomaly send
+one bounded question with `codex-harness executor message` (blockers, next
 step in at most five lines, then continue). Timed status polling of healthy
 executors is waste.
 While executors run, the lead analyzes bottlenecks, spend and next cuts, and

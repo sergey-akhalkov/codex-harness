@@ -28,7 +28,7 @@
 
 ## 5. Instructions and delivery
 
-- [ ] 5.1 Update the owning instructions for both commands and the selection rules: `crates/codex-harness/src/executor_cli.rs` usage text, `docs/rust-native.md`, `docs/agent-delegation.md`, and `.agents/skills/team-lead/SKILL.md` (message for concrete corrections; no status-only nudges or repeats without new facts; brief error alone is not stop; stop only for explicit cancellation or concrete necessity; waiting alone is not stop; standard commands before manual process killing with recorded cause; preserve partial work after stop). Verify help/docs consistency checks and the kit's documentation link/fact checks pass.
+- [x] 5.1 Update the owning instructions for both commands and the selection rules: `crates/codex-harness/src/executor_cli.rs` usage text, `docs/rust-native.md`, `docs/agent-delegation.md`, and `.agents/skills/team-lead/SKILL.md` (message for concrete corrections; no status-only nudges or repeats without new facts; brief error alone is not stop; stop only for explicit cancellation or concrete necessity; waiting alone is not stop; standard commands before manual process killing with recorded cause; preserve partial work after stop). Verify help/docs consistency checks and the kit's documentation link/fact checks pass.
 - [ ] 5.2 Build and install through the existing immutable lifecycle without interrupting other active conversations, then verify installed `codex-harness executor --help`/`--version` agreement and a fresh session seeing the updated instructions.
 
 ## 6. End-to-end acceptance

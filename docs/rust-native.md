@@ -186,6 +186,46 @@ the tab/console host that renders the native `exec --json` stream readably
 while recording it. States, exit codes and the resume identity rules live in
 [agent delegation](agent-delegation.md#observed-executor-lifecycle).
 
+A live run is then addressed and controlled through its recorded identity:
+
+```powershell
+codex-harness executor message --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session ID] (--text TEXT | --file FILE)
+codex-harness executor stop --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session ID]
+```
+
+`message` delivers one literal UTF-8 text - or a UTF-8 file's content with its
+real line breaks, without shell evaluation - into the addressed run's own
+conversation, at the nearest supported point even while a tool call runs and
+without interrupting it. The conversation, model, provider, reasoning
+effort and completed work are preserved - no new conversation, hidden
+stop/resume or re-sent task - and the input appears on that run's terminal
+surface. The result distinguishes `queued` input, confirmed `delivered` and
+`error`: a local file write is never presented as model delivery, and a retry
+after an indeterminate result cannot silently deliver the same text twice.
+`stop` urgently ends one exact run without waiting for completion, a model
+answer or a child command: native interruption where the run's backend
+provides it, then bounded termination of the recorded host's owned process
+tree - verified by recorded identity, never by process id, program name or
+window title - when that signal is unavailable or insufficient. It closes
+exactly that run's tab, leaving the lead's terminal and neighboring tabs
+usable, and records `stopped`, `already-completed`, `partial` or `error` with
+timestamps, measured duration, an unknown exit code kept unknown and pending
+messages marked undelivered; a partial stop names the surviving process, cause
+and next action instead of reporting success. Stop keeps files, the checkout,
+the slot and partial work (no reset, clean, worktree deletion, release or
+completion claim), a repeated stop safely reports the current state, and a
+stop racing natural completion reports which outcome won.
+
+Both commands verify the addressed slot, owner and exact session against the
+live run before acting and refuse a mismatch, so input cannot reach a later
+occupant of a reused slot. A completed, stopped or unavailable run gets its
+actual state and the exact-session resume remedy; a run without a recorded
+control endpoint reports `message` as unsupported with the same remedy, while
+`stop` still works through the recorded host identity. Results remain available
+after the run's tab closes. Selection rules - when messaging or stopping is
+justified - live in
+[agent delegation](agent-delegation.md#steering-and-stopping-executors).
+
 ```powershell
 cargo test --locked -p codex-harness --test executor_observation --jobs 1 -- --test-threads=1
 cargo test --locked -p codex-harness --test executor_spawn --jobs 1 -- --test-threads=1
