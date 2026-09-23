@@ -95,7 +95,7 @@ pub fn existing_root() -> io::Result<Option<PathBuf>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if bytes.len() > 4096 {
+    if bytes.len() > crate::broker_state::ANCHOR_LIMIT {
         return Err(io::Error::other(
             "CodeGraph account record exceeds its bound",
         ));
@@ -124,7 +124,7 @@ fn root_in(
     let anchor = parent.join("coding-agents-harness-codegraph.json");
     match FileGuard::read_regular(&anchor) {
         Ok((guard, bytes)) => {
-            if bytes.len() > 4096 {
+            if bytes.len() > crate::broker_state::ANCHOR_LIMIT {
                 return Err(io::Error::other(
                     "CodeGraph account record exceeds its bound",
                 ));
@@ -230,6 +230,56 @@ mod tests {
         drop(lease);
         for root in [first, second] {
             drop(BrokerRoot::open(&root).unwrap());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn grown_record_from_repeated_deliveries_is_pruned_and_reused() {
+        let parent = tempfile::tempdir().unwrap();
+        let deadline = Deadline::after(Duration::from_secs(10)).unwrap();
+        let cancel = Cancellation::default();
+        let mut roots = Vec::new();
+        let mut generations = Vec::new();
+        for seed in 0u32..30 {
+            let root = BrokerRoot::prepare().unwrap().keep().path().to_path_buf();
+            generations.push(Generation {
+                source: format!("{seed:064x}"),
+                root: root.clone(),
+            });
+            roots.push(root);
+        }
+        let anchor = parent.path().join("coding-agents-harness-codegraph.json");
+        let record = serde_json::json!({
+            "owner": OWNER,
+            "account": crate::process_service::current_user().unwrap(),
+            "root": roots[0],
+            "generations": generations,
+        });
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(
+            bytes.len() > 4096,
+            "the fixture must reproduce the grown live record"
+        );
+        std::fs::write(&anchor, &bytes).unwrap();
+        let new_source = u64::MAX;
+        let source = format!("{new_source:064x}");
+        let resolved = root_in(parent.path(), Some(&source), deadline, &cancel).unwrap();
+        assert!(
+            roots.contains(&resolved),
+            "a freed location must be reused instead of preparing a new one"
+        );
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&anchor).unwrap()).unwrap();
+        let retained = rewritten["generations"].as_array().unwrap();
+        assert_eq!(retained.len(), 1, "{retained:?}");
+        assert_eq!(retained[0]["source"], source);
+        assert!(
+            std::fs::metadata(&anchor).unwrap().len() < 4096,
+            "the rewritten record must be bounded"
+        );
+        for root in roots {
+            drop(BrokerRoot::open(&root).ok());
             std::fs::remove_dir_all(root).unwrap();
         }
     }

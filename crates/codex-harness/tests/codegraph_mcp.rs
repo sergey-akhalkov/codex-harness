@@ -621,6 +621,173 @@ fn published_managed_mcp_answers_with_caps_and_filtered_handlers() {
 }
 
 #[test]
+#[ignore = "requires explicitly selected published package and an owned indexed project"]
+fn grown_account_anchor_lets_the_published_mcp_complete_handshake() {
+    use harness_core::{broker_launch, broker_state::BrokerRoot};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::Instant,
+    };
+    let package = std::path::PathBuf::from(
+        std::env::var_os("CODEGRAPH_ACCEPTANCE_PACKAGE").expect("explicit package"),
+    );
+    let project = std::path::PathBuf::from(
+        std::env::var_os("CODEGRAPH_ACCEPTANCE_PROJECT").expect("explicit owned project"),
+    );
+    let local = tempfile::tempdir().unwrap();
+    // Reproduce an account record grown by repeated deliveries: many dead
+    // generations, larger than the old fixed read bound.
+    let mut locations = Vec::new();
+    let mut generations = Vec::new();
+    for seed in 0u32..30 {
+        let location = BrokerRoot::prepare().unwrap().keep().path().to_path_buf();
+        generations.push(json!({
+            "source": format!("{seed:064x}"),
+            "root": location,
+        }));
+        locations.push(location);
+    }
+    let anchor = local.path().join("coding-agents-harness-codegraph.json");
+    let record = json!({
+        "owner": "coding-agents-harness/codegraph-account/v1",
+        "account": harness_core::process_service::current_user().unwrap(),
+        "root": locations[0],
+        "generations": generations,
+    });
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert!(bytes.len() > 4096, "the fixture must stay grown");
+    fs::write(&anchor, &bytes).unwrap();
+
+    let stderr = fs::File::create(local.path().join("stderr.log")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .arg("mcp")
+        .arg("codegraph")
+        .arg("--package-root")
+        .arg(&package)
+        .arg("--project")
+        .arg(&project)
+        .env("LOCALAPPDATA", local.path())
+        .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("codegraph mcp spawn");
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if sender.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    struct LineClient<'a> {
+        child: &'a mut Child,
+        receiver: &'a mpsc::Receiver<String>,
+    }
+    impl LineClient<'_> {
+        fn send(&mut self, value: &Value) {
+            let stdin = self.child.stdin.as_mut().expect("codegraph stdin");
+            writeln!(stdin, "{value}").unwrap();
+            stdin.flush().unwrap();
+        }
+        fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+            self.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while Instant::now() < deadline {
+                match self.receiver.recv_timeout(Duration::from_millis(500)) {
+                    Ok(line) => {
+                        let value: Value = serde_json::from_str(line.trim())
+                            .unwrap_or_else(|error| panic!("{error}: {line}"));
+                        if value["id"] == json!(id) {
+                            return value;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("server closed before answering request {id}")
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+            panic!("request {id} timed out");
+        }
+    }
+    let mut client = LineClient {
+        child: &mut child,
+        receiver: &receiver,
+    };
+    let initialized = client.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "growth-acceptance", "version": "1"}
+        }),
+    );
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"], "codegraph",
+        "{initialized}"
+    );
+    client.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let catalogue = client.request(2, "tools/list", json!({}));
+    let names: Vec<&str> = catalogue["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"codegraph_search"), "{names:?}");
+    assert!(names.contains(&"codegraph_detail"), "{names:?}");
+
+    drop(child.stdin.take());
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() > exit_deadline => panic!("codegraph mcp did not exit"),
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    assert!(status.success(), "codegraph mcp exit: {status:?}");
+    let rewritten: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+    assert_eq!(
+        rewritten["generations"].as_array().unwrap().len(),
+        1,
+        "{rewritten}"
+    );
+    assert!(
+        fs::metadata(&anchor).unwrap().len() < 4096,
+        "the rewritten record must be bounded"
+    );
+    let broker =
+        BrokerRoot::open(std::path::Path::new(rewritten["root"].as_str().unwrap())).unwrap();
+    let retirement = broker_launch::retire(
+        &broker,
+        Deadline::after(Duration::from_secs(30)).unwrap(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    assert!(!matches!(
+        retirement,
+        broker_launch::Retirement::Pending { .. }
+    ));
+    drop(broker);
+    for location in locations {
+        let _ = fs::remove_dir_all(location);
+    }
+}
+
+#[test]
 fn shared_worker_reuses_root_across_homes_preserves_other_client_and_retires() {
     let source = tempfile::tempdir().unwrap();
     fs::create_dir(source.path().join(".codegraph-fixture")).unwrap();

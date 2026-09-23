@@ -294,3 +294,86 @@ fn mcp_serena_proxy_shares_one_worker_and_filters_the_catalogue() {
         broker_launch::Retirement::Pending { .. }
     ));
 }
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn grown_location_record_still_completes_handshake_after_deliveries() {
+    let console = adopted_console();
+    let registry = PathBuf::from(
+        std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit adopted registry"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let codex_home = root.path().join("codex-home");
+    let project = crate_project(root.path(), "proxy growth", 403);
+    // Reproduce a location record grown by repeated deliveries: many dead
+    // generations, larger than the old fixed read bound.
+    let mut locations = Vec::new();
+    let mut generations = Vec::new();
+    for seed in 0u32..30 {
+        let location = BrokerRoot::prepare().unwrap().keep().path().to_path_buf();
+        generations.push(json!({
+            "source": format!("{seed:064x}"),
+            "root": location,
+        }));
+        locations.push(location);
+    }
+    let runtime = codex_home.join("harness/runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    let anchor = runtime.join("serena-broker.json");
+    let record = json!({
+        "owner": "codex-harness-serena-broker",
+        "account": harness_core::process_service::current_user().unwrap(),
+        "root": locations[0],
+        "generations": generations,
+    });
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert!(bytes.len() > 4096, "the fixture must stay grown");
+    fs::write(&anchor, &bytes).unwrap();
+
+    let mut proxy = Proxy::start(root.path(), &codex_home, &registry, &project, &console);
+    let reply = proxy.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "proxy-growth", "version": "0.1.0"}
+        }),
+    );
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let catalogue = proxy.request(2, "tools/list", json!({}));
+    let names: Vec<&str> = catalogue["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"find_symbol"), "{names:?}");
+    proxy.finish();
+
+    let rewritten: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+    assert_eq!(
+        rewritten["generations"].as_array().unwrap().len(),
+        1,
+        "{rewritten}"
+    );
+    assert!(
+        fs::metadata(&anchor).unwrap().len() < 4096,
+        "the rewritten record must be bounded"
+    );
+    let broker = BrokerRoot::open(Path::new(rewritten["root"].as_str().unwrap())).unwrap();
+    let retirement = broker_launch::retire(
+        &broker,
+        Deadline::after(Duration::from_secs(30)).unwrap(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    assert!(!matches!(
+        retirement,
+        broker_launch::Retirement::Pending { .. }
+    ));
+    drop(broker);
+    for location in locations {
+        let _ = fs::remove_dir_all(location);
+    }
+}

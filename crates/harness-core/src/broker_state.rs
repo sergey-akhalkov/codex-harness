@@ -30,37 +30,61 @@ pub struct Generation {
     pub root: PathBuf,
 }
 
+/// Read bound for a broker location anchor record. Historical deliveries grow
+/// the record before dead generations are pruned; this bound only stops an
+/// unbounded read of a corrupt or foreign file and is not a lifetime limit.
+pub const ANCHOR_LIMIT: usize = 64 * 1024;
+
 /// Pick the location for `source`: an existing generation entry, a free legacy
-/// root, or a freshly prepared root. Entries whose directory is gone are
-/// dropped, so the list stays bounded by usable generations. Returns the
-/// location and whether the record must be rewritten.
+/// root, a freed dead generation root, or a freshly prepared root. Entries
+/// whose directory is gone or whose broker is no longer live are dropped, so
+/// the list stays bounded across deliveries while a live older generation keeps
+/// its own location. Returns the location and whether the record must be
+/// rewritten.
 pub fn choose_generation(
     legacy: &Path,
     generations: &mut Vec<Generation>,
     source: &str,
     prepare: impl FnOnce() -> io::Result<PathBuf>,
 ) -> io::Result<(PathBuf, bool)> {
-    generations.retain(|generation| BrokerRoot::open(&generation.root).is_ok());
     if let Some(generation) = generations
         .iter()
         .find(|generation| generation.source == source)
     {
         return Ok((generation.root.clone(), false));
     }
+    let mut live = Vec::with_capacity(generations.len());
+    let mut freed = Vec::new();
+    for generation in std::mem::take(generations) {
+        let root = match BrokerRoot::open(&generation.root) {
+            Ok(root) => root,
+            // The location is gone; the entry is unusable.
+            Err(_) => continue,
+        };
+        match crate::broker_endpoint::Instance::claim(&root) {
+            // The claim is dropped immediately; broker startup takes its own
+            // lease through the normal launch path.
+            Ok(_claim) => freed.push(generation.root),
+            // Busy means a live broker; any other error cannot prove the
+            // broker dead, so the entry is preserved.
+            Err(_) => live.push(generation),
+        }
+    }
     let legacy_free = BrokerRoot::open(legacy)
         .is_ok_and(|root| crate::broker_endpoint::Instance::claim(&root).is_ok())
-        && !generations
-            .iter()
-            .any(|generation| generation.root == legacy);
+        && !live.iter().any(|generation| generation.root == legacy);
     let root = if legacy_free {
         legacy.to_path_buf()
+    } else if let Some(freed) = freed.first() {
+        freed.clone()
     } else {
         prepare()?
     };
-    generations.push(Generation {
+    live.push(Generation {
         source: source.to_owned(),
         root: root.clone(),
     });
+    *generations = live;
     Ok((root, true))
 }
 fn invalid(reason: &'static str) -> io::Error {
@@ -400,5 +424,73 @@ mod tests {
         grant_public_access(&endpoint);
         assert!(root.read_private("endpoint.json", 64).is_err());
         assert_eq!(std::fs::read(endpoint).unwrap(), b"owned nonsecret fixture");
+    }
+
+    fn generation_source(seed: u64) -> String {
+        format!("{seed:064x}")
+    }
+
+    #[test]
+    fn dead_generation_roots_are_reclaimed_and_records_stay_bounded() {
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counter_for_prepare = counter.clone();
+        let make_prepare = move || {
+            let counter = counter_for_prepare.clone();
+            move || {
+                counter.set(counter.get() + 1);
+                Ok(BrokerRoot::prepare().unwrap().keep().path().to_path_buf())
+            }
+        };
+        let legacy = {
+            let first = BrokerRoot::prepare().unwrap().keep();
+            first.path().to_path_buf()
+        };
+        let mut generations = vec![Generation {
+            source: generation_source(1),
+            root: legacy.clone(),
+        }];
+        // While the first generation's broker is live, a new generation keeps
+        // the live entry and prepares its own location.
+        let held = BrokerRoot::open(&legacy).unwrap();
+        let instance = held.try_instance().unwrap().unwrap();
+        let (second, changed) = choose_generation(
+            &legacy,
+            &mut generations,
+            &generation_source(2),
+            make_prepare(),
+        )
+        .unwrap();
+        assert!(changed);
+        assert_ne!(second, legacy);
+        assert_eq!(
+            generations
+                .iter()
+                .filter(|generation| generation.source == generation_source(1))
+                .count(),
+            1
+        );
+        drop(instance);
+        drop(held);
+        // Once every broker is dead, later generations reuse the freed legacy
+        // location instead of preparing new ones, and dead entries are pruned.
+        for seed in [3, 4, 5] {
+            let (root, changed) = choose_generation(
+                &legacy,
+                &mut generations,
+                &generation_source(seed),
+                make_prepare(),
+            )
+            .unwrap();
+            assert!(changed);
+            assert_eq!(root, legacy, "a freed location must be reused");
+            assert_eq!(generations.len(), 1, "dead entries must be pruned");
+            assert_eq!(generations[0].source, generation_source(seed));
+        }
+        assert_eq!(counter.get(), 1, "no new location is prepared after drain");
+        assert!(serde_json::to_vec(&generations).unwrap().len() < 512);
+        for root in [legacy, second] {
+            drop(BrokerRoot::open(&root).unwrap());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
