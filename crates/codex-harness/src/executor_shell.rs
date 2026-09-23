@@ -60,7 +60,11 @@ pub(crate) fn prepare(
         command,
         evidence.path(),
         "permissions",
-        Duration::from_secs(20),
+        // The model-free diagnostic still loads the effective runtime
+        // configuration, including MCP brokers and skills: measured 34-36 s on
+        // the owner host against the previous 20 s budget, which fail-closed
+        // every dispatch. Keep the bound, but cover the observed startup cost.
+        Duration::from_secs(60),
     )
     .and_then(|text| serde_json::from_str::<Value>(&text).map_err(io::Error::other))
     .map_err(|error| {
