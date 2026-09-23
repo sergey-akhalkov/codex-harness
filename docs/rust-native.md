@@ -148,6 +148,28 @@ For an existing pool slot, `codex-harness executor assignment --source CHECKOUT
 resetting, writing or launching a conversation. Normal dispatch still uses the
 installed profile and visible terminal contract.
 
+The observed lifecycle of dispatched sessions is a native command, not a log
+search: `codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY
+--slot N` (or `--receipt FILE`) blocks on the receipt's recorded lifecycle and
+prints bounded review data, and `codex-harness executor run --file RECEIPT` is
+the tab/console host that renders the native `exec --json` stream readably
+while recording it. States, exit codes and the resume identity rules live in
+[agent delegation](agent-delegation.md#observed-executor-lifecycle).
+
+```powershell
+cargo test --locked -p codex-harness --test executor_observation --jobs 1 -- --test-threads=1
+cargo test --locked -p codex-harness --test executor_spawn --jobs 1 -- --test-threads=1
+```
+
+`executor_observation` drives the owned Rust event fixture
+(`crates/codex-harness/src/bin/harness-executor-fixture.rs`) through the real
+host, receipt, watch, resume and release paths and makes no model request. The
+ignored `installed_native_exec_json_event_shape_stays_observed` check in that
+target is the opt-in installed-CLI shape check: it requires
+`HARNESS_CONTROL_CODEX_EXE` pointing at the native Codex executable and runs it
+against the existing synthetic Responses provider, so it validates observed
+event behavior without a subscription or paid model call.
+
 ## Bounded token reports
 
 Use `token-audit report --format text` and `token-audit findings --format text`

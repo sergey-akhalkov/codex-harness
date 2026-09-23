@@ -224,9 +224,15 @@ observations arrive as board feedback tasks. `codex-harness` task stop remains
 the emergency path that works without the lead. Explicit stop stays stopped
 after restart.
 Do not poll from model turns or executor PIDs. While an executor runs, keep
-one native watcher process that checks the board review queue, the
-assignment's result artifact and executor liveness on a cheap shell loop and
-emits a single event; the lead blocks on that event between useful work.
+one native watcher process for the board review queue, and wait for the run
+itself through its recorded lifecycle: `codex-harness executor watch --source
+CHECKOUT --codex-home DIRECTORY --slot N` blocks on the receipt and returns the
+compact result or the named error with slot, owner, exact session, checkout,
+base, changed files, the returned message and the result/detail locators.
+Exit 0 means the run completed, 1 names a failed, defect or interrupted run
+with its cause, and 2 means unavailable coverage (tui or legacy receipt) or
+the timeout - a reason to inspect, not a result. Watch output is the
+executor's report, still not verified acceptance.
 Track session-file growth in the same loop: a live executor whose rollout is
 silent beyond a bounded threshold (about 15 minutes) is a stuck-suspect -
 then read its recent reasoning and diff, and only for a confirmed anomaly ask
@@ -294,7 +300,10 @@ force-remove a tree, or count a preserved slot as free. Dispatch is fail-closed
 and names the concrete cause instead of allocating another tree - a
 registered-but-missing slot asks for `git worktree prune` - and it never
 destroys unreviewed work. `executor pool` reports the recorded mapping, every
-slot awaiting your review and the foreign or legacy worktrees only you retire;
+slot awaiting your review, each slot's recorded `run=<state>` and the foreign or
+legacy worktrees only you retire; release prints the last observed run beside
+the disposition it records, and an empty final message is an executor output
+defect to return - never evidence of quota exhaustion;
 slot purpose lives in kit-local task state and board records, never in tracked
 files. An interruption keeps the recorded mapping, and a second live owner of
 one slot is refused instead of sharing a checkout. Slot state, release, pool
@@ -306,9 +315,10 @@ tabs are per-assignment, never pooled: a fresh session must not inherit another
 assignment's context, and the exec tab's lifetime follows the terminal's
 close-on-exit policy rather than a harness-managed close. To return defects or
 continue after a stop, resume the exact session
-(`codex-harness executor resume --slot N --owner ID --session SESSION_ID` for
-a pooled executor, `codex resume SESSION_ID` interactively otherwise) and
-state the acceptance conditions there.
+(`codex-harness executor resume --slot N --owner ID [--session SESSION_ID]`
+for a pooled executor - without `--session` it consumes the exact identity the
+dispatch receipt recorded - or `codex resume SESSION_ID` interactively
+otherwise) and state the acceptance conditions there.
 
 ## Recovery
 

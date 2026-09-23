@@ -1023,14 +1023,29 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
     assert_eq!(receipt["slot"]["owner"], "exec-xai-live-probe");
     assert_eq!(receipt["slot"]["index"], 1);
     assert_eq!(receipt["slot"]["path"], slot.to_str().unwrap());
+    // The recorded args run the observed exec form: the tab host renders the
+    // event stream readably while the same stream records the lifecycle, so a
+    // raw JSON log is never the visible surface.
+    let args = receipt["args"].as_array().unwrap();
+    assert!(args.iter().any(|arg| arg == "exec"), "{receipt}");
+    assert!(args.iter().any(|arg| arg == "--json"), "{receipt}");
+    let result = args
+        .iter()
+        .position(|arg| arg == "--output-last-message")
+        .expect("the dispatch records the final-message file");
     assert!(
-        !receipt["args"]
-            .as_array()
+        args[result + 1]
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|arg| arg == "exec" || arg == "--json"),
-        "visible spawn must not be headless exec: {receipt}"
+            .ends_with("message-1.txt"),
+        "{receipt}"
     );
+    assert_eq!(receipt["observation"]["coverage"], "native", "{receipt}");
+    assert!(
+        !receipt["observation"]["result"].is_null(),
+        "the observation records the result locator: {receipt}"
+    );
+    assert!(stdout.contains("observation: coverage=native"), "{stdout}");
     assert_eq!(
         fs::read_to_string(slot.join("proof.txt")).unwrap().trim(),
         "orch-xai"

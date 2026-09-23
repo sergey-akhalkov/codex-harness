@@ -115,7 +115,11 @@ a blocked activation), the tab opens in the stable per-checkout window
 one. Spawn does not pass `--focus` / maximized / fullscreen and never sends
 synthetic input into a conversation. If the lead is not in a terminal at all,
 it falls back to a visible native TUI (`CREATE_NEW_CONSOLE`) with the same
-restore. It does not use headless `codex exec --json`. Do not pass
+restore. The tab host runs the session as `codex exec --json` with
+`--output-last-message <kit-local file>` and renders that stream readably -
+assignment header, actual profile/model/provider/effort, assistant messages,
+tool activity and lifecycle state - so the raw event log is never the visible
+surface. Do not pass
 `--worktree` together with `--remote`; attach with `-C` at the bound pool slot.
 Steering stays `executor steer` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.
@@ -124,8 +128,9 @@ completion, leaving the tab's lifetime to the terminal's close-on-exit policy
 rather than a harness-managed close: a successful exit can close the tab while
 a failure stays visible for inspection. A mid-work stop is detected by the
 lead's watcher and the exact session continues through `codex-harness executor
-resume --slot N --owner ID --session SESSION_ID` on its recorded slot, which
-rebinds the slot without resetting partial work.
+resume --slot N --owner ID [--session SESSION_ID]` on its recorded slot, which
+rebinds the slot without resetting partial work; without `--session` it
+consumes the exact identity the dispatch receipt recorded.
 While an executor runs, one native watcher process checks the board review
 queue, the assignment's result artifact and executor liveness and emits a
 single event; the lead blocks on that event between other work instead of
@@ -268,10 +273,14 @@ hint. `--base REV` starts the slot from another revision than the upstream
 default branch, and `--owner ID` labels the session binding (default
 `exec-<profile>-<pid>`); a second live owner of one slot is refused instead of
 sharing one checkout. An interrupted session resumes through
-`codex-harness executor resume --slot N --owner ID --session SESSION_ID`:
+`codex-harness executor resume --slot N --owner ID [--session SESSION_ID]`:
 the recorded slot is rebound for the same owner without fetch, reset or clean,
 so partial work survives, while a fresh spawn resynchronizes and never
-continues a dirty slot. Hand-editing dispatch receipts for `executor run` is
+continues a dirty slot. `--session` remains supported and takes precedence;
+without it, resume consumes the exact session the dispatch receipt recorded,
+keeps that identity across failed resume attempts and refuses when nothing was
+recorded instead of choosing another session by recency. Hand-editing dispatch
+receipts for `executor run` is
 not the resume path. The recorded mapping (index, path,
 owner, synchronized base) and its lease live in kit-local task state under
 `$CODEX_HOME/harness/executor-pool/`, never in tracked files, and a claim whose
@@ -318,7 +327,7 @@ checkout's committed HEAD, keeping ignored caches, or preserved with its
 limitation and reported as awaiting review again (exit code 2); a live owner is
 never reset beneath. `codex-harness executor pool --source CHECKOUT
 --codex-home DIRECTORY` reports the recorded mapping per slot (index, path,
-presence, tree state, state, lease, owner, base, disposition, reason) plus
+presence, tree state, state, lease, run, owner, base, disposition, reason) plus
 foreign or legacy worktrees and any worktree beyond the configured pool for
 lead review; `git worktree list` remains the authoritative tree inventory, and
 merged branches are kept.
@@ -332,6 +341,49 @@ accepted work, removes retired trees with authorized `git worktree remove` and
 prunes stale entries. Pool slots are ordinary Git worktrees, so once their work
 is preserved they can be removed manually and leave no harness-specific state
 in the repository.
+
+## Observed executor lifecycle
+
+Exec mode is observable by construction: the hosted session runs
+`codex exec --json --output-last-message <file>`, and the tab host renders that
+stream readably while recording the same stream as an explicit lifecycle in
+the kit-local dispatch receipt
+`$CODEX_HOME/harness/executor-pool/spawn-<N>.json`. The recorded states are
+`dispatch-accepted`, `native-start`, `running`, `completed`, `failed`,
+`defect` and `interrupted`, beside the exact native session from
+`thread.started`, the returned result locator (`message-<N>.txt`), a bounded
+raw stream (`stream-<N>.jsonl`) and the identity of the process that recorded
+it. A created tab is not a native start: only `thread.started` establishes the
+session identity. TUI and legacy receipts record coverage as unavailable
+instead of guessing an identity.
+
+The lead waits for an executor through that record; no model polling and no
+rollout search is involved:
+
+```powershell
+codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY --slot N
+codex-harness executor watch --receipt FILE [--json]
+```
+
+Watch blocks until the run reaches a terminal state and then prints bounded
+review data: state, slot, owner, exact session, checkout, base, changed files,
+the executor's returned message (reported by the executor, not verified
+acceptance), the result and detail locators and the exit code. It exits 0 for
+a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage
+is unavailable (tui or legacy receipt) or the timeout expired while the run
+continued. An interrupted host is reported with its reason and an unknown exit
+code, never as a completion. `executor pool` adds `run=<state> session=<id>`
+per slot, and `executor release` prints the last observed run beside the
+disposition it records while still refusing to reset a live or unreviewed
+slot.
+
+An observed `executor run --file` - the process a tab or console hosts - exits
+0 only for a completed turn with a nonempty final message, otherwise propagates
+the launcher's own exit code, exits 3 when a completed turn wrote an empty or
+missing final message (an output defect, not model, authentication or quota
+unavailability) and exits 1 for failed, defect or interrupted streams. A
+completion record is evidence of execution state, not proof that the
+executor's claimed checks passed.
 
 ## How selection works
 

@@ -32,8 +32,32 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
+#[path = "executor_observation.rs"]
+mod observation;
 
-const USAGE: &str = "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\ncodex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session SESSION_ID [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\ncodex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\ncodex-harness executor run LAUNCHER [ARG...]\ncodex-harness executor succeed --request PATH\nSpawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; it adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset. Pool reports the recorded slot mapping (index, path, state, owner, base), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. The default exec mode streams the assignment visibly and exits on completion, so the tab closes itself; continue or correct the exact session later with codex exec resume SESSION_ID. The tui mode keeps an interactive conversation. Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.";
+use observation::{
+    COVERAGE_NATIVE, RunObservation, STATE_ACCEPTED, STATE_COMPLETED, STATE_DEFECT, STATE_FAILED,
+    STATE_INTERRUPTED,
+};
+
+const USAGE: &str = concat!(
+    "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\n",
+    "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\n",
+    "codex-harness executor watch (--source CHECKOUT --codex-home DIRECTORY --slot N | --receipt FILE) [--owner ID] [--timeout SECONDS] [--poll MILLISECONDS] [--json]\n",
+    "codex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\n",
+    "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
+    "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\n",
+    "codex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\n",
+    "codex-harness executor run LAUNCHER [ARG...]\n",
+    "codex-harness executor run --file RECEIPT\n",
+    "codex-harness executor succeed --request PATH\n",
+    "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
+    "The default exec mode runs `codex exec --json` with --output-last-message behind the tab host: the host renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal, while the same stream is recorded as an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) in the kit-local dispatch receipt beside the exact native session identity, the returned result locator and a bounded detail file. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
+    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files, the executor's returned message (reported, not verified acceptance), result and detail locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. ",
+    "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
+    "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
+    "Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified."
+);
 const STARTUP: Duration = Duration::from_secs(20);
 /// Windows Terminal activates the receiving window asynchronously around the
 /// launcher exit; this bounds how long dispatch keeps undoing that activation.
@@ -84,6 +108,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
             resume(&args[1..])
         }
+        Some("watch") => watch(&args[1..]),
         Some("release") => release(&args[1..]),
         Some("pool") => pool_status(&args[1..]),
         Some("assignment") => assignment_check(&args[1..]),
@@ -210,6 +235,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         profile: &profile,
         prompt,
         mode,
+        resumed_session: None,
         terminal_profile: terminal_profile.as_deref(),
         terminal_window: terminal_window.as_deref(),
     })
@@ -301,12 +327,21 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
     let owner = owner
         .filter(|owner| !owner.trim().is_empty())
         .ok_or_else(|| invalid("executor resume --owner is required"))?;
-    let session_text = session.ok_or_else(|| invalid("executor resume --session is required"))?;
     let prompt = parse_prompt(prompt, assignment_file)?;
     if !source.is_absolute() || !codex_home.is_absolute() {
         return Err(invalid("executor resume paths must be absolute"));
     }
-    let session = task_succession::exact_session_id(&session_text)?.to_owned();
+    let (session, identity) = match session {
+        Some(text) => (
+            task_succession::exact_session_id(&text)?.to_owned(),
+            "explicit --session",
+        ),
+        None => (
+            recorded_session(&codex_home, &source, slot, &owner)?,
+            "recorded dispatch receipt",
+        ),
+    };
+    println!("executor resume: slot={slot} owner={owner} session={session} identity={identity}");
     let config = load(&source)?;
     let profile = executor_profile(&config, profile.as_deref())?.to_owned();
     let request = Dispatch {
@@ -319,6 +354,7 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
         profile: &profile,
         prompt,
         mode: SpawnMode::Exec,
+        resumed_session: Some(&session),
         terminal_profile: terminal_profile.as_deref(),
         terminal_window: terminal_window.as_deref(),
     };
@@ -348,8 +384,9 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
             )));
         }
     };
-    let args = resume_child_args(&profile, &binding.path, &session, &prompt)?;
-    launch_bound(&request, &binding, args, &bound)
+    let paths = run_paths(&codex_home, &source, binding.index)?;
+    let args = resume_child_args(&profile, &binding.path, &session, &prompt, &paths.result)?;
+    launch_bound(&request, &binding, args, &bound, &paths)
 }
 
 /// `--workspace` is no longer the isolation mechanism: it may name the source
@@ -425,6 +462,9 @@ struct Dispatch<'a> {
     profile: &'a str,
     prompt: PromptSource,
     mode: SpawnMode,
+    /// Exact session a resume continues; its identity is carried into the new
+    /// observation so a failed resume attempt cannot lose it.
+    resumed_session: Option<&'a str>,
     terminal_profile: Option<&'a str>,
     terminal_window: Option<&'a str>,
 }
@@ -488,8 +528,15 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         Ok(prompt) => prompt,
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
-    let args = child_args(request.profile, &binding.path, &prompt, request.mode)?;
-    launch_bound(request, &binding, args, &bound)
+    let paths = run_paths(request.codex_home, request.source, binding.index)?;
+    let args = child_args(
+        request.profile,
+        &binding.path,
+        &prompt,
+        request.mode,
+        &paths.result,
+    )?;
+    launch_bound(request, &binding, args, &bound, &paths)
 }
 
 /// The dispatch text for the bound slot: free text passes through unchanged,
@@ -554,11 +601,12 @@ fn launch_bound(
     binding: &SlotBinding,
     args: Vec<String>,
     bound: &ProfileBinding,
+    paths: &RunPaths,
 ) -> io::Result<i32> {
     println!("{}", slot_summary(binding, request.named_slot));
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
-    let receipt = receipt_path(request.codex_home, request.source, binding.index)?;
+    let receipt = paths.receipt.clone();
     let launcher = request.codex_home.join("harness/bin/codex.exe");
     if !launcher.is_file() {
         return Err(invalid(&format!(
@@ -567,6 +615,21 @@ fn launch_bound(
             binding.index,
             binding.owner
         )));
+    }
+    // The observation covers this run only: exec mode records the native
+    // event stream and its result file, tui mode records that coverage is
+    // unavailable instead of guessing an identity.
+    let mut run = match request.mode {
+        SpawnMode::Exec => RunObservation::accepted(paths.result.clone(), paths.detail.clone()),
+        SpawnMode::Tui => RunObservation::unavailable(
+            "tui mode keeps a human conversation with no machine-readable event stream; native identity and result coverage are unavailable",
+        ),
+    };
+    run.previous_session = request.resumed_session.map(str::to_owned);
+    if request.mode == SpawnMode::Exec {
+        // A stale final message from an earlier run must never read as this
+        // run's result.
+        let _ = fs::remove_file(&paths.result);
     }
     let shell = crate::executor_shell::prepare(
         &launcher,
@@ -595,9 +658,12 @@ fn launch_bound(
             &args,
             bound,
             &shell,
+            &run,
         )
     } else {
-        dispatch_owned_console(&launcher, request, binding, &receipt, bound, &args, &shell)
+        dispatch_owned_console(
+            &launcher, request, binding, &receipt, bound, &args, &shell, &run,
+        )
     }
 }
 
@@ -714,6 +780,24 @@ fn lease_path(codex_home: &Path, source: &Path, index: u32) -> io::Result<PathBu
 /// and would travel with the executor's next commit.
 fn receipt_path(codex_home: &Path, source: &Path, index: u32) -> io::Result<PathBuf> {
     Ok(task_worktree::pool_state_dir(codex_home, source)?.join(format!("spawn-{index}.json")))
+}
+
+/// Kit-local paths of one pooled run: the dispatch receipt that records the
+/// whole lifecycle, the final-message file the CLI writes through
+/// `--output-last-message`, and the bounded raw event stream kept beside them.
+struct RunPaths {
+    receipt: PathBuf,
+    result: PathBuf,
+    detail: PathBuf,
+}
+
+fn run_paths(codex_home: &Path, source: &Path, index: u32) -> io::Result<RunPaths> {
+    let dir = task_worktree::pool_state_dir(codex_home, source)?;
+    Ok(RunPaths {
+        receipt: dir.join(format!("spawn-{index}.json")),
+        result: dir.join(format!("message-{index}.txt")),
+        detail: dir.join(format!("stream-{index}.jsonl")),
+    })
 }
 
 /// Record this process as the live host of a bound slot. A slot that was
@@ -876,6 +960,7 @@ fn release(args: &[OsString]) -> io::Result<i32> {
         None => committed_head(&source)?,
     };
     let live = |owner: &str| owner_live(&codex_home, &source, owner);
+    let run_note = observed_run_note(&codex_home, &source, index);
     match task_worktree::release_slot(
         &codex_home,
         &layout,
@@ -890,6 +975,9 @@ fn release(args: &[OsString]) -> io::Result<i32> {
                 "executor slot {index} released as {}: reset to {base} and free for the next dispatch",
                 disposition_name(disposition)
             );
+            if let Some(note) = &run_note {
+                println!("{note}");
+            }
             Ok(0)
         }
         LaneDisposition::Preserved { limitation } => {
@@ -897,9 +985,31 @@ fn release(args: &[OsString]) -> io::Result<i32> {
                 "executor slot {index} release recorded as {} but the slot is preserved: {limitation}",
                 disposition_name(disposition)
             );
+            if let Some(note) = &run_note {
+                println!("{note}");
+            }
             Ok(2)
         }
     }
+}
+
+/// One line of observed-run evidence for the release read path: what the last
+/// recorded lifecycle and its exact session were, without reading a log.
+fn observed_run_note(codex_home: &Path, source: &Path, index: u32) -> Option<String> {
+    let path = receipt_path(codex_home, source, index).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let run = RunObservation::from_receipt(&value)?;
+    Some(format!(
+        "executor slot {index} last run: state={} session={} coverage={} result={}",
+        run.state,
+        run.recorded_session().unwrap_or("-"),
+        run.coverage,
+        run.result
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".into())
+    ))
 }
 
 fn disposition_name(disposition: SlotDisposition) -> &'static str {
@@ -907,6 +1017,454 @@ fn disposition_name(disposition: SlotDisposition) -> &'static str {
         SlotDisposition::Merged => "merged",
         SlotDisposition::Discarded => "discarded",
     }
+}
+
+/// Bounded wait before a recorded run without any host identity is reported
+/// as never natively started: dispatch writes its receipt just before the
+/// host opens, so a fresh receipt may legitimately have no host yet.
+const HOST_GRACE: Duration = Duration::from_secs(30);
+/// Bound on the changed-file list one review prints.
+const MAX_CHANGED_FILES: usize = 40;
+
+/// The exact session a resume continues when `--session` is omitted: the
+/// identity the dispatch receipt mechanically recorded. Never a picker, never
+/// recency, never a rollout filename.
+fn recorded_session(
+    codex_home: &Path,
+    source: &Path,
+    slot: u32,
+    owner: &str,
+) -> io::Result<String> {
+    let receipt = receipt_path(codex_home, source, slot)?;
+    let bytes = fs::read(&receipt).map_err(|error| {
+        invalid(&format!(
+            "executor resume without --session needs the dispatch receipt {} to name the exact recorded session: {error}; pass --session SESSION_ID explicitly, or dispatch `codex-harness executor spawn` first",
+            receipt.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "dispatch receipt {} is not JSON: {error}; pass --session SESSION_ID explicitly",
+            receipt.display()
+        ))
+    })?;
+    if let Some(binding) = receipt_binding(&value)?
+        && (binding.index != slot || binding.owner != owner)
+    {
+        return Err(invalid(&format!(
+            "the recorded run in slot {} belongs to owner {} instead of {owner}; resume that owner's session, release the slot, or pass --session SESSION_ID",
+            binding.index, binding.owner
+        )));
+    }
+    let Some(run) = RunObservation::from_receipt(&value) else {
+        return Err(invalid(&format!(
+            "the receipt {} is a legacy record without native observation; it names no exact session, so pass --session SESSION_ID explicitly or dispatch `codex-harness executor spawn` again",
+            receipt.display()
+        )));
+    };
+    match run.recorded_session() {
+        Some(session) => Ok(task_succession::exact_session_id(session)?.to_owned()),
+        None => Err(invalid(&format!(
+            "the recorded run in slot {slot} observed no native session (state={}, coverage={}, cause={}); pass --session SESSION_ID explicitly or dispatch `codex-harness executor spawn` again",
+            run.state,
+            run.coverage,
+            run.cause
+                .as_deref()
+                .or(run.reason.as_deref())
+                .unwrap_or("none recorded")
+        ))),
+    }
+}
+
+/// Compact review data of one recorded run: everything the lead consumes
+/// without reading a log, a rollout or a whole raw stream.
+struct WatchReport {
+    state: String,
+    cause: Option<String>,
+    slot: Option<u64>,
+    owner: Option<String>,
+    session: Option<String>,
+    checkout: Option<String>,
+    base: Option<String>,
+    changed: Option<(usize, Vec<String>, bool)>,
+    returned: Option<String>,
+    returned_bytes: Option<u64>,
+    result: Option<String>,
+    detail: Option<String>,
+    receipt: String,
+    exit_code: Option<i32>,
+    events: u64,
+    malformed: u64,
+}
+
+impl WatchReport {
+    fn build(
+        receipt: &Path,
+        value: &serde_json::Value,
+        run: &RunObservation,
+        state: &str,
+        cause: Option<String>,
+    ) -> Self {
+        let binding = receipt_binding(value).ok().flatten();
+        let checkout = binding.as_ref().map(|binding| binding.path.clone());
+        let base = binding.as_ref().map(|binding| binding.base.clone());
+        let changed = checkout.as_deref().and_then(changed_files);
+        let returned = run.result.as_deref().and_then(read_returned);
+        Self {
+            state: state.to_owned(),
+            cause,
+            slot: binding.as_ref().map(|binding| u64::from(binding.index)),
+            owner: binding.as_ref().map(|binding| binding.owner.clone()),
+            session: run.recorded_session().map(str::to_owned),
+            checkout: checkout.map(|path| path.display().to_string()),
+            base,
+            changed,
+            returned: returned.as_ref().map(|(text, _, _)| text.clone()),
+            returned_bytes: returned.as_ref().map(|(_, bytes, _)| *bytes),
+            result: run.result.as_deref().map(|path| path.display().to_string()),
+            detail: run.detail.as_deref().map(|path| path.display().to_string()),
+            receipt: receipt.display().to_string(),
+            exit_code: run.exit_code,
+            events: run.events,
+            malformed: run.malformed,
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut text = format!(
+            "executor run: state={} events={} malformed={}\n",
+            self.state, self.events, self.malformed
+        );
+        text.push_str(&format!(
+            "slot: {} owner: {} session: {}\n",
+            self.slot
+                .map(|slot| slot.to_string())
+                .unwrap_or_else(|| "-".into()),
+            self.owner.as_deref().unwrap_or("-"),
+            self.session.as_deref().unwrap_or("-")
+        ));
+        text.push_str(&format!(
+            "checkout: {} base: {}\n",
+            self.checkout.as_deref().unwrap_or("unavailable"),
+            self.base.as_deref().unwrap_or("-")
+        ));
+        match &self.changed {
+            Some((count, files, truncated)) => {
+                let detail = if files.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({}; {})",
+                        files.join("; "),
+                        if *truncated {
+                            "more files than listed"
+                        } else {
+                            "all changed files"
+                        }
+                    )
+                };
+                text.push_str(&format!("changed files: {count}{detail}\n"));
+            }
+            None => text.push_str("changed files: unavailable (no recorded checkout)\n"),
+        }
+        if let Some(cause) = &self.cause {
+            text.push_str(&format!("cause: {cause}\n"));
+        }
+        match &self.returned {
+            Some(returned) => {
+                text.push_str(&format!(
+                    "returned (reported by the executor, not verified acceptance):\n{returned}\n"
+                ));
+            }
+            None => {
+                text.push_str("returned: unavailable (no recorded final message for this run)\n")
+            }
+        }
+        if let (Some(result), Some(bytes)) = (&self.result, self.returned_bytes) {
+            text.push_str(&format!("result: {result} ({bytes} bytes)\n"));
+        } else if let Some(result) = &self.result {
+            text.push_str(&format!("result: {result}\n"));
+        } else {
+            text.push_str("result: unavailable\n");
+        }
+        text.push_str(&format!(
+            "detail: {} receipt: {}\n",
+            self.detail.as_deref().unwrap_or("unavailable"),
+            self.receipt
+        ));
+        text.push_str(&format!(
+            "exit: {}\n",
+            self.exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".into())
+        ));
+        text
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "schema": 1,
+            "state": self.state,
+            "cause": self.cause,
+            "slot": self.slot,
+            "owner": self.owner,
+            "session": self.session,
+            "checkout": self.checkout,
+            "base": self.base,
+            "changedFiles": self.changed.as_ref().map(|(count, files, truncated)| json!({
+                "count": count,
+                "files": files,
+                "truncated": truncated,
+            })),
+            "returned": self.returned,
+            "returnedBytes": self.returned_bytes,
+            "result": self.result,
+            "detail": self.detail,
+            "receipt": self.receipt,
+            "exitCode": self.exit_code,
+            "events": self.events,
+            "malformed": self.malformed,
+        })
+    }
+}
+
+/// The bounded returned text of one run: presence, size and up to
+/// `MAX_REVIEW_BYTES` of the final message. A larger file is reported as
+/// truncated with its locator instead of being read whole.
+fn read_returned(result: &Path) -> Option<(String, u64, bool)> {
+    let metadata = fs::metadata(result).ok()?;
+    let bytes = observation::read_bounded(result, observation::MAX_RESULT_READ).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let truncated = metadata.len() > bytes.len() as u64;
+    let mut excerpt = observation::excerpt(&text, observation::MAX_REVIEW_BYTES);
+    if truncated {
+        excerpt.push_str(&format!(
+            "\n… (message continues; {} bytes at {})",
+            metadata.len(),
+            result.display()
+        ));
+    }
+    Some((excerpt, metadata.len(), truncated))
+}
+
+/// Changed files of the recorded checkout, bounded: the lead reviews paths,
+/// not a whole diff.
+fn changed_files(checkout: &Path) -> Option<(usize, Vec<String>, bool)> {
+    if !checkout.is_dir() {
+        return None;
+    }
+    let out = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(checkout)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let truncated = lines.len() > MAX_CHANGED_FILES;
+    Some((
+        lines.len(),
+        lines.into_iter().take(MAX_CHANGED_FILES).collect(),
+        truncated,
+    ))
+}
+
+fn parse_seconds(value: Option<&str>, fallback: u64, name: &str) -> io::Result<Duration> {
+    match value {
+        None => Ok(Duration::from_secs(fallback)),
+        Some(text) => text
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|_| invalid(&format!("{name} must be a whole number of seconds"))),
+    }
+}
+
+/// `executor watch`: block on the recorded lifecycle of one run and return
+/// compact review data when it reaches a terminal state, without polling a
+/// model or searching rollouts. Exit codes: 0 completed, 1 failed, defect or
+/// interrupted, 2 unavailable coverage or the timeout expired first.
+fn watch(args: &[OsString]) -> io::Result<i32> {
+    let mut source = None;
+    let mut codex_home = None;
+    let mut slot = None;
+    let mut receipt = None;
+    let mut owner = None;
+    let mut timeout = None;
+    let mut poll = None;
+    let mut json_output = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        if key == "--json" {
+            json_output = true;
+            continue;
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid("invalid native executor options"))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            "--slot" => slot = Some(option_text(value)?),
+            "--receipt" => receipt = Some(PathBuf::from(value)),
+            "--owner" => owner = Some(option_text(value)?),
+            "--timeout" => timeout = Some(option_text(value)?),
+            "--poll" => poll = Some(option_text(value)?),
+            _ => return Err(invalid("invalid native executor options")),
+        }
+    }
+    let receipt = match receipt {
+        Some(path) => path,
+        None => {
+            let source = required(source, "--source")?;
+            let codex_home = required(codex_home, "--codex-home")?;
+            let index: u32 = slot
+                .ok_or_else(|| {
+                    invalid("executor watch needs --receipt FILE or --source CHECKOUT --slot N")
+                })?
+                .parse()
+                .map_err(|_| invalid("executor watch --slot must be a pool slot index"))?;
+            receipt_path(&codex_home, &source, index)?
+        }
+    };
+    if !receipt.is_absolute() {
+        return Err(invalid("executor watch --receipt must be an absolute path"));
+    }
+    let timeout = parse_seconds(timeout.as_deref(), 1800, "--timeout")?;
+    let poll = match poll.as_deref() {
+        None => Duration::from_millis(500),
+        Some(text) => Duration::from_millis(
+            text.parse::<u64>()
+                .map_err(|_| invalid("--poll must be a whole number of milliseconds"))?,
+        ),
+    };
+    let poll = poll.max(Duration::from_millis(50));
+    let deadline = Instant::now() + timeout;
+    loop {
+        let value = match fs::read(&receipt) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+                invalid(&format!(
+                    "executor watch receipt {} is not JSON: {error}",
+                    receipt.display()
+                ))
+            })?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if Instant::now() >= deadline {
+                    println!(
+                        "executor watch: no dispatch receipt at {} within {}s; `executor spawn` writes it before the session starts, so dispatch first or point --receipt at the recorded file",
+                        receipt.display(),
+                        timeout.as_secs()
+                    );
+                    return Ok(2);
+                }
+                thread::sleep(poll);
+                continue;
+            }
+            Err(error) => {
+                return Err(invalid(&format!(
+                    "executor watch receipt {}: {error}",
+                    receipt.display()
+                )));
+            }
+        };
+        let Some(run) = RunObservation::from_receipt(&value) else {
+            println!(
+                "executor watch: {} is a legacy receipt without an observation record; native identity and result coverage are unavailable. Dispatch again with this build to record them, or resume the exact session with --session SESSION_ID",
+                receipt.display()
+            );
+            return Ok(2);
+        };
+        if let (Some(owner), Some(recorded)) = (owner.as_deref(), value["slot"]["owner"].as_str())
+            && recorded != owner
+        {
+            println!(
+                "executor watch: the recorded run belongs to owner {recorded} instead of {owner}; watch or resume that owner's session instead of taking over the slot"
+            );
+            return Ok(2);
+        }
+        if run.coverage != COVERAGE_NATIVE {
+            println!(
+                "executor watch: the recorded run has no native coverage (state={}): {}",
+                run.state,
+                run.reason
+                    .as_deref()
+                    .unwrap_or("this mode records no event stream")
+            );
+            return Ok(2);
+        }
+        let terminal = matches!(
+            run.state.as_str(),
+            STATE_COMPLETED | STATE_FAILED | STATE_DEFECT | STATE_INTERRUPTED
+        );
+        if terminal {
+            let report = WatchReport::build(&receipt, &value, &run, &run.state, run.cause.clone());
+            print_watch_report(&report, json_output)?;
+            return Ok(match run.state.as_str() {
+                STATE_COMPLETED => 0,
+                _ => 1,
+            });
+        }
+        let ended = match &run.host {
+            Some(host) => observation::host_ended(host),
+            // Dispatch wrote the receipt just before the host opens; a receipt
+            // still without any host identity after the grace period means the
+            // native start never happened.
+            None => observation::now_ms() > run.updated_ms + HOST_GRACE.as_millis() as u64,
+        };
+        if ended {
+            let cause = match &run.host {
+                Some(_) => {
+                    "the recorded session host is no longer running and no terminal event was recorded"
+                }
+                None => "no session host was ever observed for this run",
+            };
+            let report = WatchReport::build(
+                &receipt,
+                &value,
+                &run,
+                STATE_INTERRUPTED,
+                Some(format!("{cause}; the exact exit code is unknown")),
+            );
+            print_watch_report(&report, json_output)?;
+            return Ok(1);
+        }
+        if Instant::now() >= deadline {
+            let report = WatchReport::build(
+                &receipt,
+                &value,
+                &run,
+                &run.state,
+                Some(format!(
+                    "watch timed out after {}s while the run was still {}; rerun watch, or inspect the detail locator",
+                    timeout.as_secs(),
+                    run.state
+                )),
+            );
+            print_watch_report(&report, json_output)?;
+            return Ok(2);
+        }
+        thread::sleep(poll);
+    }
+}
+
+fn print_watch_report(report: &WatchReport, json_output: bool) -> io::Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.json()).map_err(io::Error::other)?
+        );
+    } else {
+        print!("{}", report.text());
+    }
+    Ok(())
 }
 
 /// The merged committed base of the source checkout, used when the lead does
@@ -1116,8 +1674,21 @@ fn slot_report(codex_home: &Path, source: &Path, slot: &task_worktree::PoolSlot)
         Some(_) => "stale",
         None => "none",
     };
+    let run = receipt_path(codex_home, source, slot.index)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| RunObservation::from_receipt(&value))
+        .map(|run| {
+            format!(
+                "run={} session={}",
+                run.state,
+                run.recorded_session().unwrap_or("-")
+            )
+        })
+        .unwrap_or_else(|| "run=-".into());
     format!(
-        "slot {} {} presence={presence} state={state} tree={} lease={lease_state} owner={owner} base={base} disposition={disposition} reason={reason}",
+        "slot {} {} presence={presence} state={state} tree={} lease={lease_state} {run} owner={owner} base={base} disposition={disposition} reason={reason}",
         slot.index,
         slot.path.display(),
         tree_state(&slot.path)
@@ -1212,11 +1783,115 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
     if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
         record_lease(codex_home, binding)?;
     }
-    let outcome = run_child(&launcher, &rest, shell.as_ref());
+    let outcome = match native_run(&value) {
+        Some(run) => {
+            let header = host_header(&value, binding.as_ref());
+            run_observed_receipt(
+                &launcher,
+                &rest,
+                Path::new(path),
+                run,
+                shell.as_ref(),
+                &header,
+            )
+        }
+        None => run_child(&launcher, &rest, shell.as_ref()),
+    };
     if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
         let _ = remove_lease(codex_home, binding);
     }
     outcome
+}
+
+/// The observed run a receipt describes: native coverage with a recorded
+/// result file. Legacy receipts and tui receipts carry no stream to consume
+/// and stay on the pass-through path.
+fn native_run(value: &serde_json::Value) -> Option<RunObservation> {
+    let run = RunObservation::from_receipt(value)?;
+    (run.coverage == COVERAGE_NATIVE && run.result.is_some()).then_some(run)
+}
+
+/// The readable header of the hosted session's visible surface: the actual
+/// dispatched identity, the slot mapping, the locators and a bounded
+/// assignment excerpt. The event stream follows it as it arrives.
+fn host_header(value: &serde_json::Value, binding: Option<&SlotBinding>) -> String {
+    let profile = value["profile"].as_str().unwrap_or("default");
+    let model = value["model"].as_str().unwrap_or("unknown");
+    let provider = value["modelProvider"].as_str().unwrap_or("unknown");
+    let effort = value["reasoningEffort"].as_str().unwrap_or("default");
+    let mode = value["mode"].as_str().unwrap_or("exec");
+    let host = value["host"].as_str().unwrap_or("host");
+    let mut header = format!(
+        "executor session: profile={profile} model={model} provider={provider} effort={effort} mode={mode} host={host}\n"
+    );
+    match binding {
+        Some(binding) => header.push_str(&format!(
+            "slot: {} owner={} checkout={} base={}\n",
+            binding.index,
+            binding.owner,
+            binding.path.display(),
+            binding.base
+        )),
+        None => header.push_str("checkout: not recorded (slotless receipt)\n"),
+    }
+    if let Some(run) = RunObservation::from_receipt(value) {
+        if let Some(result) = &run.result {
+            header.push_str(&format!("result file: {}\n", result.display()));
+        }
+        if let Some(previous) = &run.previous_session {
+            header.push_str(&format!("continuing session: {previous}\n"));
+        }
+    }
+    if let Some(assignment) = assignment_excerpt(&value["args"]) {
+        header.push_str(&format!("assignment:\n{assignment}\n"));
+    }
+    header.push_str("--- native event stream ---\n");
+    header
+}
+
+/// The last launcher argument carries the assignment; a leading '-' means the
+/// argument is an option, not a prompt.
+fn assignment_excerpt(args: &serde_json::Value) -> Option<String> {
+    let prompt = args
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .next_back()?;
+    if prompt.starts_with('-') {
+        return None;
+    }
+    Some(observation::excerpt(prompt, 1200))
+}
+
+/// Hosts one observed run: the recorded launcher runs with its event stream
+/// piped, so this process renders the session readably and keeps the receipt's
+/// lifecycle current. The child's own exit code stays the outcome.
+fn run_observed_receipt(
+    launcher: &str,
+    rest: &[OsString],
+    receipt: &Path,
+    run: RunObservation,
+    shell: Option<&crate::executor_shell::PreparedShell>,
+    header: &str,
+) -> io::Result<i32> {
+    let launcher = normalize_launcher(std::ffi::OsStr::new(launcher))?;
+    if !Path::new(&launcher).is_absolute() {
+        return Err(invalid("executor run launcher must be absolute"));
+    }
+    let mut command = Command::new(&launcher);
+    command.args(rest);
+    // The hosted Codex process and everything it starts are an executor tree.
+    command.env(EXECUTOR_SESSION_ENV, "1");
+    if let Some(shell) = shell {
+        command.env("PATH", &shell.path);
+    }
+    if let Some(log) = std::env::var_os("HARNESS_EXECUTOR_RUN_LOG") {
+        let file = fs::File::create(&log)
+            .map_err(|error| invalid(&format!("executor run log: {error}")))?;
+        command.stderr(file);
+    }
+    let mut tracker = observation::RunTracker::new(run);
+    observation::run_observed(&mut command, receipt, &mut tracker, header)
 }
 
 /// The recorded pool slot binding of a receipt; receipts written before the
@@ -1430,16 +2105,24 @@ fn native_path(path: &Path) -> io::Result<String> {
     Ok(unicode(path)?.replace('/', r"\"))
 }
 
-fn apply_executor_env(spec: &mut CommandSpec, codex_home: &Path) {
+/// Environment of the hosted session's wrapper process (the tab or console
+/// host), which starts the launcher itself: it carries the kit's Codex home
+/// and shell, and drops the lead's session identity. The executor marker
+/// belongs to the launcher process, not to this host, because the host is
+/// what runs `executor run`.
+fn apply_host_env(
+    spec: &mut CommandSpec,
+    codex_home: &Path,
+    shell: &crate::executor_shell::PreparedShell,
+) {
     spec.env
         .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
-    spec.env
-        .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
     for name in INHERITED_SESSION_ENV {
         spec.env.insert(name.into(), None);
     }
     spec.env
         .insert("COLORTERM".into(), Some("truecolor".into()));
+    spec.env.insert("PATH".into(), Some(shell.path.clone()));
 }
 
 /// Codex blocks an untrusted project directory behind an interactive prompt
@@ -1475,6 +2158,7 @@ fn dispatch_terminal_tab(
     tui: &[String],
     bound: &ProfileBinding,
     shell: &crate::executor_shell::PreparedShell,
+    run: &RunObservation,
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let wrapper = std::env::current_exe()
@@ -1522,6 +2206,7 @@ fn dispatch_terminal_tab(
         Some(&args),
         Some(binding),
         shell,
+        run,
     )?;
     suppress_loader_dialogs();
     let mut cmd = Command::new(wt);
@@ -1562,6 +2247,7 @@ fn dispatch_terminal_tab(
             title,
             receipt,
             "windows-terminal-tab",
+            run,
         )
     );
     Ok(0)
@@ -1576,6 +2262,7 @@ fn dispatch_owned_console(
     bound: &ProfileBinding,
     args: &[String],
     shell: &crate::executor_shell::PreparedShell,
+    run: &RunObservation,
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let profile = request.profile;
@@ -1596,18 +2283,28 @@ fn dispatch_owned_console(
             None,
             Some(binding),
             shell,
+            run,
         )?;
         println!(
             "{}",
-            spawn_summary(profile, bound, &title, receipt, "owned-console")
+            spawn_summary(profile, bound, &title, receipt, "owned-console", run)
         );
+        // The console hosts the same tab-host wrapper as the terminal tab, so
+        // the observed JSON stream is rendered readably there instead of
+        // showing the user a raw event log.
+        let wrapper = std::env::current_exe()
+            .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
         let view = task_view::preserve_foreground(|| {
-            let mut spec = CommandSpec::new(launcher);
-            spec.args = args.iter().map(OsString::from).collect();
+            let mut spec = CommandSpec::new(&wrapper);
+            spec.args = vec![
+                "executor".into(),
+                "run".into(),
+                "--file".into(),
+                receipt.as_os_str().to_owned(),
+            ];
             spec.current_dir = Some(workspace.to_path_buf());
             spec.new_console = Some(title.clone().into());
-            apply_executor_env(&mut spec, request.codex_home);
-            spec.env.insert("PATH".into(), Some(shell.path.clone()));
+            apply_host_env(&mut spec, request.codex_home, shell);
             let placements = task_view::layout(1)?;
             let bounds = placements
                 .first()
@@ -1618,18 +2315,13 @@ fn dispatch_owned_console(
             Ok(view)
         })?;
         let snapshot = view.snapshot()?;
-        save_receipt(
+        // Merge only the console layout: the hosted session may already be
+        // updating the same receipt with its own observed lifecycle.
+        observation::update_receipt_field(
             receipt,
-            launcher,
-            profile,
-            request.mode,
-            args,
-            bound,
-            Some(&snapshot),
-            "owned-console",
-            None,
-            Some(binding),
-            shell,
+            "window",
+            serde_json::to_value(&snapshot)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         )?;
         while view.is_running()? {
             thread::sleep(Duration::from_millis(200));
@@ -1646,12 +2338,29 @@ fn spawn_summary(
     title: &str,
     receipt: &Path,
     host: &str,
+    run: &RunObservation,
 ) -> String {
     let model = bound.model.as_deref().unwrap_or("unknown");
     let provider = bound.model_provider.as_deref().unwrap_or("unknown");
     let effort = bound.reasoning_effort.as_deref().unwrap_or("default");
+    let observation = match run.coverage.as_str() {
+        COVERAGE_NATIVE => match run.result.as_deref() {
+            Some(result) => format!(
+                "coverage=native state={STATE_ACCEPTED} result={}",
+                result.display()
+            ),
+            None => format!("coverage=native state={STATE_ACCEPTED}"),
+        },
+        _ => format!(
+            "coverage=unavailable ({})",
+            run.reason
+                .as_deref()
+                .unwrap_or("this mode records no native event stream")
+        ),
+    };
     format!(
-        "executor started: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\"\nreceipt: {}",
+        "executor started: profile={profile} model={model} provider={provider} effort={effort} host={host} title=\"{title}\"\nreceipt: {}\nobservation: {observation}\nwatch: codex-harness executor watch --receipt {}",
+        receipt.display(),
         receipt.display()
     )
 }
@@ -1672,15 +2381,22 @@ fn child_args(
     workspace: &Path,
     prompt: &str,
     mode: SpawnMode,
+    result: &Path,
 ) -> io::Result<Vec<String>> {
     match mode {
         SpawnMode::Exec => {
             let mut args = executor_session_args(profile)?;
+            // The event stream and the returned final message are the native
+            // observation contract of the hosted host, not a second protocol:
+            // the receipt records the same paths.
             args.extend([
                 "exec".into(),
+                "--json".into(),
                 "--skip-git-repo-check".into(),
                 "-C".into(),
                 native_path(workspace)?,
+                "--output-last-message".into(),
+                native_path(result)?,
                 prompt.to_owned(),
             ]);
             Ok(args)
@@ -1700,13 +2416,17 @@ fn resume_child_args(
     workspace: &Path,
     session: &str,
     prompt: &str,
+    result: &Path,
 ) -> io::Result<Vec<String>> {
     let mut args = executor_session_args(profile)?;
     args.extend([
         "exec".into(),
+        "--json".into(),
         "--skip-git-repo-check".into(),
         "-C".into(),
         native_path(workspace)?,
+        "--output-last-message".into(),
+        native_path(result)?,
         "resume".into(),
         session.to_owned(),
         prompt.to_owned(),
@@ -1729,6 +2449,7 @@ fn save_receipt(
     terminal: Option<&[String]>,
     slot: Option<&SlotBinding>,
     shell: &crate::executor_shell::PreparedShell,
+    run: &RunObservation,
 ) -> io::Result<()> {
     let window = match window {
         Some(snapshot) => serde_json::to_value(snapshot)
@@ -1761,6 +2482,7 @@ fn save_receipt(
             "reasoningEffort": bound.reasoning_effort,
             "window": window,
             "shell": shell,
+            "observation": run,
         }))?,
     )
 }
@@ -2666,7 +3388,10 @@ mod tests {
 
     #[test]
     fn unknown_option_is_rejected() {
-        let error = run(&[OsString::from("spawn"), OsString::from("--proxy")]).unwrap_err();
+        // Parse the argument path directly: `run` refuses nested dispatch when
+        // the executor marker is ambient (the normal executor-suite case), and
+        // that refusal is not what this check is about.
+        let error = spawn(&[OsString::from("--proxy")]).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2691,9 +3416,10 @@ mod tests {
     #[test]
     fn pooled_dispatch_keeps_native_worktree_isolation_out_of_the_arguments() {
         let slot = Path::new(r"D:\wt\proj-wt1");
+        let result = Path::new(r"D:\state\message-1.txt");
         for args in [
-            child_args("xai", slot, "do the work", SpawnMode::Exec).unwrap(),
-            child_args("xai", slot, "do the work", SpawnMode::Tui).unwrap(),
+            child_args("xai", slot, "do the work", SpawnMode::Exec, result).unwrap(),
+            child_args("xai", slot, "do the work", SpawnMode::Tui, result).unwrap(),
         ] {
             assert!(
                 !args
@@ -3004,6 +3730,10 @@ mod tests {
             "Codex executor (ds)",
             Path::new(r"C:\home\harness\executor-pool\proj-0123456789ab\spawn-1.json"),
             "windows-terminal-tab",
+            &RunObservation::accepted(
+                PathBuf::from(r"C:\home\harness\executor-pool\proj-0123456789ab\message-1.txt"),
+                PathBuf::from(r"C:\home\harness\executor-pool\proj-0123456789ab\stream-1.jsonl"),
+            ),
         );
         assert!(summary.contains("profile=ds"));
         assert!(summary.contains("model=deepseek-flash"));
@@ -3011,6 +3741,15 @@ mod tests {
         assert!(summary.contains("effort=max"));
         assert!(summary.contains("host=windows-terminal-tab"));
         assert!(summary.contains("title=\"Codex executor (ds)\""));
+        assert!(summary.contains("coverage=native"), "{summary}");
+        assert!(
+            summary.contains("message-1.txt"),
+            "the result locator is part of the dispatch summary: {summary}"
+        );
+        assert!(
+            summary.contains("codex-harness executor watch --receipt"),
+            "{summary}"
+        );
         assert!(summary.contains(r"C:\home\harness\executor-pool\proj-0123456789ab\spawn-1.json"));
     }
 
@@ -3034,7 +3773,13 @@ mod tests {
     #[test]
     fn executor_env_drops_inherited_session_identity() {
         let mut spec = CommandSpec::new(Path::new("codex.exe"));
-        apply_executor_env(&mut spec, Path::new(r"C:\codex-home"));
+        let shell = crate::executor_shell::PreparedShell {
+            path: r"C:\Tools\PowerShell\7".into(),
+            executable: PathBuf::from(r"C:\Tools\PowerShell\7\pwsh.exe"),
+            version: "PowerShell 7.6.6".into(),
+            sandbox_mode: "danger-full-access".into(),
+        };
+        apply_host_env(&mut spec, Path::new(r"C:\codex-home"), &shell);
         for name in INHERITED_SESSION_ENV {
             assert_eq!(spec.env.get(std::ffi::OsStr::new(name)), Some(&None));
         }
@@ -3043,8 +3788,14 @@ mod tests {
             Some(&Some(PathBuf::from(r"C:\codex-home").into_os_string()))
         );
         assert_eq!(
+            spec.env.get(std::ffi::OsStr::new("PATH")),
+            Some(&Some(r"C:\Tools\PowerShell\7".into()))
+        );
+        // The executor marker belongs to the launcher the host starts, not to
+        // the host itself: `executor run` must stay callable there.
+        assert_eq!(
             spec.env.get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
-            Some(&Some("1".into()))
+            None
         );
     }
 
@@ -3088,6 +3839,7 @@ mod tests {
             Path::new(r"D:\wt\ds"),
             "Complete the outcome in ASSIGNMENT.md.",
             SpawnMode::Exec,
+            Path::new(r"D:\state\message-1.txt"),
         )
         .unwrap();
         assert_eq!(args[0], "--profile");
@@ -3095,7 +3847,13 @@ mod tests {
         assert_eq!(args[2], "-c");
         assert_eq!(args[3], "agents.enabled=false");
         assert_eq!(args[4], "exec");
+        assert!(args.contains(&"--json".to_string()));
         assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        let result = args
+            .iter()
+            .position(|arg| arg == "--output-last-message")
+            .expect("recorded result file");
+        assert_eq!(args[result + 1], r"D:\state\message-1.txt");
         assert!(args.contains(&r"D:\wt\ds".to_string()));
         assert_eq!(
             args.last().unwrap(),
@@ -3351,6 +4109,7 @@ mod tests {
             Path::new(r"D:\wt\ds"),
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
             "Continue the interrupted assignment.",
+            Path::new(r"D:\state\message-1.txt"),
         )
         .unwrap();
         assert_eq!(
@@ -3361,9 +4120,12 @@ mod tests {
                 "-c".to_owned(),
                 "agents.enabled=false".to_owned(),
                 "exec".to_owned(),
+                "--json".to_owned(),
                 "--skip-git-repo-check".to_owned(),
                 "-C".to_owned(),
                 r"D:\wt\ds".to_owned(),
+                "--output-last-message".to_owned(),
+                r"D:\state\message-1.txt".to_owned(),
                 "resume".to_owned(),
                 "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4".to_owned(),
                 "Continue the interrupted assignment.".to_owned(),
@@ -3519,5 +4281,112 @@ mod tests {
         assert_eq!(binding.index, 2);
         assert_eq!(binding.owner, "exec-ds-7");
         assert!(receipt_binding(&json!({"slot": {"index": "two"}})).is_err());
+    }
+
+    #[test]
+    fn native_run_requires_native_coverage_and_a_recorded_result() {
+        let paths = (
+            PathBuf::from(r"C:\s\message-1.txt"),
+            PathBuf::from(r"C:\s\stream-1.jsonl"),
+        );
+        assert!(
+            native_run(&json!({
+                "observation": RunObservation::accepted(paths.0.clone(), paths.1.clone())
+            }))
+            .is_some()
+        );
+        assert!(
+            native_run(&json!({"observation": RunObservation::unavailable("tui mode")})).is_none(),
+            "tui coverage must stay on the pass-through path"
+        );
+        assert!(native_run(&json!({"schema": 1})).is_none());
+        let mut without_result = RunObservation::accepted(paths.0, paths.1);
+        without_result.result = None;
+        assert!(native_run(&json!({"observation": without_result})).is_none());
+    }
+
+    #[test]
+    fn recorded_session_comes_from_the_receipt_and_refuses_legacy_or_foreign_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("proj");
+        let home = root.path().join("home");
+        fs::create_dir_all(&source).unwrap();
+        let missing = recorded_session(&home, &source, 1, "exec-ds-7")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("pass --session"), "{missing}");
+        let receipt = receipt_path(&home, &source, 1).unwrap();
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        // Legacy receipt: no observation, so no recorded identity to consume.
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "launcher": r"C:\x\codex.exe",
+                "slot": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let legacy = recorded_session(&home, &source, 1, "exec-ds-7")
+            .unwrap_err()
+            .to_string();
+        assert!(legacy.contains("legacy record"), "{legacy}");
+        let binding = SlotBinding {
+            index: 1,
+            path: source.parent().unwrap().join("proj-wt1"),
+            source: source.clone(),
+            owner: "exec-other".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: None,
+        };
+        let mut run = RunObservation::accepted(
+            PathBuf::from(r"C:\s\message-1.txt"),
+            PathBuf::from(r"C:\s\stream-1.jsonl"),
+        );
+        run.session = Some("01a0c719-f4d4-7880-a9d2-1a96ee0f23f4".into());
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "launcher": r"C:\x\codex.exe",
+                "slot": binding,
+                "observation": run
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign = recorded_session(&home, &source, 1, "exec-ds-7")
+            .unwrap_err()
+            .to_string();
+        assert!(foreign.contains("belongs to owner exec-other"), "{foreign}");
+        assert_eq!(
+            recorded_session(&home, &source, 1, "exec-other").unwrap(),
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4"
+        );
+        // A resume attempt that never observed its own identity still
+        // continues the carried exact session.
+        let mut carried = RunObservation::accepted(
+            PathBuf::from(r"C:\s\message-1.txt"),
+            PathBuf::from(r"C:\s\stream-1.jsonl"),
+        );
+        carried.previous_session = Some("01a0c719-f4d4-7880-a9d2-1a96ee0f23f5".into());
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "launcher": r"C:\x\codex.exe",
+                "slot": binding,
+                "observation": carried
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_session(&home, &source, 1, "exec-other").unwrap(),
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
