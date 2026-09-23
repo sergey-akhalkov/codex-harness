@@ -600,10 +600,116 @@ impl RunTracker {
     /// Records that the observer itself failed and terminated the run: the
     /// state is a named failure with the real cause, never a success.
     pub(crate) fn observer_failed(&mut self, cause: String) {
+        self.session_failed(cause);
+    }
+
+    /// Records that this run never reached a conversation: startup failed
+    /// closed with the named cause, so no session identity and no exit code
+    /// exist and nothing here reports progress.
+    pub(crate) fn session_failed(&mut self, cause: String) {
         self.observation.state = STATE_FAILED.into();
         self.observation.exit_code = None;
         self.observation.cause = Some(cause);
         self.observation.updated_ms = now_ms();
+    }
+
+    /// Applies one control-backed record: the receipt state the record
+    /// establishes (when it establishes one), the activity of a completed
+    /// item, and the exact native thread identity. Returns true when the
+    /// recorded observation changed and must be persisted again.
+    pub(crate) fn apply_control(
+        &mut self,
+        state: Option<&str>,
+        completed_item: Option<&str>,
+        thread: &str,
+    ) -> bool {
+        let before = self.observation.clone();
+        self.observation.events += 1;
+        if !thread.is_empty() {
+            self.saw_thread = true;
+            self.observation.session = Some(thread.to_owned());
+        }
+        if let Some(state) = state {
+            self.observation.state = state.to_owned();
+        }
+        if let Some(kind) = completed_item {
+            match kind {
+                "agentMessage" => self.observation.messages += 1,
+                "commandExecution" | "mcpToolCall" | "webSearch" | "fileChange" => {
+                    self.observation.tool_calls += 1
+                }
+                _ => {}
+            }
+        }
+        self.observation.updated_ms = now_ms();
+        self.observation != before
+    }
+
+    /// Records the terminal outcome of a control-backed run and returns the
+    /// exit code the host must return.
+    ///
+    /// The state is the one the control driver established from the thread's
+    /// own records, and the outcome follows the same rules as [`Self::finish`]:
+    /// a completed turn with a nonempty final message is the only success, an
+    /// empty or missing message is an output defect, and a failed, interrupted
+    /// or deviating run is never reported as a completed one.
+    pub(crate) fn finish_control(&mut self, outcome: &ControlOutcome<'_>) -> i32 {
+        let (state, cause, exit) = match (outcome.state, outcome.final_message) {
+            (STATE_COMPLETED, Some(FinalMessage::Present)) => (STATE_COMPLETED, None, 0),
+            (STATE_COMPLETED, Some(FinalMessage::Empty)) => (
+                STATE_DEFECT,
+                Some(
+                    "the final message is empty; an empty completion is an output defect, not evidence of model, authentication or quota unavailability"
+                        .to_owned(),
+                ),
+                EXIT_DEFECT,
+            ),
+            (STATE_COMPLETED, _) => (
+                STATE_DEFECT,
+                Some(
+                    "the completed turn carries no final assistant message in the thread items"
+                        .to_owned(),
+                ),
+                EXIT_DEFECT,
+            ),
+            (STATE_INTERRUPTED, _) => (
+                STATE_INTERRUPTED,
+                Some(
+                    outcome
+                        .cause
+                        .unwrap_or(
+                            "the native turn was interrupted; the run has no completed result",
+                        )
+                        .to_owned(),
+                ),
+                EXIT_FAILED,
+            ),
+            (STATE_DEFECT, _) => (
+                STATE_DEFECT,
+                Some(
+                    outcome
+                        .cause
+                        .unwrap_or("a protocol deviation left the run's state unknown")
+                        .to_owned(),
+                ),
+                EXIT_DEFECT,
+            ),
+            _ => (
+                STATE_FAILED,
+                Some(
+                    outcome
+                        .cause
+                        .unwrap_or("the conversation ended without a completed turn")
+                        .to_owned(),
+                ),
+                EXIT_FAILED,
+            ),
+        };
+        self.observation.state = state.into();
+        self.observation.cause = cause;
+        self.observation.exit_code = Some(exit);
+        self.observation.updated_ms = now_ms();
+        exit
     }
 
     /// Derives the terminal state from the stream and the child's exit code
@@ -682,10 +788,41 @@ impl RunTracker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FinalMessage {
     Present,
     Empty,
     Missing,
+}
+
+/// The terminal outcome of one control-backed run, as its own driver
+/// established it: the lifecycle state mapped onto the receipt vocabulary, the
+/// final-message classification of the thread's own items (present only when a
+/// turn completed) and the first recorded failure or protocol deviation.
+pub(crate) struct ControlOutcome<'a> {
+    pub state: &'a str,
+    pub final_message: Option<FinalMessage>,
+    pub cause: Option<&'a str>,
+}
+
+/// Writes the final message a control-backed run returned to its recorded
+/// result locator, so `executor watch`, the receipt review and the resume
+/// remedy read this run exactly as they read a JSONL-backed one. The write is
+/// staged against a distinct temp name, so a concurrent reader never observes
+/// a partial message and a failed write leaves the previous file untouched.
+pub(crate) fn write_final_message(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temp, text)?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error)
+        }
+    }
 }
 
 /// Classifies the final-message file without reading more than a bounded

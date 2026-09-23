@@ -18,7 +18,8 @@ use executor_control::{
 };
 use harness_core::{
     orchestration_config::ProfileBinding,
-    process::{Job, Limits},
+    process::{Job, Limits, ProcessIdentity},
+    process_service::{self, ServiceProcess},
 };
 use serde_json::{Value, json};
 use std::{
@@ -27,6 +28,7 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -711,6 +713,18 @@ fn completion_burst(server: &Server) {
     );
 }
 
+/// The terminal record of one turn that did not complete the assignment, with
+/// the native status and failure message the thread reported.
+fn terminal_turn(server: &Server, status: &str, message: Option<&str>) {
+    server.push(json!({"method":"thread/started","params":{"thread":{"id":THREAD}}}));
+    server.push(json!({"method":"turn/started","params":{"threadId":THREAD}}));
+    let mut turn = json!({"id": TURN, "status": status});
+    if let Some(message) = message {
+        turn["error"] = json!({"message": message});
+    }
+    server.push(json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":turn}}));
+}
+
 fn drain(conversation: &mut Conversation, expected: usize) -> Vec<executor_control::ControlEvent> {
     let until = Instant::now() + WAIT;
     let mut events = Vec::new();
@@ -775,10 +789,22 @@ fn spawned_child_serves_the_documented_command_environment_and_endpoint() {
     assert_eq!(token.len(), 64, "32 bytes of OS randomness as hex");
     assert!(token.bytes().all(|byte| byte.is_ascii_alphanumeric()));
     let endpoint = Endpoint::read(&fixture.endpoint_path()).unwrap();
+    assert_eq!(endpoint.port(), fixture.server.port);
     assert_eq!(endpoint.token(), token);
     assert_eq!(endpoint.thread_id.as_deref(), Some(THREAD));
     assert_eq!(conversation.endpoint().token(), token);
     assert!(!format!("{endpoint:?}").contains(&token));
+    // The recorded process identity is the app-server child this session
+    // spawned, in the exact shape `executor stop` reads (pid, creation time
+    // and image), so the stop path can end the child that owns the thread.
+    let child = conversation.process_identity().unwrap();
+    let recorded = endpoint
+        .process
+        .as_ref()
+        .expect("a recorded child identity");
+    assert_eq!(recorded.pid, child.pid);
+    assert_eq!(recorded.creation_time, child.creation_time);
+    assert_eq!(recorded.program, PathBuf::from(FIXTURE));
 
     // The child ran the exact documented command environment.
     let requests = fixture.server.requests();
@@ -974,9 +1000,12 @@ fn control_state_sits_beside_the_receipt_and_carries_the_resolved_binding() {
     let source = root.path().join("checkout");
     fs::create_dir_all(&source).unwrap();
     let paths = ControlPaths::for_slot(&root.path().join("home"), &source, 3).unwrap();
-    assert_eq!(paths.endpoint.file_name().unwrap(), "control-3.json");
-    assert_eq!(paths.token.file_name().unwrap(), "control-3.token");
-    assert_eq!(paths.log.file_name().unwrap(), "control-3.log");
+    // The name is the convention the stop path reads (`endpoint-<index>.json`
+    // beside the receipt): a record under another name leaves a live run
+    // unaddressable for `executor stop` and `executor message`.
+    assert_eq!(paths.endpoint.file_name().unwrap(), "endpoint-3.json");
+    assert_eq!(paths.token.file_name().unwrap(), "endpoint-3.token");
+    assert_eq!(paths.log.file_name().unwrap(), "endpoint-3.log");
     let directory = paths.endpoint.parent().unwrap();
     assert_eq!(directory, paths.token.parent().unwrap());
     assert_eq!(directory, paths.log.parent().unwrap());
@@ -1474,6 +1503,540 @@ fn attach_refuses_another_bearer() {
         recorded.server.requests().is_empty(),
         "no request crosses a refused handshake"
     );
+}
+
+// ------------------------------------------------------ pooled exec host
+
+/// The real `codex-harness` binary: these checks host a pooled exec receipt
+/// through the same `executor run --file` entry point the dispatcher's
+/// terminal-tab and owned-console routes run.
+fn manager() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
+}
+
+/// The owner of the fixture slot binding.
+const OWNER: &str = "exec-deepseek-host";
+/// The assignment one fixture dispatch carries.
+const ASSIGNMENT: &str = "fixture control assignment text";
+
+/// One pooled exec dispatch as the dispatcher records it: the launcher, the
+/// resolved profile binding, the slot binding, the prepared shell, the run
+/// observation and the control route, hosted against the canned endpoint this
+/// test owns. The child the host spawns is the kit's own executor fixture
+/// process (it proves the real spawn, Job ownership and process record), while
+/// the protocol answers come from the canned endpoint because the kit has no
+/// app-server fixture binary.
+struct Pooled {
+    _root: tempfile::TempDir,
+    home: PathBuf,
+    slot: PathBuf,
+    state: PathBuf,
+    receipt: PathBuf,
+    server: Server,
+}
+
+impl Pooled {
+    /// `pinned` selects the acceptance shape that owns the endpoint itself: the
+    /// receipt then records the canned port, exactly as `ControlPlan::port`
+    /// documents for a caller that provides the server. Without it the host
+    /// reserves a free port and the spawned child must serve that port itself,
+    /// which is the ordinary dispatch shape and the startup-failure shape.
+    fn new(name: &str, thread_start: Answer, pinned: bool) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(format!("source-{name}"));
+        fs::create_dir_all(&source).unwrap();
+        let source = source.canonicalize().unwrap();
+        let home = root.path().join("home");
+        let slot = root.path().join("slot");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&slot).unwrap();
+        let paths = ControlPaths::for_slot(&home, &source, 1).unwrap();
+        let state = paths.endpoint.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&state).unwrap();
+        // The bound slot record the host's lease reconciliation reads.
+        fs::write(
+            state.join("slot-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "source": source,
+                "index": 1,
+                "path": slot,
+                "state": "occupied",
+                "owner": OWNER,
+                "base": "abc123",
+                "disposition": null,
+                "reason": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = Server::start(Bearer::File(paths.token.clone()));
+        server.answer("initialize", Answer::Result(json!({})));
+        server.answer("thread/start", thread_start);
+        server.answer("thread/name/set", Answer::Result(json!({})));
+        server.answer(
+            "turn/start",
+            Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
+        );
+        server.answer("thread/read", Answer::Result(thread_read_answer()));
+        let receipt = state.join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "launcher": FIXTURE,
+                "profile": "deepseek",
+                "mode": "exec",
+                "args": [],
+                "visible": true,
+                "host": "owned-console",
+                "control": {
+                    "schema": 1,
+                    "assignment": ASSIGNMENT,
+                    "identity": {
+                        "profile": "deepseek",
+                        "model": MODEL,
+                        "modelProvider": PROVIDER,
+                        "reasoningEffort": EFFORT,
+                    },
+                    "port": pinned.then_some(server.port),
+                },
+                "terminal": null,
+                "isolation": false,
+                "slot": {
+                    "index": 1,
+                    "path": slot,
+                    "source": source,
+                    "owner": OWNER,
+                    "base": "abc123",
+                    "remote": "origin",
+                    "branch": "main",
+                },
+                "model": MODEL,
+                "modelProvider": PROVIDER,
+                "reasoningEffort": EFFORT,
+                "window": null,
+                "shell": {
+                    "path": std::env::var_os("PATH").unwrap(),
+                    "executable": FIXTURE,
+                    "version": "fixture",
+                    "sandbox_mode": "danger-full-access",
+                },
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": "dispatch-accepted",
+                    "result": state.join("message-1.txt"),
+                    "detail": state.join("stream-1.jsonl"),
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            _root: root,
+            home,
+            slot,
+            state,
+            receipt,
+            server,
+        }
+    }
+
+    /// Starts the real host entry point for this receipt. The fixture child
+    /// mode reaches the spawned app-server double through the inherited
+    /// environment, exactly as the host's own environment reaches its child.
+    fn host(&self, child_mode: &str) -> std::process::Child {
+        let mut command = Command::new(manager());
+        command
+            .args(["executor", "run", "--file"])
+            .arg(&self.receipt)
+            .env("CODEX_HOME", &self.home)
+            .env("HARNESS_EXECUTOR_FIXTURE_MODE", child_mode)
+            .env_remove("HARNESS_EXECUTOR_SESSION")
+            .env_remove("HARNESS_EXECUTOR_RUN_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
+    }
+
+    fn receipt(&self) -> Value {
+        serde_json::from_slice(&fs::read(&self.receipt).unwrap()).unwrap()
+    }
+
+    fn endpoint_path(&self) -> PathBuf {
+        self.state.join("endpoint-1.json")
+    }
+
+    fn result_path(&self) -> PathBuf {
+        self.state.join("message-1.txt")
+    }
+
+    fn detail_path(&self) -> PathBuf {
+        self.state.join("stream-1.jsonl")
+    }
+
+    fn lease_path(&self) -> PathBuf {
+        self.state.join("lease-1.json")
+    }
+}
+
+fn output_text(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Bounded wait until the exact recorded process identity is gone. A pid alone
+/// is never enough: the creation time and image must match the record.
+fn wait_gone(pid: u32, creation_time: u64, program: &Path, reason: &str) {
+    let user = process_service::current_user().unwrap();
+    let until = Instant::now() + WAIT;
+    loop {
+        match ServiceProcess::inspect(ProcessIdentity { pid, creation_time }, program, &user) {
+            Ok(None) => return,
+            Ok(Some(_)) if Instant::now() < until => thread::sleep(Duration::from_millis(25)),
+            Ok(Some(_)) => panic!("{reason}"),
+            Err(error) => panic!("{reason}: {error}"),
+        }
+    }
+}
+
+#[test]
+fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_result() {
+    let pooled = Pooled::new("host-success", Answer::Result(thread_start_answer()), true);
+    let host = pooled.host("hang");
+    let host_pid = host.id();
+    // The assignment reaches the thread as one native turn; only then does the
+    // canned endpoint answer, exactly as the native server answers a turn that
+    // is still in progress.
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the host submits the assignment through turn/start",
+    );
+    assert!(
+        pooled.lease_path().exists(),
+        "the host holds the slot's lease for the session's lifetime"
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+
+    // The visible surface renders the conversation: the dispatched identity,
+    // the assignment, the records as they arrive and the terminal state.
+    assert!(
+        text.contains("conversation=control (codex app-server)"),
+        "{text}"
+    );
+    assert!(text.contains("assignment:"), "{text}");
+    assert!(text.contains(ASSIGNMENT), "{text}");
+    assert!(
+        text.contains(&format!("state: native start (session {THREAD})")),
+        "{text}"
+    );
+    assert!(text.contains("state: turn completed (completed)"), "{text}");
+    assert!(text.contains(&format!("assistant: {FINAL}")), "{text}");
+    assert!(text.contains("result: completed (events="), "{text}");
+    assert!(
+        text.contains(&format!(
+            "result message: {}",
+            pooled.result_path().display()
+        )),
+        "{text}"
+    );
+
+    // The receipt records the exact thread identity, the lifecycle, the exit
+    // code, the host that observed it and the final-message locator.
+    let receipt = pooled.receipt();
+    let observation = &receipt["observation"];
+    assert_eq!(observation["state"], "completed", "{receipt}");
+    assert_eq!(observation["session"], THREAD, "{receipt}");
+    assert_eq!(observation["exitCode"], 0, "{receipt}");
+    assert_eq!(observation["messages"], 1, "{receipt}");
+    assert_eq!(observation["toolCalls"], 1, "{receipt}");
+    assert!(observation["events"].as_u64().unwrap() >= 7, "{receipt}");
+    assert_eq!(observation["host"]["pid"], host_pid, "{receipt}");
+    assert_eq!(
+        fs::read_to_string(pooled.result_path()).unwrap(),
+        FINAL,
+        "the thread's own final message is the recorded result"
+    );
+    let detail = fs::read_to_string(pooled.detail_path()).unwrap();
+    assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
+    assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
+
+    // The endpoint record is the address `executor stop` and
+    // `executor message` read: beside the dispatch receipt, under the name the
+    // stop path looks for, with the app-server child's exact identity.
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(pooled.endpoint_path()).unwrap()).unwrap();
+    assert_eq!(endpoint["schema"], 1, "{endpoint}");
+    assert_eq!(endpoint["port"], pooled.server.port, "{endpoint}");
+    assert_eq!(endpoint["threadId"], THREAD, "{endpoint}");
+    assert_eq!(endpoint["process"]["program"], FIXTURE, "{endpoint}");
+    let token = fs::read_to_string(pooled.state.join("endpoint-1.token")).unwrap();
+    assert_eq!(endpoint["token"], token.trim(), "{endpoint}");
+    let child_pid = endpoint["process"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(child_pid, 0);
+    assert_ne!(child_pid, host_pid, "the recorded child is not its host");
+    // The child this host owned ended with it: no stray app-server is left
+    // behind, and the slot's lease ends with the run.
+    wait_gone(
+        child_pid,
+        endpoint["process"]["creationTime"].as_u64().unwrap(),
+        Path::new(FIXTURE),
+        "the app-server child ends with its host",
+    );
+    assert!(!pooled.lease_path().exists(), "the lease ends with the run");
+
+    // The conversation ran on the bound slot with the recorded assignment.
+    let start = pooled.server.requests_for("thread/start");
+    assert_eq!(start.len(), 1, "{start:?}");
+    assert_eq!(start[0]["params"]["cwd"], json!(pooled.slot), "{start:?}");
+    assert_eq!(start[0]["params"]["model"], MODEL, "{start:?}");
+    assert_eq!(start[0]["params"]["modelProvider"], PROVIDER, "{start:?}");
+    assert_eq!(
+        start[0]["params"]["config"]["model_reasoning_effort"], EFFORT,
+        "{start:?}"
+    );
+    assert_eq!(
+        start[0]["params"]["sandbox"], "danger-full-access",
+        "the prepared shell's sandbox is pinned on the thread: {start:?}"
+    );
+    assert_eq!(start[0]["params"]["approvalPolicy"], "never", "{start:?}");
+    let name = pooled.server.requests_for("thread/name/set");
+    assert_eq!(
+        name[0]["params"]["name"],
+        format!("CEx (deepseek) - {OWNER}"),
+        "the thread carries the same assignment title as the run's surface: {name:?}"
+    );
+    let turn = pooled.server.requests_for("turn/start");
+    assert_eq!(turn.len(), 1, "{turn:?}");
+    assert_eq!(turn[0]["params"]["threadId"], THREAD, "{turn:?}");
+    assert_eq!(
+        turn[0]["params"]["input"],
+        json!([{"type": "text", "text": ASSIGNMENT}]),
+        "{turn:?}"
+    );
+    let read = pooled.server.requests_for("thread/read");
+    assert_eq!(read[0]["params"]["threadId"], THREAD, "{read:?}");
+
+    // The recorded lifecycle is what the existing review path reads: watch
+    // reports the completed run, the exact session and the returned message
+    // from the same receipt and result locator.
+    let watched = Command::new(manager())
+        .args(["executor", "watch", "--receipt"])
+        .arg(&pooled.receipt)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .output()
+        .unwrap();
+    let watched_text = output_text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains("state=completed"), "{watched_text}");
+    assert!(
+        watched_text.contains(&format!("session: {THREAD}")),
+        "{watched_text}"
+    );
+    assert!(watched_text.contains(FINAL), "{watched_text}");
+}
+
+/// A turn that did not complete the assignment is never reported as a
+/// completed run: the receipt keeps the state the thread's own status
+/// established, keeps the measured exit code of that state, and records no
+/// final message. A record that arrives after the terminal state is still
+/// rendered and never reopens it.
+#[test]
+fn a_hosted_turn_that_did_not_complete_is_recorded_honestly() {
+    for (status, message, expected_state, expected_exit) in [
+        ("interrupted", None, "interrupted", 1),
+        ("failed", Some("fixture native failure"), "failed", 1),
+    ] {
+        let pooled = Pooled::new(
+            &format!("host-{status}"),
+            Answer::Result(thread_start_answer()),
+            true,
+        );
+        let host = pooled.host("hang");
+        wait_for(
+            || !pooled.server.requests_for("turn/start").is_empty(),
+            "the host submits the assignment through turn/start",
+        );
+        terminal_turn(&pooled.server, status, message);
+        pooled.server.push(
+            json!({"method":"item/completed","params":{"threadId":THREAD,"item":{
+            "id":"late","type":"commandExecution","command":"fixture late command","exitCode":0}}}),
+        );
+        let output = host.wait_with_output().unwrap();
+        let text = output_text(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{status}: {text}"
+        );
+        assert!(
+            text.contains(&format!("result: {expected_state}:")),
+            "{status}: {text}"
+        );
+        assert!(
+            text.contains("command: fixture late command"),
+            "a record after the terminal state is still rendered: {status}: {text}"
+        );
+        let receipt = pooled.receipt();
+        let observation = &receipt["observation"];
+        assert_eq!(observation["state"], expected_state, "{status}: {receipt}");
+        assert_eq!(
+            observation["exitCode"], expected_exit,
+            "{status}: {receipt}"
+        );
+        assert_eq!(observation["session"], THREAD, "{status}: {receipt}");
+        if let Some(message) = message {
+            assert!(
+                observation["cause"].as_str().unwrap().contains(message),
+                "{status}: {receipt}"
+            );
+        }
+        assert!(
+            !pooled.result_path().exists(),
+            "no completed result is fabricated: {status}"
+        );
+        let endpoint: Value =
+            serde_json::from_slice(&fs::read(pooled.endpoint_path()).unwrap()).unwrap();
+        wait_gone(
+            endpoint["process"]["pid"].as_u64().unwrap() as u32,
+            endpoint["process"]["creationTime"].as_u64().unwrap(),
+            Path::new(FIXTURE),
+            "the app-server child ends with its host",
+        );
+    }
+}
+
+/// A completed turn whose final message is empty is an output defect, not a
+/// successful run: the host records the defect with the documented cause, exits
+/// with the defect code and writes no result.
+#[test]
+fn a_hosted_empty_final_message_is_an_output_defect() {
+    let pooled = Pooled::new("host-empty", Answer::Result(thread_start_answer()), true);
+    let mut read = thread_read_answer();
+    read["thread"]["turns"][0]["items"] = json!([{"id":"m1","type":"agentMessage","text":""}]);
+    pooled.server.answer("thread/read", Answer::Result(read));
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the host submits the assignment through turn/start",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(3), "{text}");
+    assert!(text.contains("result: defect:"), "{text}");
+    assert!(
+        text.contains("an empty completion is an output defect"),
+        "{text}"
+    );
+    let receipt = pooled.receipt();
+    let observation = &receipt["observation"];
+    assert_eq!(observation["state"], "defect", "{receipt}");
+    assert_eq!(observation["exitCode"], 3, "{receipt}");
+    assert!(
+        observation["cause"]
+            .as_str()
+            .unwrap()
+            .contains("the final message is empty"),
+        "{receipt}"
+    );
+    assert!(!pooled.result_path().exists(), "{receipt}");
+}
+
+#[test]
+fn a_hosted_exec_dispatch_refuses_a_thread_with_another_binding() {
+    let pooled = Pooled::new(
+        "host-binding",
+        Answer::Result(json!({
+            "thread": {"id": THREAD},
+            "model": "other-model",
+            "modelProvider": PROVIDER,
+            "reasoningEffort": EFFORT
+        })),
+        true,
+    );
+    let output = pooled.host("hang").wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("binding was not preserved"), "{text}");
+    assert!(
+        text.contains("the owned child tree was terminated"),
+        "{text}"
+    );
+
+    // The honest failed state: no session identity, no fabricated exit code
+    // and no addressable endpoint for a conversation that never started.
+    let receipt = pooled.receipt();
+    let observation = &receipt["observation"];
+    assert_eq!(observation["state"], "failed", "{receipt}");
+    assert!(observation["session"].is_null(), "{receipt}");
+    assert!(observation["exitCode"].is_null(), "{receipt}");
+    assert!(
+        observation["cause"]
+            .as_str()
+            .unwrap()
+            .contains("binding was not preserved"),
+        "{receipt}"
+    );
+    assert!(!pooled.endpoint_path().exists(), "{receipt}");
+    assert!(!pooled.result_path().exists(), "{receipt}");
+    // No fallback run: the receipt records no launcher arguments for this
+    // route, and the refused assignment never reached the thread.
+    assert_eq!(receipt["args"], json!([]), "{receipt}");
+    assert!(
+        pooled.server.requests_for("turn/start").is_empty(),
+        "a refused conversation submits nothing"
+    );
+    assert!(!pooled.lease_path().exists(), "the lease ends with the run");
+}
+
+#[test]
+fn a_hosted_exec_dispatch_fails_closed_when_the_child_never_serves() {
+    // No pinned endpoint: the spawned child must serve the reserved port, and
+    // a child that exits before serving fails the run with its own cause.
+    let pooled = Pooled::new("host-startup", Answer::Result(thread_start_answer()), false);
+    let output = pooled.host("nonzero").wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("the control-backed session did not start"),
+        "{text}"
+    );
+    assert!(text.contains("exited with exit code 19"), "{text}");
+    assert!(
+        text.contains("fixture launcher fails before any native event"),
+        "the control log is where the cause is read: {text}"
+    );
+    assert!(text.contains("control log:"), "{text}");
+    assert!(
+        text.contains("no fallback run was started"),
+        "a control startup failure never falls back to another backend: {text}"
+    );
+
+    let receipt = pooled.receipt();
+    let observation = &receipt["observation"];
+    assert_eq!(observation["state"], "failed", "{receipt}");
+    assert!(observation["session"].is_null(), "{receipt}");
+    assert!(observation["exitCode"].is_null(), "{receipt}");
+    assert!(
+        observation["cause"]
+            .as_str()
+            .unwrap()
+            .contains("did not start"),
+        "{receipt}"
+    );
+    assert!(!pooled.endpoint_path().exists(), "{receipt}");
+    assert!(!pooled.result_path().exists(), "{receipt}");
+    assert_eq!(receipt["args"], json!([]), "{receipt}");
+    assert!(!pooled.lease_path().exists(), "the lease ends with the run");
 }
 
 // --------------------------------------------------------- opt-in native CLI

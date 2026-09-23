@@ -10,8 +10,11 @@
 //! conversation thread with `cwd` at the bound slot and the resolved profile
 //! binding pinned through `model`/`modelProvider`/`config`, verifies that the
 //! started thread reports that binding, names the thread with the assignment
-//! title, and records the endpoint (port, token, thread id) in `control-N.json`
-//! beside the dispatch receipt.
+//! title, and records the endpoint (port, token, thread id, plus the
+//! app-server child's exact process identity) in `endpoint-N.json` beside the
+//! dispatch receipt. That file is the address `executor message` and
+//! `executor stop` read, so the recorded process identity is the one the stop
+//! path can interrupt and end without trusting a bare pid.
 //!
 //! The tab host then submits the assignment with [`Conversation::assign`],
 //! renders what [`Conversation::pump`] returns (each record carries the
@@ -161,7 +164,7 @@ fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
 /// nothing lands in the executor's checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPaths {
-    /// `control-N.json` beside `spawn-N.json`.
+    /// `endpoint-N.json` beside `spawn-N.json`.
     pub endpoint: PathBuf,
     /// The capability token the child reads through `--ws-token-file`.
     pub token: PathBuf,
@@ -171,12 +174,17 @@ pub struct ControlPaths {
 
 impl ControlPaths {
     /// The control state of one pool slot, beside its dispatch receipt.
+    ///
+    /// The endpoint record keeps the name the stop path reads
+    /// (`endpoint-<index>.json`, task 2.1's convention): a record under any
+    /// other name would leave a live run unaddressable for `executor stop`
+    /// and `executor message`.
     pub fn for_slot(codex_home: &Path, source: &Path, index: u32) -> io::Result<Self> {
         let directory = task_worktree::pool_state_dir(codex_home, source)?;
         Ok(Self {
-            endpoint: directory.join(format!("control-{index}.json")),
-            token: directory.join(format!("control-{index}.token")),
-            log: directory.join(format!("control-{index}.log")),
+            endpoint: directory.join(format!("endpoint-{index}.json")),
+            token: directory.join(format!("endpoint-{index}.token")),
+            log: directory.join(format!("endpoint-{index}.log")),
         })
     }
 }
@@ -355,6 +363,24 @@ pub struct Endpoint {
     /// Absent until the conversation thread exists; an endpoint without it is
     /// recorded state, not an addressable conversation.
     pub thread_id: Option<String>,
+    /// The exact identity of the app-server child serving this endpoint, when
+    /// this endpoint was recorded by the host that spawned it. The stop path
+    /// verifies and ends that child through this record; a pid alone would be
+    /// a guess about a reused process.
+    #[serde(default)]
+    pub process: Option<EndpointProcess>,
+}
+
+/// The app-server child one recorded endpoint belongs to: the process
+/// identity (pid, creation time and image) the owning host spawned inside its
+/// own Job, in the shape the stop path reads (`process.pid`,
+/// `process.creationTime`, `process.program`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EndpointProcess {
+    pub pid: u32,
+    pub creation_time: u64,
+    pub program: PathBuf,
 }
 
 impl fmt::Debug for Endpoint {
@@ -364,23 +390,30 @@ impl fmt::Debug for Endpoint {
             .debug_struct("Endpoint")
             .field("port", &self.port)
             .field("thread_id", &self.thread_id)
+            .field("process", &self.process)
             .finish_non_exhaustive()
     }
 }
 
 impl Endpoint {
-    fn new(port: u16, token: String) -> Self {
+    fn new(port: u16, token: String, process: EndpointProcess) -> Self {
         Self {
             schema: SCHEMA,
             port,
             token,
             thread_id: None,
+            process: Some(process),
         }
     }
 
     /// The bearer of this endpoint. Only the transport needs it.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// The loopback port of this endpoint.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Writes the record where the lead reads it: beside the dispatch receipt,
@@ -414,6 +447,11 @@ impl Endpoint {
                 .thread_id
                 .as_deref()
                 .is_some_and(|id| id.is_empty())
+            || endpoint.process.as_ref().is_some_and(|process| {
+                process.pid == 0
+                    || process.creation_time == 0
+                    || process.program.as_os_str().is_empty()
+            })
         {
             return Err(invalid(format!(
                 "control endpoint record {} is malformed or unsupported",
@@ -627,6 +665,7 @@ impl fmt::Debug for Conversation {
             .debug_struct("Conversation")
             .field("thread_id", &self.thread_id)
             .field("endpoint", &self.endpoint)
+            .field("identity", &self.identity)
             .field("lifecycle", &self.lifecycle)
             .field("defect", &self.defect)
             .field("failure", &self.failure)
@@ -688,6 +727,9 @@ impl Conversation {
     /// Attaching changes nothing: it connects, initializes the connection with
     /// the experimental API and adopts the recorded thread identity. The
     /// caller keeps owning every decision about delivery and lifecycle.
+    // The host that started a conversation drives it directly; attaching is
+    // for the later command that addresses a live run from outside.
+    #[allow(dead_code)]
     pub fn attach(endpoint: &Endpoint, bound: Duration) -> io::Result<Self> {
         let thread_id = endpoint.thread_id.clone().ok_or_else(|| {
             invalid(
@@ -726,6 +768,7 @@ impl Conversation {
 
     /// The identity the started thread was verified against, when this session
     /// started its own thread.
+    #[allow(dead_code)] // Read back through the receipt by the addressing commands.
     pub fn identity(&self) -> Option<&BoundIdentity> {
         self.identity.as_ref()
     }
@@ -758,6 +801,7 @@ impl Conversation {
     }
 
     /// The turn this session submitted, as the native answer described it.
+    #[allow(dead_code)] // Recorded on the surface; the addressing commands read it back.
     pub fn turn(&self) -> Option<&TurnStart> {
         self.turn.as_ref()
     }
@@ -1232,7 +1276,17 @@ fn spawn_app_server(
             }
         }
     };
-    Ok((process, connection, Endpoint::new(port, token)))
+    let identity = process.identity();
+    let endpoint = Endpoint::new(
+        port,
+        token,
+        EndpointProcess {
+            pid: identity.pid,
+            creation_time: identity.creation_time,
+            program: plan.launcher.clone(),
+        },
+    );
+    Ok((process, connection, endpoint))
 }
 
 /// One capability token: 32 bytes of OS randomness as lowercase hex, the shape

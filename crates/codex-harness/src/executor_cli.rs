@@ -32,14 +32,19 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
+#[path = "executor_control.rs"]
+mod control;
 #[path = "executor_observation.rs"]
 mod observation;
 #[path = "executor_stop.rs"]
 mod executor_stop;
 
+use control::{
+    BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
+};
 use observation::{
-    COVERAGE_NATIVE, RunObservation, STATE_ACCEPTED, STATE_COMPLETED, STATE_DEFECT, STATE_FAILED,
-    STATE_INTERRUPTED,
+    COVERAGE_NATIVE, ControlOutcome, RunObservation, RunTracker, STATE_ACCEPTED, STATE_COMPLETED,
+    STATE_DEFECT, STATE_FAILED, STATE_INTERRUPTED, STATE_STARTED,
 };
 
 const USAGE: &str = concat!(
@@ -55,7 +60,7 @@ const USAGE: &str = concat!(
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
     "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default exec mode runs `codex exec --json` with --output-last-message behind the tab host: the host renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal, while the same stream is recorded as an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) in the kit-local dispatch receipt beside the exact native session identity, the returned result locator and a bounded detail file. The launcher tree runs inside the host-owned Windows Job, so an abnormal host death reaps it while an ordinary session exit preserves the CLI's own background members; the launcher's stderr is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the event spool, the bounded detail file and the initial record must all succeed before any launcher starts, and a later read, render or record failure terminates and drains the owned tree and fails the host instead of reporting a successful run. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
+    "The default exec mode hosts one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, starts the conversation thread at the bound slot with the resolved profile binding pinned on it, submits the assignment through `turn/start`, and renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a startup, read, render or record failure fails the host with its cause instead of running another backend or reporting a successful run. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
@@ -394,7 +399,13 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
     };
     let paths = run_paths(&codex_home, &source, binding.index)?;
     let args = resume_child_args(&profile, &binding.path, &session, &prompt, &paths.result)?;
-    launch_bound(&request, &binding, args, &bound, &paths)
+    launch_bound(
+        &request,
+        &binding,
+        HostRoute::Launcher(args),
+        &bound,
+        &paths,
+    )
 }
 
 /// `--workspace` is no longer the isolation mechanism: it may name the source
@@ -485,6 +496,59 @@ enum PromptSource {
     Structured(executor_assignment::Assignment),
 }
 
+/// The control-backed route one dispatch records: the host starts one
+/// `codex app-server` child inside its own Job, starts the conversation thread
+/// at the bound slot with the recorded profile binding, submits this exact
+/// assignment through `turn/start` and records the endpoint beside the receipt
+/// for `executor message` and `executor stop`. No `codex exec` invocation is
+/// recorded beside it, so a control startup failure can never fall back to a
+/// different backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ControlReceipt {
+    schema: u32,
+    /// The exact assignment text the host submits as the conversation's turn.
+    assignment: String,
+    /// The profile binding this dispatch resolved. The driver pins it on the
+    /// started thread and refuses a conversation whose thread reports another
+    /// model, provider or reasoning effort.
+    identity: BoundIdentity,
+    /// The loopback port the app-server child must serve, when the caller owns
+    /// the endpoint (an acceptance check that provides the server itself).
+    /// Ordinary dispatch records none, and the host reserves a free port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+}
+
+/// Record schema of the control route inside one dispatch receipt.
+const CONTROL_SCHEMA: u32 = 1;
+
+/// How the host of one dispatch runs the session: the control-backed
+/// conversation, or the recorded launcher invocation (tui mode, resume and
+/// legacy receipts).
+enum HostRoute {
+    Control(Box<ControlReceipt>),
+    Launcher(Vec<String>),
+}
+
+impl HostRoute {
+    /// The launcher arguments the receipt records; the control route records
+    /// none because its host starts the app-server child from the plan.
+    fn args(&self) -> &[String] {
+        match self {
+            Self::Control(_) => &[],
+            Self::Launcher(args) => args,
+        }
+    }
+
+    fn control(&self) -> Option<&ControlReceipt> {
+        match self {
+            Self::Control(control) => Some(control),
+            Self::Launcher(_) => None,
+        }
+    }
+}
+
 /// Splits `--exec PROMPT` from `--assignment FILE`: exactly one carries the
 /// assignment, and a structured file is loaded and schema-checked before any
 /// pool slot is touched.
@@ -537,14 +601,20 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
     let paths = run_paths(request.codex_home, request.source, binding.index)?;
-    let args = child_args(
-        request.profile,
-        &binding.path,
-        &prompt,
-        request.mode,
-        &paths.result,
-    )?;
-    launch_bound(request, &binding, args, &bound, &paths)
+    // A pooled exec dispatch is a control-backed conversation: the host starts
+    // the app-server child and drives this assignment through `turn/start`
+    // instead of running `codex exec --json`, so a live correction can reach
+    // the same session. Tui mode keeps its interactive launcher invocation.
+    let route = match request.mode {
+        SpawnMode::Exec => HostRoute::Control(Box::new(ControlReceipt {
+            schema: CONTROL_SCHEMA,
+            assignment: prompt,
+            identity: BoundIdentity::resolve(&bound),
+            port: None,
+        })),
+        SpawnMode::Tui => HostRoute::Launcher(tui_args(request.profile, &binding.path, &prompt)?),
+    };
+    launch_bound(request, &binding, route, &bound, &paths)
 }
 
 /// The dispatch text for the bound slot: free text passes through unchanged,
@@ -607,7 +677,7 @@ fn release_unused_claim(request: &Dispatch, binding: &SlotBinding, error: io::Er
 fn launch_bound(
     request: &Dispatch,
     binding: &SlotBinding,
-    args: Vec<String>,
+    route: HostRoute,
     bound: &ProfileBinding,
     paths: &RunPaths,
 ) -> io::Result<i32> {
@@ -663,14 +733,14 @@ fn launch_bound(
             binding,
             &receipt,
             &title,
-            &args,
+            &route,
             bound,
             &shell,
             &run,
         )
     } else {
         dispatch_owned_console(
-            &launcher, request, binding, &receipt, bound, &args, &shell, &run,
+            &launcher, request, binding, &receipt, bound, &route, &shell, &run,
         )
     }
 }
@@ -1855,19 +1925,29 @@ fn run_receipt(path: &std::ffi::OsStr) -> io::Result<i32> {
     if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
         record_lease(codex_home, binding)?;
     }
-    let outcome = match native_run(&value) {
-        Some(run) => {
-            let header = host_header(&value, binding.as_ref());
-            run_observed_receipt(
+    let header = host_header(&value, binding.as_ref());
+    let outcome = match control_route(&value)? {
+        Some(control) => run_control_receipt(
+            &launcher,
+            Path::new(path),
+            &control,
+            &value,
+            binding.as_ref(),
+            codex_home.as_deref(),
+            shell.as_ref(),
+            &header,
+        ),
+        None => match native_run(&value) {
+            Some(run) => run_observed_receipt(
                 &launcher,
                 &rest,
                 Path::new(path),
                 run,
                 shell.as_ref(),
                 &header,
-            )
-        }
-        None => run_child(&launcher, &rest, shell.as_ref()),
+            ),
+            None => run_child(&launcher, &rest, shell.as_ref()),
+        },
     };
     if let (Some(binding), Some(codex_home)) = (&binding, &codex_home) {
         let _ = remove_lease(codex_home, binding);
@@ -1883,6 +1963,32 @@ fn native_run(value: &serde_json::Value) -> Option<RunObservation> {
     (run.coverage == COVERAGE_NATIVE && run.result.is_some()).then_some(run)
 }
 
+/// The control-backed route one receipt records, when it records one.
+///
+/// A receipt that names the control route is hosted only by the control
+/// driver: its recorded launcher arguments are empty by construction, so there
+/// is no `codex exec` invocation to fall back to and a startup failure stays a
+/// failure.
+fn control_route(value: &serde_json::Value) -> io::Result<Option<ControlReceipt>> {
+    let control = &value["control"];
+    if control.is_null() {
+        return Ok(None);
+    }
+    if value["mode"].as_str().is_some_and(|mode| mode != "exec") {
+        return Err(invalid(
+            "executor run receipt records a control route outside exec mode; refusing to host it",
+        ));
+    }
+    let control: ControlReceipt = serde_json::from_value(control.clone())
+        .map_err(|error| invalid(&format!("executor run receipt control route: {error}")))?;
+    if control.schema != CONTROL_SCHEMA || control.assignment.is_empty() {
+        return Err(invalid(
+            "executor run receipt control route is malformed or unsupported",
+        ));
+    }
+    Ok(Some(control))
+}
+
 /// The readable header of the hosted session's visible surface: the actual
 /// dispatched identity, the slot mapping, the locators and a bounded
 /// assignment excerpt. The event stream follows it as it arrives.
@@ -1893,8 +1999,14 @@ fn host_header(value: &serde_json::Value, binding: Option<&SlotBinding>) -> Stri
     let effort = value["reasoningEffort"].as_str().unwrap_or("default");
     let mode = value["mode"].as_str().unwrap_or("exec");
     let host = value["host"].as_str().unwrap_or("host");
+    let control = !value["control"].is_null();
     let mut header = format!(
-        "executor session: profile={profile} model={model} provider={provider} effort={effort} mode={mode} host={host}\n"
+        "executor session: profile={profile} model={model} provider={provider} effort={effort} mode={mode} host={host}{}\n",
+        if control {
+            " conversation=control (codex app-server)"
+        } else {
+            ""
+        }
     );
     match binding {
         Some(binding) => header.push_str(&format!(
@@ -1914,17 +2026,26 @@ fn host_header(value: &serde_json::Value, binding: Option<&SlotBinding>) -> Stri
             header.push_str(&format!("continuing session: {previous}\n"));
         }
     }
-    if let Some(assignment) = assignment_excerpt(&value["args"]) {
+    if let Some(assignment) = assignment_excerpt(value) {
         header.push_str(&format!("assignment:\n{assignment}\n"));
     }
-    header.push_str("--- native event stream ---\n");
+    header.push_str(if control {
+        "--- control conversation ---\n"
+    } else {
+        "--- native event stream ---\n"
+    });
     header
 }
 
-/// The last launcher argument carries the assignment; a leading '-' means the
-/// argument is an option, not a prompt.
-fn assignment_excerpt(args: &serde_json::Value) -> Option<String> {
-    let prompt = args
+/// The assignment excerpt the visible surface shows: the control route's exact
+/// conversation input, or the last launcher argument of a recorded invocation.
+/// In the second case a leading '-' means the argument is an option, not a
+/// prompt.
+fn assignment_excerpt(value: &serde_json::Value) -> Option<String> {
+    if let Some(assignment) = value["control"]["assignment"].as_str() {
+        return Some(observation::excerpt(assignment, 1200));
+    }
+    let prompt = value["args"]
         .as_array()?
         .iter()
         .filter_map(serde_json::Value::as_str)
@@ -1975,6 +2096,499 @@ fn run_observed_receipt(
     spec.stdin = None;
     let mut tracker = observation::RunTracker::new(run);
     observation::run_observed(spec, receipt, &mut tracker, header, Some(&stderr_log))
+}
+
+/// The approval policy a control-backed exec thread runs under: an executor
+/// session has no interactive approver (the JSONL route never prompted
+/// either), so the thread must not wait for one.
+const CONTROL_APPROVAL_POLICY: &str = "never";
+/// Bounded wait for the app-server child to end after this host requested it.
+const CONTROL_CHILD_EXIT: Duration = Duration::from_secs(5);
+/// Bounded cleanup budget when this host terminates an owned control tree.
+const CONTROL_CLEANUP: Duration = Duration::from_secs(10);
+/// How long the surface keeps rendering records that arrive right after the
+/// turn's terminal state (an interrupted tool call finishing), before the run
+/// ends; an empty pump ends it sooner.
+const CONTROL_TAIL_GRACE: Duration = Duration::from_secs(1);
+
+/// Hosts one control-backed exec run: the recorded dispatch identity is
+/// verified, one `codex app-server` child starts inside this host's Job with
+/// the prepared executor shell, the assignment is submitted through
+/// `turn/start`, every control record is rendered on this surface while the
+/// bounded detail file and the receipt's lifecycle stay current, and the
+/// thread's own items supply the exact session identity and the final message.
+///
+/// Fail-closed: a startup or binding failure is recorded as a failed state
+/// with its cause and fails this host. The receipt records no `codex exec`
+/// invocation for this route, so nothing can silently fall back to another
+/// backend, and a failure never fabricates a session identity.
+#[allow(clippy::too_many_arguments)]
+fn run_control_receipt(
+    launcher: &str,
+    receipt: &Path,
+    control: &ControlReceipt,
+    value: &serde_json::Value,
+    binding: Option<&SlotBinding>,
+    codex_home: Option<&Path>,
+    shell: Option<&crate::executor_shell::PreparedShell>,
+    header: &str,
+) -> io::Result<i32> {
+    let launcher = normalize_launcher(std::ffi::OsStr::new(launcher))?;
+    if !Path::new(&launcher).is_absolute() {
+        return Err(invalid("executor run launcher must be absolute"));
+    }
+    let Some(binding) = binding else {
+        return Err(invalid(
+            "this control-backed receipt records no slot binding, so the conversation has no slot, owner or kit-local state; the dispatch must be repeated instead of hosted without one",
+        ));
+    };
+    let Some(codex_home) = codex_home else {
+        return Err(invalid(&format!(
+            "executor run receipt: CODEX_HOME is required to host the control-backed conversation of slot {} owned by {}",
+            binding.index, binding.owner
+        )));
+    };
+    let Some(shell) = shell else {
+        return Err(invalid(
+            "this control-backed receipt records no prepared executor shell and none could be re-prepared; the app-server child would run without the executor session environment",
+        ));
+    };
+    let Some(run) = RunObservation::from_receipt(value) else {
+        return Err(invalid(
+            "this control-backed receipt records no run observation; refusing to host a conversation without its lifecycle record",
+        ));
+    };
+    let Some(result) = run.result.clone() else {
+        return Err(invalid(
+            "this control-backed receipt records no result locator; the host would have nowhere to record the final message",
+        ));
+    };
+    let profile = value["profile"].as_str().unwrap_or("default");
+    let mut plan = ControlPlan::new(
+        &launcher,
+        codex_home,
+        &binding.path,
+        executor_title(profile, &binding.owner),
+        control.identity.clone(),
+        ControlPaths::for_slot(codex_home, &binding.source, binding.index)?,
+    );
+    // The app-server has no `--profile` flag, so the routing this dispatch
+    // already resolved is pinned on its thread, and the sandbox the prepared
+    // shell reports is pinned with it instead of the config default.
+    plan.approval_policy = Some(CONTROL_APPROVAL_POLICY.to_owned());
+    plan.sandbox = Some(shell.sandbox_mode.clone());
+    plan.env.insert("PATH".into(), Some(shell.path.clone()));
+    plan.port = control.port;
+    host_control_conversation(receipt, control, &plan, run, result, header)
+}
+
+/// Drives one prepared control conversation to its terminal state and records
+/// it. Setup that matters for honest observation - host identity, the initial
+/// record, the bounded detail file and the removal of a stale result - happens
+/// before the app-server child exists; a later read, render or record failure
+/// terminates the owned child tree and fails this host instead of reporting a
+/// successful run.
+fn host_control_conversation(
+    receipt: &Path,
+    control: &ControlReceipt,
+    plan: &ControlPlan,
+    run: RunObservation,
+    result: PathBuf,
+    header: &str,
+) -> io::Result<i32> {
+    let mut tracker = RunTracker::new(run);
+    tracker.observation.host = Some(observation::host_identity()?);
+    tracker.observation.updated_ms = observation::now_ms();
+    let detail = tracker.observation.detail.clone();
+    if let Some(detail) = &detail {
+        if let Some(parent) = detail.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::File::create(detail).map_err(|error| {
+            io::Error::other(format!(
+                "cannot create the bounded detail file {} before the model starts: {error}",
+                detail.display()
+            ))
+        })?;
+    }
+    // A stale final message from an earlier run must never read as this run's.
+    let _ = fs::remove_file(&result);
+    observation::update_receipt(receipt, &tracker.observation).map_err(|error| {
+        io::Error::other(format!(
+            "the initial observation record could not be written before the model starts: {error}"
+        ))
+    })?;
+    print!("{header}");
+    let mut stdout = io::stdout();
+    stdout.flush()?;
+
+    let job = Job::new(Limits::default())?;
+    let mut conversation = match Conversation::start(&job, plan) {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            return fail_control(
+                receipt,
+                &mut tracker,
+                format!("the control-backed session did not start: {error}"),
+                plan,
+                Some(job),
+            );
+        }
+    };
+    // The thread identity exists before the first model request and is what
+    // the receipt, the visible surface and the resume remedy name.
+    let thread = conversation.thread_id().to_owned();
+    tracker.observation.session = Some(thread.clone());
+    tracker.observation.state = STATE_STARTED.into();
+    tracker.observation.updated_ms = observation::now_ms();
+    if let Err(error) = observation::update_receipt(receipt, &tracker.observation) {
+        return fail_control(
+            receipt,
+            &mut tracker,
+            format!("the native identity record could not be written: {error}"),
+            plan,
+            Some(job),
+        );
+    }
+    // The record `executor message` and `executor stop` resolve this run
+    // through must address the conversation that was just started, before the
+    // assignment is submitted: a record that does not is a broken address, not
+    // a cosmetic detail.
+    if let Err(error) = verify_recorded_endpoint(plan, &conversation) {
+        return fail_control(receipt, &mut tracker, format!("{error}"), plan, Some(job));
+    }
+    match conversation.assign(&control.assignment) {
+        Ok(turn) => println!("turn: {} ({})", turn.turn_id, turn.status),
+        Err(error) => {
+            return fail_control(
+                receipt,
+                &mut tracker,
+                format!("the assignment was not submitted to the native thread: {error}"),
+                plan,
+                Some(job),
+            );
+        }
+    }
+    let state = match drive_control(
+        &mut conversation,
+        receipt,
+        &mut tracker,
+        detail.as_deref(),
+        &mut stdout,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            return fail_control(
+                receipt,
+                &mut tracker,
+                format!("executor observation failed: {error}"),
+                plan,
+                Some(job),
+            );
+        }
+    };
+    // The turn's own status is terminal. The final message comes from the
+    // thread's items, never from a transport acknowledgement.
+    let (final_message, cause) = match state {
+        Lifecycle::Completed => match conversation.final_message() {
+            Ok(FinalMessage::Present(text)) => {
+                if let Err(error) = observation::write_final_message(&result, &text) {
+                    return fail_control(
+                        receipt,
+                        &mut tracker,
+                        format!(
+                            "the final message could not be recorded at {}: {error}",
+                            result.display()
+                        ),
+                        plan,
+                        Some(job),
+                    );
+                }
+                (Some(observation::FinalMessage::Present), None)
+            }
+            Ok(FinalMessage::Empty) => (Some(observation::FinalMessage::Empty), None),
+            Ok(FinalMessage::Missing) => (Some(observation::FinalMessage::Missing), None),
+            Err(error) => {
+                return fail_control(
+                    receipt,
+                    &mut tracker,
+                    format!("the thread's final message could not be read: {error}"),
+                    plan,
+                    Some(job),
+                );
+            }
+        },
+        _ => (
+            None,
+            conversation
+                .defect()
+                .map(str::to_owned)
+                .or_else(|| conversation.failure().map(str::to_owned)),
+        ),
+    };
+    let exit = tracker.finish_control(&ControlOutcome {
+        state: state.receipt_state(),
+        final_message,
+        cause: cause.as_deref(),
+    });
+    let record = observation::update_receipt(receipt, &tracker.observation);
+    // The conversation is over: end the app-server child this host owns by its
+    // exact recorded identity and preserve the session's remaining members,
+    // exactly as an ordinary launcher exit does on the JSONL route.
+    if let Err(error) = end_owned_child(job, &conversation, Path::new(&plan.launcher)) {
+        writeln!(stdout, "note: {error}")?;
+    }
+    print_control_result(&tracker.observation, &result, &plan.paths.log, &mut stdout)?;
+    if let Err(error) = record {
+        return Err(io::Error::other(format!(
+            "the terminal run record could not be written: {error}; control log: {}",
+            plan.paths.log.display()
+        )));
+    }
+    stdout.flush()?;
+    Ok(exit)
+}
+
+/// Verifies that the endpoint record written beside the dispatch receipt
+/// addresses the conversation this host just started: the same port, bearer and
+/// thread identity the driver holds, and the app-server child this host owns.
+/// `executor message` and `executor stop` resolve a live run through exactly
+/// this record, so a record that does not address the conversation is a broken
+/// address and fails the run before the assignment is submitted.
+fn verify_recorded_endpoint(plan: &ControlPlan, conversation: &Conversation) -> io::Result<()> {
+    let recorded = Endpoint::read(&plan.paths.endpoint).map_err(|error| {
+        io::Error::other(format!(
+            "the control endpoint record {} could not be read back: {error}",
+            plan.paths.endpoint.display()
+        ))
+    })?;
+    let live = conversation.endpoint();
+    if recorded.port() != live.port()
+        || recorded.token() != live.token()
+        || recorded.thread_id.as_deref() != Some(conversation.thread_id())
+    {
+        return Err(io::Error::other(
+            "the recorded control endpoint does not address the conversation this host started, so `executor message` and `executor stop` could not reach this run",
+        ));
+    }
+    match (&recorded.process, conversation.process_identity()) {
+        (Some(process), Some(child))
+            if process.pid == child.pid && process.creation_time == child.creation_time => {}
+        (Some(_), Some(_)) => {
+            return Err(io::Error::other(
+                "the recorded control endpoint names an app-server child other than the one this host started",
+            ));
+        }
+        (None, _) => {
+            return Err(io::Error::other(
+                "the recorded control endpoint names no app-server child, so `executor stop` could not end the child that owns this thread",
+            ));
+        }
+        (Some(_), None) => {}
+    }
+    Ok(())
+}
+
+/// Renders every control record of one conversation until the turn's own
+/// status is terminal, keeping the bounded detail file and the receipt's
+/// lifecycle current. Returns the terminal lifecycle state.
+///
+/// A terminal state is established by the turn's own status; records that
+/// arrive right after it (an interrupted tool call finishing) are still
+/// rendered within a bounded grace window but never reopen it.
+fn drive_control(
+    conversation: &mut Conversation,
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    detail: Option<&Path>,
+    stdout: &mut io::Stdout,
+) -> io::Result<Lifecycle> {
+    let mut truncation_noted = false;
+    let mut grace: Option<Instant> = None;
+    loop {
+        let events = conversation.pump()?;
+        let empty = events.is_empty();
+        for event in &events {
+            if let Some(detail) = detail {
+                match observation::append_detail(detail, &event.raw.to_string()) {
+                    Ok(true) => {}
+                    Ok(false) if !truncation_noted => {
+                        truncation_noted = true;
+                        writeln!(
+                            stdout,
+                            "note: the raw record detail reached its byte bound; the detail file stops here while the readable surface continues"
+                        )?;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(io::Error::other(format!(
+                            "the bounded detail file {} is not writable: {error}",
+                            detail.display()
+                        )));
+                    }
+                }
+            }
+            event.render(stdout)?;
+            let state = event.lifecycle.map(Lifecycle::receipt_state);
+            let completed = (event.method.as_deref() == Some("item/completed"))
+                .then(|| event.raw["params"]["item"]["type"].as_str())
+                .flatten();
+            if tracker.apply_control(state, completed, conversation.thread_id()) {
+                observation::update_receipt(receipt, &tracker.observation)?;
+            }
+        }
+        if let Some(state) = conversation.lifecycle()
+            && (state.is_terminal() || state == Lifecycle::Defect)
+        {
+            match grace {
+                None => grace = Some(Instant::now() + CONTROL_TAIL_GRACE),
+                Some(until) if empty || Instant::now() >= until => return Ok(state),
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Fails one control-backed run honestly: the receipt records a failed state
+/// with the cause and no exit code, the visible surface names the failure, the
+/// control log and the next action, and an owned tree is terminated. This host
+/// still fails, so no caller observes a successful run.
+fn fail_control(
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    cause: String,
+    plan: &ControlPlan,
+    job: Option<Job>,
+) -> io::Result<i32> {
+    let cleanup = match job {
+        Some(job) => match job.terminate(1, CONTROL_CLEANUP) {
+            Ok(snapshot) => match snapshot.active_processes {
+                0 => "the owned child tree was terminated; no process remained".to_owned(),
+                remaining => {
+                    format!("the owned child tree was terminated; {remaining} processes remained")
+                }
+            },
+            Err(error) => format!("terminating the owned child tree also failed: {error}"),
+        },
+        None => "no child tree was started".to_owned(),
+    };
+    let cause = format!("{cause}; {cleanup}");
+    tracker.session_failed(cause.clone());
+    let record = observation::update_receipt(receipt, &tracker.observation);
+    let failure = match record {
+        Ok(()) => cause.clone(),
+        Err(error) => format!("{cause}; the failure record could not be written: {error}"),
+    };
+    let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "result: failed: {cause}");
+    if let Some(tail) = observation::stderr_tail(&plan.paths.log, observation::MAX_STDERR_TAIL) {
+        let _ = writeln!(stdout, "app-server log (bounded tail):");
+        let _ = writeln!(stdout, "{tail}");
+    }
+    let _ = writeln!(
+        stdout,
+        "detail: {} control log: {}",
+        tracker
+            .observation
+            .detail
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unavailable".into()),
+        plan.paths.log.display()
+    );
+    let _ = writeln!(
+        stdout,
+        "remedy: report the cause to the lead; the slot keeps its binding and partial work, and no fallback run was started"
+    );
+    let _ = stdout.flush();
+    Err(io::Error::other(failure))
+}
+
+/// Ends the app-server child this host owns by its exact recorded identity
+/// (pid, creation time and image) and then disarms kill-on-close, so the
+/// session's remaining members keep their own lifetime exactly as they do
+/// after an ordinary launcher exit on the JSONL route. The child is ended only
+/// when its live identity matches the one this host spawned.
+fn end_owned_child(job: Job, conversation: &Conversation, program: &Path) -> io::Result<()> {
+    let Some(child) = conversation.process() else {
+        return Ok(());
+    };
+    let identity = child.identity();
+    let user = harness_core::process_service::current_user()?;
+    match ServiceProcess::inspect(identity, program, &user) {
+        Ok(Some(process)) => {
+            process.terminate(0).map_err(|error| {
+                io::Error::other(format!(
+                    "the app-server child (pid {}) could not be ended: {error}; it was not terminated by name or pid alone, and this host's Job reaps the tree when the host exits",
+                    identity.pid
+                ))
+            })?;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "the app-server child recorded for this run could not be verified for ending: {error}; it was not terminated on unverified identity, and this host's Job reaps the tree when the host exits"
+            )));
+        }
+    }
+    if !child.wait_for_exit(CONTROL_CHILD_EXIT)? {
+        return Err(io::Error::other(format!(
+            "the app-server child (pid {}) was still running {:?} after it was ended; this host's Job reaps the tree when the host exits",
+            identity.pid, CONTROL_CHILD_EXIT
+        )));
+    }
+    job.wait_session_root(child)?;
+    Ok(())
+}
+
+/// The terminal summary of one control-backed run, in the shape the observed
+/// JSONL host prints, so the lead reads either route the same way.
+fn print_control_result(
+    observation: &RunObservation,
+    result: &Path,
+    log: &Path,
+    stdout: &mut io::Stdout,
+) -> io::Result<()> {
+    match observation.state.as_str() {
+        STATE_COMPLETED => {
+            writeln!(
+                stdout,
+                "result: completed (events={} messages={} tool calls={} session={})",
+                observation.events,
+                observation.messages,
+                observation.tool_calls,
+                observation.session.as_deref().unwrap_or("unrecorded")
+            )?;
+            writeln!(stdout, "result message: {}", result.display())?;
+        }
+        state => {
+            writeln!(
+                stdout,
+                "result: {state}: {} (exit {})",
+                observation.cause.as_deref().unwrap_or("no cause recorded"),
+                observation.exit_code.unwrap_or_default()
+            )?;
+            if let Some(tail) = observation::stderr_tail(log, observation::MAX_STDERR_TAIL) {
+                writeln!(stdout, "app-server log (bounded tail):")?;
+                writeln!(stdout, "{tail}")?;
+            }
+            writeln!(
+                stdout,
+                "detail: {} control log: {}",
+                observation
+                    .detail
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unavailable".into()),
+                log.display()
+            )?;
+            writeln!(
+                stdout,
+                "remedy: the session is not running; continue it with `codex-harness executor resume --source ... --slot ... --owner ...` and treat a missing final message as an executor output defect"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// The recorded pool slot binding of a receipt; receipts written before the
@@ -2238,7 +2852,7 @@ fn dispatch_terminal_tab(
     binding: &SlotBinding,
     receipt: &Path,
     title: &str,
-    tui: &[String],
+    route: &HostRoute,
     bound: &ProfileBinding,
     shell: &crate::executor_shell::PreparedShell,
     run: &RunObservation,
@@ -2282,7 +2896,7 @@ fn dispatch_terminal_tab(
         launcher,
         request.profile,
         request.mode,
-        tui,
+        route,
         bound,
         None,
         "windows-terminal-tab",
@@ -2343,7 +2957,7 @@ fn dispatch_owned_console(
     binding: &SlotBinding,
     receipt: &Path,
     bound: &ProfileBinding,
-    args: &[String],
+    route: &HostRoute,
     shell: &crate::executor_shell::PreparedShell,
     run: &RunObservation,
 ) -> io::Result<i32> {
@@ -2359,7 +2973,7 @@ fn dispatch_owned_console(
             launcher,
             profile,
             request.mode,
-            args,
+            route,
             bound,
             None,
             "owned-console",
@@ -2459,37 +3073,6 @@ fn tui_args(profile: &str, workspace: &Path, prompt: &str) -> io::Result<Vec<Str
     Ok(args)
 }
 
-fn child_args(
-    profile: &str,
-    workspace: &Path,
-    prompt: &str,
-    mode: SpawnMode,
-    result: &Path,
-) -> io::Result<Vec<String>> {
-    match mode {
-        SpawnMode::Exec => {
-            let mut args = executor_session_args(profile)?;
-            // The event stream and the returned final message are the native
-            // observation contract of the hosted host, not a second protocol:
-            // the receipt records the same paths.
-            args.extend([
-                "exec".into(),
-                "--json".into(),
-                "--skip-git-repo-check".into(),
-                "-C".into(),
-                native_path(workspace)?,
-                "--output-last-message".into(),
-                native_path(result)?,
-                prompt.to_owned(),
-            ]);
-            Ok(args)
-        }
-        // The pooled slot is the isolation: no native --worktree flag is
-        // passed on this path.
-        SpawnMode::Tui => tui_args(profile, workspace, prompt),
-    }
-}
-
 /// The verified non-interactive resume order shared with instruction-refresh
 /// succession: profile flags, then `exec --skip-git-repo-check -C <slot>
 /// resume <SESSION_ID> <PROMPT>`. The exact session id is never a picker or
@@ -2525,7 +3108,7 @@ fn save_receipt(
     launcher: &Path,
     profile: &str,
     mode: SpawnMode,
-    args: &[String],
+    route: &HostRoute,
     bound: &ProfileBinding,
     window: Option<&task_view::Snapshot>,
     host: &str,
@@ -2534,6 +3117,12 @@ fn save_receipt(
     shell: &crate::executor_shell::PreparedShell,
     run: &RunObservation,
 ) -> io::Result<()> {
+    let args = route.args();
+    let control = match route.control() {
+        Some(control) => serde_json::to_value(control)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        None => json!(null),
+    };
     let window = match window {
         Some(snapshot) => serde_json::to_value(snapshot)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
@@ -2560,6 +3149,7 @@ fn save_receipt(
             "args": args,
             "visible": true,
             "host": host,
+            "control": control,
             "terminal": terminal,
             "isolation": args.iter().any(|arg| arg == "--worktree"),
             "slot": slot,
@@ -3497,18 +4087,13 @@ mod tests {
     #[test]
     fn pooled_dispatch_keeps_native_worktree_isolation_out_of_the_arguments() {
         let slot = Path::new(r"D:\wt\proj-wt1");
-        let result = Path::new(r"D:\state\message-1.txt");
-        for args in [
-            child_args("xai", slot, "do the work", SpawnMode::Exec, result).unwrap(),
-            child_args("xai", slot, "do the work", SpawnMode::Tui, result).unwrap(),
-        ] {
-            assert!(
-                !args
-                    .iter()
-                    .any(|arg| arg == "--worktree" || arg == "--enable" || arg == "worktrees"),
-                "{args:?}"
-            );
-        }
+        let args = tui_args("xai", slot, "do the work").unwrap();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--worktree" || arg == "--enable" || arg == "worktrees"),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -3996,34 +4581,98 @@ mod tests {
         assert!(error.to_string().contains("unknown executor mode"));
     }
 
+    /// The pooled exec route the dispatcher records, hosted by
+    /// `executor run --file`: the receipt carries the exact assignment, the
+    /// binding the started thread must report and no `codex exec` invocation,
+    /// so the host cannot fall back to another backend and the assignment is
+    /// submitted verbatim instead of being wrapped in a goal prefix.
     #[test]
-    fn exec_mode_streams_the_assignment_without_a_fake_goal_prefix() {
-        let args = child_args(
+    fn exec_dispatch_records_the_control_route_with_the_resolved_binding() {
+        let root =
+            std::env::temp_dir().join(format!("executor-control-receipt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let bound = ProfileBinding {
+            profile: "ds".into(),
+            model: Some("deepseek-flash".into()),
+            model_provider: Some("deepseek".into()),
+            reasoning_effort: Some("max".into()),
+        };
+        let shell = crate::executor_shell::PreparedShell {
+            path: r"C:\Tools\PowerShell\7".into(),
+            executable: PathBuf::from(r"C:\Tools\PowerShell\7\pwsh.exe"),
+            version: "PowerShell 7.6.6".into(),
+            sandbox_mode: "danger-full-access".into(),
+        };
+        let assignment = "Complete the outcome in ASSIGNMENT.md.";
+        let exec = root.join("spawn-1.json");
+        save_receipt(
+            &exec,
+            Path::new(r"C:\home\harness\bin\codex.exe"),
             "ds",
-            Path::new(r"D:\wt\ds"),
-            "Complete the outcome in ASSIGNMENT.md.",
             SpawnMode::Exec,
-            Path::new(r"D:\state\message-1.txt"),
+            &HostRoute::Control(Box::new(ControlReceipt {
+                schema: CONTROL_SCHEMA,
+                assignment: assignment.to_owned(),
+                identity: BoundIdentity::resolve(&bound),
+                port: None,
+            })),
+            &bound,
+            None,
+            "windows-terminal-tab",
+            None,
+            None,
+            &shell,
+            &RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl")),
         )
         .unwrap();
-        assert_eq!(args[0], "--profile");
-        assert_eq!(args[1], "ds");
-        assert_eq!(args[2], "-c");
-        assert_eq!(args[3], "agents.enabled=false");
-        assert_eq!(args[4], "exec");
-        assert!(args.contains(&"--json".to_string()));
-        assert!(args.contains(&"--skip-git-repo-check".to_string()));
-        let result = args
-            .iter()
-            .position(|arg| arg == "--output-last-message")
-            .expect("recorded result file");
-        assert_eq!(args[result + 1], r"D:\state\message-1.txt");
-        assert!(args.contains(&r"D:\wt\ds".to_string()));
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&exec).unwrap()).unwrap();
+        assert_eq!(value["mode"], "exec");
         assert_eq!(
-            args.last().unwrap(),
-            "Complete the outcome in ASSIGNMENT.md."
+            value["args"],
+            json!([]),
+            "no codex exec invocation is recorded beside the control route: {value}"
         );
-        assert!(!args.iter().any(|arg| arg.starts_with("/goal")));
+        assert_eq!(value["control"]["schema"], 1, "{value}");
+        assert_eq!(value["control"]["assignment"], assignment, "{value}");
+        assert_eq!(value["control"]["identity"]["profile"], "ds", "{value}");
+        assert_eq!(value["control"]["identity"]["model"], "deepseek-flash");
+        assert_eq!(value["control"]["identity"]["modelProvider"], "deepseek");
+        assert_eq!(value["control"]["identity"]["reasoningEffort"], "max");
+        assert!(
+            value["control"].get("port").is_none(),
+            "ordinary dispatch pins no endpoint port: {value}"
+        );
+        assert_eq!(value["shell"]["sandbox_mode"], "danger-full-access");
+        assert_eq!(value["observation"]["coverage"], "native");
+        assert_eq!(value["observation"]["state"], "dispatch-accepted");
+
+        // Tui mode keeps its launcher invocation and records no control route:
+        // the changed route is the exec one only.
+        let tui = root.join("spawn-2.json");
+        save_receipt(
+            &tui,
+            Path::new(r"C:\home\harness\bin\codex.exe"),
+            "ds",
+            SpawnMode::Tui,
+            &HostRoute::Launcher(tui_args("ds", Path::new(r"D:\wt\ds"), assignment).unwrap()),
+            &bound,
+            None,
+            "windows-terminal-tab",
+            None,
+            None,
+            &shell,
+            &RunObservation::unavailable("tui mode keeps a human conversation"),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&tui).unwrap()).unwrap();
+        assert_eq!(value["mode"], "tui");
+        assert!(value["control"].is_null(), "{value}");
+        assert_eq!(
+            value["args"].as_array().unwrap().last().unwrap(),
+            assignment
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
