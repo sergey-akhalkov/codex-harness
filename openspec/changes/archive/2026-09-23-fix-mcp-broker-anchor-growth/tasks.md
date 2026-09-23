@@ -22,7 +22,7 @@
 - [x] 2.3 Extend adopted-package MCP acceptance with a pre-grown anchor: the
        published-package CodeGraph entrypoint and the real Serena proxy must
        complete initialize and tools/list after historical growth.
-- [ ] 3.1 Run the applicable native checks (affected unit tests and focused
+- [x] 3.1 Run the applicable native checks (affected unit tests and focused
        MCP integration tests), then the installed-path verification: rebuild,
        reconnect the installation and confirm both previously failing MCP
        registrations complete a real handshake after the fix.
