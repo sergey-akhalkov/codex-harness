@@ -34,6 +34,8 @@ use std::process::{Command, Stdio};
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
 #[path = "executor_observation.rs"]
 mod observation;
+#[path = "executor_stop.rs"]
+mod executor_stop;
 
 use observation::{
     COVERAGE_NATIVE, RunObservation, STATE_ACCEPTED, STATE_COMPLETED, STATE_DEFECT, STATE_FAILED,
@@ -47,6 +49,7 @@ const USAGE: &str = concat!(
     "codex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\n",
     "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
     "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\n",
+    "codex-harness executor stop --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--timeout SECONDS]\n",
     "codex-harness executor steer --state DIRECTORY --thread ID --text TEXT [--worktree DIRECTORY] [--out FILE]\n",
     "codex-harness executor run LAUNCHER [ARG...]\n",
     "codex-harness executor run --file RECEIPT\n",
@@ -56,6 +59,7 @@ const USAGE: &str = concat!(
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
+    "`executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifies each by the recorded identity and boundedly terminates survivors so a child command is reported actually terminated instead of assumed ended with the host. The stopped run's tab closes because that run's own host process ends, and the recorded tab identity is verified closed through the terminal-surface owner; no terminal command is ever sent, so the lead's window, sibling tabs and other conversations are untouched. The receipt gets a stop record with outcome stopped, already-stopped, already-completed, partial or error, honest timestamps, the measured duration, the observed exit code (one that was never observed stays unknown), the pending-message undelivered marking, and the named survivor, cause and next action on partial failure; a repeated stop reports the recorded state and keeps the first stop's outcome, timestamps and measured duration, a stop racing natural completion reports the completed result, and nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). ",
     "Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Steer delivers a visible turn/start through the named session task-control endpoint with no status polling; without an endpoint it refuses instead of pretending to deliver, and the remedy names codex exec resume. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified."
 );
 const STARTUP: Duration = Duration::from_secs(20);
@@ -111,6 +115,10 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("watch") => watch(&args[1..]),
         Some("release") => release(&args[1..]),
         Some("pool") => pool_status(&args[1..]),
+        Some("stop") => {
+            refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            executor_stop::run(&args[1..])
+        }
         Some("assignment") => assignment_check(&args[1..]),
         Some("steer") => steer(&args[1..]),
         Some("run") => {
@@ -3649,6 +3657,83 @@ mod tests {
             task_view::terminal_windows().len(),
             before,
             "the probe window must close itself after its tabs exit"
+        );
+
+        // Stop closes exactly the stopped run's tab: the run's own host process
+        // ends (here a bounded command standing in for it) while a sibling
+        // conversation tab in the same window survives. The check uses the same
+        // terminal-surface owner and helper the stop path verifies with.
+        let sibling = format!("harness sibling probe {}", std::process::id());
+        let run_tab = format!("harness stop probe {}", std::process::id());
+        let dispatch_tab = |title: &str, seconds: u64| {
+            let mut cmd = Command::new(&client);
+            cmd.args([
+                "-w",
+                &name,
+                "new-tab",
+                "--title",
+                title,
+                "--suppressApplicationTitle",
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep",
+                "-Seconds",
+                &seconds.to_string(),
+            ]);
+            let status = task_view::run_restoring_foreground(
+                &mut cmd,
+                TERMINAL_TAB_SETTLE,
+                previous.unwrap_or(0),
+            )
+            .expect("terminal dispatch");
+            assert!(status.success(), "terminal dispatch failed: {status}");
+            task_view::restore_foreground_to(previous.unwrap_or(0));
+        };
+        dispatch_tab(&sibling, 30);
+        let reopening = Instant::now();
+        while !executor_stop::terminal_window_titled(&sibling)
+            && reopening.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            executor_stop::terminal_window_titled(&sibling),
+            "the sibling conversation tab must be open before the run tab closes"
+        );
+        dispatch_tab(&run_tab, 6);
+        assert!(
+            executor_stop::terminal_window_titled(&run_tab),
+            "the run tab must be the open, active tab before it ends"
+        );
+        let closing = Instant::now();
+        while executor_stop::terminal_window_titled(&run_tab)
+            && closing.elapsed() < Duration::from_secs(20)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !executor_stop::terminal_window_titled(&run_tab),
+            "only the stopped run's tab must close"
+        );
+        assert!(
+            executor_stop::terminal_window_titled(&sibling),
+            "the sibling conversation tab must remain usable in the same window"
+        );
+        assert!(
+            task_view::terminal_windows().len() > before,
+            "the window hosting the surviving sibling tab must stay open"
+        );
+        let ended = Instant::now();
+        while task_view::terminal_windows().len() > before
+            && ended.elapsed() < Duration::from_secs(40)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !executor_stop::terminal_window_titled(&sibling),
+            "the sibling probe tab ends on its own bound"
         );
     }
 

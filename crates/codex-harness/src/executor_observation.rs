@@ -56,9 +56,23 @@ pub(crate) const STATE_FAILED: &str = "failed";
 pub(crate) const STATE_DEFECT: &str = "defect";
 pub(crate) const STATE_INTERRUPTED: &str = "interrupted";
 pub(crate) const STATE_UNOBSERVED: &str = "unobserved";
+/// Lifecycle state of a run whose stop was verified end to end.
+pub(crate) const STATE_STOPPED: &str = "stopped";
+/// Lifecycle state of a stop that verified termination but left a named
+/// survivor or an unconfirmed recorded resource: a partial stop is not success.
+pub(crate) const STATE_PARTIAL_STOP: &str = "partial-stop";
 
 pub(crate) const COVERAGE_NATIVE: &str = "native";
 pub(crate) const COVERAGE_UNAVAILABLE: &str = "unavailable";
+
+/// Version of the stop record written under `stop` in a dispatch receipt.
+pub(crate) const STOP_SCHEMA: u32 = 1;
+/// Stop records use these outcomes; nothing else is claimed.
+pub(crate) const STOP_STOPPED: &str = "stopped";
+pub(crate) const STOP_ALREADY_STOPPED: &str = "already-stopped";
+pub(crate) const STOP_ALREADY_COMPLETED: &str = "already-completed";
+pub(crate) const STOP_PARTIAL: &str = "partial";
+pub(crate) const STOP_ERROR: &str = "error";
 
 /// Exit code of an observed run whose process failed or never reached a
 /// completed turn while exiting successfully.
@@ -191,6 +205,99 @@ impl RunObservation {
     pub(crate) fn recorded_session(&self) -> Option<&str> {
         self.session.as_deref().or(self.previous_session.as_deref())
     }
+}
+
+/// One process or surface a stop could not confirm ended, named with the cause
+/// and the supported next action instead of a false success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StopSurvivor {
+    /// `process`, `terminal-tab` or `console-window`.
+    pub kind: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Windows FILETIME of the surviving process creation, so a later stop can
+    /// re-verify the same process instead of trusting a reused pid.
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub image: Option<PathBuf>,
+    /// Recorded surface identity for a terminal tab or console window.
+    #[serde(default)]
+    pub surface: Option<String>,
+    pub cause: String,
+    pub next_action: String,
+}
+
+/// Honest stop lifecycle of one executor run, written under `stop` in the
+/// kit-local dispatch receipt beside the observation it explains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StopRecord {
+    pub schema: u32,
+    /// `stopped`, `already-stopped`, `already-completed`, `partial` or `error`.
+    pub outcome: String,
+    /// Unix milliseconds when the stop was requested and when its outcome was
+    /// committed; `duration_ms` is the measured stop path.
+    pub requested_ms: u64,
+    pub completed_ms: u64,
+    pub duration_ms: u64,
+    /// The primary honest sentence: what was verified, refused or remains.
+    pub detail: String,
+    /// Exact host identity this stop verified, when one was recorded.
+    #[serde(default)]
+    pub host: Option<HostIdentity>,
+    /// Native interruption result; `None` when the run has no control endpoint.
+    #[serde(default)]
+    pub interrupt: Option<String>,
+    /// Recorded processes this stop verified gone.
+    #[serde(default)]
+    pub ended: u64,
+    /// Survivors or unverified recorded resources with their next actions.
+    #[serde(default)]
+    pub survivors: Vec<StopSurvivor>,
+    /// Terminal-surface verification text.
+    #[serde(default)]
+    pub surface: Option<String>,
+    /// Queued message ids this stop marked undelivered.
+    #[serde(default)]
+    pub undelivered: Vec<String>,
+    /// How many later stop requests merely reported this recorded outcome; the
+    /// first stop's timestamps and duration are preserved across repeats.
+    #[serde(default)]
+    pub repeats: u64,
+    /// Unix milliseconds of the last repeated stop request, when there was one.
+    #[serde(default)]
+    pub repeated_ms: Option<u64>,
+    /// Exit code of the stopped run when one was actually observed. An exit
+    /// code that was never observed stays absent, never fabricated.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+/// The lifecycle transition one stop asks its receipt to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopTransition {
+    /// This invocation verified the run stopped: state `stopped`.
+    Stopped,
+    /// Termination happened but a recorded resource remains: `partial-stop`.
+    Partial,
+    /// The host ended without a terminal record: `interrupted` with the
+    /// unknown-exit-code cause, and no stop claim.
+    Unobserved,
+    /// This invocation changed nothing (refusal, repeat, completed run).
+    Keep,
+}
+
+/// Result of committing one stop record under the receipt lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StopCommit {
+    /// Effective outcome after the commit-time race check.
+    pub outcome: String,
+    /// Effective lifecycle state after the commit.
+    pub state: String,
+    /// The recorded exit code, present only when one was observed.
+    pub exit_code: Option<i32>,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -671,6 +778,99 @@ pub(crate) fn update_receipt_field(receipt: &Path, name: &str, field: Value) -> 
 /// still-finishing host.
 pub(crate) fn write_receipt_document(receipt: &Path, value: &Value) -> io::Result<()> {
     with_receipt_lock(receipt, || write_receipt(receipt, value))
+}
+
+/// Commits one stop outcome under the receipt lock. The lifecycle is re-read at
+/// commit time, so a stop racing natural completion reports the completed
+/// result instead of recording a stop that did not happen; queued messages are
+/// marked undelivered; an exit code that was never observed stays unknown; and
+/// the stop itself releases, resets and completes nothing.
+pub(crate) fn commit_stop(
+    receipt: &Path,
+    stop: &mut StopRecord,
+    transition: StopTransition,
+) -> io::Result<StopCommit> {
+    with_receipt_lock(receipt, || {
+        let mut value = read_receipt_value(receipt)?;
+        let mut recorded = RunObservation::from_receipt(&value);
+        // The race with natural completion is resolved here, at commit time: a
+        // run that completed while the stop was verifying keeps its recorded
+        // result, and the stop reports that the completion won.
+        if matches!(stop.outcome.as_str(), STOP_STOPPED | STOP_PARTIAL)
+            && let Some(run) = &recorded
+            && run.state == STATE_COMPLETED
+        {
+            stop.outcome = STOP_ALREADY_COMPLETED.into();
+            stop.survivors.clear();
+            stop.detail = format!(
+                "the run completed while stop was verifying, so its recorded result stands and no stop was recorded; {}",
+                stop.detail
+            );
+        }
+        stop.undelivered = mark_pending_messages(&mut value, stop.completed_ms);
+        if let Some(run) = &mut recorded {
+            match stop.outcome.as_str() {
+                STOP_STOPPED => run.state = STATE_STOPPED.into(),
+                STOP_PARTIAL => run.state = STATE_PARTIAL_STOP.into(),
+                _ => {}
+            }
+            if transition == StopTransition::Unobserved && run.state != STATE_COMPLETED {
+                run.state = STATE_INTERRUPTED.into();
+                let cause = format!("{}; the exact exit code is unknown", stop.detail);
+                run.cause = Some(merge_cause(run.cause.take(), &cause));
+                run.exit_code = None;
+            }
+            if matches!(stop.outcome.as_str(), STOP_STOPPED | STOP_PARTIAL) {
+                run.cause = Some(merge_cause(run.cause.take(), &stop.detail));
+            }
+            run.updated_ms = now_ms();
+            value["observation"] = serde_json::to_value(&*run).map_err(io::Error::other)?;
+        }
+        stop.exit_code = recorded.as_ref().and_then(|run| run.exit_code);
+        value["stop"] = serde_json::to_value(&*stop).map_err(io::Error::other)?;
+        write_receipt(receipt, &value)?;
+        Ok(StopCommit {
+            outcome: stop.outcome.clone(),
+            state: recorded.map(|run| run.state).unwrap_or_default(),
+            exit_code: stop.exit_code,
+        })
+    })
+}
+
+/// Adds one cause sentence without repeating text a repeated stop already
+/// recorded, so a repeated request cannot grow the record without limit.
+fn merge_cause(previous: Option<String>, next: &str) -> String {
+    match previous {
+        Some(previous) if previous.contains(next) => previous,
+        Some(previous) if !previous.is_empty() => format!("{previous}; {next}"),
+        _ => next.to_owned(),
+    }
+}
+
+/// Stops further delivery of queued messages to a run and records their
+/// undelivered state honestly: entries the message path queued without a
+/// confirmed delivery become `undelivered`, while delivered and errored
+/// entries are never rewritten.
+fn mark_pending_messages(value: &mut Value, stop_ms: u64) -> Vec<String> {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let mut marked = Vec::new();
+    for message in messages {
+        let status = message.get("status").and_then(Value::as_str);
+        if !matches!(status, Some("queued") | Some("pending")) {
+            continue;
+        }
+        let id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unnamed")
+            .to_owned();
+        message["status"] = Value::String("undelivered".into());
+        message["undeliveredMs"] = Value::from(stop_ms);
+        marked.push(id);
+    }
+    marked
 }
 
 fn read_receipt_value(receipt: &Path) -> io::Result<Value> {
@@ -1519,5 +1719,197 @@ mod tests {
         waiter.join().unwrap().unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         assert_eq!(value["window"]["columns"], 120, "{value}");
+    }
+
+    /// A dispatch receipt whose recorded lifecycle is `state`, with the one
+    /// queued and one delivered message a stop must classify.
+    fn stop_receipt(root: &Path, state: &str) -> PathBuf {
+        let receipt = root.join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "slot": {"index": 1, "owner": "exec-ds-7", "path": r"C:\pool\proj-wt1", "base": "abc"},
+                "messages": [
+                    {"id": "m-queued", "status": "queued"},
+                    {"id": "m-delivered", "status": "delivered"}
+                ],
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": state,
+                    "session": "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+                    "result": r"C:\state\message-1.txt",
+                    "detail": r"C:\state\stream-1.jsonl",
+                    "host": {"pid": 4242, "created": 99, "program": r"C:\kit\codex-harness.exe"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        receipt
+    }
+
+    fn stop_record(outcome: &str) -> StopRecord {
+        StopRecord {
+            schema: STOP_SCHEMA,
+            outcome: outcome.into(),
+            requested_ms: 1_000,
+            completed_ms: 0,
+            duration_ms: 0,
+            detail: "the recorded host was terminated and its identity verified".into(),
+            host: Some(HostIdentity {
+                pid: 4242,
+                created: 99,
+                program: PathBuf::from(r"C:\kit\codex-harness.exe"),
+            }),
+            interrupt: None,
+            ended: 1,
+            survivors: Vec::new(),
+            surface: Some("the recorded tab closed".into()),
+            undelivered: Vec::new(),
+            repeats: 0,
+            repeated_ms: None,
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn stop_records_its_outcome_without_releasing_or_fabricating_an_exit_code() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = stop_receipt(root.path(), STATE_RUNNING);
+        let mut stop = stop_record(STOP_STOPPED);
+        stop.completed_ms = 1_250;
+        stop.duration_ms = 250;
+        let commit = commit_stop(&receipt, &mut stop, StopTransition::Stopped).unwrap();
+        assert_eq!(commit.outcome, STOP_STOPPED);
+        assert_eq!(commit.state, STATE_STOPPED);
+        assert_eq!(stop.undelivered, vec!["m-queued".to_owned()]);
+        assert_eq!(stop.exit_code, None, "an unobserved exit code stays unknown");
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_STOPPED, "{value}");
+        assert_eq!(value["stop"]["outcome"], STOP_STOPPED);
+        assert_eq!(value["stop"]["durationMs"], 250);
+        assert!(value["stop"]["exitCode"].is_null(), "{value}");
+        assert!(value["observation"]["exitCode"].is_null(), "{value}");
+        assert_eq!(value["messages"][0]["status"], "undelivered");
+        assert_eq!(value["messages"][0]["undeliveredMs"], 1_250);
+        assert_eq!(value["messages"][1]["status"], "delivered");
+        // The recorded run is never released, reset or completed by a stop.
+        assert_eq!(value["slot"]["owner"], "exec-ds-7", "{value}");
+        assert!(value["slot"]["disposition"].is_null(), "{value}");
+        assert_eq!(value["observation"]["session"], "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4");
+        assert_eq!(value["observation"]["result"], r"C:\state\message-1.txt");
+        // A partial stop records its named survivor and is not success.
+        let mut partial = stop_record(STOP_PARTIAL);
+        partial.survivors.push(StopSurvivor {
+            kind: "process".into(),
+            pid: Some(5150),
+            created: Some(77),
+            image: Some(PathBuf::from(r"C:\kit\child.exe")),
+            surface: None,
+            cause: "the recorded process did not end within the bound".into(),
+            next_action: "terminate pid 5150 yourself".into(),
+        });
+        let commit = commit_stop(&receipt, &mut partial, StopTransition::Partial).unwrap();
+        assert_eq!(commit.outcome, STOP_PARTIAL);
+        assert_eq!(commit.state, STATE_PARTIAL_STOP);
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_PARTIAL_STOP, "{value}");
+        assert_eq!(value["stop"]["survivors"][0]["pid"], 5150);
+        assert_eq!(value["stop"]["survivors"][0]["nextAction"], "terminate pid 5150 yourself");
+        // An error keeps the recorded lifecycle and only reports the refusal.
+        let mut refusal = stop_record(STOP_ERROR);
+        refusal.detail = "no live process matches the recorded host identity".into();
+        let commit = commit_stop(&receipt, &mut refusal, StopTransition::Keep).unwrap();
+        assert_eq!(commit.outcome, STOP_ERROR);
+        assert_eq!(commit.state, STATE_PARTIAL_STOP);
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["stop"]["outcome"], STOP_ERROR);
+        // A stop that found the host already gone records the unobserved end
+        // with the honest unknown exit code and never claims a stop.
+        let receipt = stop_receipt(root.path(), STATE_RUNNING);
+        let mut unobserved = stop_record(STOP_ERROR);
+        unobserved.detail = "no live process matches the recorded host identity".into();
+        commit_stop(&receipt, &mut unobserved, StopTransition::Unobserved).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_INTERRUPTED, "{value}");
+        assert!(value["observation"]["exitCode"].is_null(), "{value}");
+        assert!(
+            value["observation"]["cause"]
+                .as_str()
+                .is_some_and(|cause| cause.contains("unknown")),
+            "{value}"
+        );
+        assert_ne!(value["stop"]["outcome"], STOP_STOPPED);
+    }
+
+    #[test]
+    fn a_stop_racing_natural_completion_reports_the_completed_result() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = stop_receipt(root.path(), STATE_RUNNING);
+        // The stop read the receipt while the run was still working; the host
+        // completed it before the stop outcome was committed.
+        let mut completed: Value =
+            serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        completed["observation"]["state"] = json!(STATE_COMPLETED);
+        completed["observation"]["exitCode"] = json!(0);
+        fs::write(&receipt, serde_json::to_vec_pretty(&completed).unwrap()).unwrap();
+        let mut stop = stop_record(STOP_STOPPED);
+        stop.survivors.push(StopSurvivor {
+            kind: "process".into(),
+            pid: Some(1),
+            created: Some(2),
+            image: None,
+            surface: None,
+            cause: "not confirmed".into(),
+            next_action: "inspect".into(),
+        });
+        let commit = commit_stop(&receipt, &mut stop, StopTransition::Stopped).unwrap();
+        assert_eq!(commit.outcome, STOP_ALREADY_COMPLETED);
+        assert_eq!(commit.state, STATE_COMPLETED);
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_COMPLETED, "{value}");
+        assert_eq!(value["observation"]["exitCode"], 0, "{value}");
+        assert_eq!(value["stop"]["outcome"], STOP_ALREADY_COMPLETED);
+        assert_eq!(
+            value["stop"]["survivors"],
+            json!([]),
+            "a completion race records no stop survivors: {value}"
+        );
+        assert!(
+            value["stop"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("completed while stop was verifying")),
+            "{value}"
+        );
+        // The recorded result stays readable for the lead.
+        assert_eq!(value["observation"]["result"], r"C:\state\message-1.txt");
+    }
+
+    #[test]
+    fn a_repeated_stop_keeps_the_first_stop_and_counts_the_repeat() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = stop_receipt(root.path(), STATE_RUNNING);
+        let mut first = stop_record(STOP_STOPPED);
+        first.completed_ms = 2_000;
+        first.duration_ms = 750;
+        commit_stop(&receipt, &mut first, StopTransition::Stopped).unwrap();
+        let recorded: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(recorded["stop"]["repeats"], 0);
+        // The repeated request reports the recorded state and counts itself.
+        let mut repeat: StopRecord = serde_json::from_value(recorded["stop"].clone()).unwrap();
+        repeat.repeats += 1;
+        repeat.repeated_ms = Some(9_000);
+        let commit = commit_stop(&receipt, &mut repeat, StopTransition::Keep).unwrap();
+        assert_eq!(commit.outcome, STOP_STOPPED);
+        assert_eq!(commit.state, STATE_STOPPED);
+        let repeated: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(repeated["stop"]["outcome"], STOP_STOPPED);
+        assert_eq!(repeated["stop"]["repeats"], 1);
+        assert_eq!(repeated["stop"]["repeatedMs"], 9_000);
+        assert_eq!(repeated["stop"]["completedMs"], 2_000);
+        assert_eq!(repeated["stop"]["durationMs"], 750);
+        assert_eq!(repeated["observation"]["state"], STATE_STOPPED);
     }
 }
