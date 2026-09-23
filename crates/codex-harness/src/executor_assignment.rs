@@ -200,6 +200,9 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
         "Before editing, verify the checkout is at the base above (git rev-parse HEAD) and report a mismatch instead of editing. Choose the installed skills this assignment needs and announce their first use. Keep every change inside the checkout and leave partial work resumable for a continuation.\n",
     );
     text.push_str(
+        "Run heavy builds and checks through codex-harness heavy -- PROGRAM ARGS. It queues against the shared account budget without a lead grant; keep the default account and budget unless the assignment explicitly authorizes another. Ordinary source reads and edits need no heavy-command slot.\n",
+    );
+    text.push_str(
         &format!(
             "When the outcome is complete, report a compact result: done and remaining work, the checkout and base you worked from, the exact files touched, how each acceptance item was verified with the checks actually run, limitations, the decision you need from {consumer}, and where the full detail lives.\n"
         ),

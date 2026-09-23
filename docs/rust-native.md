@@ -45,10 +45,10 @@ linker and Windows SDK. Workspace dependencies are locked in the root
 lockfile. Use the existing toolchain; Check does not install packages.
 
 ```powershell
-cargo build --workspace --locked --jobs 1
+codex-harness heavy -- cargo build --workspace --locked --jobs 1
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
-cargo test --workspace --locked --jobs 1 -- --test-threads=1
+codex-harness heavy -- cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
+codex-harness heavy -- cargo test --workspace --locked --jobs 1 -- --test-threads=1
 cargo run -p codex-harness --bin harness-source-check -- --root .
 ```
 
@@ -88,15 +88,45 @@ Detailed receipts stay in the printed private TEMP root.
 The current requirement-to-check map lives in
 [rust-requirement-checks.json](evidence/rust-requirement-checks.json).
 
-Keep builds and process-resource acceptance sequential. `--jobs 1` also bounds
-the native manager's compiler concurrency without increasing its 2 GiB Job
-limit. A failed compilation retains its log and does not alter the active
+Run heavy builds and checks through the [shared account queue](#heavy-command-budget).
+`--jobs 1` also bounds compiler concurrency within the admitted command.
+A failed compilation retains its log and does not alter the active
 installation. Windows can keep a running test executable locked after Cargo
 releases its build lock; use `--target-dir <owned-verification-directory>`
 when a retained test binary could occupy the default target. That is a Cargo
 output choice, not an ambient `CARGO_TARGET_DIR` override for native build
 identity. Custom compiler wrappers and ambient Rust build overrides are
 rejected before creating build state.
+
+## Heavy-command budget
+
+`codex-harness heavy -- PROGRAM ARGS` runs one batch command and its descendants
+under the account's shared queue and Windows Job budget. Concurrent callers
+from different projects or `CODEX_HOME` directories wait automatically; source
+reads, edits and model conversations remain independent. Native managed builds
+use the same admission path. Route heavyweight commands from free-text executor
+assignments through this entry point too; structured briefs include it already.
+
+```powershell
+codex-harness heavy budget --json
+codex-harness heavy -- cargo test --locked --jobs 1 -- --test-threads=1
+```
+
+Defaults are 8 GiB aggregate Job memory, 50% CPU, a 30-minute execution deadline
+and a one-hour queue wait. `heavy budget` prints the effective values and local
+policy path. Explicit `--memory-bytes`, `--cpu-percent`, `--deadline-seconds` and
+`--queue-wait-seconds` update that machine policy; `--preview` shows the proposed
+change. The policy stays under the account's local application data, outside
+the kit and consuming repositories. `--account DIRECTORY` selects an isolated
+account for owned tests; normal callers retain the default shared account.
+
+Queue messages identify the current holder. Child output is streamed and the
+child's exit code is preserved. Deadline or queue expiry returns 124, memory
+exhaustion 125, incomplete cleanup 126, start failure 127 and interruption 130.
+Normal completion and termination release admission. Nested heavy commands
+verify their actual membership in the holder's Job and share its budget without
+applying a second CPU cap. Arbitrary commands launched outside this entry point
+are not covered by its budget.
 
 ## Structured executor assignments
 
@@ -689,7 +719,7 @@ maintenance command.
 
 Every compilation uses a fresh owned temporary target with a short path for
 MSVC; unchanged candidates reuse verified immutable binaries. Explicit release
-compilation has a 30-minute deadline, a 2 GiB Job and a 50% CPU cap. This is
+compilation uses the [shared heavy-command budget](#heavy-command-budget). This is
 separate from CodeGraph's 600-second indexing deadline and 25% CPU cap.
 Abandoned management scratch (the `hcb-`/`hcc-`/`hca-` temp prefixes) is
 reclaimed at the next explicit build once older than 48 hours; only ordinary
