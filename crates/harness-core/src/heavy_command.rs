@@ -11,9 +11,14 @@
 //!
 //! Every native caller that both queues heavy work and mutates build state uses
 //! one order: account admission first, then the state lock. A nested native caller
-//! inside an admitted tree detects the live inherited lease instead of re-acquiring
-//! it, which is what keeps that order deadlock-free; a heavy command must not nest
-//! a different account directory.
+//! inside an admitted tree is accepted only after the kernel confirms that its
+//! process belongs to the admitted named Job the inherited marker names; a live
+//! peer identity or a copied name is not containment. Nested callers then add only
+//! kill-on-close containment, because a nested Windows Job's CPU rate is a
+//! proportion of its parent's rate: the caller that owns the lease applies the
+//! aggregate budget exactly once for the whole tree. That keeps the order
+//! deadlock-free and the allowance single; a heavy command must not nest a
+//! different account directory.
 #![cfg(windows)]
 
 use crate::{
@@ -36,6 +41,7 @@ use windows_sys::Win32::{
     Foundation::{FILETIME, HANDLE, WAIT_TIMEOUT},
     System::{
         Console::SetConsoleCtrlHandler,
+        JobObjects::{IsProcessInJob, OpenJobObjectW},
         Threading::{
             GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -46,8 +52,9 @@ use windows_sys::Win32::{
 /// Local account-queue override for owned fixtures and relocated state.
 pub const ACCOUNT_ENV: &str = "CODEX_HARNESS_HEAVY_ACCOUNT";
 /// Inherited by an admitted command tree so nested native callers share the live
-/// lease instead of deadlocking on it. It carries the holder identity and is only
-/// honored while that exact process still runs.
+/// lease instead of deadlocking on it. It names the admitted Job and its holder;
+/// it is honored only while that holder still runs and the kernel confirms this
+/// process is a member of that Job.
 pub const LEASE_ENV: &str = "CODEX_HARNESS_HEAVY_LEASE_V1";
 
 const SCHEMA: u32 = 1;
@@ -57,6 +64,12 @@ const POLICY_FILE: &str = "budget.json";
 const HOLDER_FILE: &str = "holder.json";
 const MAX_RECORD: u64 = 64 * 1024;
 const MAX_LABEL: usize = 400;
+/// Documented JOB_OBJECT_QUERY right (winnt.h). windows-sys does not export the
+/// job access rights; a query handle can neither terminate nor assign, so a
+/// verified member never receives cleanup authority over the admitted tree.
+const JOB_OBJECT_QUERY: u32 = 0x0004;
+/// Session-local Job object name prefix for one admitted tree.
+const JOB_NAME_PREFIX: &str = "CodingAgentsHarness.HeavyCommand.";
 const MIB: usize = 1024 * 1024;
 const DEFAULT_MEMORY_BYTES: usize = 8 * 1024 * MIB;
 const DEFAULT_CPU_PERCENT: f64 = 50.0;
@@ -332,6 +345,8 @@ fn read_bounded(path: &Path) -> io::Result<Option<Vec<u8>>> {
 struct LeaseMarker {
     schema: u32,
     account: PathBuf,
+    /// Query-only handle target: membership in this Job is the admission proof.
+    job: String,
     holder: ProcessIdentity,
 }
 
@@ -343,6 +358,7 @@ struct HolderRecord {
     creation_time: u64,
     started_unix_ms: u128,
     command: String,
+    job: String,
 }
 
 /// A held account slot. Drop clears the diagnostic holder record while the slot
@@ -351,6 +367,7 @@ pub struct Holder {
     _lease: Lease,
     account: PathBuf,
     identity: ProcessIdentity,
+    job: String,
 }
 
 impl Holder {
@@ -361,6 +378,9 @@ impl Holder {
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
         let identity = current_identity()?;
+        // The same OS-random key source the broker endpoint uses; the name is
+        // unguessable so it cannot be squatted by an unrelated caller.
+        let job = format!("{JOB_NAME_PREFIX}{}", crate::broker_endpoint::random_key()?);
         let lease = Lease::acquire_reporting(
             account,
             Resource::HeavyCommand,
@@ -377,8 +397,9 @@ impl Holder {
             _lease: lease,
             account: account.to_owned(),
             identity,
+            job,
         };
-        if let Err(error) = write_holder(account, identity, label) {
+        if let Err(error) = write_holder(account, identity, label, &holder.job) {
             eprintln!("heavy: holder record not written: {error}");
         }
         Ok(holder)
@@ -395,13 +416,17 @@ impl Drop for Holder {
 pub enum Admission {
     /// This process holds the account slot and releases it when dropped.
     Held(Holder),
-    /// A live ancestor already holds the account slot for this command tree.
-    Inherited(ProcessIdentity),
+    /// The kernel confirmed this process belongs to the admitted Job named in
+    /// the inherited marker, so that tree already applies the aggregate budget.
+    Inherited {
+        job: String,
+        holder: ProcessIdentity,
+    },
 }
 
 impl Admission {
     /// Queue for the account slot, or join the live lease this process tree
-    /// already inherited from an admitted ancestor.
+    /// already inherited from an admitted Job.
     pub fn acquire(
         account: &Path,
         budget: &Budget,
@@ -409,12 +434,15 @@ impl Admission {
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
         prepare(account)?;
-        if let Some(holder) = inherited_holder(std::env::var_os(LEASE_ENV).as_deref(), account) {
+        if let Some(marker) = inherited(std::env::var_os(LEASE_ENV).as_deref(), account) {
             eprintln!(
-                "heavy: sharing the account heavy-command slot already held by pid={} for this command tree",
-                holder.pid
+                "heavy: inheriting the aggregate heavy-command budget through admitted Job \"{}\" (holder pid={}); this process is a verified member",
+                marker.job, marker.holder.pid
             );
-            return Ok(Self::Inherited(holder));
+            return Ok(Self::Inherited {
+                job: marker.job,
+                holder: marker.holder,
+            });
         }
         Ok(Self::Held(Holder::acquire(
             account,
@@ -427,7 +455,33 @@ impl Admission {
     pub fn holder(&self) -> ProcessIdentity {
         match self {
             Self::Held(holder) => holder.identity,
-            Self::Inherited(identity) => *identity,
+            Self::Inherited { holder, .. } => *holder,
+        }
+    }
+
+    /// The admitted Job every marker of this tree names.
+    pub fn job_name(&self) -> &str {
+        match self {
+            Self::Held(holder) => holder.job.as_str(),
+            Self::Inherited { job, .. } => job.as_str(),
+        }
+    }
+
+    /// Limits for one owned Job. The caller that holds the lease applies the
+    /// aggregate machine budget once for the whole tree; a verified nested
+    /// caller adds containment only, because Windows applies a nested Job's CPU
+    /// rate as a proportion of its parent's rate
+    /// (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION Remarks).
+    pub fn limits(&self, budget: &Budget) -> Limits {
+        match self {
+            Self::Held(_) => Limits {
+                memory_bytes: Some(budget.memory_bytes),
+                cpu_percent: Some(budget.cpu_percent),
+            },
+            Self::Inherited { .. } => Limits {
+                memory_bytes: None,
+                cpu_percent: None,
+            },
         }
     }
 
@@ -437,18 +491,49 @@ impl Admission {
         let marker = LeaseMarker {
             schema: SCHEMA,
             account: account.to_owned(),
+            job: self.job_name().to_owned(),
             holder: self.holder(),
         };
         Ok(serde_json::to_string(&marker)?.into())
     }
 }
 
-fn inherited_holder(value: Option<&OsStr>, account: &Path) -> Option<ProcessIdentity> {
+/// Verified containment, not identity: the marker is honored only while its
+/// recorded holder still runs and the kernel confirms that this process belongs
+/// to the Job the marker names. A live peer PID, a stale marker or a copied Job
+/// name therefore cannot claim the aggregate allowance.
+fn inherited(value: Option<&OsStr>, account: &Path) -> Option<LeaseMarker> {
     let marker: LeaseMarker = serde_json::from_str(&value?.to_string_lossy()).ok()?;
     if marker.schema != SCHEMA || !same_directory(&marker.account, account) {
         return None;
     }
-    live_process(marker.holder).then_some(marker.holder)
+    if !live_process(marker.holder) || !in_job(&marker.job) {
+        return None;
+    }
+    Some(marker)
+}
+
+/// Open the admitted Job with a query-only handle and ask the kernel whether
+/// this process is a member. The handle is transient on purpose: holding it
+/// would keep the kill-on-close object alive after its owner exits.
+fn in_job(name: &str) -> bool {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    };
+    let object: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, object.as_ptr()) };
+    if raw.is_null() {
+        return false;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut member = 0;
+    let queried =
+        unsafe { IsProcessInJob(GetCurrentProcess(), handle.as_raw_handle(), &mut member) };
+    queried != 0 && member != 0
 }
 
 fn same_directory(left: &Path, right: &Path) -> bool {
@@ -458,13 +543,19 @@ fn same_directory(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn write_holder(account: &Path, identity: ProcessIdentity, label: &str) -> io::Result<()> {
+fn write_holder(
+    account: &Path,
+    identity: ProcessIdentity,
+    label: &str,
+    job: &str,
+) -> io::Result<()> {
     let record = HolderRecord {
         schema: SCHEMA,
         pid: identity.pid,
         creation_time: identity.creation_time,
         started_unix_ms: unix_millis(),
         command: label.to_owned(),
+        job: job.to_owned(),
     };
     let staging = account.join("holder.json.tmp");
     ordinary_ancestors(&staging)?;
@@ -569,11 +660,27 @@ pub fn execute(
         OsString::from(LEASE_ENV),
         Some(admission.marker(account).map_err(RunError::Start)?),
     );
-    let job = Job::new(Limits {
-        memory_bytes: Some(budget.memory_bytes),
-        cpu_percent: Some(budget.cpu_percent),
-    })
+    // One aggregate budget: only the caller that holds the lease names a Job and
+    // applies memory/CPU to it; a verified nested caller adds an anonymous
+    // containment Job with no second cap.
+    let limits = admission.limits(budget);
+    let scope = match admission {
+        Admission::Held(_) => "aggregate",
+        Admission::Inherited { .. } => "containment",
+    };
+    let job = match admission {
+        Admission::Held(holder) => Job::new_named(limits, &holder.job),
+        Admission::Inherited { .. } => Job::new(limits),
+    }
     .map_err(RunError::Start)?;
+    let snapshot = job.snapshot().map_err(RunError::Start)?;
+    eprintln!(
+        "heavy: job scope={scope} name={} memory_limit_bytes={} cpu_rate={} kill_on_close={}",
+        admission.job_name(),
+        snapshot.memory_limit_bytes,
+        snapshot.cpu_rate,
+        snapshot.kill_on_close
+    );
     let child = job.spawn(&command).map_err(RunError::Start)?;
     eprintln!(
         "heavy: started pid={} memory_limit_bytes={} cpu_percent={} deadline_seconds={}",
@@ -759,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_marker_is_only_honored_for_the_same_account_and_a_live_holder() {
+    fn lease_marker_needs_the_same_account_a_live_holder_and_job_membership() {
         let temp = tempfile::tempdir().unwrap();
         let account = temp.path().join("account");
         prepare(&account).unwrap();
@@ -767,16 +874,16 @@ mod tests {
         let marker = LeaseMarker {
             schema: SCHEMA,
             account: account.clone(),
+            job: format!("{JOB_NAME_PREFIX}not-an-admitted-job"),
             holder: live,
         };
         let value = serde_json::to_string(&marker).unwrap();
-        assert_eq!(
-            inherited_holder(Some(OsStr::new(&value)), &account),
-            Some(live)
-        );
+        // A live holder identity and an existing account are not containment:
+        // this process is in no such Job, so the marker is refused.
+        assert!(inherited(Some(OsStr::new(&value)), &account).is_none());
         let elsewhere = temp.path().join("elsewhere");
         prepare(&elsewhere).unwrap();
-        assert_eq!(inherited_holder(Some(OsStr::new(&value)), &elsewhere), None);
+        assert!(inherited(Some(OsStr::new(&value)), &elsewhere).is_none());
         let dead = LeaseMarker {
             holder: ProcessIdentity {
                 pid: live.pid,
@@ -785,12 +892,36 @@ mod tests {
             ..marker
         };
         let value = serde_json::to_string(&dead).unwrap();
-        assert_eq!(inherited_holder(Some(OsStr::new(&value)), &account), None);
-        assert_eq!(inherited_holder(None, &account), None);
-        assert_eq!(
-            inherited_holder(Some(OsStr::new("not json")), &account),
-            None
-        );
+        assert!(inherited(Some(OsStr::new(&value)), &account).is_none());
+        assert!(inherited(None, &account).is_none());
+        assert!(inherited(Some(OsStr::new("not json")), &account).is_none());
+    }
+
+    #[test]
+    fn only_the_lease_holder_applies_the_aggregate_budget_to_its_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let account = temp.path().join("account");
+        prepare(&account).unwrap();
+        let budget = Budget {
+            memory_bytes: 1024 * MIB,
+            cpu_percent: 25.0,
+            ..Budget::default()
+        };
+        let cancellation = Cancellation::default();
+        let held = Admission::acquire(&account, &budget, "fixture", &cancellation).unwrap();
+        let limits = held.limits(&budget);
+        assert_eq!(limits.memory_bytes, Some(budget.memory_bytes));
+        assert_eq!(limits.cpu_percent, Some(budget.cpu_percent));
+        let nested = Admission::Inherited {
+            job: "fixture".into(),
+            holder: current_identity().unwrap(),
+        };
+        let limits = nested.limits(&budget);
+        // A nested Windows Job's CPU rate is a proportion of its parent's, so a
+        // nested caller must not apply a second memory or CPU cap.
+        assert_eq!(limits.memory_bytes, None);
+        assert_eq!(limits.cpu_percent, None);
+        assert_eq!(nested.job_name(), "fixture");
     }
 
     #[test]

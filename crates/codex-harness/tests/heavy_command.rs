@@ -4,7 +4,7 @@
 //! budget are exercised through the same owner while unrelated consumer state
 //! stays untouched.
 #![cfg(windows)]
-use harness_core::heavy_command::Budget;
+use harness_core::heavy_command::{Budget, LEASE_ENV};
 use serde_json::Value;
 use std::{
     fs,
@@ -491,6 +491,106 @@ fn invalid_local_policy_fails_before_the_command_starts() {
     let text = stderr(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("deadline_seconds=60"), "{text}");
+}
+
+#[test]
+fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+
+    // A real nested CLI call: the outer caller owns the lease and applies the
+    // aggregate budget; the inner caller adds containment only, because a
+    // nested Windows Job's CPU rate is a proportion of its parent's rate.
+    let mut nested = Command::new(manager());
+    nested
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--")
+        .arg(manager())
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--")
+        .arg(fixture_target())
+        .current_dir(&work)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let nested = finish(nested.spawn().unwrap(), Duration::from_secs(120));
+    let text = stderr(&nested);
+    assert_eq!(nested.status.code(), Some(0), "{text}");
+    assert!(text.contains("scope=aggregate"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "memory_limit_bytes={}",
+            Budget::default().memory_bytes
+        )),
+        "{text}"
+    );
+    assert!(text.contains("cpu_rate=5000"), "{text}");
+    assert!(
+        text.contains("this process is a verified member"),
+        "the nested caller must prove membership in the admitted Job: {text}"
+    );
+    assert!(
+        text.contains("scope=containment")
+            && text.contains("memory_limit_bytes=0 cpu_rate=0 kill_on_close=true"),
+        "the nested caller must not apply a second memory or CPU cap: {text}"
+    );
+
+    // Knowing a live holder's identity and the real admitted Job name is still
+    // not containment: the marker must queue like any other caller.
+    let holder_started = root.join("holder.started");
+    let holder_ended = root.join("holder.ended");
+    let mut holder = heavy(&account, &work);
+    holder
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "2500")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &holder_started)
+        .env("HARNESS_HEAVY_FIXTURE_ENDED", &holder_ended);
+    let holder = holder.spawn().unwrap();
+    wait_for_path(&holder_started, Duration::from_secs(30));
+    let record: Value =
+        serde_json::from_slice(&fs::read(account.join("holder.json")).unwrap()).unwrap();
+    let forged = serde_json::json!({
+        "schema": 1,
+        "account": account.display().to_string(),
+        "job": record["job"],
+        "holder": {
+            "pid": record["pid"],
+            "creation_time": record["creation_time"],
+        },
+    })
+    .to_string();
+    let forged_started = root.join("forged.started");
+    let mut forger = heavy(&account, &work);
+    forger
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &forged_started)
+        .env(LEASE_ENV, &forged);
+    let forger = finish(forger.spawn().unwrap(), Duration::from_secs(120));
+    let holder = finish(holder, Duration::from_secs(120));
+    let forged_stderr = stderr(&forger);
+    assert_eq!(holder.status.code(), Some(0), "{}", stderr(&holder));
+    assert_eq!(forger.status.code(), Some(0), "{forged_stderr}");
+    assert!(
+        !forged_stderr.contains("verified member"),
+        "a live peer identity and a copied Job name are not containment: {forged_stderr}"
+    );
+    assert!(
+        forged_stderr.contains("waiting for the account heavy-command slot"),
+        "the forged marker must queue for the real slot: {forged_stderr}"
+    );
+    assert!(
+        read_number(&holder_ended) < read_number(&forged_started),
+        "the forged marker must run only after the real holder released the slot"
+    );
 }
 
 #[test]

@@ -153,7 +153,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             return Ok(EXIT_STARTUP);
         }
         Err(heavy_command::RunError::Cleanup(error)) => {
-            eprintln!("heavy: {error}; no descendant of the command survives");
+            eprintln!("heavy: {}", cleanup_message(&error));
             return Ok(EXIT_CLEANUP);
         }
     };
@@ -191,6 +191,14 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             Ok(EXIT_INTERRUPTED)
         }
     }
+}
+
+/// A cleanup deadline that expired is a failed verification, not proof that the
+/// command tree is gone: keep the original cause and name the armed containment.
+fn cleanup_message(error: &io::Error) -> String {
+    format!(
+        "cleanup failed: {error}; termination is unconfirmed (the owned Job was terminated and closed with kill-on-close containment armed)"
+    )
 }
 
 /// Inspect or update the local machine budget. No command runs here.
@@ -323,4 +331,31 @@ fn report(
         );
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_cleanup_verification_is_not_reported_as_proof_of_no_survivors() {
+        let message = cleanup_message(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "owned job cleanup deadline expired",
+        ));
+        assert!(message.contains("cleanup failed"), "{message}");
+        assert!(
+            message.contains("owned job cleanup deadline expired"),
+            "the original cause must be retained: {message}"
+        );
+        assert!(message.contains("termination is unconfirmed"), "{message}");
+        assert!(
+            message.contains("kill-on-close containment armed"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("no descendant"),
+            "an expired cleanup deadline is failed verification, not proof: {message}"
+        );
+    }
 }

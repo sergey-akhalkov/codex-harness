@@ -242,6 +242,10 @@ impl Job {
             "Windows 10+ Job Objects are required",
         ))
     }
+
+    pub fn new_named(_: Limits, _: &str) -> io::Result<Self> {
+        Self::new(Limits::default())
+    }
 }
 
 #[cfg(windows)]
@@ -528,8 +532,10 @@ mod windows {
         }
     }
 
-    /// A new anonymous job is the sole cleanup authority. There is deliberately
-    /// no API to adopt a named/containing job or assign an arbitrary process.
+    /// A new job is the sole cleanup authority. There is deliberately no API to
+    /// adopt a named/containing job or assign an arbitrary process: a named job
+    /// is created or refused by this owner, never opened here, and only its
+    /// members may open it for a query-only containment check.
     #[derive(Debug)]
     pub struct Job {
         handle: OwnedHandle,
@@ -538,6 +544,26 @@ mod windows {
 
     impl Job {
         pub fn new(limits: Limits) -> io::Result<Self> {
+            Self::create(limits, None)
+        }
+
+        /// Same containment and cleanup authority with a session-local object
+        /// name, so a nested member can verify its membership with a query-only
+        /// handle. A pre-existing name is refused instead of adopted.
+        pub fn new_named(limits: Limits, name: &str) -> io::Result<Self> {
+            if name.is_empty()
+                || name.len() > 128
+                || !name.is_ascii()
+                || name.contains(['\\', '\0'])
+            {
+                return Err(invalid(
+                    "job object name must be a bounded ASCII session-local name",
+                ));
+            }
+            Self::create(limits, Some(wide(OsStr::new(name))?.as_slice()))
+        }
+
+        fn create(limits: Limits, name: Option<&[u16]>) -> io::Result<Self> {
             if limits.memory_bytes == Some(0) {
                 return Err(invalid("memory limit must be positive"));
             }
@@ -548,7 +574,19 @@ mod windows {
                 }
                 Some(_) => return Err(invalid("CPU percent must be finite and within 0.01..=100")),
             };
-            let handle = owned(unsafe { CreateJobObjectW(null(), null()) })?;
+            // CreateJobObject opens an existing object of the same name; that
+            // would hand this owner a foreign job, so a taken name must fail.
+            unsafe { SetLastError(0) };
+            let handle = match owned(unsafe {
+                CreateJobObjectW(null(), name.map_or(null(), |name| name.as_ptr()))
+            }) {
+                Ok(_) if name.is_some() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS => {
+                    return Err(io::Error::other(
+                        "job object name is already in use; preserving the existing job",
+                    ));
+                }
+                other => other?,
+            };
             let completion =
                 owned(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 1) })?;
             let job = Self { handle, completion };

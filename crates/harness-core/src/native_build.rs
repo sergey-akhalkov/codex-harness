@@ -663,18 +663,21 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     }
     // One global order for every native caller that both queues heavy work and
     // mutates build state: account admission first, then the state lock. A
-    // nested native caller inside an admitted tree shares the live lease, so
-    // this order cannot deadlock with the shared queue. Compilation consumes the
-    // same machine-local budget as every other heavy command.
+    // nested native caller inside an admitted tree is a verified member of the
+    // admitted Job, so this order cannot deadlock with the shared queue.
+    // Compilation consumes the same machine-local budget as every other heavy
+    // command, and applies it only when this process owns the lease: a nested
+    // Windows Job's CPU rate is a proportion of its parent's rate, so an
+    // inherited build adds containment without a second cap.
     let account = heavy_command::account_dir(None)?;
     let budget = heavy_command::Budget::read(&account)?;
-    let _admission = heavy_command::Admission::acquire(
+    let admission = heavy_command::Admission::acquire(
         &account,
         &budget,
         &format!("native build {}", source.display()),
         &Cancellation::default(),
     )?;
-    let (memory_bytes, cpu_percent) = (budget.memory_bytes, budget.cpu_percent);
+    let limits = admission.limits(&budget);
     let deadline = budget.deadline()?;
     owner_root(&state)?;
     let lock = lock_owned_state(&state)?;
@@ -735,13 +738,11 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     command.current_dir = Some(source.clone());
     command.stdout = Some(log.try_clone()?);
     command.stderr = Some(log);
-    // Release LTO of every manager binary exceeds a 4 GiB Job; the compiler
-    // uses the same machine-local heavy-command budget as every other heavy
-    // command, whose defaults keep the installed 8 GiB / 50% / 30 minutes.
-    let job = Job::new(Limits {
-        memory_bytes: Some(memory_bytes),
-        cpu_percent: Some(cpu_percent),
-    })?;
+    // Release LTO of every manager binary exceeds a 4 GiB Job; the compiler Job
+    // carries the aggregate heavy-command limits when this process owns the
+    // lease (installed defaults: 8 GiB / 50% / 30 minutes) and containment only
+    // when an admitted parent already applies them.
+    let job = Job::new(limits)?;
     let child = job
         .spawn(&command)
         .map_err(|e| io::Error::other(format!("Starting bounded Cargo failed: {e}")))?;
