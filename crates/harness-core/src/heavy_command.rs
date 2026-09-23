@@ -467,6 +467,15 @@ impl Admission {
         }
     }
 
+    /// `aggregate` when this process owns the lease, `containment` when an
+    /// admitted Job already applies the budget for this tree.
+    pub fn scope(&self) -> &'static str {
+        match self {
+            Self::Held(_) => "aggregate",
+            Self::Inherited { .. } => "containment",
+        }
+    }
+
     /// Limits for one owned Job. The caller that holds the lease applies the
     /// aggregate machine budget once for the whole tree; a verified nested
     /// caller adds containment only, because Windows applies a nested Job's CPU
@@ -483,6 +492,33 @@ impl Admission {
                 cpu_percent: None,
             },
         }
+    }
+
+    /// The one owned Job every consumer of this owner runs its children in,
+    /// together with the marker those children inherit. The lease holder names
+    /// the Job and applies the aggregate limits; a verified nested caller adds
+    /// an anonymous kill-on-close Job with no second cap.
+    pub fn owned_job(&self, budget: &Budget, account: &Path) -> io::Result<(Job, OsString)> {
+        let limits = self.limits(budget);
+        let job = match self {
+            Self::Held(holder) => Job::new_named(limits, &holder.job)?,
+            Self::Inherited { .. } => Job::new(limits)?,
+        };
+        Ok((job, self.marker(account)?))
+    }
+
+    /// One diagnostics line describing the Job that actually enforces this
+    /// budget for the current tree.
+    pub fn job_line(&self, job: &Job) -> io::Result<String> {
+        let snapshot = job.snapshot()?;
+        Ok(format!(
+            "heavy: job scope={} name={} memory_limit_bytes={} cpu_rate={} kill_on_close={}",
+            self.scope(),
+            self.job_name(),
+            snapshot.memory_limit_bytes,
+            snapshot.cpu_rate,
+            snapshot.kill_on_close
+        ))
     }
 
     /// The marker every admitted process passes to its children so nested native
@@ -656,31 +692,11 @@ pub fn execute(
     command
         .inherit_standard_streams()
         .map_err(RunError::Start)?;
-    command.env.insert(
-        OsString::from(LEASE_ENV),
-        Some(admission.marker(account).map_err(RunError::Start)?),
-    );
-    // One aggregate budget: only the caller that holds the lease names a Job and
-    // applies memory/CPU to it; a verified nested caller adds an anonymous
-    // containment Job with no second cap.
-    let limits = admission.limits(budget);
-    let scope = match admission {
-        Admission::Held(_) => "aggregate",
-        Admission::Inherited { .. } => "containment",
-    };
-    let job = match admission {
-        Admission::Held(holder) => Job::new_named(limits, &holder.job),
-        Admission::Inherited { .. } => Job::new(limits),
-    }
-    .map_err(RunError::Start)?;
-    let snapshot = job.snapshot().map_err(RunError::Start)?;
-    eprintln!(
-        "heavy: job scope={scope} name={} memory_limit_bytes={} cpu_rate={} kill_on_close={}",
-        admission.job_name(),
-        snapshot.memory_limit_bytes,
-        snapshot.cpu_rate,
-        snapshot.kill_on_close
-    );
+    let (job, marker) = admission
+        .owned_job(budget, account)
+        .map_err(RunError::Start)?;
+    command.env.insert(OsString::from(LEASE_ENV), Some(marker));
+    eprintln!("{}", admission.job_line(&job).map_err(RunError::Start)?);
     let child = job.spawn(&command).map_err(RunError::Start)?;
     eprintln!(
         "heavy: started pid={} memory_limit_bytes={} cpu_percent={} deadline_seconds={}",
@@ -909,19 +925,67 @@ mod tests {
         };
         let cancellation = Cancellation::default();
         let held = Admission::acquire(&account, &budget, "fixture", &cancellation).unwrap();
-        let limits = held.limits(&budget);
-        assert_eq!(limits.memory_bytes, Some(budget.memory_bytes));
-        assert_eq!(limits.cpu_percent, Some(budget.cpu_percent));
+        let (job, marker) = held.owned_job(&budget, &account).unwrap();
+        // The marker names the Job this owner actually created, so a child of
+        // the tree proves membership in it instead of queueing on it.
+        assert_eq!(held.scope(), "aggregate");
+        assert!(named_job_exists(held.job_name()));
+        let marker: LeaseMarker = serde_json::from_str(&marker.to_string_lossy()).unwrap();
+        assert_eq!(marker.job, held.job_name());
+        let snapshot = job.snapshot().unwrap();
+        assert_eq!(snapshot.memory_limit_bytes, budget.memory_bytes);
+        assert_eq!(snapshot.cpu_rate, 2500);
+        assert!(snapshot.kill_on_close);
+        // A nested Windows Job's CPU rate is a proportion of its parent's, so a
+        // verified nested caller must not apply a second memory or CPU cap.
         let nested = Admission::Inherited {
-            job: "fixture".into(),
+            job: held.job_name().to_owned(),
             holder: current_identity().unwrap(),
         };
-        let limits = nested.limits(&budget);
-        // A nested Windows Job's CPU rate is a proportion of its parent's, so a
-        // nested caller must not apply a second memory or CPU cap.
-        assert_eq!(limits.memory_bytes, None);
-        assert_eq!(limits.cpu_percent, None);
-        assert_eq!(nested.job_name(), "fixture");
+        let (containment, _) = nested.owned_job(&budget, &account).unwrap();
+        let snapshot = containment.snapshot().unwrap();
+        assert_eq!(nested.scope(), "containment");
+        assert_eq!(nested.job_name(), held.job_name());
+        assert_eq!(snapshot.memory_limit_bytes, 0);
+        assert_eq!(snapshot.cpu_rate, 0);
+        assert!(snapshot.kill_on_close);
+    }
+
+    #[test]
+    fn named_job_names_are_created_once_or_refused() {
+        let name = format!("{JOB_NAME_PREFIX}fixture-{}", std::process::id());
+        let job = Job::new_named(Limits::default(), &name).unwrap();
+        let refused = Job::new_named(Limits::default(), &name).unwrap_err();
+        assert!(refused.to_string().contains("already in use"), "{refused}");
+        let long = "x".repeat(129);
+        for invalid in ["", "local\\name", long.as_str()] {
+            assert!(
+                Job::new_named(Limits::default(), invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        drop(job);
+        // The name is released with the last handle, so the owner can recreate it.
+        let reused = Job::new_named(Limits::default(), &name).unwrap();
+        drop(reused);
+    }
+
+    /// Query-only existence probe for the named object a marker points at.
+    fn named_job_exists(name: &str) -> bool {
+        use std::os::windows::{
+            ffi::OsStrExt,
+            io::{FromRawHandle, OwnedHandle},
+        };
+        let object: Vec<u16> = OsStr::new(name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let raw = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, object.as_ptr()) };
+        if raw.is_null() {
+            return false;
+        }
+        drop(unsafe { OwnedHandle::from_raw_handle(raw) });
+        true
     }
 
     #[test]

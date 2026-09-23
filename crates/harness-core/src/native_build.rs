@@ -677,7 +677,6 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         &format!("native build {}", source.display()),
         &Cancellation::default(),
     )?;
-    let limits = admission.limits(&budget);
     let deadline = budget.deadline()?;
     owner_root(&state)?;
     let lock = lock_owned_state(&state)?;
@@ -738,11 +737,17 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     command.current_dir = Some(source.clone());
     command.stdout = Some(log.try_clone()?);
     command.stderr = Some(log);
-    // Release LTO of every manager binary exceeds a 4 GiB Job; the compiler Job
-    // carries the aggregate heavy-command limits when this process owns the
-    // lease (installed defaults: 8 GiB / 50% / 30 minutes) and containment only
-    // when an admitted parent already applies them.
-    let job = Job::new(limits)?;
+    // Release LTO of every manager binary exceeds a 4 GiB Job. The compiler Job
+    // is the one this admission owns - named and carrying the aggregate limits
+    // when this process holds the lease (installed defaults: 8 GiB / 50% / 30
+    // minutes), anonymous containment only when an admitted parent already
+    // applies them - and the compilation tree inherits the same marker, so a
+    // nested native consumer reuses this admission instead of queueing on it.
+    let (job, marker) = admission.owned_job(&budget, &account)?;
+    command
+        .env
+        .insert(heavy_command::LEASE_ENV.into(), Some(marker));
+    eprintln!("{}", admission.job_line(&job)?);
     let child = job
         .spawn(&command)
         .map_err(|e| io::Error::other(format!("Starting bounded Cargo failed: {e}")))?;

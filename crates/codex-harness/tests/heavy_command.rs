@@ -606,6 +606,11 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
     let work = root.join("work");
     fs::create_dir_all(&work).unwrap();
     fixture(&source);
+    // A bounded nested probe inside the build: if the build's admission were not
+    // reusable, this nested caller would report a queue wait instead.
+    let policy = budget_cli(&account, &["--queue-wait-seconds", "20"]);
+    assert_eq!(policy.status.code(), Some(0), "{}", stderr(&policy));
+    let evidence = root.join("nested-heavy.txt");
     let holder_started = root.join("holder.started");
     let mut holder = heavy(&account, &work);
     holder
@@ -622,6 +627,8 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
         .arg("--state")
         .arg(&state)
         .env("CODEX_HARNESS_HEAVY_ACCOUNT", &account)
+        .env("HARNESS_HEAVY_TEST_NESTED", manager())
+        .env("HARNESS_HEAVY_TEST_EVIDENCE", &evidence)
         .output()
         .unwrap();
     let build_stderr = stderr(&build);
@@ -638,6 +645,21 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
     assert!(
         build_stderr.contains("holder pid="),
         "the build must observe the running heavy caller: {build_stderr}"
+    );
+    assert!(
+        build_stderr.contains("job scope=aggregate"),
+        "a direct build must own the named aggregate Job: {build_stderr}"
+    );
+    let nested = fs::read_to_string(&evidence).unwrap_or_default();
+    assert!(nested.contains("marker=true"), "{nested}");
+    assert!(nested.contains("exit=Some(0)"), "{nested}");
+    assert!(
+        nested.contains("verified member"),
+        "the build's child must reuse the build's admission: {nested}"
+    );
+    assert!(
+        !nested.contains("waiting for the account heavy-command slot"),
+        "the build's child must not queue on its own admission: {nested}"
     );
     let prepared: Value = serde_json::from_slice(&build.stdout).unwrap();
     let published = Path::new(prepared["build"].as_str().unwrap());
@@ -809,6 +831,35 @@ fn fixture(source: &Path) {
             .unwrap();
         }
     }
+    // The manager's build script proves that the compilation tree inherits the
+    // admission marker and can reuse the build's own admission without queueing.
+    fs::write(
+        source.join("crates/manager/build.rs"),
+        r#"
+fn main() {
+    let marker = std::env::var("CODEX_HARNESS_HEAVY_LEASE_V1").is_ok();
+    let manager = std::env::var("HARNESS_HEAVY_TEST_NESTED").expect("nested manager path");
+    let nested = std::process::Command::new(manager)
+        .args(["heavy", "--", "cargo", "--version"])
+        .output()
+        .expect("nested heavy command");
+    let evidence = format!(
+        "marker={marker} exit={:?} stderr={}",
+        nested.status.code(),
+        String::from_utf8_lossy(&nested.stderr).replace('\n', " | ")
+    );
+    if let Ok(path) = std::env::var("HARNESS_HEAVY_TEST_EVIDENCE") {
+        std::fs::write(path, &evidence).expect("evidence file");
+    }
+    eprintln!("fixture-nested-heavy {evidence}");
+    assert!(
+        nested.status.success(),
+        "nested heavy through the build failed: {evidence}"
+    );
+}
+"#,
+    )
+    .unwrap();
     let lock = Command::new("cargo")
         .args(["generate-lockfile", "--offline"])
         .current_dir(source)
