@@ -40,7 +40,9 @@
 //! unsupported with the same remedy. Nothing here resets, cleans, releases or
 //! completes a run.
 
-use super::control::{self, BoundIdentity, ControlPaths, Conversation, Endpoint, Reply};
+use super::control::{
+    self, BoundIdentity, ControlPaths, Conversation, Endpoint, Reply, active_turn,
+};
 use super::observation::{
     self, HostIdentity, RunObservation, STATE_COMPLETED, STATE_DEFECT, STATE_FAILED,
     STATE_INTERRUPTED, STATE_PARTIAL_STOP, STATE_STOPPED,
@@ -822,17 +824,6 @@ fn answer_turn(result: &Value) -> String {
         .or_else(|| result["turn"]["id"].as_str())
         .unwrap_or_default()
         .to_owned()
-}
-
-/// The active turn of one thread record, when a turn is running.
-fn active_turn(thread: &Value) -> Option<String> {
-    thread["turns"]
-        .as_array()?
-        .iter()
-        .rev()
-        .find(|turn| turn["status"] == "inProgress")
-        .and_then(|turn| turn["id"].as_str())
-        .map(str::to_owned)
 }
 
 /// Watches the conversation's own items for the input this invocation

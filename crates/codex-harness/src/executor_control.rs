@@ -339,6 +339,19 @@ pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
     command
 }
 
+/// The turn currently in progress on one thread record, when a turn is
+/// running. Native requests that address an active turn (`turn/steer`,
+/// `turn/interrupt`) name it by id, not by thread alone.
+pub fn active_turn(thread: &Value) -> Option<String> {
+    thread["turns"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|turn| turn["status"] == "inProgress")
+        .and_then(|turn| turn["id"].as_str())
+        .map(str::to_owned)
+}
+
 fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("app-server"),

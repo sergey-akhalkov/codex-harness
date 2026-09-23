@@ -10,6 +10,7 @@
 //! the run, and it never sends a terminal command: the tab of the addressed run
 //! closes because that run's own host process ended.
 
+use super::control;
 use super::observation::{
     self, HostIdentity, RunObservation, STATE_COMPLETED, STATE_STOPPED, STOP_ALREADY_COMPLETED,
     STOP_ALREADY_STOPPED, STOP_ERROR, STOP_PARTIAL, STOP_SCHEMA, STOP_STOPPED, StopRecord,
@@ -759,11 +760,43 @@ fn interrupt(endpoint: &Endpoint, budget: Duration) -> (bool, String) {
             "the recorded control endpoint names no thread id, so no native interruption could be requested; the run was terminated directly".into(),
         );
     };
-    match control_call(
+    // `turn/interrupt` addresses the active turn by id; the thread's own
+    // record is the authoritative source for it, never a guess from recency.
+    let read = match control_call(
         &mut connection,
         2,
+        "thread/read",
+        json!({"threadId": thread_id, "includeTurns": true}),
+        budget,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                false,
+                format!(
+                    "the recorded control endpoint rejected thread/read while locating the active turn: {error}; the run was terminated directly"
+                ),
+            );
+        }
+    };
+    let thread = &read["thread"];
+    if thread["id"].as_str() != Some(thread_id.as_str()) {
+        return (
+            false,
+            "thread/read answered for another thread while locating the active turn; the run was terminated directly".into(),
+        );
+    }
+    let Some(turn) = control::active_turn(thread) else {
+        return (
+            false,
+            "no native turn was in progress, so there was nothing to interrupt; the run was terminated directly".into(),
+        );
+    };
+    match control_call(
+        &mut connection,
+        3,
         "turn/interrupt",
-        json!({"threadId": thread_id}),
+        json!({"threadId": thread_id, "turnId": turn}),
         budget,
     ) {
         Ok(_) => (
