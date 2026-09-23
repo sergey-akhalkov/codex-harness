@@ -605,7 +605,7 @@ token spend and the time to the accepted result, keeps judgment,
 decomposition, integration, acceptance and capability-exceeding work, and
 does work whose delegation overhead exceeds the work itself - typically a
 one-line correction - directly, with no task or board note. Change:
-[autonomous lead activation](../openspec/changes/autonomous-lead-activation/proposal.md).
+[autonomous lead activation](../openspec/changes/archive/2026-09-23-autonomous-lead-activation/proposal.md).
 
 ## Recording further decisions
 
