@@ -1,13 +1,17 @@
 #![cfg(windows)]
 use harness_core::{
     cancellable_pipe::{CancellablePipe, PipeIoError, anonymous_pipe},
-    process::{Cancellation, CommandSpec, Deadline, Job, Limits},
-    process_service::{ServiceProcess, creation_clock, current_user},
+    process::{
+        Cancellation, CommandSpec, Deadline, Job, Limits, SHARED_CPU_PERCENT, SharedCpuBudget,
+    },
+    process_service::{
+        ServiceProcess, SharedCpuCoverage, creation_clock, current_user, shared_cpu_coverage,
+    },
 };
 use serde_json::Value;
 use std::{
     fs::{self, File},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -40,7 +44,26 @@ fn wait_json(path: &Path) -> Value {
     }
 }
 
+/// Synthetic account allowance for one test. The client conveys it to the
+/// service, and the test verifies membership against the same directory, so no
+/// test touches the machine's real account budget.
+fn account(root: &Path) -> PathBuf {
+    root.join("cpu-account")
+}
+
 fn start(root: &Path, mode: &str) -> (Job, CancellablePipe, ServiceProcess, u64) {
+    start_with_account(root, mode, Some(&account(root)))
+}
+
+/// `account` is the CPU allowance the service joins through the client's
+/// environment. `None` withholds every account location, which is how a service
+/// outside a usable allowance (an older installation or missing storage) is
+/// reproduced.
+fn start_with_account(
+    root: &Path,
+    mode: &str,
+    account: Option<&Path>,
+) -> (Job, CancellablePipe, ServiceProcess, u64) {
     let (stdin, write) = anonymous_pipe(4096).unwrap();
     let (read, stdout) = anonymous_pipe(4096).unwrap();
     let mut command = CommandSpec::new(FIXTURE);
@@ -57,6 +80,18 @@ fn start(root: &Path, mode: &str) -> (Job, CancellablePipe, ServiceProcess, u64)
         "HARNESS_SERVICE_AMBIENT_ONLY".into(),
         Some("must-not-inherit".into()),
     );
+    match account {
+        Some(path) => {
+            command.env.insert(
+                "CODEX_HARNESS_CPU_ACCOUNT".into(),
+                Some(path.as_os_str().to_owned()),
+            );
+        }
+        None => {
+            command.env.insert("CODEX_HARNESS_CPU_ACCOUNT".into(), None);
+            command.env.insert("LOCALAPPDATA".into(), None);
+        }
+    }
     command.stdin = Some(stdin);
     command.stdout = Some(stdout);
     command.stderr = Some(File::create(root.join("starter.stderr")).unwrap());
@@ -144,7 +179,9 @@ fn service_survives_first_client_job_and_reclaims_its_child() {
     );
     assert_eq!(report["job"]["active_processes"], 2);
     assert_eq!(report["job"]["memory_limit_bytes"], 256 * 1024 * 1024);
-    assert_eq!(report["job"]["cpu_rate"], 2500);
+    // The requested 25% of host is expressed against the verified 75% account
+    // allowance (33.33% of the parent), so its host-relative meaning is kept.
+    assert_eq!(report["job"]["cpu_rate"], 3333);
     assert_eq!(report["job"]["kill_on_close"], true);
     assert_eq!(report["job"]["handle_inheritable"], false);
     let leaf = ServiceProcess::observe(
@@ -406,4 +443,143 @@ fn blocked_helper_is_bounded_and_cancelled_without_detaching_its_process() {
         );
         assert!(!root.path().join("endpoint.json").exists());
     }
+}
+
+#[test]
+fn admitted_service_and_backend_keep_the_account_allowance_after_their_client_exits() {
+    let root = tempfile::Builder::new()
+        .prefix("shared allowance Русский-日本-")
+        .tempdir()
+        .unwrap();
+    let _stop = StopService(root.path());
+    let budget = SharedCpuBudget::acquire(&account(root.path()), SHARED_CPU_PERCENT).unwrap();
+    let snapshot = budget.snapshot().unwrap();
+    assert_eq!(snapshot.cpu_rate, 7500);
+    assert!(snapshot.cpu_hard_cap && !snapshot.kill_on_close);
+    let (job, input, service, began) = start(root.path(), "serve");
+    let report = wait_json(&root.path().join("endpoint.json"));
+    assert_eq!(report["pid"], service.identity().pid);
+    // The WMI sibling start inherits no client job, so the service admits itself
+    // from its own bootstrap before it does any payload work.
+    assert!(
+        service.in_shared_cpu_budget(&budget).unwrap(),
+        "the WMI sibling start must join the account allowance"
+    );
+    // Its own lower ceiling is expressed against the verified parent rate, so
+    // 25% of host stays 25% of host inside the 75% allowance.
+    assert_eq!(report["job"]["cpu_rate"], 3333);
+    assert_eq!(report["job"]["memory_limit_bytes"], 256 * 1024 * 1024);
+    assert_eq!(report["job"]["kill_on_close"], true);
+    let leaf = ServiceProcess::observe(
+        report["child"].as_u64().unwrap() as u32,
+        Path::new(FIXTURE),
+        began,
+        &current_user().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        leaf.in_shared_cpu_budget(&budget).unwrap(),
+        "a service descendant inherits the allowance"
+    );
+    let starter = fs::read_to_string(root.path().join("starter.stderr")).unwrap();
+    assert!(
+        !starter.contains("shared CPU allowance"),
+        "an admitted service must not be reported degraded: {starter}"
+    );
+    // Real retained calls flow through the admitted service.
+    exchange(root.path(), "first client");
+    // One client exits: its Job is gone while the backend keeps working and
+    // keeps its place in the one account allowance.
+    assert_eq!(
+        job.terminate(130, Duration::from_secs(3))
+            .unwrap()
+            .active_processes,
+        0
+    );
+    drop(input);
+    assert!(service.is_running().unwrap() && leaf.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert!(leaf.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    exchange(root.path(), "second client 日本");
+    match shared_cpu_coverage(&service, Some(&account(root.path()))) {
+        SharedCpuCoverage::Covered { job: name, rate } => {
+            assert_eq!(rate, 7500);
+            assert!(name.starts_with("CodingAgentsHarness.SharedCpu."), "{name}");
+        }
+        other => panic!("admitted service reported as {other:?}"),
+    }
+    fs::write(root.path().join("stop"), []).unwrap();
+    assert!(service.wait_for_exit(deadline(8)).unwrap());
+    assert!(
+        leaf.wait_for_exit(deadline(5)).unwrap(),
+        "service cleanup still reclaims its own child"
+    );
+}
+
+#[test]
+fn service_without_account_storage_starts_degraded_with_a_visible_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let _stop = StopService(root.path());
+    let (job, input, service, _began) = start_with_account(root.path(), "serve", None);
+    let report = wait_json(&root.path().join("endpoint.json"));
+    // Fail-open: the requested payload is unchanged, and an unadmitted service
+    // keeps its own host-relative ceiling instead of claiming the 75% one.
+    assert_eq!(report["job"]["cpu_rate"], 2500);
+    // Real work still reaches the retained service.
+    exchange(root.path(), "degraded client");
+    // The service reports the failed allowance on its own established channel.
+    let log = fs::read_to_string(root.path().join("service.log")).unwrap();
+    assert!(
+        log.contains("outside the shared 75% CPU allowance"),
+        "{log}"
+    );
+    assert!(log.contains("LOCALAPPDATA"), "{log}");
+    // The starting client reports the same uncovered state, never a cap.
+    let starter = fs::read_to_string(root.path().join("starter.stderr")).unwrap();
+    assert!(
+        starter.contains("shared CPU allowance unverified"),
+        "{starter}"
+    );
+    assert!(starter.contains("LOCALAPPDATA is not set"), "{starter}");
+    assert!(
+        !starter.contains("inside the shared CPU allowance"),
+        "{starter}"
+    );
+    // Independent verification: the process is not a member of a usable account
+    // allowance established by the verifying client.
+    let verifying = account(root.path());
+    match shared_cpu_coverage(&service, Some(&verifying)) {
+        SharedCpuCoverage::Unadmitted { cause } => {
+            assert!(cause.contains("not a member"), "{cause}")
+        }
+        other => panic!("unadmitted service reported as {other:?}"),
+    }
+    // An account allowance established at another rate cannot verify membership:
+    // it is reported unverified with its cause, never as capped.
+    let conflicting = root.path().join("other-account");
+    let _other = SharedCpuBudget::acquire(&conflicting, 1.0).unwrap();
+    match shared_cpu_coverage(&service, Some(&conflicting)) {
+        SharedCpuCoverage::Unverified { cause } => {
+            assert!(
+                cause.contains("already established at 1 percent"),
+                "{cause}"
+            )
+        }
+        other => panic!("conflicting allowance reported as {other:?}"),
+    }
+    assert!(service.is_running().unwrap());
+    assert_eq!(
+        job.terminate(130, Duration::from_secs(3))
+            .unwrap()
+            .active_processes,
+        0
+    );
+    drop(input);
+    assert!(
+        service.is_running().unwrap(),
+        "fail-open keeps the service available"
+    );
+    fs::write(root.path().join("stop"), []).unwrap();
+    assert!(service.wait_for_exit(deadline(8)).unwrap());
 }

@@ -129,6 +129,11 @@ pub(super) fn create(command: &[u16], directory: &str, environment: &[String]) -
         }
         let startup = unsafe { object(&services, "Win32_ProcessStartup")?.SpawnInstance(0)? };
         put(&startup, w!("ShowWindow"), &VARIANT::from(0_i32))?;
+        // CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT:
+        // WMI creates this process under its own provider host, so the requested
+        // service is a sibling of the client that asked for it. Breakaway leaves
+        // the provider's job, which means no parent job reaches the service and
+        // its CPU allowance admission has to happen in its own bootstrap.
         put(&startup, w!("CreateFlags"), &VARIANT::from(0x09000400_i32))?;
         put(&startup, w!("EnvironmentVariables"), &strings(environment)?)?;
         let process = object(&services, "Win32_Process")?;

@@ -5,7 +5,7 @@ use crate::{
     broker_http,
     broker_state::BrokerRoot,
     process::{Cancellation, Deadline},
-    process_service,
+    process_service::{self, ServiceProcess, SharedCpuCoverage},
 };
 use std::{collections::BTreeMap, io, path::Path, time::Duration};
 
@@ -124,6 +124,20 @@ pub fn source_conflict(error: &io::Error) -> bool {
     text.contains("older source/runtime") || text.contains("broker readiness/source differs")
 }
 
+/// Kernel-verified CPU coverage of one served owner, with the visible degraded
+/// diagnostic for a service outside the account allowance. A pre-existing
+/// service is reported, never adopted or replaced: its owner keeps its
+/// lifecycle and the corrective action is a safe restart.
+fn coverage_of(endpoint: &Endpoint, owner: &ServiceProcess) -> SharedCpuCoverage {
+    let coverage = process_service::shared_cpu_coverage(owner, None);
+    process_service::warn_shared_cpu(
+        &format!("broker (pid {})", endpoint.pid),
+        owner.identity(),
+        &coverage,
+    );
+    coverage
+}
+
 /// The caller supplies a trusted bootstrap and the source identity of its full
 /// service configuration. A compatible live owner is joined, never replaced.
 /// New services must publish an exact endpoint and answer authenticated status.
@@ -136,6 +150,30 @@ pub fn ensure(
     deadline: Deadline,
     cancel: &Cancellation,
 ) -> io::Result<Endpoint> {
+    ensure_with_coverage(
+        root,
+        program,
+        arguments,
+        environment,
+        source,
+        deadline,
+        cancel,
+    )
+    .map(|(endpoint, _)| endpoint)
+}
+
+/// `ensure` plus the verified CPU coverage of the owner serving the endpoint.
+/// Both forms emit the visible degraded diagnostic, so a shared backend outside
+/// the allowance is never silently treated as capped.
+pub fn ensure_with_coverage(
+    root: &BrokerRoot,
+    program: &Path,
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+    source: &str,
+    deadline: Deadline,
+    cancel: &Cancellation,
+) -> io::Result<(Endpoint, SharedCpuCoverage)> {
     stop(deadline, cancel)?;
     if source.len() != 64 || !source.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::Error::new(
@@ -144,12 +182,9 @@ pub fn ensure(
         ));
     }
     let _startup = root.startup(deadline, cancel)?;
-    if let Observation::Ready {
-        endpoint,
-        owner: _owner,
-    } = broker_endpoint::observe(root)?
-    {
-        return healthy(endpoint, source, deadline, cancel);
+    if let Observation::Ready { endpoint, owner } = broker_endpoint::observe(root)? {
+        let coverage = coverage_of(&endpoint, &owner);
+        return Ok((healthy(endpoint, source, deadline, cancel)?, coverage));
     }
     // Reconcile an exact stale receipt while this client owns both admission
     // leases, before launching and polling. Otherwise its readiness reader
@@ -168,17 +203,14 @@ pub fn ensure(
     )?;
     loop {
         stop(deadline, cancel)?;
-        if let Observation::Ready {
-            endpoint,
-            owner: _owner,
-        } = broker_endpoint::observe(root)?
-        {
+        if let Observation::Ready { endpoint, owner } = broker_endpoint::observe(root)? {
             if endpoint.identity() != service.identity() {
                 return Err(io::Error::other(
                     "broker endpoint does not belong to the launched service; preserving owner",
                 ));
             }
-            return healthy(endpoint, source, deadline, cancel);
+            let coverage = coverage_of(&endpoint, &owner);
+            return Ok((healthy(endpoint, source, deadline, cancel)?, coverage));
         }
         if !service.is_running()? {
             return Err(io::Error::other(format!(

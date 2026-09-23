@@ -4,8 +4,11 @@ use harness_core::{
     broker_http, broker_launch, broker_rpc,
     broker_state::BrokerRoot,
     cancellable_pipe::{CancellablePipe, anonymous_pipe},
-    process::{Cancellation, CommandSpec, Deadline, Job, Limits, OwnedProcess, ProcessIdentity},
-    process_service::{ServiceProcess, current_user},
+    process::{
+        Cancellation, CommandSpec, Deadline, Job, Limits, OwnedProcess, ProcessIdentity,
+        SHARED_CPU_PERCENT, SharedCpuBudget,
+    },
+    process_service::{ServiceProcess, SharedCpuCoverage, current_user, shared_cpu_coverage},
 };
 use serde_json::{Value, json};
 use std::{
@@ -29,6 +32,12 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(FIXTURE)
 }
 
+/// Synthetic account allowance directory for one test root; see
+/// `Prepared::account` and `Client::start`.
+fn account(root: &Path) -> PathBuf {
+    root.join("cpu-account")
+}
+
 struct Prepared {
     prepared: Option<harness_core::broker_state::PreparedRoot>,
 }
@@ -46,6 +55,13 @@ impl Prepared {
 
     fn path(&self) -> &Path {
         self.root().path()
+    }
+
+    /// Synthetic account allowance for this test: the clients convey it to the
+    /// service, and the test verifies membership against the same directory, so
+    /// the machine's real account budget is never touched.
+    fn account(&self) -> PathBuf {
+        self.path().join("cpu-account")
     }
 }
 
@@ -75,13 +91,33 @@ struct Client {
 }
 
 impl Client {
-    fn start(root: &Path, args: Vec<std::ffi::OsString>, stderr_name: &str) -> Self {
+    /// `account` is the CPU allowance the client (and through it the service)
+    /// joins. `None` withholds every account location, which is how a service
+    /// outside a usable allowance is reproduced.
+    fn start_with_account(
+        root: &Path,
+        args: Vec<std::ffi::OsString>,
+        stderr_name: &str,
+        account: Option<&Path>,
+    ) -> Self {
         let (stdin, write) = anonymous_pipe(4096).unwrap();
         let (read, stdout) = anonymous_pipe(4096).unwrap();
         let stderr = root.join(stderr_name);
         let mut command = CommandSpec::new(FIXTURE);
         command.current_dir = Some(root.into());
         command.args = args;
+        match account {
+            Some(path) => {
+                command.env.insert(
+                    "CODEX_HARNESS_CPU_ACCOUNT".into(),
+                    Some(path.as_os_str().to_owned()),
+                );
+            }
+            None => {
+                command.env.insert("CODEX_HARNESS_CPU_ACCOUNT".into(), None);
+                command.env.insert("LOCALAPPDATA".into(), None);
+            }
+        }
         command.stdin = Some(stdin);
         command.stdout = Some(stdout);
         command.stderr = Some(File::create(&stderr).unwrap());
@@ -111,6 +147,29 @@ impl Client {
         deadline_ms: Option<&str>,
         stderr_name: &str,
     ) -> Self {
+        Self::connect_in_account(
+            root,
+            source,
+            idle_ms,
+            operation,
+            payload,
+            deadline_ms,
+            stderr_name,
+            Some(&account(root)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_in_account(
+        root: &Path,
+        source: &str,
+        idle_ms: &str,
+        operation: &str,
+        payload: Option<&str>,
+        deadline_ms: Option<&str>,
+        stderr_name: &str,
+        account: Option<&Path>,
+    ) -> Self {
         let mut args = vec![
             "--client".into(),
             root.into(),
@@ -126,7 +185,7 @@ impl Client {
         if let Some(deadline_ms) = deadline_ms {
             args.push(deadline_ms.into());
         }
-        Self::start(root, args, stderr_name)
+        Self::start_with_account(root, args, stderr_name, account)
     }
 
     fn read_json(&mut self, seconds: u64) -> Value {
@@ -466,7 +525,9 @@ fn two_clients_join_same_pid_and_child_after_first_job_exit() {
         status["backend"]["job"]["memory_limit_bytes"],
         256 * 1024 * 1024
     );
-    assert_eq!(status["backend"]["job"]["cpu_rate"], 2500);
+    // The requested 25% of host is expressed against the verified 75% account
+    // allowance (33.33% of the parent), so its host-relative meaning is kept.
+    assert_eq!(status["backend"]["job"]["cpu_rate"], 3333);
     let child_pid = status["backend"]["child"].as_u64().unwrap() as u32;
     let leaf =
         ServiceProcess::observe(child_pid, &fixture_path(), 0, &current_user().unwrap()).unwrap();
@@ -1010,4 +1071,252 @@ fn tool_errors_preserve_owner_but_unconfirmed_cleanup_stops_it() {
             .contains("owned-private-call-sentinel")
     );
     starter.terminate();
+}
+
+#[test]
+fn admitted_broker_and_backend_keep_the_account_allowance_after_one_client_exits() {
+    let prepared = Prepared::new();
+    let budget = SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT).unwrap();
+    let snapshot = budget.snapshot().unwrap();
+    assert_eq!(snapshot.cpu_rate, 7500);
+    assert!(snapshot.cpu_hard_cap && !snapshot.kill_on_close);
+    let mut first = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        IDLE_MS,
+        "echo",
+        Some(&json!({ "text": UNICODE }).to_string()),
+        None,
+        "allowance-first.stderr",
+    );
+    let first_json = first.read_json(40);
+    secret_free(&first_json);
+    let pid = first_json["identity"]["pid"].as_u64().unwrap() as u32;
+    let creation_time = first_json["identity"]["creation_time"].as_u64().unwrap();
+    let service = observe_service(pid, creation_time);
+    // The WMI sibling start admits itself before the service does payload work.
+    assert!(
+        service.in_shared_cpu_budget(&budget).unwrap(),
+        "the WMI sibling start must join the account allowance"
+    );
+    let Observation::Ready { endpoint, owner } = broker_endpoint::observe(prepared.root()).unwrap()
+    else {
+        panic!("ready endpoint missing")
+    };
+    assert_eq!(owner.identity().pid, pid);
+    assert!(owner.in_shared_cpu_budget(&budget).unwrap());
+    // Real retained MCP calls flow through the admitted broker.
+    assert_eq!(
+        broker_rpc::invoke(
+            &endpoint,
+            "echo",
+            &json!({ "text": UNICODE }),
+            deadline(3),
+            &Cancellation::default()
+        )
+        .unwrap()["payload"]["text"],
+        UNICODE
+    );
+    let status = control(&endpoint, "status", &json!({}));
+    secret_free(&status);
+    // The backend's own lower ceiling is expressed against the verified parent
+    // rate, so 25% of host stays 25% of host inside the 75% allowance.
+    assert_eq!(status["backend"]["job"]["cpu_rate"], 3333);
+    assert_eq!(
+        status["backend"]["job"]["memory_limit_bytes"],
+        256 * 1024 * 1024
+    );
+    assert_eq!(status["backend"]["job"]["kill_on_close"], true);
+    let child_pid = status["backend"]["child"].as_u64().unwrap() as u32;
+    let leaf =
+        ServiceProcess::observe(child_pid, &fixture_path(), 0, &current_user().unwrap()).unwrap();
+    assert!(
+        leaf.in_shared_cpu_budget(&budget).unwrap(),
+        "a backend child inherits the allowance"
+    );
+    // One of two clients exits: its Job is gone, the backend and its child stay
+    // alive, keep their place in the one allowance and keep answering.
+    first.terminate();
+    assert!(service.is_running().unwrap() && leaf.is_running().unwrap());
+    assert!(owner.in_shared_cpu_budget(&budget).unwrap());
+    assert!(leaf.in_shared_cpu_budget(&budget).unwrap());
+    let surviving = budget.snapshot().unwrap();
+    assert_eq!(surviving.cpu_rate, 7500);
+    assert!(surviving.cpu_hard_cap && !surviving.kill_on_close);
+    // A later client joins the same object rather than a second allowance.
+    assert_eq!(
+        SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT)
+            .unwrap()
+            .name(),
+        budget.name()
+    );
+    let mut second = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        IDLE_MS,
+        "echo",
+        Some(&json!({ "text": "second 日本" }).to_string()),
+        None,
+        "allowance-second.stderr",
+    );
+    let second_json = second.read_json(20);
+    secret_free(&second_json);
+    assert_eq!(second_json["identity"]["pid"], pid);
+    assert_eq!(second_json["identity"]["creation_time"], creation_time);
+    assert_eq!(second_json["result"]["payload"]["text"], "second 日本");
+    assert!(matches!(
+        shared_cpu_coverage(&owner, Some(&prepared.account())),
+        SharedCpuCoverage::Covered { rate: 7500, .. }
+    ));
+    second.terminate();
+    let retired =
+        broker_launch::retire(prepared.root(), deadline(8), &Cancellation::default()).unwrap();
+    assert!(
+        matches!(retired, broker_launch::Retirement::Exited { pid: exited, .. } if exited == pid)
+    );
+    wait_exit(&leaf, 5);
+}
+
+#[test]
+fn foreign_chain_join_after_service_admission_is_real_or_refused() {
+    let prepared = Prepared::new();
+    let budget = SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT).unwrap();
+    let mut client = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        IDLE_MS,
+        "echo",
+        Some(&json!({ "text": UNICODE }).to_string()),
+        None,
+        "foreign-chain.stderr",
+    );
+    let started = client.read_json(40);
+    secret_free(&started);
+    let pid = started["identity"]["pid"].as_u64().unwrap() as u32;
+    let service = observe_service(pid, started["identity"]["creation_time"].as_u64().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    // A service that admitted itself is inside the WMI provider container, so the
+    // allowance is nested under that container. Measured Windows behavior: a
+    // participant from another job chain may join only if the kernel accepts the
+    // resulting hierarchy. Either outcome must be a real membership or a kernel
+    // refusal; neither may damage the anchored service or the allowance, and
+    // neither may pass as capped coverage without membership.
+    let marker = prepared.path().join("foreign-member.json");
+    let job = Job::new(Limits::default()).unwrap();
+    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    spec.args = vec!["hold".into(), marker.clone().into_os_string()];
+    match budget.spawn(&job, &spec) {
+        Ok(member) => {
+            let receipt: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+            assert_eq!(receipt["in_job"], true);
+            assert!(budget.contains(&member).unwrap());
+            println!("foreign chain join: admitted pid={}", member.identity().pid);
+            job.terminate(0, Duration::from_secs(3)).unwrap();
+        }
+        Err(error) => {
+            println!("foreign chain join: refused ({error})");
+        }
+    }
+    let snapshot = budget.snapshot().unwrap();
+    assert_eq!(snapshot.cpu_rate, 7500);
+    assert!(snapshot.cpu_hard_cap && !snapshot.kill_on_close);
+    assert!(service.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(
+        broker_rpc::invoke(
+            &broker_endpoint::observe(prepared.root())
+                .ok()
+                .and_then(|observation| match observation {
+                    Observation::Ready { endpoint, .. } => Some(endpoint),
+                    _ => None,
+                })
+                .expect("ready endpoint missing"),
+            "echo",
+            &json!({ "text": "still serving" }),
+            deadline(3),
+            &Cancellation::default()
+        )
+        .unwrap()["payload"]["text"],
+        "still serving"
+    );
+    client.terminate();
+}
+
+#[test]
+fn unadmitted_pre_existing_broker_is_reported_with_restart_guidance() {
+    let prepared = Prepared::new();
+    // A service started without any account location cannot join the allowance.
+    // It must still start, serve and be reported instead of passing as capped.
+    let mut starter = Client::connect_in_account(
+        prepared.path(),
+        SOURCE_A,
+        "8000",
+        "echo",
+        Some(&json!({ "text": UNICODE }).to_string()),
+        None,
+        "unadmitted-start.stderr",
+        None,
+    );
+    let started = starter.read_json(40);
+    secret_free(&started);
+    let pid = started["identity"]["pid"].as_u64().unwrap() as u32;
+    let creation_time = started["identity"]["creation_time"].as_u64().unwrap();
+    let service = observe_service(pid, creation_time);
+    assert!(service.is_running().unwrap());
+    // The service reports the failed allowance on its own established channel.
+    let log = fs::read_to_string(prepared.path().join("service.log")).unwrap();
+    assert!(
+        log.contains("outside the shared 75% CPU allowance"),
+        "{log}"
+    );
+    // The starting client reports the uncovered state, never a cap, and real
+    // work still reaches the service.
+    let starter_log = fs::read_to_string(prepared.path().join("unadmitted-start.stderr")).unwrap();
+    assert!(
+        starter_log.contains("shared CPU allowance unverified"),
+        "{starter_log}"
+    );
+    assert!(
+        !starter_log.contains("inside the shared CPU allowance"),
+        "{starter_log}"
+    );
+    assert_eq!(started["result"]["payload"]["text"], UNICODE);
+    // A later client with a usable allowance finds the pre-existing owner
+    // outside it: it keeps serving, is preserved rather than adopted, and the
+    // diagnostic names the restart boundary.
+    let mut joining = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        "8000",
+        "echo",
+        Some(&json!({ "text": "joined 日本" }).to_string()),
+        None,
+        "unadmitted-join.stderr",
+    );
+    let joined = joining.read_json(20);
+    secret_free(&joined);
+    assert_eq!(
+        joined["identity"]["pid"], pid,
+        "the pre-existing owner must be preserved, not replaced"
+    );
+    assert_eq!(joined["result"]["payload"]["text"], "joined 日本");
+    let join_log = fs::read_to_string(prepared.path().join("unadmitted-join.stderr")).unwrap();
+    assert!(
+        join_log.contains("outside the shared CPU allowance"),
+        "{join_log}"
+    );
+    assert!(join_log.contains("restarted"), "{join_log}");
+    assert!(service.is_running().unwrap());
+    let Observation::Ready { owner, .. } = broker_endpoint::observe(prepared.root()).unwrap()
+    else {
+        panic!("ready endpoint missing")
+    };
+    match shared_cpu_coverage(&owner, Some(&prepared.account())) {
+        SharedCpuCoverage::Unadmitted { cause } => {
+            assert!(cause.contains("not a member"), "{cause}")
+        }
+        other => panic!("pre-existing owner reported as {other:?}"),
+    }
+    starter.terminate();
+    joining.terminate();
 }

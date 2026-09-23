@@ -6,7 +6,10 @@ use crate::{
     cancellable_pipe::{CancellablePipe, PipeIoError, anonymous_pipe},
     dependency_mcp_probe::strict_json,
     native_build::ordinary_ancestors,
-    process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity, StopReason},
+    process::{
+        CPU_BUDGET_ACCOUNT_ENV, Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity,
+        SHARED_CPU_PERCENT, SharedCpuBudget, StopReason,
+    },
     registration_native::ReadGuard,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,10 @@ use std::{
     io::{self, Write},
     os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Sender},
+    sync::{
+        Mutex, OnceLock,
+        mpsc::{self, Sender},
+    },
     time::Duration,
 };
 use windows_sys::Win32::{
@@ -25,6 +31,7 @@ use windows_sys::Win32::{
     Security::*,
     System::{
         Console::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle},
+        JobObjects::{AssignProcessToJobObject, IsProcessInJob, OpenJobObjectW},
         SystemInformation::GetSystemTimeAsFileTime,
         Threading::*,
     },
@@ -38,6 +45,18 @@ pub const RUN_ARGUMENT: &str = "--harness-service-run";
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_STARTUP_MS: u64 = 120_000;
 const CLEANUP: Duration = Duration::from_secs(5);
+/// Job-object access rights (winnt.h). The enabled windows-sys features do not
+/// export the SystemServices constants, so the documented values are spelled
+/// here; only these two rights are ever requested.
+const JOB_OBJECT_ASSIGN_PROCESS: u32 = 0x0001;
+const JOB_OBJECT_QUERY: u32 = 0x0004;
+/// A held account lock must not delay a service past its bounded startup
+/// window; `SharedCpuBudget::acquire` uses the same bound.
+const SHARED_CPU_JOIN_WAIT: Duration = Duration::from_secs(10);
+/// Distinct service identities already reported outside the allowance. Startup
+/// and join callers repeat on every request, and repeated identical warnings
+/// are noise rather than status.
+static REPORTED_OUTSIDE_ALLOWANCE: OnceLock<Mutex<BTreeSet<(u32, u64)>>> = OnceLock::new();
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -55,6 +74,32 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     } else {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
     }
+}
+
+fn wide(text: &str) -> io::Result<Vec<u16>> {
+    if text.contains('\0') {
+        return Err(invalid("service job name contains a NUL"));
+    }
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    Ok(units)
+}
+
+/// Handle to a named account job object. Callers must hold the verified budget
+/// handle for that same name: while that handle lives the object cannot be
+/// replaced or renamed, so the name cannot resolve to a foreign object and
+/// nothing is adopted here.
+fn open_shared_job(name: &str, access: u32) -> io::Result<OwnedHandle> {
+    let name = wide(name)?;
+    owned(unsafe { OpenJobObjectW(access, 0, name.as_ptr()) })
+}
+
+/// Membership check mirroring the process owner's own check; the handles stay
+/// non-owning, so this confers no cleanup authority.
+fn in_job(process: HANDLE, job: HANDLE) -> io::Result<bool> {
+    let mut member = 0;
+    checked(unsafe { IsProcessInJob(process, job, &mut member) })?;
+    Ok(member != 0)
 }
 
 /// Windows FILETIME units, also used by ProcessIdentity. Not a monotonic deadline.
@@ -416,6 +461,15 @@ impl ServiceProcess {
         Ok(Some(code))
     }
 
+    /// Kernel membership of this exact retained process in the account
+    /// allowance. The caller holds the verified budget handle, so the name
+    /// cannot resolve to another object; nothing is adopted, assigned or
+    /// restarted by this check.
+    pub fn in_shared_cpu_budget(&self, budget: &SharedCpuBudget) -> io::Result<bool> {
+        let handle = open_shared_job(budget.name(), JOB_OBJECT_QUERY)?;
+        in_job(self.handle.as_raw_handle(), handle.as_raw_handle())
+    }
+
     /// Terminate this exact process after re-validating the recorded identity
     /// on a fresh terminate handle. A stale, exited or mismatched identity is
     /// never killed; callers own the recorded session, not arbitrary PIDs.
@@ -455,6 +509,101 @@ impl ServiceProcess {
     }
 }
 
+/// Kernel-verified coverage of one retained service process. `Covered` needs a
+/// membership check against the verified account allowance; anything unknown,
+/// inaccessible or merely name-similar is never reported as capped.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum SharedCpuCoverage {
+    Covered { job: String, rate: u32 },
+    Unadmitted { cause: String },
+    Unverified { cause: String },
+}
+
+impl SharedCpuCoverage {
+    pub fn is_covered(&self) -> bool {
+        matches!(self, Self::Covered { .. })
+    }
+
+    /// One human line for logs and inspection. It never claims a ceiling that
+    /// was not verified, and for an unadmitted service it names the recovery
+    /// step: a safe restart, never adoption of the running process.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Covered { job, rate } => format!(
+                "inside the shared CPU allowance {job} at {}% of host capacity (hard cap)",
+                f64::from(*rate) / 100.0
+            ),
+            Self::Unadmitted { cause } => format!(
+                "outside the shared CPU allowance: {cause}; it runs uncapped by the account budget, so coverage stays incomplete until it is restarted"
+            ),
+            Self::Unverified { cause } => format!(
+                "shared CPU allowance unverified: {cause}; enforcement is unknown for this service"
+            ),
+        }
+    }
+}
+
+/// Verify one observed service process against the account CPU allowance. This
+/// only reads kernel state: it never assigns, adopts or restarts a process, and
+/// a service that is not a member is reported instead of being enrolled.
+pub fn shared_cpu_coverage(service: &ServiceProcess, account: Option<&Path>) -> SharedCpuCoverage {
+    let budget = match crate::process::cpu_budget_directory(account)
+        .and_then(|directory| SharedCpuBudget::acquire(&directory, SHARED_CPU_PERCENT))
+    {
+        Ok(budget) => budget,
+        Err(error) => {
+            return SharedCpuCoverage::Unverified {
+                cause: error.to_string(),
+            };
+        }
+    };
+    service
+        .in_shared_cpu_budget(&budget)
+        .and_then(|member| {
+            if !member {
+                return Ok(SharedCpuCoverage::Unadmitted {
+                    cause: format!(
+                        "process {} is not a member of the account allowance {}",
+                        service.identity().pid,
+                        budget.name()
+                    ),
+                });
+            }
+            Ok(SharedCpuCoverage::Covered {
+                job: budget.name().to_owned(),
+                rate: budget.snapshot()?.cpu_rate,
+            })
+        })
+        .unwrap_or_else(|error| SharedCpuCoverage::Unverified {
+            cause: error.to_string(),
+        })
+}
+
+/// Visible fail-open diagnostic for a service outside verified coverage, at most
+/// once per distinct process identity because start and join callers repeat.
+/// Diagnostics use stderr only, so stdout, MCP STDIO and native protocols stay
+/// untouched.
+pub fn warn_shared_cpu(scope: &str, identity: ProcessIdentity, coverage: &SharedCpuCoverage) {
+    if coverage.is_covered() {
+        return;
+    }
+    let Ok(mut reported) = REPORTED_OUTSIDE_ALLOWANCE
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    else {
+        return;
+    };
+    if !reported.insert((identity.pid, identity.creation_time)) {
+        return;
+    }
+    let _ = writeln!(
+        io::stderr(),
+        "coding-agents-harness: {scope} is {}",
+        coverage.describe()
+    );
+}
+
 /// Caller supplies a trusted executable implementing both bootstrap commands,
 /// an owned directory and the COMPLETE service environment. No acquisition,
 /// shell resolution, service registration or persistent launcher is performed.
@@ -487,6 +636,22 @@ pub fn spawn(
     // link could retarget a service that is already running.
     let program = crate::dependency_discovery::local_path(program)?;
     let _program_guard = ReadGuard::open(&program)?;
+    // The service joins the account CPU allowance from its own bootstrap. Pass
+    // the account's storage location explicitly when the caller did not, so
+    // admission does not depend on ambient variables a minimal service
+    // environment omits. The service still validates that allowance itself and
+    // never adopts one from a name the caller supplied.
+    let mut environment = environment;
+    if !environment
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(CPU_BUDGET_ACCOUNT_ENV))
+        && let Ok(account) = crate::process::cpu_budget_directory(None)
+    {
+        environment.insert(
+            CPU_BUDGET_ACCOUNT_ENV.into(),
+            account.to_string_lossy().into_owned(),
+        );
+    }
     let began = creation_clock();
     let request = Request {
         directory: directory.into(),
@@ -549,10 +714,94 @@ pub fn spawn(
     )
     .map_err(|_| invalid("invalid service helper receipt"))?;
     match (outcome.exit_code, receipt.pid, receipt.error) {
-        (0, Some(pid), None) => ServiceProcess::observe(pid, &program, began, &request.user),
+        (0, Some(pid), None) => {
+            let service = ServiceProcess::observe(pid, &program, began, &request.user)?;
+            // Fail-open reporting: a service that could not join the allowance
+            // still starts and stays usable, and this client says so instead of
+            // implying that the requested ceiling holds.
+            warn_shared_cpu(
+                &format!("the service started from {} (pid {pid})", program.display()),
+                service.identity(),
+                &shared_cpu_coverage(&service, None),
+            );
+            Ok(service)
+        }
         (2, None, Some(error)) => Err(io::Error::other(format!("native service helper: {error}"))),
         _ => Err(invalid("inconsistent service helper receipt")),
     }
+}
+
+/// Join the account-wide CPU allowance before any service payload work, and
+/// return the handle the service keeps for its whole lifetime, the verified
+/// host rate, and whether this process already belonged to another job.
+///
+/// A WMI-started service is a sibling of its client and inherits no job from it,
+/// so the service joins the allowance itself and only then creates its own
+/// lifecycle Job inside it. Windows associates a process already in a job with
+/// another job only while that job is empty or already inside the process's own
+/// hierarchy, so a service that starts inside a provider container can join an
+/// allowance that no foreign containment chain anchored yet; a kernel refusal
+/// is reported as a failed allowance instead of being retried or assumed.
+fn join_shared_cpu(deadline: Deadline) -> io::Result<(SharedCpuBudget, u32, bool)> {
+    let directory = crate::process::cpu_budget_directory(None)?;
+    let budget = SharedCpuBudget::acquire_within(
+        &directory,
+        SHARED_CPU_PERCENT,
+        deadline,
+        &Cancellation::default(),
+    )?;
+    let snapshot = budget.snapshot()?;
+    if !snapshot.cpu_hard_cap
+        || snapshot.kill_on_close
+        || snapshot.job_memory_limit_bytes != 0
+        || snapshot.breakaway_ok
+        || snapshot.silent_breakaway_ok
+    {
+        return Err(io::Error::other(
+            "the account CPU allowance does not carry the required CPU-only settings; preserving it",
+        ));
+    }
+    // Recorded for reporting: a service that starts inside another job nests the
+    // allowance under that container instead of standing at the root.
+    let contained = in_job(unsafe { GetCurrentProcess() }, std::ptr::null_mut())?;
+    let handle = open_shared_job(budget.name(), JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY)?;
+    let assigned = unsafe { AssignProcessToJobObject(handle.as_raw_handle(), GetCurrentProcess()) };
+    if assigned == 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "the kernel refused joining the account allowance ({error}); the service already belongs to another job ({contained}), and a contained process can only join an empty allowance or one inside its own job hierarchy"
+        )));
+    }
+    if !in_job(unsafe { GetCurrentProcess() }, handle.as_raw_handle())? {
+        return Err(io::Error::other(
+            "shared CPU allowance assignment was not observed",
+        ));
+    }
+    Ok((budget, snapshot.cpu_rate, contained))
+}
+
+/// Ceiling for the service's own lifecycle Job. Windows expresses a nested
+/// job's rate against its rate-controlled parent, so an inner percentage would
+/// otherwise silently shrink to a fraction of the shared allowance. A requested
+/// ceiling that is not lower than the allowance adds no separate limit at all,
+/// because the allowance already binds the whole tree.
+fn nested_cpu_percent(requested: Option<f64>, host_rate: u32) -> Option<f64> {
+    let requested = requested?;
+    let host_percent = f64::from(host_rate) / 100.0;
+    if !(0.01..host_percent).contains(&requested) {
+        return None;
+    }
+    let nested = requested / (host_percent / 100.0);
+    nested.is_finite().then_some(nested)
+}
+
+/// Concise fail-open diagnostic for a service outside the allowance: failed
+/// ceiling, cause, affected scope and recovery step. It never claims that the
+/// ceiling is enforced and never implies that a peer lost its own allowance.
+fn shared_cpu_service_warning(error: &io::Error) -> String {
+    format!(
+        "coding-agents-harness: this service and its children run outside the shared {SHARED_CPU_PERCENT}% CPU allowance for this account: {error}. Other sessions keep their own allowance, and coverage stays incomplete until the account CPU budget is usable and this service is restarted into it."
+    )
 }
 
 /// The service owns this Job, not any client. Bootstrap callers must enter
@@ -560,6 +809,9 @@ pub fn spawn(
 /// after their instance lock + endpoint, and implement a bounded idle shutdown.
 pub struct ServiceGuard {
     job: Job,
+    shared: Option<SharedCpuBudget>,
+    shared_cpu_container: bool,
+    shared_cpu_warning: Option<String>,
     ready: Option<Sender<()>>,
     watchdog: Option<std::thread::JoinHandle<()>>,
     startup_deadline: Deadline,
@@ -595,18 +847,45 @@ pub(crate) fn exit_with_diagnostic(code: i32, message: &'static str) -> ! {
 
 impl ServiceGuard {
     pub fn enter(startup_until: u64, expected_user: &str, limits: Limits) -> io::Result<Self> {
-        let job = Job::new(limits)?;
-        if job.contain_current_process().is_err() {
-            std::process::exit(2);
-        }
-        // Once self-contained, exit explicitly on bootstrap errors. Dropping
-        // the live Job would otherwise obscure the selected failure exit code.
+        // Account identity and the bounded startup window are checked before any
+        // shared or service state is created.
         match current_user() {
             Ok(actual) if actual == expected_user => (),
             _ => std::process::exit(2),
         }
         let remaining =
             startup_remaining(startup_until).unwrap_or_else(|_| std::process::exit(124));
+        // The account allowance is joined first so it stays outside the
+        // service's own lifecycle Job. A service that cannot join it still
+        // starts, reported as degraded, rather than losing availability.
+        let mut limits = limits;
+        let mut shared_cpu_warning = None;
+        let mut shared_cpu_container = false;
+        let shared = match join_shared_cpu(
+            Deadline::after(remaining.min(SHARED_CPU_JOIN_WAIT))
+                .unwrap_or_else(|_| std::process::exit(2)),
+        ) {
+            Ok((budget, host_rate, contained)) => {
+                limits.cpu_percent = nested_cpu_percent(limits.cpu_percent, host_rate);
+                shared_cpu_container = contained;
+                Some(budget)
+            }
+            Err(error) => {
+                // Human diagnostics never use stdout, and the write is
+                // harmless when this service has no stream yet: the log
+                // attached by `redirect_standard_streams` repeats it.
+                let warning = shared_cpu_service_warning(&error);
+                let _ = writeln!(io::stderr(), "{warning}");
+                shared_cpu_warning = Some(warning);
+                None
+            }
+        };
+        let job = Job::new(limits)?;
+        if job.contain_current_process().is_err() {
+            std::process::exit(2);
+        }
+        // Once self-contained, exit explicitly on bootstrap errors. Dropping
+        // the live Job would otherwise obscure the selected failure exit code.
         let startup_deadline = Deadline::after(remaining).unwrap_or_else(|_| std::process::exit(2));
         let (ready, receive) = mpsc::channel();
         let watchdog = std::thread::Builder::new()
@@ -624,6 +903,9 @@ impl ServiceGuard {
             .unwrap_or_else(|_| std::process::exit(2));
         Ok(Self {
             job,
+            shared,
+            shared_cpu_container,
+            shared_cpu_warning,
             ready: Some(ready),
             watchdog: Some(watchdog),
             startup_deadline,
@@ -644,10 +926,35 @@ impl ServiceGuard {
         {
             checked(unsafe { SetStdHandle(kind, file.as_raw_handle()) })?;
         }
+        // The log is the established diagnostic channel for services, so a
+        // start-time allowance warning is repeated here once. Diagnostics never
+        // reach stdout or any machine protocol stream.
+        if let Some(warning) = &self.shared_cpu_warning {
+            let _ = writeln!(io::stderr(), "{warning}");
+        }
         Ok(())
     }
     pub fn job(&self) -> &Job {
         &self.job
+    }
+    /// The verified account allowance this service joined, retained for the
+    /// service's lifetime. `None` means the service runs degraded.
+    pub fn shared_cpu(&self) -> Option<&SharedCpuBudget> {
+        self.shared.as_ref()
+    }
+    /// True when this service already belonged to another job at bootstrap (the
+    /// WMI provider container), so the account allowance is nested inside that
+    /// container instead of standing at the root of the hierarchy. Membership,
+    /// settings and lifecycle ownership are unaffected; the nesting position
+    /// decides which later participants can still join the same allowance, so
+    /// inspection reports it instead of assuming a root position.
+    pub fn shared_cpu_container(&self) -> bool {
+        self.shared_cpu_container
+    }
+    /// Degraded start diagnostic: what failed and which action admits the
+    /// service next time. `None` while the allowance is verified.
+    pub fn shared_cpu_warning(&self) -> Option<&str> {
+        self.shared_cpu_warning.as_deref()
     }
     pub fn mark_ready(&mut self) -> io::Result<()> {
         if let Some(ready) = self.ready.take() {
@@ -668,5 +975,26 @@ impl ServiceGuard {
     /// OS process teardown closes the non-inheritable Job and reclaims children.
     pub fn exit(self, code: i32) -> ! {
         std::process::exit(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nested_cpu_percent;
+
+    #[test]
+    fn nested_cpu_percent_preserves_host_relative_meaning() {
+        // 25% of host under the 75% allowance is 33.33% of the parent, which the
+        // kernel quantizes down to 3333 hundredths of a percent.
+        let nested = nested_cpu_percent(Some(25.0), 7500).unwrap();
+        assert_eq!((nested * 100.0).floor() as u32, 3333);
+        assert_eq!(nested_cpu_percent(Some(0.5), 7500), Some(0.5 / 0.75));
+        assert_eq!(nested_cpu_percent(Some(0.01), 7500), Some(0.01 / 0.75));
+        // A ceiling that is not lower than the allowance adds no second limit.
+        assert_eq!(nested_cpu_percent(Some(75.0), 7500), None);
+        assert_eq!(nested_cpu_percent(Some(100.0), 7500), None);
+        assert_eq!(nested_cpu_percent(None, 7500), None);
+        assert_eq!(nested_cpu_percent(Some(f64::NAN), 7500), None);
+        assert_eq!(nested_cpu_percent(Some(0.0), 7500), None);
     }
 }
