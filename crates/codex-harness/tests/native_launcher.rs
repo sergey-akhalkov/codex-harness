@@ -4,17 +4,37 @@ use harness_core::{
     build_identity::{self, BINARIES, BuildRecord, INSPECTION_SCHEMA, SCHEMA},
     build_selection,
     console::{ConsoleSession, ConsoleSpec},
-    process::{Cancellation, CommandSpec, Deadline, StopReason},
+    process::{
+        Cancellation, CommandSpec, Deadline, SHARED_CPU_PERCENT, SharedCpuBudget, StopReason,
+    },
 };
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
+
+/// Account override used by every fixture launch: an ordinary launch must not
+/// touch the developer's real account state from a test, and the lowered test
+/// ceiling stays scoped to this account directory.
+const CPU_ACCOUNT_ENV: &str = "CODEX_HARNESS_CPU_ACCOUNT";
+/// Machine-local ceiling override read by the launcher before admission.
+const CPU_PERCENT_ENV: &str = "CODEX_HARNESS_CPU_PERCENT";
+/// A relative account location is refused by the launcher, so a misconfigured
+/// machine-local value must not silently create a second allowance.
+const RELATIVE_ACCOUNT: &str = "relative-cpu-account";
+/// Lowered rate for measurement: the spinning demand stays many times the
+/// allowance, so a working cap is unambiguous and the uncapped control of the
+/// surrounding developer session cannot explain the observation.
+const TEST_RATE: f64 = 0.5;
+/// Leading text of every fail-open notice. It is asserted on the diagnostic
+/// channel and never on stdout.
+const CAP_WARNING: &str = "codex-harness: shared agent CPU cap not verified";
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -23,6 +43,7 @@ struct Fixture {
     state: PathBuf,
     launcher: PathBuf,
     upstream: PathBuf,
+    account: PathBuf,
 }
 
 impl Fixture {
@@ -88,6 +109,7 @@ impl Fixture {
         )
         .unwrap();
         build_selection::activate(&state, &build).unwrap();
+        let account = root.path().join("cpu-account");
         let f = Self {
             root,
             home,
@@ -95,6 +117,7 @@ impl Fixture {
             state,
             launcher,
             upstream,
+            account,
         };
         f.register(json!({"executable":f.upstream, "sha256":build_identity::hash_file(&f.upstream).unwrap(), "package":null}));
         f
@@ -117,8 +140,18 @@ impl Fixture {
         let mut c = Command::new(&self.launcher);
         c.current_dir(self.root.path())
             .env("CODEX_HOME", &self.home)
+            .env(CPU_ACCOUNT_ENV, &self.account)
+            .env_remove(CPU_PERCENT_ENV)
             .env_remove("HARNESS_LAUNCH_FIXTURE_MODE");
         c
+    }
+    /// Register the synthetic CPU consumer as the installed upstream payload.
+    fn register_consumer(&self, consumer: &Path) {
+        self.register(json!({
+            "executable": consumer,
+            "sha256": build_identity::hash_file(consumer).unwrap(),
+            "package": null
+        }));
     }
     fn console(&self, mode: &str) -> ConsoleSession {
         let mut c = CommandSpec::new(&self.launcher);
@@ -127,6 +160,13 @@ impl Fixture {
             "CODEX_HOME".into(),
             Some(self.home.clone().into_os_string()),
         );
+        c.env.insert(
+            CPU_ACCOUNT_ENV.into(),
+            Some(self.account.clone().into_os_string()),
+        );
+        // Absent means "inherit the caller's ceiling override", which a test
+        // must not pick up from the developer's environment.
+        c.env.insert(CPU_PERCENT_ENV.into(), None);
         c.env
             .insert("HARNESS_LAUNCH_FIXTURE_MODE".into(), Some(mode.into()));
         ConsoleSession::spawn(ConsoleSpec::new(c)).unwrap()
@@ -302,6 +342,10 @@ fn installed_manager_link_enforces_integrity_and_allows_source_stale_recovery() 
 #[test]
 fn native_argv_unicode_stdin_streams_cwd_and_nonzero_exit() {
     let f = Fixture::new();
+    // Pre-establish this fixture's own account so the launch exercises joining
+    // an existing group. Forwarding and exit status are the assertions here;
+    // positive membership is proven by the measurement case below.
+    let _budget = SharedCpuBudget::acquire(&f.account, SHARED_CPU_PERCENT).unwrap();
     let args = [
         "--harness-effort",
         "routine",
@@ -354,6 +398,9 @@ fn native_argv_unicode_stdin_streams_cwd_and_nonzero_exit() {
             .unwrap(),
         f.root.path().canonicalize().unwrap()
     );
+    // Positive admission of a piped session is proven by the dedicated
+    // measurement case below; here the exact stderr above already rules out
+    // every warned fallback, so forwarding and exit status stay the assertions.
 }
 
 #[test]
@@ -657,6 +704,14 @@ fn real_console_interaction_and_ctrl_c_return_upstream_exit() {
     let f = Fixture::new();
     let session = f.console("interactive");
     wait_for(&session, "upstream prompt console=true");
+    // The account is observed while the payload runs: this interactive route
+    // must either admit the payload or report the shared cap as unverified.
+    let budget = SharedCpuBudget::acquire(&f.account, SHARED_CPU_PERCENT).unwrap();
+    assert_eq!(
+        budget.snapshot().unwrap().cpu_rate,
+        cpu_rate_units(SHARED_CPU_PERCENT)
+    );
+    assert_cpu_attempt_visible(&budget, &session);
     session.send("console input\r\n").unwrap();
     wait_for(&session, "upstream echo:console input");
     let result = session
@@ -670,6 +725,7 @@ fn real_console_interaction_and_ctrl_c_return_upstream_exit() {
     assert_eq!(result.outcome.exit_code, 0);
     let session = f.console("ctrl-c");
     wait_for(&session, "upstream ready");
+    assert_cpu_attempt_visible(&budget, &session);
     session.send("\u{3}").unwrap();
     let result = session
         .wait(
@@ -692,4 +748,562 @@ fn wait_for(session: &ConsoleSession, text: &str) {
         "{}",
         session.transcript()
     );
+}
+
+fn host_logical_processors() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(1)
+}
+
+/// Spinning threads per process. The two spinning processes must demand
+/// several times the lowered allowance, or the measurement proves nothing; the
+/// count grows with the host only when a fixed count would not.
+fn spinner_threads(cpus: u32, percent: f64) -> u64 {
+    (percent / 100.0 * f64::from(cpus) * 2.0).ceil().max(2.0) as u64
+}
+
+/// Kernel rate units of the shared budget: 0.01% steps, like `Limits`.
+fn cpu_rate_units(percent: f64) -> u32 {
+    (percent * 100.0).floor() as u32
+}
+
+fn receipt(path: &Path) -> Value {
+    let bytes =
+        fs::read(path).unwrap_or_else(|error| panic!("{} is missing: {error}", path.display()));
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Bounded wait for kernel membership accounting: admission is observed from
+/// the object itself, not from payload cooperation.
+fn wait_for_members(budget: &SharedCpuBudget, expected: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if budget.snapshot().unwrap().active_processes >= expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// A dispatching job hierarchy either hosts the ordered pair or the kernel
+/// refuses the placement; what must never happen is a silent skip. The session
+/// is therefore either an admitted member of the account group or it carries
+/// the visible placement notice.
+fn assert_cpu_attempt_visible(budget: &SharedCpuBudget, session: &ConsoleSession) {
+    let transcript = session.transcript();
+    let admitted = wait_for_members(budget, 1, Duration::from_secs(3));
+    assert!(
+        admitted || transcript.contains(CAP_WARNING),
+        "the session neither joined the account group nor reported the shared cap as unverified: {transcript}"
+    );
+    if !admitted {
+        assert!(
+            transcript.contains("failed stage: session placement"),
+            "{transcript}"
+        );
+    }
+}
+
+/// Bounded wait for a drained group, so a session's exit cannot leave its tree
+/// behind in the shared accounting object.
+fn wait_for_empty(budget: &SharedCpuBudget) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if budget.snapshot().unwrap().active_processes == 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Observable account state: names for a directory, bytes for a plain file,
+/// nothing when absent. Deliberately format-agnostic: the point is that a
+/// degraded launch persists and changes no machine-local budget state.
+fn account_state(account: &Path) -> String {
+    match fs::metadata(account) {
+        Err(_) => "absent".into(),
+        Ok(metadata) if metadata.is_dir() => {
+            let mut names: Vec<_> = fs::read_dir(account)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            format!("dir {names:?}")
+        }
+        Ok(_) => format!(
+            "file {:?}",
+            String::from_utf8_lossy(&fs::read(account).unwrap())
+        ),
+    }
+}
+
+fn rustc() -> PathBuf {
+    let output = Command::new("where.exe")
+        .arg("rustc.exe")
+        .output()
+        .expect("where.exe runs");
+    let found = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .find(|path| path.is_file());
+    found.unwrap_or_else(|| {
+        let home = env::var_os("USERPROFILE").expect("USERPROFILE");
+        PathBuf::from(home).join(".cargo/bin/rustc.exe")
+    })
+}
+
+/// The synthetic direct executable used by the CPU-budget acceptance: compiled
+/// once per test binary with the toolchain that already builds this test, so no
+/// product entry point and no external dependency is involved.
+fn consumer() -> &'static Path {
+    static CONSUMER: OnceLock<PathBuf> = OnceLock::new();
+    CONSUMER.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("cpu-budget-consumer-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let source = root.join("cpu_budget_consumer.rs");
+        fs::write(&source, include_str!("fixtures/cpu_budget_consumer.rs")).unwrap();
+        let executable = root.join("cpu-budget-consumer.exe");
+        let compiled = Command::new(rustc())
+            .arg(&source)
+            .arg("--edition=2024")
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .output()
+            .expect("rustc runs");
+        assert!(
+            compiled.status.success(),
+            "cpu budget consumer fixture did not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(executable.is_file(), "{}", executable.display());
+        executable
+    })
+}
+
+/// One synthetic consumer launch: artifact directory, start log and the
+/// `HARNESS_CPU_FIXTURE_*` environment the fixture reads instead of arguments.
+struct Consumer {
+    directory: PathBuf,
+    starts: PathBuf,
+}
+
+impl Consumer {
+    fn new(root: &Path, name: &str) -> Self {
+        let directory = root.join(format!("consumer-{name}"));
+        fs::create_dir_all(&directory).unwrap();
+        Self {
+            starts: directory.join("starts.txt"),
+            directory,
+        }
+    }
+
+    fn configure(
+        &self,
+        command: &mut Command,
+        job: &str,
+        threads: u64,
+        spin_ms: u64,
+        leaf: bool,
+        exit: i32,
+    ) {
+        command
+            .env("HARNESS_CPU_FIXTURE_DIR", &self.directory)
+            .env("HARNESS_CPU_FIXTURE_JOB", job)
+            .env("HARNESS_CPU_FIXTURE_THREADS", threads.to_string())
+            .env("HARNESS_CPU_FIXTURE_SPIN_MS", spin_ms.to_string())
+            .env("HARNESS_CPU_FIXTURE_LEAF", if leaf { "1" } else { "0" })
+            .env("HARNESS_CPU_FIXTURE_EXIT", exit.to_string())
+            .env("HARNESS_CPU_FIXTURE_STARTS", &self.starts);
+    }
+
+    fn tree(&self) -> Value {
+        receipt(&self.directory.join("tree.json"))
+    }
+
+    fn leaf(&self) -> Value {
+        receipt(&self.directory.join("leaf.json"))
+    }
+
+    fn starts(&self) -> Vec<String> {
+        fs::read_to_string(&self.starts)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+#[test]
+fn admitted_session_covers_payload_and_grandchildren_under_a_lowered_test_rate() {
+    let f = Fixture::new();
+    let cpus = host_logical_processors();
+    let threads = spinner_threads(cpus, TEST_RATE);
+    let spin_ms = 3000;
+    // One explicit isolated account directory, established at a lowered rate
+    // before the session starts: the launcher must join this exact object.
+    let budget = SharedCpuBudget::acquire(&f.account, TEST_RATE).unwrap();
+    let name = budget.name().to_owned();
+    assert_eq!(
+        budget.snapshot().unwrap().cpu_rate,
+        cpu_rate_units(TEST_RATE)
+    );
+    f.register_consumer(consumer());
+    let payload = Consumer::new(f.root.path(), "admitted");
+    let mut command = f.command();
+    command.env(CPU_PERCENT_ENV, TEST_RATE.to_string());
+    payload.configure(&mut command, &name, threads, spin_ms, true, 21);
+    let before = budget.snapshot().unwrap();
+    let started = Instant::now();
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(21),
+        "exit status must survive the ordered spawn: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the account budget must not write to stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !stderr.contains(CAP_WARNING),
+        "an admitted launch must not warn: {stderr}"
+    );
+    // The direct executable and its grandchild each read their own kernel
+    // membership in the named account object at the start of their execution.
+    let tree = payload.tree();
+    let leaf = payload.leaf();
+    assert_eq!(tree["role"], json!("tree"), "{tree}");
+    assert_eq!(leaf["role"], json!("leaf"), "{leaf}");
+    assert_eq!(tree["in_shared"], json!(true), "{tree}");
+    assert_eq!(leaf["in_shared"], json!(true), "{leaf}");
+    assert_eq!(tree["in_any_job"], json!(true), "{tree}");
+    assert_eq!(leaf["in_any_job"], json!(true), "{leaf}");
+    assert_eq!(tree["child"], leaf["pid"], "{tree} {leaf}");
+    let starts = payload.starts();
+    assert_eq!(starts.len(), 2, "one start per payload process: {starts:?}");
+    assert!(starts[0].starts_with("tree "), "{starts:?}");
+    assert!(starts[1].starts_with("leaf "), "{starts:?}");
+    // Declared bound: the group may consume the lowered share of total host CPU
+    // capacity over the measured wall clock (rate * logical processors *
+    // elapsed), with 25% slack for the kernel rate cycle, timer granularity and
+    // sampling. Demand is the two single-threaded spinners' unthrottled CPU
+    // seconds, which must stay far above the allowance for this to prove
+    // anything at all.
+    let snapshot = budget.snapshot().unwrap();
+    let measured = snapshot
+        .cpu_time
+        .saturating_sub(before.cpu_time)
+        .as_secs_f64();
+    let allowance = TEST_RATE / 100.0 * f64::from(cpus) * elapsed.as_secs_f64();
+    let demand = 2.0 * threads as f64 * (spin_ms as f64 / 1000.0);
+    // Measurement evidence for the run log: rate, aggregate consumption,
+    // declared allowance and unthrottled demand over the observed wall clock.
+    eprintln!(
+        "cpu budget evidence: rate={TEST_RATE}% cpus={cpus} threads_per_process={threads} elapsed={:.2}s measured_cpu={measured:.3}s allowance={allowance:.3}s demand={demand:.3}s",
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        demand > allowance * 2.0,
+        "workload demand {demand}s must exceed the allowance {allowance}s"
+    );
+    assert!(
+        measured <= allowance * 1.25 + 0.05,
+        "measured aggregate {measured}s exceeded the lowered ceiling: allowance {allowance}s over {elapsed:?}"
+    );
+    assert!(
+        measured < demand * 0.5,
+        "measured aggregate {measured}s shows no throttling against demand {demand}s"
+    );
+    assert_eq!(snapshot.cpu_rate, cpu_rate_units(TEST_RATE));
+    assert!(snapshot.cpu_hard_cap);
+    assert!(
+        wait_for_empty(&budget),
+        "the isolated account still holds members after the session exited"
+    );
+}
+
+/// One ordinary native session launch of the registered upstream fixture.
+/// `failure` selects the CPU-admission fault the test injects.
+fn launch_session(f: &Fixture, args: &[&str], failure: Option<&str>) -> (i32, Value, String) {
+    let mut command = f.command();
+    match failure {
+        None => {}
+        Some("ceiling") => {
+            command.env(CPU_PERCENT_ENV, "eighty");
+        }
+        Some("storage") => {
+            command.env(CPU_ACCOUNT_ENV, RELATIVE_ACCOUNT);
+        }
+        Some("account") => {}
+        Some(other) => panic!("unknown failure mode {other}"),
+    }
+    let mut child = command
+        .args(args)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "nonzero")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("первая строка\nsecond line\n".as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let report = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("stdout is not the payload's own report ({error}): {stdout:?}")
+    });
+    (
+        output.status.code().unwrap_or(-1),
+        report,
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+#[test]
+fn cpu_admission_failure_warns_once_and_preserves_native_inputs_and_exit() {
+    let args = [
+        "exec",
+        "",
+        "проверка \"кавычки\"",
+        "trailing\\",
+        "$() `literal` ; &",
+    ];
+    for mode in ["ceiling", "storage", "account"] {
+        let f = Fixture::new();
+        let (code, admitted, stderr) = launch_session(&f, &args, None);
+        assert_eq!(code, 19, "{mode}: {stderr}");
+        assert!(
+            !stderr.contains(CAP_WARNING),
+            "{mode}: the admitted reference launch warned: {stderr}"
+        );
+        match mode {
+            // An unusable requested ceiling must not silently become another
+            // policy, an unusable account location stays unusable, and an
+            // unusable account path stays unusable.
+            "ceiling" => {}
+            "storage" => {}
+            "account" => {
+                fs::remove_dir_all(&f.account).unwrap();
+                fs::write(&f.account, b"not a directory").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let account_before = account_state(&f.account);
+        let (code, failed_open, stderr) = launch_session(&f, &args, Some(mode));
+        assert_eq!(code, 19, "{mode}: {stderr}");
+        assert_eq!(
+            failed_open, admitted,
+            "{mode}: the degraded launch changed the payload's arguments, cwd, streams or environment"
+        );
+        // One visible warning on the diagnostic channel, naming the requested
+        // ceiling, the failed stage, the cause, the scope and the recovery.
+        assert_eq!(
+            stderr.matches(CAP_WARNING).count(),
+            1,
+            "{mode}: exactly one fallback notice: {stderr}"
+        );
+        let requested = match mode {
+            "ceiling" => "requested ceiling eighty% of host CPU",
+            "storage" | "account" => "requested ceiling 75% of host CPU",
+            _ => unreachable!(),
+        };
+        assert!(stderr.contains(requested), "{mode}: {stderr}");
+        let stage = match mode {
+            "ceiling" => "failed stage: ceiling configuration",
+            "storage" => "failed stage: account storage",
+            "account" => "failed stage: budget admission",
+            _ => unreachable!(),
+        };
+        for marker in [stage, "cause: ", "scope: ", "recovery: ", "upstream stderr"] {
+            assert!(
+                stderr.contains(marker),
+                "{mode}: missing {marker:?}: {stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("codex-harness: shared harness unavailable"),
+            "{mode}: the shared checkout is intact here: {stderr}"
+        );
+        // Fail-open persists nothing: no disabled default, no replaced account
+        // path, and no change to the state a later launch reads.
+        assert_eq!(
+            account_state(&f.account),
+            account_before,
+            "{mode}: the degraded launch changed machine-local budget state"
+        );
+        assert!(
+            !f.root.path().join(RELATIVE_ACCOUNT).exists(),
+            "{mode}: a relative account location was created"
+        );
+    }
+}
+
+#[test]
+fn cpu_budget_conflict_fails_open_for_one_session_and_keeps_the_peer_allowance() {
+    let f = Fixture::new();
+    let cpus = host_logical_processors();
+    let threads = spinner_threads(cpus, TEST_RATE);
+    let budget = SharedCpuBudget::acquire(&f.account, TEST_RATE).unwrap();
+    let name = budget.name().to_owned();
+    let account_before = account_state(&f.account);
+    f.register_consumer(consumer());
+    // Peer session: admitted into the same lowered account allowance.
+    let peer = Consumer::new(f.root.path(), "peer");
+    let mut peer_command = f.command();
+    peer.configure(&mut peer_command, &name, threads, 30_000, true, 0);
+    peer_command.env(CPU_PERCENT_ENV, TEST_RATE.to_string());
+    let mut peer_child = peer_command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let peer_deadline = Duration::from_secs(30);
+    wait_for_path(&peer.directory.join("tree.json"), peer_deadline);
+    wait_for_path(&peer.directory.join("leaf.json"), peer_deadline);
+    assert_eq!(peer.tree()["in_shared"], json!(true), "{:?}", peer.tree());
+    assert_eq!(peer.leaf()["in_shared"], json!(true), "{:?}", peer.leaf());
+    // A second session asks for the installed default ceiling while the account
+    // already carries the lowered one. The account budget is preserved, so this
+    // launch must warn and start outside the group.
+    let failing = Consumer::new(f.root.path(), "conflict");
+    let mut failing_command = f.command();
+    failing.configure(&mut failing_command, &name, 1, 0, false, 23);
+    let output = failing_command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(23), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "the fallback notice must not reach stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(stderr.matches(CAP_WARNING).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("requested ceiling 75% of host CPU"),
+        "{stderr}"
+    );
+    for marker in [
+        "failed stage: budget admission",
+        "cause: ",
+        "scope: ",
+        "recovery: ",
+    ] {
+        assert!(stderr.contains(marker), "missing {marker:?}: {stderr}");
+    }
+    // Exactly one payload start, outside the account group but still inside its
+    // own session Job: fallback changes CPU admission, not containment.
+    let starts = failing.starts();
+    assert_eq!(starts.len(), 1, "one launch, one start: {starts:?}");
+    let tree = failing.tree();
+    assert_eq!(tree["in_shared"], json!(false), "{tree}");
+    assert_eq!(tree["in_any_job"], json!(true), "{tree}");
+    // The peer keeps its membership, ceiling and settings, and the account
+    // state a later launch reads is unchanged.
+    let snapshot = budget.snapshot().unwrap();
+    assert_eq!(
+        snapshot.cpu_rate,
+        cpu_rate_units(TEST_RATE),
+        "the degraded launch changed the peer ceiling"
+    );
+    assert!(snapshot.cpu_hard_cap);
+    assert!(
+        wait_for_members(&budget, 2, Duration::from_secs(15)),
+        "peer members left the group: {snapshot:?}"
+    );
+    assert!(
+        peer_child.try_wait().unwrap().is_none(),
+        "the peer session ended before the assertions"
+    );
+    assert_eq!(account_state(&f.account), account_before);
+    // Abnormal peer loss still reaps its own tree through its lifecycle Job.
+    peer_child.kill().unwrap();
+    let _ = peer_child.wait_with_output().unwrap();
+    assert!(
+        wait_for_empty(&budget),
+        "the peer session tree outlived its launcher"
+    );
+}
+
+#[test]
+fn unavailable_checkout_still_admits_the_payload_into_the_account_budget() {
+    let f = Fixture::new();
+    let budget = SharedCpuBudget::acquire(&f.account, TEST_RATE).unwrap();
+    let name = budget.name().to_owned();
+    f.register_consumer(consumer());
+    // The registered build stays launchable without its shared checkout, and
+    // the CPU cap must still be attempted for that launch.
+    fs::remove_dir_all(&f.source).unwrap();
+    let payload = Consumer::new(f.root.path(), "degraded");
+    let mut command = f.command();
+    command.env(CPU_PERCENT_ENV, TEST_RATE.to_string());
+    payload.configure(&mut command, &name, 2, 300, true, 21);
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(21), "{stderr}");
+    assert!(
+        stderr.contains(
+            "shared harness unavailable; launching registered Codex without harness overrides"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(CAP_WARNING),
+        "the CPU cap is independent of checkout availability: {stderr}"
+    );
+    assert_eq!(
+        payload.tree()["in_shared"],
+        json!(true),
+        "{:?}",
+        payload.tree()
+    );
+    assert_eq!(
+        payload.leaf()["in_shared"],
+        json!(true),
+        "{:?}",
+        payload.leaf()
+    );
+    let starts = payload.starts();
+    assert_eq!(starts.len(), 2, "{starts:?}");
 }

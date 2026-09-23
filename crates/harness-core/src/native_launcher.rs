@@ -2,6 +2,10 @@
 //! streams and console. The session process tree is owned by a kill-on-close
 //! Job that reaps it after an abnormal launcher death; on an ordinary exit the
 //! upstream-managed background processes keep their own lifetime.
+//! The payload is created into the account shared CPU budget (outer) and this
+//! session's lifecycle Job (inner) when that budget can be established; when it
+//! cannot, the launch warns on stderr and starts the same payload once outside
+//! the shared allowance instead of failing.
 //! Independently started kit services are not members of that job.
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
@@ -546,6 +550,141 @@ fn interactive_spec(command: &Command) -> io::Result<crate::process::CommandSpec
     Ok(spec)
 }
 
+/// Machine-local ceiling override for the shared account CPU budget, expressed
+/// like [`crate::process::SHARED_CPU_PERCENT`] as a percent of total host CPU.
+/// The value never comes from tracked source: an absent override keeps the
+/// installed default and an unusable one degrades to the warned fallback
+/// instead of silently changing the requested policy.
+#[cfg(windows)]
+const CPU_PERCENT_ENV: &str = "CODEX_HARNESS_CPU_PERCENT";
+
+/// Bound on the account critical section (one object create plus one small
+/// ownership-record write) before this launch reports the failed stage and
+/// proceeds. A stuck holder must delay a session start, never hang it.
+#[cfg(windows)]
+const CPU_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(windows)]
+const CPU_ACQUISITION_RECOVERY: &str = "repair the account budget state named in the cause (an unowned or conflicting shared job object, or an unreadable ownership record) and start the session again; the next launch retries the cap automatically";
+
+/// The account group exists, but the kernel refused to create this payload
+/// inside it. A dispatching hierarchy that already assigns the launcher to
+/// another job can reject the ordered placement outright; the payload then
+/// starts once in its session lifecycle Job alone.
+#[cfg(windows)]
+const CPU_PLACEMENT_RECOVERY: &str = "start the session from a plain interactive shell when the shared cap is required, and report the dispatching route so its job hierarchy can be reconciled; the next launch retries the cap automatically";
+
+/// Visible degradation notice for one failed CPU-admission attempt. It names
+/// the requested ceiling, the failed stage and cause, the affected scope and
+/// the recovery action, and never claims that inherited limits were removed.
+/// stderr only: stdout belongs to the payload and to machine protocols.
+#[cfg(windows)]
+fn warn_cpu_fallback(requested: &str, stage: &str, cause: &str, recovery: &str) {
+    eprintln!(
+        "codex-harness: shared agent CPU cap not verified: requested ceiling {requested}; failed stage: {stage}; cause: {cause}; scope: this session starts outside the verified account CPU group, so its own CPU use is not bounded by the shared allowance while other sessions keep theirs; recovery: {recovery}"
+    );
+}
+
+#[cfg(windows)]
+struct CpuAdmission {
+    /// Requested ceiling as reported to the user, e.g. `75% of host CPU`.
+    requested: String,
+    /// The established account group, or `None` after a warned fail-open.
+    budget: Option<crate::process::SharedCpuBudget>,
+}
+
+/// Join or establish this account's shared CPU budget for the payload that is
+/// about to start. Fail-open contract: every setup, acquisition or readback
+/// failure warns on stderr and yields no group, so the caller starts the
+/// requested payload exactly once without the shared ceiling. Nothing is
+/// persisted here, no build or update is required, and other sessions keep
+/// their own handles, membership and settings.
+#[cfg(windows)]
+fn session_cpu_admission() -> CpuAdmission {
+    use crate::process::{
+        CPU_BUDGET_ACCOUNT_ENV, Cancellation, Deadline, SHARED_CPU_PERCENT, SharedCpuBudget,
+        cpu_budget_directory,
+    };
+    let (requested, percent) = match env::var_os(CPU_PERCENT_ENV).filter(|value| !value.is_empty())
+    {
+        None => (
+            format!("{SHARED_CPU_PERCENT}% of host CPU"),
+            SHARED_CPU_PERCENT,
+        ),
+        Some(value) => {
+            let text = value.to_string_lossy().into_owned();
+            let requested = format!("{text}% of host CPU");
+            match text.trim().parse::<f64>() {
+                Ok(percent) => (requested, percent),
+                Err(_) => {
+                    warn_cpu_fallback(
+                        &requested,
+                        "ceiling configuration",
+                        &format!("{CPU_PERCENT_ENV} does not hold a number"),
+                        &format!(
+                            "set {CPU_PERCENT_ENV} to a percentage within 0.01..=100 or unset it to use the installed {SHARED_CPU_PERCENT}% default"
+                        ),
+                    );
+                    return CpuAdmission {
+                        requested,
+                        budget: None,
+                    };
+                }
+            }
+        }
+    };
+    let directory = match cpu_budget_directory(None) {
+        Ok(directory) => directory,
+        Err(error) => {
+            warn_cpu_fallback(
+                &requested,
+                "account storage",
+                &error.to_string(),
+                &format!(
+                    "point {CPU_BUDGET_ACCOUNT_ENV} at a writable absolute account directory or restore LOCALAPPDATA"
+                ),
+            );
+            return CpuAdmission {
+                requested,
+                budget: None,
+            };
+        }
+    };
+    let deadline = match Deadline::after(CPU_ADMISSION_WAIT) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            warn_cpu_fallback(
+                &requested,
+                "budget admission",
+                &error.to_string(),
+                CPU_ACQUISITION_RECOVERY,
+            );
+            return CpuAdmission {
+                requested,
+                budget: None,
+            };
+        }
+    };
+    let budget = match SharedCpuBudget::acquire_within(
+        &directory,
+        percent,
+        deadline,
+        &Cancellation::default(),
+    ) {
+        Ok(budget) => Some(budget),
+        Err(error) => {
+            warn_cpu_fallback(
+                &requested,
+                "budget admission",
+                &error.to_string(),
+                CPU_ACQUISITION_RECOVERY,
+            );
+            None
+        }
+    };
+    CpuAdmission { requested, budget }
+}
+
 pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32> {
     // An unusable upstream executable must fail as an error, not as a desktop
     // loader dialog.
@@ -582,7 +721,34 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     let code = {
         let spec = interactive_spec(&command)?;
         let job = crate::process::Job::new(crate::process::Limits::default())?;
-        let child = job.spawn(&spec)?;
+        // Admission happens before payload creation: the ordered pair keeps the
+        // account CPU budget outside this session's lifecycle Job, so no
+        // payload code runs outside the shared ceiling. When the budget cannot
+        // be established, or when the kernel refuses to place this payload
+        // inside it, the same lifecycle Job alone starts the requested payload
+        // exactly once with its arguments, cwd, streams and exit status. Every
+        // failed attempt below is terminated while still suspended, so no
+        // payload code has run and no work is replayed or duplicated.
+        let admission = session_cpu_admission();
+        let child = match &admission.budget {
+            Some(budget) => match budget.spawn(&job, &spec) {
+                Ok(child) => child,
+                Err(error) => {
+                    warn_cpu_fallback(
+                        &admission.requested,
+                        "session placement",
+                        &format!("the ordered payload placement was refused ({error})"),
+                        CPU_PLACEMENT_RECOVERY,
+                    );
+                    job.spawn(&spec)?
+                }
+            },
+            None => job.spawn(&spec)?,
+        };
+        // `admission` is held until this wait returns: while a member runs, the
+        // named object stays this account's one shared allowance for any later
+        // session, and closing one participant's handle changes nothing for
+        // peers.
         job.wait_session_root(&child)? as i32
     };
     #[cfg(not(windows))]
