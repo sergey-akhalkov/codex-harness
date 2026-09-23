@@ -207,6 +207,11 @@ fn completion_burst(server: &Server) {
         json!({"method":"item/completed","params":{"threadId":THREAD,"item":{
         "id":"m1","type":"agentMessage","text":FINAL}}}),
     );
+    // Token-level deltas must neither render nor occupy the bounded detail
+    // file; the completed item above carries the same content.
+    server.push(
+        json!({"method":"item/agentMessage/delta","params":{"threadId":THREAD,"turnId":TURN,"itemId":"m1","delta":"IGNORED_DELTA"}}),
+    );
     server.push(
         json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":TURN,"status":"completed"}}}),
     );
@@ -630,7 +635,7 @@ fn lifecycle_mapping_follows_the_thread_records() {
     let mut fixture = fixture();
     let mut conversation = fixture.start().unwrap();
     completion_burst(&fixture.server);
-    let events = drain(&mut conversation, 7);
+    let events = drain(&mut conversation, 8);
     let states: Vec<Option<Lifecycle>> = events.iter().map(|event| event.lifecycle).collect();
     assert_eq!(
         states,
@@ -640,6 +645,7 @@ fn lifecycle_mapping_follows_the_thread_records() {
             Some(Lifecycle::Running),
             Some(Lifecycle::Running),
             Some(Lifecycle::Running),
+            None,
             Some(Lifecycle::Completed),
             None
         ],
@@ -1270,6 +1276,9 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
     let detail = fs::read_to_string(pooled.detail_path()).unwrap();
     assert!(detail.contains("\"method\":\"thread/started\""), "{detail}");
     assert!(detail.contains("\"method\":\"turn/completed\""), "{detail}");
+    assert!(!detail.contains("agentMessage/delta"), "{detail}");
+    assert!(!text.contains("event: item/agentMessage/delta"), "{text}");
+    assert!(!text.contains("IGNORED_DELTA"), "{text}");
 
     // The endpoint record is the address `executor stop` and
     // `executor message` read: beside the dispatch receipt, under the name the

@@ -2423,6 +2423,11 @@ fn drive_control(
         let events = conversation.pump()?;
         let empty = events.is_empty();
         for event in &events {
+            if event.transient {
+                // A token-level delta neither renders nor occupies the
+                // bounded detail file: its completed item carries the text.
+                continue;
+            }
             if let Some(detail) = detail {
                 match observation::append_detail(detail, &event.raw.to_string()) {
                     Ok(true) => {}

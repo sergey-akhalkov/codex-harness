@@ -548,7 +548,8 @@ pub enum FinalMessage {
 ///
 /// The raw record is retained for the receipt and the bounded detail file, so a
 /// rendering decision or a later reconciliation never has to re-read the
-/// conversation.
+/// conversation; token-level delta records are the one exception, because
+/// their completed item already carries their content.
 #[derive(Debug, Clone)]
 pub struct ControlEvent {
     /// The raw control record.
@@ -564,6 +565,11 @@ pub struct ControlEvent {
     /// rendered; [`Self::render`] skips it so one delivered message shows once
     /// even when the server announces it both as started and as completed.
     pub repeat: bool,
+    /// True for a token-level `*/*delta` record. Its content is fully
+    /// derivable from the completed item, so it is neither rendered on the
+    /// visible surface nor retained in the bounded detail file; one such
+    /// record per model token would otherwise flood both.
+    pub transient: bool,
 }
 
 impl ControlEvent {
@@ -572,7 +578,7 @@ impl ControlEvent {
     /// Reasoning summaries are intentionally not rendered: the surface carries
     /// decisions, activity and lifecycle, not opaque model state.
     pub fn render(&self, out: &mut dyn Write) -> io::Result<()> {
-        if self.repeat {
+        if self.repeat || self.transient {
             return Ok(());
         }
         let Some(line) = self.line() else {
@@ -1098,6 +1104,9 @@ impl Conversation {
             lifecycle: None,
             deviation: None,
             repeat: false,
+            transient: method
+                .as_deref()
+                .is_some_and(|name| name.ends_with("/delta")),
         };
         let Some(method) = method else {
             // A response that no request awaits is a deviation from the
