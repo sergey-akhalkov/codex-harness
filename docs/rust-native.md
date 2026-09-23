@@ -248,7 +248,7 @@ examples and routing rules live in
 
 ## Native task-control contract
 
-The [subscription orchestration change](../openspec/changes/orchestrate-subscription-agents/tasks.md)
+The [subscription orchestration change](../openspec/changes/archive/2026-09-20-orchestrate-subscription-agents/tasks.md)
 is under development. Its bounded Rust WebSocket client has an opt-in native
 contract check; global activation and quota handoff remain unfinished.
 Supply the intended native CLI executable explicitly, then run from this checkout:
@@ -817,6 +817,16 @@ rejects missing registry, missing Python and incompatible version/status before 
 child starts. Adopted-package probes need `HARNESS_CODE_TOOLS_REGISTRY` and
 `--ignored`. The helper sets an owned `SERENA_HOME` under the launch home, does
 not take a CodeGraph admission slot, and does not replace the live Python seam.
+Post-delivery MCP availability is also checked through the real entrypoints
+with a location record grown past the historical fixed bound: the unignored
+broker-state, CodeGraph-account and Serena-broker regressions run in the
+standard workspace gate, and the adopted-package checks
+`cargo test --locked -p codex-harness --test codegraph_mcp grown_account_anchor_lets_the_published_mcp_complete_handshake -- --ignored --exact --test-threads=1`
+(explicit `CODEGRAPH_ACCEPTANCE_PACKAGE` and an owned indexed
+`CODEGRAPH_ACCEPTANCE_PROJECT`) and
+`cargo test --locked -p codex-harness --test serena_stdio grown_location_record_still_completes_handshake_after_deliveries -- --ignored --exact --test-threads=1`
+(explicit `HARNESS_CODE_TOOLS_REGISTRY`) must complete MCP initialize and
+tools/list before a release is called delivered.
 
 ## Diagnostics, dependencies and CBM
 

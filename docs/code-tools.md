@@ -282,6 +282,13 @@ the broker that sessions of the previous build still use; those keep working
 and their broker expires on its own idle timeout once they finish. Sharing
 within one generation is unchanged, and `mcp broker-retire` /
 `mcp retire-codegraph` remain the explicit maintenance path.
+Location records stay bounded across deliveries: entries whose directory is
+gone are dropped, a generation whose broker instance is no longer live is
+pruned, and a new generation reuses a freed location before preparing another
+one. The record read stays a fixed 64 KiB guard, not a lifetime limit; a record
+grown by past deliveries is parsed, pruned and rewritten on the first startup
+instead of failing MCP initialize. Release checks cover both record owners with
+a grown-record regression and adopted-package handshakes.
 
 ## Large-repository indexing
 
