@@ -12,8 +12,6 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 #[derive(Clone, Copy, Debug)]
 pub enum Resource {
-    CodebaseIndex,
-    CodebaseCatalogue,
     BrokerStartup,
     BrokerInstance,
     Desktop,
@@ -23,8 +21,6 @@ pub enum Resource {
 impl Resource {
     fn filename(self) -> &'static str {
         match self {
-            Self::CodebaseIndex => "cbm-index.lock",
-            Self::CodebaseCatalogue => "cbm-catalogue.lock",
             Self::BrokerStartup => "startup.lock",
             Self::BrokerInstance => "instance.lock",
             Self::Desktop => "desktop.lock",
@@ -152,25 +148,25 @@ mod tests {
     #[test]
     fn serializes_account_slot_and_preserves_existing_bytes_and_file() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("cbm-index.lock");
+        let path = root.path().join("startup.lock");
         fs::write(&path, b"existing-private-marker").unwrap();
-        let first = acquire(root.path(), Resource::CodebaseIndex).unwrap();
+        let first = acquire(root.path(), Resource::BrokerStartup).unwrap();
         assert!(matches!(
-            acquire(root.path(), Resource::CodebaseIndex),
+            acquire(root.path(), Resource::BrokerStartup),
             Err(error) if error.kind() == io::ErrorKind::TimedOut
         ));
-        let independent = acquire(root.path(), Resource::CodebaseCatalogue).unwrap();
+        let independent = acquire(root.path(), Resource::BrokerInstance).unwrap();
         assert!(fs::remove_file(&path).is_err());
         drop((first, independent));
         assert_eq!(fs::read(&path).unwrap(), b"existing-private-marker");
-        assert!(acquire(root.path(), Resource::CodebaseIndex).is_ok());
+        assert!(acquire(root.path(), Resource::BrokerStartup).is_ok());
         assert!(path.exists());
     }
 
     #[test]
     fn conflicts_with_the_legacy_first_byte_lock() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("cbm-index.lock");
+        let path = root.path().join("startup.lock");
         let legacy = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -192,11 +188,11 @@ mod tests {
             0
         );
         assert!(matches!(
-            acquire(root.path(), Resource::CodebaseIndex),
+            acquire(root.path(), Resource::BrokerStartup),
             Err(error) if error.kind() == io::ErrorKind::TimedOut
         ));
         drop(legacy);
-        assert!(acquire(root.path(), Resource::CodebaseIndex).is_ok());
+        assert!(acquire(root.path(), Resource::BrokerStartup).is_ok());
     }
 
     #[test]
@@ -205,12 +201,12 @@ mod tests {
         let cancellation = Cancellation::default();
         cancellation.cancel();
         assert!(matches!(Lease::acquire(
-            root.path(), Resource::CodebaseIndex,
+            root.path(), Resource::BrokerStartup,
             Deadline::after(Duration::from_secs(1)).unwrap(), &cancellation
         ), Err(error) if error.kind() == io::ErrorKind::Interrupted));
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         let absent = root.path().join("absent");
-        assert!(acquire(&absent, Resource::CodebaseIndex).is_err());
+        assert!(acquire(&absent, Resource::BrokerStartup).is_err());
         assert!(!absent.exists());
     }
 
@@ -219,8 +215,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sentinel = root.path().join("sentinel");
         fs::write(&sentinel, b"PRIVATE-SENTINEL").unwrap();
-        fs::hard_link(&sentinel, root.path().join("cbm-index.lock")).unwrap();
-        assert!(acquire(root.path(), Resource::CodebaseIndex).is_err());
+        fs::hard_link(&sentinel, root.path().join("startup.lock")).unwrap();
+        assert!(acquire(root.path(), Resource::BrokerStartup).is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"PRIVATE-SENTINEL");
     }
 

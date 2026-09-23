@@ -4,13 +4,12 @@
 #![cfg(windows)]
 
 use crate::{
-    codegraph_integration,
-    codegraph_registration::{self, RegistrationRequest},
     config_file::ConfigSnapshot,
     dependency_discovery::{self, local_path},
     installation_lock::InstallationLocks,
     installation_state::normal,
-    inventory,
+    inventory, mcp_preparation,
+    mcp_registration::{self, RegistrationRequest},
     registration_native::StagedFile,
 };
 use serde::Serialize;
@@ -128,7 +127,6 @@ fn discovery_request(
         rustup_home: selected("RUSTUP_HOME"),
         path: if include { env::var_os("PATH") } else { None },
         nuphus_models: selected("NUPHUS_MODELS_DIR"),
-        codegraph_roots: Vec::new(),
         full_records: false,
         probe_versions: false,
         processes: false,
@@ -238,11 +236,9 @@ pub fn run(request: &Request) -> io::Result<Report> {
     }
     let activating = matches!(request.mode, Mode::Install | Mode::Update) && !request.preview;
     if request.mode == Mode::Recover {
-        let registration = codegraph_registration::apply(&RegistrationRequest {
+        let registration = mcp_registration::apply(&RegistrationRequest {
             codex_home: home.clone(),
             mode: "Recover".into(),
-            command: None,
-            package_root: None,
             defer_commit: false,
             preview: request.preview,
             retained_registrations: None,
@@ -259,11 +255,9 @@ pub fn run(request: &Request) -> io::Result<Report> {
         });
     }
     if activating && let Some(manager) = request.manager.as_deref() {
-        let prepared = codegraph_integration::prepare(
-            &codegraph_integration::Request {
+        let prepared = mcp_preparation::prepare(
+            &mcp_preparation::Request {
                 codex_home: home.clone(),
-                dependency_state: dependency.join(".cache/coding-agents-harness-codegraph"),
-                package_root: None,
                 source_root: Some(source.clone()),
                 inventory: Some(inventory.clone()),
                 mode: if request.mode == Mode::Update {
@@ -288,7 +282,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
     // Mutating modes never silently drop a managed connection: every managed
     // tool must carry a verified native registration.
     if activating {
-        for name in ["serena", "nuphus", "codegraph"] {
+        for name in ["serena", "nuphus"] {
             if retained_for_graph["registrations"][name].is_null() {
                 return Err(conflict(&format!(
                     "{name} has no verified native connection; explicit provisioning is required."
@@ -296,7 +290,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
             }
         }
     }
-    let registration = codegraph_registration::apply(&RegistrationRequest {
+    let registration = mcp_registration::apply(&RegistrationRequest {
         codex_home: home.clone(),
         mode: match request.mode {
             Mode::Install if !request.preview => "Install".into(),
@@ -304,14 +298,6 @@ pub fn run(request: &Request) -> io::Result<Report> {
             Mode::Disconnect => "Disconnect".into(),
             _ => "Check".into(),
         },
-        command: retained_for_graph["registrations"]["codegraph"]["command"]
-            .as_str()
-            .map(PathBuf::from),
-        package_root: retained_for_graph["registrations"]["codegraph"]["args"]
-            .as_array()
-            .and_then(|args| args.get(3))
-            .and_then(Value::as_str)
-            .map(PathBuf::from),
         defer_commit: false,
         preview: request.preview,
         retained_registrations: Some(retained_for_graph),

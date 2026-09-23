@@ -14,20 +14,6 @@ struct Fixture {
     bin: PathBuf,
 }
 impl Fixture {
-    fn select_legacy_cbm(&self) {
-        let path = self.source.join("global/code-tools.json");
-        let mut catalogue: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let provider = catalogue["mcp"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|entry| entry["id"] == "codegraph")
-            .unwrap();
-        *provider = json!({"id":"codebase-memory","package":"codebase-memory-mcp",
-            "manager":"npm","source":"https://github.com/DeusData/codebase-memory-mcp",
-            "metadata":"https://registry.npmjs.org/codebase-memory-mcp/latest"});
-        fs::write(path, serde_json::to_vec(&catalogue).unwrap()).unwrap();
-    }
     fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("dependency-observation проверка-")
@@ -135,7 +121,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
     assert_eq!(report["read_only"], true);
     assert_eq!(report["network_requested"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 4);
     for item in items {
         assert_eq!(item["release"]["state"], "unresolved");
         assert!(item["release"]["version"].is_null());
@@ -148,7 +134,7 @@ fn explicit_plan_preserves_unresolved_sources_without_network_or_secret_output()
 }
 
 #[test]
-#[ignore = "explicit public HTTPS release metadata for the five selected dependencies"]
+#[ignore = "explicit public HTTPS release metadata for the four selected dependencies"]
 fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptance() {
     let fixture = Fixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
@@ -175,7 +161,7 @@ fn actual_official_release_plan_retains_missing_home_and_requires_later_acceptan
     assert_eq!(report["model_calls"], 0);
     assert_eq!(report["read_only"], true);
     let items = report["items"].as_array().unwrap();
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 5);
     for item in items {
         assert_eq!(
             item["release"]["state"], "checked",
@@ -206,8 +192,8 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
     assert_eq!(report["processes_started"], 0);
     assert_eq!(report["model_calls"], 0);
     assert_eq!(report["languages"].as_array().unwrap().len(), 2);
-    assert_eq!(report["mcp"].as_array().unwrap().len(), 3);
-    for id in ["serena", "codegraph", "nuphus", "python", "rust"] {
+    assert_eq!(report["mcp"].as_array().unwrap().len(), 2);
+    for id in ["serena", "nuphus", "python", "rust"] {
         assert_eq!(record(&report, id)["status"], "missing", "{id}: {report}");
     }
     assert!(!fixture.home.exists());
@@ -215,10 +201,10 @@ fn foreign_home_never_adopts_ambient_runtime_or_creates_missing_directories() {
 }
 
 #[test]
-fn discover_reports_missing_codegraph_without_mutating_or_downloading() {
+fn discover_omits_retired_codegraph_without_mutating_or_downloading() {
     let fixture = Fixture::new();
     let report = fixture.observe(&["--no-process-environment"]);
-    assert_eq!(report["mcp"].as_array().unwrap().len(), 3);
+    assert_eq!(report["mcp"].as_array().unwrap().len(), 2);
     assert_eq!(
         report["mcp"]
             .as_array()
@@ -226,7 +212,7 @@ fn discover_reports_missing_codegraph_without_mutating_or_downloading() {
             .iter()
             .filter(|row| row["id"] == "codegraph")
             .count(),
-        1
+        0
     );
     assert!(
         !report["mcp"]
@@ -235,10 +221,8 @@ fn discover_reports_missing_codegraph_without_mutating_or_downloading() {
             .iter()
             .any(|row| row["id"] == "codebase-memory")
     );
-    let row = record(&report, "codegraph");
-    assert_eq!(row["status"], "missing");
-    assert_eq!(row["identity"], "@colbymchenry/codegraph");
-    assert_eq!(row["health"]["callable"], Value::Null);
+    assert_eq!(record(&report, "serena")["status"], "missing");
+    assert_eq!(record(&report, "nuphus")["status"], "missing");
     assert_eq!(
         report["release_checks"],
         "not-requested; explicit lifecycle operation required"
@@ -247,57 +231,21 @@ fn discover_reports_missing_codegraph_without_mutating_or_downloading() {
 }
 
 #[test]
-fn inspect_codegraph_rejects_synthetic_layout_without_network() {
-    let fixture = Fixture::new();
-    let pkg = fixture.root.path().join("fake-codegraph");
-    fs::create_dir_all(pkg.join("lib/dist/bin")).unwrap();
-    fs::create_dir_all(pkg.join("lib/kernel")).unwrap();
-    fs::create_dir_all(pkg.join("lib/node_modules")).unwrap();
-    fs::write(pkg.join("node.exe"), b"not-official-node").unwrap();
-    fs::write(pkg.join("lib/dist/bin/codegraph.js"), b"not-official-entry").unwrap();
-    fs::write(
-        pkg.join("lib/kernel/codegraph-kernel.node"),
-        b"not-official-kernel",
-    )
-    .unwrap();
-    fs::write(
-        pkg.join("lib/package.json"),
-        br#"{"name":"@colbymchenry/codegraph","version":"1.6.0"}"#,
-    )
-    .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
-        .args(["dependencies", "inspect-codegraph", "--package-root"])
-        .arg(&pkg)
-        .current_dir(fixture.root.path())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-}
-
-#[test]
 fn native_payloads_are_observed_without_shims_or_runtimes_and_versions_must_match() {
     let fixture = Fixture::new();
-    fixture.select_legacy_cbm();
     let prefix = fixture.home.join("AppData/Roaming/npm");
-    let codebase = fixture.npm(&prefix, "codebase-memory-mcp", "codebase-memory-mcp");
     let nuphus = fixture.npm(&prefix, "@nuphus/nuphus-mcp", "nuphus-mcp");
     let absent = fixture.observe(&["--no-process-environment"]);
-    assert_eq!(record(&absent, "codebase-memory")["status"], "broken");
     assert_eq!(record(&absent, "nuphus")["status"], "broken");
-    fs::create_dir(codebase.join("bin")).unwrap();
-    fs::write(
-        codebase.join("bin/codebase-memory-mcp.exe"),
-        b"inert codebase payload",
-    )
-    .unwrap();
+    fs::create_dir(nuphus.join("bin")).unwrap();
+    fs::write(nuphus.join("bin/nuphus-mcp.exe"), b"inert nuphus payload").unwrap();
     let companion = fixture.npm(&prefix, "@nuphus/nuphus-mcp-win32-x64", "unused");
     fs::create_dir(companion.join("bin")).unwrap();
     let native = companion.join("bin/nuphus-mcp.exe");
     fs::write(&native, b"inert native companion").unwrap();
     fs::write(companion.join("bin/onnxruntime.dll"), b"inert library").unwrap();
     let observed = fixture.observe(&["--no-process-environment"]);
-    for id in ["codebase-memory", "nuphus"] {
+    for id in ["nuphus"] {
         let row = record(&observed, id);
         assert_eq!(row["status"], "adopted");
         assert_eq!(row["command"].as_array().unwrap().len(), 1);
@@ -585,11 +533,10 @@ fn cli_process_observation_sees_owned_consumer_without_disclosing_arguments_or_s
         }
     }
     let fixture = Fixture::new();
-    fixture.select_legacy_cbm();
     let prefix = fixture.home.join("AppData/Roaming/npm");
-    let root = fixture.npm(&prefix, "codebase-memory-mcp", "codebase-memory-mcp");
+    let root = fixture.npm(&prefix, "@nuphus/nuphus-mcp", "nuphus-mcp");
     fs::create_dir(root.join("bin")).unwrap();
-    let binary = root.join("bin/codebase-memory-mcp.exe");
+    let binary = root.join("bin/nuphus-mcp.exe");
     fs::copy(env!("CARGO_BIN_EXE_harness-launch-fixture"), &binary).unwrap();
     let pid_file = fixture.root.path().join("consumer.pid");
     let mut child = ChildGuard(
@@ -613,7 +560,7 @@ fn cli_process_observation_sees_owned_consumer_without_disclosing_arguments_or_s
     let report = fixture.observe(&["--processes", "--no-process-environment"]);
     assert_eq!(report["processes_started"], 0);
     assert_eq!(report["process_inspection_requested"], true);
-    let consumers = &record(&report, "codebase-memory")["active_consumers"];
+    let consumers = &record(&report, "nuphus")["active_consumers"];
     assert!(
         matches!(consumers["state"].as_str(), Some("observed" | "incomplete")),
         "{consumers}"

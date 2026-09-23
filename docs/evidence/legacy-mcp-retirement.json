@@ -1,79 +1,60 @@
 {
   "schema": 1,
-  "capturedUtc": "2026-09-17T08:55:13Z",
-  "change": "migrate-harness-to-rust; remove-graphify-remnants",
-  "task": "8.1; updated by 9.5; graphify removal and guard recorded by remove-graphify-remnants 3.3/5.4",
+  "capturedUtc": "2026-09-23T18:55:00Z",
+  "change": "retire-codegraph-sharpen-serena",
+  "task": "retirement record for CodeGraph and the final Codebase Memory removal",
   "liveMcp": [
     "serena",
-    "codegraph",
     "nuphus"
   ],
   "retiredMcp": [
     "graphify",
     "codebase-memory",
+    "codegraph",
     "harness-lsp"
   ],
-  "classification": [
-    {
-      "path": "tools/lsp, tools/code-tools, tools/*.psm1, install.ps1, global/kit.psd1",
-      "class": "retired-owned",
-      "consumers": [],
-      "action": "removed 2026-09-17 after consumer checks: the live installation uses native launcher, Check, MCP and hook registrations; machine-local rollback copies stay under the owned staging root only"
-    },
-    {
-      "path": "crates/harness-core/src/cbm_*.rs",
-      "class": "rollback-residue",
-      "consumers": [
-        "codex-harness mcp codebase-memory",
-        "crates/codex-harness/tests/cbm_*.rs"
-      ],
-      "action": "no new CBM port; retained as documented compatibility/rollback for the retired registration with transport/resource failure oracles"
-    },
-    {
-      "path": "tests/fixtures/lsp/{delayed-mcp,mcp-edit}.py",
-      "class": "inert-data",
-      "consumers": [
-        "crates/harness-core/src/analysis_samples.rs"
-      ],
-      "action": "declared analysis samples; native helpers refuse them as launchable programs"
-    }
-  ],
-  "graphify": {
-    "retired": "2026-09-15 from the managed MCP selection after measured use collapsed to a handful of calls; CodeGraph covers the selected graph role",
-    "removedSurface": [
-      "crates/harness-core/src/dependency_discovery.rs: the uv verification branch (graphify/serve.py module, Scripts/graphify-mcp.exe entry, graphify-mcp console identity, graphify package dirs), the (mcp,graphify) -> (graphifyy,uv) identity mapping, the @dreamtree-org/graphify npm exclusion, the shared-service manifest read and the graphify_manifest request/discovery field",
-      "crates/harness-core/src/dependency_plan.rs and dependency_fetch.rs: dispatch arms; fixtures re-pointed to retained ids with normalized-name coverage kept",
-      "crates/harness-core/src/dependency_apply.rs and crates/codex-harness/src/dependency_apply_cli.rs: the graphify mention in the apply note and help (an accepted CLI break for the retired tool only)",
-      "crates/codex-harness/src/dependency_cli.rs: the --graphify-manifest flag, its help text and the PROGRAMDATA/OpenCodeWorkstation/manifest.json default",
-      "crates/harness-core/src/subscription_lifecycle.rs: the bootstrap-graphify-pending.json restart blocker (a retired tool cannot be mid-bootstrap and a stale marker must not block restart-policy changes)",
-      "crates/codex-harness/tests: the manifest-secret test (feature-specific) and the retired-tool fixture ids; the rustup observation it also covered remains as rustup_metadata_is_observed_without_executing_or_claiming_versions"
+  "registrationGuard": {
+    "where": [
+      "crates/harness-core/src/mcp_registration.rs (CBM, GRAPHIFY and GRAPH skip/conflict lists and all_names)"
     ],
-    "registrationGuard": {
-      "where": [
-        "crates/harness-core/src/codegraph_registration.rs (GRAPHIFY skip/conflict lists, retired projection, all_names)",
-        "crates/harness-core/src/codegraph_integration.rs (retired projection)"
-      ],
-      "rationale": "an Update must remove an owned registration recorded by a pre-retirement version instead of re-registering a broken server, and must still refuse name/ownership conflicts on an unowned same-name table",
-      "removalCondition": "drop only when no supported host state can predate the 2026-09-15 retirement; revisit at the next major lifecycle change",
-      "tests": [
-        "crates/codex-harness/tests/codegraph_install.rs (graphify-absence assertions preserved)",
-        "crates/codex-harness/tests/codegraph_consumers.rs"
-      ]
-    },
-    "referenceSweep": {
-      "date": "2026-09-17",
-      "commands": [
-        "git grep -i graphify",
-        "git ls-files | rg -i graphify"
-      ],
-      "allowlist": [
-        "the current change artifacts and OpenSpec archives (historical records)",
-        "docs/evidence/rust-migration-map.json (dated 2026-09-08 inventory), docs/evidence/rust-migration.md (migration evidence) and docs/project-decisions.md (decision records)",
-        "docs/code-tools.md retired-tool note and docs/evidence/legacy-mcp-retirement.json / rust-requirement-checks.json",
-        "the GRAPHIFY registration guard, its comment and the graphify-absence assertions",
-        "current specs that describe the accepted retired selection (global-code-tools scenarios)"
-      ],
-      "result": "5.4/5.5 re-run 2026-09-17T08:55:13Z after native workspace tests: no graphify-named source files; every remaining hit falls in this allowlist; the transitional tools/ layer no longer exists (migrate-harness-to-rust 9.2/9.5 landed before this change)"
-    }
+    "rationale": "an Update must remove an owned registration recorded by a pre-retirement version instead of re-registering a broken server, and must still refuse name/ownership conflicts on an unowned same-name table",
+    "removalCondition": "drop a name only when no supported host state can predate its retirement; revisit at the next major lifecycle change",
+    "tests": [
+      "crates/codex-harness/tests/mcp_registration.rs"
+    ]
+  },
+  "codegraph": {
+    "retired": "2026-09-23 from the managed selection and from first-party code by the user's decision",
+    "evidence": [
+      "measured Code Mode invocations over 30 local rollout days: Serena 689, Nuphus 662, CodeGraph 49, with 41 CodeGraph calls in the 2026-09-13..15 acceptance window and 0-3/day after 2026-09-18",
+      "a live session returned 'CodeGraph client is not connected' for every managed codegraph_search while check --code-tools-only still reported the registration connected",
+      "first-party maintenance surface was about 7.5k source and 5.5k test lines, roughly twice the Serena integration"
+    ],
+    "removedSurface": [
+      "crates/harness-core/src/codegraph_*.rs serving, broker, scheduler, observer, runtime, catalogue, response, generation, store and transport modules",
+      "crates/harness-core/src/dependency_codegraph.rs and every codegraph dispatch arm in dependency discovery, planning, staging, selection, audit and fetch",
+      "codex-harness mcp codegraph, codegraph-control, retire-codegraph CLI routes; prepare-codegraph/apply-codegraph-registration renamed to prepare-mcp/apply-registration",
+      "the codegraph mcp entry in global/code-tools.json and the CodeGraph resource row",
+      "tests: codegraph_consumers, codegraph_dependency, codegraph_failures, codegraph_mcp, codegraph_transport, codegraph_generation and the codegraph comparison support"
+    ],
+    "hostResidue": "shared published package, saved graphs, .codegraph-harness-* caches and account/broker state stay on the host as inert data; the kit neither reads nor restores them"
+  },
+  "codebaseMemory": {
+    "history": "retired from the managed selection 2026-09-17; the manual stdio/broker route and cbm_* modules remained as documented rollback residue",
+    "removed": "2026-09-23 with the graph cleanup: cbm_* modules, the mcp codebase-memory CLI, cbm dependency planning/probing and the cbm_* tests are gone; the registration guard above still removes an owned legacy registration on Update"
+  },
+  "referenceSweep": {
+    "commands": [
+      "git grep -i codegraph",
+      "git grep -i 'codebase-memory'",
+      "git grep -i graphify"
+    ],
+    "allowlist": [
+      "current change artifacts and OpenSpec archives (historical records)",
+      "docs/evidence/rust-migration-map.json (dated inventory), rust-migration.md and project-decisions.md (decision history)",
+      "retirement notes in docs/code-tools.md and this record",
+      "the registration guard constants and their tests",
+      "current specs that describe the accepted retired selection"
+    ]
   }
 }

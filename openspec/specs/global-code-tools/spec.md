@@ -4,35 +4,36 @@ Make the accepted MCP and language capabilities usable from globally configured 
 
 ## Requirements
 
-### Requirement: Three globally available MCP integrations
+### Requirement: Two globally available MCP integrations
 
-Serena, CodeGraph from `colbymchenry/codegraph`, and Nuphus SHALL be the
-managed global capabilities, subject to applicable user overrides. Graphify
-SHALL remain retired from the managed selection the same way Codebase Memory
-was: an update removes only the owned registration, while the shared package
-and saved state remain installed and usable through an explicit local route
-without per-project configuration. The accepted subscription-efficiency
-selection SHALL still be allowed to disable an LSP-bearing integration when
-its language functions fail the benefit gate, including Serena; unrelated
-useful MCP functions and external installations SHALL be preserved. Retained
-integrations SHALL be discoverable without per-project configuration, manual
-startup or a special working directory in supported interactive,
-non-interactive, resumed/forked and subagent consumers. Desktop/IDE coverage
-SHALL require actual configuration-consumer evidence rather than a CLI-only
-claim. Existing processes needing registration reload SHALL be identified
+Serena and Nuphus SHALL be the managed global capabilities, subject to
+applicable user overrides. CodeGraph, Graphify and Codebase Memory SHALL be
+fully retired: no managed selection, registration, first-party adapter or CLI
+route survives in the kit, while an update removes any owned registration
+recorded by an earlier version and shared packages, saved graphs and caches
+remain inert host residue outside the kit's ownership. Retained integrations SHALL be
+discoverable without per-project configuration, manual startup or a special
+working directory in supported interactive, non-interactive, resumed/forked
+and subagent consumers. Desktop/IDE coverage SHALL continue to require
+actual configuration-consumer evidence rather than a CLI-only claim.
+Existing processes needing registration reload SHALL be identified
 explicitly.
 
 #### Scenario: Codex starts in an unrelated project
 - **WHEN** Codex starts outside the checkout after this change is active
-- **THEN** Serena, CodeGraph and Nuphus are available, CodeGraph selects the intended root, and retired Graphify and Codebase Memory registrations do not reappear
+- **THEN** Serena and Nuphus are available, and retired Graphify, Codebase Memory and CodeGraph registrations do not reappear
+
+#### Scenario: Update runs over a pre-retirement installation
+- **WHEN** an owned `codegraph` registration exists from an earlier version
+- **THEN** Install/Update removes only that owned registration, preserves unrelated registrations and the shared package/state, and reports the retirement
 
 #### Scenario: Several Codex CLI projects are open together
-- **WHEN** separate Codex CLI sessions start in different indexed projects through the installed global configuration
-- **THEN** every session has usable CodeGraph operations and automatic refresh for its own root, without extra per-project setup or selecting one globally exclusive project; bounded resource contention is explicit
+- **WHEN** separate Codex CLI sessions start in different projects through the installed global configuration
+- **THEN** every session gets usable Serena operations for its own project context, without extra per-project setup or selecting one globally exclusive project; bounded resource contention is explicit
 
 #### Scenario: A retired integration is still needed locally
-- **WHEN** the user deliberately wants Graphify or Codebase Memory for a specific task
-- **THEN** the shared package and saved state remain usable through an explicit local route, and the managed selection does not silently restore the registration
+- **WHEN** leftover shared packages, saved graphs, caches or account state from Graphify, Codebase Memory or CodeGraph exist on the host
+- **THEN** the kit neither reads, restores nor re-registers them, and the managed selection reports only Serena and Nuphus
 
 #### Scenario: A different session entry point is used
 - **WHEN** non-interactive, resumed/forked, tool-capable child or supported local desktop/IDE consumers load the same host settings
@@ -44,32 +45,30 @@ explicitly.
 
 ### Requirement: MCP operations preserve useful source capabilities
 
-Each retained integration SHALL preserve its accepted explicit source operations
-through a bounded model-facing surface: suitable Serena navigation, references
-and semantic edits; CodeGraph bounded symbol search and retained detail reads
-with bounded automatic and manual incremental refresh; Nuphus authorized
-desktop/browser inspection and interaction. CodeGraph deliberate full indexing,
-explicit catch-up and status inspection SHALL remain available through a native
-CLI control command outside model sessions, and the CodeGraph MCP tools/list
-SHALL expose only the bounded query surface. The Serena model-facing tool list
-SHALL exclude memory, onboarding and configuration-introspection tools; native
-Git records remain the authoritative memory route, and an explicit escape hatch
-SHALL keep an unfiltered debugging view possible. Diagnostic retention SHALL
-follow the subscription-efficiency assessment and SHALL distinguish a returned
-empty object from authoritative current completion. Tool filtering and
+Each retained integration SHALL preserve its accepted explicit source
+operations through a bounded model-facing surface: suitable Serena
+navigation, references, semantic edits and explicit diagnostics; Nuphus
+authorized desktop/browser inspection and interaction. The Serena
+model-facing tool list SHALL exclude memory, onboarding,
+configuration-introspection tools and `search_for_pattern`; native Git
+records remain the authoritative memory route, an explicit escape hatch
+SHALL keep an unfiltered debugging view possible, and literal text, regex,
+configuration and document search SHALL route to scoped native search
+(`rg`). Diagnostic retention SHALL follow the
+subscription-efficiency assessment and SHALL distinguish a returned empty
+object from authoritative current completion. Tool filtering and
 unavailable operations SHALL remain explicit. Representative actual calls,
-rather than a tool list, SHALL establish delivered operation scope. Acceptance
-mutations SHALL use owned targets. CodeGraph's approximate edges SHALL be
-treated as candidates; required exact-reference and refactoring claims SHALL be
-checked with current Serena or source evidence.
+rather than a tool list, SHALL establish delivered operation scope.
+Acceptance mutations SHALL use owned targets. Required exact-reference and
+refactoring claims SHALL be checked with current Serena or source evidence.
 
 #### Scenario: Each MCP is exercised by its consumer
 - **WHEN** acceptance performs a meaningful read and applicable bounded mutation through each retained MCP
 - **THEN** the actual result or owned-target effect and server identity are recorded, with diagnostic uncertainty preserved
 
 #### Scenario: Maintenance moves outside the model session
-- **WHEN** a root needs a deliberate full index, explicit catch-up or status inspection
-- **THEN** the native CLI control command performs it without a model session, and the MCP catalogue still exposes only the bounded query tools
+- **WHEN** any retired integration's host residue needs maintenance or deletion
+- **THEN** it is handled outside the kit with explicit user action, and no managed MCP catalogue, registration or kit CLI route is restored
 
 #### Scenario: Filtered Serena surface stays debuggable
 - **WHEN** a debugging session needs the unfiltered Serena tool list
@@ -80,42 +79,12 @@ checked with current Serena or source evidence.
 - **THEN** that operation remains unverified and its original cause is retained; an unrelated passing call does not establish its support
 
 #### Scenario: Index excludes a maintained input
-- **WHEN** a needed source, configuration or specification file is unsupported, oversized, ignored or only partly extracted
+- **WHEN** a needed source, configuration or specification file is unsupported, oversized, ignored or only partly extracted by any indexed or semantic route
 - **THEN** coverage reports that limit and the appropriate current semantic or text tool remains usable; a successful exit code does not certify complete source coverage
 
-### Requirement: Rust-owned CodeGraph integration
-
-All new maintained first-party executable CodeGraph integration SHALL be implemented in Rust, including the MCP adapter, process supervision, refresh coordination, resource/storage limits, catalogue and response shaping, dependency/registration/recovery logic, tests and executable acceptance fixtures. Owned Python, JavaScript/TypeScript, PowerShell or C# bridges, including embedded or generated programs, MUST NOT implement this integration. Declarative configuration, documentation and inert language-analysis samples SHALL remain distinct from executable integration code.
-
-The verified published CodeGraph implementation and its bundled Node runtime SHALL remain third-party dependencies with recorded provenance; this requirement SHALL NOT authorize an upstream rewrite or fork. Existing transitional lifecycle entry points MAY dispatch to native commands until the broader Rust migration replaces those entry points, but new CodeGraph-specific executable logic SHALL reside in Rust. This replacement SHALL NOT require completion of the entire native lifecycle migration before activation.
-
-#### Scenario: Integration language is checked before activation
-- **WHEN** the replacement is reviewed for activation
-- **THEN** source ownership, generated/embedded programs, command registrations and the exercised process chain establish that all new first-party integration and executable acceptance code is Rust, while the published CodeGraph/Node process is recorded as external; a first-party foreign-language implementation leaves acceptance incomplete
-
-#### Scenario: Transitional lifecycle invokes the provider
-- **WHEN** an existing lifecycle entry point connects or recovers CodeGraph before full native cutover
-- **THEN** it dispatches to the same Rust implementation without adding CodeGraph-specific executable logic in another language or creating a second provider implementation
-
-### Requirement: Reproducible and reversible CodeGraph delivery
-
-The kit SHALL adopt or stage a verified published CodeGraph package with recorded version and artifact identity through its existing dependency and registration lifecycle. Ordinary MCP startup SHALL NOT download packages, build upstream source, alter agent instructions, install hooks or enable telemetry. Check SHALL inspect the selected tool without installing it. Install, Update, Recover and Disconnect SHALL preserve unrelated registrations, user edits, shared packages and product sources. An interrupted replacement SHALL retain enough owned state to restore the last usable selection. The tool catalogue and initialization instructions SHALL accurately describe the delivered filtered tools and bounded automatic-refresh policy.
-
-#### Scenario: Update is interrupted
-- **WHEN** replacement activation stops between package selection and registration commit
-- **THEN** Recover restores a coherent owned configuration, preserves later user changes and does not leave both providers indexing automatically
-
-#### Scenario: Existing project changes between client requests
-- **WHEN** a client switches canonical project root or the indexed source changes
-- **THEN** subsequent requests cannot use another client's project, inherited context deduplication or an unverified stale index as current evidence
-
-#### Scenario: Rust migration consumes the graph replacement
-- **WHEN** the broader native migration integrates the graph provider
-- **THEN** it adopts the same first-party Rust CodeGraph adapter and applicable acceptance evidence owned by this replacement, does not restart a CBM port or rewrite the third-party CodeGraph runtime, and does not make this replacement depend on completion of the entire native migration
-
-#### Scenario: Upstream instructions promote unrestricted exploration
-- **WHEN** the published server supplies broad retrieval or automatic-freshness guidance inconsistent with the managed entry point
-- **THEN** the delivered initialization guidance describes the actual bounded selection, refresh limits and pending/stale state without concealing server identity or protocol errors
+#### Scenario: Literal text search stays native
+- **WHEN** a session needs literal text, regex, configuration or document matches
+- **THEN** the managed Serena catalogue offers no `search_for_pattern`, the call is rejected explicitly if attempted, and scoped `rg` remains the documented route
 
 ### Requirement: Selected languages
 
@@ -164,16 +133,21 @@ If Delphi LSP operations are retained, they SHALL use Delphi-appropriate syntax,
 
 ### Requirement: Workspace and session isolation
 
-Project-sensitive calls, language-server state, diagnostics and indexes SHALL be bound to a canonical project/worktree root. Concurrent sessions and subagents MUST NOT select another project's mutable workspace or consume its diagnostic results. Changes to project roots and user-approved additional roots SHALL be resolved explicitly. Shared immutable installations and intentional knowledge bases are permitted; an intentionally shared graph SHALL retain its identity instead of being represented as the current project's graph.
+Project-sensitive calls, language-server state and diagnostics SHALL be bound
+to a canonical project/worktree root. Concurrent sessions and subagents MUST
+NOT select another project's mutable workspace or consume its diagnostic
+results. Changes to project roots and user-approved additional roots SHALL be
+resolved explicitly. Shared immutable installations are permitted; an
+intentionally shared service SHALL retain its identity instead of being
+represented as the current project's state.
 
 #### Scenario: Two projects use the same symbol names
-- **WHEN** two concurrent sessions navigate, index and edit their respective projects
+- **WHEN** two concurrent sessions navigate and edit their respective projects
 - **THEN** each receives only the applicable project results and closing one session does not invalidate the other
 
 #### Scenario: A worktree or nested project changes the applicable root
 - **WHEN** a session operates in that root
 - **THEN** the selected project, configuration, cache identity and reported file paths agree with that root
-
 ### Requirement: Complete global acceptance evidence
 
 Acceptance SHALL exercise the selected configuration through actual installed Codex consumers outside this checkout. It SHALL cover retained operations, intentional absence of retired hooks/LSP, applicable entry points, concurrent-root isolation and selected install/update/recovery paths. Component versions, source identities, inputs, outputs and substitute-environment limits SHALL be recorded. Automatic diagnostic evidence SHALL be required only for capabilities passing the benefit gate, including every strict no-trigger scenario. Unrelated OpenCode configuration SHALL be preserved; additional runs of the original source-kit consumer SHALL NOT be required. Rejected capabilities SHALL NOT be misrepresented as verified support or force unbounded further evaluation.
@@ -181,43 +155,6 @@ Acceptance SHALL exercise the selected configuration through actual installed Co
 #### Scenario: Global delivery is declared complete
 - **WHEN** implementation is marked complete
 - **THEN** all accepted operations and lifecycle requirements have evidence, rejected capabilities remain absent, and no required task is unchecked
-
-### Requirement: CodeGraph MCP starts with Codex CLI
-
-Owned CodeGraph SHALL become ready during Codex CLI startup through the
-installed registration, together with the other retained MCP servers. The
-registered command MUST remain able to complete MCP initialize when its native
-binaries still match their recorded hashes, even if the linked checkout later
-differs from that build. A manager that is admitted only for integrity-checked
-management MUST NOT be the Codex MCP command unless it is also admitted for
-serving. Ordinary Codex startup MUST NOT download packages, rebuild native
-source, alter agent instructions, install hooks or enable telemetry. Unrelated
-MCP registrations, user edits, published CodeGraph/Node and existing indexes
-SHALL be preserved. An unavailable CodeGraph process SHALL remain explicit and
-MUST NOT disable the other retained MCP servers.
-
-#### Scenario: Codex CLI starts after later source edits
-- **WHEN** a consumer starts Codex CLI through the installed launcher after the linked checkout has changed relative to the recorded native build, and the recorded CodeGraph binaries still match
-- **THEN** CodeGraph completes MCP initialize and is present in the session catalogue with the other retained MCP servers, without a rebuild or extra per-session setup
-
-#### Scenario: Interactive, non-interactive and child sessions share the same host settings
-- **WHEN** interactive, non-interactive, resumed/forked or tool-capable child consumers load the same installed host configuration
-- **THEN** each session gets a usable CodeGraph MCP connection for its current project root, or an explicit CodeGraph startup error that does not omit the other retained servers
-
-#### Scenario: Native binaries no longer match the recorded build
-- **WHEN** the registered CodeGraph command is missing, hash-mismatched or otherwise not admitted for serving
-- **THEN** Codex CLI still starts, CodeGraph is omitted with an explicit startup failure, and Serena and Nuphus remain available
-
-### Requirement: Check reports CodeGraph serving admission
-Check SHALL inspect owned CodeGraph without installing, rebuilding or mutating configuration. Check MUST NOT report the owned CodeGraph registration as connected when the registered command cannot complete MCP initialize. A source-stale checkout whose recorded binaries still match MAY be reported as degraded for rebuild awareness while remaining callable. Interrupted registration recovery, unrelated settings and user edits SHALL stay preserved.
-
-#### Scenario: Check sees a command that cannot handshake
-- **WHEN** Check inspects an owned CodeGraph registration whose command exits before MCP initialize
-- **THEN** the result is degraded, configuration is unchanged, and the reason identifies that CodeGraph cannot serve
-
-#### Scenario: Check sees a source-stale but serving-admitted command
-- **WHEN** Check inspects an owned CodeGraph registration whose binaries match and that still completes MCP initialize after later source edits
-- **THEN** it does not report the registration as connected-without-qualification if a rebuild is needed to pick up native adapter changes, and it does not disable serving
 
 ### Requirement: Bounded visual desktop captures
 
@@ -238,22 +175,22 @@ Nuphus desktop and window screenshot operations SHALL deliver a local file path 
 ### Requirement: Serena and Nuphus MCP start with Codex CLI
 
 Owned Serena and Nuphus SHALL become ready during Codex CLI startup through
-the installed registrations, together with CodeGraph. The registered command
-MUST remain able to complete MCP initialize for those servers when its native
-binaries still match their recorded hashes, even if the linked checkout later
-differs from that build. A manager that is admitted only for integrity-checked
-management MUST NOT be the Codex MCP command for Serena or Nuphus unless it is
-also admitted for serving. Source-consuming MCP, including `mcp codebase-memory`,
-MUST remain gated on a healthy source match. Ordinary Codex startup MUST NOT
-download packages, rebuild native source, alter agent instructions, install
-hooks or enable telemetry. Unrelated MCP registrations, user edits and the
-adopted Serena and audited Nuphus packages SHALL be preserved. An unavailable
-Serena or Nuphus process SHALL remain explicit and MUST NOT disable the other
-retained MCP servers.
+the installed registrations. The registered command MUST remain able to
+complete MCP initialize for those servers when its native binaries still
+match their recorded hashes, even if the linked checkout later differs from
+that build. A manager that is admitted only for integrity-checked
+management MUST NOT be the Codex MCP command for Serena or Nuphus unless it
+is also admitted for serving. Source-consuming MCP, including
+`mcp codebase-memory`, MUST remain gated on a healthy source match.
+Ordinary Codex startup MUST NOT download packages, rebuild native source,
+alter agent instructions, install hooks or enable telemetry. Unrelated MCP
+registrations, user edits and the adopted Serena and audited Nuphus
+packages SHALL be preserved. An unavailable Serena or Nuphus process SHALL
+remain explicit and MUST NOT disable the other retained MCP server.
 
 #### Scenario: Codex CLI starts after later source edits
 - **WHEN** a consumer starts Codex CLI through the installed launcher after the linked checkout has changed relative to the recorded native build, and the recorded binaries still match
-- **THEN** Serena and Nuphus complete MCP initialize and are present in the session catalogue with CodeGraph, without a rebuild or extra per-session setup
+- **THEN** Serena and Nuphus complete MCP initialize and are present in the session catalogue, without a rebuild or extra per-session setup
 
 #### Scenario: Interactive, non-interactive and child sessions share the same host settings
 - **WHEN** interactive, non-interactive, resumed/forked or tool-capable child consumers load the same installed host configuration

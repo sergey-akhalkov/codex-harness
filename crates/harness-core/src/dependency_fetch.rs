@@ -28,20 +28,10 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
             "uv",
             "https://pypi.org/pypi/serena-agent/json",
         ),
-        Some("codebase-memory") => (
-            "codebase-memory-mcp",
-            "npm",
-            "https://registry.npmjs.org/codebase-memory-mcp/latest",
-        ),
         Some("nuphus") => (
             "@nuphus/nuphus-mcp",
             "npm",
             "https://registry.npmjs.org/@nuphus%2fnuphus-mcp/latest",
-        ),
-        Some("codegraph") => (
-            "@colbymchenry/codegraph",
-            "github-release",
-            "https://api.github.com/repos/colbymchenry/codegraph/releases/tags/v1.6.0",
         ),
         Some("python") => (
             "basedpyright",
@@ -55,10 +45,7 @@ pub(crate) fn identity_endpoint(spec: &Value) -> Result<&'static str> {
         ),
         _ => return Err("unsupported-metadata-source"),
     };
-    // The lifecycle catalogue delegates this provider to the native owner;
-    // the owner's dependency records name the actual acquisition transport.
-    let native_codegraph = spec["id"] == "codegraph" && spec["manager"] == "native";
-    if spec["package"] != package || (spec["manager"] != manager && !native_codegraph) {
+    if spec["package"] != package || spec["manager"] != manager {
         return Err("unsupported-metadata-source");
     }
     Ok(url)

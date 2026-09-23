@@ -216,16 +216,7 @@ impl Session {
                     id: id.clone(),
                     name: name.into(),
                     arguments,
-                    deadline: Deadline::after(Duration::from_secs(
-                        if matches!(
-                            name,
-                            "index_repository" | "codegraph_index" | "codegraph_sync"
-                        ) {
-                            600
-                        } else {
-                            60
-                        },
-                    ))?,
+                    deadline: Deadline::after(Duration::from_secs(60))?,
                     cancellation: Cancellation::default(),
                 });
                 Ok(None)

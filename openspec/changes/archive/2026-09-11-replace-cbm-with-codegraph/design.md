@@ -100,7 +100,7 @@ the earlier single-project comparison for concurrent runtime acceptance. Two
 source oracles in each root remain absent upstream for ambiguous/common-name
 follow-ups; their absence is preserved and does not establish missing source.
 Current behavior is documented in the
-[provider guide](../../../../docs/code-tools.md#native-codegraph-provider).
+[provider guide](../../../../docs/code-tools.md).
 
 The native concurrent entry-point check now exercises three owned indexed Rust
 projects plus another client in the first project, each with a distinct Codex
@@ -197,7 +197,7 @@ contain.
 
 Adopt the pinned Windows release through dependency discovery and checksum validation. Use its bundled Node and published MCP/index/sync entry points, telemetry off, one parse worker and one resolution worker. Keep `CODEGRAPH_NO_DAEMON=1` when the native broker owns direct-mode processes; an independent detached upstream daemon must not escape the resource boundary. Explicitly remove conflicting inherited watch/debug/worker settings from the owned child environment; preserve unrelated user settings outside it.
 
-Reuse the existing Rust MCP, Job, admission and broker primitives. This change owns the CodeGraph adapter, supervision and executable acceptance tests in Rust; the published CodeGraph implementation and bundled Node stay third-party. Rust migration task 5.4 adopts this implementation and evidence under the [shared ownership/order map](../../migrate-harness-to-rust/design.md#graph-provider-ownership-and-order), without developing another CBM or CodeGraph adapter or waiting for complete native installer migration.
+Reuse the existing Rust MCP, Job, admission and broker primitives. This change owns the CodeGraph adapter, supervision and executable acceptance tests in Rust; the published CodeGraph implementation and bundled Node stay third-party. Rust migration task 5.4 adopts this implementation and evidence under the [shared ownership/order map](../2026-09-17-migrate-harness-to-rust/design.md#graph-provider-ownership-and-order), without developing another CBM or CodeGraph adapter or waiting for complete native installer migration.
 
 Separate project observation from expensive indexing admission. The account-wide native owner tracks connected clients by canonical project root, including across Codex homes, and keeps one observation/state owner for each active indexed root. Admission covers an individual bounded work episode, not a project's entire open session. Coalesce pending source changes per project and serve pending projects fairly; a continuous burst in one project must not repeatedly jump ahead of another. Queued/pending state remains visible until the corresponding update completes. Keep event storage bounded; overflow requires a bounded catch-up scan, not silent loss of changes. Index creation remains explicit, but connecting to an already indexed root registers its observation and catch-up without waiting for the first graph query.
 

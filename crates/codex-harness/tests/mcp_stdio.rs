@@ -22,33 +22,14 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
-        Self::start_with(None)
+        Self::start_with()
     }
-    fn start_with(cbm: Option<(&std::path::Path, &std::path::Path, &std::path::Path)>) -> Self {
+    fn start_with() -> Self {
         let root = tempfile::tempdir().unwrap();
         let (input, writer) = anonymous_pipe(4096).unwrap();
         let (reader, output) = anonymous_pipe(4096).unwrap();
         let mut command = CommandSpec::new(env!("CARGO_BIN_EXE_harness-mcp-probe-fixture"));
         command.args.push("--stdio-session".into());
-        if let Some((executable, owned, catalogue)) = cbm {
-            command = CommandSpec::new(env!("CARGO_BIN_EXE_codex-harness"));
-            command.args = vec![
-                "mcp".into(),
-                "codebase-memory".into(),
-                "--executable".into(),
-                executable.into(),
-                "--cache".into(),
-                owned.join("cache").into_os_string(),
-                "--runtime".into(),
-                owned.join("runtime").into_os_string(),
-                "--account".into(),
-                owned.join("account").into_os_string(),
-                "--catalogue-file".into(),
-                catalogue.into(),
-                "--connection-seconds".into(),
-                "120".into(),
-            ];
-        }
         command.current_dir = Some(root.path().into());
         command.stdin = Some(input);
         command.stdout = Some(output);
@@ -271,132 +252,4 @@ fn a_backend_cleanup_error_survives_cancellation_and_eof_without_advancing_queue
         let error = server.finish(91, Duration::from_secs(2));
         assert!(error.contains("owned backend cleanup failure"), "{error}");
     }
-}
-
-fn saved_catalogue() -> Value {
-    let names = [
-        "index_repository",
-        "search_graph",
-        "query_graph",
-        "trace_path",
-        "get_code_snippet",
-        "get_graph_schema",
-        "get_architecture",
-        "search_code",
-        "list_projects",
-        "delete_project",
-        "index_status",
-        "check_index_coverage",
-        "detect_changes",
-        "manage_adr",
-        "ingest_traces",
-    ];
-    json!({"state":"catalogue-read","server":"codebase-memory-mcp",
-        "protocol_version":"2024-11-05","artifact_sha256":harness_core::cbm_index::AUDITED_BUILD,
-        "tool_count":15,"tool_calls_executed":false,
-        "tools":names.into_iter().map(|name| json!({"name":name,"inputSchema":{"type":"object","properties":{}}})).collect::<Vec<_>>()})
-}
-
-#[test]
-fn cbm_stdio_handshake_is_lazy_and_backend_failure_closes_the_connection() {
-    let owned = tempfile::tempdir().unwrap();
-    let catalogue = owned.path().join("catalogue.json");
-    fs::write(&catalogue, serde_json::to_vec(&saved_catalogue()).unwrap()).unwrap();
-    let missing = owned.path().join("missing.exe");
-    let mut server = Server::start_with(Some((&missing, owned.path(), &catalogue)));
-    server.initialize_named("codex-harness-codebase-memory");
-    server.send(json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}));
-    assert_eq!(
-        server.reply()["result"]["tools"].as_array().unwrap().len(),
-        15
-    );
-    assert_eq!(fs::read_dir(owned.path()).unwrap().count(), 1);
-    server.send(json!({"jsonrpc":"2.0","id":"bad-backend","method":"tools/call","params":{"name":"list_projects","arguments":{}}}));
-    assert!(server.child.wait_for_exit(Duration::from_secs(5)).unwrap());
-    assert_eq!(fs::read_dir(owned.path()).unwrap().count(), 1);
-    assert!(!server.finish(2, Duration::from_secs(2)).is_empty());
-}
-
-#[test]
-#[ignore = "explicit audited CBM, native-owned test root and catalogue paths required"]
-fn actual_cbm_cli_stdio_indexes_queries_and_recovers_after_cancellation() {
-    // Reuse the explicit native-owned cache prepared by core CBM acceptance.
-    // No defaults point to installed/global state; this is an opt-in query check.
-    let executable = std::path::PathBuf::from(
-        std::env::var_os("HARNESS_CBM_EXECUTABLE").expect("explicit audited CBM required"),
-    );
-    let owned = std::path::PathBuf::from(
-        std::env::var_os("HARNESS_CBM_TEST_ROOT").expect("explicit owned test root required"),
-    );
-    let catalogue = std::path::PathBuf::from(
-        std::env::var_os("HARNESS_CBM_CATALOGUE").expect("explicit saved catalogue required"),
-    );
-    let prior: Value =
-        serde_json::from_slice(&fs::read(owned.join("report.json")).unwrap()).unwrap();
-    assert_eq!(
-        prior["peer_clean_shutdown"], true,
-        "native owned fixture prerequisite"
-    );
-    assert_eq!(prior["owned_ui_disabled"], true);
-    let mut server = Server::start_with(Some((&executable, &owned, &catalogue)));
-    server.initialize_named("codex-harness-codebase-memory");
-    server.send(json!({"jsonrpc":"2.0","id":"index-owned","method":"tools/call",
-        "params":{"name":"index_repository","arguments":{"repo_path":owned.join("repository"),"name":"native-cbm-coexist-owned","mode":"fast"}}}));
-    let indexed = server.reply_with_timeout(Duration::from_secs(65));
-    assert_eq!(indexed["id"], "index-owned");
-    assert_eq!(indexed["result"]["isError"], false, "{indexed}");
-    for (id, query, failed) in [
-        (
-            json!(u64::MAX),
-            "MATCH (n:Function) WHERE n.name = 'alpha' RETURN n.name",
-            false,
-        ),
-        (json!("ошибка-日本"), "MATCH ((( INVALID", true),
-    ] {
-        server.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
-            "params":{"name":"query_graph","arguments":{"project":"native-cbm-coexist-owned","query":query,"format":"json"}}}));
-        // The real tool may spend about ten seconds on its private daemon cycle.
-        let response = server.reply_with_timeout(Duration::from_secs(65));
-        assert_eq!(response["id"], id);
-        assert_eq!(response["result"]["isError"], failed);
-        if !failed {
-            assert_eq!(
-                response["result"]["structuredContent"]["rows"],
-                json!([["alpha"]])
-            );
-        }
-    }
-    server.send(json!({"jsonrpc":"2.0","id":"cancel-owned","method":"tools/call",
-        "params":{"name":"query_graph","arguments":{"project":"native-cbm-coexist-owned","query":"MATCH (n) RETURN n","format":"json"}}}));
-    // Observe the real daemon's live operation-log handle before cancelling;
-    // a handshake alone would exercise only the pre-spawn cancellation path.
-    use std::os::windows::fs::OpenOptionsExt;
-    let deadline = Instant::now() + Duration::from_secs(25);
-    loop {
-        let probe = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(owned.join("cache/logs/cbm-daemon.log"));
-        if matches!(probe, Err(ref error) if error.raw_os_error() == Some(32)) {
-            break;
-        }
-        drop(probe); // Leave a real window for the daemon to acquire its writer.
-        assert!(server.child.is_running().unwrap());
-        assert!(
-            Instant::now() < deadline,
-            "no owned live daemon observed before cancellation"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    server.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-owned"}}));
-    server.send(json!({"jsonrpc":"2.0","id":"after-cancel","method":"tools/call",
-        "params":{"name":"query_graph","arguments":{"project":"native-cbm-coexist-owned","query":"MATCH (n:Function) WHERE n.name = 'alpha' RETURN n.name","format":"json"}}}));
-    let after_cancel = server.reply_with_timeout(Duration::from_secs(65));
-    assert_eq!(after_cancel["id"], "after-cancel");
-    assert_eq!(
-        after_cancel["result"]["structuredContent"]["rows"],
-        json!([["alpha"]])
-    );
-    server.eof();
-    assert!(server.finish(0, Duration::from_secs(10)).is_empty());
 }

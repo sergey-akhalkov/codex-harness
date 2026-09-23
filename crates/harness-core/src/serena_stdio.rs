@@ -2,8 +2,9 @@
 //!
 //! Ports the seam's proxy: one lazily connected client per stdio connection
 //! forwards JSON-RPC requests through the authenticated shared broker, keeps
-//! its own cached route, filters memory/onboarding/configuration tools from
-//! tools/list (unless explicitly unfiltered) and reports catalogue changes.
+//! its own cached route, filters memory/onboarding/configuration tools and
+//! the rg-superseded text search from tools/list (unless explicitly
+//! unfiltered) and reports catalogue changes.
 //! Notifications are not forwarded, matching the seam; client EOF disconnects
 //! from the shared worker pool.
 #![cfg(windows)]
@@ -22,7 +23,9 @@ const CLEANUP: Duration = Duration::from_secs(5);
 
 /// Native Git records own project memory; onboarding and configuration
 /// introspection are not part of the managed model-facing surface.
-pub const HIDDEN_TOOLS: [&str; 9] = [
+/// `search_for_pattern` is superseded by scoped native `rg`: the managed
+/// route keeps literal text and regex search complete, fast and shell-owned.
+pub const HIDDEN_TOOLS: [&str; 10] = [
     "onboarding",
     "initial_instructions",
     "get_current_config",
@@ -32,6 +35,7 @@ pub const HIDDEN_TOOLS: [&str; 9] = [
     "edit_memory",
     "delete_memory",
     "rename_memory",
+    "search_for_pattern",
 ];
 
 fn invalid(message: &'static str) -> io::Error {
@@ -336,6 +340,7 @@ mod tests {
             json!({"name": "onboarding"}),
             json!({"name": "list_memories"}),
             json!({"name": "read_memory"}),
+            json!({"name": "search_for_pattern"}),
             json!({"name": "get_symbols_overview"}),
         ];
         let exposed = exposed_tools(&tools);
@@ -411,6 +416,16 @@ mod tests {
             Some("initial_instructions")
         );
         assert!(hidden_tool_name(&json!({"name": "find_symbol"})).is_none());
+    }
+
+    #[test]
+    fn text_search_stays_native() {
+        let tools = vec![json!({"name": "search_for_pattern"})];
+        assert!(exposed_tools(&tools).is_empty());
+        assert_eq!(
+            hidden_tool_name(&json!({"name": "search_for_pattern"})),
+            Some("search_for_pattern")
+        );
     }
 
     #[test]

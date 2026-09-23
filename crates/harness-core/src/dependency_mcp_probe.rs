@@ -10,11 +10,10 @@ use serde_json::Value;
 use std::{io, path::Path};
 
 #[cfg(windows)]
-pub(crate) use windows::{artifact, environment, pipe, private_directory, strict_json};
+pub(crate) use windows::{private_directory, strict_json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeKind {
-    CodebaseMemory,
     Nuphus,
 }
 
@@ -459,8 +458,6 @@ mod windows {
             ("XDG_CONFIG_HOME", "config"),
             ("XDG_DATA_HOME", "data"),
             ("CODEX_HOME", "codex"),
-            ("CBM_CACHE_DIR", "cbm"),
-            ("CBM_RUNTIME_DIR", "ipc"),
             ("NUPHUS_MODELS_DIR", "models"),
         ] {
             let path = root.join(folder);
@@ -582,29 +579,14 @@ mod windows {
                     .ok_or_else(|| invalid("MCP response lacks object result"));
             }
         }
-        fn call(&mut self, name: &str, arguments: Value) -> io::Result<Value> {
-            let result = self.request("tools/call", json!({"name":name,"arguments":arguments}))?;
-            if result.get("isError").is_some_and(|v| v != false)
-                || result.get("error").is_some()
-                || !result["content"].as_array().is_some_and(|a| {
-                    a.iter().any(|v| {
-                        v["type"] == "text" && v["text"].as_str().is_some_and(|s| !s.is_empty())
-                    })
-                })
-            {
-                return Err(invalid("MCP tool operation failed"));
-            }
-            Ok(result)
-        }
         fn exchange(
             &mut self,
             kind: ProbeKind,
-            root: &Path,
+            _root: &Path,
             catalogue_only: bool,
         ) -> io::Result<Value> {
             let info = self.request("initialize", json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"harness-update-probe","version":"1"}}))?;
             let server = match kind {
-                ProbeKind::CodebaseMemory => "codebase-memory-mcp",
                 ProbeKind::Nuphus => "nuphus-mcp",
             };
             if info["protocolVersion"] != PROTOCOL
@@ -750,112 +732,6 @@ mod windows {
                         }
                         summary["selector_ref_branch_types_missing"] = json!(missing_types);
                     }
-                    ProbeKind::CodebaseMemory => {
-                        for name in [
-                            "index_repository",
-                            "search_graph",
-                            "query_graph",
-                            "get_graph_schema",
-                            "list_projects",
-                        ] {
-                            if !tools.contains_key(name) {
-                                return Err(invalid("Codebase Memory required operation missing"));
-                            }
-                        }
-                        let index = &tools["index_repository"]["properties"];
-                        let path_key = ["repo_path", "path", "repository_path"]
-                            .into_iter()
-                            .find(|k| index[*k]["type"] == "string")
-                            .ok_or_else(|| {
-                                invalid("Codebase Memory index path contract incompatible")
-                            })?;
-                        for (name, keys) in [
-                            ("query_graph", &["project", "query"][..]),
-                            ("get_graph_schema", &["project"][..]),
-                        ] {
-                            if keys
-                                .iter()
-                                .any(|k| tools[name]["properties"][*k]["type"] != "string")
-                            {
-                                return Err(invalid(
-                                    "Codebase Memory schema contract incompatible",
-                                ));
-                            }
-                        }
-                        let fixture = root.join("fixture");
-                        fs::create_dir(&fixture)
-                            .map_err(|_| invalid("MCP indexing fixture creation failed"))?;
-                        fs::write(
-                            fixture.join("probe.rs"),
-                            "pub fn inventory_probe(value: i32) -> i32 { value + 1 }\n",
-                        )
-                        .map_err(|_| invalid("MCP indexing fixture creation failed"))?;
-                        let mode = &index["mode"];
-                        let admits_fast = mode["type"] == "string"
-                            && mode["enum"]
-                                .as_array()
-                                .is_some_and(|values| values.iter().any(|v| v == "fast"));
-                        if !admits_fast {
-                            return Err(invalid(
-                                "Codebase Memory index mode contract incompatible",
-                            ));
-                        }
-                        self.call("index_repository", json!({path_key:fixture,"mode":"fast"}))?;
-                        let projects = payload(&self.call("list_projects", json!({}))?)?;
-                        let projects = if projects.is_array() {
-                            projects.as_array()
-                        } else {
-                            if projects.get("total").is_some_and(|v| v != 1)
-                                || projects.get("has_more").is_some_and(|v| v != false)
-                            {
-                                return Err(invalid(
-                                    "Codebase Memory disposable project isolation failed",
-                                ));
-                            }
-                            projects["projects"].as_array()
-                        }
-                        .filter(|a| a.len() == 1)
-                        .ok_or_else(|| {
-                            invalid("Codebase Memory disposable project isolation failed")
-                        })?;
-                        let project = &projects[0];
-                        let name = project["name"]
-                            .as_str()
-                            .or_else(|| project["project"].as_str())
-                            .filter(|s| !s.is_empty() && s.len() <= 256)
-                            .ok_or_else(|| invalid("Codebase Memory project identity missing"))?;
-                        let observed = project["root_path"]
-                            .as_str()
-                            .ok_or_else(|| invalid("Codebase Memory project root missing"))?;
-                        if Path::new(observed)
-                            .canonicalize()
-                            .map_err(|_| invalid("Codebase Memory project root unavailable"))?
-                            != fixture
-                                .canonicalize()
-                                .map_err(|_| invalid("Codebase Memory fixture root unavailable"))?
-                        {
-                            return Err(invalid("Codebase Memory project root mismatch"));
-                        }
-                        self.call("get_graph_schema", json!({"project":name}))?;
-                        let query = payload(&self.call("query_graph", json!({"project":name,"query":"MATCH (n:Function) WHERE n.name = 'inventory_probe' RETURN n.name","format":"json"}))?)?;
-                        if query["rows"] != json!([["inventory_probe"]])
-                            || query["columns"] != json!(["n.name"])
-                            || query["total"] != 1
-                        {
-                            return Err(invalid("Codebase Memory disposable graph query failed"));
-                        }
-                        summary["state"] = json!("passed");
-                        summary["checked_operations"] = json!([
-                            "initialize",
-                            "notifications/initialized",
-                            "tools/list",
-                            "index_repository",
-                            "list_projects",
-                            "get_graph_schema",
-                            "query_graph"
-                        ]);
-                        summary["isolated_project_count"] = json!(1);
-                    }
                 }
             }
             // EOF is the stdio shutdown contract. Inspect all remaining output,
@@ -889,27 +765,6 @@ mod windows {
             }
         }
         Ok(())
-    }
-    fn payload(result: &Value) -> io::Result<Value> {
-        if let Some(value) = result.get("structuredContent") {
-            if value.is_object() || value.is_array() {
-                return Ok(value.clone());
-            }
-            return Err(invalid("MCP structured tool result incompatible"));
-        }
-        let content = result["content"]
-            .as_array()
-            .ok_or_else(|| invalid("MCP tool content missing"))?;
-        let texts: Vec<_> = content.iter().filter(|v| v["type"] == "text").collect();
-        if texts.len() != 1 {
-            return Err(invalid("MCP tool text result ambiguous"));
-        }
-        strict_json(
-            texts[0]["text"]
-                .as_str()
-                .ok_or_else(|| invalid("MCP tool text missing"))?
-                .as_bytes(),
-        )
     }
 
     // serde_json::Value normally accepts duplicate object keys, including two
@@ -1010,9 +865,6 @@ mod windows {
         let mut command = CommandSpec::new(executable);
         command.current_dir = Some(state.path().into());
         environment(&mut command, state.path())?;
-        if kind == ProbeKind::CodebaseMemory {
-            crate::cbm_configuration::initialize_private(&state.path().join("cbm"))?;
-        }
         let (input, writer) = pipe()?;
         let (reader, output) = pipe()?;
         let (mut errors, stderr) = pipe()?;
@@ -1020,7 +872,6 @@ mod windows {
         command.stdout = Some(output);
         command.stderr = Some(stderr);
         let memory = match kind {
-            ProbeKind::CodebaseMemory => 2 * 1024 * 1024 * 1024usize,
             ProbeKind::Nuphus => 512 * 1024 * 1024,
         };
         let job = Job::new(Limits {

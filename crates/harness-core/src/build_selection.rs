@@ -443,11 +443,13 @@ mod tests {
         assert!(!activate(&state, &a).unwrap().changed);
         let record = build_identity::read_record(&a).unwrap();
         fs::write(record.source_root.join("crates/one/src/lib.rs"), "changed").unwrap();
-        assert!(selected(&state).is_err());
-        assert!(activate(&state, &b).is_err());
+        // A stale checkout keeps launches on the verified delivered build.
+        assert!(selected(&state).is_ok());
+        // Switching to another verified immutable build needs no source refresh.
+        assert!(activate(&state, &b).unwrap().changed);
         assert!(recover(&state).unwrap().build.is_some());
         fs::write(record.source_root.join("crates/one/src/lib.rs"), "fixture").unwrap();
-        assert!(activate(&state, &b).unwrap().changed);
+        assert!(!activate(&state, &b).unwrap().changed);
         assert_eq!(selected(&state).unwrap(), b.canonicalize().unwrap());
         assert_eq!(
             held.metadata().unwrap().len(),

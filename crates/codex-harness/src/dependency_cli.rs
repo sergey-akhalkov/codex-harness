@@ -46,82 +46,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(0);
     }
-    if args.first().is_some_and(|arg| arg == "cbm-tool") {
-        if args == ["cbm-tool", "--help"] {
-            println!(
-                "codex-harness dependencies cbm-tool --executable FILE --cache DIRECTORY --tool NAME --arguments-file JSON\nExecute a non-index CBM tool on the selected graph cache through a private bounded daemon. The requested tool may modify graph state; indexing uses cbm-index. A cache held by another daemon is refused. No packages are acquired or installed daemon stopped."
-            );
-            return Ok(0);
-        }
-        let mut values = BTreeMap::new();
-        let mut arguments = args[1..].iter();
-        while let Some(option) = arguments.next() {
-            if !matches!(
-                option.to_str(),
-                Some("--executable" | "--cache" | "--tool" | "--arguments-file")
-            ) || values
-                .insert(
-                    option.clone(),
-                    arguments.next().ok_or_else(invalid)?.clone(),
-                )
-                .is_some()
-            {
-                return Err(invalid());
-            }
-        }
-        let value = |key: &str| values.get(&OsString::from(key)).ok_or_else(invalid);
-        let path = |key: &str| dependency_discovery::local_path(&PathBuf::from(value(key)?));
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path("--arguments-file")?)?
-            .take(16 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        let arguments = harness_core::cbm_index::parse_arguments(&bytes)?;
-        let report = harness_core::cbm_index::call(
-            &path("--executable")?,
-            &path("--cache")?,
-            value("--tool")?.to_str().ok_or_else(invalid)?,
-            &arguments,
-            &harness_core::process::Cancellation::default(),
-        )?;
-        let failed = report["result"]["isError"].as_bool().unwrap_or(false);
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(if failed { 1 } else { 0 });
-    }
-    if args.first().is_some_and(|arg| arg == "cbm-catalogue") {
-        if args == ["cbm-catalogue", "--help"] {
-            println!(
-                "codex-harness dependencies cbm-catalogue --executable FILE --account DIRECTORY\nRead complete tool definitions from the audited CBM 0.10.8 executable in a private bounded process under account admission. No tool is called and no installed graph is opened."
-            );
-            return Ok(0);
-        }
-        let mut values = BTreeMap::new();
-        let mut arguments = args[1..].iter();
-        while let Some(option) = arguments.next() {
-            if !matches!(option.to_str(), Some("--executable" | "--account"))
-                || values
-                    .insert(
-                        option.clone(),
-                        arguments.next().ok_or_else(invalid)?.clone(),
-                    )
-                    .is_some()
-            {
-                return Err(invalid());
-            }
-        }
-        let path = |key: &str| -> io::Result<PathBuf> {
-            dependency_discovery::local_path(&PathBuf::from(
-                values.get(&OsString::from(key)).ok_or_else(invalid)?,
-            ))
-        };
-        let report = harness_core::cbm_index::catalogue(
-            &path("--executable")?,
-            &path("--account")?,
-            &harness_core::process::Cancellation::default(),
-        )?;
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(0);
-    }
     if args.first().is_some_and(|arg| arg == "stage-python") {
         if args == ["stage-python", "--help"] {
             println!(
@@ -161,78 +85,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         println!("{}", serde_json::to_string_pretty(&staged.report)?);
         return Ok(0);
     }
-    if args.first().is_some_and(|arg| arg == "cbm-index") {
-        if args == ["cbm-index", "--help"] {
-            println!(
-                "codex-harness dependencies cbm-index --executable FILE --cache DIRECTORY --runtime DIRECTORY --account DIRECTORY --arguments-file JSON\nExplicitly index the requested repository using the audited CBM 0.10.8 worker. The selected cache is modified. Resource settings must already be active; no packages are acquired."
-            );
-            return Ok(0);
-        }
-        let mut values = BTreeMap::new();
-        let mut arguments = args[1..].iter();
-        while let Some(option) = arguments.next() {
-            if !matches!(
-                option.to_str(),
-                Some("--executable" | "--cache" | "--runtime" | "--account" | "--arguments-file")
-            ) || values
-                .insert(
-                    option.clone(),
-                    arguments.next().ok_or_else(invalid)?.clone(),
-                )
-                .is_some()
-            {
-                return Err(invalid());
-            }
-        }
-        let path = |key: &str| -> io::Result<PathBuf> {
-            dependency_discovery::local_path(&PathBuf::from(
-                values.get(&OsString::from(key)).ok_or_else(invalid)?,
-            ))
-        };
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path("--arguments-file")?)?
-            .take(16 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 16 * 1024 {
-            return Err(invalid());
-        }
-        let arguments = harness_core::cbm_index::parse_arguments(&bytes)?;
-        let report = harness_core::cbm_index::index(
-            &path("--executable")?,
-            &path("--cache")?,
-            &path("--runtime")?,
-            &path("--account")?,
-            &arguments,
-            &harness_core::process::Cancellation::default(),
-        )?;
-        let failed = report["result"]["isError"].as_bool().unwrap_or(false);
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(if failed { 1 } else { 0 });
-    }
-    if args.first().is_some_and(|arg| arg == "resource-check") {
-        if args == ["resource-check", "--help"] {
-            println!(
-                "codex-harness dependencies resource-check --cache DIRECTORY\nRead persisted Codebase Memory resource settings without starting its daemon or acquiring packages. Exit 1 means the bounded policy is inactive."
-            );
-            return Ok(0);
-        }
-        if args.len() != 3 || args[1] != "--cache" {
-            return Err(invalid());
-        }
-        let cache = dependency_discovery::local_path(&PathBuf::from(&args[2]))?;
-        let configuration = harness_core::cbm_configuration::read(&cache)?;
-        let active = configuration.bounded_policy_active();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version":1,"operation":"codebase-memory-resource-inspection",
-                "cache":cache,"configuration":configuration,"policy_active":active,
-                "package_code_executed":false,"packages_acquired":false
-            }))?
-        );
-        return Ok(if active { 0 } else { 1 });
-    }
     if let Some(result) = crate::dependency_apply_cli::run(args) {
         return result;
     }
@@ -242,7 +94,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args.first().is_some_and(|arg| arg == "probe") {
         if args == ["probe", "--help"] {
             println!(
-                "codex-harness dependencies probe --executable FILE --kind codebase-memory|nuphus --sha256 DIGEST\nRun an explicitly verified native artifact in an owned bounded process. Codebase Memory indexes an inert private sample; Nuphus negotiates and lists tools without desktop/browser calls."
+                "codex-harness dependencies probe --executable FILE --kind nuphus --sha256 DIGEST\nRun an explicitly verified native artifact in an owned bounded process. Nuphus negotiates and lists tools without desktop/browser calls."
             );
             return Ok(0);
         }
@@ -265,7 +117,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         let value = |key: &str| values.get(&OsString::from(key)).ok_or_else(invalid);
         use harness_core::dependency_mcp_probe::{ProbeKind, probe};
         let kind = match value("--kind")?.to_str() {
-            Some("codebase-memory") => ProbeKind::CodebaseMemory,
             Some("nuphus") => ProbeKind::Nuphus,
             _ => return Err(invalid()),
         };
@@ -275,21 +126,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             value("--sha256")?.to_str().ok_or_else(invalid)?,
         )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(0);
-    }
-    if args.first().is_some_and(|arg| arg == "inspect-codegraph") {
-        if args == ["inspect-codegraph", "--help"] {
-            println!(
-                "codex-harness dependencies inspect-codegraph --package-root DIRECTORY\nRead-only verification of a staged or adopted CodeGraph 1.6.0 Windows package. Requires pinned file identity; no download, toolchain or installer side effects."
-            );
-            return Ok(0);
-        }
-        if args.len() != 3 || args[1] != "--package-root" {
-            return Err(invalid());
-        }
-        let inspected =
-            harness_core::dependency_discovery::inspect_package(&PathBuf::from(&args[2]))?;
-        println!("{}", serde_json::to_string_pretty(&inspected.report())?);
         return Ok(0);
     }
     if args.first().is_some_and(|arg| arg == "stage") {
@@ -340,7 +176,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     if args == ["--help"] || args == ["discover", "--help"] || args == ["plan", "--help"] {
         println!(
-            "codex-harness dependencies <stage-python|resource-check|cbm-index|cbm-catalogue|cbm-tool> --help (explicit native runtime prerequisites)"
+            "codex-harness dependencies stage-python --help (explicit native runtime prerequisites)"
         );
         println!(
             "codex-harness dependencies <validate|select|selected|recover-selection|rollback-selection> --help (retained native candidates)"
@@ -351,14 +187,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         println!(
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
         );
-        println!(
-            "codex-harness dependencies inspect-codegraph --package-root DIRECTORY (read-only pinned CodeGraph 1.6.0 identity)"
-        );
+        println!();
         println!(
             "codex-harness dependencies audit --package-root DIRECTORY (explicit official archive comparison)"
         );
         println!(
-            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY] [--npm-prefix DIRECTORY ...] [--codegraph-root DIRECTORY ...] [--uv-tools-dir DIRECTORY] [--serena-cache DIRECTORY] [--rustup-home DIRECTORY] [--nuphus-models DIRECTORY] [--full-records] [--probe-versions] [--processes] [--include-process-environment|--no-process-environment]\nDefault discovery executes no packages. --probe-versions requests a bounded native Rust analyzer version read. --processes observes existing host consumers without retaining arguments. --codegraph-root observes a published CodeGraph package without installing it. Plan explicitly reads official release metadata through system curl and proposes actions requiring further compatibility checks. Neither command installs packages or changes a project."
+            "codex-harness dependencies <discover|plan> --source CHECKOUT [--user-home DIRECTORY] [--npm-prefix DIRECTORY ...] [--uv-tools-dir DIRECTORY] [--serena-cache DIRECTORY] [--rustup-home DIRECTORY] [--nuphus-models DIRECTORY] [--full-records] [--probe-versions] [--processes] [--include-process-environment|--no-process-environment]\nDefault discovery executes no packages. --probe-versions requests a bounded native Rust analyzer version read. --processes observes existing host consumers without retaining arguments. Plan explicitly reads official release metadata through system curl and proposes actions requiring further compatibility checks. Neither command installs packages or changes a project."
         );
         return Ok(0);
     }
@@ -368,7 +202,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     }
     let mut values = BTreeMap::new();
     let mut prefixes = Vec::new();
-    let mut codegraph_roots = Vec::new();
     let mut full = false;
     let mut probes = false;
     let mut processes = false;
@@ -386,9 +219,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             }
             Some("--npm-prefix") => {
                 prefixes.push(PathBuf::from(arguments.next().ok_or_else(invalid)?))
-            }
-            Some("--codegraph-root") => {
-                codegraph_roots.push(PathBuf::from(arguments.next().ok_or_else(invalid)?))
             }
             Some(
                 "--source" | "--user-home" | "--uv-tools-dir" | "--serena-cache" | "--rustup-home"
@@ -444,7 +274,6 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         rustup_home: selected("--rustup-home", "RUSTUP_HOME"),
         path: if include { env::var_os("PATH") } else { None },
         nuphus_models: selected("--nuphus-models", "NUPHUS_MODELS_DIR"),
-        codegraph_roots,
         full_records: full,
         probe_versions: probes,
         processes,

@@ -197,22 +197,6 @@ fn run() -> io::Result<i32> {
                 verify_runtime()?;
                 harness_core::task_runtime::serve(guard, expected)?
             }
-            Some("codebase-memory") => {
-                verify_runtime()?;
-                harness_core::cbm_broker::serve(
-                    guard,
-                    expected,
-                    serde_json::from_str(encoded).map_err(|_| invalid())?,
-                )?
-            }
-            Some("codegraph") => {
-                verify_serving()?;
-                harness_core::codegraph_broker::serve(
-                    guard,
-                    expected,
-                    serde_json::from_str(encoded).map_err(|_| invalid())?,
-                )?
-            }
             Some("serena") => {
                 verify_serving()?;
                 harness_core::serena_broker::serve(
@@ -249,10 +233,8 @@ fn run() -> io::Result<i32> {
         return source_diagnostics::run(&args);
     }
     if args.is_empty() || args[0] == "--help" {
-        println!("codex-harness mcp codebase-memory --help (explicit native stdio connection)");
-        println!(
-            "codex-harness mcp codegraph-control --help (deliberate index/sync/status outside model sessions)"
-        );
+        println!("codex-harness mcp prepare-mcp --help (native MCP projection planning)");
+        println!("codex-harness mcp apply-registration --help (owned MCP registration journal)");
         println!("codex-harness mcp serena --help (shared native Serena stdio client)");
         println!("codex-harness mcp nuphus --help (audited original Nuphus stdio adapter)");
         println!(
@@ -267,7 +249,7 @@ fn run() -> io::Result<i32> {
         );
         println!("codex-harness dependencies audit --package-root DIRECTORY");
         println!(
-            "codex-harness dependencies probe --executable FILE --kind codebase-memory|nuphus --sha256 DIGEST"
+            "codex-harness dependencies probe --executable FILE --kind nuphus --sha256 DIGEST"
         );
         println!(
             "codex-harness dependencies stage --package NAME --version VERSION --state DIRECTORY"
@@ -350,19 +332,14 @@ fn run() -> io::Result<i32> {
         if args.get(1).is_some_and(|arg| {
             matches!(
                 arg.to_str(),
-                Some(
-                    "broker-retire"
-                        | "retire-codegraph"
-                        | "prepare-codegraph"
-                        | "apply-codegraph-registration"
-                )
+                Some("broker-retire" | "prepare-mcp" | "apply-registration")
             )
         }) {
             verify_manager()?;
         } else if args
             .get(1)
             .and_then(|arg| arg.to_str())
-            .is_some_and(|op| matches!(op, "codegraph" | "codegraph-control" | "serena" | "nuphus"))
+            .is_some_and(|op| matches!(op, "serena" | "nuphus"))
         {
             // Retained Codex MCP frontends stay callable after later source edits.
             verify_serving()?;

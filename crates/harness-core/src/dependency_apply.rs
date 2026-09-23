@@ -90,7 +90,6 @@ fn preserved_opencode_cache(before: &[(PathBuf, Vec<u8>)]) -> io::Result<()> {
 
 fn native_slot(id: &str) -> Option<&'static str> {
     match id {
-        "codegraph" => Some("codegraph"),
         "python" => Some("basedpyright"),
         _ => None,
     }
@@ -98,7 +97,6 @@ fn native_slot(id: &str) -> Option<&'static str> {
 
 fn staging_package(id: &str) -> Option<&'static str> {
     match id {
-        "codegraph" => Some(crate::dependency_discovery::dependency_codegraph::PACKAGE),
         "python" => Some("basedpyright"),
         _ => None,
     }
@@ -191,7 +189,7 @@ fn apply_native(request: &Request, item: &Value, activating: bool) -> io::Result
                 .unwrap_or("Required backend-specific provisioning/update remains unfinished."),
             item,
         )),
-        "install-required" if matches!(id, "codebase-memory" | "nuphus") => {
+        "install-required" if id == "nuphus" => {
             if !activating {
                 return Ok(result_item(
                     id,

@@ -319,8 +319,6 @@ fn isolate_environment(command: &mut CommandSpec, root: &Path) -> io::Result<()>
         ("XDG_CONFIG_HOME", "config"),
         ("XDG_DATA_HOME", "data"),
         ("CODEX_HOME", "codex"),
-        ("CBM_CACHE_DIR", "cbm"),
-        ("CBM_RUNTIME_DIR", "ipc"),
         ("NUPHUS_MODELS_DIR", "models"),
         ("NPM_CONFIG_CACHE", "npm-cache"),
         ("npm_config_cache", "npm-cache"),
@@ -516,12 +514,7 @@ pub(crate) fn inspect(
     let envelope: ManifestEnvelope =
         serde_json::from_slice(&manifest_bytes).map_err(|_| invalid())?;
     let report = envelope.report;
-    let codegraph = crate::dependency_discovery::dependency_codegraph::is_package(&request.package);
-    let preparation = if codegraph {
-        "codegraph-candidate-preparation"
-    } else {
-        "npm-candidate-preparation"
-    };
+    let preparation = "npm-candidate-preparation";
     if report.get("schema_version") != Some(&json!(1))
         || report.get("operation") != Some(&json!(preparation))
         || report.get("status") != Some(&json!("staged-unverified"))
@@ -568,14 +561,7 @@ pub(crate) fn inspect(
     )?;
     let package_json = files
         .iter()
-        .find(|file| {
-            file.path
-                == if codegraph {
-                    "lib/package.json"
-                } else {
-                    "package.json"
-                }
-        })
+        .find(|file| file.path == "package.json")
         .ok_or_else(invalid)?;
     let mut identity_bytes = Vec::new();
     package_json
@@ -620,18 +606,6 @@ pub(crate) fn inspect(
     }
 
     let entry = match request.package.as_str() {
-        "codebase-memory-mcp" => {
-            let file = files
-                .iter()
-                .find(|file| file.path == "bin/codebase-memory-mcp.exe")
-                .ok_or_else(invalid)?;
-            json!({
-                "kind": "native-executable",
-                "path": file.path,
-                "sha256": file.sha256,
-                "size": file.size
-            })
-        }
         "@nuphus/nuphus-mcp-win32-x64" => {
             let executable = files
                 .iter()
@@ -666,19 +640,6 @@ pub(crate) fn inspect(
                 "sha256": file.sha256,
                 "size": file.size,
                 "node_sha256": node_digest.ok_or_else(invalid)?
-            })
-        }
-        "@colbymchenry/codegraph" | "codegraph" => {
-            let inspected = crate::dependency_discovery::inspect_package(&stage)?;
-            json!({
-                "kind": "bundled-node",
-                "path": crate::dependency_discovery::dependency_codegraph::ENTRY,
-                "node": crate::dependency_discovery::dependency_codegraph::NODE,
-                "kernel": crate::dependency_discovery::dependency_codegraph::KERNEL,
-                "sha256": crate::dependency_discovery::dependency_codegraph::ENTRY_SHA256,
-                "node_sha256": crate::dependency_discovery::dependency_codegraph::NODE_SHA256,
-                "kernel_sha256": crate::dependency_discovery::dependency_codegraph::KERNEL_SHA256,
-                "root": inspected.root
             })
         }
         _ => return Err(invalid()),
@@ -725,7 +686,6 @@ fn probe_mcp(inspected: &InspectedCandidate) -> io::Result<Value> {
         .ok_or_else(invalid)?
         .join(path);
     let kind = match inspected.package() {
-        "codebase-memory-mcp" => dependency_mcp_probe::ProbeKind::CodebaseMemory,
         "@nuphus/nuphus-mcp-win32-x64" => dependency_mcp_probe::ProbeKind::Nuphus,
         _ => return Err(invalid()),
     };
@@ -824,11 +784,8 @@ pub fn validate(
 ) -> io::Result<ValidatedCandidate> {
     let inspected = inspect(stage, expected_manifest_sha256, node)?;
     let runtime = match inspected.package() {
-        "codebase-memory-mcp" | "@nuphus/nuphus-mcp-win32-x64" => probe_mcp(&inspected)?,
+        "@nuphus/nuphus-mcp-win32-x64" => probe_mcp(&inspected)?,
         "basedpyright" => probe_basedpyright(&inspected)?,
-        "@colbymchenry/codegraph" | "codegraph" => {
-            crate::codegraph_runtime::probe_package(&stage.join("package"))?
-        }
         _ => return Err(invalid()),
     };
     let mut report = inspected.report.clone();
@@ -967,18 +924,18 @@ pub(crate) mod tests {
     fn inspect_rejects_digest_mismatch_and_extra_files_without_execution() {
         let (_root, state) = owned_state();
         let manifest = package_json(
-            "codebase-memory-mcp",
-            "0.10.8",
-            json!({"codebase-memory-mcp": "./bin.js"}),
+            "@nuphus/nuphus-mcp",
+            "0.2.2",
+            json!({"nuphus-mcp": "./bin.js"}),
         );
         let (stage, digest) = write_stage(
             &state,
-            "codebase-memory-mcp",
-            "0.10.8",
+            "@nuphus/nuphus-mcp",
+            "0.2.2",
             &[
                 ("package.json", manifest.as_slice()),
                 ("bin.js", b"inert"),
-                ("bin/codebase-memory-mcp.exe", b"not-a-real-exe-but-hashed"),
+                ("bin/nuphus-mcp.exe", b"not-a-real-exe-but-hashed"),
             ],
             json!({}),
         );

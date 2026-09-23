@@ -20,7 +20,7 @@ Diagnostics do not repair found conflicts.
 `codex-harness-check.exe`,
 which calls the same diagnostics. CLI paths resolve relative to the calling
 command directory; the report is always JSON. Native port checks are recorded
-in [native Rust commands](rust-native.md#diagnostics-dependencies-and-cbm).
+in [native Rust commands](rust-native.md#diagnostics-and-dependencies).
 
 ## What is returned
 

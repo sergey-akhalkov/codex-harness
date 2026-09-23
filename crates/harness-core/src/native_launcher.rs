@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn run_reaps_detached_session_helper_and_returns_exit_code() {
+    fn run_preserves_detached_session_helper_after_an_ordinary_exit() {
         let fixture = Fixture::new();
         let compile = fixture.root.join("session-parent");
         fs::create_dir_all(&compile).unwrap();
@@ -1189,8 +1189,20 @@ mod tests {
         assert_eq!(code, 7);
         let pid: u32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
         assert!(
-            !pid_running(pid),
-            "detached session helper {pid} survived launcher return"
+            pid_running(pid),
+            "ordinary launcher exit must preserve upstream-managed background processes"
         );
+        // The session Job reaps the helper only after an abnormal launcher
+        // death; clean the fixture up directly here.
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                let _ = TerminateProcess(handle, 0);
+                let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
     }
 }

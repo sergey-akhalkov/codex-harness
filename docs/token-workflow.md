@@ -57,9 +57,9 @@ Explicit expansion requires a missing fact; a single response stays within
 16 KiB. Until enforced by a managed adapter, retain bulky raw responses in Code
 Mode and return selected evidence plus errors, coverage and detail access.
 The [portable recipes](../.agents/skills/token-efficient-workflow/references/code-retrieval.md)
-own the detailed limits and traps. [CodeGraph calibration](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/design.md#calibration)
-records actual comparisons and the accepted replacement. CodeGraph is the live
-graph registration, with automatic refresh inside the resource policy.
+own the detailed limits and traps. The archived [CodeGraph calibration](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/design.md#calibration)
+records the historical comparisons that supported the later full retirement;
+the managed graph registration no longer exists.
 
 For a new task the launcher accepts `--harness-effort routine|standard|demanding`
 as the first argument, mapping to native `low|high|xhigh`. An explicit native
@@ -158,10 +158,9 @@ run, with both windows served after the source command was removed. Those are
 output bytes and avoided reruns of a local fixture, not token or weekly-quota
 measurements.
 
-Serena/CBM retrieval on an owned fixture needed 2728 B of tool responses against
-4204 B of source. After both indexes, coverage reported `metadata_changed` with
-`generation_matches=true`; that is not a coverage miss and not verified
-filesystem freshness. Current-source oracle or snippet evidence remains the
+Historical Serena/CBM retrieval on an owned fixture needed 2728 B of tool
+responses against 4204 B of source; the CBM side of that comparison retired
+with the graph tools. Current-source oracle or snippet evidence remains the
 fallback.
 
 Runtime contracts: [RTK 0.48.0](https://github.com/rtk-ai/rtk/releases/tag/v0.48.0),

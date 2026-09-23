@@ -1,7 +1,7 @@
 //! Explicit preparation of an owned, unactivated npm package candidate.
 #![cfg(windows)]
 use crate::{
-    dependency_archive, dependency_assets, dependency_audit, dependency_discovery,
+    dependency_archive, dependency_audit, dependency_discovery,
     dependency_fetch::Client,
     native_build,
     process::{CommandSpec, StopReason},
@@ -142,47 +142,6 @@ fn unpack(
     )
 }
 
-fn codebase_binary(
-    client: &Client,
-    root: &Path,
-    version: &str,
-    listing: &mut Value,
-) -> io::Result<Value> {
-    let url = dependency_assets::metadata_url(version).map_err(io::Error::other)?;
-    let metadata = client
-        .fetch_validated(&url, MAX_DOCUMENT)
-        .map_err(io::Error::other)?;
-    let asset = dependency_assets::select(&metadata, version, std::env::consts::ARCH)
-        .map_err(io::Error::other)?;
-    let bytes = client.github_asset(&asset).map_err(io::Error::other)?;
-    if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
-        return Err(io::Error::other("native-asset-integrity-rejected"));
-    }
-    let mut binary = None;
-    dependency_archive::visit_zip(&bytes, |name: &str, size: u64, reader: &mut dyn Read| {
-        if name.rsplit('/').next() != Some("codebase-memory-mcp.exe") { return Ok(()); }
-        if binary.is_some() { return Err(invalid()); }
-        let destination = root.join("package/bin/codebase-memory-mcp.exe").components().collect::<PathBuf>();
-        native_build::ordinary_ancestors(destination.parent().ok_or_else(invalid)?)?;
-        fs::create_dir_all(destination.parent().ok_or_else(invalid)?)?;
-        let mut capture = Capture { input:reader, hash:Sha256::new(), manifest:None };
-        StagedFile::from_reader(&destination, &mut capture, size)?.commit()?;
-        binary = Some(json!({"path":"bin/codebase-memory-mcp.exe","size":size,"sha256":format!("{:x}",capture.hash.finalize())}));
-        Ok(())
-    }).map_err(|_| io::Error::other("native-candidate-archive-rejected"))?;
-    let binary = binary.ok_or_else(|| io::Error::other("native-candidate-executable-missing"))?;
-    let size = binary["size"].as_u64().ok_or_else(invalid)?;
-    listing["files"]
-        .as_array_mut()
-        .ok_or_else(invalid)?
-        .push(binary);
-    listing["file_count"] = json!(listing["file_count"].as_u64().ok_or_else(invalid)? + 1);
-    listing["payload_bytes"] = json!(listing["payload_bytes"].as_u64().ok_or_else(invalid)? + size);
-    Ok(
-        json!({"metadata":url,"metadata_sha256":format!("{:x}",Sha256::digest(&metadata)),"asset_id":asset.id,"archive":asset.url,"archive_sha256":asset.sha256,"archive_bytes":asset.size}),
-    )
-}
-
 fn npm_package(root: &Path, request: &Request, request_bytes: &[u8]) -> io::Result<(Value, Value)> {
     let (metadata_url, _) = dependency_audit::endpoints(&request.package, &request.version)?;
     let client = Client::new().map_err(io::Error::other)?;
@@ -194,63 +153,14 @@ fn npm_package(root: &Path, request: &Request, request_bytes: &[u8]) -> io::Resu
     let bytes = client
         .fetch_validated(&archive_url, MAX_ARCHIVE)
         .map_err(io::Error::other)?;
-    let mut listing = unpack(root, &request.package, &request.version, &bytes, &integrity)
+    let listing = unpack(root, &request.package, &request.version, &bytes, &integrity)
         .map_err(|_| io::Error::other("npm-candidate-archive-rejected"))?;
-    let native_asset = if request.package == "codebase-memory-mcp" {
-        codebase_binary(&client, root, &request.version, &mut listing)?
-    } else {
-        Value::Null
-    };
+    let native_asset = Value::Null;
     Ok((
         json!({
             "schema_version":1,"operation":"npm-candidate-preparation","status":"staged-unverified",
             "package":request.package,"version":request.version,"stage":root,"candidate":root.join("package"),
             "source":{"metadata":metadata_url,"archive":archive_url,"integrity":integrity,"metadata_sha256":format!("{:x}",Sha256::digest(&metadata)),"archive_sha256":format!("{:x}",Sha256::digest(&bytes)),"client_version":client.version},"native_asset":native_asset,
-            "request_sha256":format!("{:x}",Sha256::digest(request_bytes)),
-            "file_count":listing["file_count"],"payload_bytes":listing["payload_bytes"],
-            "activation_allowed":false,"runtime_compatibility":"not-probed","package_code_executed":false,"model_calls":0
-        }),
-        listing,
-    ))
-}
-
-fn codegraph_package(
-    root: &Path,
-    request: &Request,
-    request_bytes: &[u8],
-) -> io::Result<(Value, Value)> {
-    let metadata_url =
-        crate::dependency_discovery::dependency_codegraph::metadata_url(&request.version)
-            .map_err(io::Error::other)?;
-    let client = Client::new().map_err(io::Error::other)?;
-    let metadata = client
-        .fetch_validated(metadata_url, MAX_DOCUMENT)
-        .map_err(io::Error::other)?;
-    let asset = crate::dependency_discovery::dependency_codegraph::select(
-        &metadata,
-        &request.version,
-        std::env::consts::ARCH,
-    )
-    .map_err(io::Error::other)?;
-    let bytes = client.github_asset(&asset).map_err(io::Error::other)?;
-    if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
-        return Err(io::Error::other("native-asset-integrity-rejected"));
-    }
-    let listing =
-        crate::dependency_discovery::dependency_codegraph::unpack(root, &bytes, &asset.sha256)?;
-    let native_asset = json!({
-        "metadata": metadata_url,
-        "metadata_sha256": format!("{:x}", Sha256::digest(&metadata)),
-        "asset_id": asset.id,
-        "archive": asset.url,
-        "archive_sha256": asset.sha256,
-        "archive_bytes": asset.size
-    });
-    Ok((
-        json!({
-            "schema_version":1,"operation":"codegraph-candidate-preparation","status":"staged-unverified",
-            "package":request.package,"version":request.version,"stage":root,"candidate":root.join("package"),
-            "source":{"metadata":metadata_url,"archive":asset.url,"integrity":format!("sha256:{}", asset.sha256),"metadata_sha256":format!("{:x}",Sha256::digest(&metadata)),"archive_sha256":asset.sha256,"client_version":client.version},"native_asset":native_asset,
             "request_sha256":format!("{:x}",Sha256::digest(request_bytes)),
             "file_count":listing["file_count"],"payload_bytes":listing["payload_bytes"],
             "activation_allowed":false,"runtime_compatibility":"not-probed","package_code_executed":false,"model_calls":0
@@ -281,12 +191,7 @@ pub fn worker(root: &Path) -> io::Result<Value> {
         return Err(invalid());
     }
     native_build::verify_owned_state(&state)?;
-    let (mut report, listing) =
-        if crate::dependency_discovery::dependency_codegraph::is_package(&request.package) {
-            codegraph_package(&root, &request, &request_bytes)?
-        } else {
-            npm_package(&root, &request, &request_bytes)?
-        };
+    let (mut report, listing) = npm_package(&root, &request, &request_bytes)?;
     let manifest = serde_json::to_vec(&json!({ "report": report, "contents": listing }))?;
     if manifest.len() > MAX_MANIFEST {
         return Err(invalid());
@@ -299,11 +204,6 @@ pub fn worker(root: &Path) -> io::Result<Value> {
 /// Explicit preparation can initialize an empty native owned state. It never
 /// overwrites an installation, selects an active candidate or runs package code.
 pub fn prepare(manager: &Path, package: &str, version: &str, state: &Path) -> io::Result<Value> {
-    let package = if crate::dependency_discovery::dependency_codegraph::is_package(package) {
-        crate::dependency_discovery::dependency_codegraph::PACKAGE
-    } else {
-        package
-    };
     dependency_audit::endpoints(package, version)?;
     let state = dependency_discovery::local_path(state).map_err(|_| invalid())?;
     native_build::owner_root(&state)?;
@@ -366,12 +266,7 @@ pub fn prepare(manager: &Path, package: &str, version: &str, state: &Path) -> io
         let report: Value =
             serde_json::from_slice(&read(&stdout, 64 * 1024)?).map_err(|_| invalid())?;
         let manifest = read(&stage.path().join("manifest.json"), MAX_MANIFEST as u64)?;
-        let expected_operation =
-            if crate::dependency_discovery::dependency_codegraph::is_package(package) {
-                "codegraph-candidate-preparation"
-            } else {
-                "npm-candidate-preparation"
-            };
+        let expected_operation = "npm-candidate-preparation";
         if report["operation"] != expected_operation
             || report["schema_version"] != 1
             || report["status"] != "staged-unverified"

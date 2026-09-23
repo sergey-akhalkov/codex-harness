@@ -30,11 +30,13 @@ current source, the installed CLI and the relevant local inputs.
 | Skill evolution calibration and limits | [Skill evolution](memory/skill-evolution.md) |
 
 Archived [CodeGraph replacement](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/proposal.md)
-recorded the accepted bounded automatic refresh and measured retrieval policy.
-Active OpenSpec work remains authoritative until its own tasks close:
+and the 2026-09 retirement record the graph tool's full lifecycle, ending in
+its complete removal from the managed selection and first-party code.
+Archived change records remain available, and open migration work stays owned
+by [Rust migration](evidence/rust-migration.md):
 
-- [migrate-harness-to-rust](../openspec/changes/migrate-harness-to-rust/proposal.md)
-- [orchestrate-subscription-agents](../openspec/changes/orchestrate-subscription-agents/proposal.md)
+- [migrate-harness-to-rust](../openspec/changes/archive/2026-09-17-migrate-harness-to-rust/proposal.md)
+- [orchestrate-subscription-agents](../openspec/changes/archive/2026-09-20-orchestrate-subscription-agents/proposal.md)
 
 Use `openspec list` and the owning tasks for current progress. Publication and
 retention requirements live in [public-source-hygiene](../openspec/specs/public-source-hygiene/spec.md).

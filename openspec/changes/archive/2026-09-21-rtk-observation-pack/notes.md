@@ -1,7 +1,7 @@
 # Observation-pack notes
 
 Measurement and acceptance evidence for this change, produced by the acceptance
-suite [rtk_adapter.rs](../../../crates/codex-harness/tests/rtk_adapter.rs).
+suite [rtk_adapter.rs](../../../../crates/codex-harness/tests/rtk_adapter.rs).
 Only local fixture bytes and avoided reruns are recorded: no token, session or
 weekly-quota effect is claimed, and no model task was involved.
 

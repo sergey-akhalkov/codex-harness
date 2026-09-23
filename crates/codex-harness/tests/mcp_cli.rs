@@ -12,11 +12,8 @@ fn native_mcp_options_fail_before_opening_a_connection_or_creating_state() {
         vec!["mcp", "unknown"],
         vec!["mcp", "broker-retire"],
         vec!["mcp", "broker-retire", "--unknown", "x"],
-        vec!["mcp", "codebase-memory", "--executable"],
-        vec!["mcp", "codebase-memory", "--unknown", "x"],
-        vec!["mcp", "codebase-memory", "--cache", "one", "--cache", "two"],
-        vec!["mcp", "codebase-memory", "--connection-seconds", "0"],
-        vec!["mcp", "codebase-memory", "--connection-seconds", "86401"],
+        vec!["mcp", "prepare-mcp", "--mode", "Install", "--codex-home"],
+        vec!["mcp", "apply-registration", "--unknown", "x"],
         vec!["mcp", "nuphus", "--executable"],
         vec!["mcp", "nuphus", "--unknown", "x"],
         vec!["mcp", "nuphus", "--connection-seconds", "0"],
@@ -35,12 +32,12 @@ fn native_mcp_options_fail_before_opening_a_connection_or_creating_state() {
     }
     let help = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
         .current_dir(root.path())
-        .args(["mcp", "codebase-memory", "--help"])
+        .args(["mcp", "--help"])
         .output()
         .unwrap();
     assert!(help.status.success());
     assert!(help.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("--catalogue-file"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("serena"));
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
@@ -79,8 +76,7 @@ fn prepare_and_retire_commands_use_an_explicit_owned_private_root() {
 }
 
 #[test]
-fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_serving_remains_available()
- {
+fn source_stale_manager_keeps_serving_and_management_available() {
     use harness_core::build_identity::{self, BINARIES, BuildRecord, INSPECTION_SCHEMA, SCHEMA};
     use std::collections::BTreeMap;
     let root = tempfile::tempdir().unwrap();
@@ -137,7 +133,7 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
     let invoke = || {
         Command::new(&manager)
             .current_dir(root.path())
-            .args(["mcp", "codebase-memory", "--help"])
+            .args(["mcp", "serena", "--help"])
             .output()
             .unwrap()
     };
@@ -156,17 +152,6 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
     );
     assert_eq!(stale.stdout, healthy.stdout);
     assert!(stale.stderr.is_empty());
-    let served = Command::new(&manager)
-        .current_dir(root.path())
-        .args(["mcp", "codegraph", "--help"])
-        .output()
-        .unwrap();
-    assert!(
-        served.status.success(),
-        "{}",
-        String::from_utf8_lossy(&served.stderr)
-    );
-    assert!(String::from_utf8_lossy(&served.stdout).contains("--package-root"));
     for name in ["serena", "nuphus"] {
         let served = serving_help(&manager, root.path(), name);
         assert!(
@@ -215,16 +200,6 @@ fn recorded_source_consuming_runtime_rejects_stale_source_while_codegraph_servin
     );
     assert_eq!(missing.stdout, healthy.stdout);
     assert!(missing.stderr.is_empty());
-    let still_served = Command::new(&manager)
-        .current_dir(root.path())
-        .args(["mcp", "codegraph", "--help"])
-        .output()
-        .unwrap();
-    assert!(
-        still_served.status.success(),
-        "{}",
-        String::from_utf8_lossy(&still_served.stderr)
-    );
     for name in ["serena", "nuphus"] {
         let served = serving_help(&manager, root.path(), name);
         assert!(
@@ -299,7 +274,7 @@ fn source_stale_manager_still_emits_shared_config_overrides() {
     fs::write(source.join("crates/one/src/lib.rs"), "changed owned source").unwrap();
     let stale_runtime = Command::new(&manager)
         .current_dir(root.path())
-        .args(["mcp", "codebase-memory", "--help"])
+        .args(["mcp", "nuphus", "--help"])
         .output()
         .unwrap();
     assert!(

@@ -8,13 +8,13 @@ Increase completed, verified work from existing model subscriptions through reus
 
 This baseline records the earlier named-level contract. The accepted transition
 to direct model/effort selection, GPT leadership, Z.AI text/code execution and
-Grok visual/routine execution is specified in the active
-[orchestration delta](../../changes/orchestrate-subscription-agents/specs/agent-delegation/spec.md).
+Grok visual/routine execution is specified in the accepted
+[orchestration change](../../changes/archive/2026-09-20-orchestrate-subscription-agents/specs/agent-delegation/spec.md).
 Use the [operating guide](../../../docs/agent-delegation.md) for currently
 supported entry points and limitations. Keeping the baseline here does not
-override that transition or establish that its pending acceptance has passed;
-its [tasks](../../changes/orchestrate-subscription-agents/tasks.md) remain open
-until verified.
+override that transition; its archived
+[tasks](../../changes/archive/2026-09-20-orchestrate-subscription-agents/tasks.md)
+closed with that accepted change.
 
 ### Requirement: Universal capability levels
 

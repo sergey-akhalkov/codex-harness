@@ -65,11 +65,6 @@ fn conflict(message: &str) -> io::Error {
 
 fn package_identity(id: &str) -> io::Result<(&'static str, &'static str, ProbeKind)> {
     match id {
-        "codebase-memory" => Ok((
-            "codebase-memory-mcp",
-            "codebase-memory-mcp",
-            ProbeKind::CodebaseMemory,
-        )),
         "nuphus" => Ok(("@nuphus/nuphus-mcp", "nuphus-mcp", ProbeKind::Nuphus)),
         _ => Err(invalid()),
     }
@@ -219,21 +214,6 @@ struct RealOps;
 impl Ops for RealOps {
     fn stage(&mut self, request: &Request, id: &str, version: &str) -> io::Result<Staged> {
         match id {
-            "codebase-memory" => {
-                let report = dependency_stage::prepare(
-                    &request.manager,
-                    "codebase-memory-mcp",
-                    version,
-                    &request.state,
-                )?;
-                let candidate = report_path(&report, "candidate")?;
-                let executable = candidate.join("bin/codebase-memory-mcp.exe");
-                Ok(Staged {
-                    executable,
-                    candidate,
-                    sources: report_sources(&report),
-                })
-            }
             "nuphus" => {
                 let Some((_, expected)) = AUDITED_NUPHUS_ORIGINALS
                     .iter()
@@ -783,16 +763,28 @@ mod tests {
             fs::write(
                 candidate.join("package.json"),
                 format!(
-                    r#"{{"name":"codebase-memory-mcp","version":"{version}","bin":{{"codebase-memory-mcp":"bin/tool.js"}}}}"#
+                    r#"{{"name":"@nuphus/nuphus-mcp","version":"{version}","bin":{{"nuphus-mcp":"bin/tool.js"}}}}"#
                 ),
             )?;
             fs::write(candidate.join("bin/tool.js"), b"fixture entry point")?;
             fs::write(
-                candidate.join("bin/codebase-memory-mcp.exe"),
+                candidate.join("bin/nuphus-mcp.exe"),
                 b"owned fixture binary",
             )?;
+            let companion = candidate
+                .join("node_modules")
+                .join("@nuphus/nuphus-mcp-win32-x64");
+            fs::create_dir_all(companion.join("bin"))?;
+            fs::write(
+                companion.join("package.json"),
+                format!(r#"{{"name":"@nuphus/nuphus-mcp-win32-x64","version":"{version}"}}"#),
+            )?;
+            fs::write(
+                companion.join("bin/nuphus-mcp.exe"),
+                b"owned fixture native binary",
+            )?;
             Ok(Staged {
-                executable: candidate.join("bin/codebase-memory-mcp.exe"),
+                executable: candidate.join("bin/nuphus-mcp.exe"),
                 candidate,
                 sources: vec![json!("fixture://archive")],
             })
@@ -844,11 +836,11 @@ mod tests {
         }
 
         fn installation(&self) -> PathBuf {
-            self.modules().join("codebase-memory-mcp")
+            self.modules().join("@nuphus/nuphus-mcp")
         }
 
         fn install(&self, ops: &mut FakeOps) -> io::Result<Value> {
-            install(&self.request, "codebase-memory", "1.9.9", ops)
+            install(&self.request, "nuphus", "1.9.9", ops)
         }
 
         fn journal(&self) -> PathBuf {
@@ -877,10 +869,11 @@ mod tests {
         assert_eq!(ops.probes, 2, "staged and installed executables are probed");
         let installation = fixture.installation();
         assert!(installation.join("package.json").is_file());
-        let marker = installation.join("bin/.harness-provisioning.json");
+        let marker = installation
+            .join("node_modules/@nuphus/nuphus-mcp-win32-x64/bin/.harness-provisioning.json");
         let marker_value: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
         assert_eq!(marker_value["owner"], "codex-harness-dependencies");
-        assert_eq!(marker_value["id"], "codebase-memory");
+        assert_eq!(marker_value["id"], "nuphus");
         let journal: Value = serde_json::from_slice(&fs::read(fixture.journal()).unwrap()).unwrap();
         assert_eq!(journal["phase"], "committed");
         assert_eq!(
@@ -934,7 +927,7 @@ mod tests {
         fs::create_dir_all(installation.join("bin")).unwrap();
         fs::write(
             installation.join("package.json"),
-            r#"{"name":"codebase-memory-mcp","version":"0.0.1"}"#,
+            r#"{"name":"@nuphus/nuphus-mcp","version":"0.0.1"}"#,
         )
         .unwrap();
         let mut ops = FakeOps::new(false);
@@ -944,7 +937,7 @@ mod tests {
         assert_eq!(ops.probes, 0);
         assert_eq!(
             fs::read_to_string(installation.join("package.json")).unwrap(),
-            r#"{"name":"codebase-memory-mcp","version":"0.0.1"}"#
+            r#"{"name":"@nuphus/nuphus-mcp","version":"0.0.1"}"#
         );
         assert!(!fixture.request.state.join("transactions").exists());
 
@@ -968,7 +961,7 @@ mod tests {
 
         fs::write(
             fixture.installation().join("package.json"),
-            r#"{"name":"codebase-memory-mcp","version":"9.9.9"}"#,
+            r#"{"name":"@nuphus/nuphus-mcp","version":"9.9.9"}"#,
         )
         .unwrap();
         let pending = recover_journal(&journal_path, true).unwrap();
@@ -994,7 +987,7 @@ mod tests {
         let fixture = Fixture::new();
         let error = install(
             &fixture.request,
-            "codebase-memory",
+            "nuphus",
             "1.0.0-beta",
             &mut FakeOps::new(false),
         )
@@ -1026,12 +1019,12 @@ mod tests {
         fs::create_dir_all(installation.join("bin")).unwrap();
         let marker = installation.join("bin/.harness-provisioning.json");
         fs::write(&marker, br#"{"owner":"foreign-tool","note":"preserve me"}"#).unwrap();
-        let executable = installation.join("bin/codebase-memory-mcp.exe");
+        let executable = installation.join("bin/nuphus-mcp.exe");
         fs::write(&executable, b"owned fixture binary").unwrap();
         let error = write_provenance_marker(
             &fixture.request.state.join("transactions/unused.json"),
             &installation,
-            "codebase-memory",
+            "nuphus",
             "1.9.9",
             &executable,
         )
@@ -1070,7 +1063,7 @@ mod tests {
         fs::create_dir_all(installation.join("bin")).unwrap();
         fs::write(
             installation.join("package.json"),
-            r#"{"name":"codebase-memory-mcp","version":"1.9.9"}"#,
+            r#"{"name":"@nuphus/nuphus-mcp","version":"1.9.9"}"#,
         )
         .unwrap();
         let owner = state.join("transactions/standalone-interrupted");
@@ -1082,13 +1075,13 @@ mod tests {
             "phase": "prepared",
             "installation": installation,
             "candidate": state.join("staging/candidate-interrupted/package"),
-            "backup": state.join("rollback/codebase-memory-new-interrupted"),
+            "backup": state.join("rollback/nuphus-new-interrupted"),
             "candidate_identity": tree_identity(&installation, &BTreeMap::new()).unwrap(),
             "transaction_id": "standalone-interrupted",
-            "component": "codebase-memory",
+            "component": "nuphus",
         });
         fs::write(
-            owner.join("codebase-memory.json"),
+            owner.join("nuphus.json"),
             serde_json::to_vec_pretty(&journal).unwrap(),
         )
         .unwrap();

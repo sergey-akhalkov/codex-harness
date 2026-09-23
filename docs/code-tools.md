@@ -5,20 +5,24 @@
 [Resource specification](../openspec/specs/bounded-tool-resources/spec.md)
 
 
-The live global MCP selection is Serena, CodeGraph and Nuphus. Codebase Memory
-and Graphify are retired from the managed selection; leftover shared packages,
-saved graphs and indexes stay on the host.
+The live global MCP selection is Serena and Nuphus. Codebase Memory, Graphify
+and CodeGraph are retired and their first-party code is removed; leftover
+shared packages, saved graphs and indexes stay on the host as inert residue
+for manual inspection or deletion.
 Start a new Codex session to load current registrations. Existing sessions keep
 previously loaded catalogues until restart.
 
 ## Selecting tools in everyday work
 
 The [global MCP selection rules](../global/principles-of-work.md#mcp-tool-selection)
-apply to parents and tool-capable children in every project. Serena is the first
-choice for known-file symbols, exact references and suitable edits. CodeGraph
-serves compact repository discovery and relationships through its bounded query
-surface; deliberate indexing, catch-up and status run outside model sessions
-through the native codegraph-control CLI. Use explicit project checks for
+apply to parents and tool-capable children in every project. Serena is the
+primary code surface: file structure through `get_symbols_overview`, bounded
+bodies through `find_symbol`, exact relationships through
+`find_referencing_symbols`/`find_implementations`/`find_declaration`, and code
+changes through symbol operations (`replace_symbol_body`,
+`insert_before_symbol`/`insert_after_symbol`, `rename_symbol`,
+`safe_delete_symbol`) instead of line surgery; `replace_in_files` serves
+matching narrow multi-file text edits. Use explicit project checks for
 validation and Nuphus for authorized UI work. Connected Apps serve their
 matching remote resources when enabled locally; the portable default disables
 the Apps feature. Literal text and narrow line edits retain native tools. The
@@ -26,18 +30,21 @@ Serena proxy hides memory, onboarding and configuration-introspection tools;
 HARNESS_SERENA_UNFILTERED=1 restores the full catalogue for debugging. Initialize
 `instructions` that name those hidden tools are stripped so Codex does not keep
 the model and TUI on Serena while it retries `initial_instructions`.
+`search_for_pattern` is also hidden: scoped native `rg` owns literal text and
+regex search because it is faster, complete and shell-owned.
 
 Desktop window identity uses list, title, bounds and state. Screenshots are for
 genuine visual questions about owned non-text UI, not to prove Codex conversation
 visibility. Desktop/window captures without a path become native image blocks;
 caller-supplied owned paths stay path-only and must not include image bytes.
 
-Availability does not establish the active project, index coverage, graph
-identity, language support or an open document session. Initialize only relevant
+Availability does not establish the active project, language support or an
+open document session. Initialize only relevant
 missing context, bound queries, and use a scoped fallback for observed gaps.
 This is an instruction policy, not a forced scheduler or a measured
-subscription-saving claim. The archived [CodeGraph replacement](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/proposal.md)
-records the native adapter and its accepted consumer evidence.
+subscription-saving claim. The measured-use history that led to the CodeGraph
+retirement lives in the archived [CodeGraph replacement](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/proposal.md)
+and the 2026-09 retirement change.
 Use the [retrieval recipes](../.agents/skills/token-efficient-workflow/references/code-retrieval.md)
 to choose small answers and preserve uncertainty; broad explore is not the
 default entry point.
@@ -72,11 +79,9 @@ three-worker/idle-expiry lifecycle. Two owned native consumers returned distinct
 values for the same Rust symbol name under the current broker and completed
 their owned process cleanup; no additional Project Server is selected.
 
-Graphify 0.9.55 is retired from the managed selection after measured use
-collapsed to a handful of calls while CodeGraph covers the selected graph role.
-Leftover shared packages and saved graphs stay on the host; the first-party
-proxy and update sources were removed with the retirement, so Graphify has no
-managed registration and no in-repo rollback route.
+Graphify 0.9.55 was the first graph tool retired after measured use collapsed
+to a handful of calls; its first-party proxy and update sources were removed
+with that retirement.
 
 The kit adds MCP path registrations and one owned readiness setting to the
 existing user config. The native Codex TOML editor renders these registrations
@@ -115,12 +120,9 @@ introduce a shared Codex app-server.
 
 | Tool | Reuse and resource contract |
 | --- | --- |
-| Codebase Memory | Retired from the managed selection; not registered and not launched. Existing indexes and leftover native rollback commands are compatibility residue, not a live MCP. |
-| CodeGraph | Live graph provider. One account-wide indexing slot, one parse worker, one resolve worker, a 2 GiB Windows Job and 25% CPU. Each indexing episode has a 600-second deadline. Native observation covers every active indexed root; clients of the same root share resources. Healthy worker retirement preserves queued refresh. The model-facing MCP surface is codegraph_search plus codegraph_detail; deliberate index/sync/status run through the native codegraph-control CLI. Check is read-only; Install/Update stage the pinned published Windows x64 1.6.0 tree (940 files). Ordinary startup does not download, build or enable telemetry. |
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
-| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers, 300-second idle expiry, a 4 GiB Windows Job and 25% CPU per worker. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. A worker whose language-server manager failed during project initialization is replaced and the same semantic call is retried once. The proxy filters memory, onboarding and introspection tools from tools/list and drops initialize instructions that name them; native Git records stay authoritative. |
+| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers, 300-second idle expiry, a 4 GiB Windows Job and 25% CPU per worker. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. A worker whose language-server manager failed during project initialization is replaced and the same semantic call is retried once. The proxy filters memory, onboarding, introspection and text-search tools from tools/list and drops initialize instructions that name them; native Git records stay authoritative and scoped `rg` owns literal text. |
 | Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
-| Graphify | Retired from the managed selection; not registered and not launched. Leftover shared packages and saved graphs stay on the host; the first-party proxy and update sources were removed with the retirement. |
 
 Windows ownership guards reclaim owned descendant processes on owner exit or
 crash, including language servers and private browsers. Pool eviction closes the
@@ -136,17 +138,6 @@ service is added; an unavailable WMI launcher produces an explicit startup error
 Environment is passed through STDIN into the native process environment, never
 through command lines or handoff files.
 
-Before graph-backed CBM search or navigation, explicitly run `index_repository`
-unless a successful index of the current source state is already verified.
-Unknown freshness before the first search, local edits, external changes and
-branch switches require refresh before the next graph query. Batch edits and
-reuse a verified unchanged index across related queries. Wait for indexing to
-succeed and check coverage before relying on results. A busy slot, resource
-limit, cancellation or deadline does not establish freshness: use fresh Serena
-or direct source and label the retained graph stale. Generated-log exclusions
-are project-specific, additive changes; the kit does not delete source or
-indexes.
-
 Resource settings have an account-level receipt with a set of installation owners.
 Repeated installation for the same `CODEX_HOME` is idempotent. Disconnect releases
 that owner; only the last owner restores original native settings, and only where
@@ -158,171 +149,17 @@ Enforcement applies to delivered kit entry points; direct native invocations can
 bypass supervision. Existing MCP processes have loaded old code and must be
 replaced by restarting their Codex sessions.
 
-## Native CodeGraph provider
+## Retired graph integrations
 
-The first-party adapter lives in `crates/harness-core/src/codegraph_*.rs`. Native
-commands:
-
-```powershell
-codex-harness.exe mcp prepare-codegraph --mode Check --codex-home <directory> --dependency-state <directory>
-codex-harness.exe mcp prepare-codegraph --mode Install --codex-home <directory> --dependency-state <directory> [--package-root <directory>]
-codex-harness.exe mcp apply-codegraph-registration --mode Check --codex-home <directory> [--package-root <directory>]
-codex-harness.exe mcp codegraph --package-root <directory> [--project <directory>] [--broker-root <directory>]
-codex-harness.exe mcp retire-codegraph
-```
-
-Check inspects identity without staging. Install/Update may explicitly acquire
-and probe the pinned published package; they do not write MCP registrations.
-The Rust registration command journals the provider switch and supports
-Install/Update/Check/Recover/Disconnect. The existing installer coordinates it
-with the other component journals. Transitional PowerShell passes the native
-projection and retained tools' planned registrations into that Rust transaction;
-the provider uses `startup_timeout_sec=30` / `tool_timeout_sec=660`.
-
-The exact current directory is the default project root for a connection.
-Initial/full indexing is deliberate (`codegraph_index`). An account-wide native
-broker observes each connected indexed root, including clients in different
-Codex homes. Source notifications coalesce into bounded counters; a fair queue
-runs published finite sync operations and commits completed generations. Native
-observation replaces the upstream autonomous watcher so different roots share
-one indexing allowance. Queries identify the canonical root and generation;
-changes arriving during an episode remain pending and require current source
-until a subsequent completed refresh.
-
-On Windows, checkpoint rotation waits up to two seconds for a short-lived
-reader to release a conflicting handle, within the current operation deadline
-and cancellation. Persistent sharing or permission failures remain explicit;
-the saved checkpoint stays recoverable and is not presented as current.
-
-Backend processes are reused for the selected root and drained before switching
-roots. Idle backends retire after 60 seconds, and healthy replacement precedes
-the process lease deadline without ending source observation. Closing the last
-client stops that project's observation and cancels its active work; other roots
-remain available. Reopening performs catch-up. An actual failed episode preserves
-the saved checkpoint and suspends automatic retries for that root until deliberate
-recovery. Ordinary queries do not make full database copies.
-
-The managed catalogue is ten tools: `codegraph_status`, `codegraph_index`,
-`codegraph_sync`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`,
-`codegraph_impact`, `codegraph_node`, `codegraph_explore` and
-`codegraph_detail`. Defaults are five matches, depth one and 4 KiB serialized
-answers, with an explicit 16 KiB maximum. Explore requires a named question and
-`maxFiles` of 1 or 2; file count is not a byte budget. Per-client retained details
-are at most 32
-pages, 256 KiB each, 8 MiB total, 30-minute expiry; retrieving a page never
-repeats the query. Graph edges are candidates; exact references and edits use
-Serena or current source.
-
-Owned project caches are `.codegraph-harness-store`,
-`.codegraph-harness-active` and `.codegraph-harness-stage` beside the selected
-root. Prepare/index writes an owned `OWNER` record and a cache-local
-`.gitignore` containing only `*`; that ignore belongs to the cache, never to
-the project's Git rules. Account-wide worker state uses a private
-`LOCALAPPDATA` location. Product sources, CBM indexes and unrelated
-packages stay in place for rollback.
-
-The pinned package is CodeGraph 1.6.0 Windows x64, archive SHA-256
-`cd76c3c3391f2d40abef12b142151950b6d77abc2d8429e648f89eaa90f5b68a`, verified
-940-file tree. Published CodeGraph and bundled Node remain third-party; the kit
-does not maintain a fork or install their development toolchains.
-
-Accepted evidence before activation included:
-real-package CLI stage/select/Check/rollback; unit identity with companion
-mutation refusal; native 2 GiB allocation deny, deadline and cancel after
-partial writes with the committed generation preserved; generation store
-checks; small native MCP index, watch, rename, delete and reconnect; and a
-full real-root comparison with zero source-oracle loss on the pack and the
-locally selected large repository. Exhaustive detail recovery increases total
-bytes and extra calls, so those measurements are not a weekly-quota or overall
-savings claim. The model-facing managed catalogue is the bounded query surface
-(codegraph_search plus codegraph_detail); deliberate maintenance runs through
-the native control CLI, and a filtered upstream raw catalogue can be smaller.
-
-Activation passed through the existing recoverable lifecycle: the transitional
-installer rebuilt the native manager from current source, adopted the verified
-package and committed the CodeGraph registration while retiring only the owned
-CBM entry. Live Check reports the connection protocol-ready; semantic config
-comparison showed only the owned CodeGraph command path changing. CBM's shared
-package and existing indexes stayed in place. Isolated journal tests cover
-interrupted activation, Recover back to CBM's manual policy, preserved user
-edits and Disconnect removing only the owned block.
-
-Installed consumer acceptance then verified fresh non-interactive app-server
-sessions in three indexed projects plus another client of the first root
-(automatic add/change-burst/rename/delete, shared worker identity, last-client
-retirement, offline-root stop and reopen catch-up, 49.9 seconds), a fresh
-interactive TUI smoke through the installed launcher, resume and fork of a
-saved thread, retained Serena/Nuphus operations including an owned
-browser effect, and one explicit exec parent plus tool-capable middle child
-that each performed a real CodeGraph search with the expected canonical root.
-The default probe model is Astra; the recorded run used the separately
-authorized xAI/Grok route while that account quota was unavailable.
-
-Restart boundaries: already running sessions keep their previous MCP catalogue
-until restarted. After Install/Update rebuilds native source, an account broker
-from the older build is not adopted by frontends from the new build. The Codex
-MCP command retires that incompatible broker once and starts the current source
-instead of failing initialize. `codex-harness.exe mcp retire-codegraph` remains
-the explicit maintenance path. A later checkout edit does not stop an already recorded
-hash-matching CodeGraph, Serena or Nuphus adapter: Codex CLI can still complete
-MCP initialize from that command. Native adapter changes still need explicit
-Install/Update and a new session. Source-consuming native operations remain
-gated on a healthy source match. Do not continue a CBM port; retire CBM-only
-paths only with further consumer-backed evidence. Disconnect retires only owned
-CodeGraph workers and registrations.
-
-The managed registrations name the stable `<CODEX_HOME>/harness/bin/codex-harness.exe`
-link, which core Install/Update re-points at the freshest integrity-verified
-build. A new session therefore starts the delivered manager without rewriting
-`config.toml`, and a manager that running sessions still hold is left in place.
-
-Each delivered build generation gets its own private broker location. A new
-session starts or joins the broker of the manager it runs, and does not retire
-the broker that sessions of the previous build still use; those keep working
-and their broker expires on its own idle timeout once they finish. Sharing
-within one generation is unchanged, and `mcp broker-retire` /
-`mcp retire-codegraph` remain the explicit maintenance path.
-Location records stay bounded across deliveries: entries whose directory is
-gone are dropped, a generation whose broker instance is no longer live is
-pruned, and a new generation reuses a freed location before preparing another
-one. The record read stays a fixed 64 KiB guard, not a lifetime limit; a record
-grown by past deliveries is parsed, pruned and rewritten on the first startup
-instead of failing MCP initialize. Release checks cover both record owners with
-a grown-record regression and adopted-package handshakes.
-
-## Large-repository indexing
-
-Acceptance of graph indexing requires the locally selected large real project.
-A small fixture does not replace it. Preserve that project's product sources
-and do not contact controllers. Generated HTML logs are excluded.
-
-A historical CBM full index under the delivered policy completed: 3,668
-discovered files, 27.874 seconds, about 1.97 GiB peak private memory, 128,315
-nodes / 219,315 edges, 0 skipped and 118 partially parsed files. Native
-coverage later reported `coverage_unavailable / metadata_changed` for
-representative files whose saved hash, mtime and size still matched; that
-upstream signal is not relabelled clean and is not proof of missing source.
-
-The current larger checkout of the same locally selected project fails the same
-CBM memory policy. A native shared-MCP index into an owned private cache failed
-in 79.53 seconds with worker `MemoryLimit`, exit 125, Job limit 2 GiB and Windows
-allocation error 1455. Largest remaining inputs include maintained XML
-configurations, headers and reference data rather than the previously excluded
-generated HTML logs. No successful current CBM full index or refresh is claimed.
-
-The current CodeGraph comparison indexed that same locally selected project
-under the retained 2 GiB policy: 979 eligible files matched 979 SQL indexed
-files; the pack checkout matched 315 eligible to 315 indexed. The large index
-completed in 56.658 seconds with 714,379,264 bytes peak private memory. These
-counts account for eligible maintained-source extraction; the comparison's
-source oracles and refresh checks provide separate behavioral evidence.
-Replacement task 3.5 is complete. Global delivery and the broader Rust task
-5.4 remain open; current measurements and limits live in the
-[replacement design](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/design.md).
-
-Missing CBM UI JSON is treated as enabled for the audited embedded-UI binary,
-regardless of SQLite settings. Coverage flags `missing` and `metadata_changed` are
-upstream best-effort signals, not complete-source proof.
+CodeGraph, Codebase Memory and Graphify are fully retired: no managed
+selection, registration, first-party adapter or CLI route remains in the kit.
+Update removes any owned registration recorded by an earlier version while
+preserving unrelated settings; shared packages, saved graphs, caches and
+account/broker state stay on the host as inert residue. Delete them manually
+when no longer needed; the kit neither reads nor re-registers them. The
+measured-use and breakage history that justified the retirement lives in the
+archived [CodeGraph replacement](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/proposal.md)
+and the 2026-09 retirement change.
 
 ## Explicit lifecycle
 
@@ -395,8 +232,6 @@ Native MCP/hook contract notes that remain current:
   acceptance; isolated user roots and fresh checkout relocation are substitutes,
   not a clean-VM claim.
 
-Primary contracts: [CBM 0.10.8 configuration](https://github.com/DeusData/codebase-memory-mcp/blob/v0.10.8/docs/CONFIGURATION.md),
-[CodeGraph 1.6.0 Windows release](https://github.com/colbymchenry/codegraph/releases/tag/v1.6.0),
-[Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),
+Primary contracts: [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),
 [Serena configuration](https://oraios.github.io/serena/02-usage/050_configuration.html),
 [rust-analyzer installation](https://rust-analyzer.github.io/book/installation.html).

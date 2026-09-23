@@ -879,7 +879,8 @@ mod tests {
             let fixture = Fixture::new();
             let report = connect(&fixture.request, true).unwrap();
             assert_eq!(report.status, "preview");
-            assert_eq!(report.links, 9);
+            // Desired links follow the current binary and launcher set.
+            assert_eq!(report.links, 11);
             assert!(!fixture.request.codex_home.exists());
             assert!(!fixture.request.user_home.exists());
             assert!(!fixture.request.dependency_user_home.exists());

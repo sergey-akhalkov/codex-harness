@@ -118,11 +118,11 @@ Intersecting work retains its original acceptance:
 
 | Active owner | Boundary preserved by this adaptation |
 | --- | --- |
-| [autonomous-skill-evolution](../../autonomous-skill-evolution/proposal.md) | Same-session skill recovery, compact/resume, children and global delivery remain required; native memories remain excluded. Advertised experimental context management is not evidence of refreshed skill discovery or a reason to restore ordinary hooks. |
+| [autonomous-skill-evolution](../2026-09-19-autonomous-skill-evolution/proposal.md) | Same-session skill recovery, compact/resume, children and global delivery remain required; native memories remain excluded. Advertised experimental context management is not evidence of refreshed skill discovery or a reason to restore ordinary hooks. |
 | [improve-installed-tool-workflows](../2026-09-14-improve-installed-tool-workflows/proposal.md) | The shared skills keep current MCP/root/coverage and memory-tool constraints. Global real-consumer and benefit acceptance stays with that change. Description/refactoring work here does not close its tasks. |
-| [accelerate-verified-delivery](../../accelerate-verified-delivery/proposal.md) | Real-consumer verification and remaining benefit comparisons are preserved. Our owned loading fixtures and source checks are not substitutes. |
-| [migrate-harness-to-rust](../../migrate-harness-to-rust/proposal.md) | Transitional entry points, Rust cutover and their acceptance remain separate. A working AGENTS link or direct native check does not prove that the installed shared-default bridge is healthy. |
-| [orchestrate-subscription-agents](../../orchestrate-subscription-agents/proposal.md) | Direct route selection, visibility, resource ownership and recovery remain required. Existing legacy probe strings are retained for their bounded contracts, but cannot be run as visible-conversation acceptance without the required views. |
+| [accelerate-verified-delivery](../2026-09-18-accelerate-verified-delivery/proposal.md) | Real-consumer verification and remaining benefit comparisons are preserved. Our owned loading fixtures and source checks are not substitutes. |
+| [migrate-harness-to-rust](../2026-09-17-migrate-harness-to-rust/proposal.md) | Transitional entry points, Rust cutover and their acceptance remain separate. A working AGENTS link or direct native check does not prove that the installed shared-default bridge is healthy. |
+| [orchestrate-subscription-agents](../2026-09-20-orchestrate-subscription-agents/proposal.md) | Direct route selection, visibility, resource ownership and recovery remain required. Existing legacy probe strings are retained for their bounded contracts, but cannot be run as visible-conversation acceptance without the required views. |
 
 ### 3. Preserve OpenSpec without indirect overrides
 

@@ -3,7 +3,7 @@
   "capturedUtc": "2026-09-15T12:54:17Z",
   "change": "migrate-harness-to-rust",
   "task": "7.4; 8.2 executable ownership increment; updated by 9.5; check references corrected by the 8.4 review",
-  "scope": "Current requirement-to-check map for accepted native behavior. Dated rust-migration-map.json remains a 2026-09-08 file inventory, not remaining work. Transitional first-party Python/PowerShell/JS/C# paths were retired 2026-09-17 (task 9.5); the executable ownership check reports zero open findings. Global outside-checkout cutover completed in 9.2-9.3. Graphify is retired from the managed selection and its dependency-lifecycle surface is removed; only the documented registration guard remains.",
+  "scope": "Current requirement-to-check map for accepted native behavior. Dated rust-migration-map.json remains a 2026-09-08 file inventory, not remaining work. Transitional first-party Python/PowerShell/JS/C# paths were retired 2026-09-17 (task 9.5); the executable ownership check reports zero open findings. Global outside-checkout cutover completed in 9.2-9.3. Graphify, Codebase Memory and CodeGraph are fully retired (2026-09-23): their first-party code and CLI routes are removed and only the registration guard for owned legacy registrations remains.",
   "matrix": [
     {
       "area": "executable ownership accounting",
@@ -25,8 +25,8 @@
         "crates/codex-harness/tests/native_build.rs::cli_build_reuse_source_staleness_integrity_and_failed_update",
         "crates/codex-harness/tests/native_launcher.rs::installed_manager_link_enforces_integrity_and_allows_source_stale_recovery",
         "crates/codex-harness/tests/installation_state.rs::actual_command_preserves_absent_homes_and_legacy_adoption_after_relocation",
-        "crates/codex-harness/tests/codegraph_install.rs::deferred_install_recover_restores_cbm_manual_policy_and_index_bytes",
-        "crates/codex-harness/tests/codegraph_install.rs::disconnect_removes_owned_native_entry_and_keeps_foreign_server"
+        "crates/codex-harness/tests/mcp_registration.rs::deferred_install_recover_restores_cbm_manual_policy_and_index_bytes",
+        "crates/codex-harness/tests/mcp_registration.rs::disconnect_removes_owned_native_entry_and_keeps_foreign_server"
       ],
       "unfinished": "closed 2026-09-17: staged 9.1 acceptance and the journaled 9.2 global activation are verified; real-CLI relocation remains covered by the default acceptance suites"
     },
@@ -45,7 +45,7 @@
       "checks": [
         "crates/codex-harness/tests/config_boundary.rs::legacy_migration_preserves_local_conflicts_unknown_fields_and_recovery",
         "crates/codex-harness/tests/installation_state.rs::pending_reparse_and_concurrent_edits_preserve_state_and_foreign_objects",
-        "crates/codex-harness/tests/codegraph_install.rs::recover_preserves_later_user_edits_after_interrupted_activation",
+        "crates/codex-harness/tests/mcp_registration.rs::recover_preserves_later_user_edits_after_interrupted_activation",
         "crates/harness-core/tests/link_changes.rs::capture_identity_and_foreign_rollback_conflicts_preserve_all_versions"
       ]
     },
@@ -75,13 +75,13 @@
     },
     {
       "area": "four MCP interfaces",
-      "status": "native-covered; Graphify removed, registration guard retained",
+      "status": "native-covered; retired graph tools removed, registration guard retained",
       "checks": [
         "crates/codex-harness/tests/mcp_stdio.rs::actual_stdio_preserves_unicode_exact_ids_and_output_purity",
-        "crates/codex-harness/tests/codegraph_mcp.rs::managed_catalogue_defaults_errors_and_private_detail_recovery",
+        "crates/codex-harness/tests/mcp_stdio.rs::actual_stdio_preserves_unicode_exact_ids_and_output_purity",
         "crates/harness-core/tests/serena.rs::missing_registry_is_rejected_before_child_start",
         "crates/codex-harness/tests/nuphus_stdio.rs::native_nuphus_stdio_repairs_schema_bounds_screenshots_and_expires_refs",
-        "crates/codex-harness/tests/codegraph_install.rs::install_replaces_owned_cbm_and_preserves_indexes_packages_and_unrelated_settings"
+        "crates/codex-harness/tests/mcp_registration.rs::install_replaces_owned_cbm_and_preserves_indexes_packages_and_unrelated_settings"
       ]
     },
     {

@@ -14,7 +14,7 @@ two-client/native-child/reconnect contract, the Rust control connection
 performs initialization, exact model binding, one tool-using assignment and a
 deterministic GPT-refusal-to-successor handoff, and redundant supplied presets
 are retired. The
-[native contract receipt](../../../docs/rust-native.md#native-task-control-contract)
+[native contract receipt](../../../../docs/rust-native.md#native-task-control-contract)
 owns the tested behavior, original failure boundaries and remaining limits;
 global activation remains disabled.
 
@@ -91,7 +91,7 @@ and no second source of truth appears. The kit delivers board availability and
 workflow guidance through its installation lifecycle and verifies them from a
 fresh external session. Public kit sources use synthetic examples only. The
 `beads` assessment and pin are recorded in
-[project decisions](../../../docs/project-decisions.md#orchestration-board).
+[project decisions](../../../../docs/project-decisions.md#orchestration-board).
 Verified Windows v1.3.0 non-interactive contract: `bd init --skip-agents
 --non-interactive --quiet` (no `AGENTS.md`); stages as `bd create -t epic
 --json`; specifications as `bd create -t feature --parent <epic> --json`;

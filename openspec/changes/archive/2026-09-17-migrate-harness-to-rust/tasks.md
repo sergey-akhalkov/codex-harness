@@ -1,4 +1,4 @@
-The graph-provider target is CodeGraph, owned by [replace-cbm-with-codegraph](../archive/2026-09-11-replace-cbm-with-codegraph/tasks.md). Follow the [ownership and dependency map](design.md#graph-provider-ownership-and-order) before tasks 5.2–5.4, 8 or 9. Do not resume a separate CBM migration because its existing files or historical checks appear in the inventory. These dependencies do not mark implementation or global acceptance complete.
+The graph-provider target is CodeGraph, owned by [replace-cbm-with-codegraph](../2026-09-11-replace-cbm-with-codegraph/tasks.md). Follow the [ownership and dependency map](design.md#graph-provider-ownership-and-order) before tasks 5.2–5.4, 8 or 9. Do not resume a separate CBM migration because its existing files or historical checks appear in the inventory. These dependencies do not mark implementation or global acceptance complete.
 
 ## 1. Fix migration inputs and preserve acceptance
 

@@ -234,7 +234,8 @@ fn run() -> Result<bool, &'static str> {
                 ".pytest_cache",
                 ".mypy_cache",
                 ".ruff_cache",
-                ".codebase-memory",
+                ".codegraph-harness-store",
+                ".codegraph-harness-active",
             ]
             .contains(p)
         }) || ["pyc", "pyo", "jsonl", "log", "sqlite", "sqlite3", "db"]

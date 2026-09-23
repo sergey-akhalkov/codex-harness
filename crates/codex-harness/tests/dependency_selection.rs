@@ -11,7 +11,7 @@ fn official_staged_artifact_selection_preserves_conflicts_and_rolls_back() {
     let digest =
         std::env::var_os("HARNESS_DEPENDENCY_MANIFEST_SHA256").expect("explicit trusted digest");
     let slot = std::env::var("HARNESS_DEPENDENCY_SLOT").expect("explicit slot");
-    assert!(["codebase-memory", "nuphus", "basedpyright"].contains(&slot.as_str()));
+    assert!(["nuphus", "basedpyright"].contains(&slot.as_str()));
     let state = stage.parent().unwrap().parent().unwrap();
     let active = state.join(format!("dependency-{slot}.json"));
     assert!(

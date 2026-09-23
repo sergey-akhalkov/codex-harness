@@ -6,7 +6,7 @@ Reduce avoidable subscription use while preserving complete accepted outcomes, c
 
 ## Requirements
 
-The active [routing and efficiency delta](../../changes/orchestrate-subscription-agents/specs/subscription-efficiency/spec.md)
+The archived [routing and efficiency change](../../changes/archive/2026-09-20-orchestrate-subscription-agents/specs/subscription-efficiency/spec.md)
 owns the accepted transition from the earlier Grok-middle preference below.
 Current selection and migration status follow the
 [delegation contract](../agent-delegation/spec.md#requirements); this baseline

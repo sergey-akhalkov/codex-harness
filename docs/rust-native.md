@@ -3,11 +3,10 @@
 The [migration specification](../openspec/changes/archive/2026-09-17-migrate-harness-to-rust/proposal.md)
 requires Rust for all maintained harness-owned executable code, including tests
 and skill helpers. This is a rule for pack development; it does not change the
-languages of projects using the kit. External Codex, Serena,
-Codebase Memory, published CodeGraph/Node, Nuphus and language
-servers retain their own implementations and supported runtimes. The
-first-party CodeGraph adapter is Rust and is the live global graph after
-replacement acceptance.
+languages of projects using the kit. External Codex, Serena, Nuphus and
+language servers retain their own implementations and supported runtimes.
+CodeGraph, Codebase Memory and Graphify are retired and carry no first-party
+code.
 
 The native lifecycle is the live global installation: the manager, launcher,
 diagnostic alias, MCP servers and RTK adapter are Rust. The transitional
@@ -26,7 +25,7 @@ The retired script interface and its native equivalent. Selectors, preview
 | `install.ps1 -Mode Check` (`-Diagnose`) / `codex-harness-check.ps1` | `codex-harness check` / `check --diagnose` / `codex-harness diagnose` |
 | `install.ps1 -Mode Disconnect` / `-Mode Recover` | `codex-harness disconnect` / `recover` |
 | `install.ps1 -Mode ConfigureRestart -SubscriptionsOnly` | `codex-harness configure-restart --subscriptions-only` |
-| `tools/mcp.ps1 <server>` | `codex-harness mcp serena` / `nuphus` / `codegraph-control` (plus `codebase-memory` only as documented rollback) |
+| `tools/mcp.ps1 <server>` | `codex-harness mcp serena` / `nuphus` |
 | `tools/hook.ps1` | Retired no-op compatibility entry; the accepted RTK exception runs native `harness-rtk.exe` |
 | `tools/delegation-usage.py` | `codex-harness delegation-usage` |
 | First-party usage analyzer | `token-audit report` / `findings` / `detail` / `baseline save|diff` (crate `crates/token-audit`, operated by the `tokenomics` skill) |
@@ -39,8 +38,9 @@ The retired script interface and its native equivalent. Selectors, preview
 
 ## Prerequisites and checks
 
-Windows x64, Rust MSVC toolchain (minimum Rust 1.89), Cargo, the MSVC C++
-linker and Windows SDK. Workspace dependencies are locked in the root
+Windows x64, Rust MSVC toolchain (minimum Rust 1.98, currently verified with
+1.98.1), Cargo, the MSVC C++ linker and Windows SDK. Workspace dependencies
+are locked in the root
 `Cargo.lock`. The RTK adapter is a workspace member with no independent
 lockfile. Use the existing toolchain; Check does not install packages.
 
@@ -717,7 +717,7 @@ manager file is never replaced: already started sessions keep their build and
 the next session resolves the delivered one. Code-tools registrations name that
 stable manager link instead of a frozen build path.
 
-The shared Serena and CodeGraph brokers keep one private location per delivered
+The shared Serena broker keeps one private location per delivered
 build generation, so a new session serves from its own manager while sessions
 of the previous build keep their broker until they finish. A generation with no
 consumers retires on its idle timeout; explicit retirement remains a separate
@@ -725,8 +725,7 @@ maintenance command.
 
 Every compilation uses a fresh owned temporary target with a short path for
 MSVC; unchanged candidates reuse verified immutable binaries. Explicit release
-compilation uses the [shared heavy-command budget](#heavy-command-budget). This is
-separate from CodeGraph's 600-second indexing deadline and 25% CPU cap.
+compilation uses the [shared heavy-command budget](#heavy-command-budget).
 Abandoned management scratch (the `hcb-`/`hcc-`/`hca-` temp prefixes) is
 reclaimed at the next explicit build once older than 48 hours; only ordinary
 prefixed directories are removed and reparse points are skipped. Retained
@@ -776,8 +775,8 @@ Registration currently requires local NTFS with TxF.
 Mutually exclusive `--core-only`, `--code-tools-only`, `--subscriptions-only`,
 `--token-workflow-only` and `--board-only` are accepted. Combined activation is
 refused.
-`--code-tools-only` Check/preview/Install reuse adopted packages and preserve an
-existing CodeGraph registration. Update rewrites owned MCP registrations from
+`--code-tools-only` Check/preview/Install reuse adopted packages.
+Update rewrites owned MCP registrations from
 adopted inventory without acquiring packages or stopping shared OpenCode
 consumers. Subscription and token-workflow Check/preview inspect owned records
 only and do not query or stop the live routing proxy. Code-tools Recover/Disconnect
@@ -815,141 +814,50 @@ without following it.
 `cargo test --locked -p harness-core --test serena --jobs 1 -- --test-threads=1`
 rejects missing registry, missing Python and incompatible version/status before a
 child starts. Adopted-package probes need `HARNESS_CODE_TOOLS_REGISTRY` and
-`--ignored`. The helper sets an owned `SERENA_HOME` under the launch home, does
-not take a CodeGraph admission slot, and does not replace the live Python seam.
-Post-delivery MCP availability is also checked through the real entrypoints
-with a location record grown past the historical fixed bound: the unignored
-broker-state, CodeGraph-account and Serena-broker regressions run in the
-standard workspace gate, and the adopted-package checks
-`cargo test --locked -p codex-harness --test codegraph_mcp grown_account_anchor_lets_the_published_mcp_complete_handshake -- --ignored --exact --test-threads=1`
-(explicit `CODEGRAPH_ACCEPTANCE_PACKAGE` and an owned indexed
-`CODEGRAPH_ACCEPTANCE_PROJECT`) and
+`--ignored`. The helper sets an owned `SERENA_HOME` under the launch home and
+does not replace the live Python seam. Post-delivery MCP availability is also
+checked through the real entrypoints with a location record grown past the
+historical fixed bound: the unignored broker-state and Serena-broker
+regressions run in the standard workspace gate, and the adopted-package check
 `cargo test --locked -p codex-harness --test serena_stdio grown_location_record_still_completes_handshake_after_deliveries -- --ignored --exact --test-threads=1`
 (explicit `HARNESS_CODE_TOOLS_REGISTRY`) must complete MCP initialize and
 tools/list before a release is called delivered.
 
-## Diagnostics, dependencies and CBM
+## Diagnostics and dependencies
 
-`codex-harness.exe diagnose` and core alias `codex-harness-check.exe` provide
-read-only source reports. Global cutover has not replaced the script diagnostic
-alias.
-
-`dependencies discover --source CHECKOUT` and `dependencies plan --source CHECKOUT`
-are read-only. `dependencies audit --package-root DIRECTORY` compares selected
-npm package files with their exact official archive in a bounded worker.
-`dependencies stage --package NAME --version VERSION --state DIRECTORY` prepares
-an owned candidate without activation. `dependencies probe --executable FILE
---kind codebase-memory|nuphus --sha256 DIGEST` checks a digest-pinned native
-MCP: Codebase Memory uses an owned inert source sample; Nuphus lists its
+`dependencies discover` and `dependencies plan` remain read-only; discovery
+executes no package code, and planning reads official release metadata through
+system curl. `dependencies stage`, `validate`, `select`, `selected`,
+`recover-selection` and `rollback-selection` connect explicit candidates to
+bounded runtime validation and journaled local selection. BasedPyright
+requires an explicit Node path and digest. `dependencies apply|update`
+dispatches explicit plan actions: Check and preview stay read-only; Apply
+stages BasedPyright with an explicit Node path and digest, and installs
+missing nuphus packages into the shared user npm tree through a native
+journaled create-directory transaction with audited official archives,
+probed executables, recorded provenance and rollback to prior absence on
+failure. Existing installations, a shared npm lockfile and foreign markers
+are preserved without mutation. `dependencies probe --executable FILE --kind
+nuphus --sha256 DIGEST` checks a digest-pinned native MCP: Nuphus lists its
 protocol/tool contract without desktop or browser actions. The caller must
 establish executable and companion DLL provenance first.
+`dependencies recover-npm --state DIRECTORY [--rollback-committed]` finishes
+or rolls back interrupted shared-npm activation journals.
 
-`dependencies validate`, `select`, `selected`, `recover-selection` and
-`rollback-selection` connect retained candidates to explicit runtime validation
-and journaled local selection. BasedPyright requires an explicit Node path and
-digest. `dependencies apply|update` dispatches explicit plan actions. Check
-and preview stay read-only and do not stage, select, acquire packages or
-stop shared OpenCode consumers. Apply stages and selects native CodeGraph and, with an explicit Node path and
-digest, BasedPyright. Missing codebase-memory and nuphus packages install into
-the shared user npm tree through a native journaled create-directory
-transaction: audited official archives only, staged and installed executables
-probed, provenance marker recorded, and any post-activation failure rolls the
-activation back to prior absence. Existing installations, a shared npm
-lockfile and foreign markers are preserved without mutation. Serena,
-shared-tree replacement updates and the remaining language backends stay
-pending for their owning tasks. Complete provisioning and global connection
-remain open.
-`dependencies recover-npm --state DIRECTORY [--rollback-committed]` finishes or
-rolls back interrupted shared-npm activation journals; committed installations
-stay in place unless the explicit rollback flag is supplied.
-
-`dependencies resource-check --cache DIRECTORY` reads persisted CBM policy.
-`dependencies cbm-index`, `cbm-catalogue` and `cbm-tool` are explicit audited
-operations. A cache held by another daemon is refused before launch. Missing
-CBM UI JSON is treated as enabled for the audited embedded-UI binary,
-regardless of SQLite settings. `mcp codebase-memory` connects explicit CBM
-paths and a saved catalogue report to a bounded native stdio connection. The
-installed MCP entry requires the build receipt's `runtime_allowed` decision,
-which follows recorded binary integrity and stays true for a stale or
-unavailable checkout. The optional `--broker-root` route passed
-an actual two-client index/query/EOF scenario outside the checkout and requires
-a fresh private broker root for each service lifetime. Keep these CBM commands
-for rollback of the retired registration. Do not continue a CBM port; retire
-CBM-only paths only with further consumer-backed evidence. The historical CBM
-full index of the locally selected large repository failed the retained
-2 GiB / 25% CPU / 600-second memory policy.
-
-Native CodeGraph commands:
-
-```powershell
-codex-harness.exe mcp prepare-codegraph --mode Check --codex-home <directory> --dependency-state <directory>
-codex-harness.exe mcp prepare-codegraph --mode Install --codex-home <directory> --dependency-state <directory> [--package-root <directory>]
-codex-harness.exe mcp apply-codegraph-registration --mode Check --codex-home <directory> [--package-root <directory>]
-codex-harness.exe mcp codegraph --package-root <directory> [--project <directory>] [--broker-root <directory>]
-codex-harness.exe mcp retire-codegraph
-```
-
-`prepare-codegraph` Check is read-only. Install/Update may explicitly stage and
-probe the pinned published Windows x64 1.6.0 tree (940 files, archive SHA-256
-`cd76c3c3391f2d40abef12b142151950b6d77abc2d8429e648f89eaa90f5b68a`). Ordinary
-startup does not download, build or enable telemetry. The command emits the
-desired registration (`startup_timeout_sec=30`, `tool_timeout_sec=660`) and
-does not write MCP registrations. `apply-codegraph-registration` owns the native
-Install/Update/Check/Recover/Disconnect journal; the transitional installer
-coordinates it with retained components and passes their planned registrations.
-`mcp codegraph` serves the verified package through one account-wide
-broker. The exact current directory is the default project. Initial index is
-deliberate; every connected indexed root receives native observation and queued
-finite catch-up. Indexing episodes share one account slot, a 2 GiB Job, 25% CPU
-and a 600-second deadline. Backend idle retirement is 60 seconds; healthy
-replacement preserves observation and queued changes. Automatic and manual
-refresh commit generations; queries do not copy the database. Failed episodes
-preserve the committed checkpoint and require deliberate recovery.
-`retire-codegraph` retires the owned account broker. Concurrent installed MCP
-acceptance and global CodeGraph activation are complete; see the
-[provider contract](code-tools.md#native-codegraph-provider). After a native
-rebuild, retire an account broker from the older build before new consumers
-connect.
-
-`mcp nuphus` serves the audited original Nuphus binary through a native stdio
-adapter. Handshake and tools/list stay local when the account catalogue cache
-matches that digest. Browser tools start a private Chrome/Edge/Chromium CDP
-endpoint; desktop tools take the account-wide admission lock. Path screenshots
-stay path-only; no-path desktop screenshots become one native image block.
-Live global registration remains a later lifecycle task.
-
-```powershell
-codex-harness.exe mcp nuphus --executable <nuphus-mcp.exe> --expected-digest <sha256> --codex-home <directory> --account <directory> --source-root <checkout> --connection-seconds 86400
-```
-
-`dependencies stage-python --help` creates an empty offline UV environment from
-explicit trusted executable hashes. That unactivated candidate is not eligible
-for activation.
+`mcp serena` and `mcp nuphus` serve the retained integrations through
+first-party stdio adapters. `mcp prepare-mcp` plans native projections for
+the installer, `mcp apply-registration` journals the owned MCP registration
+block (including removal of retired owned registrations), and
+`mcp broker-prepare` / `mcp broker-retire` manage explicit broker roots.
+Retired CodeGraph, Codebase Memory and Graphify commands no longer exist;
+host residue is inert.
 
 ## Outcome, usage and helpers
 
-Installed tool-workflow qualification reuses the `codegraph_consumers` Rust
-consumer. Set `CODEGRAPH_CONSUMER_CODEX_EXE` to the exact native Codex executable,
-`CODEGRAPH_CONSUMER_HOME` to the installed home and `CODEGRAPH_CONSUMER_OUTPUT`
-to an owned evidence directory outside this checkout. The ignored
-`installed_tool_workflows::installed_code_and_memory_operations` case creates
-an external Rust project, exercises the real CLI oracle through Serena edits,
-and checks protected/ignored memory and partial-rename recovery without model
-turns. Run it with the ordinary Cargo test selector and `--ignored --exact
---nocapture --test-threads=1`; its printed directory retains all tool responses.
-
-`installed_readonly_boundary_on_prepared_project` reuses its completed project
-through explicit `TOOL_WORKFLOW_PREPARED_PROJECT`, then checks a fresh read-only
-consumer, negative writes and two-root symbol identity. The separate
-`installed_graph_routes_on_prepared_project` uses the same input and deliberately
-indexes it through the installed CodeGraph, then checks scoped relationships
-and completed watcher updates. Establish a current global manager before that
-case; these operation checks do not replace the change's pending native model
-comparisons or parent/child instruction-consumption checks.
-
-The unignored `memory_text_survives_clone_and_conflicting_worktrees` case uses
-only owned temporary Git repositories. It verifies actual tracked clone
-contents, excluded runtime cache and preserved conflicting versions.
+Installed tool-workflow qualification for the retired graph tools was removed
+with their code. Serena and Nuphus operation coverage lives in the
+`serena_stdio` adopted-package checks and the Nuphus probe contract above;
+new installed-consumer checks belong to the change that needs them.
 
 `codex-harness.exe outcome-report --input <private-json> [--markdown]` formats
 local attempt accounting without executing anything.
@@ -1000,11 +908,9 @@ skill descriptors remain live; accepted skill revisions must be delivered in an
 existing session without reloading the entire initial prompt. Ordinary hooks
 remain off. The accepted RTK exception and explicit Serena Python/Rust
 selection are preserved. The current resource selection must survive every
-native port: CodeGraph uses one account-wide worker, the 2048 MiB/25%
-CPU/600-second boundary, shared project-isolated Serena workers and
-ownership-aware cleanup; restored CBM remains explicit indexing only. Rust
-task 5.4 adopts this same CodeGraph owner and evidence; the whole Rust
-migration is not a prerequisite for replacement activation.
+native port: shared project-isolated Serena workers with their Job and CPU
+caps, and ownership-aware cleanup. Retired graph tools impose no runtime
+resource selection anymore.
 
 The original RTK script lifecycle now reads the root workspace manifest/lock
 and builds only `harness-rtk`. Native RTK lifecycle and Rust acceptance-helper

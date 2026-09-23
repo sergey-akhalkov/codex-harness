@@ -117,12 +117,7 @@ fn parse_release(spec: &Value, body: &[u8]) -> Result<Parsed, &'static str> {
     let text = utf8(body)?;
     match spec["id"].as_str() {
         Some("serena") => parse_pypi(package, text),
-        Some("codebase-memory" | "nuphus" | "python") => parse_npm(package, text),
-        Some("codegraph") => crate::dependency_discovery::dependency_codegraph::parse_release(body)
-            .map(|version| Parsed {
-                version,
-                rust: None,
-            }),
+        Some("nuphus" | "python") => parse_npm(package, text),
         Some("rust") => parse_rust_channel(text),
         _ => Err("unsupported-metadata-source"),
     }
@@ -398,7 +393,7 @@ fn inventory_records<'a>(
     let mut expected = BTreeMap::new();
     for spec in specs {
         let id = spec["id"].as_str().unwrap();
-        let group = if matches!(id, "serena" | "codebase-memory" | "nuphus" | "codegraph") {
+        let group = if matches!(id, "serena" | "nuphus") {
             "mcp"
         } else {
             "languages"
@@ -539,13 +534,9 @@ mod tests {
             "serena" => {
                 json!({"id":"serena","package":"serena-agent","manager":"uv","metadata":"https://pypi.org/pypi/serena-agent/json","runtime":["Python >=3.11","uv"]})
             }
-            "codebase-memory" => {
-                json!({"id":"codebase-memory","package":"codebase-memory-mcp","manager":"npm","metadata":"https://registry.npmjs.org/codebase-memory-mcp/latest","runtime":["Node.js"]})
-            }
             "nuphus" => {
                 json!({"id":"nuphus","package":"@nuphus/nuphus-mcp","manager":"npm","metadata":"https://registry.npmjs.org/@nuphus%2fnuphus-mcp/latest","runtime":["Node.js"]})
             }
-            "codegraph" => crate::dependency_discovery::dependency_codegraph::spec(),
             "python" => {
                 json!({"id":"python","package":"basedpyright","manager":"npm","required":true,"metadata":"https://registry.npmjs.org/basedpyright/latest","runtime":["Node.js"]})
             }
@@ -579,7 +570,7 @@ mod tests {
         let mut languages = Vec::new();
         for id in ids {
             match *id {
-                "serena" | "codebase-memory" | "nuphus" | "codegraph" => mcp.push(spec(id)),
+                "serena" | "nuphus" => mcp.push(spec(id)),
                 _ => languages.push(spec(id)),
             }
         }
@@ -591,9 +582,7 @@ mod tests {
         let mut languages = Vec::new();
         for item in records {
             match item["id"].as_str() {
-                Some("serena" | "codebase-memory" | "nuphus" | "codegraph") => {
-                    mcp.push(item.clone())
-                }
+                Some("serena" | "nuphus") => mcp.push(item.clone()),
                 _ => languages.push(item.clone()),
             }
         }
@@ -618,21 +607,7 @@ mod tests {
     fn checked(id: &str, version: &str) -> Value {
         let body = match id {
             "serena" => pypi("serena-agent", version),
-            "codebase-memory" => npm("codebase-memory-mcp", version),
             "nuphus" => npm("@nuphus/nuphus-mcp", version),
-            "codegraph" => serde_json::to_vec(&json!({
-                "tag_name": format!("v{version}"),
-                "draft": false,
-                "prerelease": false,
-                "assets": [{
-                    "name": crate::dependency_discovery::dependency_codegraph::ARCHIVE_NAME,
-                    "id": crate::dependency_discovery::dependency_codegraph::ASSET_ID,
-                    "size": crate::dependency_discovery::dependency_codegraph::ARCHIVE_BYTES,
-                    "state": "uploaded",
-                    "digest": format!("sha256:{}", crate::dependency_discovery::dependency_codegraph::ARCHIVE_SHA256),
-                    "browser_download_url": "https://github.com/colbymchenry/codegraph/releases/download/v1.6.0/codegraph-win32-x64.zip"
-                }]
-            })).unwrap(),
             "python" => npm("basedpyright", version),
             "rust" => rust_channel(version, "0.0.0", "2026-09-03"),
             _ => panic!("unsupported fixture id"),
@@ -744,26 +719,23 @@ mod tests {
 
     #[test]
     fn plan_preserves_modified_ambiguous_and_incomplete_installations() {
-        let cat = catalogue(&["nuphus", "python", "codebase-memory"]);
+        let cat = catalogue(&["nuphus", "python", "rust"]);
         let inv = inventory(&[
             record("nuphus", "modified", json!("0.2.1"), idle()),
             record("python", "ambiguous", json!("1.28.0"), idle()),
-            record("codebase-memory", "incomplete", json!("0.10.7"), idle()),
+            record("rust", "incomplete", json!("1.2.3"), idle()),
         ]);
         let mut releases = BTreeMap::new();
         releases.insert("nuphus".into(), checked("nuphus", "0.2.2"));
         releases.insert("python".into(), checked("python", "1.29.0"));
-        releases.insert(
-            "codebase-memory".into(),
-            checked("codebase-memory", "0.10.8"),
-        );
+        releases.insert("rust".into(), checked("rust", "1.3.0"));
         let planned = plan(&cat, &inv, &releases).unwrap();
         assert_eq!(
             actions(&planned),
             vec![
                 ("nuphus", "preserve-and-audit", Some("modified")),
-                ("codebase-memory", "preserve-and-audit", Some("incomplete")),
                 ("python", "preserve-and-audit", Some("ambiguous")),
+                ("rust", "preserve-and-audit", Some("incomplete")),
             ]
         );
         assert_eq!(planned["mode"], "plan");
@@ -773,9 +745,9 @@ mod tests {
     #[test]
     fn plan_active_consumers_and_missing_metadata_do_not_authorize_replacement() {
         let busy = record(
-            "codebase-memory",
+            "nuphus",
             "adopted",
-            json!("0.10.7"),
+            json!("0.2.1"),
             json!({"state":"observed","processes":[{"pid":4242}]}),
         );
         let unverified = record(
@@ -785,12 +757,9 @@ mod tests {
             json!({"state":"incomplete","processes":[]}),
         );
         let planned = plan(
-            &catalogue(&["codebase-memory", "python"]),
+            &catalogue(&["nuphus", "python"]),
             &inventory(&[busy.clone(), unverified]),
-            &BTreeMap::from([(
-                "codebase-memory".into(),
-                checked("codebase-memory", "0.10.8"),
-            )]),
+            &BTreeMap::from([("nuphus".into(), checked("nuphus", "0.2.2"))]),
         )
         .unwrap();
         assert_eq!(planned["items"][0]["action"], "update-pending-consumers");
@@ -804,30 +773,24 @@ mod tests {
         let mut unchecked = busy;
         unchecked["active_consumers"] = json!({"state":"not-checked","processes":[]});
         let planned = plan(
-            &catalogue(&["codebase-memory"]),
+            &catalogue(&["nuphus"]),
             &inventory(&[unchecked]),
-            &BTreeMap::from([(
-                "codebase-memory".into(),
-                checked("codebase-memory", "0.10.8"),
-            )]),
+            &BTreeMap::from([("nuphus".into(), checked("nuphus", "0.2.2"))]),
         )
         .unwrap();
         assert_eq!(planned["items"][0]["action"], "preserve-and-audit");
         assert_eq!(planned["items"][0]["reason"], "consumers-unverified");
 
         let observed = record(
-            "codebase-memory",
+            "nuphus",
             "adopted",
-            json!("0.10.7"),
+            json!("0.2.1"),
             json!({"state":"incomplete","processes":[{"pid":4242}]}),
         );
         let planned = plan(
-            &catalogue(&["codebase-memory"]),
+            &catalogue(&["nuphus"]),
             &inventory(&[observed]),
-            &BTreeMap::from([(
-                "codebase-memory".into(),
-                checked("codebase-memory", "0.10.8"),
-            )]),
+            &BTreeMap::from([("nuphus".into(), checked("nuphus", "0.2.2"))]),
         )
         .unwrap();
         assert_eq!(planned["items"][0]["action"], "update-pending-consumers");
@@ -1025,12 +988,11 @@ mod tests {
     }
 
     #[test]
-    fn current_catalogue_plan_reports_five_read_only_items() {
-        let ids = ["serena", "codebase-memory", "nuphus", "python", "rust"];
+    fn current_catalogue_plan_reports_four_read_only_items() {
+        let ids = ["serena", "nuphus", "python", "rust"];
         let cat = catalogue(&ids);
         let inv = inventory(&[
             record("serena", "adopted", json!("1.7.0"), idle()),
-            record("codebase-memory", "adopted", json!("0.10.8"), idle()),
             record("nuphus", "modified", json!("0.2.2"), idle()),
             record("python", "adopted", json!("1.29.0"), idle()),
             record(
@@ -1042,17 +1004,13 @@ mod tests {
         ]);
         let mut releases = BTreeMap::new();
         releases.insert("serena".into(), checked("serena", "1.7.0"));
-        releases.insert(
-            "codebase-memory".into(),
-            checked("codebase-memory", "0.10.8"),
-        );
         releases.insert("nuphus".into(), checked("nuphus", "0.2.2"));
         releases.insert("python".into(), checked("python", "1.29.0"));
         releases.insert("rust".into(), checked("rust", "1.98.1"));
         let planned = plan(&cat, &inv, &releases).unwrap();
         assert_eq!(planned["mode"], "plan");
         assert_eq!(planned["read_only"], true);
-        assert_eq!(planned["items"].as_array().unwrap().len(), 5);
+        assert_eq!(planned["items"].as_array().unwrap().len(), 4);
         assert_eq!(
             planned["items"]
                 .as_array()
@@ -1062,8 +1020,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ids
         );
-        assert_eq!(planned["items"][2]["action"], "preserve-and-audit");
-        assert_eq!(planned["items"][4]["action"], "reuse");
-        assert_eq!(planned["items"][4]["reason"], "held-toolchain-policy");
+        assert_eq!(planned["items"][1]["action"], "preserve-and-audit");
+        assert_eq!(planned["items"][3]["action"], "reuse");
+        assert_eq!(planned["items"][3]["reason"], "held-toolchain-policy");
     }
 }

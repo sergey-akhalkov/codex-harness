@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     os::windows::{
-        fs::{OpenOptionsExt, symlink_file},
+        fs::symlink_file,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     path::{Path, PathBuf},
@@ -17,7 +17,6 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
-    Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE},
     System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
 };
 
@@ -36,7 +35,11 @@ impl Fixture {
         let executable = dir.path().join("fixture.exe");
         fs::copy(env!("CARGO_BIN_EXE_harness-mcp-probe-fixture"), &executable).unwrap();
         let digest = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
-        fs::write(executable.with_extension("json"), serde_json::to_vec(&json!({"mode":mode,"kind":if kind==ProbeKind::CodebaseMemory {"cbm"} else {"nuphus"}})).unwrap()).unwrap();
+        fs::write(
+            executable.with_extension("json"),
+            serde_json::to_vec(&json!({"mode":mode,"kind":"nuphus"})).unwrap(),
+        )
+        .unwrap();
         Self {
             dir,
             executable,
@@ -89,7 +92,7 @@ impl Fixture {
 
 #[test]
 fn catalogue_preserves_complete_definitions_without_executing_tools() {
-    for kind in [ProbeKind::CodebaseMemory, ProbeKind::Nuphus] {
+    for kind in [ProbeKind::Nuphus, ProbeKind::Nuphus] {
         for mode in ["valid", "fragmented", "paged"] {
             let fixture = Fixture::new(mode, kind);
             let report = fixture
@@ -125,7 +128,7 @@ fn catalogue_preserves_complete_definitions_without_executing_tools() {
         "duplicate-key",
         "malformed",
     ] {
-        let fixture = Fixture::new(mode, ProbeKind::CodebaseMemory);
+        let fixture = Fixture::new(mode, ProbeKind::Nuphus);
         let error = fixture.catalogue().unwrap_err();
         assert!(!error.to_string().contains("SECRET_FOREIGN_TOKEN"));
         fixture.removed();
@@ -178,115 +181,6 @@ fn nuphus_negotiates_catalogue_and_reports_only_private_bounded_summary() {
         assert!(calls[2..].iter().all(|c| c == "tools/list"));
         fixture.removed();
     }
-}
-
-#[test]
-fn codebase_preserves_disposable_index_project_schema_and_exact_query_oracles() {
-    for mode in ["valid", "text-payload"] {
-        let fixture = Fixture::new(mode, ProbeKind::CodebaseMemory);
-        let summary = fixture.run().unwrap();
-        assert_eq!(summary["state"], "passed");
-        assert_eq!(summary["isolated_project_count"], 1);
-        assert_eq!(
-            summary["checked_operations"],
-            json!([
-                "initialize",
-                "notifications/initialized",
-                "tools/list",
-                "index_repository",
-                "list_projects",
-                "get_graph_schema",
-                "query_graph"
-            ])
-        );
-        assert_eq!(fixture.receipt()["memory_limit"], 2 * 1024 * 1024 * 1024u64);
-        fixture.removed();
-    }
-    for (mode, reason) in [
-        ("index-error", "tool operation failed"),
-        ("multiple-projects", "project isolation failed"),
-        ("wrong-root", "project root mismatch"),
-        ("query-spoof", "graph query failed"),
-        ("missing-mode", "index mode contract"),
-    ] {
-        Fixture::new(mode, ProbeKind::CodebaseMemory).failure(reason);
-    }
-}
-
-#[test]
-fn delayed_private_state_handle_release_still_removes_owned_tree() {
-    let fixture = Fixture::new("hold-state", ProbeKind::CodebaseMemory);
-    let executable = fixture.executable.clone();
-    let digest = fixture.digest.clone();
-    let worker = std::thread::spawn(move || probe(&executable, ProbeKind::CodebaseMemory, &digest));
-    let receipt = wait_receipt(&fixture.executable);
-    let cwd = PathBuf::from(receipt["cwd"].as_str().unwrap());
-    let hold = cwd.join("held-by-test");
-    let start = Instant::now();
-    let handle = loop {
-        if let Ok(file) = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&hold)
-        {
-            break file;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "hold file never appeared"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    fs::write(cwd.join("hold-ready"), b"ready").unwrap();
-    let child = owned_handle(receipt["pid"].as_u64().unwrap());
-    assert_eq!(
-        unsafe { WaitForSingleObject(child.as_raw_handle(), 15_000) },
-        WAIT_OBJECT_0
-    );
-    // Keep the first private-state removal failing with a sharing violation, then
-    // release inside the five-second cleanup retry budget.
-    std::thread::sleep(Duration::from_millis(400));
-    drop(handle);
-    let summary = worker.join().unwrap().unwrap();
-    assert_eq!(summary["state"], "passed");
-    assert_eq!(summary["isolation"]["temporary_state_removed"], true);
-    assert_eq!(summary["isolation"]["private_cleanup_retried"], true);
-    assert!(summary["isolation"]["private_cleanup_initial_os_error"].is_i64());
-    fixture.removed();
-}
-
-#[test]
-fn primary_protocol_error_keeps_failed_cleanup_visible() {
-    let fixture = Fixture::new("hold-state-query-spoof", ProbeKind::CodebaseMemory);
-    let executable = fixture.executable.clone();
-    let digest = fixture.digest.clone();
-    let worker = std::thread::spawn(move || probe(&executable, ProbeKind::CodebaseMemory, &digest));
-    let receipt = wait_receipt(&fixture.executable);
-    let cwd = PathBuf::from(receipt["cwd"].as_str().unwrap());
-    let until = Instant::now() + Duration::from_secs(5);
-    let handle = loop {
-        if let Ok(file) = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(cwd.join("held-by-test"))
-        {
-            break file;
-        }
-        assert!(Instant::now() < until, "hold file never appeared");
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    fs::write(cwd.join("hold-ready"), b"ready").unwrap();
-    let error = worker.join().unwrap().unwrap_err();
-    let retained = cwd.join("held-by-test").exists();
-    drop(handle);
-    // This exact root came from the owned fixture's receipt and was held above.
-    fs::remove_dir_all(&cwd).unwrap();
-    fixture.removed();
-    assert!(retained);
-    assert!(error.to_string().contains("disposable graph query failed"));
-    assert!(error.to_string().contains("cleanup failed"), "{error}");
-    assert!(error.to_string().contains("retained for recovery"));
-    assert!(!error.to_string().contains("SECRET_FOREIGN_TOKEN"));
 }
 
 #[test]
@@ -532,7 +426,6 @@ fn installed_original_protocol_probe() {
     let digest =
         std::env::var("HARNESS_MCP_PROBE_SHA256").expect("explicit audited digest required");
     let kind = match std::env::var("HARNESS_MCP_PROBE_KIND").as_deref() {
-        Ok("codebase-memory") => ProbeKind::CodebaseMemory,
         Ok("nuphus") => ProbeKind::Nuphus,
         _ => panic!("explicit kind required"),
     };

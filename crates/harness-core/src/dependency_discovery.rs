@@ -10,10 +10,6 @@ use std::{
     path::{Component, Path, PathBuf, Prefix},
 };
 
-#[path = "dependency_codegraph.rs"]
-pub mod dependency_codegraph;
-pub use dependency_codegraph::{InspectedCodeGraph, inspect_package};
-
 #[derive(Default)]
 pub struct Request {
     pub catalogue: PathBuf,
@@ -24,7 +20,6 @@ pub struct Request {
     pub rustup_home: Option<PathBuf>,
     pub path: Option<OsString>,
     pub nuphus_models: Option<PathBuf>,
-    pub codegraph_roots: Vec<PathBuf>,
     pub full_records: bool,
     pub probe_versions: bool,
     pub processes: bool,
@@ -226,7 +221,6 @@ struct Discovery {
     rustup: PathBuf,
     node: Option<PathBuf>,
     models: PathBuf,
-    codegraph_roots: Vec<PathBuf>,
     full: bool,
     probe_versions: bool,
 }
@@ -243,8 +237,6 @@ impl Discovery {
                 let id = entry["id"].as_str().ok_or_else(package::invalid)?;
                 let expected = match (group, id) {
                     ("mcp", "serena") => ("serena-agent", "uv"),
-                    ("mcp", "codebase-memory") => ("codebase-memory-mcp", "npm"),
-                    ("mcp", "codegraph") => ("@colbymchenry/codegraph", "native"),
                     ("mcp", "nuphus") => ("@nuphus/nuphus-mcp", "npm"),
                     ("languages", "python") => ("basedpyright", "npm"),
                     ("languages", "rust") => ("rust-analyzer", "rustup"),
@@ -259,10 +251,9 @@ impl Discovery {
                 }
             }
         }
-        if ids.len() != 5
-            || ["serena", "nuphus", "python", "rust"]
-                .iter()
-                .any(|id| !ids.contains(id))
+        if ["serena", "nuphus", "python", "rust"]
+            .iter()
+            .any(|id| !ids.contains(id))
         {
             return Err(package::invalid());
         }
@@ -330,13 +321,6 @@ impl Discovery {
                     .as_deref()
                     .unwrap_or(&home.join("AppData/Roaming/Nuphus/models")),
             )?,
-            codegraph_roots: {
-                let mut roots = Vec::new();
-                for path in &request.codegraph_roots {
-                    roots.push(local_path(path)?);
-                }
-                unique(roots)
-            },
             home,
             full: request.full_records,
             probe_versions: request.probe_versions,
@@ -447,11 +431,7 @@ impl Discovery {
     fn record(&self, spec: &Value, group: &str) -> Value {
         let result = match spec["id"].as_str().unwrap() {
             "serena" => uv(spec, &self.uv, self.full),
-            "codebase-memory" => self.npm("codebase-memory-mcp", "codebase-memory-mcp", None),
             "nuphus" => self.npm("@nuphus/nuphus-mcp", "nuphus-mcp", None),
-            "codegraph" => {
-                crate::dependency_discovery::dependency_codegraph::observe(&self.codegraph_roots)
-            }
             "python" => self
                 .npm(
                     "basedpyright",
@@ -469,11 +449,7 @@ impl Discovery {
             "rust" => self.rust(),
             _ => unreachable!(),
         };
-        let base = if spec["id"] == "codegraph" {
-            dependency_codegraph::missing()
-        } else {
-            package::base(spec)
-        };
+        let base = package::base(spec);
         let mut record = match result {
             Ok(candidates) => package::select(base, candidates),
             Err(_) => {

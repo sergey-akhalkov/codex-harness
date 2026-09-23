@@ -33,28 +33,7 @@ mod windows {
     fn tool(name: &str, properties: Value, required: Value) -> Value {
         json!({"name":name,"description":"SECRET_FOREIGN_TOKEN","inputSchema":{"type":"object","properties":properties,"required":required}})
     }
-    fn catalogue(cbm: bool) -> Vec<Value> {
-        if cbm {
-            return vec![
-                tool(
-                    "index_repository",
-                    json!({"repo_path":{"type":"string"},"mode":{"type":"string","enum":["full","moderate","fast","cross-repo-intelligence"],"default":"full"}}),
-                    json!(["repo_path"]),
-                ),
-                tool("search_graph", json!({}), json!([])),
-                tool("list_projects", json!({}), json!([])),
-                tool(
-                    "get_graph_schema",
-                    json!({"project":{"type":"string"}}),
-                    json!(["project"]),
-                ),
-                tool(
-                    "query_graph",
-                    json!({"project":{"type":"string"},"query":{"type":"string"}}),
-                    json!(["query", "project"]),
-                ),
-            ];
-        }
+    fn catalogue() -> Vec<Value> {
         // Independent test catalogue from upstream v0.2.2 schemas.rs.
         let names = "desktop_screen_size desktop_screenshot desktop_windows_list desktop_window_activate desktop_window_screenshot desktop_window_move desktop_window_resize desktop_window_info desktop_vision desktop_perceive desktop_mouse desktop_mouse_drag desktop_input desktop_clipboard_clean desktop_clipboard_write browser_navigate browser_snapshot browser_exec browser_click browser_type browser_press browser_scroll browser_extract browser_screenshot browser_close browser_evaluate browser_back browser_forward browser_wait_for browser_cookies_get browser_cookies_set browser_import_cookies browser_upload browser_drag_files browser_list_downloads browser_new_tab browser_list_tabs browser_switch_tab";
         names.split_whitespace().map(|name| {
@@ -128,7 +107,6 @@ mod windows {
         let executable = std::env::current_exe()?;
         let config: Value = serde_json::from_slice(&fs::read(executable.with_extension("json"))?)?;
         let mode = config["mode"].as_str().unwrap_or("valid");
-        let cbm = config["kind"] == "cbm";
         let root = std::env::current_dir()?;
         let mut member = 0;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -162,8 +140,6 @@ mod windows {
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "CODEX_HOME",
-            "CBM_CACHE_DIR",
-            "CBM_RUNTIME_DIR",
             "NUPHUS_MODELS_DIR",
         ]
         .iter()
@@ -172,7 +148,7 @@ mod windows {
             "memory_limit":limits.JobMemoryLimit,"cpu_rate":unsafe{cpu.Anonymous.CpuRate},"cpu_hard_cap":cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP != 0,
             "no_breakaway":limits.BasicLimitInformation.LimitFlags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK|JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) == 0,
             "kill_on_close":limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0,
-            "private_directories":isolated,"owner_acl":owner_acl(&root,true),"child_acl":owner_acl(&root.join("ipc"),false),"no_models":std::env::var("NUPHUS_MCP_NO_MODEL_DOWNLOAD").ok().as_deref()==Some("1"),
+            "private_directories":isolated,"owner_acl":owner_acl(&root,true),"child_acl":owner_acl(&root.join("models"),false),"no_models":std::env::var("NUPHUS_MCP_NO_MODEL_DOWNLOAD").ok().as_deref()==Some("1"),
             "ambient_absent":(["PATH","OPENAI_API_KEY","HARNESS_MCP_SECRET","NUPHUS_MCP_BROWSER_CDP_URL","HTTP_PROXY"].iter().all(|k| std::env::var_os(k).is_none())),"calls":[]});
         let mut descendant = if ["valid-tree", "cancel", "deadline", "root-exit"].contains(&mode) {
             let child = Command::new(&executable)
@@ -312,7 +288,7 @@ mod windows {
                     assert_eq!(request["params"]["protocolVersion"], "2024-11-05");
                     assert_eq!(request["params"]["capabilities"], json!({}));
                     initialized = true;
-                    json!({"protocolVersion":if mode=="protocol" {"2099-01-01"} else {"2024-11-05"},"capabilities":{"tools":{}},"serverInfo":{"name":if cbm {"codebase-memory-mcp"} else {"nuphus-mcp"},"version":"0.2.2"},"instructions":"SECRET_FOREIGN_TOKEN"})
+                    json!({"protocolVersion":if mode=="protocol" {"2099-01-01"} else {"2024-11-05"},"capabilities":{"tools":{}},"serverInfo":{"name":"nuphus-mcp","version":"0.2.2"},"instructions":"SECRET_FOREIGN_TOKEN"})
                 }
                 "notifications/initialized" => {
                     assert!(initialized && !declared);
@@ -322,7 +298,7 @@ mod windows {
                 }
                 "tools/list" => {
                     assert!(declared);
-                    let mut tools = catalogue(cbm);
+                    let mut tools = catalogue();
                     match mode {
                         "missing-tool" => {
                             tools.pop();
@@ -373,7 +349,7 @@ mod windows {
                     }
                 }
                 "tools/call" => {
-                    assert!(cbm && declared, "Nuphus must never receive tools/call");
+                    assert!(false, "Nuphus must never receive tools/call");
                     let names = [
                         "index_repository",
                         "list_projects",
@@ -447,7 +423,7 @@ mod windows {
                 json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
                 mode == "fragmented",
             )?;
-            let final_reply = (!cbm && method == "tools/list") || (cbm && calls == 4);
+            let final_reply = method == "tools/list";
             if final_reply {
                 match mode {
                     "trailing-id" => emit(
@@ -465,16 +441,6 @@ mod windows {
         }
         if mode == "late-nonzero" {
             std::process::exit(23);
-        }
-        if cbm {
-            assert_eq!(
-                calls,
-                if config["catalogue_only"] == true {
-                    0
-                } else {
-                    4
-                }
-            );
         }
         if let Some(child) = descendant.as_mut() {
             assert!(child.try_wait()?.is_none());

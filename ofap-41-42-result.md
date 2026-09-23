@@ -1,6 +1,6 @@
 # OFAP 4.1-4.2 result: instruction-refresh succession
 
-Base commit `3f5f14a`; worktree `D:\home\sergey-akhalkov\codex-harness-ofap-succession`.
+Base commit `3f5f14a`; worktree `<kit-checkout>-ofap-succession`.
 
 ## What changed
 

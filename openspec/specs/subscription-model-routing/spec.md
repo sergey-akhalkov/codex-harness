@@ -7,8 +7,8 @@ Make subscription-backed external models available in the official Codex CLI acr
 ## Requirements
 
 Named-role requirements below describe the compatibility baseline. The accepted
-transition is owned by the active
-[exact model/effort delta](../../changes/orchestrate-subscription-agents/specs/subscription-model-routing/spec.md)
+transition is owned by the archived
+[exact model/effort change](../../changes/archive/2026-09-20-orchestrate-subscription-agents/specs/subscription-model-routing/spec.md)
 and [delegation contract](../agent-delegation/spec.md#requirements).
 Its pending migration and acceptance are not established by retaining this baseline.
 

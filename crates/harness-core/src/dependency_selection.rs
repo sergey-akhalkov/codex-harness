@@ -30,10 +30,8 @@ fn digest(value: &str) -> bool {
 
 fn package(slot: &str) -> io::Result<&'static str> {
     match slot {
-        "codebase-memory" => Ok("codebase-memory-mcp"),
         "nuphus" => Ok("@nuphus/nuphus-mcp-win32-x64"),
         "basedpyright" => Ok("basedpyright"),
-        "codegraph" => Ok("@colbymchenry/codegraph"),
         _ => Err(invalid()),
     }
 }

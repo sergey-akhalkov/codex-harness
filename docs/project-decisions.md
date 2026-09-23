@@ -265,7 +265,7 @@ does not constrain it.
 
 ## MCP, language tools and resources
 
-Three MCP servers remain live: Serena, CodeGraph and Nuphus.
+Two MCP servers remain live: Serena and Nuphus.
 Ordinary diagnostic and Stop hooks stay off. The separate `harness-lsp`
 registration is retired. Explicit Serena Python operations are retained; other
 historical language candidates are not mandatory installations. A common Codex
@@ -274,26 +274,23 @@ app-server is excluded; independent CLI applications remain.
 Compared optional interfaces for installed-tool workflows: keep the native Git
 Markdown memory route (`retain-native`). Serena 1.7.0 reads work, but memory
 edits and rename were rejected under the durable `approval_policy=never`
-contract. Graphify and Codebase Memory are retired from the managed selection;
-do not port or relaunch them. Mixed-source questions use current source and
-CodeGraph.
+contract. Graphify, Codebase Memory and CodeGraph are fully retired with
+their first-party code; do not port or relaunch them. Mixed-source questions
+use current source and scoped search.
 Keep the existing Serena broker for cross-project queries; a separate Project
 Server is not selected. Native comparisons did not show a repeating speed or
 output benefit beyond variation, so the verified baseline routes stay selected.
 
-CodeGraph is the live graph after replacement acceptance (2026-09-11): one
-account-wide indexing slot, one parse and one resolve worker, a 2 GiB Windows
-Job, 25% CPU, 600-second episodes, and bounded automatic refresh plus
-connect-time catch-up for every active indexed root. Codebase Memory is
-retired from the managed selection; its package, indexes and native commands
-stay for rollback with explicit index/refresh only.
+CodeGraph was the live graph between 2026-09-11 and 2026-09-23. It was retired
+completely after measured 30-day use collapsed to 49 calls (41 of them in the
+acceptance window) while every managed search in a live session failed with
+"client is not connected"; the user chose full removal over keeping a manual
+route. Codebase Memory's rollback modules were removed with it. Shared
+packages, saved graphs and caches stay on the host as inert residue.
 
-**Large-repository acceptance** must use the locally selected large real project
-as a parameter. A small fixture does not replace it. Preserve that project's
-product sources and do not contact controllers. Generated HTML logs are excluded
-from indexing. The historical CBM full index of that project exceeded the
-retained 2 GiB policy; CodeGraph indexed it within that policy in isolated,
-comparative and installed-consumer checks.
+**Large-repository acceptance** applied to the retired graph tools and is
+historical; no current capability indexes repositories. Preserve product
+sources and do not contact controllers in any future re-adoption.
 
 Automated interfaces send the minimum needed information. Silence is required
 when nothing material changed; compact output must not hide errors or incomplete
@@ -302,38 +299,12 @@ checks.
 Prefer Serena for known-file symbols, exact references and suitable edits. Do
 not build bypass infrastructure to restore unselected automatic diagnostics.
 
-**CodeGraph replacement:** every indexed project with an open Codex CLI session
-must receive automatic refresh and usable graph operations, including several
-projects open simultaneously. Observation can stop after the last session of a
-project closes; reopening catches up automatically. Clients of the same canonical
-project must share its index, watcher and suitable backend processes, including
-across Codex homes. Reuse published sharing capabilities and existing native
-ownership before adding coordination, and verify actual process/memory behavior.
-One heavy indexing slot and the retained 2 GiB / 25% CPU / 600-second operation
-limits must not become exclusive selection of one active project or periodic
-manual renewal of a healthy session. Initial/full indexing remains deliberate.
-
-The [native provider](code-tools.md#native-codegraph-provider) uses shared
-observation and finite work episodes, and passed installer activation plus
-installed consumer acceptance. Maintaining foreign source forks or installing
-their development toolchains is not part of this replacement. Graph edges
-remain candidates; exact claims use Serena or current source. After a native
-rebuild, retire the account broker from the old build before new consumers
-connect; already running sessions keep their previous catalogue until restart.
-
-All new first-party CodeGraph integration and executable acceptance code must be
-Rust. Published CodeGraph and its bundled Node remain external dependencies.
-Existing transitional lifecycle entry points may dispatch to native commands
-until their migration; new provider logic must not use owned scripts, including
-embedded/generated ones. See the
-[required ownership check](../openspec/changes/archive/2026-09-11-replace-cbm-with-codegraph/specs/global-code-tools/spec.md#requirement-rust-owned-codegraph-integration).
-
-The Rust migration consumes the same CodeGraph adapter and acceptance evidence;
-it must not resume a separate CBM port. Whole-Rust-migration cutover is not a
-prerequisite for replacement activation. The replacement owns native
-graph-provider implementation, while the Rust migration owns remaining
-generic/native lifecycle integration. [The dependency map](../openspec/changes/archive/2026-09-17-migrate-harness-to-rust/design.md#graph-provider-ownership-and-order)
-preserves open acceptance without a circular dependency.
+**Serena-first routing (2026-09-23):** the managed MCP surface is Serena for
+semantic navigation and symbol-level edits plus Nuphus for authorized UI work;
+literal text and regex search belong to scoped `rg` (`search_for_pattern` is
+hidden from the Serena catalogue). Exact-reference and refactoring claims use
+Serena or current source. Any future graph re-adoption is a deliberate new
+decision with measured everyday demand, not a restore of retired code.
 
 ## Subscriptions
 
@@ -606,6 +577,15 @@ decomposition, integration, acceptance and capability-exceeding work, and
 does work whose delegation overhead exceeds the work itself - typically a
 one-line correction - directly, with no task or board note. Change:
 [autonomous lead activation](../openspec/changes/archive/2026-09-23-autonomous-lead-activation/proposal.md).
+
+**2026-09-23, confirmed:** the shared kit tracks the current stable Rust
+family instead of a conservative MSRV: the workspace `rust-version` moves to
+the newest stable minor (now 1.98) once the installed toolchain confirms it,
+patch releases are taken as they arrive, and consumers accept current-stable
+upgrades as part of kit delivery. Modern Rust/Cargo knowledge ships as the
+global `rust-modern` and `cargo-fast` skills, which re-verify against current
+official release notes instead of trusting dated snapshots. Change:
+[add-rust-cargo-efficiency-skills](../openspec/changes/archive/2026-09-23-add-rust-cargo-efficiency-skills/proposal.md).
 
 ## Recording further decisions
 

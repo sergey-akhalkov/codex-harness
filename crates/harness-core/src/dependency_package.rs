@@ -267,22 +267,7 @@ pub(crate) fn npm(
         "status":if installed {"adopted"} else {"broken"},"ownership":"adopted-shared","update_safe":false,
         "health":{"installed":installed,"identity_verified":true,"integrity":"unknown","callable":null,"checked_operations":[]},
         "provenance":{"metadata":manifest,"package_identity":package,"entrypoint":script},"evidence":evidence});
-    if package == "codebase-memory-mcp" {
-        let native = resolved(&root.join("bin/codebase-memory-mcp.exe"))?;
-        let available = contained(&native, &root) && native.is_file();
-        record["paths"]["native_executable"] = json!(native);
-        record["executable"] = json!(native);
-        record["command"] = if available {
-            json!([native])
-        } else {
-            json!([])
-        };
-        record["status"] = json!(if available { "adopted" } else { "broken" });
-        record["health"]["installed"] = json!(available);
-        record["evidence"].as_array_mut().unwrap().push(if available {
-            json!({"kind":"native-payload-fingerprint","path":native,"sha256":fingerprint(&native)?})
-        } else { json!({"kind":"missing-native-payload","path":native}) });
-    } else if package == "@nuphus/nuphus-mcp" {
+    if package == "@nuphus/nuphus-mcp" {
         let companion_name = "@nuphus/nuphus-mcp-win32-x64";
         let mut chosen = None;
         for relative in [
