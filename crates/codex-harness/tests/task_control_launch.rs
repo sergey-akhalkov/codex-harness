@@ -7,14 +7,37 @@ use harness_core::{
     broker_state::BrokerRoot,
     build_identity::{self, BuildRecord},
     console::{ConsoleSession, ConsoleSpec},
-    process::{Cancellation, CommandSpec, Deadline, StopReason},
+    process::{
+        Cancellation, CommandSpec, Deadline, SHARED_CPU_PERCENT, SharedCpuBudget, StopReason,
+    },
+    process_service::{self, ServiceProcess},
 };
 use serde_json::{Value, json};
 use std::{
     fs,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
+    System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+            JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+            JobObjectCpuRateControlInformation, OpenJobObjectW, QueryInformationJobObject,
+        },
+        Threading::{
+            GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    },
+};
+
+/// Documented JOB_OBJECT_QUERY right (winnt.h); windows-sys does not export the
+/// job access rights. A query-only handle can neither assign, configure nor
+/// terminate the object it opens.
+const JOB_OBJECT_QUERY: u32 = 0x0004;
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -94,6 +117,253 @@ enum EntryCase {
     Helper,
     ViewClose,
     UserStop,
+}
+
+/// One independently started task-control service, as the ordinary launcher
+/// starts it: through the `process_service` helper, which creates the service
+/// as a WMI sibling that inherits no Job from this test process.
+struct SessionService {
+    session: PathBuf,
+    service: ServiceProcess,
+}
+
+impl SessionService {
+    /// Build one session tree: a private session root whose launch record names
+    /// an owned native-agent double, and the account CPU budget this session
+    /// must share with every other session of this Windows account.
+    fn start(session: &Path, account: &Path, name: &str) -> Self {
+        let manager = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+        let upstream = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+        let workspace = session.join(format!("{name}-workspace"));
+        fs::create_dir_all(&workspace).unwrap();
+        let root = BrokerRoot::prepare().unwrap().keep();
+        let launch = root.path().join("launch.json");
+        fs::write(
+            &launch,
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "executable": upstream,
+                "sha256": build_identity::hash_file(&upstream).unwrap(),
+                "cwd": workspace,
+                "arguments": [],
+                "new_session": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // The session's native server is an owned double that holds instead of
+        // serving the control protocol, so this check observes admission
+        // without a conversation.
+        let mut environment: std::collections::BTreeMap<String, String> =
+            std::env::vars().collect();
+        environment.insert(
+            "CODEX_HARNESS_CPU_ACCOUNT".into(),
+            account.display().to_string(),
+        );
+        environment.insert("HARNESS_LAUNCH_FIXTURE_MODE".into(), "heavy-hold".into());
+        environment.insert("HARNESS_HEAVY_FIXTURE_MS".into(), "20000".into());
+        environment.insert(
+            "HARNESS_LAUNCH_FIXTURE_STARTED".into(),
+            session.join("native-server.pid").display().to_string(),
+        );
+        let service = process_service::spawn(
+            &manager,
+            root.path(),
+            vec![
+                "task-control".into(),
+                build_identity::hash_file(&launch).unwrap(),
+                "{}".into(),
+            ],
+            environment,
+            Deadline::after(Duration::from_secs(60)).unwrap(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        Self {
+            session: session.to_path_buf(),
+            service,
+        }
+    }
+
+    /// The native server of this session, alive and observable by the pid it
+    /// recorded for itself.
+    fn native_server(&self, timeout: Duration) -> HANDLE {
+        observe_payload(&self.session.join("native-server.pid"), timeout)
+    }
+
+    /// Ask the kernel whether this exact retained service belongs to the
+    /// account allowance named by the test's verified budget handle.
+    fn in_budget(&self, budget: &SharedCpuBudget) -> bool {
+        self.service.in_shared_cpu_budget(budget).unwrap()
+    }
+}
+
+impl Drop for SessionService {
+    fn drop(&mut self) {
+        // The session double keeps holding its native server; ending the
+        // service reaps the tree through its own lifecycle Job.
+        let _ = self.service.terminate(130);
+    }
+}
+
+/// Kernel CPU rate of one named Job (0 means no rate control is enabled).
+fn job_cpu_rate(name: &str) -> u32 {
+    let handle = open_job(name);
+    let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        QueryInformationJobObject(
+            handle,
+            JobObjectCpuRateControlInformation,
+            (&mut cpu as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    assert_ne!(queried, 0, "job object {name} could not be queried");
+    if cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE == 0 {
+        return 0;
+    }
+    assert_ne!(
+        cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        0,
+        "job {name} is not a hard cap"
+    );
+    unsafe { cpu.Anonymous.CpuRate }
+}
+
+fn open_job(name: &str) -> HANDLE {
+    let object: Vec<u16> = std::ffi::OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, object.as_ptr()) };
+    assert!(!handle.is_null(), "job object {name} is not observable");
+    handle
+}
+
+/// Kernel membership of one live process in one named Job.
+fn process_in_job(process: HANDLE, job: &str) -> bool {
+    let job_handle = open_job(job);
+    let mut member = 0;
+    let queried = unsafe { IsProcessInJob(process, job_handle, &mut member) };
+    unsafe { CloseHandle(job_handle) };
+    assert_ne!(queried, 0, "IsProcessInJob failed");
+    member != 0
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let started = Instant::now();
+    while !path.exists() {
+        assert!(
+            started.elapsed() < timeout,
+            "{} was not created within {timeout:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn observe_payload(marker: &Path, timeout: Duration) -> HANDLE {
+    wait_for_path(marker, timeout);
+    let pid: u32 = fs::read_to_string(marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("native server pid");
+    observe_pid(pid, timeout)
+}
+
+/// One live process, opened by pid, so the kernel answers for the process that
+/// was recorded instead of for a wrapper's claim about it.
+fn observe_pid(pid: u32, timeout: Duration) -> HANDLE {
+    let started = Instant::now();
+    loop {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if !handle.is_null() {
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE as u32
+            {
+                return handle;
+            }
+            unsafe { CloseHandle(handle) };
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "pid {pid} was not observable while it was running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Independently started task-control sessions of different session trees share
+/// one account CPU allowance: the second service joins the group the first
+/// established, each session's native server is a kernel-verified member of
+/// that one group at the delivered 75% hard cap, and an unrelated process of
+/// the same account stays outside it.
+#[test]
+fn independently_started_task_control_sessions_share_one_account_cpu_budget() {
+    let root = std::env::temp_dir().join(format!("task-control-budget-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let account = root.join("cpu-budget");
+    let first = SessionService::start(&root.join("session-one"), &account, "first");
+    let first_server = first.native_server(Duration::from_secs(30));
+    // The second session starts while the first is already inside the group, so
+    // joining an established allowance is what this check exercises.
+    let second = SessionService::start(&root.join("session-two"), &account, "second");
+    let second_server = second.native_server(Duration::from_secs(30));
+
+    let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+    let job = budget.name().to_owned();
+    assert_eq!(
+        job_cpu_rate(&job),
+        (SHARED_CPU_PERCENT * 100.0) as u32,
+        "the shared account group must carry the delivered 75% hard cap"
+    );
+    assert!(
+        first.in_budget(&budget),
+        "the first session's service must be inside the account allowance"
+    );
+    assert!(
+        second.in_budget(&budget),
+        "a second independently started session must join the established allowance"
+    );
+    assert!(
+        process_in_job(first_server, &job) && process_in_job(second_server, &job),
+        "both sessions' native servers must belong to the one account group"
+    );
+    // An unrelated process of the same account, started by the same terminal
+    // that starts sessions, must stay outside the allowance.
+    let unrelated_marker = root.join("unrelated.pid");
+    let mut unrelated = Command::new(env!("CARGO_BIN_EXE_harness-launch-fixture"))
+        .env_remove("CODEX_HARNESS_CPU_ACCOUNT")
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "20000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &unrelated_marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let unrelated_pid = observe_payload(&unrelated_marker, Duration::from_secs(30));
+    assert!(
+        !process_in_job(unrelated_pid, &job),
+        "an unrelated process of the same account must stay outside the allowance"
+    );
+    assert!(
+        !process_in_job(unsafe { GetCurrentProcess() }, &job),
+        "starting a session must not enrol the caller or its terminal"
+    );
+
+    unsafe { CloseHandle(first_server) };
+    unsafe { CloseHandle(second_server) };
+    unsafe { CloseHandle(unrelated_pid) };
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    drop(first);
+    drop(second);
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn native_entry(case: EntryCase) {
@@ -1066,4 +1336,97 @@ fn close_conversation(snapshot: &harness_core::task_view::Snapshot) {
         let _ = TerminateProcess(handle, 0);
         CloseHandle(handle);
     }
+}
+
+/// Marker env of the session-owner check below; the child of that check is this
+/// same test binary running one filtered case.
+const OWNER_CHILD_ENV: &str = "HARNESS_OWNED_TASK_OWNER_CHILD";
+
+/// The task-control session owner joins the account CPU allowance before it
+/// starts the service and the native server of its session, so the whole
+/// session tree shares the one account ceiling. The owner is a throwaway child
+/// of this test binary, so the session it owns cannot outlive the check.
+#[test]
+fn task_control_session_owner_joins_the_account_budget_before_its_service() {
+    let root = std::env::temp_dir().join(format!("task-control-owner-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let account = root.join("cpu-budget");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let payload_marker = root.join("native-server.pid");
+    let manager = PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"));
+    let fixture = PathBuf::from(env!("CARGO_BIN_EXE_harness-launch-fixture"));
+
+    if std::env::var_os(OWNER_CHILD_ENV).is_some() {
+        // The owned native-agent double holds instead of serving the control
+        // protocol, so this session reaches its native start and then reports
+        // that its controller never became ready - without opening a
+        // conversation or a desktop window.
+        let mut command = Command::new(&fixture);
+        command
+            .arg("continue the owned task-control assignment")
+            .current_dir(&workspace)
+            .env("CODEX_HOME", root.join("home"));
+        let outcome = harness_core::task_runtime::run(&command, &manager, &root.join("home"));
+        eprintln!("owned owner outcome: {outcome:?}");
+        return;
+    }
+
+    let owner = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "task_control_session_owner_joins_the_account_budget_before_its_service",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(OWNER_CHILD_ENV, "1")
+        .env("CODEX_HARNESS_CPU_ACCOUNT", &account)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "4000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &payload_marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = observe_payload(&payload_marker, Duration::from_secs(30));
+    let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+    let job = budget.name().to_owned();
+    assert_eq!(
+        job_cpu_rate(&job),
+        (SHARED_CPU_PERCENT * 100.0) as u32,
+        "the session's account group must carry the delivered 75% hard cap"
+    );
+    let owner_handle = observe_pid(owner.id(), Duration::from_secs(30));
+    assert!(
+        process_in_job(owner_handle, &job),
+        "the session owner must join the account allowance before its service"
+    );
+    assert!(
+        process_in_job(payload, &job),
+        "the session's native server must be a kernel-verified member of the same group"
+    );
+    let finished = owner.wait_with_output().unwrap();
+    assert!(
+        finished.status.success(),
+        "the owned session owner reported its own outcome: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&finished.stdout),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        reported.contains("owned owner outcome: Err"),
+        "the owner must reach its controller start and report the owned double's outcome: {reported}"
+    );
+    assert!(
+        !reported.contains("could not admit") && !reported.contains("runs outside the shared"),
+        "a session that joins the allowance must not report degraded coverage: {reported}"
+    );
+    unsafe { CloseHandle(owner_handle) };
+    unsafe { CloseHandle(payload) };
+    let _ = fs::remove_dir_all(&root);
 }

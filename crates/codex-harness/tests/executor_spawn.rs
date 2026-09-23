@@ -4,14 +4,35 @@
 //! subscription work stays opt-in.
 #![cfg(windows)]
 
+use harness_core::process::{SHARED_CPU_PERCENT, SharedCpuBudget};
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
+    os::windows::ffi::OsStrExt,
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::Duration,
 };
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
+    System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+            JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+            JobObjectCpuRateControlInformation, OpenJobObjectW, QueryInformationJobObject,
+        },
+        Threading::{
+            GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    },
+};
+
+/// Documented JOB_OBJECT_QUERY right (winnt.h); windows-sys does not export the
+/// job access rights. A query-only handle can neither assign, configure nor
+/// terminate the object it opens.
+const JOB_OBJECT_QUERY: u32 = 0x0004;
 
 fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
@@ -436,6 +457,7 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     let mut host = lead_command()
         .args(["executor", "run", "--file", receipt.to_str().unwrap()])
         .env("CODEX_HOME", &fixture.home)
+        .env("CODEX_HARNESS_CPU_ACCOUNT", cpu_account(&fixture.root))
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -451,6 +473,18 @@ fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(listed.contains("state=occupied"), "{listed}");
+    // The tab host that keeps this slot's liveness is the session owner, so it
+    // holds the account allowance while it runs; attaching the shared ceiling
+    // does not change the pool bookkeeping it records.
+    let budget = SharedCpuBudget::acquire(&cpu_account(&fixture.root), SHARED_CPU_PERCENT).unwrap();
+    let job = budget.name().to_owned();
+    assert_eq!(job_cpu_rate(&job), shared_cpu_rate(), "{listed}");
+    let host_handle = observe_pid(host.id(), Duration::from_secs(20));
+    assert!(
+        process_in_job(host_handle, &job),
+        "the dispatched session host must hold the account allowance: {listed}"
+    );
+    unsafe { CloseHandle(host_handle) };
     // A live session keeps its slot: another identity cannot take it and the
     // same identity is never dispatched into a second session.
     let other = fixture.spawn(&["--owner", "exec-other"]);
@@ -1219,4 +1253,378 @@ fn pooled_slot_path(home: &Path) -> PathBuf {
 
 fn pooled_receipt_path(home: &Path, index: u32) -> PathBuf {
     pooled_state_dir(home).join(format!("spawn-{index}.json"))
+}
+
+/// The account CPU budget of one test-local account directory. Every budget
+/// case uses its own, so the machine's real allowance and any unrelated
+/// consumer of the same Windows account stay untouched.
+fn cpu_account(root: &Path) -> PathBuf {
+    root.join("cpu-budget")
+}
+
+/// The delivered aggregate ceiling in the kernel's 0.01% units.
+fn shared_cpu_rate() -> u32 {
+    (SHARED_CPU_PERCENT * 100.0) as u32
+}
+
+/// Query-only handle on a named Job object: membership and the effective rate
+/// are read from the kernel instead of from diagnostics printed by the process
+/// under test.
+fn open_job(name: &str) -> HANDLE {
+    let object: Vec<u16> = std::ffi::OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, object.as_ptr()) };
+    assert!(!handle.is_null(), "job object {name} is not observable");
+    handle
+}
+
+/// Kernel CPU rate of one named Job (0 means no rate control is enabled).
+fn job_cpu_rate(name: &str) -> u32 {
+    let handle = open_job(name);
+    let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        QueryInformationJobObject(
+            handle,
+            JobObjectCpuRateControlInformation,
+            (&mut cpu as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    assert_ne!(queried, 0, "job object {name} could not be queried");
+    if cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE == 0 {
+        return 0;
+    }
+    assert_ne!(
+        cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        0,
+        "job {name} is not a hard cap"
+    );
+    unsafe { cpu.Anonymous.CpuRate }
+}
+
+/// Kernel membership of one live process in one named Job.
+fn process_in_job(process: HANDLE, job: &str) -> bool {
+    let job_handle = open_job(job);
+    let mut member = 0;
+    let queried = unsafe { IsProcessInJob(process, job_handle, &mut member) };
+    unsafe { CloseHandle(job_handle) };
+    assert_ne!(queried, 0, "IsProcessInJob failed");
+    member != 0
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let started = std::time::Instant::now();
+    while !path.exists() {
+        assert!(
+            started.elapsed() < timeout,
+            "{} was not created within {timeout:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// One running fixture process, opened by the pid it recorded itself, so the
+/// kernel answers for the actual payload and not for a wrapper.
+fn observe_payload(marker: &Path, timeout: Duration) -> HANDLE {
+    wait_for_path(marker, timeout);
+    let pid: u32 = fs::read_to_string(marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("payload pid");
+    observe_pid(pid, timeout)
+}
+
+fn observe_pid(pid: u32, timeout: Duration) -> HANDLE {
+    let started = std::time::Instant::now();
+    loop {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if !handle.is_null() {
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE as u32
+            {
+                return handle;
+            }
+            unsafe { CloseHandle(handle) };
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "pid {pid} was not observable while it was running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn current_process() -> HANDLE {
+    unsafe { GetCurrentProcess() }
+}
+
+/// An unrelated terminal tab or plain process of the same account: it never
+/// passes through a dispatch route, so no admission may enrol it.
+fn unrelated_process(marker: &Path) -> Child {
+    let mut command = Command::new(launch_fixture());
+    command
+        .env_remove("CODEX_HARNESS_CPU_ACCOUNT")
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "20000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().unwrap()
+}
+
+/// The record of one tab host invocation: its receipt file and the recorded
+/// payload identity it must produce for the kernel checks below.
+struct TabHost {
+    receipt: PathBuf,
+    payload: PathBuf,
+}
+
+impl TabHost {
+    fn resume_receipt(root: &Path, name: &str, arguments: &[String]) -> Self {
+        let receipt = root.join(format!("{name}-receipt.json"));
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "launcher": launch_fixture(),
+                "args": arguments,
+                "slot": Value::Null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            receipt,
+            payload: root.join(format!("{name}-payload.pid")),
+        }
+    }
+
+    /// One dispatched session as the dispatch route starts it: the tab host is
+    /// the process that lives for the session, and its cwd is the session
+    /// workspace the payload must keep.
+    fn start(&self, workspace: &Path, account: &Path) -> Child {
+        let mut command = lead_command();
+        command
+            .args(["executor", "run", "--file", self.receipt.to_str().unwrap()])
+            .current_dir(workspace)
+            .env("CODEX_HARNESS_CPU_ACCOUNT", account)
+            .env("HARNESS_LAUNCH_FIXTURE_STARTED", &self.payload)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
+    }
+}
+
+/// End the hosted payload's input and collect the host's own outcome.
+fn finish_host(host: Child) -> std::process::Output {
+    host.wait_with_output().unwrap()
+}
+
+/// The recorded arguments of one resume dispatch, exactly as the resume route
+/// writes them into the receipt.
+fn resume_arguments(workspace: &Path, result: &Path) -> Vec<String> {
+    [
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-C",
+        workspace.to_str().unwrap(),
+        "--output-last-message",
+        result.to_str().unwrap(),
+        "resume",
+        "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+        "continue the interrupted assignment",
+    ]
+    .iter()
+    .map(|argument| (*argument).to_owned())
+    .collect()
+}
+
+/// One dispatched session joins the account CPU allowance before its payload
+/// exists, the payload inherits that one ceiling, and the terminal tab or plain
+/// process that started the session stays outside it. Arguments, cwd, streams
+/// and the exit code of the resumed session reach the payload unchanged.
+#[test]
+fn executor_session_host_joins_the_shared_account_budget_before_its_payload() {
+    let root = std::env::temp_dir().join(format!("executor-budget-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let workspace = root.join("proj-wt1");
+    fs::create_dir_all(&workspace).unwrap();
+    let account = cpu_account(&root);
+    let arguments = resume_arguments(&workspace, &root.join("result.txt"));
+    let host = TabHost::resume_receipt(&root, "session", &arguments);
+
+    let mut unrelated = unrelated_process(&root.join("unrelated.pid"));
+    let unrelated_pid = observe_payload(&root.join("unrelated.pid"), Duration::from_secs(30));
+
+    let mut session = host.start(&workspace, &account);
+    // The payload is alive and still reading its input, so both members of this
+    // session can be asked directly.
+    let payload = observe_payload(&host.payload, Duration::from_secs(30));
+    let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+    let job = budget.name().to_owned();
+    assert_eq!(
+        job_cpu_rate(&job),
+        shared_cpu_rate(),
+        "the account group must carry the delivered 75% hard cap"
+    );
+    assert!(
+        process_in_job(payload, &job),
+        "the dispatched payload must be inside the account allowance before it does work"
+    );
+    let host_handle = observe_pid(session.id(), Duration::from_secs(30));
+    assert!(
+        process_in_job(host_handle, &job),
+        "the tab host of this session must hold the account allowance"
+    );
+    assert!(
+        !process_in_job(unrelated_pid, &job),
+        "an unrelated process of the same account must stay outside the allowance"
+    );
+    assert!(
+        !process_in_job(current_process(), &job),
+        "starting a session must not enrol the terminal or the dispatching caller"
+    );
+
+    // The hosted payload receives the recorded interaction, then ends: the host
+    // forwards the payload's own outcome instead of reporting a fabricated one.
+    session
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"assignment input\n")
+        .unwrap();
+    drop(session.stdin.take());
+    let finished = finish_host(session);
+    assert_eq!(
+        finished.status.code(),
+        Some(0),
+        "the session outcome must be the payload's own: {}",
+        output_text(&finished)
+    );
+    let recorded: Value = serde_json::from_str(String::from_utf8_lossy(&finished.stdout).trim())
+        .expect("the payload reports its own invocation");
+    assert_eq!(
+        recorded["args"],
+        serde_json::to_value(&arguments).unwrap(),
+        "the resumed session arguments must reach the payload unchanged: {recorded}"
+    );
+    assert_eq!(
+        PathBuf::from(recorded["cwd"].as_str().unwrap()),
+        workspace,
+        "the payload must run in the session workspace: {recorded}"
+    );
+    assert_eq!(
+        recorded["stdin"], "assignment input\n",
+        "interactive input must reach the payload: {recorded}"
+    );
+    assert!(
+        String::from_utf8_lossy(&finished.stderr).contains("upstream stderr"),
+        "the payload's own stderr must stay separate and visible"
+    );
+    unsafe { CloseHandle(payload) };
+    unsafe { CloseHandle(host_handle) };
+    unsafe { CloseHandle(unrelated_pid) };
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Admission failure follows the visible fail-open contract: the requested
+/// session starts once with its own arguments and outcome, the warning names
+/// the failed ceiling, its cause, the affected scope and the recovery step, and
+/// a peer session keeps its allowance unchanged.
+#[test]
+fn executor_run_reports_degraded_coverage_when_admission_fails() {
+    let root = std::env::temp_dir().join(format!("executor-degraded-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let workspace = root.join("proj-wt1");
+    fs::create_dir_all(&workspace).unwrap();
+    let account = cpu_account(&root);
+    let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+    let job = budget.name().to_owned();
+
+    // A peer session that is already capped keeps running while the failing
+    // session starts.
+    let peer_arguments = resume_arguments(&workspace, &root.join("peer-result.txt"));
+    let peer = TabHost::resume_receipt(&root, "peer", &peer_arguments);
+    let mut peer_session = peer.start(&workspace, &account);
+    let peer_payload = observe_payload(&peer.payload, Duration::from_secs(30));
+    assert!(
+        process_in_job(peer_payload, &job),
+        "the peer session must hold the account allowance"
+    );
+
+    let arguments = resume_arguments(&workspace, &root.join("result.txt"));
+    let degraded = TabHost::resume_receipt(&root, "degraded", &arguments);
+    // A relative account directory is unusable, so the allowance cannot be
+    // established at all: the session is requested anyway and reports it.
+    let mut session = degraded.start(&workspace, Path::new("relative-cpu-budget"));
+    drop(session.stdin.take());
+    let finished = finish_host(session);
+    let reported = output_text(&finished);
+    assert_eq!(
+        finished.status.code(),
+        Some(0),
+        "the requested session must still start and report its own outcome: {reported}"
+    );
+    assert!(
+        reported.contains("runs outside the shared 75% account CPU allowance"),
+        "the warning must name the failed ceiling: {reported}"
+    );
+    assert!(
+        reported.contains("must be absolute and normalized"),
+        "the warning must name the concrete cause: {reported}"
+    );
+    assert!(
+        reported.contains("other sessions keep their allowance"),
+        "the warning must state that peers are unaffected: {reported}"
+    );
+    assert!(
+        reported.contains("coverage stays degraded") && reported.contains("restarted into it"),
+        "the warning must state degraded coverage and the recovery step: {reported}"
+    );
+    assert!(
+        !reported.to_lowercase().contains("joined the shared"),
+        "a failed admission must never be reported as a capped start: {reported}"
+    );
+    let recorded: Value = serde_json::from_str(String::from_utf8_lossy(&finished.stdout).trim())
+        .expect("the requested payload must still run exactly as asked");
+    assert_eq!(
+        recorded["args"],
+        serde_json::to_value(&arguments).unwrap(),
+        "a degraded session keeps the requested arguments: {recorded}"
+    );
+    assert_eq!(
+        PathBuf::from(recorded["cwd"].as_str().unwrap()),
+        workspace,
+        "a degraded session keeps the requested cwd: {recorded}"
+    );
+
+    // The peer's allowance is neither lifted nor duplicated by the failure.
+    assert_eq!(job_cpu_rate(&job), shared_cpu_rate());
+    assert!(
+        process_in_job(peer_payload, &job),
+        "the peer session must keep its allowance after a peer's admission failure"
+    );
+    drop(peer_session.stdin.take());
+    let peer_finished = finish_host(peer_session);
+    assert_eq!(
+        peer_finished.status.code(),
+        Some(0),
+        "{}",
+        output_text(&peer_finished)
+    );
+    unsafe { CloseHandle(peer_payload) };
+    let _ = fs::remove_dir_all(&root);
 }
