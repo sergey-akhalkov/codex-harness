@@ -1397,7 +1397,7 @@ struct ControlHost {
     slot: PathBuf,
     state: PathBuf,
     receipt: PathBuf,
-    server: control_endpoint::Server,
+    server: Option<control_endpoint::Server>,
 }
 
 impl ControlHost {
@@ -1546,8 +1546,18 @@ impl ControlHost {
             slot,
             state,
             receipt,
-            server,
+            server: Some(server),
         }
+    }
+
+    fn server(&self) -> &control_endpoint::Server {
+        self.server
+            .as_ref()
+            .expect("control endpoint is still serving")
+    }
+
+    fn disconnect(&mut self) {
+        self.server.take();
     }
 
     fn title(&self) -> String {
@@ -1642,11 +1652,15 @@ fn attachment_failure_is_reported_before_the_assignment() {
             "{mode}: {output}"
         );
         assert!(
-            host.server.requests_for("turn/start").is_empty(),
+            host.server().requests_for("turn/start").is_empty(),
             "{mode}: a failed attachment must not submit the assignment: {:?}",
-            host.server.requests_for("turn/start")
+            host.server().requests_for("turn/start")
         );
-        assert_eq!(host.server.requests_for("thread/start").len(), 1, "{mode}");
+        assert_eq!(
+            host.server().requests_for("thread/start").len(),
+            1,
+            "{mode}"
+        );
         let watched = lead_command()
             .args(["executor", "watch", "--receipt"])
             .arg(&host.receipt)
@@ -1792,17 +1806,17 @@ fn assert_managed_presentation(name: &str, mode: &str, presentation: &str, inlin
         .unwrap();
     let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
     let until = Instant::now() + Duration::from_secs(25);
-    while host.server.requests_for("turn/start").is_empty() && Instant::now() < until {
+    while host.server().requests_for("turn/start").is_empty() && Instant::now() < until {
         thread::sleep(Duration::from_millis(40));
     }
-    let turns = host.server.requests_for("turn/start");
+    let turns = host.server().requests_for("turn/start");
     assert_eq!(turns.len(), 1, "{mode}: one assignment: {turns:?}");
     assert_eq!(turns[0]["params"]["threadId"], CONTROL_THREAD);
     assert_eq!(
         turns[0]["params"]["input"],
         json!([{"type": "text", "text": CONTROL_ASSIGNMENT}])
     );
-    let started = host.server.requests_for("thread/start");
+    let started = host.server().requests_for("thread/start");
     assert_eq!(started.len(), 1, "{mode}: {started:?}");
     assert_eq!(started[0]["params"]["model"], CONTROL_MODEL);
     assert_eq!(started[0]["params"]["modelProvider"], CONTROL_PROVIDER);
@@ -1845,7 +1859,7 @@ fn assert_managed_presentation(name: &str, mode: &str, presentation: &str, inlin
         !backend.contains(token.trim()),
         "{mode}: the capability token leaked into the control log"
     );
-    completion_burst(&host.server);
+    completion_burst(host.server());
     let finished = session
         .wait(
             Deadline::after(Duration::from_secs(20)).unwrap(),
@@ -1944,10 +1958,10 @@ fn losing_the_frontend_does_not_leave_the_run_working() {
     host.register_frontend(&double);
     let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
     let until = Instant::now() + Duration::from_secs(25);
-    while host.server.requests_for("turn/start").is_empty() && Instant::now() < until {
+    while host.server().requests_for("turn/start").is_empty() && Instant::now() < until {
         thread::sleep(Duration::from_millis(40));
     }
-    assert_eq!(host.server.requests_for("turn/start").len(), 1);
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
     fs::write(host.home.join("frontend-release"), "release").unwrap();
     let finished = session
         .wait(
@@ -1968,7 +1982,7 @@ fn losing_the_frontend_does_not_leave_the_run_working() {
     let receipt = receipt_json(&host.receipt);
     assert_ne!(receipt["observation"]["state"], "completed", "{receipt}");
     assert!(
-        host.server.requests_for("turn/start").len() == 1,
+        host.server().requests_for("turn/start").len() == 1,
         "loss must not submit another assignment"
     );
     let watched = lead_command()
@@ -2013,10 +2027,10 @@ fn endpoint_backend(host: &ControlHost) -> (u32, u64, PathBuf) {
 
 fn wait_turn(host: &ControlHost) {
     let until = Instant::now() + Duration::from_secs(25);
-    while host.server.requests_for("turn/start").is_empty() && Instant::now() < until {
+    while host.server().requests_for("turn/start").is_empty() && Instant::now() < until {
         thread::sleep(Duration::from_millis(40));
     }
-    assert_eq!(host.server.requests_for("turn/start").len(), 1);
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
 }
 
 fn assert_frontend_gone(host: &ControlHost, double: &Path) {
@@ -2036,7 +2050,7 @@ fn assert_backend_released(host: &ControlHost) {
         "closing the owned frontend left this run's backend running: pid {pid}"
     );
     assert!(
-        !host.server.requests_for("turn/start").is_empty(),
+        !host.server().requests_for("turn/start").is_empty(),
         "releasing this run's backend dropped the neighboring control session"
     );
 }
@@ -2061,7 +2075,7 @@ fn successful_and_unsuccessful_results_survive_tab_closure() {
         let session = ConsoleSession::spawn(ConsoleSpec::new(host_command(&host, true))).unwrap();
         wait_turn(&host);
         if failed {
-            host.server.push(json!({
+            host.server().push(json!({
                 "method": "turn/completed",
                 "params": {
                     "threadId": CONTROL_THREAD,
@@ -2073,7 +2087,7 @@ fn successful_and_unsuccessful_results_survive_tab_closure() {
                 }
             }));
         } else {
-            completion_burst(&host.server);
+            completion_burst(host.server());
         }
         let finished = session
             .wait(
@@ -2150,7 +2164,7 @@ fn owned_console_returns_the_failed_run_exit_code() {
     let mut neighbor = spawn_neighbor();
     let session = ConsoleSession::spawn(ConsoleSpec::new(host_command(&host, false))).unwrap();
     wait_turn(&host);
-    host.server.push(json!({
+    host.server().push(json!({
         "method": "turn/completed",
         "params": {
             "threadId": CONTROL_THREAD,
@@ -2200,7 +2214,7 @@ fn cleanup_failure_names_survivors_without_changing_the_outcome() {
             ConsoleSession::spawn(ConsoleSpec::new(host_command(&host, close_tab))).unwrap();
         wait_turn(&host);
         fs::write(host.home.join("frontend-cleanup-fail"), "fail").unwrap();
-        completion_burst(&host.server);
+        completion_burst(host.server());
         let finished = session
             .wait(
                 Deadline::after(Duration::from_secs(20)).unwrap(),
@@ -2270,4 +2284,443 @@ fn cleanup_failure_names_survivors_without_changing_the_outcome() {
             "{name}: {watched_text}"
         );
     }
+}
+
+const STALE_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24aa";
+const CORRECTION_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24bb";
+const REPLY_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24cc";
+const LATE_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24dd";
+const STALE_FINAL: &str = "STALE_PREVIOUS_RESULT";
+const CORRECTION_FINAL: &str = "CORRECTION_ACCEPTED_RESULT";
+const REPLY_FINAL: &str = "REPLY_CONTINUED_RESULT";
+
+fn spawn_managed(name: &str) -> (ControlHost, ConsoleSession) {
+    let host = ControlHost::new(name);
+    host.use_presentation("tui", "native-tui");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
+    wait_turn(&host);
+    (host, session)
+}
+
+fn watch_receipt(host: &ControlHost, timeout: &str) -> Output {
+    lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .args(["--timeout", timeout, "--poll", "50"])
+        .output()
+        .unwrap()
+}
+
+fn wait_session(session: ConsoleSession) -> harness_core::console::ConsoleOutcome {
+    session
+        .wait(
+            Deadline::after(Duration::from_secs(25)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+}
+
+fn push_completed(host: &ControlHost, turn: &str, status: &str) {
+    host.server().push(json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "turn": {"id": turn, "status": status}
+        }
+    }));
+}
+
+fn push_user_input(host: &ControlHost, item_id: &str, turn: &str, text: &str) {
+    for method in ["item/started", "item/completed"] {
+        host.server().push(json!({
+            "method": method,
+            "params": {
+                "threadId": CONTROL_THREAD,
+                "item": {
+                    "id": item_id,
+                    "type": "userMessage",
+                    "text": text,
+                    "turnId": turn
+                }
+            }
+        }));
+    }
+    host.server().push(json!({
+        "method": "turn/started",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "turn": {"id": turn, "status": "inProgress"}
+        }
+    }));
+}
+
+fn agent_turn(id: &str, text: &str) -> Value {
+    json!({
+        "id": id,
+        "status": "completed",
+        "items": [{
+            "id": format!("agent-{id}"),
+            "type": "agentMessage",
+            "text": text
+        }]
+    })
+}
+
+fn answer_thread(host: &ControlHost, turns: Value) {
+    host.server().answer(
+        "thread/read",
+        control_endpoint::Answer::Result(json!({"thread": {
+            "id": CONTROL_THREAD,
+            "cwd": host.slot,
+            "turns": turns
+        }})),
+    );
+}
+
+fn write_reply_hold(host: &ControlHost, unresolved: bool) {
+    let mut receipt = receipt_json(&host.receipt);
+    if unresolved {
+        receipt["replyRequests"] = json!([{
+            "id": "req-1",
+            "status": "unresolved",
+            "requiresReply": true
+        }]);
+    } else if let Some(object) = receipt.as_object_mut() {
+        object.remove("replyRequests");
+    }
+    fs::write(&host.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+}
+
+#[test]
+fn stale_completion_on_resume_does_not_finish_the_current_run() {
+    let (host, session) = spawn_managed("stale-resume");
+    push_completed(&host, STALE_TURN, "completed");
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "stale-m", "type": "agentMessage", "text": STALE_FINAL}
+        }
+    }));
+    thread::sleep(Duration::from_millis(1500));
+    let early_receipt = receipt_json(&host.receipt);
+    assert_ne!(
+        early_receipt["observation"]["state"], "completed",
+        "a resumed session's old completion finished this run: {early_receipt}"
+    );
+    let early = watch_receipt(&host, "1");
+    assert_eq!(early.status.code(), Some(2), "{}", text(&early));
+    assert!(
+        !text(&early).contains(STALE_FINAL),
+        "watch treated the stale result as this run: {}",
+        text(&early)
+    );
+
+    // The accepted turn is not the last turn in the thread record. The
+    // persisted result must still be this run's, not the stale one.
+    answer_thread(
+        &host,
+        json!([
+            agent_turn(CONTROL_TURN, CONTROL_FINAL),
+            agent_turn(STALE_TURN, STALE_FINAL)
+        ]),
+    );
+    completion_burst(host.server());
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CONTROL_FINAL
+    );
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains(CONTROL_FINAL), "{watched_text}");
+    assert!(!watched_text.contains(STALE_FINAL), "{watched_text}");
+    assert_eq!(
+        receipt_json(&host.receipt)["observation"]["session"],
+        CONTROL_THREAD
+    );
+}
+
+#[test]
+fn native_tui_input_at_a_turn_boundary_is_delivered_once_or_undelivered_after_closure() {
+    let (host, session) = spawn_managed("boundary-input");
+    push_completed(&host, CONTROL_TURN, "completed");
+    push_user_input(&host, "input-1", CORRECTION_TURN, "addressed correction");
+    // The started and completed records of one item are one delivery.
+    push_user_input(&host, "input-1", CORRECTION_TURN, "addressed correction");
+    thread::sleep(Duration::from_millis(1500));
+    let mid = receipt_json(&host.receipt);
+    assert_ne!(
+        mid["observation"]["state"], "completed",
+        "the assignment turn's completion finished the correction: {mid}"
+    );
+    assert_eq!(
+        host.server().requests_for("turn/start").len(),
+        1,
+        "native input must not submit a second assignment"
+    );
+
+    answer_thread(
+        &host,
+        json!([agent_turn(CORRECTION_TURN, CORRECTION_FINAL)]),
+    );
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "corr-m", "type": "agentMessage", "text": CORRECTION_FINAL}
+        }
+    }));
+    push_completed(&host, CORRECTION_TURN, "completed");
+    let until = Instant::now() + Duration::from_secs(8);
+    let mut pushed_late = false;
+    while Instant::now() < until {
+        let receipt = receipt_json(&host.receipt);
+        if receipt["inputClosure"] == "begun" && !pushed_late {
+            push_user_input(&host, "input-late", LATE_TURN, "late after closure");
+            pushed_late = true;
+        }
+        if pushed_late && receipt["observation"]["state"] == "completed" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert!(
+        pushed_late,
+        "closure began without a chance to report the late input undelivered"
+    );
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CORRECTION_FINAL
+    );
+    let receipt = receipt_json(&host.receipt);
+    let late = receipt["messages"].as_array().and_then(|messages| {
+        messages
+            .iter()
+            .find(|message| message["id"] == "input-late")
+    });
+    assert_eq!(
+        late.and_then(|message| message["status"].as_str()),
+        Some("undelivered"),
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["id"] == "input-late")
+            .count(),
+        1,
+        "a repeated late input must be reported once: {receipt}"
+    );
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    let watched = watch_receipt(&host, "10");
+    assert_eq!(watched.status.code(), Some(0), "{}", text(&watched));
+    assert!(
+        text(&watched).contains(CORRECTION_FINAL),
+        "{}",
+        text(&watched)
+    );
+}
+
+#[test]
+fn empty_final_on_the_accepted_turn_is_an_output_defect() {
+    let (host, session) = spawn_managed("empty-final");
+    answer_thread(
+        &host,
+        json!([{
+            "id": CONTROL_TURN,
+            "status": "completed",
+            "items": [{"id": "empty", "type": "agentMessage", "text": "  "}]
+        }]),
+    );
+    completion_burst(host.server());
+    let finished = wait_session(session);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "defect", "{receipt}");
+    let cause = receipt["observation"]["cause"].as_str().unwrap_or_default();
+    assert!(cause.contains("output defect"), "{cause}");
+    assert!(
+        cause.contains("not evidence of model, authentication or quota unavailability"),
+        "{cause}"
+    );
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(watched_text.contains("state=defect"), "{watched_text}");
+    assert!(!watched_text.contains("state=completed"), "{watched_text}");
+}
+
+#[test]
+fn control_disconnection_is_not_success() {
+    let (mut host, session) = spawn_managed("disconnect");
+    host.disconnect();
+    let finished = wait_session(session);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = receipt_json(&host.receipt);
+    assert_ne!(receipt["observation"]["state"], "completed", "{receipt}");
+    let cause = receipt["observation"]["cause"].as_str().unwrap_or_default();
+    assert!(
+        cause.contains("connection closed")
+            || cause.contains("Connection reset")
+            || finished.transcript.contains("connection closed")
+            || finished.transcript.contains("Connection reset"),
+        "{cause}\n{}",
+        finished.transcript
+    );
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(!watched_text.contains("state=completed"), "{watched_text}");
+}
+
+#[test]
+fn lost_control_host_is_interrupted_without_a_fabricated_result() {
+    let (host, session) = spawn_managed("lost-host");
+    let pid = receipt_json(&host.receipt)["observation"]["host"]["pid"]
+        .as_u64()
+        .expect("host identity") as u32;
+    let killed = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(killed.success(), "could not stop the host pid {pid}");
+    let started = Instant::now();
+    let watched = watch_receipt(&host, "15");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a lost host left watch unbounded: {}",
+        text(&watched)
+    );
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(watched_text.contains("state=interrupted"), "{watched_text}");
+    assert!(!watched_text.contains("state=completed"), "{watched_text}");
+    let _ = wait_session(session);
+}
+
+#[test]
+fn watch_timeout_does_not_stop_and_a_later_watch_sees_the_same_run() {
+    let (host, session) = spawn_managed("watch-timeout");
+    let first = watch_receipt(&host, "1");
+    let first_text = text(&first);
+    assert_eq!(first.status.code(), Some(2), "{first_text}");
+    assert!(
+        first_text.contains("timed out") && !first_text.contains("state=completed"),
+        "{first_text}"
+    );
+    assert!(
+        host.server().requests_for("turn/interrupt").is_empty(),
+        "timeout stopped the run: {:?}",
+        host.server().requests_for("turn/interrupt")
+    );
+    let second = watch_receipt(&host, "1");
+    assert_eq!(second.status.code(), Some(2), "{}", text(&second));
+    assert!(
+        host.server().requests_for("turn/interrupt").is_empty(),
+        "repeated watch after timeout stopped the run"
+    );
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, CONTROL_FINAL)]));
+    completion_burst(host.server());
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let third = watch_receipt(&host, "10");
+    let third_text = text(&third);
+    assert_eq!(third.status.code(), Some(0), "{third_text}");
+    assert!(third_text.contains(CONTROL_FINAL), "{third_text}");
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CONTROL_FINAL
+    );
+}
+
+#[test]
+fn unresolved_reply_hold_keeps_the_tui_open_until_one_reply_continues_the_run() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    let (host, session) = spawn_managed("reply-hold");
+    write_reply_hold(&host, true);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    thread::sleep(Duration::from_millis(1600));
+    let mid = receipt_json(&host.receipt);
+    assert_ne!(mid["observation"]["state"], "completed", "{mid}");
+    assert_ne!(
+        mid["observation"]["state"], "defect",
+        "an unresolved reply was reported as an empty-output defect: {mid}"
+    );
+    assert_ne!(
+        mid["inputClosure"], "begun",
+        "a reply hold began closure: {mid}"
+    );
+    let phases = frontend_phases(&host);
+    assert!(
+        phases.iter().any(|phase| phase["phase"] == "attached"),
+        "{phases:?}"
+    );
+    assert!(
+        !phases.iter().any(|phase| phase["phase"] == "persisted"),
+        "the TUI closed while the reply was unresolved: {phases:?}"
+    );
+    let pid = phases[0]["pid"].as_u64().unwrap() as u32;
+    let created = phases[0]["creationTime"].as_u64().unwrap();
+    assert!(
+        !process_gone(pid, created, &double),
+        "frontend closed during the unresolved reply hold"
+    );
+    let waiting = watch_receipt(&host, "1");
+    assert_eq!(
+        waiting.status.code(),
+        Some(2),
+        "an unresolved reply is nonterminal: {}",
+        text(&waiting)
+    );
+
+    write_reply_hold(&host, false);
+    answer_thread(&host, json!([agent_turn(REPLY_TURN, REPLY_FINAL)]));
+    push_user_input(&host, "reply-1", REPLY_TURN, "one reply");
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "reply-m", "type": "agentMessage", "text": REPLY_FINAL}
+        }
+    }));
+    push_completed(&host, REPLY_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        REPLY_FINAL
+    );
+    assert_eq!(
+        receipt_json(&host.receipt)["observation"]["session"],
+        CONTROL_THREAD,
+        "the reply started another session"
+    );
+    assert_frontend_gone(&host, &double);
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains(REPLY_FINAL), "{watched_text}");
 }

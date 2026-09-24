@@ -19,7 +19,7 @@ use harness_core::process::{
 };
 use harness_core::process_service::ServiceProcess;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs, io,
     io::{Read, Write},
@@ -410,13 +410,31 @@ pub(crate) fn now_ms() -> u64 {
 /// One parsed event of the native stream.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NativeEvent {
-    ThreadStarted { thread_id: String },
-    TurnStarted,
-    TurnCompleted,
-    TurnFailed { message: String },
-    Item { phase: ItemPhase, item: ItemSummary },
-    Error { message: String },
-    Unknown { kind: String },
+    ThreadStarted {
+        thread_id: String,
+    },
+    /// `turn_id` is present when the stream names the turn. An id-less event is
+    /// the legacy exec JSON shape and belongs to the current turn.
+    TurnStarted {
+        turn_id: Option<String>,
+    },
+    TurnCompleted {
+        turn_id: Option<String>,
+    },
+    TurnFailed {
+        turn_id: Option<String>,
+        message: String,
+    },
+    Item {
+        phase: ItemPhase,
+        item: ItemSummary,
+    },
+    Error {
+        message: String,
+    },
+    Unknown {
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +460,23 @@ pub(crate) struct ItemSummary {
     pub plan_items: Option<usize>,
 }
 
+/// Turn identity carried by an exec JSON event, when the stream names one.
+/// Absence is the legacy shape, not a missing current turn.
+fn event_turn_id(value: &Value) -> Option<String> {
+    value
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("turnId").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 /// Parses one JSONL event. The error text is a bounded, human-readable
 /// description of the unparsed line; the caller counts and surfaces it.
 pub(crate) fn parse_event(line: &str) -> Result<NativeEvent, String> {
@@ -463,9 +498,14 @@ pub(crate) fn parse_event(line: &str) -> Result<NativeEvent, String> {
                 .ok_or_else(|| "thread.started without thread_id".to_owned())?
                 .to_owned(),
         },
-        "turn.started" => NativeEvent::TurnStarted,
-        "turn.completed" => NativeEvent::TurnCompleted,
+        "turn.started" => NativeEvent::TurnStarted {
+            turn_id: event_turn_id(&value),
+        },
+        "turn.completed" => NativeEvent::TurnCompleted {
+            turn_id: event_turn_id(&value),
+        },
         "turn.failed" => NativeEvent::TurnFailed {
+            turn_id: event_turn_id(&value),
             message: value["error"]["message"]
                 .as_str()
                 .unwrap_or("turn failed without a message")
@@ -527,9 +567,9 @@ pub(crate) fn render_event(event: &NativeEvent, out: &mut dyn Write) -> io::Resu
         NativeEvent::ThreadStarted { thread_id } => {
             Some(format!("state: native start (session {thread_id})"))
         }
-        NativeEvent::TurnStarted => Some("state: turn started".to_owned()),
-        NativeEvent::TurnCompleted => Some("state: turn completed".to_owned()),
-        NativeEvent::TurnFailed { message } => Some(format!("turn failed: {message}")),
+        NativeEvent::TurnStarted { .. } => Some("state: turn started".to_owned()),
+        NativeEvent::TurnCompleted { .. } => Some("state: turn completed".to_owned()),
+        NativeEvent::TurnFailed { message, .. } => Some(format!("turn failed: {message}")),
         NativeEvent::Error { message } => Some(format!("error: {message}")),
         NativeEvent::Unknown { kind } => Some(format!("event: {kind}")),
         NativeEvent::Item { phase, item } => match item.kind.as_str() {
@@ -622,8 +662,15 @@ pub(crate) fn render_event(event: &NativeEvent, out: &mut dyn Write) -> io::Resu
 pub(crate) struct RunTracker {
     pub observation: RunObservation,
     saw_thread: bool,
+    /// The latest turn this stream accepted. A terminal event for another id
+    /// is history and cannot finish the current turn.
+    accepted_turn: Option<String>,
     saw_turn_completed: bool,
+    /// Stream-level error. A later turn does not erase it.
     failure: Option<String>,
+    /// Failure of the current turn. A newer `turn.started` clears it so a
+    /// resumed session is not finished by the predecessor's failure.
+    turn_failure: Option<String>,
     oversize: u64,
 }
 
@@ -634,8 +681,10 @@ impl RunTracker {
         Self {
             observation,
             saw_thread: false,
+            accepted_turn: None,
             saw_turn_completed: false,
             failure: None,
+            turn_failure: None,
             oversize: 0,
         }
     }
@@ -651,17 +700,32 @@ impl RunTracker {
                 self.observation.session = Some(thread_id.clone());
                 self.observation.state = STATE_STARTED.into();
             }
-            NativeEvent::TurnStarted => {
+            NativeEvent::TurnStarted { turn_id } => {
                 if self.saw_thread {
                     self.observation.state = STATE_RUNNING.into();
                 }
+                // A newer turn means the previous terminal event is not this
+                // run's outcome. An id-less start is the legacy boundary.
+                let changed = match turn_id {
+                    Some(id) => self.accepted_turn.as_deref() != Some(id.as_str()),
+                    None => true,
+                };
+                if changed {
+                    self.accepted_turn = turn_id.clone();
+                    self.saw_turn_completed = false;
+                    self.turn_failure = None;
+                }
             }
-            NativeEvent::TurnCompleted => {
-                self.saw_turn_completed = true;
-                self.observation.state = STATE_RUNNING.into();
+            NativeEvent::TurnCompleted { turn_id } => {
+                if self.terminal_matches(turn_id.as_deref()) {
+                    self.saw_turn_completed = true;
+                    self.observation.state = STATE_RUNNING.into();
+                }
             }
-            NativeEvent::TurnFailed { message } => {
-                self.failure = Some(message.clone());
+            NativeEvent::TurnFailed { turn_id, message } => {
+                if self.terminal_matches(turn_id.as_deref()) {
+                    self.turn_failure = Some(message.clone());
+                }
             }
             NativeEvent::Error { message } => {
                 self.failure = Some(message.clone());
@@ -684,6 +748,16 @@ impl RunTracker {
         }
         self.observation.updated_ms = now_ms();
         self.observation != before
+    }
+
+    /// A terminal event finishes the current turn only. Matching ids are
+    /// required when both sides name a turn; an id-less legacy event belongs
+    /// to whatever turn is current after the latest `turn.started`.
+    fn terminal_matches(&self, turn_id: Option<&str>) -> bool {
+        match (self.accepted_turn.as_deref(), turn_id) {
+            (Some(accepted), Some(id)) => accepted == id,
+            _ => true,
+        }
     }
 
     pub(crate) fn count_malformed(&mut self) -> bool {
@@ -830,9 +904,9 @@ impl RunTracker {
             if let Some(failure) = &self.failure {
                 cause = Some(format!("{failure}; {}", cause.unwrap_or_default()));
             }
-        } else if let Some(failure) = &self.failure {
+        } else if let Some(failure) = self.turn_failure.clone().or_else(|| self.failure.clone()) {
             self.observation.state = STATE_FAILED.into();
-            cause = Some(failure.clone());
+            cause = Some(failure);
         } else if !self.saw_thread {
             self.observation.state = STATE_FAILED.into();
             cause = Some(
@@ -988,6 +1062,66 @@ pub(crate) fn host_ended(host: &HostIdentity) -> bool {
         Ok(None) => true,
         Err(_) => false,
     }
+}
+
+/// Messaging records unresolved required replies on the dispatch receipt.
+/// A native turn that ends while one remains is not a completed run and must
+/// not be closed as an empty-output defect. Absence of the field is no hold.
+///
+/// The messaging workflow owns writing this record. An entry retains the run
+/// when `status` is `unresolved`, it is not a notification (`kind` of
+/// `notify`), and `requiresReply` is not false. Watch exit 3 stays with that
+/// workflow; this reader only keeps the base lifecycle from treating the hold
+/// as completion. The control driver keeps an equivalent reader because that
+/// file is also compiled alone by its fixture tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unresolved_reply_hold(receipt: &Value) -> bool {
+    let Some(requests) = receipt.get("replyRequests").and_then(Value::as_array) else {
+        return false;
+    };
+    requests.iter().any(|request| {
+        request.get("status").and_then(Value::as_str) == Some("unresolved")
+            && request.get("kind").and_then(Value::as_str) != Some("notify")
+            && request.get("requiresReply").and_then(Value::as_bool) != Some(false)
+    })
+}
+
+/// Records one input that arrived after closure began. The same id is recorded
+/// once. Delivered entries are not rewritten. The existing `messages` field is
+/// the report; this does not add a second queue. The control driver records
+/// the live path; this copy keeps the receipt contract testable here.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_undelivered_input(receipt: &Path, id: &str, detail: &str) -> io::Result<()> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    with_receipt_lock(receipt, || {
+        let mut value = read_receipt_value(receipt)?;
+        let messages = value
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("dispatch receipt is not an object"))?
+            .entry("messages")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(messages) = messages.as_array_mut() else {
+            return Err(io::Error::other(
+                "dispatch receipt messages field is not an array",
+            ));
+        };
+        if messages
+            .iter()
+            .any(|message| message.get("id").and_then(Value::as_str) == Some(id))
+        {
+            return Ok(());
+        }
+        messages.push(json!({
+            "schema": 1,
+            "id": id,
+            "status": "undelivered",
+            "undeliveredMs": now_ms(),
+            "detail": detail,
+        }));
+        write_receipt(receipt, &value)
+    })
 }
 
 /// Updates only the `observation` field of the receipt, preserving every
@@ -1815,6 +1949,70 @@ mod tests {
             tracker.observation.cause.as_deref(),
             Some("quota exhausted")
         );
+    }
+
+    #[test]
+    fn a_stale_turn_completion_does_not_finish_a_newer_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let result = root.path().join("message.txt");
+        fs::write(&result, "done").unwrap();
+
+        let mut tracker = RunTracker::new(observation());
+        tracker.apply(&parse_event(r#"{"type":"thread.started","thread_id":"s"}"#).unwrap());
+        tracker.apply(&parse_event(r#"{"type":"turn.started","turn_id":"old"}"#).unwrap());
+        tracker.apply(&parse_event(r#"{"type":"turn.completed","turn_id":"old"}"#).unwrap());
+        tracker.apply(&parse_event(r#"{"type":"turn.started","turn_id":"new"}"#).unwrap());
+        assert_ne!(
+            tracker.finish(0, Some(result.as_path())),
+            0,
+            "a resumed turn must not inherit the predecessor completion"
+        );
+
+        let mut tracker = RunTracker::new(observation());
+        tracker.apply(&parse_event(r#"{"type":"thread.started","thread_id":"s"}"#).unwrap());
+        tracker.apply(&parse_event(r#"{"type":"turn.started","turn_id":"new"}"#).unwrap());
+        tracker.apply(&parse_event(r#"{"type":"turn.completed","turn_id":"old"}"#).unwrap());
+        assert_ne!(tracker.finish(0, Some(result.as_path())), 0);
+        tracker.apply(&parse_event(r#"{"type":"turn.completed","turn_id":"new"}"#).unwrap());
+        assert_eq!(tracker.finish(0, Some(result.as_path())), 0);
+
+        let mut tracker = RunTracker::new(observation());
+        tracker.apply(&parse_event(r#"{"type":"thread.started","thread_id":"s"}"#).unwrap());
+        tracker.apply(
+            &parse_event(
+                r#"{"type":"turn.failed","turn_id":"old","error":{"message":"predecessor failed"}}"#,
+            )
+            .unwrap(),
+        );
+        tracker.apply(&parse_event(r#"{"type":"turn.started","turn_id":"new"}"#).unwrap());
+        tracker.apply(&parse_event(r#"{"type":"turn.completed","turn_id":"new"}"#).unwrap());
+        assert_eq!(tracker.finish(0, Some(result.as_path())), 0);
+    }
+
+    #[test]
+    fn an_unresolved_reply_hold_is_not_completion_and_late_input_is_undelivered_once() {
+        let open = json!({"replyRequests": [{"id": "q1", "status": "unresolved"}]});
+        assert!(unresolved_reply_hold(&open));
+        let notice =
+            json!({"replyRequests": [{"id": "n1", "status": "unresolved", "kind": "notify"}]});
+        assert!(!unresolved_reply_hold(&notice));
+        let resolved = json!({"replyRequests": [{"id": "q1", "status": "resolved"}]});
+        assert!(!unresolved_reply_hold(&resolved));
+        assert!(!unresolved_reply_hold(&json!({})));
+
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({"schema": 1})).unwrap(),
+        )
+        .unwrap();
+        record_undelivered_input(&receipt, "input-1", "after closure").unwrap();
+        record_undelivered_input(&receipt, "input-1", "repeat").unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(value["messages"][0]["status"], "undelivered");
+        assert_eq!(value["schema"], 1);
     }
 
     #[test]

@@ -60,7 +60,9 @@
 
 use harness_core::{
     orchestration_config::{EXECUTOR_AGENT_TOOLS_OFF, EXECUTOR_SESSION_ENV, ProfileBinding},
-    process::{CommandSpec, Job, OwnedProcess, ProcessIdentity},
+    process::{
+        Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, OwnedProcess, ProcessIdentity,
+    },
     task_control::ControlConnection,
     task_worktree,
 };
@@ -732,7 +734,24 @@ pub struct Conversation {
     lifecycle: Option<Lifecycle>,
     defect: Option<String>,
     failure: Option<String>,
+    /// The turn whose terminal status can finish this run. Assignment
+    /// submission and later accepted input update it. A historical turn cannot.
     turn: Option<TurnStart>,
+    /// Turns whose terminal status was already observed. A replay cannot finish
+    /// this run.
+    settled_turns: BTreeSet<String>,
+    /// Set once further input is no longer accepted. The host may still be
+    /// rendering the tail; closure of the frontend is a later, separate step.
+    closure_begun: bool,
+    /// Terminal outcome of the current turn, committed only after a quiet pump
+    /// so a correction in the same or next burst can supersede it.
+    pending_terminal: Option<(Lifecycle, Option<String>)>,
+    /// A user input arrived without a turn id and the next `turn/started` may
+    /// be that input's turn.
+    input_awaits_turn: bool,
+    /// Dispatch receipt beside the endpoint, when this conversation was started
+    /// by the host. Reply holds and undelivered input live there.
+    receipt: Option<PathBuf>,
     pending: VecDeque<Value>,
     /// Item ids of lead inputs this surface has already rendered, so one
     /// delivered message is not printed twice when the server announces it as
@@ -814,6 +833,11 @@ impl Conversation {
             defect: None,
             failure: None,
             turn: None,
+            settled_turns: BTreeSet::new(),
+            closure_begun: false,
+            pending_terminal: None,
+            input_awaits_turn: false,
+            receipt: receipt_beside_endpoint(&plan.paths.endpoint),
             pending: VecDeque::new(),
             rendered_inputs: BTreeSet::new(),
             next_id: 0,
@@ -860,6 +884,11 @@ impl Conversation {
             defect: None,
             failure: None,
             turn: None,
+            settled_turns: BTreeSet::new(),
+            closure_begun: false,
+            pending_terminal: None,
+            input_awaits_turn: false,
+            receipt: None,
             pending: VecDeque::new(),
             rendered_inputs: BTreeSet::new(),
             next_id: 0,
@@ -957,7 +986,10 @@ impl Conversation {
                 .unwrap_or("unknown")
                 .to_owned(),
         };
-        self.turn = Some(turn.clone());
+        if !self.closure_begun {
+            self.pending_terminal = None;
+            self.turn = Some(turn.clone());
+        }
         Ok(turn)
     }
 
@@ -1048,7 +1080,9 @@ impl Conversation {
     /// most one poll interval for the first one and draining a burst after it.
     ///
     /// A closed connection is an error, never an empty batch: the host must see
-    /// that the conversation can no longer be observed.
+    /// that the conversation can no longer be observed. A pending terminal
+    /// outcome is committed at the end of the burst, after a correction in the
+    /// same burst has had a chance to supersede it.
     pub fn pump(&mut self) -> io::Result<Vec<ControlEvent>> {
         let mut events = Vec::new();
         let mut wait = self.poll;
@@ -1072,6 +1106,7 @@ impl Conversation {
             events.push(self.observe(value));
             wait = DRAIN;
         }
+        self.settle_batch(&mut events);
         Ok(events)
     }
 
@@ -1095,11 +1130,12 @@ impl Conversation {
         Ok(thread.clone())
     }
 
-    /// The final assistant message of the thread's last turn, taken from the
-    /// thread items rather than from any transport acknowledgement.
+    /// The final assistant message of the accepted turn, taken from the thread
+    /// items rather than from any transport acknowledgement or an older turn.
     pub fn final_message(&mut self) -> io::Result<FinalMessage> {
         let thread = self.thread_state()?;
-        Ok(final_message_from(&thread))
+        let turn_id = self.turn.as_ref().map(|turn| turn.turn_id.as_str());
+        Ok(final_message_for(&thread, turn_id))
     }
 
     fn initialize(&mut self) -> io::Result<()> {
@@ -1208,7 +1244,7 @@ impl Conversation {
             return event;
         };
         // One lead input arrives as a started and a completed record of the
-        // same item; the surface renders its text once.
+        // same item; the surface renders its text once, and acceptance is once.
         if method.starts_with("item/")
             && event.raw["params"]["item"]["type"] == "userMessage"
             && !user_message_text(&event.raw["params"]["item"]).is_empty()
@@ -1217,7 +1253,13 @@ impl Conversation {
             if self.rendered_inputs.len() >= RENDERED_INPUTS_LIMIT {
                 self.rendered_inputs.clear();
             }
-            event.repeat = !self.rendered_inputs.insert(id.to_owned());
+            let fresh = self.rendered_inputs.insert(id.to_owned());
+            event.repeat = !fresh;
+            if fresh {
+                let text = user_message_text(&event.raw["params"]["item"]);
+                let turn_id = item_turn_id(&event.raw["params"]).map(str::to_owned);
+                self.note_user_input(id, turn_id.as_deref(), &text);
+            }
         }
         let (lifecycle, deviation) = self.classify(&method, &event.raw);
         event.lifecycle = lifecycle;
@@ -1227,6 +1269,12 @@ impl Conversation {
 
     /// Maps one notification onto the lifecycle state it establishes, or onto
     /// a recorded deviation when it establishes nothing.
+    ///
+    /// A terminal turn status finishes this run only when it names the current
+    /// accepted turn and no newer input superseded it in this burst. A previous
+    /// session's completion, or an older turn's completion after a correction,
+    /// is history. The lifecycle is not committed here: [`Self::settle_pending`]
+    /// does that on a quiet pump so the two cannot be confused.
     fn classify(&mut self, method: &str, raw: &Value) -> (Option<Lifecycle>, Option<String>) {
         let bound = self.thread_id.clone();
         let params = &raw["params"];
@@ -1272,33 +1320,74 @@ impl Conversation {
                 if !addressed {
                     return (None, None);
                 }
+                self.note_turn_started(turn_id_of(params));
                 (self.progress(), None)
             }
             "turn/completed" => {
                 if !addressed {
                     return (None, None);
                 }
+                let Some(id) = turn_id_of(params) else {
+                    if self.turn.is_none() || self.closure_begun {
+                        return (None, None);
+                    }
+                    // No identity, no correlation. Do not treat it as success.
+                    let cause = "turn/completed carried no turn identity; refusing to treat it as this run's completion"
+                        .to_owned();
+                    self.deviation(&cause);
+                    self.arm_terminal(Lifecycle::Defect, Some(cause.clone()));
+                    return (None, Some(cause));
+                };
+                // A driver that is only observing adopts the first addressed
+                // turn. Once a turn is accepted, another id is history.
+                if self.turn.is_none() {
+                    self.turn = Some(TurnStart {
+                        turn_id: id.to_owned(),
+                        status: params["turn"]["status"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                    });
+                }
+                if !self.is_current(id) {
+                    self.settled_turns.insert(id.to_owned());
+                    return (None, None);
+                }
+                self.settled_turns.insert(id.to_owned());
                 match params["turn"]["status"].as_str() {
-                    Some("completed") => (self.set(Lifecycle::Completed), None),
+                    Some("completed") => {
+                        if self.reply_hold_unresolved() {
+                            self.pending_terminal = None;
+                            return (None, None);
+                        }
+                        self.arm_terminal(Lifecycle::Completed, None);
+                        (None, None)
+                    }
                     Some("failed") => {
                         let message = params["turn"]["error"]["message"]
                             .as_str()
                             .unwrap_or("the native turn failed without a message")
                             .to_owned();
-                        self.failure = Some(message.clone());
-                        (self.set(Lifecycle::Failed), Some(message))
+                        self.arm_terminal(Lifecycle::Failed, Some(message.clone()));
+                        (None, Some(message))
                     }
-                    Some("interrupted") => (self.set(Lifecycle::Interrupted), None),
-                    Some(other) => (
-                        self.set(Lifecycle::Defect),
-                        self.deviation(&format!(
-                            "turn/completed reported the unknown turn status {other}"
-                        )),
-                    ),
-                    None => (
-                        self.set(Lifecycle::Defect),
-                        self.deviation("turn/completed carried no turn status"),
-                    ),
+                    Some("interrupted") => {
+                        self.arm_terminal(Lifecycle::Interrupted, None);
+                        (None, None)
+                    }
+                    Some(other) => {
+                        let cause =
+                            format!("turn/completed reported the unknown turn status {other}");
+                        self.deviation(&cause);
+                        self.arm_terminal(Lifecycle::Defect, Some(cause.clone()));
+                        (None, Some(cause))
+                    }
+                    None => {
+                        let cause = "turn/completed carried no turn status".to_owned();
+                        self.deviation(&cause);
+                        self.arm_terminal(Lifecycle::Defect, Some(cause.clone()));
+                        (None, Some(cause))
+                    }
                 }
             }
             "item/started" | "item/updated" | "item/completed" => {
@@ -1331,7 +1420,134 @@ impl Conversation {
         }
     }
 
+    fn is_current(&self, id: &str) -> bool {
+        self.turn.as_ref().is_some_and(|turn| turn.turn_id == id)
+    }
+
+    fn note_turn_started(&mut self, id: Option<&str>) {
+        let Some(id) = id else {
+            return;
+        };
+        if self.closure_begun || self.settled_turns.contains(id) {
+            return;
+        }
+        let current = self.turn.as_ref().map(|turn| turn.turn_id.as_str());
+        if current == Some(id) {
+            self.input_awaits_turn = false;
+            return;
+        }
+        let current_settled = current.is_some_and(|current| self.settled_turns.contains(current));
+        if self.input_awaits_turn || current_settled {
+            self.accept_observed_turn(id);
+        }
+        self.input_awaits_turn = false;
+    }
+
+    fn note_user_input(&mut self, id: &str, turn_id: Option<&str>, text: &str) {
+        if self.closure_begun {
+            self.report_undelivered(id, text);
+            return;
+        }
+        if let Some(turn_id) = turn_id {
+            if !self.settled_turns.contains(turn_id)
+                && self
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.turn_id != turn_id)
+            {
+                self.accept_observed_turn(turn_id);
+            }
+            self.input_awaits_turn = false;
+        } else {
+            self.input_awaits_turn = true;
+        }
+    }
+
+    fn accept_observed_turn(&mut self, id: &str) {
+        self.pending_terminal = None;
+        if !self.closure_begun
+            && self
+                .lifecycle
+                .is_some_and(|state| state.is_terminal() || state == Lifecycle::Defect)
+        {
+            self.lifecycle = Some(Lifecycle::Running);
+        }
+        self.turn = Some(TurnStart {
+            turn_id: id.to_owned(),
+            status: "inProgress".to_owned(),
+        });
+    }
+
+    fn arm_terminal(&mut self, state: Lifecycle, cause: Option<String>) {
+        self.pending_terminal = Some((state, cause));
+    }
+
+    /// Commits a terminal outcome that this burst did not supersede, and stamps
+    /// it on the turn event so callers see the same lifecycle the conversation
+    /// recorded. A reply hold keeps a completed turn nonterminal.
+    fn settle_batch(&mut self, events: &mut [ControlEvent]) {
+        let Some((state, cause)) = self.pending_terminal.take() else {
+            return;
+        };
+        if state == Lifecycle::Completed && self.reply_hold_unresolved() {
+            return;
+        }
+        if let Some(cause) = cause.as_deref() {
+            match state {
+                Lifecycle::Failed => self.failure = Some(cause.to_owned()),
+                Lifecycle::Defect => {
+                    self.deviation(cause);
+                }
+                _ => {}
+            }
+        }
+        self.lifecycle = Some(state);
+        self.closure_begun = true;
+        if let Some(receipt) = self.receipt.clone() {
+            let _ = mark_input_closure(&receipt);
+        }
+        if let Some(event) = events
+            .iter_mut()
+            .rev()
+            .find(|event| event.method.as_deref() == Some("turn/completed"))
+        {
+            event.lifecycle = Some(state);
+            if event.deviation.is_none()
+                && let Some(cause) = cause
+            {
+                event.deviation = Some(cause);
+            }
+        }
+    }
+
+    fn reply_hold_unresolved(&self) -> bool {
+        let Some(receipt) = &self.receipt else {
+            return false;
+        };
+        // A receipt that cannot be read does not prove the hold is gone.
+        // Leaving the run nonterminal is safer than reporting completion.
+        unresolved_reply_hold_at(receipt).unwrap_or(true)
+    }
+
+    fn report_undelivered(&self, id: &str, text: &str) {
+        let Some(receipt) = &self.receipt else {
+            return;
+        };
+        let detail = format!(
+            "input arrived after closure began and was not delivered: {}",
+            excerpt(text, 200)
+        );
+        let _ = record_undelivered_input(receipt, id, &detail);
+    }
+
     fn set(&mut self, state: Lifecycle) -> Option<Lifecycle> {
+        let closed = self.closure_begun
+            || self
+                .lifecycle
+                .is_some_and(|current| current.is_terminal() || current == Lifecycle::Defect);
+        if closed && !state.is_terminal() && state != Lifecycle::Defect {
+            return self.lifecycle;
+        }
         self.lifecycle = Some(state);
         Some(state)
     }
@@ -1428,9 +1644,18 @@ fn normalize_slot(path: &str) -> String {
     text.trim_end_matches('\\').to_owned()
 }
 
-/// The final assistant message of the last turn of one thread record.
-fn final_message_from(thread: &Value) -> FinalMessage {
-    let Some(turn) = thread["turns"].as_array().and_then(|turns| turns.last()) else {
+/// The final assistant message of one thread record.
+///
+/// When `turn_id` is set, only that accepted turn is read. Falling back to
+/// another turn would let a stale completion supply this run's result.
+fn final_message_for(thread: &Value, turn_id: Option<&str>) -> FinalMessage {
+    let turns = thread["turns"].as_array();
+    let turn = match (turns, turn_id) {
+        (Some(turns), Some(id)) => turns.iter().find(|turn| turn["id"].as_str() == Some(id)),
+        (Some(turns), None) => turns.last(),
+        _ => None,
+    };
+    let Some(turn) = turn else {
         return FinalMessage::Missing;
     };
     let Some(last) = turn["items"].as_array().and_then(|items| {
@@ -1445,6 +1670,123 @@ fn final_message_from(thread: &Value) -> FinalMessage {
         Some(text) if !text.trim().is_empty() => FinalMessage::Present(text.to_owned()),
         _ => FinalMessage::Empty,
     }
+}
+
+const RECEIPT_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Same hold record the observation owner reads. Kept here because this file
+/// is also compiled alone by the control fixture tests.
+fn unresolved_reply_hold(receipt: &Value) -> bool {
+    let Some(requests) = receipt.get("replyRequests").and_then(Value::as_array) else {
+        return false;
+    };
+    requests.iter().any(|request| {
+        request.get("status").and_then(Value::as_str) == Some("unresolved")
+            && request.get("kind").and_then(Value::as_str) != Some("notify")
+            && request.get("requiresReply").and_then(Value::as_bool) != Some(false)
+    })
+}
+
+fn unresolved_reply_hold_at(receipt: &Path) -> io::Result<bool> {
+    if !receipt.is_file() {
+        return Ok(false);
+    }
+    with_control_receipt_lock(receipt, || {
+        let value =
+            serde_json::from_slice::<Value>(&fs::read(receipt)?).map_err(io::Error::other)?;
+        Ok(unresolved_reply_hold(&value))
+    })
+}
+
+fn record_undelivered_input(receipt: &Path, id: &str, detail: &str) -> io::Result<()> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    with_control_receipt_lock(receipt, || {
+        let mut value =
+            serde_json::from_slice::<Value>(&fs::read(receipt)?).map_err(io::Error::other)?;
+        let messages = value
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("dispatch receipt is not an object"))?
+            .entry("messages")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(messages) = messages.as_array_mut() else {
+            return Err(io::Error::other(
+                "dispatch receipt messages field is not an array",
+            ));
+        };
+        if messages
+            .iter()
+            .any(|message| message.get("id").and_then(Value::as_str) == Some(id))
+        {
+            return Ok(());
+        }
+        messages.push(json!({
+            "schema": 1,
+            "id": id,
+            "status": "undelivered",
+            "detail": detail,
+        }));
+        let bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
+        let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
+        fs::write(&temp, bytes)?;
+        fs::rename(&temp, receipt)
+    })
+}
+
+fn mark_input_closure(receipt: &Path) -> io::Result<()> {
+    with_control_receipt_lock(receipt, || {
+        let mut value =
+            serde_json::from_slice::<Value>(&fs::read(receipt)?).map_err(io::Error::other)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("inputClosure".to_owned(), Value::String("begun".to_owned()));
+        }
+        let bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
+        let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
+        fs::write(&temp, bytes)?;
+        fs::rename(&temp, receipt)
+    })
+}
+
+fn with_control_receipt_lock<T>(
+    receipt: &Path,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let path = receipt.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let deadline = Deadline::after(RECEIPT_LOCK_WAIT)?;
+    let _lock = ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default())?;
+    action()
+}
+
+/// `spawn-N.json` beside `endpoint-N.json`, the dispatch receipt this run owns.
+fn receipt_beside_endpoint(endpoint: &Path) -> Option<PathBuf> {
+    let name = endpoint.file_name()?.to_str()?;
+    let spawn = name.replacen("endpoint-", "spawn-", 1);
+    if spawn == name {
+        return None;
+    }
+    Some(endpoint.with_file_name(spawn))
+}
+
+fn turn_id_of(params: &Value) -> Option<&str> {
+    params
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| params.get("turnId").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+}
+
+fn item_turn_id(params: &Value) -> Option<&str> {
+    let item = &params["item"];
+    item.get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("turn_id").and_then(Value::as_str))
+        .or_else(|| params.get("turnId").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
 }
 
 /// Binds a free loopback port for the child that will serve it.
