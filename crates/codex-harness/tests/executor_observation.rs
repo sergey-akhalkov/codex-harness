@@ -1954,6 +1954,23 @@ fn assert_managed_presentation(name: &str, mode: &str, presentation: &str, inlin
 #[test]
 fn losing_the_frontend_does_not_leave_the_run_working() {
     let host = ControlHost::new("frontend-loss");
+    host.server().answer_sequence(
+        "thread/read",
+        vec![
+            control_endpoint::Answer::Result(json!({"thread": {
+                "id": CONTROL_THREAD,
+                "cwd": host.slot,
+                "turns": []
+            }})),
+            control_endpoint::Answer::Result(json!({"thread": {
+                "id": CONTROL_THREAD,
+                "cwd": host.slot,
+                "turns": [{"id": CONTROL_TURN, "status": "inProgress"}]
+            }})),
+        ],
+    );
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "kept partial work").unwrap();
     let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
     host.register_frontend(&double);
     let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
@@ -1971,26 +1988,166 @@ fn losing_the_frontend_does_not_leave_the_run_working() {
         )
         .unwrap();
     assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
-    assert!(
-        finished.transcript.contains("frontend exited")
-            || fs::read_to_string(&host.receipt)
-                .unwrap()
-                .contains("frontend exited"),
-        "{}",
-        finished.transcript
-    );
     let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "interrupted", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "{receipt}"
+    );
     assert_ne!(receipt["observation"]["state"], "completed", "{receipt}");
     assert!(
-        host.server().requests_for("turn/start").len() == 1,
-        "loss must not submit another assignment"
+        receipt["observation"]["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("frontend exited") && cause.contains("resume")),
+        "{receipt}"
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "kept partial work");
+    let slot: Value =
+        serde_json::from_slice(&fs::read(host.state.join("slot-1.json")).unwrap()).unwrap();
+    assert_eq!(slot["state"], "occupied");
+    assert_eq!(slot["owner"], CONTROL_OWNER);
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    assert_eq!(
+        host.server().requests_for("turn/interrupt").len(),
+        1,
+        "view loss must interrupt the active turn"
+    );
+    assert_backend_released(&host);
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(
+        watched_text.contains("state=interrupted") && watched_text.contains("frontend exited"),
+        "{watched_text}"
+    );
+    assert!(watched_text.contains(CONTROL_THREAD), "{watched_text}");
+    assert!(watched_text.contains("resume"), "{watched_text}");
+    assert!(!watched_text.contains("state=completed"), "{watched_text}");
+}
+
+#[test]
+fn completion_racing_frontend_exit_keeps_the_retained_result() {
+    let host = ControlHost::new("frontend-race");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
+    let until = Instant::now() + Duration::from_secs(25);
+    while host.server().requests_for("turn/start").is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    // The thread already holds the completed turn, and the terminal event is
+    // pushed in the same moment the frontend exits. Either signal may win the
+    // race; frontend exit must not replace the retained result.
+    completion_burst(host.server());
+    fs::write(host.home.join("frontend-release"), "release").unwrap();
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CONTROL_FINAL
+    );
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "{receipt}"
+    );
+    assert!(
+        receipt["observation"]["cause"].is_null()
+            || !receipt["observation"]["cause"]
+                .as_str()
+                .unwrap_or("")
+                .contains("frontend exited"),
+        "frontend exit must not replace the retained result: {receipt}"
+    );
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains("state=completed"), "{watched_text}");
+    assert!(watched_text.contains(CONTROL_FINAL), "{watched_text}");
+    assert!(watched_text.contains(CONTROL_THREAD), "{watched_text}");
+    assert!(
+        !watched_text.contains("state=interrupted"),
+        "{watched_text}"
+    );
+}
+
+#[test]
+fn unfocused_tab_remains_a_valid_surface() {
+    let host = ControlHost::new("frontend-unfocused");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
+    let until = Instant::now() + Duration::from_secs(25);
+    while host.server().requests_for("turn/start").is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    let phases = frontend_phases(&host);
+    assert!(
+        phases
+            .iter()
+            .any(|phase| phase["phase"] == "attached" && phase["alive"] == true),
+        "the unselected surface must still be attached: {phases:?}"
+    );
+    // This pseudoconsole is not a selected Windows Terminal tab. Waiting here
+    // would interrupt the run if focus or selection were treated as view loss.
+    let _foreground = harness_core::task_view::foreground_window();
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        host.server().requests_for("turn/interrupt").is_empty(),
+        "an unfocused tab must not interrupt the run"
+    );
+    assert!(
+        !host.home.join("frontend-release").exists(),
+        "the frontend process is still the surface"
+    );
+    completion_burst(host.server());
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert!(host.server().requests_for("turn/interrupt").is_empty());
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "{receipt}"
     );
     let watched = lead_command()
         .args(["executor", "watch", "--receipt"])
         .arg(&host.receipt)
         .output()
         .unwrap();
-    assert_eq!(watched.status.code(), Some(1), "{}", text(&watched));
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains("state=completed"), "{watched_text}");
+    assert!(watched_text.contains(CONTROL_FINAL), "{watched_text}");
+    assert!(!watched_text.contains("frontend exited"), "{watched_text}");
 }
 
 fn host_command(host: &ControlHost, close_tab: bool) -> CommandSpec {

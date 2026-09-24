@@ -63,7 +63,7 @@ const USAGE: &str = concat!(
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
     "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the existing terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. A finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
+    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the existing terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. A finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An unfocused or unselected tab is not frontend loss, and a completion already retained is not overwritten or reported as success because the frontend closed. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
@@ -2842,14 +2842,11 @@ fn host_control_conversation(
                 .get_ref()
                 .is_some_and(|cause| cause.is::<FrontendLost>())
             {
-                let interrupted = conversation.interrupt_active().unwrap_or(false);
-                return fail_with_frontend(
+                return contain_frontend_loss(
                     &mut frontend,
+                    &mut conversation,
                     receipt,
                     &mut tracker,
-                    format!(
-                        "the owned native frontend exited while the assignment was active; further model dispatch was suspended and the owned backend was contained (interrupt requested: {interrupted}). Frontend exit is not success. Remedy: executor resume reopens this session with a frontend"
-                    ),
                     plan,
                     Some(job),
                 );
@@ -3060,6 +3057,7 @@ fn drive_control(
     let mut truncation_noted = false;
     let mut grace: Option<Instant> = None;
     let mut streamed_message = None;
+    let mut exit_drained = false;
     loop {
         let events = conversation.pump()?;
         let empty = events.is_empty();
@@ -3129,11 +3127,131 @@ fn drive_control(
             && !conversation
                 .lifecycle()
                 .is_some_and(|state| state.is_terminal() || state == Lifecycle::Defect)
-            && !frontend.is_running()?
+            && frontend_view_lost(frontend.is_running()?)
         {
+            // A terminal event can arrive in the same moment as the exit.
+            // Drain it once before deciding. Process exit is not a result.
+            if !exit_drained {
+                exit_drained = true;
+                continue;
+            }
+            if let Some(outcome) = retained_native_outcome(conversation, receipt) {
+                return Ok((outcome, streamed_message));
+            }
             return Err(io::Error::other(FrontendLost));
         }
     }
+}
+
+/// Process exit of the only attached frontend is view loss. Focus, tab
+/// selection and tiling are not: an unfocused or unselected tab remains the
+/// surface.
+fn frontend_view_lost(process_running: bool) -> bool {
+    !process_running
+}
+
+/// The accepted turn's own recorded status, when that status is already
+/// terminal. A missing read, another turn, or a non-terminal status is not a
+/// result, and frontend exit never manufactures one. An unresolved reply hold
+/// keeps a completed turn from settling as success.
+fn retained_native_outcome(conversation: &mut Conversation, receipt: &Path) -> Option<Lifecycle> {
+    let turn_id = conversation.turn()?.turn_id.clone();
+    let thread = conversation.thread_state().ok()?;
+    let status = thread
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|turns| {
+            turns.iter().rev().find(|turn| {
+                turn.get("id").and_then(serde_json::Value::as_str) == Some(turn_id.as_str())
+            })
+        })
+        .and_then(|turn| turn.get("status").and_then(serde_json::Value::as_str))?;
+    match status {
+        "completed" if completed_may_settle(receipt) => Some(Lifecycle::Completed),
+        "failed" => Some(Lifecycle::Failed),
+        "interrupted" => Some(Lifecycle::Interrupted),
+        _ => None,
+    }
+}
+
+/// A receipt that cannot be read does not prove a reply hold is gone. Leaving
+/// the completed turn unsettled is safer than reporting success.
+fn completed_may_settle(receipt: &Path) -> bool {
+    let Ok(bytes) = fs::read(receipt) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    !observation::unresolved_reply_hold(&value)
+}
+
+/// The only frontend exited during active work. Interrupt the accepted turn,
+/// contain the owned backend, and record interruption unless a terminal result
+/// is already retained. No further assignment is submitted.
+fn contain_frontend_loss(
+    frontend: &mut Option<OwnedFrontend>,
+    conversation: &mut Conversation,
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    plan: &ControlPlan,
+    job: Option<Job>,
+) -> io::Result<i32> {
+    if let Some(frontend) = frontend.take() {
+        let _ = frontend.close();
+    }
+    let interrupted = conversation.interrupt_active().unwrap_or(false);
+    let cleanup = match job {
+        Some(job) => match job.terminate(1, CONTROL_CLEANUP) {
+            Ok(snapshot) => match snapshot.active_processes {
+                0 => "the owned child tree was terminated; no process remained".to_owned(),
+                remaining => {
+                    format!("the owned child tree was terminated; {remaining} processes remained")
+                }
+            },
+            Err(error) => format!("terminating the owned child tree also failed: {error}"),
+        },
+        None => "no child tree was started".to_owned(),
+    };
+    let cause = format!(
+        "the owned native frontend exited while the assignment was active; further model dispatch was suspended and the owned backend was contained (interrupt requested: {interrupted}). Frontend exit is not success. Remedy: executor resume reopens this session with a frontend; {cleanup}"
+    );
+    let retained = observation::commit_frontend_loss(receipt, tracker, cause.clone())?;
+    if retained {
+        let exit = tracker.observation.exit_code.unwrap_or(0);
+        note_log(
+            &plan.paths.log,
+            &format!(
+                "frontend exit kept the retained result state={} exit={exit}",
+                tracker.observation.state
+            ),
+        );
+        return Ok(exit);
+    }
+    let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "result: interrupted: {cause}");
+    if let Some(tail) = observation::stderr_tail(&plan.paths.log, observation::MAX_STDERR_TAIL) {
+        let _ = writeln!(stdout, "app-server log (bounded tail):");
+        let _ = writeln!(stdout, "{tail}");
+    }
+    let _ = writeln!(
+        stdout,
+        "detail: {} control log: {}",
+        tracker
+            .observation
+            .detail
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unavailable".into()),
+        plan.paths.log.display()
+    );
+    let _ = writeln!(
+        stdout,
+        "remedy: executor resume reopens this session with a frontend; the slot keeps its binding and partial work, and no fallback run was started"
+    );
+    let _ = stdout.flush();
+    note_log(&plan.paths.log, &cause);
+    Err(io::Error::other(cause))
 }
 
 /// The full text of a completed assistant item already delivered on this turn.
@@ -4804,6 +4922,15 @@ mod tests {
     #[test]
     fn help_is_accepted() {
         assert_eq!(run(&[OsString::from("--help")]).unwrap(), 0);
+    }
+
+    #[test]
+    fn unfocused_or_unselected_tab_is_not_view_loss() {
+        assert!(
+            !frontend_view_lost(true),
+            "a live frontend stays a valid surface when it is unfocused or unselected"
+        );
+        assert!(frontend_view_lost(false));
     }
 
     #[test]
