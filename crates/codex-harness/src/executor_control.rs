@@ -795,6 +795,33 @@ impl Conversation {
     /// On any failure the child, if it started at all, stays inside the
     /// caller's Job, and the error names the log to read.
     pub fn start(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
+        let mut conversation = Self::open(job, plan)?;
+        conversation.start_thread(plan)?;
+        conversation.record_endpoint(plan)?;
+        Ok(conversation)
+    }
+
+    /// Starts the app-server and resumes one exact existing thread.
+    ///
+    /// This does not call `thread/start`. The conversation identity is the
+    /// requested session, so attaching the native frontend cannot replace the
+    /// recorded session with a new one. A resume answer for another thread is
+    /// refused before the endpoint is published.
+    // The host uses this. The fixture test binary compiles this file alone.
+    #[allow(dead_code)]
+    pub fn start_resuming(job: &Job, plan: &ControlPlan, session: &str) -> io::Result<Self> {
+        if session.is_empty() {
+            return Err(invalid(
+                "exact-session resume requires the recorded session id; refusing to start another conversation",
+            ));
+        }
+        let mut conversation = Self::open(job, plan)?;
+        conversation.resume_exact(session, plan)?;
+        conversation.record_endpoint(plan)?;
+        Ok(conversation)
+    }
+
+    fn open(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
         if plan.launcher.as_os_str().is_empty() || plan.slot.as_os_str().is_empty() {
             return Err(invalid(
                 "a control session requires the launcher, the kit home and the bound slot",
@@ -845,17 +872,34 @@ impl Conversation {
             poll: plan.poll,
         };
         conversation.initialize()?;
-        conversation.start_thread(plan)?;
-        conversation
-            .endpoint
-            .record(&plan.paths.endpoint)
-            .map_err(|error| {
-                invalid(format!(
-                    "control endpoint record {}: {error}",
-                    plan.paths.endpoint.display()
-                ))
-            })?;
         Ok(conversation)
+    }
+
+    fn record_endpoint(&self, plan: &ControlPlan) -> io::Result<()> {
+        self.endpoint.record(&plan.paths.endpoint).map_err(|error| {
+            invalid(format!(
+                "control endpoint record {}: {error}",
+                plan.paths.endpoint.display()
+            ))
+        })
+    }
+
+    /// Adopts `session` through `thread/resume` and refuses any other thread.
+    fn resume_exact(&mut self, session: &str, plan: &ControlPlan) -> io::Result<()> {
+        let resumed = self.call("thread/resume", json!({"threadId": session}))?;
+        if resumed["thread"]["id"].as_str() != Some(session) {
+            return Err(invalid(
+                "thread/resume returned another thread; refusing to attach a frontend to a different conversation",
+            ));
+        }
+        if let Err(mismatch) = confirm_resumed(&plan.identity, &resumed, &plan.slot) {
+            return Err(invalid(format!(
+                "resuming the exact session changed the bound routing: {mismatch}"
+            )));
+        }
+        self.thread_id = session.to_owned();
+        self.endpoint.thread_id = Some(session.to_owned());
+        Ok(())
     }
 
     /// Attaches to a conversation that already runs, through its recorded

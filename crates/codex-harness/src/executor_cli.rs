@@ -4,8 +4,10 @@
 //! succession, OFAP 4.1).
 #![cfg(windows)]
 
+#[cfg(test)]
+use harness_core::orchestration_config::executor_session_args;
 use harness_core::orchestration_config::{
-    self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, executor_session_args, load,
+    self, EXECUTOR_SESSION_ENV, ProfileBinding, executor_profile, load,
 };
 use harness_core::process::{Job, Limits, StopReason};
 use harness_core::process_service::ServiceProcess;
@@ -52,7 +54,7 @@ use observation::{
 const USAGE: &str = concat!(
     "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\n",
     "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\n",
-    "codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session PREVIOUS_SESSION_ID] [--profile ID] [--exec PROMPT | --assignment FILE]\n  Start a NEW conversation in the same occupied worktree, preserving partial work and reusing the recorded assignment by default. Never releases or resets the slot.\n",
+    "codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session PREVIOUS_SESSION_ID] [--profile ID] [--exec PROMPT | --assignment FILE]\n  Start a NEW conversation in the same occupied worktree, preserving partial work and reusing the recorded assignment by default. The successor records the predecessor session and publishes a new control endpoint; a stale endpoint is not an address of that conversation. Never releases or resets the slot.\n",
     "codex-harness executor watch (--source CHECKOUT --codex-home DIRECTORY --slot N | --receipt FILE) [--owner ID] [--timeout SECONDS] [--poll MILLISECONDS] [--json]\n",
     "codex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\n",
     "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
@@ -65,7 +67,7 @@ const USAGE: &str = concat!(
     "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
     "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the existing terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. A finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An unfocused or unselected tab is not frontend loss, and a completion already retained is not overwritten or reported as success because the frontend closed. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
-    "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
+    "Resume continues one exact interrupted session on its recorded slot through the managed native TUI: the host starts a control-backed app-server, resumes that exact thread, retires any stale control endpoint, and attaches one native Codex TUI to that session without fetch, reset, clean, a new conversation or a replay of completed work. Without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
     "`executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifies each by the recorded identity and boundedly terminates survivors so a child command is reported actually terminated instead of assumed ended with the host. The stopped run's tab closes because that run's own host process ends, and the recorded tab identity is verified closed through the terminal-surface owner; no terminal command is ever sent, so the lead's window, sibling tabs and other conversations are untouched. The receipt gets a stop record with outcome stopped, already-stopped, already-completed, partial or error, honest timestamps, the measured duration, the observed exit code (one that was never observed stays unknown), the pending-message undelivered marking, and the named survivor, cause and next action on partial failure; a repeated stop reports the recorded state and keeps the first stop's outcome, timestamps and measured duration, a stop racing natural completion reports the completed result, and nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). ",
     "`executor message` delivers one literal correction into the addressed run's own live conversation: the text of --text or the verbatim content of a UTF-8 --file (no shell evaluation, real line breaks preserved), addressed by --source, --codex-home, --slot, --owner and, when given, the exact --session the dispatch receipt recorded. It verifies the recorded slot binding, the owner, the exact session, the live lease, the recorded host and app-server child, and the live conversation itself - recorded session identity, the addressed slot as its working directory and the receipt's resolved model/provider/reasoning effort - before delivering, so input cannot reach a later occupant of a reused slot and cannot enter a conversation routed differently. Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread, and no new conversation, hidden stop/resume, model/provider/effort change or re-sent task happens. The result distinguishes delivered (the input is observed in the conversation's own items as a user message correlated by the recorded client message id or its exact text), queued (accepted by the recorded turn; its own items do not show it yet), error (the native endpoint refused; nothing was delivered) and indeterminate (the request was not answered, so whether it was applied is unknown); acceptance is never reported as the executor having applied the correction. Every attempt is recorded with its content identity in the receipt's `messages` field, so the same literal text is one input: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat and names the next action, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state and result with the exact-session continuation remedy, and a surface that records no control endpoint (a historical unmanaged receipt or a legacy receipt) is reported as unsupported with the same remedy instead of pretending delivery. Exit codes: 0 delivered, queued or already recorded as delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. ",
@@ -266,9 +268,10 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
 }
 
 /// Resume one exact interrupted pooled session on its recorded slot. The slot
-/// is adopted without resynchronization so partial work survives, and the
-/// session continues through the verified non-interactive resume path in the
-/// same visible hosts as a fresh dispatch.
+/// is adopted without resynchronization so partial work survives. The session
+/// continues on the managed native presentation: the host resumes that exact
+/// thread and attaches the native frontend to it, instead of starting another
+/// conversation or replaying completed work.
 fn resume(args: &[OsString]) -> io::Result<i32> {
     continue_slot(args, false)
 }
@@ -453,25 +456,46 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
         }
     };
     let paths = run_paths(&codex_home, &source, binding.index)?;
-    let route = if fresh {
-        HostRoute::Control(Box::new(ControlReceipt {
-            schema: CONTROL_SCHEMA,
-            assignment: restart_assignment(&prompt, &session, &predecessor),
-            original_assignment: Some(prompt),
-            identity: BoundIdentity::resolve(&bound),
-            presentation: NativePresentation::NativeTui,
-            port: None,
-        }))
-    } else {
-        HostRoute::Launcher(resume_child_args(
-            &profile,
-            &binding.path,
-            &session,
-            &prompt,
-            &paths.result,
-        )?)
-    };
+    // Resume keeps the exact session on the managed presentation. Restart
+    // starts a fresh conversation and carries the predecessor separately.
+    let route = continuation_route(
+        fresh,
+        &prompt,
+        &session,
+        &predecessor,
+        BoundIdentity::resolve(&bound),
+    );
     launch_bound(&request, &binding, route, &bound, &paths)
+}
+
+/// Managed continuation route. Resume attaches the native frontend to the
+/// recorded session. Restart starts a fresh conversation, keeps the original
+/// task beside a bounded handoff, and does not resume the predecessor thread.
+fn continuation_route(
+    fresh: bool,
+    prompt: &str,
+    session: &str,
+    predecessor: &serde_json::Value,
+    identity: BoundIdentity,
+) -> HostRoute {
+    let (assignment, original, resume_session) = if fresh {
+        (
+            restart_assignment(prompt, session, predecessor),
+            Some(prompt.to_owned()),
+            None,
+        )
+    } else {
+        (prompt.to_owned(), None, Some(session.to_owned()))
+    };
+    HostRoute::Control(Box::new(ControlReceipt {
+        schema: CONTROL_SCHEMA,
+        assignment,
+        original_assignment: original,
+        identity,
+        presentation: NativePresentation::NativeTui,
+        port: None,
+        resume_session,
+    }))
 }
 
 /// The checkpoint stays in the existing receipt and the original rollout.
@@ -639,41 +663,38 @@ struct ControlReceipt {
     /// Ordinary dispatch records none, and the host reserves a free port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
+    /// Exact session a resume continues. Absent on a fresh spawn or restart,
+    /// which starts a new thread. The host must attach the native frontend to
+    /// this session instead of creating another conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_session: Option<String>,
 }
 
 /// Record schema of the control route inside one dispatch receipt.
 const CONTROL_SCHEMA: u32 = 1;
 
-/// How the host of one dispatch runs the session: the control-backed
-/// conversation, or the recorded launcher invocation (resume and legacy
-/// receipts). Managed spawn spellings use the control route.
+/// The managed route one new dispatch records. Legacy receipts still host the
+/// launcher arguments they already recorded; new spawn, resume and restart do
+/// not write another launcher invocation.
 enum HostRoute {
     Control(Box<ControlReceipt>),
-    Launcher(Vec<String>),
 }
 
 impl HostRoute {
-    /// The launcher arguments the receipt records; the control route records
-    /// none because its host starts the app-server child from the plan.
-    fn args(&self) -> &[String] {
-        match self {
-            Self::Control(_) => &[],
-            Self::Launcher(args) => args,
-        }
+    /// New dispatches record no launcher arguments. The host starts the
+    /// app-server child from the control plan.
+    fn args(&self) -> &'static [String] {
+        &[]
     }
 
-    fn control(&self) -> Option<&ControlReceipt> {
+    fn control(&self) -> &ControlReceipt {
         match self {
-            Self::Control(control) => Some(control),
-            Self::Launcher(_) => None,
+            Self::Control(control) => control,
         }
     }
 
     fn presentation_label(&self) -> &'static str {
-        match self {
-            Self::Control(control) => control.presentation.as_str(),
-            Self::Launcher(_) => "launcher",
-        }
+        self.control().presentation.as_str()
     }
 }
 
@@ -739,6 +760,7 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         identity: BoundIdentity::resolve(&bound),
         presentation: request.mode.presentation(),
         port: None,
+        resume_session: None,
     }));
     launch_bound(request, &binding, route, &bound, &paths)
 }
@@ -831,10 +853,10 @@ fn launch_bound(
             binding.owner
         )));
     }
-    // Managed spellings record native coverage. A launcher route (resume,
-    // legacy) still records coverage when its mode is observed exec; it does
-    // not guess an identity for a receipt that already says coverage is
-    // unavailable.
+    // Managed spellings, including exact-session resume and fresh restart,
+    // record native coverage. A legacy launcher receipt still records coverage
+    // when its mode is observed exec; it does not guess an identity for a
+    // receipt that already says coverage is unavailable.
     let mut run = RunObservation::accepted(paths.result.clone(), paths.detail.clone());
     run.previous_session = request.resumed_session.map(str::to_owned);
     // A stale final message from an earlier run must never read as this
@@ -2528,6 +2550,20 @@ fn note_log(log: &Path, line: &str) {
     }
 }
 
+/// Removes a predecessor's control endpoint before this run is addressable.
+/// Message and stop resolve the slot's endpoint file; leaving the previous
+/// port, token or process in place would let that address act on the successor.
+/// A missing file is the first run of the slot.
+fn retire_stale_endpoint(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::other(format!(
+            "the previous control endpoint {} could not be retired before this run became addressable: {error}",
+            path.display()
+        ))),
+    }
+}
 fn fail_with_frontend(
     frontend: &mut Option<OwnedFrontend>,
     receipt: &Path,
@@ -2636,6 +2672,7 @@ fn wait_for_frontend(
     frontend: &OwnedFrontend,
     plan: &ControlPlan,
     conversation: &mut Conversation,
+    resume_existing: bool,
 ) -> io::Result<()> {
     let until = Instant::now() + FRONTEND_ATTACH;
     let pid = frontend.identity().pid;
@@ -2646,7 +2683,10 @@ fn wait_for_frontend(
             ));
         }
         if harness_core::task_control::frontend_loaded(pid, &plan.title)? {
-            if conversation.has_turns()? {
+            // A fresh thread must still be empty. An exact-session resume
+            // already holds completed work; those turns are not a replay and
+            // must not block the one continuation prompt.
+            if !resume_existing && conversation.has_turns()? {
                 return Err(invalid(
                     "the bound thread already had a turn before the assignment was submitted; refusing a duplicate model request",
                 ));
@@ -2712,22 +2752,43 @@ fn host_control_conversation(
         stdout.flush()?;
     }
 
+    // A predecessor endpoint is not an address of this run. Retire it before
+    // the successor is spawned so message and stop cannot reach this
+    // conversation through the old port, token or process.
+    if let Err(error) = retire_stale_endpoint(&plan.paths.endpoint) {
+        return fail_control(receipt, &mut tracker, error.to_string(), plan, None);
+    }
     let job = Job::new(Limits::default())?;
-    let mut conversation = match Conversation::start(&job, plan) {
+    let started = match control.resume_session.as_deref() {
+        Some(session) => Conversation::start_resuming(&job, plan, session).map_err(|error| {
+            format!(
+                "the exact session {session} was not resumed on the managed backend: {error}; the assignment was not submitted"
+            )
+        }),
+        None => Conversation::start(&job, plan)
+            .map_err(|error| format!("the control-backed session did not start: {error}")),
+    };
+    let mut conversation = match started {
         Ok(conversation) => conversation,
-        Err(error) => {
-            return fail_control(
-                receipt,
-                &mut tracker,
-                format!("the control-backed session did not start: {error}"),
-                plan,
-                Some(job),
-            );
-        }
+        Err(error) => return fail_control(receipt, &mut tracker, error, plan, Some(job)),
     };
     // The thread identity exists before the first model request and is what
-    // the receipt, the visible surface and the resume remedy name.
+    // the receipt, the visible surface and the resume remedy name. A resume
+    // that came back as another thread must not replace the recorded session.
     let thread = conversation.thread_id().to_owned();
+    if let Some(expected) = control.resume_session.as_deref()
+        && thread != expected
+    {
+        return fail_control(
+            receipt,
+            &mut tracker,
+            format!(
+                "exact-session resume attached thread {thread} instead of the recorded session {expected}; the assignment was not submitted and the recorded session was kept"
+            ),
+            plan,
+            Some(job),
+        );
+    }
     tracker.observation.session = Some(thread.clone());
     tracker.observation.state = STATE_STARTED.into();
     tracker.observation.updated_ms = observation::now_ms();
@@ -2780,7 +2841,12 @@ fn host_control_conversation(
         }
         match attach_owned_frontend(plan, &conversation, control.presentation) {
             Ok(attached) => {
-                if let Err(error) = wait_for_frontend(&attached, plan, &mut conversation) {
+                if let Err(error) = wait_for_frontend(
+                    &attached,
+                    plan,
+                    &mut conversation,
+                    control.resume_session.is_some(),
+                ) {
                     let _ = attached.close();
                     return fail_control(receipt, &mut tracker, error.to_string(), plan, Some(job));
                 }
@@ -3999,6 +4065,7 @@ fn spawn_summary(
 /// succession: profile flags, then `exec --skip-git-repo-check -C <slot>
 /// resume <SESSION_ID> <PROMPT>`. The exact session id is never a picker or
 /// `--last`.
+#[cfg(test)]
 fn resume_child_args(
     profile: &str,
     workspace: &Path,
@@ -4040,11 +4107,8 @@ fn save_receipt(
     run: &RunObservation,
 ) -> io::Result<()> {
     let args = route.args();
-    let control = match route.control() {
-        Some(control) => serde_json::to_value(control)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        None => json!(null),
-    };
+    let control = serde_json::to_value(route.control())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let window = match window {
         Some(snapshot) => serde_json::to_value(snapshot)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
@@ -5511,6 +5575,7 @@ mod tests {
                 identity: BoundIdentity::resolve(&bound),
                 presentation: NativePresentation::NativeInline,
                 port: None,
+                resume_session: None,
             })),
             &bound,
             None,
@@ -5556,6 +5621,7 @@ mod tests {
                 identity: BoundIdentity::resolve(&bound),
                 presentation: NativePresentation::NativeTui,
                 port: None,
+                resume_session: None,
             })),
             &bound,
             None,
@@ -5882,6 +5948,48 @@ mod tests {
                 "Continue the interrupted assignment.".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn continuation_route_keeps_the_exact_session_and_starts_restart_fresh() {
+        let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+        let prompt = "Finish the interrupted outcome.";
+        let identity = BoundIdentity {
+            profile: "ds".into(),
+            model: Some("deepseek-flash".into()),
+            model_provider: Some("deepseek".into()),
+            reasoning_effort: Some("max".into()),
+        };
+        let predecessor = json!({
+            "control": {"assignment": prompt, "originalAssignment": prompt}
+        });
+        let resume = continuation_route(false, prompt, session, &predecessor, identity.clone());
+        let HostRoute::Control(control) = &resume;
+        assert!(
+            resume.args().is_empty(),
+            "resume must not record a launcher invocation"
+        );
+        assert_eq!(control.presentation, NativePresentation::NativeTui);
+        assert_eq!(control.resume_session.as_deref(), Some(session));
+        assert_eq!(control.assignment, prompt);
+        assert!(control.original_assignment.is_none());
+        assert!(!control.assignment.contains("fresh conversation"));
+
+        let restart = continuation_route(true, prompt, session, &predecessor, identity);
+        let HostRoute::Control(control) = &restart;
+        assert!(
+            control.resume_session.is_none(),
+            "restart must not resume the predecessor thread"
+        );
+        assert_eq!(control.original_assignment.as_deref(), Some(prompt));
+        assert!(control.assignment.contains(session), "{control:?}");
+        assert!(control.assignment.contains("do not reset"), "{control:?}");
+        assert!(
+            control.assignment.contains("fresh conversation"),
+            "{control:?}"
+        );
+        assert_ne!(control.assignment, prompt);
+        assert_eq!(control.presentation, NativePresentation::NativeTui);
     }
 
     #[test]
