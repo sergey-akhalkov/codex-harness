@@ -88,7 +88,7 @@ Detailed receipts stay in the printed private TEMP root.
 The current requirement-to-check map lives in
 [rust-requirement-checks.json](evidence/rust-requirement-checks.json).
 
-Run heavy builds and checks through the [shared account queue](#heavy-command-budget).
+Run heavy builds and checks through the [heavy-command budget](#heavy-command-budget).
 Those admitted commands also join the [shared CPU allowance](#shared-agent-cpu-allowance).
 `--jobs 1` also bounds compiler concurrency within the admitted command.
 A failed compilation retains its log and does not alter the active
@@ -102,11 +102,12 @@ rejected before creating build state.
 ## Heavy-command budget
 
 `codex-harness heavy -- PROGRAM ARGS` runs one batch command and its descendants
-under the account's shared queue and Windows Job budget. Concurrent callers
-from different projects or `CODEX_HOME` directories wait automatically; source
-reads, edits and model conversations remain independent. Native managed builds
-use the same admission path. Route heavyweight commands from free-text executor
-assignments through this entry point too; structured briefs include it already.
+under the account heavy-command slot set. The default is 2 concurrent trees.
+Callers from different projects or `CODEX_HOME` directories share that bound;
+only a caller past it waits. Source reads, edits and model conversations stay
+outside the slots. Native managed builds use the same admission path. Route
+heavyweight commands from free-text executor assignments through this entry
+point too; structured briefs include it already.
 
 ```powershell
 codex-harness heavy --help
@@ -114,25 +115,39 @@ codex-harness heavy budget --json
 codex-harness heavy -- cargo test --locked --jobs 1 -- --test-threads=1
 ```
 
-Defaults are 8 GiB aggregate Job memory, a 30-minute execution deadline and a
-one-hour queue wait. There is no per-operation CPU default. Admitted commands
-use the shared account ceiling, 75% of host CPU, in
-[Shared agent CPU allowance](#shared-agent-cpu-allowance). The top-level
-`codex-harness --help` summary does not list `--uncapped`; `heavy --help` does.
+A missing `max_concurrent_trees` is 2. A missing
+`aggregate_memory_limit_bytes` equals the effective per-tree limit, 8 GiB when
+that limit is also the default. The aggregate is one account envelope,
+`JOB_OBJECT_LIMIT_JOB_MEMORY`, covering every admitted tree; each tree keeps
+its own containment Job. The deadline still defaults to 30 minutes and the
+queue wait to one hour. There is no per-operation CPU default. Admitted
+commands use the unchanged shared account ceiling, 75% of host CPU, not 75%
+per slot, in [Shared agent CPU allowance](#shared-agent-cpu-allowance). The
+top-level `codex-harness --help` summary names the slot set and does not list
+`--uncapped`; `heavy --help` does.
 
-`heavy budget` prints the effective memory, deadline, queue wait, CPU policy
-and local policy path. With no heavy-command policy file, `cpu_percent` is
-absent, `shared_cpu_percent` is 75 and `cpu_policy` says there is no
-per-operation CPU limit. Inspection creates no account state. Explicit
+Policy field `max_concurrent_trees` set to 1 is the serialized rollback: the
+exclusive legacy `heavy-command.lock` and no slot file. A larger count holds a
+shared lock on that same file for the admission lifetime, so a legacy exclusive
+lock still blocks current callers while slot files are free. Slot files alone
+do not admit. `heavy budget` reports the slot count and aggregate limit; it has
+no flag that changes them. Reads do not rewrite a policy that omits the new
+fields.
+
+`heavy budget` prints effective per-tree memory, aggregate memory, slot count,
+deadline, queue wait, CPU policy, field sources and the local policy path.
+With no heavy-command policy file, `cpu_percent` is absent, `shared_cpu_percent`
+is 75 and `cpu_policy` says there is no per-operation CPU limit. Inspection
+creates no account state and does not start work. Explicit
 `--memory-bytes`, `--cpu-percent`, `--deadline-seconds` and
 `--queue-wait-seconds` update that machine policy; `--preview` shows the
 proposed change and does not write it. `--cpu-percent shared` removes a
 per-operation CPU limit. A lower `--cpu-percent P` is a deliberate ceiling in
 percent of host CPU, translated against the kernel-verified parent rate,
 rounding down, and reported with its effective host-relative value. A recorded
-value of 50 cannot be
-distinguished from the retired batch default: it is preserved, `legacy_default_cpu_percent`
-is true, and it is not silently rewritten.
+value of 50 cannot be distinguished from the retired batch default: it is
+preserved, `legacy_default_cpu_percent` is true, and it is not silently
+rewritten.
 
 The heavy-command policy stays at
 `$env:LOCALAPPDATA\coding-agents-harness\heavy-command\budget.json`, outside
@@ -140,15 +155,17 @@ the kit and consuming repositories. It is not the shared CPU policy record.
 `--account DIRECTORY` selects an isolated heavy-command account for owned
 tests; normal callers retain the default shared account.
 
-Queue messages identify the current holder. Child output is streamed and the
-child's exit code is preserved. Deadline or queue expiry returns 124, memory
-exhaustion 125, incomplete cleanup 126, start failure 127 and interruption 130.
-Normal completion and termination release admission. Nested heavy commands
-verify their actual membership in the holder's Job and share its budget without
-applying a second default CPU cap. Commands launched outside this entry point
-are not in the heavy queue. Descendants of an admitted agent route still share
-the account CPU allowance; the queue does not cover arbitrary processes started
-outside those routes.
+A waiting caller prints one bounded queue line naming the busy-slot count, the
+total slots and available holder descriptions. When no holder record is
+available, that line says the legacy lock is held. Child output is streamed
+and the child's exit code is preserved. Deadline or queue expiry returns 124,
+memory exhaustion 125, incomplete cleanup 126, start failure 127 and
+interruption 130. Normal completion and termination release the slot. Nested
+heavy commands inherit the outer admission, take no second slot, and verify
+membership in the holder's Job without a second CPU cap. Commands launched
+outside this entry point are not in the heavy queue. Descendants of an admitted
+agent route still share the account CPU allowance; the queue does not cover
+arbitrary processes started outside those routes.
 
 ```powershell
 codex-harness heavy --uncapped -- cargo test --locked --jobs 1 -- --test-threads=1

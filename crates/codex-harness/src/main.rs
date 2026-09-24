@@ -312,7 +312,7 @@ fn run() -> io::Result<i32> {
             "codex-harness feedback record|list|ledger|triage|candidates|promote --project DIRECTORY [--bd FILE] [--source CHECKOUT] ... (bd-backed feedback loop; no model calls)"
         );
         println!(
-            "codex-harness heavy [--account DIRECTORY] -- PROGRAM [ARGS...] (account-wide serialized heavy command; see heavy --help)"
+            "codex-harness heavy [--account DIRECTORY] -- PROGRAM [ARGS...] (account-wide heavy-command slot set; see heavy --help)"
         );
         println!(
             "codex-harness heavy budget [--account DIRECTORY] [--json] [--memory-bytes N --cpu-percent P --deadline-seconds N --queue-wait-seconds N] [--preview]"

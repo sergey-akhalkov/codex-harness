@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-22**.
+Last updated: **2026-09-24**.
 
 ## Public pack
 
@@ -297,6 +297,28 @@ deadlines stay with the heavy-command owner.
 Commands and inspection live in
 [Rust native](rust-native.md#shared-agent-cpu-allowance). Install, update and
 disconnect notices live in [installation](installation.md#shared-cpu-policy).
+Heavy-command slots do not multiply this ceiling. See
+[Heavy-command concurrency](#heavy-command-concurrency).
+
+## Heavy-command concurrency
+
+Selected for one Windows heavy-command account: 2 concurrent batch trees by
+default, under one aggregate commit-memory envelope and the existing shared
+CPU ceiling. The account, not a checkout, is the admission domain. The
+envelope is `JOB_OBJECT_LIMIT_JOB_MEMORY`. A missing aggregate limit equals
+the effective per-tree memory limit. Reads apply that default without rewriting
+an older policy file, and one tree keeps the limit it already had. Slot count 1
+restores serialized admission on the exclusive legacy `heavy-command.lock`.
+A larger count holds that file shared for the admission lifetime; slot files
+alone do not admit, and a legacy exclusive lock still blocks current callers.
+Waiting stays
+mechanical: one bounded queue diagnostic names the busy and total slots and
+available holders, or that the legacy lock is held. Slot count does not
+multiply the shared CPU ceiling.
+
+Commands live in [Rust native](rust-native.md#heavy-command-budget). Install,
+update and disconnect leave the policy file untouched; see
+[installation](installation.md#heavy-command-concurrency).
 
 ## MCP, language tools and resources
 

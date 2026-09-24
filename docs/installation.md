@@ -216,7 +216,8 @@ not rewritten. If account storage cannot be opened, install reports the policy
 unavailable, writes nothing and terminates nothing. `--preview` does not write
 the record, create a job or stop a process.
 Code-tools-only update does not establish this policy, and neither install nor
-update rewrites the heavy-command budget.
+update rewrites the heavy-command budget. Slot defaults are in
+[Heavy-command concurrency](#heavy-command-concurrency).
 
 ```powershell
 & <build>\codex-harness.exe install --core-only --preview --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
@@ -242,6 +243,20 @@ print that notice. `recover` finishes installation journals; it is not the CPU
 coverage withdrawal. Selectors and batch safeguards are in
 [Rust native](rust-native.md#shared-agent-cpu-allowance). The decision is in
 [project decisions](project-decisions.md#shared-agent-cpu-budget).
+
+## Heavy-command concurrency
+
+Install, update and disconnect do not rewrite the machine-local heavy-command
+policy. A missing slot count defaults to 2. A missing aggregate memory limit
+equals the effective per-tree limit. Admitted trees share one account envelope
+enforced by `JOB_OBJECT_LIMIT_JOB_MEMORY`. Each admission holds the legacy
+`heavy-command.lock` gate, so an older exclusive lock still blocks a current
+caller; slot files alone do not admit. A caller past the bound prints one
+queue line with the busy and total slot counts and available holder
+descriptions, or that the legacy lock is held. Slot count 1 restores
+serialized admission. The shared CPU ceiling is unchanged. Commands are in
+[Rust native](rust-native.md#heavy-command-budget). The decision is in
+[project decisions](project-decisions.md#heavy-command-concurrency).
 
 ## Disconnect and recovery
 
