@@ -6,7 +6,7 @@ Lets one heavy-command account run a bounded number of concurrent batch trees wh
 
 ### Requirement: Bounded concurrent heavy-command admission
 
-The account heavy-command queue SHALL admit up to a configured positive number of concurrent command trees per heavy-command account. Admission beyond the bound SHALL wait under the existing bounded queue wait and then fail without starting a payload. Each admitted tree SHALL hold exactly one slot for its lifetime, and a nested heavy command inside an admitted tree SHALL NOT acquire a second slot. A slot SHALL be released on normal exit, payload failure, deadline expiry or cancellation, without deleting or altering another holder's admission state.
+The account heavy-command queue SHALL admit up to a configured positive number of concurrent command trees per heavy-command account. Admission beyond the bound SHALL wait under the existing bounded queue wait and then fail without starting a payload. Each admitted tree SHALL hold exactly one slot for its lifetime, and a nested heavy command inside an admitted tree SHALL NOT acquire a second slot. A current caller SHALL acquire a shared lock on the account's legacy `heavy-command.lock` before taking a slot and SHALL hold that lock until the slot is released. An exclusive lock on that same file, including the first-byte exclusive lock of the previous build, SHALL block current admission even when every slot file is free. A current admission SHALL block a later exclusive lock on that file. Slot files alone SHALL NOT admit a caller. A slot count of 1 SHALL take the legacy file exclusively and SHALL NOT create a slot file. A slot SHALL be released on normal exit, payload failure, deadline expiry or cancellation, without deleting or altering another holder's admission state.
 
 #### Scenario: Two concurrent trees within the bound
 - **WHEN** two independent callers start heavy commands while free slots remain and the configured slot count is at least two
@@ -28,13 +28,21 @@ The account heavy-command queue SHALL admit up to a configured positive number o
 - **WHEN** an admitted command is cancelled, misses its deadline or its owner dies
 - **THEN** its command tree is cleaned up, its slot becomes available to the next permitted caller, and other holders keep their slots and trees
 
+#### Scenario: Legacy exclusive lock blocks a free slot
+- **WHEN** an exclusive lock is held on the account `heavy-command.lock` and every current slot file is free
+- **THEN** a current caller waits on the existing queue path, starts no payload, and proceeds only after that exclusive lock is released
+
+#### Scenario: Current admission blocks a legacy exclusive lock
+- **WHEN** a current caller holds one slot
+- **THEN** an exclusive lock of that account's `heavy-command.lock` conflicts until the current admission releases it, and locking only a slot file never constitutes admission
+
 ### Requirement: Account aggregate memory envelope
 
-All concurrently admitted heavy-command trees of one account SHALL be members of one account aggregate Job whose commit-memory limit is the account aggregate memory setting. Each admitted tree SHALL also keep its own containment Job with its per-tree memory limit, deadline and kill-on-close cleanup. The aggregate envelope SHALL NOT add a second CPU cap, SHALL stay isolated per heavy-command account, and SHALL be created and joined by the callers themselves without a background owner process.
+All concurrently admitted heavy-command trees of one account SHALL be members of one account aggregate Job whose commit-memory limit is the account aggregate memory setting enforced by `JOB_OBJECT_LIMIT_JOB_MEMORY` (`JobMemoryLimit`). The aggregate Job SHALL NOT use `JOB_OBJECT_LIMIT_PROCESS_MEMORY` as that limit, SHALL NOT set a CPU rate, and SHALL NOT set kill-on-close. Each admitted tree SHALL also keep its own containment Job with its per-tree `JOB_OBJECT_LIMIT_JOB_MEMORY` limit, deadline and kill-on-close cleanup. The aggregate envelope SHALL NOT add a second CPU cap, SHALL NOT be applied to the shared CPU job, SHALL stay isolated per heavy-command account, and SHALL be created and joined by the callers themselves without a background owner process. A missing aggregate setting SHALL equal the effective per-tree memory limit. An explicit aggregate below that per-tree limit SHALL be refused before admission.
 
 #### Scenario: Concurrent trees share one envelope
 - **WHEN** two trees are admitted concurrently in one account
-- **THEN** kernel readback shows both payload trees inside one account aggregate Job with the configured aggregate memory limit, and each tree inside its own containment Job with its per-tree settings
+- **THEN** kernel readback shows both payload trees inside one account aggregate Job whose extended limits include `JOB_OBJECT_LIMIT_JOB_MEMORY`, whose `JobMemoryLimit` equals the configured aggregate, whose per-process memory limit and CPU rate are unset, and each tree inside its own containment Job with its per-tree settings
 
 #### Scenario: Aggregate limit binds collectively
 - **WHEN** the combined committed memory of admitted trees exceeds the aggregate limit
@@ -50,11 +58,11 @@ All concurrently admitted heavy-command trees of one account SHALL be members of
 
 ### Requirement: Concurrency policy and reporting
 
-The machine-local heavy-command policy SHALL define the concurrent slot count and the aggregate memory limit with defaults that preserve the aggregate guarantees. A policy without the new fields SHALL use those defaults without being rewritten, and an explicit slot count of 1 SHALL restore serialized admission. `heavy budget` SHALL report the effective slot count, aggregate memory limit, per-tree memory limit and their policy source in text and JSON without mutating policy or starting work.
+The machine-local heavy-command policy SHALL define the concurrent slot count and the aggregate memory limit with defaults that preserve the aggregate guarantees. A missing slot count SHALL default to 2. A missing aggregate memory limit SHALL equal the effective per-tree memory limit. A policy without the new fields SHALL use those defaults without being rewritten, and an explicit slot count of 1 SHALL restore serialized admission. `heavy budget` SHALL report the effective slot count, aggregate memory limit, per-tree memory limit and their policy source in text and JSON without mutating policy or starting work.
 
 #### Scenario: Legacy policy
 - **WHEN** an existing heavy-command policy file lacks the new fields
-- **THEN** heavy uses the documented defaults, reports them as defaults, and leaves the file bytes unchanged
+- **THEN** heavy uses two slots and an aggregate limit equal to that file's effective per-tree memory limit, reports those as defaults, and leaves the file bytes unchanged
 
 #### Scenario: Explicit serialization
 - **WHEN** the policy sets the slot count to 1

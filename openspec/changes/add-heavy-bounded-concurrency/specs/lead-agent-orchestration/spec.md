@@ -2,7 +2,7 @@
 
 ### Requirement: Shared heavy-command admission
 
-Executor heavy commands SHALL use the existing resource and process ownership mechanisms to admit a bounded number of concurrent command trees under one installed aggregate memory envelope and one aggregate CPU ceiling. Independent reads, analysis and edits SHALL remain concurrent. Executor-specific limits SHALL NOT multiply the aggregate memory, CPU or slot allowance. Queue admission and release SHALL be mechanical, with observable waiting, execution, exit and failure. Machine resource settings SHALL remain local.
+Executor heavy commands SHALL use the existing resource and process ownership mechanisms to admit a bounded number of concurrent command trees under one installed aggregate memory envelope and one aggregate CPU ceiling. The envelope SHALL be the job-wide commit limit `JOB_OBJECT_LIMIT_JOB_MEMORY`. Callers from mixed builds SHALL NOT bypass that bound or envelope by locking different files. Independent reads, analysis and edits SHALL remain concurrent. Executor-specific limits SHALL NOT multiply the aggregate memory, CPU or slot allowance. Queue admission and release SHALL be mechanical, with observable waiting, execution, exit and failure. Machine resource settings SHALL remain local.
 
 #### Scenario: Two executors require heavy commands
 - **WHEN** independently working executors request overlapping heavy checks and a free slot remains
@@ -11,3 +11,7 @@ Executor heavy commands SHALL use the existing resource and process ownership me
 #### Scenario: Resource owner ends
 - **WHEN** an admitted command completes, fails or is interrupted
 - **THEN** its command tree and admission ownership are released appropriately and a subsequent permitted request can proceed without deleting a live owner's lock
+
+#### Scenario: Mixed builds do not add allowances
+- **WHEN** a previous build holds the legacy heavy-command lock and a current executor requests a heavy command
+- **THEN** the current request waits or fails through the existing queue path and does not start a second tree beside the legacy holder
