@@ -61,9 +61,12 @@ is an explicitly installed local executable artifact independent of the checkout
 shared data remains live-linked. An in-place Codex CLI update must still start
 that current CLI; digest drift is not incompatibility and must not warn when
 harness enhancements still apply. Warn only when those enhancements cannot be
-applied, and never refuse Codex for that. Check still reports degraded harness
-health, and explicit core update restores the optional shared behavior. See
-[installation and recovery](installation.md).
+applied, and never refuse Codex for that. The same availability rule applies
+when the shared CPU cap cannot be established or verified: warn, start the
+requested payload once, and do not report that launch as capped. Check still
+reports degraded harness health, and explicit core update restores the optional
+shared behavior. See [installation and recovery](installation.md) and
+[Shared agent CPU budget](#shared-agent-cpu-budget).
 
 ## Global delivery
 
@@ -262,6 +265,38 @@ history, caches and installer metadata stay on the host.
 Installing or updating selected MCP/LSP dependencies is in scope for that
 capability; the earlier core-only limit of not installing external applications
 does not constrain it.
+
+## Shared agent CPU budget
+
+Selected for local Windows agent work: one Windows account shares a single
+ceiling of 75% of total host CPU across ordinary agent sessions and their local
+tools. The ceiling does not multiply by project, worktree, agent home, session,
+command or thread. It is not a cap on unrelated applications, other terminal
+tabs or the whole workstation, and it does not by itself remove memory, GPU or
+storage contention.
+
+Admission is automatic on the installed routes. It does not depend on a shell
+wrapper. An explicit uncapped invocation applies only to that launch, is
+visible, and does not raise the allowance for other sessions or shared
+services. The next invocation without that selector is capped again.
+
+A warned start is not successful enforcement and not an uncapped request. It
+does not disable the default for later launches or lift a peer's cap. The
+machine-local policy record stays outside the kit and consuming repositories.
+`CODEX_HARNESS_CPU_PERCENT` is not written into that record. It requests a
+ceiling for the launch that reads it. Creating the account job uses that
+requested ceiling; an existing job at another rate is left unchanged.
+
+Installation does not terminate running work to manufacture coverage. Uncovered
+ordinary routes stay incomplete until they end or are restarted after their
+work can stop. Disconnect preserves the policy record and reports that default
+coverage is no longer provided. The retired unconditional 50% batch CPU default
+is not a second multiplicative ceiling; batch memory, queue, cancellation and
+deadlines stay with the heavy-command owner.
+
+Commands and inspection live in
+[Rust native](rust-native.md#shared-agent-cpu-allowance). Install, update and
+disconnect notices live in [installation](installation.md#shared-cpu-policy).
 
 ## MCP, language tools and resources
 
