@@ -34,11 +34,11 @@ Separate 75% jobs were rejected because aggregate use increases with concurrency
 
 ### 2. Admit through every installed launch owner
 
-Wire the common admission into the checkout-independent Codex bootstrap, the manager's task/executor/resume path, OpenCode's installed launch connection, and shared tool-service startup. Keep native argument, environment, working-directory, streams and exit-code forwarding. Do not route arbitrary tool commands through PowerShell to enforce CPU policy. Root admission and ordinary inheritance cover direct native children; service-owned sibling launches require their own admission.
+Wire the common admission into the checkout-independent Codex bootstrap, the manager's task/executor/resume path, and shared tool-service startup. Keep native argument, environment, working-directory, streams and exit-code forwarding. Do not route arbitrary tool commands through PowerShell to enforce CPU policy. Root admission and ordinary inheritance cover direct native children; service-owned sibling launches require their own admission.
 
 Use the existing `process.rs` creation machinery rather than starting a payload and then attempting to catch it. Microsoft exposes `PROC_THREAD_ATTRIBUTE_JOB_LIST` for job assignment during process creation; validate the complete ordered list through the existing native entry point. See [UpdateProcThreadAttribute](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
 
-Installation must exercise Codex, OpenCode, terminal dispatch and MCP routes outside the checkout. Resolve installed upstream executables with the existing identity/update rules; preserve original executable access and avoid recursive launcher discovery. New supported agent integrations must enter the same policy rather than gain a new budget. Checking process names alone or limiting Windows Terminal itself is insufficient.
+Installation must exercise Codex, terminal dispatch and MCP routes outside the checkout. Resolve installed upstream executables with the existing identity/update rules; preserve original executable access and avoid recursive launcher discovery. New supported agent integrations must enter the same policy rather than gain a new budget. Checking process names alone or limiting Windows Terminal itself is insufficient.
 
 ### 3. Compose with the existing heavy-command policy
 
@@ -84,7 +84,7 @@ Exercise normal interactive input/cancellation while the group is loaded, identi
 ## Migration Plan
 
 1. Implement and verify the common CPU owner and one installed vertical path, then connect the remaining session and service launch owners. Use the repository's current capped verification entry point during development; this planning change has not changed the live budget.
-2. Extend the existing installation/update preview and owned registration lifecycle for Codex and OpenCode, with machine-local policy and rollback. No global activation occurs merely because source artifacts exist.
+2. Extend the existing installation/update preview and owned registration lifecycle for Codex, with machine-local policy and rollback. No global activation occurs merely because source artifacts exist.
 3. Inspect existing sessions and services. Prefer a documented safe restart for an incompatible old job hierarchy; adopt live work only if complete membership and lifecycle verification is possible. Preserve unfinished work and show incomplete activation until all ordinary routes have transitioned.
 4. Exercise installed entry points from a synthetic consumer outside this checkout and complete the acceptance matrix. Reconcile the native-command guide, installation guide and project decision record in their existing homes.
 5. Roll back only owned registrations/artifacts while retaining running identities and later user edits. Report the resulting coverage and required restart without silently lifting a cap on unrelated active work.
