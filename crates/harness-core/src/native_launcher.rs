@@ -6,6 +6,10 @@
 //! session's lifecycle Job (inner) when that budget can be established; when it
 //! cannot, the launch warns on stderr and starts the same payload once outside
 //! the shared allowance instead of failing.
+//! `--harness-cpu uncapped` is a per-invocation exception: it is not saved, it
+//! does not raise the allowance for other sessions or shared services, and a
+//! caller already inside the allowance relaunches that one payload through the
+//! existing job-free sibling anchor so the exception is not inherited.
 //! Independently started kit services are not members of that job.
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
@@ -389,18 +393,63 @@ fn wait_for_shim_free(port: u16) -> io::Result<()> {
 /// Start the selected build's shim and confirm the port is served by exactly
 /// that executable, so a foreign or outdated listener is never mistaken for it.
 fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
-    let mut command = Command::new(manager);
-    command.args(["xai-responses-shim"]);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
     #[cfg(windows)]
+    let service = {
+        use crate::process::{Cancellation, Deadline};
+        // Preflight and tool commands run inside kill-on-close Jobs. A normal
+        // detached spawn still inherits that Job and dies when its caller is
+        // cleaned up. Use the existing independent service bootstrap, which
+        // also prevents inheritance of the caller's output pipe handles.
+        let environment = env::vars_os()
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string()
+                        .map_err(|_| fail("non-Unicode service environment key"))?,
+                    value
+                        .into_string()
+                        .map_err(|_| fail("non-Unicode service environment value"))?,
+                ))
+            })
+            .collect::<io::Result<_>>()?;
+        let manager = manager.canonicalize()?;
+        let directory = manager
+            .parent()
+            .ok_or_else(|| fail("shim manager has no directory"))?;
+        let spawned = crate::process_service::spawn(
+            &manager,
+            directory,
+            vec![
+                "xai-responses-shim".into(),
+                "--port".into(),
+                port.to_string(),
+            ],
+            environment,
+            Deadline::after(std::time::Duration::from_secs(30))?,
+            &Cancellation::default(),
+        );
+        match spawned {
+            Ok(service) => service,
+            Err(error) => {
+                // Parallel cold starts can race to bind. A losing helper may exit
+                // before its identity is observed; accept only a ready peer from
+                // this exact build, otherwise preserve the bootstrap failure.
+                if matches!(shim_probe(port), ShimProbe::Ours(exe) if same_executable(&exe, &manager))
+                {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        }
+    };
+    #[cfg(not(windows))]
     {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+        let mut command = Command::new(manager);
+        command.args(["xai-responses-shim", "--port", &port.to_string()]);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        drop(command.spawn()?);
     }
-    // The returned handle is dropped: the shim must outlive this launcher.
-    drop(spawn_background(&mut command)?);
     for _ in 0..250 {
         match shim_probe(port) {
             ShimProbe::Ours(exe) if same_executable(&exe, manager) => return Ok(()),
@@ -411,50 +460,15 @@ fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
             }
             _ => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
+        #[cfg(windows)]
+        if !service.is_running()? {
+            return Err(io::Error::other(format!(
+                "xAI compatibility shim exited before readiness (exit {:?})",
+                service.exit_code()?
+            )));
+        }
     }
     Err(fail("xAI compatibility shim did not become ready"))
-}
-
-/// Spawn the resident shim without transferring the caller's stdio handles.
-/// `Stdio::null()` replaces the child's std handles but the caller's own
-/// inheritable stdout/stderr handles are still duplicated into the child on
-/// Windows, so a piped `codex` invocation would stay open until the shim
-/// exits. The shim may outlive every session, so clear the inherit flag for
-/// the duration of its creation and restore it afterwards.
-#[cfg(windows)]
-fn spawn_background(command: &mut Command) -> io::Result<std::process::Child> {
-    use windows_sys::Win32::Foundation::{
-        GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation,
-    };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
-    let mut cleared = Vec::new();
-    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let handle = unsafe { GetStdHandle(id) };
-        if handle.is_null() {
-            continue;
-        }
-        let mut flags = 0u32;
-        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
-            continue;
-        }
-        if flags & HANDLE_FLAG_INHERIT != 0
-            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0
-        {
-            cleared.push(handle);
-        }
-    }
-    let spawned = command.spawn();
-    for handle in cleared {
-        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
-    }
-    spawned
-}
-
-#[cfg(not(windows))]
-fn spawn_background(command: &mut Command) -> io::Result<std::process::Child> {
-    command.spawn()
 }
 
 /// Reuse a shim only when it is the selected build's shim. A shim from a
@@ -463,11 +477,10 @@ fn spawn_background(command: &mut Command) -> io::Result<std::process::Child> {
 /// alive. A listener without identity reporting (a pre-identity shim) is
 /// reused as before, with an explicit notice, because it cannot be replaced
 /// without breaking a session that may still depend on it.
-fn ensure_xai_shim(manager: &Path) -> io::Result<()> {
-    ensure_xai_shim_on(crate::xai_responses_shim::DEFAULT_PORT, manager)
-}
-
-fn ensure_xai_shim_on(port: u16, manager: &Path) -> io::Result<()> {
+/// Call from the session host before spawning its owned child tree: the shim
+/// is shared by sessions and must not inherit one app-server's cleanup Job.
+/// The explicit loopback port also permits isolated lifecycle verification.
+pub fn ensure_xai_shim(manager: &Path, port: u16) -> io::Result<()> {
     match shim_probe(port) {
         ShimProbe::Ours(exe) if same_executable(&exe, manager) => return Ok(()),
         ShimProbe::Ours(stale) => {
@@ -689,17 +702,24 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     // An unusable upstream executable must fail as an error, not as a desktop
     // loader dialog.
     crate::process::suppress_loader_dialogs();
-    let (command, task_control) = prepared_command(executable, home, args)?;
-    if launcher::xai_shim_requested(args) {
+    let (uncapped, args) = take_uncapped_session_selector(args)?;
+    let (command, task_control) = prepared_command(executable, home, &args)?;
+    if launcher::xai_shim_requested(&args) {
         let manager = executable
             .canonicalize()?
             .parent()
             .ok_or_else(|| fail("launcher has no build directory"))?
             .join("codex-harness.exe");
-        ensure_xai_shim(&manager)?;
+        ensure_xai_shim(&manager, crate::xai_responses_shim::DEFAULT_PORT)?;
     }
     #[cfg(windows)]
     let _console = ConsoleHandler::install()?;
+    #[cfg(windows)]
+    if uncapped {
+        // An explicit exception does not enter task-control admission: that
+        // owner joins the shared allowance before its payload exists.
+        return launch_uncapped_session(&command);
+    }
     #[cfg(windows)]
     if task_control
         && let Some(code) = crate::task_runtime::run(
@@ -759,6 +779,893 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     Ok(code)
 }
 
+/// Leading session selector. `uncapped` is the only accepted mode; anything
+/// else is a usage error rather than a silent return to the shared allowance.
+/// The flag is consumed only in the harness-option prefix, including beside
+/// `--harness-effort`, and is never forwarded to the payload.
+pub fn take_uncapped_session_selector(args: &[OsString]) -> io::Result<(bool, Vec<OsString>)> {
+    let mut uncapped = false;
+    let mut kept = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let Some(text) = args[index].to_str() else {
+            break;
+        };
+        if text == "--" {
+            break;
+        }
+        if text == "--harness-cpu" || text.starts_with("--harness-cpu=") {
+            let value = if let Some(value) = text.strip_prefix("--harness-cpu=") {
+                value
+            } else {
+                index += 1;
+                args.get(index).and_then(|arg| arg.to_str()).ok_or_else(|| {
+                    fail("--harness-cpu requires uncapped; the shared allowance stays the default")
+                })?
+            };
+            if !value.eq_ignore_ascii_case("uncapped") {
+                return Err(fail(
+                    "--harness-cpu requires uncapped; the shared allowance stays the default",
+                ));
+            }
+            if uncapped {
+                return Err(fail("duplicate --harness-cpu"));
+            }
+            uncapped = true;
+            index += 1;
+            continue;
+        }
+        if text == "--harness-effort" || text.starts_with("--harness-effort=") {
+            kept.push(args[index].clone());
+            if text == "--harness-effort" {
+                index += 1;
+                if let Some(value) = args.get(index) {
+                    kept.push(value.clone());
+                }
+            }
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    kept.extend_from_slice(&args[index..]);
+    Ok((uncapped, kept))
+}
+
+/// stderr notice for one explicit exception. It names the shared ceiling and
+/// the consequence for combined load, and it is not the fail-open warning.
+pub fn uncapped_notice(scope: &str) -> String {
+    use crate::process::SHARED_CPU_PERCENT;
+    format!(
+        "codex-harness: explicit uncapped invocation: this {scope} runs outside the shared {SHARED_CPU_PERCENT}% account CPU allowance; combined host agent load can exceed that ceiling while this exception runs; other sessions and shared services keep their allowance, and the next invocation without this selector is capped by default"
+    )
+}
+
+/// Wrapper entry. The process that owns the lifecycle Job waits on this
+/// process; its exit code is the payload's. Not a service and not a session.
+pub const CPU_EXCEPTION_LAUNCH: &str = "--harness-cpu-exception-launch";
+
+const CPU_EXCEPTION_ANCHOR: &str = "cpu-exception-anchor";
+const CPU_EXCEPTION_PIPE: &str = "HARNESS_CPU_EXCEPTION_PIPE";
+
+#[cfg(windows)]
+fn launch_uncapped_session(command: &Command) -> io::Result<i32> {
+    let spec = interactive_spec(command)?;
+    if process_in_any_job()? {
+        // A child of this process would inherit the capped ancestry. The
+        // named lifecycle Job is reapplied by the outside-group launcher.
+        let name = format!(
+            "CodingAgentsHarness.CpuException.{}",
+            crate::broker_endpoint::random_key()?
+        );
+        let job = crate::process::Job::new_named(crate::process::Limits::default(), &name)?;
+        let launch = spawn_uncapped(&name, &spec, "session")?;
+        let code = launch.wrapper_job.wait_session_root(&launch.process)? as i32;
+        drop(job);
+        return Ok(code);
+    }
+    // This process is not in a job, so a direct child is already outside the
+    // shared allowance. Do not assign that allowance for this invocation.
+    eprintln!("{}", uncapped_notice("session"));
+    let job = crate::process::Job::new(crate::process::Limits::default())?;
+    let child = job.spawn(&spec)?;
+    Ok(job.wait_session_root(&child)? as i32)
+}
+
+/// A bounded outside-group launcher and the job that contains only that launcher.
+#[cfg(windows)]
+pub struct UncappedLaunch {
+    pub process: crate::process::OwnedProcess,
+    pub wrapper_job: crate::process::Job,
+}
+
+/// Start `command` outside the caller's job ancestry and inside the named
+/// lifecycle Job. The wrapper is not placed in that Job: the caller is already
+/// in the shared allowance, and assigning such a process would nest the Job.
+#[cfg(windows)]
+pub fn spawn_uncapped(
+    lifecycle_name: &str,
+    command: &crate::process::CommandSpec,
+    scope: &str,
+) -> io::Result<UncappedLaunch> {
+    let bootstrap = exception_bootstrap()?;
+    let pipe_name = format!(
+        r"\\.\pipe\CodingAgentsHarness.CpuException.{}",
+        crate::broker_endpoint::random_key()?
+    );
+    let request = exception_request(command, lifecycle_name, scope)?;
+    let pipe = create_request_pipe(&pipe_name)?;
+    let mut wrapper = crate::process::CommandSpec::new(bootstrap);
+    wrapper.args = vec![OsString::from(CPU_EXCEPTION_LAUNCH)];
+    wrapper.current_dir = command.current_dir.clone();
+    wrapper
+        .env
+        .insert(OsString::from(CPU_EXCEPTION_PIPE), Some(pipe_name.into()));
+    if command.inherit_console {
+        wrapper.inherit_console = true;
+    } else {
+        wrapper.stdin = command.stdin.as_ref().map(clone_file).transpose()?;
+        wrapper.stdout = command.stdout.as_ref().map(clone_file).transpose()?;
+        wrapper.stderr = command.stderr.as_ref().map(clone_file).transpose()?;
+    }
+    let wrapper_job = crate::process::Job::new(crate::process::Limits::default())?;
+    let process = wrapper_job.spawn(&wrapper)?;
+    if let Err(error) = write_exception_request(&pipe, &request) {
+        drop(process);
+        return Err(error);
+    }
+    Ok(UncappedLaunch {
+        process,
+        wrapper_job,
+    })
+}
+
+#[cfg(windows)]
+fn clone_file(file: &std::fs::File) -> io::Result<std::fs::File> {
+    file.try_clone()
+}
+
+/// Hold the job-free sibling created by the existing service helper. It is a
+/// creation parent only: it does not join the allowance and does not run a
+/// payload. A request that is not this anchor is refused.
+#[cfg(windows)]
+pub fn hold_cpu_exception_anchor() -> ! {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.get(3).and_then(|arg| arg.to_str()) != Some(CPU_EXCEPTION_ANCHOR) {
+        eprintln!("codex-harness: refusing an unrecognized bootstrap run request");
+        std::process::exit(2);
+    }
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::process::exit(0);
+}
+
+/// Read one bounded launch request and create its payload outside this
+/// process's job ancestry. Exits with the payload's code.
+#[cfg(windows)]
+pub fn cpu_exception_launch_entry() -> i32 {
+    match cpu_exception_launch() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!(
+                "codex-harness: explicit uncapped invocation was not started ({error}); no payload ran"
+            );
+            127
+        }
+    }
+}
+
+#[cfg(windows)]
+fn process_in_any_job() -> io::Result<bool> {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut member = 0;
+    if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut member) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(member != 0)
+}
+
+#[cfg(windows)]
+fn exception_bootstrap() -> io::Result<PathBuf> {
+    let current = env::current_exe()?.canonicalize()?;
+    if current
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe"))
+    {
+        return Ok(current);
+    }
+    let sibling = current
+        .parent()
+        .ok_or_else(|| io::Error::other("launcher has no directory"))?
+        .join("codex.exe");
+    if sibling.is_file() {
+        return sibling.canonicalize();
+    }
+    Err(io::Error::other(
+        "uncapped launch needs the codex bootstrap beside this executable",
+    ))
+}
+
+#[cfg(windows)]
+fn exception_request(
+    command: &crate::process::CommandSpec,
+    job: &str,
+    scope: &str,
+) -> io::Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+    let units = |value: &std::ffi::OsStr| -> io::Result<Vec<u16>> {
+        let encoded: Vec<u16> = value.encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(io::Error::other("uncapped launch input contains NUL"));
+        }
+        Ok(encoded)
+    };
+    let mut variables: Vec<_> = env::vars_os().collect();
+    for (name, value) in &command.env {
+        variables.retain(|(existing, _)| {
+            !existing
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&name.to_string_lossy())
+        });
+        if let Some(value) = value {
+            variables.push((name.clone(), value.clone()));
+        }
+    }
+    variables.sort_by(|left, right| left.0.cmp(&right.0));
+    let environment = variables
+        .into_iter()
+        .map(|(name, value)| Ok((units(&name)?, units(&value)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let shared_job = shared_cpu_job_name();
+    let request = serde_json::json!({
+        "program": units(command.program.as_os_str())?,
+        "arguments": command.args.iter().map(|arg| units(arg)).collect::<io::Result<Vec<_>>>()?,
+        "directory": command.current_dir.as_ref().map(|path| units(path.as_os_str())).transpose()?,
+        "environment": environment,
+        "job": job,
+        "shared_job": shared_job,
+        "scope": scope,
+    });
+    let bytes = serde_json::to_vec(&request)
+        .map_err(|_| io::Error::other("uncapped launch request could not be encoded"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::other(
+            "uncapped launch request exceeds its bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn shared_cpu_job_name() -> Option<String> {
+    use crate::process::{SHARED_CPU_PERCENT, SharedCpuBudget, cpu_budget_directory};
+    let directory = cpu_budget_directory(None).ok()?;
+    SharedCpuBudget::acquire(&directory, SHARED_CPU_PERCENT)
+        .ok()
+        .map(|budget| budget.name().to_owned())
+}
+
+#[cfg(windows)]
+fn create_request_pipe(name: &str) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    wide.push(0);
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            0x0000_0002,
+            PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            64 * 1024,
+            64 * 1024,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+fn write_exception_request(
+    pipe: &std::os::windows::io::OwnedHandle,
+    request: &[u8],
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+    let handle = pipe.as_raw_handle();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let connect_handle = handle as isize;
+    std::thread::spawn(move || {
+        let connected = unsafe {
+            ConnectNamedPipe(
+                connect_handle as windows_sys::Win32::Foundation::HANDLE,
+                std::ptr::null_mut(),
+            )
+        };
+        let error = if connected == 0 {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        let _ = sender.send((connected, error));
+    });
+    let (connected, error) = receiver
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .map_err(|_| {
+            io::Error::other("uncapped launch did not connect to its outside-group launcher")
+        })?;
+    if connected == 0 && error != Some(ERROR_PIPE_CONNECTED as i32) {
+        return Err(io::Error::other(
+            "uncapped launch did not connect to its outside-group launcher",
+        ));
+    }
+    let mut written = 0u32;
+    let ok = unsafe {
+        WriteFile(
+            handle,
+            request.as_ptr(),
+            request.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || written as usize != request.len() {
+        return Err(io::Error::other(
+            "uncapped launch request was not delivered",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cpu_exception_launch() -> io::Result<i32> {
+    use std::io::Read;
+    use std::os::windows::ffi::OsStringExt;
+    let pipe_name = env::var(CPU_EXCEPTION_PIPE)
+        .map_err(|_| io::Error::other("uncapped launch is missing its request pipe"))?;
+    let mut file = open_request_pipe(&pipe_name)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::other(
+            "uncapped launch request exceeds its bound",
+        ));
+    }
+    let request: ExceptionRequest = serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::other("uncapped launch request is invalid"))?;
+    if request.scope != "session" && request.scope != "command" {
+        return Err(io::Error::other("uncapped launch scope is invalid"));
+    }
+    let program = std::ffi::OsString::from_wide(&request.program);
+    let arguments = request
+        .arguments
+        .iter()
+        .map(|arg| std::ffi::OsString::from_wide(arg))
+        .collect::<Vec<_>>();
+    let directory = request
+        .directory
+        .as_ref()
+        .map(|path| std::ffi::OsString::from_wide(path));
+    let anchor = start_exception_anchor()?;
+    let code = create_uncapped_payload(
+        &anchor,
+        &PreparedPayload {
+            program: &program,
+            arguments: &arguments,
+            directory: directory.as_deref(),
+            environment: &request.environment,
+            job_name: &request.job,
+            shared_job: request.shared_job.as_deref(),
+            scope: &request.scope,
+        },
+    )?;
+    let _ = anchor.terminate(0);
+    Ok(code)
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct ExceptionRequest {
+    program: Vec<u16>,
+    arguments: Vec<Vec<u16>>,
+    directory: Option<Vec<u16>>,
+    environment: Vec<(Vec<u16>, Vec<u16>)>,
+    job: String,
+    shared_job: Option<String>,
+    scope: String,
+}
+
+#[cfg(windows)]
+fn open_request_pipe(name: &str) -> io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    wide.push(0);
+    let started = std::time::Instant::now();
+    loop {
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            return Ok(unsafe { std::fs::File::from_raw_handle(handle) });
+        }
+        if started.elapsed() > std::time::Duration::from_secs(15) {
+            return Err(io::Error::other(
+                "uncapped launch request pipe was not available",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// One job-free sibling of this bootstrap, created by the existing service
+/// helper. The sibling is a creation parent only; closing it does not grant
+/// cleanup authority over a payload created through it.
+#[cfg(windows)]
+fn start_exception_anchor() -> io::Result<crate::process_service::ServiceProcess> {
+    use crate::cancellable_pipe::anonymous_pipe;
+    use crate::process::{CommandSpec, Deadline, Job, Limits, StopReason};
+    use crate::process_service::{self, CREATE_ARGUMENT};
+    use std::io::Write;
+    use std::time::Duration;
+    let bootstrap = exception_bootstrap()?;
+    let directory = env::current_dir()?.canonicalize().or_else(|_| {
+        bootstrap
+            .parent()
+            .ok_or_else(|| io::Error::other("bootstrap has no directory"))
+            .map(Path::to_path_buf)
+    })?;
+    let began = process_service::creation_clock();
+    let user = process_service::current_user()?;
+    let mut environment = std::collections::BTreeMap::new();
+    match env::var("SystemRoot") {
+        Ok(root) => {
+            environment.insert("SystemRoot".to_owned(), root);
+        }
+        Err(_) => {
+            environment.insert("HARNESS_CPU_EXCEPTION_ANCHOR".to_owned(), "1".to_owned());
+        }
+    }
+    let request = serde_json::json!({
+        "directory": directory,
+        "arguments": [CPU_EXCEPTION_ANCHOR],
+        "environment": environment,
+        "startup_until": began / 10_000 + 20_000,
+        "user": user,
+    });
+    let bytes = serde_json::to_vec(&request)
+        .map_err(|_| io::Error::other("uncapped anchor request could not be encoded"))?;
+    let (stdin, mut write) = anonymous_pipe(4096)?;
+    let (read, stdout) = anonymous_pipe(4096)?;
+    let mut command = CommandSpec::new(&bootstrap);
+    command.args.push(CREATE_ARGUMENT.into());
+    command.current_dir = Some(directory);
+    command.stdin = Some(stdin);
+    command.stdout = Some(stdout);
+    let job = Job::new(Limits {
+        memory_bytes: Some(256 * 1024 * 1024),
+        cpu_percent: Some(25.0),
+    })?;
+    let child = job.spawn(&command)?;
+    write.write_all(&bytes)?;
+    drop(write);
+    let cancel = crate::process::Cancellation::default();
+    let deadline = Deadline::after(Duration::from_secs(20))?;
+    let mut reader = crate::cancellable_pipe::CancellablePipe::reader(read, cancel.clone())?;
+    let receipt_bytes = reader
+        .read(1024, deadline, &cancel)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let outcome = job.wait(&child, deadline, &cancel, Duration::from_secs(5))?;
+    if outcome.reason != StopReason::Exited || outcome.exit_code != 0 {
+        return Err(io::Error::other(
+            "uncapped anchor helper did not finish inside its bound",
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Receipt {
+        pid: Option<u32>,
+        error: Option<String>,
+    }
+    let receipt: Receipt = serde_json::from_slice(&receipt_bytes)
+        .map_err(|_| io::Error::other("uncapped anchor helper receipt is invalid"))?;
+    let pid = receipt.pid.ok_or_else(|| {
+        io::Error::other(
+            receipt
+                .error
+                .unwrap_or_else(|| "uncapped anchor helper returned no process".to_owned()),
+        )
+    })?;
+    process_service::ServiceProcess::observe(pid, &bootstrap, began, &user)
+}
+
+#[cfg(windows)]
+struct PreparedPayload<'a> {
+    program: &'a std::ffi::OsStr,
+    arguments: &'a [std::ffi::OsString],
+    directory: Option<&'a std::ffi::OsStr>,
+    environment: &'a [(Vec<u16>, Vec<u16>)],
+    job_name: &'a str,
+    shared_job: Option<&'a str>,
+    scope: &'a str,
+}
+
+#[cfg(windows)]
+fn create_uncapped_payload(
+    anchor: &crate::process_service::ServiceProcess,
+    payload: &PreparedPayload<'_>,
+) -> io::Result<i32> {
+    let program = payload.program;
+    let arguments = payload.arguments;
+    let directory = payload.directory;
+    let environment = payload.environment;
+    let job_name = payload.job_name;
+    let shared_job = payload.shared_job;
+    let scope = payload.scope;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        PROCESS_CREATE_PROCESS, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+        ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
+    const JOB_OBJECT_ASSIGN_PROCESS: u32 = 0x0001;
+    const JOB_OBJECT_QUERY: u32 = 0x0004;
+    const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+    let wide = |value: &std::ffi::OsStr| -> io::Result<Vec<u16>> {
+        let mut encoded: Vec<u16> = value.encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(io::Error::other("uncapped payload input contains NUL"));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    };
+    let lifecycle = open_named_job(job_name, JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY)?;
+    let parent = open_process(
+        anchor.identity().pid,
+        PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+    )?;
+    let standards = [
+        unsafe { GetStdHandle(STD_INPUT_HANDLE) },
+        unsafe { GetStdHandle(STD_OUTPUT_HANDLE) },
+        unsafe { GetStdHandle(STD_ERROR_HANDLE) },
+    ];
+    let nul = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")?;
+    let mut remote = [std::ptr::null_mut(); 3];
+    for (slot, handle) in remote.iter_mut().zip(standards) {
+        let source =
+            if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                nul.as_raw_handle()
+            } else {
+                handle
+            };
+        let ok = unsafe {
+            windows_sys::Win32::Foundation::DuplicateHandle(
+                GetCurrentProcess(),
+                source,
+                parent.as_raw_handle(),
+                slot,
+                0,
+                1,
+                windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut bytes = 0usize;
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 3, 0, &mut bytes) };
+    if bytes == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut attributes = vec![0u8; bytes];
+    if unsafe {
+        InitializeProcThreadAttributeList(attributes.as_mut_ptr().cast(), 3, 0, &mut bytes)
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let parent_handle = parent.as_raw_handle();
+    let jobs = [lifecycle.as_raw_handle()];
+    let attribute_ok = unsafe {
+        UpdateProcThreadAttribute(
+            attributes.as_mut_ptr().cast(),
+            0,
+            PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+            (&parent_handle as *const HANDLE).cast(),
+            std::mem::size_of::<HANDLE>(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+            && UpdateProcThreadAttribute(
+                attributes.as_mut_ptr().cast(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                remote.as_ptr().cast(),
+                std::mem::size_of_val(&remote),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) != 0
+            && UpdateProcThreadAttribute(
+                attributes.as_mut_ptr().cast(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast(),
+                std::mem::size_of_val(&jobs),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) != 0
+    };
+    if !attribute_ok {
+        let error = io::Error::last_os_error();
+        unsafe { DeleteProcThreadAttributeList(attributes.as_mut_ptr().cast()) };
+        return Err(error);
+    }
+    let application = wide(program)?;
+    let mut line = Vec::new();
+    crate::process::quote_argument(program, &mut line)?;
+    for arg in arguments {
+        line.push(32);
+        crate::process::quote_argument(arg, &mut line)?;
+    }
+    if line.len() >= 32767 {
+        unsafe { DeleteProcThreadAttributeList(attributes.as_mut_ptr().cast()) };
+        return Err(io::Error::other(
+            "uncapped payload command line exceeds the Windows bound",
+        ));
+    }
+    line.push(0);
+    let directory = directory.map(wide).transpose()?;
+    let environment = environment_block(environment)?;
+    #[repr(C)]
+    struct StartupInfoEx {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count: u32,
+        y_count: u32,
+        fill: u32,
+        flags: u32,
+        show: u16,
+        reserved2: u16,
+        reserved3: *mut u8,
+        stdin: HANDLE,
+        stdout: HANDLE,
+        stderr: HANDLE,
+        attribute_list: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct ProcessInformation {
+        process: HANDLE,
+        thread: HANDLE,
+        pid: u32,
+        tid: u32,
+    }
+    let mut startup = StartupInfoEx {
+        cb: std::mem::size_of::<StartupInfoEx>() as u32,
+        reserved: std::ptr::null_mut(),
+        desktop: std::ptr::null_mut(),
+        title: std::ptr::null_mut(),
+        x: 0,
+        y: 0,
+        x_size: 0,
+        y_size: 0,
+        x_count: 0,
+        y_count: 0,
+        fill: 0,
+        flags: STARTF_USESTDHANDLES,
+        show: 0,
+        reserved2: 0,
+        reserved3: std::ptr::null_mut(),
+        stdin: remote[0],
+        stdout: remote[1],
+        stderr: remote[2],
+        attribute_list: attributes.as_mut_ptr().cast(),
+    };
+    let mut info = ProcessInformation {
+        process: std::ptr::null_mut(),
+        thread: std::ptr::null_mut(),
+        pid: 0,
+        tid: 0,
+    };
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            CREATE_SUSPENDED
+                | CREATE_NO_WINDOW
+                | CREATE_UNICODE_ENVIRONMENT
+                | EXTENDED_STARTUPINFO_PRESENT,
+            environment.as_ptr().cast(),
+            directory
+                .as_ref()
+                .map_or(std::ptr::null(), |path| path.as_ptr()),
+            &mut startup as *mut StartupInfoEx as *mut _,
+            &mut info as *mut ProcessInformation as *mut _,
+        )
+    };
+    unsafe { DeleteProcThreadAttributeList(attributes.as_mut_ptr().cast()) };
+    if created == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let process = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(info.process) };
+    let thread = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(info.thread) };
+    let outside = match shared_job {
+        Some(name) => !process_in_named_job(process.as_raw_handle(), name)?,
+        None => true,
+    };
+    let contained = process_in_named_job(process.as_raw_handle(), job_name)?;
+    if !outside || !contained {
+        unsafe { TerminateProcess(process.as_raw_handle(), 127) };
+        let anchor_inside = match shared_job {
+            Some(name) => process_in_named_job(parent.as_raw_handle(), name).unwrap_or(false),
+            None => false,
+        };
+        return Err(io::Error::other(format!(
+            "uncapped payload did not leave the shared CPU allowance (outside={outside}, lifecycle={contained}, anchor_inside={anchor_inside}, shared={shared_job:?}); it was not resumed"
+        )));
+    }
+    eprintln!("{}", uncapped_notice(scope));
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+        let error = io::Error::last_os_error();
+        unsafe { TerminateProcess(process.as_raw_handle(), 127) };
+        return Err(error);
+    }
+    if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut code = 0;
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Normal completion preserves payload-owned background processes. An
+    // abnormal caller death still closes the lifecycle Job with kill-on-close
+    // armed, because this disarm has not run.
+    if let Err(error) = disarm_lifecycle_job(job_name) {
+        eprintln!(
+            "codex-harness: warning: could not preserve background processes after the uncapped payload ({error})"
+        );
+    }
+    Ok(code as i32)
+}
+
+#[cfg(windows)]
+fn disarm_lifecycle_job(name: &str) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    let job = open_named_job(name, 0x0002 | 0x0004)?;
+    let mut extended = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+    let queried = unsafe {
+        windows_sys::Win32::System::JobObjects::QueryInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&mut extended as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if queried == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    extended.BasicLimitInformation.LimitFlags &= !JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let updated = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&extended as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if updated == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_named_job(name: &str, access: u32) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    wide.push(0);
+    let handle = unsafe { OpenJobObjectW(access, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+fn open_process(pid: u32, access: u32) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+#[cfg(windows)]
+fn process_in_named_job(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    let job = open_named_job(name, 0x0004)?;
+    let mut member = 0;
+    if unsafe { IsProcessInJob(process, job.as_raw_handle(), &mut member) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(member != 0)
+}
+
+#[cfg(windows)]
+fn environment_block(variables: &[(Vec<u16>, Vec<u16>)]) -> io::Result<Vec<u16>> {
+    let mut block = Vec::new();
+    for (name, value) in variables {
+        if name.is_empty() || name.contains(&0) || value.contains(&0) {
+            return Err(io::Error::other("uncapped payload environment is invalid"));
+        }
+        block.extend_from_slice(name);
+        block.push(u16::from(b'='));
+        block.extend_from_slice(value);
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -772,7 +1679,7 @@ mod tests {
         io::Write,
         path::{Path, PathBuf},
         process::Stdio,
-        sync::{Arc, mpsc},
+        sync::Arc,
         time::Duration,
     };
 
@@ -937,7 +1844,7 @@ mod tests {
         // proves the matching shim was reused.
         fs::write(&manager, b"").unwrap();
         let mut fixture = ShimFixture::start(&manager.display().to_string());
-        assert!(ensure_xai_shim_on(fixture.port, &manager).is_ok());
+        assert!(ensure_xai_shim(&manager, fixture.port).is_ok());
         assert!(!fixture.retired.load(std::sync::atomic::Ordering::SeqCst));
         let _ = shim_control_request(fixture.port, "POST", crate::xai_responses_shim::RETIRE_PATH);
         fixture.join();
@@ -948,7 +1855,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let manager = root.path().join("codex-harness.exe");
         let mut fixture = ShimFixture::start(r"C:\superseded-build\codex-harness.exe");
-        let error = ensure_xai_shim_on(fixture.port, &manager).unwrap_err();
+        let error = ensure_xai_shim(&manager, fixture.port).unwrap_err();
         assert!(
             error.to_string().contains("absent from the selected build"),
             "{error}"
@@ -959,71 +1866,6 @@ mod tests {
             matches!(shim_probe(fixture.port), ShimProbe::Free),
             "retired shim must release the port"
         );
-    }
-
-    #[test]
-    fn background_spawn_does_not_keep_the_caller_pipeline_open() {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
-        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
-        let compile = tempfile::tempdir().unwrap();
-        let child_exe = compile_fixture(
-            compile.path(),
-            "long-lived-child.exe",
-            include_str!("../tests/fixtures/long_lived_child.rs"),
-        );
-        // A fresh pipe stands in for the pipeline a script or shell would use
-        // to capture `codex` output. Its write end becomes this process's
-        // stdout, which is inheritable exactly like the real capture pipe.
-        let (reader, writer) = crate::cancellable_pipe::anonymous_pipe(4096).unwrap();
-        assert_ne!(
-            unsafe {
-                windows_sys::Win32::Foundation::SetHandleInformation(
-                    writer.as_raw_handle(),
-                    HANDLE_FLAG_INHERIT,
-                    HANDLE_FLAG_INHERIT,
-                )
-            },
-            0
-        );
-        let previous = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        assert_ne!(
-            unsafe { SetStdHandle(STD_OUTPUT_HANDLE, writer.as_raw_handle()) },
-            0
-        );
-        let mut command = Command::new(&child_exe);
-        command.stdin(std::process::Stdio::null());
-        command.stdout(std::process::Stdio::null());
-        command.stderr(std::process::Stdio::null());
-        let spawned = spawn_background(&mut command);
-        assert_ne!(unsafe { SetStdHandle(STD_OUTPUT_HANDLE, previous) }, 0);
-        let mut child = spawned.expect("fixture child must start");
-        drop(writer);
-
-        // EOF must arrive while the child is still alive: the child did not
-        // inherit the write end. A blocking read would mean the caller's
-        // pipeline stays open until the shim exits.
-        let (signal, wait) = mpsc::channel();
-        let reader_thread = std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut chunk = [0u8; 256];
-            loop {
-                match std::io::Read::read(&mut reader, &mut chunk) {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-            let _ = signal.send(());
-        });
-        let closed = wait.recv_timeout(Duration::from_secs(5));
-        child.kill().ok();
-        let _ = child.wait_with_output();
-        assert!(
-            closed.is_ok(),
-            "the background child kept the caller's output pipe open"
-        );
-        reader_thread.join().unwrap();
     }
 
     fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {

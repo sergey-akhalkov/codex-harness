@@ -26,7 +26,7 @@ const EXIT_STARTUP: i32 = 127;
 const EXIT_INTERRUPTED: i32 = 130;
 
 const USAGE: &str = "\
-codex-harness heavy [--account DIRECTORY] -- PROGRAM [ARGS...]
+codex-harness heavy [--account DIRECTORY] [--uncapped] -- PROGRAM [ARGS...]
   Run one batch command under the account-wide heavy-command slot: one local
   machine budget, one serialized queue and one bounded Windows Job per admitted
   command. The command tree is terminated and the slot released before the next
@@ -34,6 +34,10 @@ codex-harness heavy [--account DIRECTORY] -- PROGRAM [ARGS...]
   outside this slot. Exit codes: the command's own code; 124 deadline or queue
   wait expired; 125 memory budget exceeded; 126 the command tree could not be
   cleaned; 127 the command could not be resolved or started; 130 interrupted.
+  --uncapped runs this one command outside the shared account CPU allowance.
+  It is not saved, does not raise the allowance for other sessions or shared
+  services, and the next command without it is capped by default. Combined
+  host agent load can exceed the shared ceiling while the exception runs.
 
 codex-harness heavy budget [--account DIRECTORY] [--json]
   Show the effective local machine budget and where it comes from.
@@ -70,6 +74,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         return budget(&args[1..]);
     }
     let mut option = None;
+    let mut uncapped = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_str() {
@@ -81,6 +86,13 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
                     return Err(invalid("duplicate --account"));
                 }
                 index += 2;
+            }
+            Some("--uncapped") => {
+                if uncapped {
+                    return Err(invalid("duplicate --uncapped"));
+                }
+                uncapped = true;
+                index += 1;
             }
             Some("--") => break,
             Some(other) if other.starts_with("--") => {
@@ -148,6 +160,9 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         }
         Err(error) => return Err(error),
     };
+    if uncapped {
+        return run_uncapped(&budget, &account, &program, rest, &admission, &cancellation);
+    }
     let run = match heavy_command::execute(
         &budget,
         &account,
@@ -208,6 +223,97 @@ fn cleanup_message(error: &io::Error) -> String {
     format!(
         "cleanup failed: {error}; termination is unconfirmed (the owned Job was terminated and closed with kill-on-close containment armed)"
     )
+}
+
+/// One explicit CPU exception. The queue, memory limit, deadline and exit-code
+/// contract stay; only the shared CPU group is escaped, and only for this
+/// invocation. The notice is printed by the outside-group launcher before the
+/// payload is resumed.
+fn run_uncapped(
+    budget: &heavy_command::Budget,
+    account: &Path,
+    program: &Path,
+    args: &[OsString],
+    admission: &heavy_command::Admission,
+    cancellation: &Cancellation,
+) -> io::Result<i32> {
+    use harness_core::{
+        native_launcher,
+        process::{CommandSpec, Job, Limits, StopReason},
+    };
+    use std::time::Duration;
+    let job = Job::new_named(
+        Limits {
+            memory_bytes: Some(budget.memory_bytes),
+            cpu_percent: None,
+        },
+        admission.job_name(),
+    )?;
+    let snapshot = job.snapshot()?;
+    if snapshot.cpu_rate != 0 {
+        eprintln!("heavy: uncapped command job carries a CPU rate; refusing to start");
+        return Ok(EXIT_STARTUP);
+    }
+    eprintln!("{}", admission.job_line(&job)?);
+    let mut spec = CommandSpec::new(program.to_owned());
+    spec.args = args.to_vec();
+    spec.inherit_standard_streams()?;
+    spec.env.insert(
+        OsString::from(heavy_command::LEASE_ENV),
+        Some(admission.marker(account)?),
+    );
+    let launch = match native_launcher::spawn_uncapped(admission.job_name(), &spec, "command") {
+        Ok(launch) => launch,
+        Err(error) => {
+            eprintln!("heavy: {error}");
+            return Ok(EXIT_STARTUP);
+        }
+    };
+    let started = std::time::Instant::now();
+    let outcome = match launch.wrapper_job.wait(
+        &launch.process,
+        budget.deadline()?,
+        cancellation,
+        Duration::from_secs(10),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("heavy: {}", cleanup_message(&error));
+            return Ok(EXIT_CLEANUP);
+        }
+    };
+    let elapsed = started.elapsed().as_millis();
+    match outcome.reason {
+        StopReason::Exited => {
+            eprintln!(
+                "heavy: exited code={} elapsed_ms={elapsed} memory_limit_bytes={} peak_memory_bytes={} cpu_rate={} kill_on_close={}",
+                outcome.exit_code,
+                outcome.job.memory_limit_bytes,
+                outcome.job.peak_job_memory_bytes,
+                outcome.job.cpu_rate,
+                outcome.job.kill_on_close
+            );
+            Ok(outcome.exit_code as i32)
+        }
+        StopReason::Timeout => {
+            eprintln!(
+                "heavy: deadline of {}s expired after {elapsed} ms; bounded process tree terminated",
+                budget.deadline_seconds
+            );
+            Ok(EXIT_DEADLINE)
+        }
+        StopReason::MemoryLimit => {
+            eprintln!(
+                "heavy: command tree exceeded the {} byte memory budget after {elapsed} ms; bounded process tree terminated",
+                budget.memory_bytes
+            );
+            Ok(EXIT_MEMORY_LIMIT)
+        }
+        StopReason::Cancelled => {
+            eprintln!("heavy: interrupted after {elapsed} ms; bounded process tree terminated");
+            Ok(EXIT_INTERRUPTED)
+        }
+    }
 }
 
 /// Inspect or update the local machine budget. No command runs here.

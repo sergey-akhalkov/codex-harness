@@ -25,13 +25,15 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
     System::{
         JobObjects::{
-            IsProcessInJob, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+            AssignProcessToJobObject, IsProcessInJob, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
             JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
             QueryInformationJobObject,
         },
-        Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        Threading::{
+            GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     },
 };
 
@@ -1542,4 +1544,234 @@ fn job_rate(name: &str) -> u32 {
         "{}",
         String::from_utf8_lossy(&lock.stderr)
     );
+}
+
+/// Re-exec entry: join the named allowance, then run one heavy command.
+#[test]
+fn uncapped_heavy_caller() {
+    let Ok(spec_path) = std::env::var("HARNESS_UNCAPPED_HEAVY_SPEC") else {
+        return;
+    };
+    let spec: Value = serde_json::from_slice(&fs::read(&spec_path).unwrap()).unwrap();
+    let job = spec["job"].as_str().unwrap();
+    assert!(assign_current_to_job(job), "could not join {job}");
+    assert!(
+        current_process_in_job(job),
+        "join was not observed by the kernel"
+    );
+    let mut command = std::process::Command::new(spec["program"].as_str().unwrap());
+    command
+        .args(
+            spec["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap()),
+        )
+        .current_dir(spec["cwd"].as_str().unwrap())
+        .env(CPU_ACCOUNT_ENV, spec["account"].as_str().unwrap());
+    for (name, value) in spec["env"].as_object().unwrap() {
+        command.env(name, value.as_str().unwrap());
+    }
+    let output = command.output().unwrap();
+    fs::write(
+        spec["result"].as_str().unwrap(),
+        serde_json::to_vec(&serde_json::json!({
+            "code": output.status.code(),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn assign_current_to_job(name: &str) -> bool {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        let job = OpenJobObjectW(0x0001, 0, wide.as_ptr());
+        if job.is_null() {
+            return false;
+        }
+        let assigned = AssignProcessToJobObject(job, GetCurrentProcess());
+        CloseHandle(job);
+        assigned != 0
+    }
+}
+
+fn current_process_in_job(name: &str) -> bool {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        let job = OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr());
+        if job.is_null() {
+            return false;
+        }
+        let mut member = 0;
+        let queried = IsProcessInJob(GetCurrentProcess(), job, &mut member);
+        CloseHandle(job);
+        queried != 0 && member != 0
+    }
+}
+
+#[test]
+fn uncapped_heavy_command_escapes_a_capped_caller_without_lifting_peers() {
+    use harness_core::process::{Cancellation, Deadline, SharedCpuBudget};
+    use harness_core::process_service::{self, SharedCpuCoverage};
+    use std::collections::BTreeMap;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let cpu = cpu_account(&account);
+    let budget = SharedCpuBudget::acquire(&cpu, SHARED_CPU_PERCENT).unwrap();
+    let job_name = budget.name().to_owned();
+    let rate = budget.snapshot().unwrap().cpu_rate;
+    assert_eq!(rate, shared_cpu_rate());
+
+    let peer_ready = root.join("peer.ready");
+    let peer_stop = root.join("peer.stop");
+    let mut peer = std::process::Command::new(std::env::current_exe().unwrap());
+    peer.args(["--exact", "capped_allowance_peer", "--test-threads=1"])
+        .env("HARNESS_CAPPED_PEER_JOB", &job_name)
+        .env("HARNESS_CAPPED_PEER_READY", &peer_ready)
+        .env("HARNESS_CAPPED_PEER_STOP", &peer_stop)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut peer_child = peer.spawn().unwrap();
+    wait_for_path(&peer_ready, Duration::from_secs(20));
+    let peer_payload =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, peer_child.id()) };
+    assert!(
+        process_in_job(peer_payload, &job_name),
+        "capped peer did not join the shared allowance"
+    );
+
+    let service_root = root.join("service");
+    fs::create_dir_all(&service_root).unwrap();
+    let mut environment = BTreeMap::new();
+    environment.insert("SystemRoot".into(), std::env::var("SystemRoot").unwrap());
+    environment.insert(CPU_ACCOUNT_ENV.into(), cpu.display().to_string());
+    unsafe { std::env::set_var(CPU_ACCOUNT_ENV, &cpu) };
+    let service = process_service::spawn(
+        Path::new(env!("CARGO_BIN_EXE_harness-service-fixture")),
+        &service_root,
+        vec!["serve".into()],
+        environment,
+        Deadline::after(Duration::from_secs(30)).unwrap(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    unsafe { std::env::remove_var(CPU_ACCOUNT_ENV) };
+    assert!(
+        matches!(
+            process_service::shared_cpu_coverage(&service, Some(&cpu)),
+            SharedCpuCoverage::Covered { .. }
+        ),
+        "shared service was not admitted"
+    );
+
+    let started = root.join("exception.pid");
+    let spec_path = root.join("heavy-spec.json");
+    let result_path = root.join("heavy-result.json");
+    let spec = serde_json::json!({
+        "spec_path": spec_path,
+        "job": job_name,
+        "program": manager(),
+        "cwd": work,
+        "account": cpu,
+        "result": result_path,
+        "args": ["heavy", "--account", account, "--uncapped", "--", fixture_target()],
+        "env": {
+            "HARNESS_LAUNCH_FIXTURE_MODE": "heavy-hold",
+            "HARNESS_HEAVY_FIXTURE_MS": "1500",
+            "HARNESS_LAUNCH_FIXTURE_STARTED": started,
+            "HARNESS_HEAVY_FIXTURE_STARTED": root.join("exception.started"),
+            "HARNESS_HEAVY_FIXTURE_ENDED": root.join("exception.ended"),
+            "CODEX_HOME": root.join("home"),
+        },
+    });
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    let caller = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "uncapped_heavy_caller", "--test-threads=1"])
+        .env("HARNESS_UNCAPPED_HEAVY_SPEC", &spec_path)
+        .env(CPU_ACCOUNT_ENV, &cpu)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = wait_for_payload(&started, Duration::from_secs(40));
+    assert!(
+        !process_in_job(payload, &job_name),
+        "uncapped payload remained in the shared allowance"
+    );
+    assert!(
+        process_in_job(peer_payload, &job_name),
+        "the capped peer lost the shared allowance"
+    );
+    assert!(
+        service.in_shared_cpu_budget(&budget).unwrap(),
+        "shared service left the allowance during the exception"
+    );
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    let caller = caller.wait_with_output().unwrap();
+    assert!(
+        caller.status.success(),
+        "capped heavy caller failed: {}",
+        String::from_utf8_lossy(&caller.stderr)
+    );
+    let result: Value = serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
+    let stderr = result["stderr"].as_str().unwrap();
+    assert_eq!(result["code"], serde_json::json!(0), "{stderr}");
+    assert!(
+        stderr.contains("explicit uncapped invocation")
+            && stderr.contains("can exceed")
+            && stderr.contains("75%"),
+        "{stderr}"
+    );
+    unsafe { CloseHandle(payload) };
+
+    let next_pid = root.join("next.pid");
+    let next_log = root.join("next.log");
+    let mut next = heavy_logged(&account, &work, &next_log);
+    next.env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "400")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &next_pid)
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", root.join("next.started"))
+        .env("HARNESS_HEAVY_FIXTURE_ENDED", root.join("next.ended"));
+    let next_child = next.spawn().unwrap();
+    let next_payload = wait_for_payload(&next_pid, Duration::from_secs(40));
+    assert!(
+        process_in_job(next_payload, &job_name),
+        "the next default command was not capped"
+    );
+    let next_text = wait_for_log(&next_log, "heavy: exited code=0", Duration::from_secs(40));
+    assert!(
+        !next_text.contains("explicit uncapped invocation"),
+        "the exception persisted: {next_text}"
+    );
+    let _ = next_child.wait_with_output();
+    unsafe { CloseHandle(next_payload) };
+    fs::write(&peer_stop, "stop").unwrap();
+    let _ = peer_child.wait();
+    unsafe { CloseHandle(peer_payload) };
+    let _ = service.terminate(0);
+}
+
+/// Holds a kernel membership in the named allowance until the stop file appears.
+#[test]
+fn capped_allowance_peer() {
+    let Ok(job) = std::env::var("HARNESS_CAPPED_PEER_JOB") else {
+        return;
+    };
+    assert!(assign_current_to_job(&job), "peer could not join {job}");
+    assert!(current_process_in_job(&job), "peer join was not observed");
+    fs::write(std::env::var("HARNESS_CAPPED_PEER_READY").unwrap(), "ready").unwrap();
+    let stop = std::env::var("HARNESS_CAPPED_PEER_STOP").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !Path::new(&stop).exists() {
+        assert!(Instant::now() < deadline, "capped peer was not stopped");
+        sleep(Duration::from_millis(50));
+    }
 }

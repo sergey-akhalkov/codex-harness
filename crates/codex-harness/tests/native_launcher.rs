@@ -1307,3 +1307,328 @@ fn unavailable_checkout_still_admits_the_payload_into_the_account_budget() {
     let starts = payload.starts();
     assert_eq!(starts.len(), 2, "{starts:?}");
 }
+
+/// Re-exec entry for a caller that must already be inside the shared allowance.
+/// A normal suite run has no spec and returns immediately.
+#[test]
+fn uncapped_session_caller() {
+    let Ok(spec_path) = env::var("HARNESS_UNCAPPED_SPEC") else {
+        return;
+    };
+    let spec: Value = serde_json::from_slice(&fs::read(&spec_path).unwrap()).unwrap();
+    let job = spec["job"].as_str().unwrap();
+    assert!(
+        join_named_job(job),
+        "the uncapped caller is not a kernel member of {job}"
+    );
+    let mut command = Command::new(spec["program"].as_str().unwrap());
+    command
+        .args(
+            spec["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap()),
+        )
+        .current_dir(spec["cwd"].as_str().unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in spec["env"].as_object().unwrap() {
+        match value {
+            Value::Null => {
+                command.env_remove(name);
+            }
+            Value::String(text) => {
+                command.env(name, text);
+            }
+            other => panic!("unsupported env value {other}"),
+        }
+    }
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(spec["stdin"].as_str().unwrap_or("").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let result = json!({
+        "code": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+        "caller_in_job": true,
+    });
+    fs::write(
+        spec["result"].as_str().unwrap(),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+}
+
+fn join_named_job(name: &str) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> *mut std::ffi::c_void;
+        fn AssignProcessToJobObject(
+            job: *mut std::ffi::c_void,
+            process: *mut std::ffi::c_void,
+        ) -> i32;
+        fn IsProcessInJob(
+            process: *mut std::ffi::c_void,
+            job: *mut std::ffi::c_void,
+            result: *mut i32,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        let job = OpenJobObjectW(0x0005, 0, wide.as_ptr());
+        if job.is_null() {
+            return false;
+        }
+        let assigned = AssignProcessToJobObject(job, GetCurrentProcess());
+        let mut member = 0;
+        let queried = IsProcessInJob(GetCurrentProcess(), job, &mut member);
+        CloseHandle(job);
+        assigned != 0 && queried != 0 && member != 0
+    }
+}
+
+fn run_capped_caller(spec: &Value) -> Value {
+    let spec_path = spec["spec_path"].as_str().unwrap();
+    fs::write(spec_path, serde_json::to_vec(spec).unwrap()).unwrap();
+    let output = Command::new(env::current_exe().unwrap())
+        .args(["--exact", "uncapped_session_caller", "--test-threads=1"])
+        .env("HARNESS_UNCAPPED_SPEC", spec_path)
+        .env_remove(CPU_PERCENT_ENV)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "capped caller failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&fs::read(spec["result"].as_str().unwrap()).unwrap()).unwrap()
+}
+
+#[test]
+fn uncapped_session_escapes_a_capped_caller_without_lifting_peers() {
+    use harness_core::process_service::{self, SharedCpuCoverage};
+    use std::collections::BTreeMap;
+    let f = Fixture::new();
+    let budget = SharedCpuBudget::acquire(&f.account, SHARED_CPU_PERCENT).unwrap();
+    let job_name = budget.name().to_owned();
+    let rate = budget.snapshot().unwrap().cpu_rate;
+    f.register_consumer(consumer());
+    let peer = Consumer::new(f.root.path(), "peer");
+    let mut peer_command = f.command();
+    peer_command.env(CPU_PERCENT_ENV, SHARED_CPU_PERCENT.to_string());
+    peer.configure(&mut peer_command, &job_name, 1, 20_000, true, 0);
+    let mut peer_child = peer_command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_path(&peer.directory.join("tree.json"), Duration::from_secs(30));
+    let peer_tree = peer.tree();
+    assert_eq!(peer_tree["in_shared"], json!(true), "{peer_tree}");
+    let peer_pid = peer_tree["pid"].as_u64().unwrap() as u32;
+
+    let service_root = f.root.path().join("service");
+    fs::create_dir_all(&service_root).unwrap();
+    let mut environment = BTreeMap::new();
+    environment.insert("SystemRoot".into(), env::var("SystemRoot").unwrap());
+    environment.insert(CPU_ACCOUNT_ENV.into(), f.account.display().to_string());
+    // spawn's coverage check reads this process environment. Point it at the
+    // fixture so the check does not query the machine account.
+    unsafe { env::set_var(CPU_ACCOUNT_ENV, &f.account) };
+    let service = process_service::spawn(
+        Path::new(env!("CARGO_BIN_EXE_harness-service-fixture")),
+        &service_root,
+        vec!["serve".into()],
+        environment,
+        Deadline::after(Duration::from_secs(30)).unwrap(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    unsafe { env::remove_var(CPU_ACCOUNT_ENV) };
+    let coverage = process_service::shared_cpu_coverage(&service, Some(&f.account));
+    let service_log = fs::read_to_string(service_root.join("service.log")).unwrap_or_default();
+    assert!(
+        matches!(coverage, SharedCpuCoverage::Covered { .. }),
+        "shared service was not admitted before the exception: {coverage:?}\n{service_log}"
+    );
+
+    let exception = Consumer::new(f.root.path(), "exception");
+    let spec_path = f.root.path().join("caller-spec.json");
+    let result_path = f.root.path().join("caller-result.json");
+    let mut env = serde_json::Map::new();
+    env.insert("CODEX_HOME".into(), f.home.display().to_string().into());
+    env.insert(
+        CPU_ACCOUNT_ENV.into(),
+        f.account.display().to_string().into(),
+    );
+    env.insert(
+        CPU_PERCENT_ENV.into(),
+        SHARED_CPU_PERCENT.to_string().into(),
+    );
+    env.insert(
+        "HARNESS_CPU_FIXTURE_DIR".into(),
+        exception.directory.display().to_string().into(),
+    );
+    env.insert("HARNESS_CPU_FIXTURE_JOB".into(), job_name.clone().into());
+    env.insert("HARNESS_CPU_FIXTURE_THREADS".into(), "1".into());
+    env.insert("HARNESS_CPU_FIXTURE_SPIN_MS".into(), "200".into());
+    env.insert("HARNESS_CPU_FIXTURE_LEAF".into(), "1".into());
+    env.insert("HARNESS_CPU_FIXTURE_EXIT".into(), "21".into());
+    env.insert(
+        "HARNESS_CPU_FIXTURE_STARTS".into(),
+        exception.starts.display().to_string().into(),
+    );
+    let result = run_capped_caller(&json!({
+        "spec_path": spec_path,
+        "result": result_path,
+        "job": job_name,
+        "program": f.launcher,
+        "args": ["--harness-cpu", "uncapped"],
+        "cwd": f.root.path(),
+        "env": env,
+        "stdin": "",
+    }));
+    let stderr = result["stderr"].as_str().unwrap();
+    assert_eq!(result["code"], json!(21), "{stderr}");
+    assert!(
+        stderr.contains("explicit uncapped invocation")
+            && stderr.contains("can exceed")
+            && stderr.contains("75%"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(CAP_WARNING),
+        "an explicit exception must not be reported as a failed cap: {stderr}"
+    );
+    let tree = exception.tree();
+    assert_eq!(tree["in_shared"], json!(false), "{tree}");
+    assert_eq!(tree["in_any_job"], json!(true), "{tree}");
+    let leaf = exception.leaf();
+    assert_eq!(leaf["in_shared"], json!(false), "{leaf}");
+    assert!(
+        process_in_named_job(peer_pid, &job_name),
+        "the peer session lost the shared allowance"
+    );
+    assert!(
+        service.in_shared_cpu_budget(&budget).unwrap(),
+        "the shared service left the allowance while an uncapped session ran"
+    );
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+
+    f.register(json!({
+        "executable": f.upstream,
+        "sha256": build_identity::hash_file(&f.upstream).unwrap(),
+        "package": null
+    }));
+    let stream_spec = f.root.path().join("stream-spec.json");
+    let stream_result = f.root.path().join("stream-result.json");
+    let stream = run_capped_caller(&json!({
+        "spec_path": stream_spec,
+        "result": stream_result,
+        "job": job_name,
+        "program": f.launcher,
+        "args": ["--harness-cpu", "uncapped", "exec", "", "проверка \"кавычки\"", "trailing\\"],
+        "cwd": f.root.path(),
+        "env": {
+            "CODEX_HOME": f.home.display().to_string(),
+            CPU_ACCOUNT_ENV: f.account.display().to_string(),
+            CPU_PERCENT_ENV: SHARED_CPU_PERCENT.to_string(),
+            "HARNESS_LAUNCH_FIXTURE_MODE": "nonzero",
+        },
+        "stdin": "первая строка\nsecond line\n",
+    }));
+    let stream_stderr = stream["stderr"].as_str().unwrap();
+    assert_eq!(stream["code"], json!(19), "{stream_stderr}");
+    assert!(
+        stream_stderr.contains("explicit uncapped invocation"),
+        "{stream_stderr}"
+    );
+    let report: Value = serde_json::from_str(stream["stdout"].as_str().unwrap())
+        .unwrap_or_else(|error| panic!("{error}: {stream}"));
+    let args = report["args"].as_array().unwrap();
+    assert!(
+        args.ends_with(&[
+            json!("exec"),
+            json!(""),
+            json!("проверка \"кавычки\""),
+            json!("trailing\\"),
+        ]),
+        "{args:?}"
+    );
+    assert_eq!(report["stdin"], json!("первая строка\nsecond line\n"));
+    assert!(
+        report["cwd"]
+            .as_str()
+            .is_some_and(|cwd| cwd.contains("native-launch")),
+        "{report}"
+    );
+
+    f.register_consumer(consumer());
+    let again = Consumer::new(f.root.path(), "default-after");
+    let mut again_command = f.command();
+    again_command.env(CPU_PERCENT_ENV, SHARED_CPU_PERCENT.to_string());
+    again.configure(&mut again_command, &job_name, 1, 200, true, 0);
+    let again_output = again_command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let again_stderr = String::from_utf8_lossy(&again_output.stderr);
+    assert!(
+        again_output.status.success(),
+        "the next default session failed: {again_stderr}"
+    );
+    assert!(
+        !again_stderr.contains("explicit uncapped invocation"),
+        "the exception persisted: {again_stderr}"
+    );
+    assert_eq!(again.tree()["in_shared"], json!(true), "{:?}", again.tree());
+    let _ = service.terminate(0);
+    let _ = peer_child.kill();
+}
+
+fn process_in_named_job(pid: u32, name: &str) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> *mut std::ffi::c_void;
+        fn IsProcessInJob(
+            process: *mut std::ffi::c_void,
+            job: *mut std::ffi::c_void,
+            result: *mut i32,
+        ) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        let process = OpenProcess(0x1000, 0, pid);
+        let job = OpenJobObjectW(0x0004, 0, wide.as_ptr());
+        if process.is_null() || job.is_null() {
+            if !process.is_null() {
+                CloseHandle(process);
+            }
+            if !job.is_null() {
+                CloseHandle(job);
+            }
+            return false;
+        }
+        let mut member = 0;
+        let queried = IsProcessInJob(process, job, &mut member);
+        CloseHandle(process);
+        CloseHandle(job);
+        queried != 0 && member != 0
+    }
+}
