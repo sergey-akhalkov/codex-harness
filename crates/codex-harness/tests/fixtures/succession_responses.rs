@@ -26,6 +26,7 @@ pub struct Responses {
 
 impl Responses {
     pub fn start(evidence: PathBuf) -> Self {
+        let cache_loss = evidence.join("cache-loss").is_file();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -74,7 +75,21 @@ impl Responses {
                         ) && item["call_id"] == call
                     })
                 };
-                let item = if sequence == 1 {
+                let item = if cache_loss {
+                    let shell = std::env::var("HARNESS_ACCEPTANCE_POWERSHELL")
+                        .expect("owner PowerShell 7 for cache-loss fixture");
+                    let arguments = serde_json::to_string(&json!({"cmd":"Write-Output cache-fixture; Start-Sleep -Milliseconds 200", "shell":shell,"yield_time_ms":1000})).unwrap();
+                    let call = format!("cache-tool-{sequence}");
+                    if request["tools"].as_array().is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| tool["type"] == "custom" && tool["name"] == "exec")
+                    }) {
+                        json!({"type":"custom_tool_call","call_id":call,"name":"exec","input":format!("text(await tools.exec_command({arguments}));")})
+                    } else {
+                        json!({"type":"function_call","call_id":call,"name":"exec_command","arguments":arguments})
+                    }
+                } else if sequence == 1 {
                     assert!(
                         !continuation,
                         "the seed turn must not be a succession continuation"
@@ -127,11 +142,16 @@ impl Responses {
                         panic!("unexpected request while a continuation read is pending")
                     }
                 };
+                let usage = if cache_loss {
+                    json!({"input_tokens":200_000,"input_tokens_details":{"cached_tokens":if sequence == 1 {199_000} else {4_000}},"output_tokens":10,"total_tokens":200_010})
+                } else {
+                    json!({"input_tokens":10,"output_tokens":10,"total_tokens":20})
+                };
                 let events = [
                     json!({"type":"response.created","response":{"id":format!("resp-{sequence}")}}),
                     json!({"type":"response.output_item.done","item":item}),
                     json!({"type":"response.completed","response":{"id":format!("resp-{sequence}"),
-                        "usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}),
+                        "usage":usage}}),
                 ];
                 let body = events
                     .iter()

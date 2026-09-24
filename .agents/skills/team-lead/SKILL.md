@@ -223,7 +223,7 @@ for the lead to ask.
 The default exec mode streams the assignment in a visible tab and exits on
 completion; the tab's lifetime follows the terminal's close-on-exit policy, so
 a successful exit can close it while a failure stays visible for inspection. A
-mid-work stop is continued on the recorded slot through the resume path below.
+mid-work stop is continued on the recorded slot through the recovery paths below.
 Do not prefix prompts with `/goal`: the CLI has no argv goal hook and the
 prefix would be inert text. Accept only against the assignment, not effort
 spent. Spawn returns after the executor window/tab is open so the lead can keep
@@ -246,9 +246,15 @@ cancellation request or a concrete necessity such as a demonstrated wrong
 direction or a run that cannot progress: a brief error, a slow stream, waiting
 or silence alone is not a reason to stop. Use the kit commands before killing
 processes manually; manual killing needs a recorded cause. After a stop,
-preserve the files, slot and partial work and continue by resuming the exact
-session instead of restarting; a stop neither releases the slot nor restarts
-work.
+preserve the files, slot and partial work. Ordinary interruption continues by
+resuming the exact session. A DeepSeek cache-loss stop instead requires a fresh
+conversation: inspect the preserved work and follow the receipt's exact
+`executor restart` command for the same slot/owner/predecessor. It carries the
+original task and bounded visible progress, keeps all saved work and requires
+checking interrupted tests/builds. Do not use spawn, release, reset or resume
+the expensive history as its fallback; investigate recurrence before another
+restart. The policy and limits live in
+[cache-loss recovery](../../../docs/agent-delegation.md#deepseek-cache-loss-protection-and-recovery).
 Command flags and result classes live in
 [native commands](../../../docs/rust-native.md#structured-executor-assignments),
 lifecycle and steering semantics in
@@ -264,6 +270,14 @@ Exit 0 means the run completed, 1 names a failed, defect or interrupted run
 with its cause, and 2 means unavailable coverage (tui or legacy receipt) or
 the timeout - a reason to inspect, not a result. Watch output is the
 executor's report, still not verified acceptance.
+Wait in one blocking call, not a polling loop: omit `--timeout` (its default
+1800s covers long acceptance runs) or set it to the expected run duration,
+and give the shell call itself enough timeout to cover that wait. Watch
+prints nothing while the run continues, so the wait costs nothing until the
+report. If the shell timeout ends the wait early or watch exits 2 with the run
+still running, rerun the same watch as its continuation; never shrink waiting
+into short fixed-interval polling such as every 50 seconds. `executor pool`
+is the cheap snapshot between other work; a healthy run needs no extra check.
 Track session-file growth in the same loop: a live executor whose rollout is
 silent beyond a bounded threshold (about 15 minutes) is a stuck-suspect -
 then read its recent reasoning and diff, and only for a confirmed anomaly send
@@ -345,7 +359,7 @@ accept or returns the item to `in_progress` with conditions. Executor terminal
 tabs are per-assignment, never pooled: a fresh session must not inherit another
 assignment's context, and the exec tab's lifetime follows the terminal's
 close-on-exit policy rather than a harness-managed close. To return defects or
-continue after a stop, resume the exact session
+continue after an ordinary stop, resume the exact session
 (`codex-harness executor resume --slot N --owner ID [--session SESSION_ID]`
 for a pooled executor - without `--session` it consumes the exact identity the
 dispatch receipt recorded - or `codex resume SESSION_ID` interactively

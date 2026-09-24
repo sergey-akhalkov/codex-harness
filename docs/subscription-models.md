@@ -49,7 +49,7 @@ codex --profile zai
 ```
 
 Ordinary `codex` uses the shared GPT-6 Astra default. Grok is opt-in via
-`--profile xai` (model `grok-4.6`, provider `xai`, reasoning `xhigh`).
+`--profile xai` (model `grok-4.7`, provider `xai`, reasoning `xhigh`).
 Z.AI GLM-5.3 is opt-in via `--profile zai`. The launcher starts the shim
 only for `xai`-profile invocations; it self-exits when no `codex.exe` process
 remains.

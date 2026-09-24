@@ -130,7 +130,7 @@ are not covered by its budget.
 
 ## Structured executor assignments
 
-`codex-harness executor spawn` and `resume` accept `--assignment FILE` as an
+`codex-harness executor spawn`, `resume` and `restart` accept `--assignment FILE` as an
 alternative to `--exec PROMPT`. Keep the file local or in the owning project;
 do not put private consumer details into this pack. Example schema:
 
@@ -242,6 +242,17 @@ target is the opt-in installed-CLI shape check: it requires
 `HARNESS_CONTROL_CODEX_EXE` pointing at the native Codex executable and runs it
 against the existing synthetic Responses provider, so it validates observed
 event behavior without a subscription or paid model call.
+
+Cache-loss acceptance also has two opt-in native checks:
+`native_control_cache_loss_stops_a_fresh_session_and_preserves_work` in
+`executor_control` and `installed_native_cache_loss_stops_before_more_requests`
+in `executor_observation`. They use local canned Responses with a warmed cache
+followed by three large misses, require `HARNESS_CONTROL_CODEX_EXE` and
+`HARNESS_ACCEPTANCE_POWERSHELL` (the owner's existing PowerShell 7), and verify
+termination with bounded request counts and preserved work. Set
+`HARNESS_OBSERVATION_MANAGER_EXE` to the installed manager to exercise that
+binary; the compiled test targets can run from outside the source checkout.
+No real provider, credentials or subscription is used by these checks.
 
 ## Bounded token reports
 

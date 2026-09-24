@@ -9,6 +9,8 @@
 //! fail-closed paths are exercised without a model, a subscription or the
 //! installed CLI.
 #![cfg(windows)]
+#[path = "fixtures/cache_usage.rs"]
+mod cache_usage;
 #[path = "../src/executor_control.rs"]
 mod executor_control;
 
@@ -1029,7 +1031,9 @@ fn attach_refuses_another_bearer() {
 /// through the same `executor run --file` entry point the dispatcher's
 /// terminal-tab and owned-console routes run.
 fn manager() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
+    std::env::var_os("HARNESS_OBSERVATION_MANAGER_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_codex-harness")))
 }
 
 /// The owner of the fixture slot binding.
@@ -1367,6 +1371,151 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
         "{watched_text}"
     );
     assert!(watched_text.contains(FINAL), "{watched_text}");
+}
+
+#[test]
+fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
+    let pooled = Pooled::new("cache-loss", Answer::Result(thread_start_answer()), true);
+    pooled
+        .server
+        .answer("turn/interrupt", Answer::Result(json!({})));
+    let preserved = pooled.slot.join("partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let mut host = pooled.host("complete");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "cache-loss assignment started",
+    );
+    let rollout = cache_usage::write_loss(&pooled.home, THREAD);
+    let until = Instant::now() + WAIT;
+    loop {
+        if host.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= until {
+            let _ = host.kill();
+            panic!("cache-loss host did not terminate within its test deadline");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("DeepSeek cache loss"), "{text}");
+    assert!(text.contains("no process remained"), "{text}");
+    let interrupts = pooled.server.requests_for("turn/interrupt");
+    assert!(
+        interrupts.is_empty(),
+        "cache loss must terminate without waiting for a control reply"
+    );
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
+    assert_eq!(receipt["cacheGuard"]["lastMissTokens"], 394_000);
+    assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
+    assert!(rollout.exists());
+    assert!(pooled.state.join("slot-1.json").exists());
+}
+
+#[path = "fixtures/succession_responses.rs"]
+mod cache_responses;
+
+#[test]
+#[ignore = "requires native Codex and owner PowerShell 7; all Responses are local canned events"]
+fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
+    let exe =
+        PathBuf::from(std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("native Codex path"));
+    let shell = PathBuf::from(
+        std::env::var_os("HARNESS_ACCEPTANCE_POWERSHELL").expect("owner PowerShell 7"),
+    );
+    let pooled = Pooled::new("native-cache", Answer::Result(thread_start_answer()), false);
+    let evidence = pooled._root.path().join("evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    fs::write(evidence.join("cache-loss"), "synthetic counters").unwrap();
+    fs::write(pooled.slot.join("partial.txt"), "previous work preserved").unwrap();
+    let responses = cache_responses::Responses::start(evidence.clone());
+    fs::write(pooled.home.join("config.toml"), format!(
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\n[profiles.deepseek]\nmodel = 'gpt-6-astra'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'low'\n[model_providers.deepseek]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, pooled.slot.to_string_lossy())).unwrap();
+    let mut receipt = pooled.receipt();
+    receipt["launcher"] = json!(exe);
+    for (key, value) in [
+        ("model", "gpt-6-astra"),
+        ("modelProvider", "deepseek"),
+        ("reasoningEffort", "low"),
+    ] {
+        receipt[key] = json!(value);
+        receipt["control"]["identity"][key] = json!(value);
+    }
+    receipt["shell"]["executable"] = json!(shell);
+    receipt["shell"]["version"] = json!("owner PowerShell 7");
+    receipt["observation"]["previousSession"] = json!(THREAD);
+    receipt["control"]["assignment"] = json!(
+        "Continue the original fixture task in this preserved checkout; keep partial.txt and check previous work before using results."
+    );
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let stdout = fs::File::create(evidence.join("host-stdout.txt")).unwrap();
+    let stderr = fs::File::create(evidence.join("host-stderr.txt")).unwrap();
+    let mut host = Command::new(manager())
+        .args(["executor", "run", "--file"])
+        .arg(&pooled.receipt)
+        .env("CODEX_HOME", &pooled.home)
+        .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(45);
+    loop {
+        if host.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= until {
+            let _ = host.kill();
+            panic!(
+                "native control cache host timed out; evidence: {}",
+                evidence.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let status = host.wait().unwrap();
+    let output = fs::read_to_string(evidence.join("host-stdout.txt")).unwrap();
+    let error = fs::read_to_string(evidence.join("host-stderr.txt")).unwrap();
+    let receipt = pooled.receipt();
+    assert_eq!(status.code(), Some(1), "{output}\n{error}");
+    assert_eq!(
+        receipt["observation"]["state"], "stopped",
+        "{receipt}\n{output}\n{error}"
+    );
+    assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
+    assert!(
+        receipt["observation"]["session"]
+            .as_str()
+            .is_some_and(|session| session != THREAD)
+    );
+    assert_eq!(
+        fs::read_to_string(pooled.slot.join("partial.txt")).unwrap(),
+        "previous work preserved"
+    );
+    let requests = fs::read_dir(&evidence)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+        .count();
+    assert!(
+        (4..=5).contains(&requests),
+        "requests after stop: {requests}"
+    );
+    println!(
+        "native app-server cache stop: {requests} local requests; fresh session identity and preserved work verified"
+    );
 }
 
 /// A turn that did not complete the assignment is never reported as a

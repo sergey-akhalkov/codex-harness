@@ -1,9 +1,9 @@
 {
   "models": [
     {
-      "slug": "grok-4.6",
-      "display_name": "grok-4.6",
-      "description": "xAI Grok 4.6 SuperGrok Heavy",
+      "slug": "grok-4.7",
+      "display_name": "grok-4.7",
+      "description": "xAI Grok 4.7 SuperGrok Heavy",
       "default_reasoning_level": "xhigh",
       "supported_reasoning_levels": [
         {

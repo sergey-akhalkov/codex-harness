@@ -612,6 +612,69 @@ fn resume_with_a_rejected_assignment_keeps_the_slot_and_partial_work() {
     fixture.drop();
 }
 
+#[test]
+fn restart_preserves_dirty_worktree_reuses_assignment_and_refuses_a_stale_session() {
+    let fixture = Fixture::new("restart-cache", 1);
+    let spawned = fixture.spawn(&["--owner", "exec-ds-52"]);
+    assert!(output_text(&spawned).contains("installed Codex launcher is missing"));
+    let slot = fixture.slot(1);
+    fs::write(slot.join("partial.txt"), "preserved work\n").unwrap();
+    let before = git_output(&slot, &["rev-parse", "HEAD"]);
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let receipt = pooled_receipt_path(&fixture.home, 1);
+    fs::write(&receipt, serde_json::to_vec_pretty(&json!({
+        "slot":{"index":1,"source":fixture.source,"path":slot,"owner":"exec-ds-52","base":before.trim(),"remote":"origin","branch":"main"},
+        "control":{"assignment":"Finish the original CPU budget assignment; preserve completed edits."},
+        "observation":{"schema":1,"coverage":"native","state":"stopped","session":session,"updatedMs":1}
+    })).unwrap()).unwrap();
+    let command = |previous: &str| {
+        let mut command = lead_command();
+        command.args([
+            "executor",
+            "restart",
+            "--source",
+            fixture.source.to_str().unwrap(),
+            "--codex-home",
+            fixture.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            "exec-ds-52",
+            "--session",
+            previous,
+        ]);
+        command
+    };
+    let refused = command("01a0c719-f4d4-7880-a9d2-1a96ee0f2401")
+        .output()
+        .unwrap();
+    assert!(
+        output_text(&refused).contains("previous session no longer occupies"),
+        "{}",
+        output_text(&refused)
+    );
+    let out = command(session).output().unwrap();
+    let text = output_text(&out);
+    assert!(
+        text.contains("fresh conversation, preserved worktree"),
+        "{text}"
+    );
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("requires --exec"),
+        "the recorded original assignment is reused: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(slot.join("partial.txt")).unwrap(),
+        "preserved work\n"
+    );
+    assert_eq!(git_output(&slot, &["rev-parse", "HEAD"]), before);
+    fixture.drop();
+}
+
 /// Free-text dispatch is unchanged, and exactly one assignment source is
 /// accepted by both dispatch paths.
 #[test]

@@ -7,7 +7,7 @@ handles visual and suitable routine work. Kit executor dispatch takes no
 per-assignment model or effort: it runs exactly the configured executor
 profiles, and the profile's configured model and reasoning effort are that
 assignment's complete explicit selection. The kit configures one executor,
-`ds`, binding DeepSeek V4.1-Flash (`deepseek-flash`) at `max`; one executor
+`xai`, binding Grok 4.7 (`grok-4.7`) at `xhigh`; one executor
 profile is normal full capacity, not a delegation limit. Choose from task
 complexity, risk and the full cost of the accepted result; a separate TOML
 file per effort or activity is unnecessary. Supported efforts differ by
@@ -25,7 +25,7 @@ their former meaning; it does not prescribe an effort for every new assignment.
 
 For example, use an ordinary agent with `model="gpt-6-astra"` and
 `reasoning_effort="high"` instead of `agent_type="middle_backup"`. The same
-parameter selection applies to enabled external models. Use `codex --profile xai` with `grok-4.6` / `xhigh` instead of any subscription
+parameter selection applies to enabled external models. Use `codex --profile xai` with `grok-4.7` / `xhigh` instead of any subscription
 middle preset. Those OpenCodex role files are retired. The former
 `grok_reviewer` remains retired.
 
@@ -88,7 +88,7 @@ is identifiable without guessing.
 That command uses `codex --profile xai` from the example above. An unlisted
 `--profile` is an error. Explicit user `codex --profile <id>` keeps native
 precedence over role configuration. The live kit routes every executor
-through `ds` (DeepSeek V4.1-Flash, `max`) and accepts no per-assignment model
+through `xai` (Grok 4.7, `xhigh`) and accepts no per-assignment model
 or effort override by design: the profile is the selection. If any
 instruction appears to demand per-assignment model/effort for executor
 dispatch, that demand belongs to ordinary in-session agents; dispatch the
@@ -275,14 +275,15 @@ slots, while an ad-hoc task-named worktree path is refused with a migration
 hint. `--base REV` starts the slot from another revision than the upstream
 default branch, and `--owner ID` labels the session binding (default
 `exec-<profile>-<pid>`); a second live owner of one slot is refused instead of
-sharing one checkout. An interrupted session resumes through
+sharing one checkout. An ordinary interrupted session resumes through
 `codex-harness executor resume --slot N --owner ID [--session SESSION_ID]`:
 the recorded slot is rebound for the same owner without fetch, reset or clean,
 so partial work survives, while a fresh spawn resynchronizes and never
 continues a dirty slot. `--session` remains supported and takes precedence;
 without it, resume consumes the exact session the dispatch receipt recorded,
 keeps that identity across failed resume attempts and refuses when nothing was
-recorded instead of choosing another session by recency. Hand-editing dispatch
+recorded instead of choosing another session by recency. For an automatic cache
+stop, use the fresh-conversation recovery below instead. Hand-editing dispatch
 receipts for `executor run` is
 not the resume path. The recorded mapping (index, path,
 owner, synchronized base) and its lease live in kit-local task state under
@@ -397,6 +398,13 @@ host is reported with its reason and an unknown exit code, never as a
 completion. `executor pool` adds `run=<state> session=<id>` per slot, and
 `executor release` prints the last observed run beside the disposition it
 records while still refusing to reset a live or unreviewed slot.
+Waiting follows that one-event shape: one blocking watch call covers the
+whole wait - omit `--timeout` (default 1800s) or match the assignment's
+expected duration, keep the calling shell's own timeout long enough to cover
+it, and rerun the same watch when a boundary arrives with the run still
+running. Watch prints nothing while the run continues; short fixed-interval
+watch polling (for example every 50 seconds) is waste, and `executor pool`
+already provides the compact between-work snapshot.
 
 An observed `executor run --file` - the process a tab or console hosts - exits
 0 only for a completed turn with a nonempty final message, otherwise propagates
@@ -434,13 +442,50 @@ and the current work first. Use the kit's stop command rather than killing
 processes by hand: manual process killing has no identity check, tab closure
 or honest receipt and needs a recorded cause. A stop preserves the files,
 checkout, slot and partial work and claims no completion; continue by
-resuming the exact session, not by restarting the assignment, and release
+resuming the exact session (except cache-loss recovery below), and release
 the slot only as its own explicit decision.
+
+### DeepSeek cache-loss protection and recovery
+
+New observed DeepSeek executor hosts monitor their exact session's native
+per-response input/cache counters. After a response with at least 100,000 input
+tokens and 90% cached input, three consecutive responses each missing at least
+100,000 tokens and 50% of input trigger termination of the owned process tree.
+Cold starts, duplicate observations and historical losses on resume do not
+count. The host terminates before waiting on control acknowledgments or writing
+its stop receipt; it does not wait for a model, test or build to finish.
+
+Windows file-change notifications and native events trigger bounded reads of
+appended records. A one-second open-file size check covers delayed Windows
+notifications; unchanged content is not periodically reread. No monitoring request is
+sent to the model. Usage arrives after billing, so the three responses and an
+already in-flight request can still cost money. This is a repeated-loss guard,
+not a currency cap or a fix for the upstream cache. Missing/invalid counters
+are reported as unavailable coverage. Already running older hosts do not gain
+protection from installing a new binary.
+
+The receipt's `cacheGuard` and failed watch result retain the counters and an
+exact recovery command. The lead reviews preserved work and runs that command:
+
+```powershell
+codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session PREVIOUS_SESSION_ID
+```
+
+Restart starts a fresh conversation in the same worktree, keeping its commits,
+uncommitted/untracked files and saved test/build evidence. It does not fetch,
+reset, clean or release the slot. The old rollout remains available. The new
+session receives the recorded original assignment plus a bounded checkpoint
+of recent visible activity and must inspect the actual work before continuing;
+an interrupted command is not proof of success. It does not replay the whole
+old context or restore unsaved internal model state. If no assignment was
+retained, supply the original `--assignment FILE` or `--exec PROMPT`. A stale
+predecessor identity or live owner is refused. Use the configured binding;
+investigate recurring loss instead of creating an automatic restart loop.
 
 ## How selection works
 
 Kit executor assignments go to the configured executor profile - currently
-the single `ds` profile (DeepSeek V4.1-Flash, `max`) - with no substitution:
+the single `xai` profile (Grok 4.7, `xhigh`) - with no substitution:
 in-session routing preferences never override it and never justify
 withholding a dispatch; report a wording conflict and dispatch anyway. A
 short edit,
@@ -572,7 +617,7 @@ new workflow's acceptance until their visible-view integration is implemented:
 
 ```powershell
 & (uv python find) tests/agent-delegation.py --run-model-probes --scenario all
-./tests/subscription-consumer.Tests.ps1 -RunModelProbes -GrokModel xai/grok-4.6 -GrokReasoningEffort xhigh -Scenario Delegation
+./tests/subscription-consumer.Tests.ps1 -RunModelProbes -GrokModel xai/grok-4.7 -GrokReasoningEffort xhigh -Scenario Delegation
 ```
 
 The first probe compares the same tasks for direct Astra and two Grok children,

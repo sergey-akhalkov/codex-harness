@@ -16,7 +16,7 @@ token-efficient-workflow skill covers RTK raw recovery and native task-effort
 selection when verbose output or repeated work is material. Keep its detail on demand.
 For every OpenAI model assignment use the Astra family only, including reserves
 and auxiliary calls. Do not select GPT-5 models. GPT normally leads; prefer
-zai/glm-5.3 for worthwhile substantial text/code work and xai/grok-4.6 for visual
+zai/glm-5.3 for worthwhile substantial text/code work and xai/grok-4.7 for visual
 and suitable routine work. Launch an ordinary agent with explicit model and
 reasoning_effort supported by that model, rather than a named level profile.
 Use Astra reserves for a concrete capability need or unavailable suitable external

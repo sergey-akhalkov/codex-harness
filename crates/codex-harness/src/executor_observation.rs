@@ -27,6 +27,75 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "executor_cache.rs"]
+pub(crate) mod cache;
+
+/// Stop only the child tree owned by this host. Preserve the receipt, checkout
+/// and rollout, and distinguish verified termination from incomplete cleanup.
+pub(crate) fn stop_cache_run(
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    job: Job,
+    loss: cache::CacheLoss,
+) -> io::Result<i32> {
+    let (state, cleanup) = match job.terminate(1, JOB_CLEANUP) {
+        Ok(snapshot) if snapshot.active_processes == 0 => (
+            STATE_STOPPED,
+            "owned child tree terminated; no process remained".to_owned(),
+        ),
+        Ok(snapshot) => (
+            STATE_PARTIAL_STOP,
+            format!(
+                "{} owned processes remain; use executor stop and inspect the recorded run",
+                snapshot.active_processes
+            ),
+        ),
+        Err(error) => (
+            STATE_PARTIAL_STOP,
+            format!(
+                "termination could not be verified: {error}; use executor stop and inspect the recorded run"
+            ),
+        ),
+    };
+    let value = read_receipt_value(receipt)?;
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let recovery = match (value["slot"]["source"].as_str(), value["slot"]["index"].as_u64(),
+        value["slot"]["owner"].as_str(), tracker.observation.session.as_deref()) {
+        (Some(source), Some(slot), Some(owner), Some(session)) => {
+            let home = harness_core::native_launcher::codex_home()?;
+            format!("Lead action required: review preserved partial work, then start a NEW session for the original assignment in the SAME worktree with `codex-harness executor restart --source {} --codex-home {} --slot {slot} --owner {} --session {}`. Do not use spawn/release/reset or resume the expensive history; if this recurs, investigate before another restart", quote(source), quote(&home.to_string_lossy()), quote(owner), quote(session))
+        }
+        _ => "Lead action required: preserve partial work and start a new conversation in the same checkout for the original task; this receipt has no verified pool address for executor restart".to_owned(),
+    };
+    let cause = format!("{}; {cleanup}. {recovery}", loss.0);
+    tracker.observation.state = state.into();
+    tracker.observation.cause = Some(cause.clone());
+    tracker.observation.exit_code = None;
+    tracker.observation.updated_ms = now_ms();
+    with_receipt_lock(receipt, || {
+        let mut value = read_receipt_value(receipt)?;
+        value["observation"] = serde_json::to_value(&tracker.observation)?;
+        value["cacheGuard"] = loss.1;
+        value["cacheGuard"]["status"] = Value::String(state.into());
+        value["cacheGuard"]["reason"] = Value::String(cause.clone());
+        value["cacheGuard"]["recovery"] = Value::String(recovery.clone());
+        mark_pending_messages(&mut value, tracker.observation.updated_ms);
+        write_receipt(receipt, &value)
+    })?;
+    println!("result: {state}: {cause}");
+    println!(
+        "session: {} receipt: {}",
+        tracker
+            .observation
+            .session
+            .as_deref()
+            .unwrap_or("unrecorded"),
+        receipt.display()
+    );
+    io::stdout().flush()?;
+    Ok(EXIT_FAILED)
+}
+
 /// Version of the observation record written into a dispatch receipt.
 pub(crate) const OBSERVATION_SCHEMA: u32 = 1;
 /// Bound on one rendered message or tool line on the visible surface.
@@ -1147,6 +1216,9 @@ pub(crate) fn run_observed(
     io::stdout().flush()?;
 
     command.stdout = Some(spool_file);
+    let mut cache_monitor =
+        cache::Monitor::new(receipt, &harness_core::native_launcher::codex_home()?)?;
+    let mut cache_loss = None;
     let job = Job::new(Limits::default())?;
     let child = job.spawn(&command).map_err(|error| {
         io::Error::other(format!(
@@ -1171,6 +1243,23 @@ pub(crate) fn run_observed(
                         failure = Some(error);
                         break;
                     }
+                    if !matches!(
+                        sink.tracker.observation.state.as_str(),
+                        STATE_COMPLETED | STATE_FAILED | STATE_DEFECT | STATE_INTERRUPTED
+                    ) && let Some(monitor) = &mut cache_monitor
+                    {
+                        match monitor.poll(sink.tracker.observation.session.as_deref(), read > 0) {
+                            Ok(Some(loss)) => {
+                                cache_loss = Some(loss);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
                     if read == 0 {
                         match child.wait_for_exit(Duration::from_millis(0)) {
                             Ok(true) => break,
@@ -1188,7 +1277,7 @@ pub(crate) fn run_observed(
                 }
             }
         }
-        if failure.is_none() {
+        if failure.is_none() && cache_loss.is_none() {
             loop {
                 match tail.read_available() {
                     Ok(0) => break,
@@ -1206,11 +1295,18 @@ pub(crate) fn run_observed(
             }
         }
         if failure.is_none()
+            && cache_loss.is_none()
             && let Some(line) = tail.take_line(true)
             && let Err(error) = sink.line(line)
         {
             failure = Some(error);
         }
+    }
+    if let Some(loss) = cache_loss {
+        let result = stop_cache_run(receipt, tracker, job, loss);
+        tail.discard_remaining();
+        let _ = fs::remove_file(&spool);
+        return result;
     }
     if let Some(error) = failure {
         // The observer failed: stop and reap the owned tree, drain what the

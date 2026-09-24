@@ -1,7 +1,7 @@
 # Start with: codex --profile xai
 # SuperGrok Heavy over native Codex provider. No pay-as-you-go key.
 model_provider = "xai"
-model = "grok-4.6"
+model = "grok-4.7"
 model_reasoning_effort = "xhigh"
 model_catalog_json = "{{CODEX_HOME}}/xai.models.json"
 # The local shim strips the unsupported `external_web_access` field.

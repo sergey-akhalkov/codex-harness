@@ -6,6 +6,8 @@
 #![cfg(windows)]
 
 use serde_json::{Value, json};
+#[path = "fixtures/cache_usage.rs"]
+mod cache_usage;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,7 +16,9 @@ use std::{
 };
 
 fn manager() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
+    std::env::var_os("HARNESS_OBSERVATION_MANAGER_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_codex-harness")))
 }
 
 /// Owned native event fixture: emits the CLI's `exec --json` control-plane
@@ -1113,6 +1117,44 @@ fn observer_failure_terminates_the_owned_tree() {
 }
 
 #[test]
+fn cache_loss_stops_the_observed_launcher_and_descendant_preserving_work() {
+    let run = SeededRun::new();
+    let started = run.root.join("cache-started.json");
+    let descendant_marker = run.root.join("cache-descendant.json");
+    let preserved = run.root.join("workspace/partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let mut host = run.host(
+        "descendant",
+        &[
+            ("CODEX_HOME", &run.root),
+            ("HARNESS_EXECUTOR_FIXTURE_STARTED", &started),
+            ("HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER", &descendant_marker),
+        ],
+    );
+    let launcher = identity_of(&wait_for_marker(&started));
+    let descendant = identity_of(&wait_for_marker(&descendant_marker));
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let rollout = cache_usage::write_loss(&run.root, session);
+    let status = wait_host(&mut host, "cache-loss host");
+    assert!(!status.success());
+    wait_gone(launcher, "cache-loss launcher");
+    wait_gone(descendant, "cache-loss descendant");
+    assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
+    assert!(rollout.exists());
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session);
+    assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
+    let watch = run.watch(&["--timeout", "1"]);
+    assert_eq!(watch.status.code(), Some(1), "{}", text(&watch));
+    assert!(
+        text(&watch).contains("DeepSeek cache loss"),
+        "{}",
+        text(&watch)
+    );
+}
+
+#[test]
 fn killing_the_host_reaps_the_owned_launcher_tree() {
     let run = SeededRun::new();
     let started = run.root.join("fixture-started.json");
@@ -1260,3 +1302,74 @@ fn installed_native_exec_json_event_shape_stays_observed() {
 /// or subscription.
 #[path = "fixtures/succession_responses.rs"]
 mod fixture_responses;
+
+#[test]
+#[ignore = "requires native Codex and owner PowerShell 7; all Responses are local canned events"]
+fn installed_native_cache_loss_stops_before_more_requests() {
+    let exe =
+        PathBuf::from(std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("native Codex path"));
+    assert!(exe.is_absolute() && exe.is_file());
+    let run = SeededRun::new();
+    let home = run.root.join("home");
+    let evidence = run.root.join("evidence");
+    let workspace = run.root.join("workspace");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&evidence).unwrap();
+    fs::write(evidence.join("cache-loss"), "synthetic counters").unwrap();
+    let responses = fixture_responses::Responses::start(evidence.clone());
+    fs::write(home.join("config.toml"), format!(
+        "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'low'\nmodel_provider = 'deepseek'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\napproval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n[model_providers.deepseek]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, workspace.to_string_lossy())).unwrap();
+    let mut receipt = receipt_json(&run.receipt);
+    receipt["launcher"] = json!(exe);
+    receipt["model"] = json!("gpt-6-astra");
+    receipt["modelProvider"] = json!("deepseek");
+    receipt["reasoningEffort"] = json!("low");
+    receipt["args"] = json!([
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-C",
+        workspace,
+        "-o",
+        run.result,
+        "Run the owned fixture commands."
+    ]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let stdout = fs::File::create(run.root.join("native-cache-stdout.txt")).unwrap();
+    let stderr = fs::File::create(run.root.join("native-cache-stderr.txt")).unwrap();
+    let mut host = lead_command()
+        .args(["executor", "run", "--file"])
+        .arg(&run.receipt)
+        .env("CODEX_HOME", &home)
+        .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let status = wait_host(&mut host, "native cache-loss host");
+    let output = fs::read_to_string(run.root.join("native-cache-stdout.txt")).unwrap();
+    let error = fs::read_to_string(run.root.join("native-cache-stderr.txt")).unwrap();
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(status.code(), Some(1), "{output}\n{error}");
+    assert_eq!(
+        receipt["observation"]["state"], "stopped",
+        "{receipt}\n{output}\n{error}"
+    );
+    assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
+    assert_eq!(receipt["cacheGuard"]["lastMissTokens"], 196_000);
+    let requests = fs::read_dir(evidence)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+        .count();
+    assert!(
+        (4..=5).contains(&requests),
+        "request count after real-time stop: {requests}"
+    );
+    println!(
+        "native cache stop: {requests} local requests; per-response counters persisted and the guard stopped the live CLI"
+    );
+}

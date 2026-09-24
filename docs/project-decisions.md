@@ -539,8 +539,8 @@ faithfully unless it risks serious harm. Routine taste choices proceed with
 disclosure, and silence means no material objection was found, not obedience.
 Canonical rule: [portable principles](../global/principles-of-work.md#partnership-and-dissent).
 
-**2026-09-21, confirmed:** the kit's only executor is the configured `ds`
-profile binding DeepSeek V4.1-Flash (`deepseek-flash`) at `max` reasoning
+**2026-09-24, confirmed (supersedes the 2026-09-21 binding):** the kit's only executor is the configured `xai`
+profile binding Grok 4.7 (`grok-4.7`) at `xhigh` reasoning
 effort, and executor dispatch stays profile-only. The configured profile is
 each assignment's complete explicit model/effort selection: per-assignment
 model/effort arguments belong to ordinary in-session agents, a single
