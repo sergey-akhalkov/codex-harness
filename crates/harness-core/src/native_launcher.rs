@@ -10,9 +10,10 @@
 use crate::{build_identity, build_selection, launcher};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     env,
-    ffi::OsString,
-    fs::File,
+    ffi::{OsStr, OsString},
+    fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
     process::Command,
@@ -757,6 +758,497 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
         .code()
         .ok_or_else(|| fail("upstream terminated without an exit code"))?;
     Ok(code)
+}
+
+/// Owned registration record for the installed OpenCode launcher.
+///
+/// The record pins one installed OpenCode executable and its content identity,
+/// so an ordinary launch never follows `PATH`. It is deliberately independent
+/// of Codex profiles, models, providers and configuration: it carries one
+/// executable path with its digest and nothing else, the launcher injects no
+/// Codex-specific environment or arguments, and an unusable record degrades to
+/// a warned resolution of the installed OpenCode instead of blocking it.
+pub const OPENCODE_RECORD_SCHEMA: u32 = 1;
+
+/// Record location inside the harness home of this installation.
+pub const OPENCODE_RECORD_PATH: &str = "harness/opencode-launch.json";
+
+/// Installed command names considered by explicit resolution. A native
+/// executable is adopted directly; a command shim is adopted only through a
+/// verified package layout, because running an unknown script proves nothing
+/// about the program a session would actually start.
+const OPENCODE_CANDIDATES: &[&str] = &["opencode.exe", "opencode.cmd", "opencode.ps1", "opencode"];
+
+/// Published OpenCode package and its native payload inside one package root.
+const OPENCODE_PACKAGE: &str = "opencode-ai";
+const OPENCODE_PACKAGE_BINARY: &str = "bin/opencode.exe";
+/// Bun keeps one global package root and a small launcher under `<home>/.bun/bin`.
+const BUN_GLOBAL_MODULES: &str = "install/global/node_modules";
+
+const OPENCODE_PATH_LIMIT: usize = 256;
+const OPENCODE_VERSION_LIMIT: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeRegistration {
+    pub schema: u32,
+    pub upstream: OpenCodeUpstream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeUpstream {
+    pub executable: PathBuf,
+    pub sha256: String,
+}
+
+/// Record path for one harness home.
+pub fn opencode_record(home: &Path) -> PathBuf {
+    home.join(OPENCODE_RECORD_PATH)
+}
+
+/// Exact owned bytes for one adopted upstream. Installer and launcher share one
+/// shape, so they cannot disagree about what a registration contains.
+pub fn opencode_record_bytes(upstream: &OpenCodeUpstream) -> io::Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&OpenCodeRegistration {
+        schema: OPENCODE_RECORD_SCHEMA,
+        upstream: upstream.clone(),
+    })?)
+}
+
+/// Harness-owned entry points of one installation: the paths whose directories
+/// hold kit commands, plus the content of every existing file among them.
+/// Resolution refuses anything equal to, inside or byte-identical with them, so
+/// a launcher can never discover and re-run this kit's own commands.
+struct OwnedEntryPoints {
+    keys: BTreeSet<String>,
+    hashes: BTreeSet<String>,
+}
+
+/// `installation_state` identity helpers accept drive paths only, while
+/// `canonicalize` returns a verbatim (`\\?\`) path on Windows. Drop only that
+/// prefix before comparing; no other rewriting is permitted.
+fn metadata_key(path: &Path) -> io::Result<String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| fail("OpenCode paths must be Unicode"))?;
+    crate::installation_state::key(Path::new(text.strip_prefix(r"\\?\").unwrap_or(text)))
+}
+
+impl OwnedEntryPoints {
+    fn capture(excluded: &[PathBuf]) -> io::Result<Self> {
+        let mut keys = BTreeSet::new();
+        let mut hashes = BTreeSet::new();
+        for path in excluded {
+            keys.insert(metadata_key(path)?);
+            let Ok(resolved) = path.canonicalize() else {
+                continue;
+            };
+            keys.insert(metadata_key(&resolved)?);
+            let Ok(metadata) = fs::metadata(&resolved) else {
+                continue;
+            };
+            if metadata.is_file()
+                && let Ok(hash) = build_identity::hash_file(&resolved)
+            {
+                hashes.insert(hash);
+            }
+            if metadata.is_dir() {
+                // A harness directory holds this kit's own commands. A copy of
+                // one of them elsewhere on a search path must be refused by
+                // content, not only by the directory it was copied from.
+                for entry in fs::read_dir(&resolved)?.take(OPENCODE_PATH_LIMIT) {
+                    let entry = entry?;
+                    if entry.metadata().is_ok_and(|metadata| metadata.is_file())
+                        && let Ok(hash) = build_identity::hash_file(&entry.path())
+                    {
+                        hashes.insert(hash);
+                    }
+                }
+            }
+        }
+        Ok(Self { keys, hashes })
+    }
+
+    fn refuses(&self, target: &Path, sha256: &str) -> io::Result<bool> {
+        if self.hashes.contains(sha256) {
+            return Ok(true);
+        }
+        let candidate = metadata_key(target)?;
+        Ok(self
+            .keys
+            .iter()
+            .any(|owned| candidate == *owned || candidate.starts_with(&format!("{owned}\\"))))
+    }
+}
+
+fn exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Bounded read of the JSON manifest of one candidate package root.
+fn package_manifest(root: &Path) -> io::Result<Option<serde_json::Value>> {
+    let manifest = root.join("package.json");
+    if !exists(&manifest)? {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    File::open(&manifest)?
+        .take(REGISTRATION_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > REGISTRATION_LIMIT {
+        return Err(fail("OpenCode package metadata exceeds its bound"));
+    }
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+/// The verified native payload of an `opencode-ai` package root. Only the
+/// documented identity decides: the manifest must name the published package
+/// with a bounded version and select `bin/opencode.exe`.
+fn package_payload(root: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(manifest) = package_manifest(root)? else {
+        return Ok(None);
+    };
+    if manifest.get("name").and_then(serde_json::Value::as_str) != Some(OPENCODE_PACKAGE) {
+        return Ok(None);
+    }
+    if manifest
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|version| version.is_empty() || version.len() > OPENCODE_VERSION_LIMIT)
+    {
+        return Ok(None);
+    }
+    let selected = manifest.get("bin").and_then(|bin| match bin {
+        serde_json::Value::String(value) => Some(value.as_str()),
+        _ => bin.get("opencode").and_then(serde_json::Value::as_str),
+    });
+    if !selected.is_some_and(|value| {
+        value
+            .trim_start_matches("./")
+            .eq_ignore_ascii_case(OPENCODE_PACKAGE_BINARY)
+    }) {
+        return Ok(None);
+    }
+    let payload = root.join(OPENCODE_PACKAGE_BINARY);
+    if !exists(&payload)? {
+        return Ok(None);
+    }
+    Ok(Some(payload))
+}
+
+/// Native payload of a verified package behind one candidate path: the
+/// candidate inside a package root, the package beside an npm prefix shim, or
+/// the global package a bun shim launches. `None` means no verified layout.
+fn package_owned_binary(entry: &Path) -> io::Result<Option<PathBuf>> {
+    if entry.is_dir() {
+        return package_payload(entry);
+    }
+    let Some(directory) = entry.parent() else {
+        return Ok(None);
+    };
+    // The candidate is the package payload itself.
+    if entry
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("opencode.exe"))
+        && directory
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+        && let Some(root) = directory.parent()
+        && let Some(payload) = package_payload(root)?
+    {
+        return Ok(Some(payload));
+    }
+    // An npm prefix keeps the shim and `node_modules` side by side.
+    if let Some(payload) = package_payload(&directory.join("node_modules").join(OPENCODE_PACKAGE))?
+    {
+        return Ok(Some(payload));
+    }
+    // Bun keeps the shim in `<home>/.bun/bin` and the global package beside it.
+    if directory
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+        && let Some(bun) = directory.parent()
+        && let Some(payload) =
+            package_payload(&bun.join(BUN_GLOBAL_MODULES).join(OPENCODE_PACKAGE))?
+    {
+        return Ok(Some(payload));
+    }
+    Ok(None)
+}
+
+/// Verify one candidate as an adoptable native executable. `None` refuses it:
+/// not a native executable, not an ordinary file, or harness-owned.
+fn pin_candidate(path: &Path, owned: &OwnedEntryPoints) -> io::Result<Option<OpenCodeUpstream>> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Ok(None);
+    }
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if build_identity::ordinary(&resolved).is_err() || !fs::metadata(&resolved)?.is_file() {
+        return Ok(None);
+    }
+    let sha256 = build_identity::hash_file(&resolved)?;
+    if owned.refuses(&resolved, &sha256)? {
+        return Ok(None);
+    }
+    Ok(Some(OpenCodeUpstream {
+        executable: resolved,
+        sha256,
+    }))
+}
+
+fn adopt(entry: &Path, owned: &OwnedEntryPoints) -> io::Result<Option<OpenCodeUpstream>> {
+    if !entry.is_absolute() {
+        return Err(fail("OpenCode upstream must be an absolute path"));
+    }
+    if let Some(payload) = package_owned_binary(entry)? {
+        return pin_candidate(&payload, owned);
+    }
+    let native = entry
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("opencode.exe"));
+    if !native {
+        // A command shim without a verified package layout cannot prove which
+        // program it starts, so it is not adopted.
+        return Ok(None);
+    }
+    pin_candidate(entry, owned)
+}
+
+/// Resolve an installed OpenCode executable for explicit install/update, in the
+/// style of the Codex upstream rules: an explicit selection first, otherwise a
+/// bounded `PATH` lookup. Only native executables are adopted and harness-owned
+/// entry points are excluded, so resolution can never adopt a kit launcher.
+pub fn opencode_resolve(
+    explicit: Option<&Path>,
+    search_path: Option<&OsStr>,
+    excluded: &[PathBuf],
+) -> io::Result<Option<OpenCodeUpstream>> {
+    let owned = OwnedEntryPoints::capture(excluded)?;
+    if let Some(entry) = explicit {
+        return adopt(entry, &owned);
+    }
+    let Some(search_path) = search_path else {
+        return Ok(None);
+    };
+    let directories: Vec<_> = env::split_paths(search_path).collect();
+    if directories.len() > OPENCODE_PATH_LIMIT {
+        return Err(fail("the OpenCode PATH lookup exceeds its bound"));
+    }
+    for directory in directories {
+        if directory.as_os_str().is_empty() || !directory.is_absolute() {
+            continue;
+        }
+        let mut found: Option<OpenCodeUpstream> = None;
+        for name in OPENCODE_CANDIDATES {
+            let entry = directory.join(name);
+            if !exists(&entry)? {
+                continue;
+            }
+            // An unverifiable candidate is skipped rather than fatal: a search
+            // path routinely holds partial or foreign shims, and refusing one
+            // must not hide a usable OpenCode later on the same path.
+            let Ok(Some(candidate)) = adopt(&entry, &owned) else {
+                continue;
+            };
+            match &found {
+                Some(previous) if previous.executable != candidate.executable => {
+                    return Err(fail(
+                        "ambiguous OpenCode commands in one PATH directory; select the intended upstream explicitly",
+                    ));
+                }
+                Some(_) => {}
+                None => found = Some(candidate),
+            }
+        }
+        if let Some(upstream) = found {
+            return Ok(Some(upstream));
+        }
+    }
+    Ok(None)
+}
+
+/// stderr-only notice for an unusable OpenCode registration. stdout belongs to
+/// the payload.
+#[cfg(windows)]
+const OPENCODE_FALLBACK_NOTICE: &str = "codex-harness: OpenCode launch registration unavailable";
+
+#[cfg(windows)]
+const OPENCODE_REGISTRATION_RECOVERY: &str =
+    "run the native install/update with the installed OpenCode on PATH to pin it again";
+
+#[cfg(windows)]
+fn read_registration(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(REGISTRATION_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > REGISTRATION_LIMIT {
+        return Err(fail("OpenCode launch registration exceeds its bound"));
+    }
+    Ok(bytes)
+}
+
+/// The pinned payload of a usable record. A recorded executable that no longer
+/// resolves, is not an ordinary native executable, or names a harness command
+/// is an ordinary launch error: substituting another program would silently
+/// change the requested agent.
+#[cfg(windows)]
+fn pinned_payload(
+    upstream: &OpenCodeUpstream,
+    launcher: &Path,
+    home: &Path,
+) -> io::Result<PathBuf> {
+    if !upstream.executable.is_absolute()
+        || !upstream
+            .executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err(fail(
+            "the registered OpenCode upstream is not an absolute native executable; explicit update required",
+        ));
+    }
+    let target = upstream.executable.canonicalize().map_err(|_| {
+        fail("the registered OpenCode upstream is missing or unreachable; explicit update required")
+    })?;
+    if build_identity::ordinary(&target).is_err() || !fs::metadata(&target)?.is_file() {
+        return Err(fail(
+            "the registered OpenCode upstream is not an ordinary native executable; explicit update required",
+        ));
+    }
+    let commands = metadata_key(&home.join("harness/bin"))?;
+    let candidate = metadata_key(&target)?;
+    if candidate == commands
+        || candidate.starts_with(&format!("{commands}\\"))
+        || target == launcher
+        || build_identity::hash_file(&target)? == build_identity::hash_file(launcher)?
+    {
+        return Err(fail(
+            "the registered OpenCode upstream points at a harness launcher; explicit repair required",
+        ));
+    }
+    Ok(target)
+}
+
+/// Warned resolution of the installed OpenCode when the record cannot be used.
+/// The same identity rules as the installer apply, so the fallback can neither
+/// adopt a harness entry point nor run an unknown command shim.
+#[cfg(windows)]
+fn fallback_payload(launcher: &Path, home: &Path, cause: &str) -> io::Result<PathBuf> {
+    let mut excluded = vec![launcher.to_owned(), home.join("harness/bin")];
+    if let Some(build) = launcher.parent() {
+        excluded.push(build.to_owned());
+    }
+    // An ambiguous or unreadable search path degrades to "nothing resolvable",
+    // which the caller reports as the ordinary launch error below.
+    let resolved =
+        opencode_resolve(None, env::var_os("PATH").as_deref(), &excluded).unwrap_or_default();
+    match resolved {
+        Some(upstream) => {
+            eprintln!(
+                "{OPENCODE_FALLBACK_NOTICE}: {cause}; launching the PATH-resolved OpenCode executable {}; scope: this launch is not identity-pinned by the kit; recovery: {OPENCODE_REGISTRATION_RECOVERY}",
+                upstream.executable.display()
+            );
+            Ok(upstream.executable)
+        }
+        None => Err(fail(
+            "OpenCode is not registered and no installed OpenCode executable was found on the PATH; run the native install/update with the installed OpenCode on PATH",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn opencode_payload(launcher: &Path, home: &Path) -> io::Result<PathBuf> {
+    let launcher = launcher.canonicalize()?;
+    let bytes = match read_registration(&opencode_record(home)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return fallback_payload(&launcher, home, "the record is absent");
+        }
+        Err(error) => {
+            return fallback_payload(
+                &launcher,
+                home,
+                &format!("the record could not be read ({error})"),
+            );
+        }
+    };
+    match serde_json::from_slice::<OpenCodeRegistration>(&bytes) {
+        Ok(registration) if registration.schema == OPENCODE_RECORD_SCHEMA => {
+            pinned_payload(&registration.upstream, &launcher, home)
+        }
+        _ => fallback_payload(
+            &launcher,
+            home,
+            "the record is not a schema 1 OpenCode registration",
+        ),
+    }
+}
+
+/// Launch the installed OpenCode payload.
+///
+/// The payload is the executable pinned by the owned registration record; when
+/// that record is absent, unreadable or foreign the launch warns on stderr and
+/// continues with the installed OpenCode resolved from `PATH` instead of
+/// failing, so kit behavior survives a Codex home that was moved or never
+/// registered. Arguments, environment, working directory, console, streams and
+/// the exit code are forwarded unchanged, and no Codex-specific environment or
+/// model selection is added. The payload is created inside the account shared
+/// CPU budget (outer) and this session's lifecycle Job (inner) before it can
+/// run; a CPU admission failure warns and starts the same payload once outside
+/// the shared allowance, exactly like a Codex session.
+#[cfg(windows)]
+pub fn run_opencode(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32> {
+    // An unusable payload must fail as an error, not as a desktop loader dialog.
+    crate::process::suppress_loader_dialogs();
+    let payload = opencode_payload(executable, home)?;
+    let mut spec = crate::process::CommandSpec::new(payload);
+    spec.args = args.to_vec();
+    spec.inherit_console = true;
+    let _console = ConsoleHandler::install()?;
+    let job = crate::process::Job::new(crate::process::Limits::default())?;
+    // The ordered pair keeps the account CPU budget outside this session's
+    // lifecycle Job. Every failed attempt below is terminated while still
+    // suspended, so no payload code has run and no work is replayed.
+    let admission = session_cpu_admission();
+    let child = match &admission.budget {
+        Some(budget) => match budget.spawn(&job, &spec) {
+            Ok(child) => child,
+            Err(error) => {
+                warn_cpu_fallback(
+                    &admission.requested,
+                    "session placement",
+                    &format!("the ordered payload placement was refused ({error})"),
+                    CPU_PLACEMENT_RECOVERY,
+                );
+                job.spawn(&spec)?
+            }
+        },
+        None => job.spawn(&spec)?,
+    };
+    Ok(job.wait_session_root(&child)? as i32)
+}
+
+#[cfg(not(windows))]
+pub fn run_opencode(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32> {
+    let _ = (executable, home, args);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the installed OpenCode launch requires Windows 10+ Job Objects",
+    ))
 }
 
 #[cfg(all(test, windows))]

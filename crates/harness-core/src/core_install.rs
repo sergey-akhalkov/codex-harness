@@ -20,6 +20,8 @@ use crate::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsStr,
     fs, io,
     io::Read,
     path::{Path, PathBuf},
@@ -55,6 +57,9 @@ pub struct Report {
     pub changed_links: usize,
     pub path_change: bool,
     pub runtime: Option<core_runtime::RuntimeReceipt>,
+    /// Owned OpenCode launch registration of this installation. Counted
+    /// separately from `links`: it is one record, not a linked destination.
+    pub opencode: OpenCodeReport,
 }
 
 #[derive(Serialize)]
@@ -568,6 +573,139 @@ impl Plan {
     }
 }
 
+/// Owned OpenCode launch registration of one installed home.
+#[derive(Debug, Serialize)]
+pub struct OpenCodeReport {
+    /// `absent`, `created`, `updated`, `unchanged`, `foreign` or `unavailable`.
+    pub action: &'static str,
+    /// Whether the kit's OpenCode launcher will find a usable record with the
+    /// adopted executable once this operation has finished.
+    pub registered: bool,
+    /// Owned record path inside the harness home.
+    pub record: PathBuf,
+    /// Adopted OpenCode executable, when one was verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<PathBuf>,
+}
+
+enum LiveRecord {
+    Absent,
+    Ours(Vec<u8>),
+    Foreign,
+}
+
+fn live_opencode_record(record: &Path) -> LiveRecord {
+    match ConfigSnapshot::read(record) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => LiveRecord::Absent,
+        Err(_) => LiveRecord::Foreign,
+        Ok(snapshot) => match serde_json::from_slice::<native_launcher::OpenCodeRegistration>(
+            snapshot.contents(),
+        ) {
+            Ok(registration) if registration.schema == native_launcher::OPENCODE_RECORD_SCHEMA => {
+                LiveRecord::Ours(snapshot.contents().to_vec())
+            }
+            _ => LiveRecord::Foreign,
+        },
+    }
+}
+
+/// One staged publication: a new record appears whole or not at all, and an
+/// existing one is replaced under its captured object identity.
+fn publish_opencode_record(record: &Path, live: &LiveRecord, bytes: &[u8]) -> io::Result<()> {
+    match live {
+        LiveRecord::Ours(_) => {
+            ConfigSnapshot::read(record)?.replace(bytes)?;
+        }
+        LiveRecord::Absent => {
+            if let Some(parent) = record.parent()
+                && !parent.is_dir()
+            {
+                inventory::ordinary_parents(parent)?;
+                fs::create_dir_all(parent)?;
+            }
+            StagedFile::create(record, bytes)?.commit()?;
+        }
+        LiveRecord::Foreign => {
+            return Err(io::Error::other(
+                "foreign OpenCode launch record; preserving it",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Publish or refresh the owned OpenCode launch record of one installed home.
+///
+/// Identity is proven once, at explicit install or update; an ordinary OpenCode
+/// launch then follows the pinned record without any discovery. Repeated
+/// installation is idempotent: an identical record is left untouched, a record
+/// whose adopted upstream changed is replaced as one staged object, and a
+/// foreign file is preserved untouched. Nothing here reads or writes Codex
+/// profiles, models, providers, `config.toml` or the adopted OpenCode
+/// installation, so OpenCode availability never depends on Codex
+/// configuration. An installation without an installed OpenCode keeps working:
+/// the report says `absent` and no record is created.
+pub fn configure_opencode(
+    codex_home: &Path,
+    build: Option<&Path>,
+    search_path: Option<&OsStr>,
+    preview: bool,
+) -> io::Result<OpenCodeReport> {
+    let home = plain(codex_home)?;
+    let record = native_launcher::opencode_record(&home);
+    let mut excluded = vec![home.join("harness/bin")];
+    if let Some(build) = build {
+        excluded.push(build.to_owned());
+    }
+    if let Ok(launcher) = env::current_exe() {
+        excluded.push(launcher);
+    }
+    // A missing, ambiguous or unreadable search path never blocks the Codex
+    // installation: without a verified upstream there is simply no record.
+    let adopted =
+        native_launcher::opencode_resolve(None, search_path, &excluded).unwrap_or_default();
+    let Some(upstream) = adopted else {
+        return Ok(OpenCodeReport {
+            action: "absent",
+            registered: false,
+            record,
+            executable: None,
+        });
+    };
+    let bytes = native_launcher::opencode_record_bytes(&upstream)?;
+    let live = live_opencode_record(&record);
+    let action = match &live {
+        LiveRecord::Absent => "created",
+        LiveRecord::Ours(current) if *current == bytes => "unchanged",
+        LiveRecord::Ours(_) => "updated",
+        LiveRecord::Foreign => {
+            return Ok(OpenCodeReport {
+                action: "foreign",
+                registered: false,
+                record,
+                executable: None,
+            });
+        }
+    };
+    if !preview && let Err(error) = publish_opencode_record(&record, &live, &bytes) {
+        eprintln!(
+            "codex-harness: the OpenCode launch registration was not published ({error}); the Codex connection is unaffected; rerun the install/update to retry"
+        );
+        return Ok(OpenCodeReport {
+            action: "unavailable",
+            registered: false,
+            record,
+            executable: None,
+        });
+    }
+    Ok(OpenCodeReport {
+        action,
+        registered: true,
+        record,
+        executable: Some(upstream.executable),
+    })
+}
+
 /// Explicit native core connection; dependency and subscription components are
 /// selected by the outer manager. Preview performs no publication or execution.
 pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
@@ -581,6 +719,12 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
             changed_links: plan.planned_changes,
             path_change: !plan.path.is_noop(),
             runtime: None,
+            opencode: configure_opencode(
+                &request.codex_home,
+                Some(&request.build),
+                env::var_os("PATH").as_deref(),
+                true,
+            )?,
         });
     }
     let manifest: crate::inventory::Manifest =
@@ -662,6 +806,15 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
             connection: Connection::Missing,
         });
     }
+    // The OpenCode record is published before the journaled core transaction and
+    // independently of it: Codex availability must not depend on an optional
+    // agent, and the resumed next run repairs any interrupted publication.
+    let opencode = configure_opencode(
+        &request.codex_home,
+        Some(&request.build),
+        env::var_os("PATH").as_deref(),
+        false,
+    )?;
     let changed: BTreeSet<_> = plan
         .changes
         .iter()
@@ -737,6 +890,7 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
             + applied.changed_links.len(),
         path_change: !plan.path.is_noop(),
         runtime,
+        opencode,
     })
 }
 
