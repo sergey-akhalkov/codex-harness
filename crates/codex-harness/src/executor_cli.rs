@@ -63,12 +63,12 @@ const USAGE: &str = concat!(
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
     "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default exec mode hosts one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend; a finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. The explicit tui mode still keeps its interactive launcher; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
+    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend; a finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
     "`executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifies each by the recorded identity and boundedly terminates survivors so a child command is reported actually terminated instead of assumed ended with the host. The stopped run's tab closes because that run's own host process ends, and the recorded tab identity is verified closed through the terminal-surface owner; no terminal command is ever sent, so the lead's window, sibling tabs and other conversations are untouched. The receipt gets a stop record with outcome stopped, already-stopped, already-completed, partial or error, honest timestamps, the measured duration, the observed exit code (one that was never observed stays unknown), the pending-message undelivered marking, and the named survivor, cause and next action on partial failure; a repeated stop reports the recorded state and keeps the first stop's outcome, timestamps and measured duration, a stop racing natural completion reports the completed result, and nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). ",
-    "`executor message` delivers one literal correction into the addressed run's own live conversation: the text of --text or the verbatim content of a UTF-8 --file (no shell evaluation, real line breaks preserved), addressed by --source, --codex-home, --slot, --owner and, when given, the exact --session the dispatch receipt recorded. It verifies the recorded slot binding, the owner, the exact session, the live lease, the recorded host and app-server child, and the live conversation itself - recorded session identity, the addressed slot as its working directory and the receipt's resolved model/provider/reasoning effort - before delivering, so input cannot reach a later occupant of a reused slot and cannot enter a conversation routed differently. Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread, and no new conversation, hidden stop/resume, model/provider/effort change or re-sent task happens. The result distinguishes delivered (the input is observed in the conversation's own items as a user message correlated by the recorded client message id or its exact text), queued (accepted by the recorded turn; its own items do not show it yet), error (the native endpoint refused; nothing was delivered) and indeterminate (the request was not answered, so whether it was applied is unknown); acceptance is never reported as the executor having applied the correction. Every attempt is recorded with its content identity in the receipt's `messages` field, so the same literal text is one input: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat and names the next action, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state and result with the exact-session continuation remedy, and a surface that records no control endpoint (tui mode or a legacy receipt) is reported as unsupported with the same remedy instead of pretending delivery. Exit codes: 0 delivered, queued or already recorded as delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. ",
+    "`executor message` delivers one literal correction into the addressed run's own live conversation: the text of --text or the verbatim content of a UTF-8 --file (no shell evaluation, real line breaks preserved), addressed by --source, --codex-home, --slot, --owner and, when given, the exact --session the dispatch receipt recorded. It verifies the recorded slot binding, the owner, the exact session, the live lease, the recorded host and app-server child, and the live conversation itself - recorded session identity, the addressed slot as its working directory and the receipt's resolved model/provider/reasoning effort - before delivering, so input cannot reach a later occupant of a reused slot and cannot enter a conversation routed differently. Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread, and no new conversation, hidden stop/resume, model/provider/effort change or re-sent task happens. The result distinguishes delivered (the input is observed in the conversation's own items as a user message correlated by the recorded client message id or its exact text), queued (accepted by the recorded turn; its own items do not show it yet), error (the native endpoint refused; nothing was delivered) and indeterminate (the request was not answered, so whether it was applied is unknown); acceptance is never reported as the executor having applied the correction. Every attempt is recorded with its content identity in the receipt's `messages` field, so the same literal text is one input: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat and names the next action, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state and result with the exact-session continuation remedy, and a surface that records no control endpoint (a historical unmanaged receipt or a legacy receipt) is reported as unsupported with the same remedy instead of pretending delivery. Exit codes: 0 delivered, queued or already recorded as delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. ",
     "Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and its partial work. `executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. `executor message` is the kit's steering command. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified."
 );
 const STARTUP: Duration = Duration::from_secs(20);
@@ -459,6 +459,7 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
             assignment: restart_assignment(&prompt, &session, &predecessor),
             original_assignment: Some(prompt),
             identity: BoundIdentity::resolve(&bound),
+            presentation: NativePresentation::NativeTui,
             port: None,
         }))
     } else {
@@ -522,10 +523,10 @@ fn named_slot(source: &Path, pool_size: u32, workspace: Option<&Path>) -> io::Re
     }
 }
 
-/// `exec` streams the assignment in a visible tab and exits on completion, so
-/// the tab closes itself and corrections reopen the exact session via
-/// `codex resume`. `tui` keeps an interactive conversation for cases that
-/// need a human-attended executor.
+/// `tui` is the default managed native TUI. `exec` keeps that spelling and
+/// uses the qualified native inline presentation on the same observed control
+/// lifecycle. Neither spelling launches an unobserved interactive CLI. The
+/// assignment input `--exec` is not a presentation selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnMode {
     Exec,
@@ -535,8 +536,8 @@ enum SpawnMode {
 impl SpawnMode {
     fn parse(value: Option<&str>) -> io::Result<Self> {
         match value {
-            None | Some("exec") => Ok(Self::Exec),
-            Some("tui") => Ok(Self::Tui),
+            None | Some("tui") => Ok(Self::Tui),
+            Some("exec") => Ok(Self::Exec),
             Some(other) => Err(invalid(&format!(
                 "unknown executor mode {other}; use exec or tui"
             ))),
@@ -548,6 +549,37 @@ impl SpawnMode {
             Self::Exec => "exec",
             Self::Tui => "tui",
         }
+    }
+
+    fn presentation(self) -> NativePresentation {
+        match self {
+            Self::Tui => NativePresentation::NativeTui,
+            Self::Exec => NativePresentation::NativeInline,
+        }
+    }
+}
+/// How a managed conversation is shown. The default and explicit tui spelling
+/// use the full native TUI. Explicit exec uses the native inline TUI so the
+/// supported text/observation contract keeps terminal scrollback. A receipt
+/// written before this field existed keeps the full TUI it was hosted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativePresentation {
+    #[default]
+    NativeTui,
+    NativeInline,
+}
+
+impl NativePresentation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeTui => "native-tui",
+            Self::NativeInline => "native-inline",
+        }
+    }
+
+    fn inline(self) -> bool {
+        matches!(self, Self::NativeInline)
     }
 }
 
@@ -598,6 +630,10 @@ struct ControlReceipt {
     /// started thread and refuses a conversation whose thread reports another
     /// model, provider or reasoning effort.
     identity: BoundIdentity,
+    /// Qualified native surface for this control conversation. Absent on a
+    /// receipt written before the field existed, which keeps the full TUI.
+    #[serde(default)]
+    presentation: NativePresentation,
     /// The loopback port the app-server child must serve, when the caller owns
     /// the endpoint (an acceptance check that provides the server itself).
     /// Ordinary dispatch records none, and the host reserves a free port.
@@ -609,8 +645,8 @@ struct ControlReceipt {
 const CONTROL_SCHEMA: u32 = 1;
 
 /// How the host of one dispatch runs the session: the control-backed
-/// conversation, or the recorded launcher invocation (tui mode, resume and
-/// legacy receipts).
+/// conversation, or the recorded launcher invocation (resume and legacy
+/// receipts). Managed spawn spellings use the control route.
 enum HostRoute {
     Control(Box<ControlReceipt>),
     Launcher(Vec<String>),
@@ -630,6 +666,13 @@ impl HostRoute {
         match self {
             Self::Control(control) => Some(control),
             Self::Launcher(_) => None,
+        }
+    }
+
+    fn presentation_label(&self) -> &'static str {
+        match self {
+            Self::Control(control) => control.presentation.as_str(),
+            Self::Launcher(_) => "launcher",
         }
     }
 }
@@ -686,20 +729,17 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         Err(error) => return Err(release_unused_claim(request, &binding, error)),
     };
     let paths = run_paths(request.codex_home, request.source, binding.index)?;
-    // A pooled exec dispatch is a control-backed conversation: the host starts
-    // the app-server child and drives this assignment through `turn/start`
-    // instead of running `codex exec --json`, so a live correction can reach
-    // the same session. Tui mode keeps its interactive launcher invocation.
-    let route = match request.mode {
-        SpawnMode::Exec => HostRoute::Control(Box::new(ControlReceipt {
-            schema: CONTROL_SCHEMA,
-            assignment: prompt,
-            original_assignment: None,
-            identity: BoundIdentity::resolve(&bound),
-            port: None,
-        })),
-        SpawnMode::Tui => HostRoute::Launcher(tui_args(request.profile, &binding.path, &prompt)?),
-    };
+    // Default and both presentation spellings share one control lifecycle.
+    // The native frontend is attached by the host; explicit exec qualifies
+    // that frontend as inline instead of launching an unobserved CLI.
+    let route = HostRoute::Control(Box::new(ControlReceipt {
+        schema: CONTROL_SCHEMA,
+        assignment: prompt,
+        original_assignment: None,
+        identity: BoundIdentity::resolve(&bound),
+        presentation: request.mode.presentation(),
+        port: None,
+    }));
     launch_bound(request, &binding, route, &bound, &paths)
 }
 
@@ -770,6 +810,17 @@ fn launch_bound(
     println!("{}", slot_summary(binding, request.named_slot));
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
+    // Visible before a missing launcher aborts, so a dispatch that never
+    // opens a window still names the presentation it selected.
+    println!(
+        "executor presentation: mode={} presentation={} model={} provider={} effort={} cwd={}",
+        request.mode.as_str(),
+        route.presentation_label(),
+        bound.model.as_deref().unwrap_or("unknown"),
+        bound.model_provider.as_deref().unwrap_or("unknown"),
+        bound.reasoning_effort.as_deref().unwrap_or("default"),
+        binding.path.display()
+    );
     let receipt = paths.receipt.clone();
     let launcher = request.codex_home.join("harness/bin/codex.exe");
     if !launcher.is_file() {
@@ -780,21 +831,15 @@ fn launch_bound(
             binding.owner
         )));
     }
-    // The observation covers this run only: exec mode records the native
-    // event stream and its result file, tui mode records that coverage is
-    // unavailable instead of guessing an identity.
-    let mut run = match request.mode {
-        SpawnMode::Exec => RunObservation::accepted(paths.result.clone(), paths.detail.clone()),
-        SpawnMode::Tui => RunObservation::unavailable(
-            "tui mode keeps a human conversation with no machine-readable event stream; native identity and result coverage are unavailable",
-        ),
-    };
+    // Managed spellings record native coverage. A launcher route (resume,
+    // legacy) still records coverage when its mode is observed exec; it does
+    // not guess an identity for a receipt that already says coverage is
+    // unavailable.
+    let mut run = RunObservation::accepted(paths.result.clone(), paths.detail.clone());
     run.previous_session = request.resumed_session.map(str::to_owned);
-    if request.mode == SpawnMode::Exec {
-        // A stale final message from an earlier run must never read as this
-        // run's result.
-        let _ = fs::remove_file(&paths.result);
-    }
+    // A stale final message from an earlier run must never read as this
+    // run's result.
+    let _ = fs::remove_file(&paths.result);
     let shell = crate::executor_shell::prepare(
         &launcher,
         request.codex_home,
@@ -1619,12 +1664,27 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             return Ok(2);
         }
         if run.coverage != COVERAGE_NATIVE {
-            println!(
-                "executor watch: the recorded run has no native coverage (state={}): {}",
-                run.state,
+            // Historical unmanaged receipts still use this constructor's
+            // coverage and state. Reconstructing from the recorded reason
+            // keeps that definition live without changing the printed report.
+            let historical = RunObservation::unavailable(
                 run.reason
                     .as_deref()
-                    .unwrap_or("this mode records no event stream")
+                    .unwrap_or("this mode records no event stream"),
+            );
+            let state = if run.state == historical.state {
+                historical.state.as_str()
+            } else {
+                run.state.as_str()
+            };
+            let reason = run
+                .reason
+                .as_deref()
+                .or(historical.reason.as_deref())
+                .unwrap_or("this mode records no event stream");
+            println!(
+                "executor watch: the recorded run has no native coverage (state={}): {}",
+                state, reason
             );
             return Ok(2);
         }
@@ -2096,15 +2156,19 @@ fn native_run(value: &serde_json::Value) -> Option<RunObservation> {
 /// A receipt that names the control route is hosted only by the control
 /// driver: its recorded launcher arguments are empty by construction, so there
 /// is no `codex exec` invocation to fall back to and a startup failure stays a
-/// failure.
+/// failure. Default and explicit tui receipts use this route; a historical
+/// unmanaged receipt has no control object and stays on its recorded path.
 fn control_route(value: &serde_json::Value) -> io::Result<Option<ControlReceipt>> {
     let control = &value["control"];
     if control.is_null() {
         return Ok(None);
     }
-    if value["mode"].as_str().is_some_and(|mode| mode != "exec") {
+    if value["mode"]
+        .as_str()
+        .is_some_and(|mode| mode != "exec" && mode != "tui")
+    {
         return Err(invalid(
-            "executor run receipt records a control route outside exec mode; refusing to host it",
+            "executor run receipt records a control route for an unsupported mode; refusing to host it",
         ));
     }
     let control: ControlReceipt = serde_json::from_value(control.clone())
@@ -2322,9 +2386,13 @@ fn run_control_receipt(
     host_control_conversation(receipt, control, &plan, run, result, header)
 }
 
-/// The canned executor fixture keeps the existing renderer. Ordinary pooled
-/// spawn does not set that switch, so its host attaches the native TUI instead
-/// of substituting a text stream.
+/// The canned `exec --json` fixture has no native TUI and cannot attach
+/// `codex resume --remote`. While `HARNESS_EXECUTOR_FIXTURE_MODE` is set, the
+/// host keeps the event renderer so those checks can read messages and tool
+/// activity. That renderer is the remaining compatibility adapter for the
+/// missing native surface; it is not a second delivered presentation.
+/// Ordinary pooled spawn does not set the switch, so its host attaches the
+/// native frontend instead of substituting a text stream.
 fn native_frontend_required() -> bool {
     std::env::var_os("HARNESS_EXECUTOR_FIXTURE_MODE").is_none()
 }
@@ -2433,10 +2501,13 @@ fn fail_with_frontend(
 /// Launches `codex resume --remote` against the bound thread. The capability
 /// token stays in the environment. Permission overrides stay on the backend;
 /// remote resume rejects them. The assignment is not an argument, so the
-/// frontend cannot submit it.
+/// frontend cannot submit it. Explicit exec adds `--no-alt-screen` so the
+/// native inline TUI keeps the text/scrollback contract. Both spellings pin
+/// `agents.enabled=false`; that config override is not a permission override.
 fn attach_owned_frontend(
     plan: &ControlPlan,
     conversation: &Conversation,
+    presentation: NativePresentation,
 ) -> io::Result<OwnedFrontend> {
     // A redirected standard stream can still inherit the caller's console.
     // That is not a surface this host may give the TUI.
@@ -2459,14 +2530,14 @@ fn attach_owned_frontend(
     let mut spec = CommandSpec::new(&upstream);
     spec.inherit_console = true;
     spec.current_dir = Some(plan.slot.clone());
-    spec.args = vec![
-        "--remote".into(),
-        format!("ws://127.0.0.1:{}", conversation.endpoint().port()).into(),
-        "--remote-auth-token-env".into(),
-        FRONTEND_TOKEN_ENV.into(),
-        "resume".into(),
-        conversation.thread_id().into(),
-    ];
+    spec.args = frontend_args(
+        conversation.endpoint().port(),
+        conversation.thread_id(),
+        presentation,
+    )
+    .into_iter()
+    .map(Into::into)
+    .collect();
     spec.env.insert(
         "CODEX_HOME".into(),
         Some(plan.home.as_os_str().to_os_string()),
@@ -2494,6 +2565,25 @@ fn attach_owned_frontend(
         process,
         program: upstream,
     })
+}
+
+/// Global options before `resume`. The thread id is the only positional, so
+/// the frontend cannot submit the assignment.
+fn frontend_args(port: u16, thread_id: &str, presentation: NativePresentation) -> Vec<String> {
+    let mut args = vec![
+        "--remote".into(),
+        format!("ws://127.0.0.1:{port}"),
+        "--remote-auth-token-env".into(),
+        FRONTEND_TOKEN_ENV.into(),
+        "-c".into(),
+        "agents.enabled=false".into(),
+    ];
+    if presentation.inline() {
+        args.push("--no-alt-screen".into());
+    }
+    args.push("resume".into());
+    args.push(thread_id.to_owned());
+    args
 }
 
 fn wait_for_frontend(
@@ -2611,6 +2701,21 @@ fn host_control_conversation(
     if let Err(error) = verify_recorded_endpoint(plan, &conversation) {
         return fail_control(receipt, &mut tracker, format!("{error}"), plan, Some(job));
     }
+    let backend = control::app_server_spec(plan, conversation.endpoint().port());
+    let backend_args = backend
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The child's stdout owns the control log exclusively, so the command
+    // record is a sibling file. It names the single-agent override and the
+    // token file, never the token.
+    let command_record = plan.paths.log.with_extension("command.txt");
+    let _ = fs::write(
+        &command_record,
+        format!("app-server command: {backend_args}\n"),
+    );
     if attach_frontend {
         note_log(&plan.paths.log, header);
     }
@@ -2627,7 +2732,7 @@ fn host_control_conversation(
                 Some(job),
             );
         }
-        match attach_owned_frontend(plan, &conversation) {
+        match attach_owned_frontend(plan, &conversation, control.presentation) {
             Ok(attached) => {
                 if let Err(error) = wait_for_frontend(&attached, plan, &mut conversation) {
                     let _ = attached.close();
@@ -3544,9 +3649,9 @@ fn dispatch_owned_console(
             "{}",
             spawn_summary(profile, bound, &title, receipt, "owned-console", run)
         );
-        // The console hosts the same tab-host wrapper as the terminal tab, so
-        // the observed JSON stream is rendered readably there instead of
-        // showing the user a raw event log.
+        // The console hosts the same tab-host wrapper as the terminal tab.
+        // The native frontend owns that surface; the wrapper does not render
+        // a second event stream into it.
         let wrapper = std::env::current_exe()
             .map_err(|error| io::Error::other(format!("executor wrapper path: {error}")))?;
         let view = task_view::preserve_foreground(|| {
@@ -3618,17 +3723,6 @@ fn spawn_summary(
         receipt.display(),
         receipt.display()
     )
-}
-
-fn tui_args(profile: &str, workspace: &Path, prompt: &str) -> io::Result<Vec<String>> {
-    let mut args = executor_session_args(profile)?;
-    args.extend(["-C".into(), native_path(workspace)?, prompt.to_owned()]);
-    if args.iter().any(|arg| arg == "exec" || arg == "--json") {
-        return Err(invalid(
-            "executor spawn must open a visible TUI, not headless exec",
-        ));
-    }
-    Ok(args)
 }
 
 /// The verified non-interactive resume order shared with instruction-refresh
@@ -4574,29 +4668,42 @@ mod tests {
     }
 
     #[test]
-    fn tui_args_open_a_profile_session_not_headless_exec() {
-        let args = tui_args("xai", Path::new(r"D:\wt\xai"), "do the work").unwrap();
-        assert_eq!(args[0], "--profile");
-        assert_eq!(args[1], "xai");
-        assert_eq!(args[2], "-c");
-        assert_eq!(args[3], "agents.enabled=false");
-        assert!(args.contains(&"-C".to_string()));
-        assert!(args.contains(&r"D:\wt\xai".to_string()));
-        assert!(!args.iter().any(|arg| arg == "exec" || arg == "--json"));
-        assert!(!args.iter().any(|arg| arg == "--remote"));
-        assert_eq!(args.last().unwrap(), "do the work");
-    }
-
-    #[test]
-    fn pooled_dispatch_keeps_native_worktree_isolation_out_of_the_arguments() {
-        let slot = Path::new(r"D:\wt\proj-wt1");
-        let args = tui_args("xai", slot, "do the work").unwrap();
+    fn frontend_args_qualify_inline_exec_and_keep_the_full_tui_single_agent() {
+        let inline = frontend_args(9, "thread-1", NativePresentation::NativeInline);
+        assert!(inline.contains(&"--remote".to_string()), "{inline:?}");
         assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--worktree" || arg == "--enable" || arg == "worktrees"),
-            "{args:?}"
+            inline.contains(&"--no-alt-screen".to_string()),
+            "{inline:?}"
         );
+        assert!(
+            inline.contains(&"agents.enabled=false".to_string()),
+            "{inline:?}"
+        );
+        assert_eq!(inline.last().unwrap(), "thread-1");
+        assert!(inline.iter().any(|arg| arg == "resume"));
+        assert!(
+            !inline
+                .iter()
+                .any(|arg| arg == "exec" || arg == "--json" || arg == "--worktree")
+        );
+        let full = frontend_args(9, "thread-1", NativePresentation::NativeTui);
+        assert!(!full.contains(&"--no-alt-screen".to_string()), "{full:?}");
+        assert!(
+            full.contains(&"agents.enabled=false".to_string()),
+            "{full:?}"
+        );
+        assert!(
+            !full
+                .iter()
+                .any(|arg| arg == "--worktree" || arg == "--enable")
+        );
+        assert!(
+            inline
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == "agents.enabled=false")
+        );
+        let resume = inline.iter().position(|arg| arg == "resume").unwrap();
+        assert!(inline[..resume].iter().any(|arg| arg == "--no-alt-screen"));
     }
 
     #[test]
@@ -5078,17 +5185,19 @@ mod tests {
 
     #[test]
     fn goal_prefix_is_added_only_without_an_explicit_command() {
-        assert!(SpawnMode::parse(None).is_ok());
+        assert_eq!(SpawnMode::parse(None).unwrap(), SpawnMode::Tui);
         assert_eq!(SpawnMode::parse(Some("tui")).unwrap(), SpawnMode::Tui);
+        assert_eq!(SpawnMode::parse(Some("exec")).unwrap(), SpawnMode::Exec);
+        assert_eq!(SpawnMode::Tui.presentation(), NativePresentation::NativeTui);
+        assert!(SpawnMode::Exec.presentation().inline());
         let error = SpawnMode::parse(Some("headless")).unwrap_err();
         assert!(error.to_string().contains("unknown executor mode"));
     }
 
-    /// The pooled exec route the dispatcher records, hosted by
-    /// `executor run --file`: the receipt carries the exact assignment, the
-    /// binding the started thread must report and no `codex exec` invocation,
-    /// so the host cannot fall back to another backend and the assignment is
-    /// submitted verbatim instead of being wrapped in a goal prefix.
+    /// The pooled route the dispatcher records, hosted by `executor run --file`:
+    /// both spellings carry the exact assignment, the binding the started thread
+    /// must report and no `codex exec` invocation, so the host cannot fall back
+    /// to another backend.
     #[test]
     fn exec_dispatch_records_the_control_route_with_the_resolved_binding() {
         let root =
@@ -5108,6 +5217,8 @@ mod tests {
             sandbox_mode: "danger-full-access".into(),
         };
         let assignment = "Complete the outcome in ASSIGNMENT.md.";
+        let observed =
+            RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
         let exec = root.join("spawn-1.json");
         save_receipt(
             &exec,
@@ -5119,6 +5230,7 @@ mod tests {
                 assignment: assignment.to_owned(),
                 original_assignment: None,
                 identity: BoundIdentity::resolve(&bound),
+                presentation: NativePresentation::NativeInline,
                 port: None,
             })),
             &bound,
@@ -5127,11 +5239,12 @@ mod tests {
             None,
             None,
             &shell,
-            &RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl")),
+            &observed,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&exec).unwrap()).unwrap();
         assert_eq!(value["mode"], "exec");
+        assert_eq!(value["control"]["presentation"], "native-inline");
         assert_eq!(
             value["args"],
             json!([]),
@@ -5151,31 +5264,35 @@ mod tests {
         assert_eq!(value["observation"]["coverage"], "native");
         assert_eq!(value["observation"]["state"], "dispatch-accepted");
 
-        // Tui mode keeps its launcher invocation and records no control route:
-        // the changed route is the exec one only.
         let tui = root.join("spawn-2.json");
         save_receipt(
             &tui,
             Path::new(r"C:\home\harness\bin\codex.exe"),
             "ds",
             SpawnMode::Tui,
-            &HostRoute::Launcher(tui_args("ds", Path::new(r"D:\wt\ds"), assignment).unwrap()),
+            &HostRoute::Control(Box::new(ControlReceipt {
+                schema: CONTROL_SCHEMA,
+                assignment: assignment.to_owned(),
+                original_assignment: None,
+                identity: BoundIdentity::resolve(&bound),
+                presentation: NativePresentation::NativeTui,
+                port: None,
+            })),
             &bound,
             None,
             "windows-terminal-tab",
             None,
             None,
             &shell,
-            &RunObservation::unavailable("tui mode keeps a human conversation"),
+            &observed,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&tui).unwrap()).unwrap();
         assert_eq!(value["mode"], "tui");
-        assert!(value["control"].is_null(), "{value}");
-        assert_eq!(
-            value["args"].as_array().unwrap().last().unwrap(),
-            assignment
-        );
+        assert_eq!(value["control"]["presentation"], "native-tui");
+        assert_eq!(value["args"], json!([]), "{value}");
+        assert_eq!(value["observation"]["coverage"], "native");
+        assert_eq!(value["control"]["assignment"], assignment);
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -561,7 +561,9 @@ fn legacy_and_tui_receipts_keep_their_documented_coverage_limits() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     assert!(text(&out).contains("legacy receipt"), "{}", text(&out));
 
-    // A tui receipt records unavailable coverage instead of an identity.
+    // A historical unmanaged tui receipt records unavailable coverage instead
+    // of an identity. Current explicit tui dispatch is observed; this receipt
+    // is the old shape and must stay honestly limited.
     let run = SeededRun::new();
     let mut receipt = receipt_json(&run.receipt);
     receipt["mode"] = json!("tui");
@@ -1503,6 +1505,7 @@ impl ControlHost {
                         "modelProvider": CONTROL_PROVIDER,
                         "reasoningEffort": CONTROL_EFFORT
                     },
+                    "presentation": "native-inline",
                     "port": server.port
                 },
                 "terminal": null,
@@ -1565,6 +1568,13 @@ impl ControlHost {
         .unwrap();
         fs::write(self.home.join("frontend-title.txt"), self.title()).unwrap();
     }
+
+    fn use_presentation(&self, mode: &str, presentation: &str) {
+        let mut receipt = receipt_json(&self.receipt);
+        receipt["mode"] = json!(mode);
+        receipt["control"]["presentation"] = json!(presentation);
+        fs::write(&self.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    }
 }
 
 fn host_spec(host: &ControlHost) -> CommandSpec {
@@ -1610,34 +1620,45 @@ fn frontend_phases(host: &ControlHost) -> Vec<Value> {
 
 #[test]
 fn attachment_failure_is_reported_before_the_assignment() {
-    let host = ControlHost::new("attach-fail");
-    let out = lead_command()
-        .args(["executor", "run", "--file"])
-        .arg(&host.receipt)
-        .env("CODEX_HOME", &host.home)
-        .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let output = text(&out);
-    assert_ne!(out.status.code(), Some(0), "{output}");
-    assert!(
-        output.contains("no live terminal surface")
-            && output.contains("assignment was not submitted"),
-        "{output}"
-    );
-    assert!(
-        host.server.requests_for("turn/start").is_empty(),
-        "a failed attachment must not submit the assignment: {:?}",
-        host.server.requests_for("turn/start")
-    );
-    assert_eq!(host.server.requests_for("thread/start").len(), 1);
-    let watched = lead_command()
-        .args(["executor", "watch", "--receipt"])
-        .arg(&host.receipt)
-        .output()
-        .unwrap();
-    assert_eq!(watched.status.code(), Some(1), "{}", text(&watched));
+    for (name, mode, presentation) in [
+        ("attach-fail-exec", "exec", "native-inline"),
+        ("attach-fail-tui", "tui", "native-tui"),
+    ] {
+        let host = ControlHost::new(name);
+        host.use_presentation(mode, presentation);
+        let out = lead_command()
+            .args(["executor", "run", "--file"])
+            .arg(&host.receipt)
+            .env("CODEX_HOME", &host.home)
+            .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let output = text(&out);
+        assert_ne!(out.status.code(), Some(0), "{mode}: {output}");
+        assert!(
+            output.contains("no live terminal surface")
+                && output.contains("assignment was not submitted"),
+            "{mode}: {output}"
+        );
+        assert!(
+            host.server.requests_for("turn/start").is_empty(),
+            "{mode}: a failed attachment must not submit the assignment: {:?}",
+            host.server.requests_for("turn/start")
+        );
+        assert_eq!(host.server.requests_for("thread/start").len(), 1, "{mode}");
+        let watched = lead_command()
+            .args(["executor", "watch", "--receipt"])
+            .arg(&host.receipt)
+            .output()
+            .unwrap();
+        assert_eq!(watched.status.code(), Some(1), "{mode}: {}", text(&watched));
+        assert!(
+            !text(&watched).contains("no native coverage"),
+            "{mode}: attachment failure must stay observed: {}",
+            text(&watched)
+        );
+    }
 }
 
 #[path = "fixtures/control_responses.rs"]
@@ -1749,7 +1770,17 @@ fn installed_native_frontend_shows_the_assignment_and_watch_keeps_the_result() {
 
 #[test]
 fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() {
-    let host = ControlHost::new("attach-watch");
+    assert_managed_presentation("attach-watch", "exec", "native-inline", true);
+}
+
+#[test]
+fn explicit_tui_spelling_is_observed_on_the_native_frontend() {
+    assert_managed_presentation("attach-tui", "tui", "native-tui", false);
+}
+
+fn assert_managed_presentation(name: &str, mode: &str, presentation: &str, inline: bool) {
+    let host = ControlHost::new(name);
+    host.use_presentation(mode, presentation);
     let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
     host.register_frontend(&double);
     let mut neighbor = Command::new("pwsh")
@@ -1765,14 +1796,14 @@ fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() 
         thread::sleep(Duration::from_millis(40));
     }
     let turns = host.server.requests_for("turn/start");
-    assert_eq!(turns.len(), 1, "one assignment: {turns:?}");
+    assert_eq!(turns.len(), 1, "{mode}: one assignment: {turns:?}");
     assert_eq!(turns[0]["params"]["threadId"], CONTROL_THREAD);
     assert_eq!(
         turns[0]["params"]["input"],
         json!([{"type": "text", "text": CONTROL_ASSIGNMENT}])
     );
     let started = host.server.requests_for("thread/start");
-    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started.len(), 1, "{mode}: {started:?}");
     assert_eq!(started[0]["params"]["model"], CONTROL_MODEL);
     assert_eq!(started[0]["params"]["modelProvider"], CONTROL_PROVIDER);
     assert_eq!(
@@ -1784,18 +1815,35 @@ fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() 
             .as_str()
             .unwrap_or_default()
             .eq_ignore_ascii_case(&host.slot.to_string_lossy()),
-        "{started:?}"
+        "{mode}: {started:?}"
     );
     let argv = fs::read_to_string(host.home.join("frontend-argv.txt")).unwrap();
-    assert!(argv.contains("resume"), "{argv}");
-    assert!(argv.contains(CONTROL_THREAD), "{argv}");
-    assert!(!argv.contains(CONTROL_ASSIGNMENT), "{argv}");
-    assert!(!argv.contains("--sandbox"), "{argv}");
-    assert!(!argv.to_lowercase().contains("token="), "{argv}");
+    assert!(argv.contains("resume"), "{mode}: {argv}");
+    assert!(argv.contains(CONTROL_THREAD), "{mode}: {argv}");
+    assert!(argv.contains("agents.enabled=false"), "{mode}: {argv}");
+    assert_eq!(
+        argv.contains("--no-alt-screen"),
+        inline,
+        "{mode}: inline={inline} argv={argv}"
+    );
+    assert!(!argv.contains(CONTROL_ASSIGNMENT), "{mode}: {argv}");
+    assert!(!argv.contains("--sandbox"), "{mode}: {argv}");
+    assert!(!argv.contains("--worktree"), "{mode}: {argv}");
+    assert!(!argv.contains("exec"), "{mode}: {argv}");
+    assert!(!argv.to_lowercase().contains("token="), "{mode}: {argv}");
     let token = fs::read_to_string(host.state.join("endpoint-1.token")).unwrap();
     assert!(
         !argv.contains(token.trim()),
-        "the capability token leaked into argv"
+        "{mode}: the capability token leaked into argv"
+    );
+    let backend = fs::read_to_string(host.state.join("endpoint-1.command.txt")).unwrap_or_default();
+    assert!(
+        backend.contains("app-server command:") && backend.contains("agents.enabled=false"),
+        "{mode}: backend single-agent restriction missing: {backend}"
+    );
+    assert!(
+        !backend.contains(token.trim()),
+        "{mode}: the capability token leaked into the control log"
     );
     completion_burst(&host.server);
     let finished = session
@@ -1805,10 +1853,14 @@ fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() 
             Duration::from_secs(5),
         )
         .unwrap();
-    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(
+        finished.outcome.exit_code, 0,
+        "{mode}: {}",
+        finished.transcript
+    );
     assert!(
         !finished.transcript.contains("conversation=control"),
-        "controller output corrupted the frontend surface: {}",
+        "{mode}: controller output corrupted the frontend surface: {}",
         finished.transcript
     );
     assert_eq!(
@@ -1822,13 +1874,13 @@ fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() 
         phases
             .iter()
             .any(|phase| phase["phase"] == "attached" && phase["alive"] == true),
-        "{phases:?}"
+        "{mode}: {phases:?}"
     );
     assert!(
         phases
             .iter()
             .any(|phase| phase["phase"] == "persisted" && phase["alive"] == true),
-        "{phases:?}"
+        "{mode}: {phases:?}"
     );
     let pid = phases[0]["pid"].as_u64().unwrap() as u32;
     let created = phases[0]["creationTime"].as_u64().unwrap();
@@ -1842,10 +1894,13 @@ fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() 
         &user,
     )
     .unwrap();
-    assert!(gone.is_none(), "the owned frontend was still running");
+    assert!(
+        gone.is_none(),
+        "{mode}: the owned frontend was still running"
+    );
     assert!(
         neighbor.try_wait().unwrap().is_none(),
-        "closing the owned frontend stopped a neighboring process"
+        "{mode}: closing the owned frontend stopped a neighboring process"
     );
     let _ = neighbor.kill();
     let watched = lead_command()
@@ -1854,10 +1909,23 @@ fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() 
         .output()
         .unwrap();
     let watched_text = text(&watched);
-    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
-    assert!(watched_text.contains("state=completed"), "{watched_text}");
-    assert!(watched_text.contains(CONTROL_FINAL), "{watched_text}");
-    assert!(watched_text.contains(CONTROL_THREAD), "{watched_text}");
+    assert_eq!(watched.status.code(), Some(0), "{mode}: {watched_text}");
+    assert!(
+        watched_text.contains("state=completed"),
+        "{mode}: {watched_text}"
+    );
+    assert!(
+        watched_text.contains(CONTROL_FINAL),
+        "{mode}: {watched_text}"
+    );
+    assert!(
+        watched_text.contains(CONTROL_THREAD),
+        "{mode}: {watched_text}"
+    );
+    assert!(
+        !watched_text.contains("no native coverage"),
+        "{mode}: native presentation must stay observable: {watched_text}"
+    );
     let _ = host.source;
 }
 
