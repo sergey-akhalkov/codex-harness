@@ -736,8 +736,10 @@ impl RunTracker {
             (STATE_COMPLETED, _) => (
                 STATE_DEFECT,
                 Some(
-                    "the completed turn carries no final assistant message in the thread items"
-                        .to_owned(),
+                    outcome.cause.map(str::to_owned).unwrap_or_else(|| {
+                        "the completed turn carries no final assistant message in the thread items"
+                            .to_owned()
+                    }),
                 ),
                 EXIT_DEFECT,
             ),

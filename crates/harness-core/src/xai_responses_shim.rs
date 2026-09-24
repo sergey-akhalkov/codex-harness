@@ -66,9 +66,25 @@ impl Default for Options {
 }
 
 pub fn run(options: &Options) -> io::Result<()> {
+    run_with_ready(options, || Ok(()))
+}
+
+/// Independent service entry: retain its own Job and CPU allowance until the
+/// shim retires, and stop the bootstrap watchdog only after binding the port.
+#[cfg(windows)]
+pub fn run_service(mut guard: crate::process_service::ServiceGuard, options: &Options) -> ! {
+    let result = run_with_ready(options, || guard.mark_ready());
+    if let Err(error) = &result {
+        eprintln!("xAI compatibility shim service failed: {error}");
+    }
+    guard.exit(if result.is_ok() { 0 } else { 1 })
+}
+
+fn run_with_ready(options: &Options, ready: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", options.port)).map_err(|_| {
         io::Error::other("xai responses shim port unavailable; another shim may be running")
     })?;
+    ready()?;
     serve(
         listener,
         &options.upstream,

@@ -538,6 +538,16 @@ no argv goal hook, so such a prefix is inert text; crash recovery is owned by
 the lead's watcher plus exact-session resume. Interactive `--mode tui` remains
 available for human-attended executors.
 
+**2026-09-24, confirmed:** a failed executor tab closes too. Windows Terminal's
+graceful close-on-exit was leaving the tab open after a non-zero host exit,
+including the frequent case where a completed turn's full-thread final-message
+read exceeds the 1 MiB transport limit and the host exited 2. The tab host
+exits 0 after the outcome is recorded so that tab closes; the receipt, detail
+file and control log remain the inspection surface, and the receipt's exit
+code is unchanged. This supersedes the earlier choice that a failure stays
+visible in the tab. A process killed before the host can exit is unchanged:
+stop still ends that host and reports a tab that did not close.
+
 **2026-09-19/20, confirmed:** the self-improvement loop runs on the consuming
 project's board, not in chat. Lead and executor observations become bounded
 `feedback` tasks; the lead batch-triages at safe boundaries; unique incubator

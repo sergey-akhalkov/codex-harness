@@ -124,9 +124,12 @@ surface. Do not pass
 Steering stays `executor message` (`turn/start`), not TUI keystrokes.
 Spawn returns after the tab or window is open so the lead keeps working.
 The default exec mode streams the assignment in that visible tab and exits on
-completion, leaving the tab's lifetime to the terminal's close-on-exit policy
-rather than a harness-managed close: a successful exit can close the tab while
-a failure stays visible for inspection. A mid-work stop is detected by the
+completion. The tab host then exits 0, including after a recorded failure, so
+Windows Terminal's graceful close-on-exit closes that tab instead of leaving
+it open with "You can now close this terminal". The receipt keeps the real
+state and exit code; inspection is the receipt, detail file and control log,
+not a leftover tab. An owned console still returns the run's own exit code.
+A mid-work stop is detected by the
 lead's watcher and the exact session continues through `codex-harness executor
 resume --slot N --owner ID [--session SESSION_ID]` on its recorded slot, which
 rebinds the slot without resetting partial work; without `--session` it

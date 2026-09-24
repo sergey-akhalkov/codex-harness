@@ -205,6 +205,20 @@ fn run() -> io::Result<i32> {
                     serde_json::from_str(encoded).map_err(|_| invalid())?,
                 )?
             }
+            Some("xai-responses-shim") if expected == "--port" => {
+                verify_serving()?;
+                let port = encoded.parse::<u16>().map_err(|_| invalid())?;
+                if port == 0 {
+                    return Err(invalid());
+                }
+                harness_core::xai_responses_shim::run_service(
+                    guard,
+                    &harness_core::xai_responses_shim::Options {
+                        port,
+                        ..Default::default()
+                    },
+                )
+            }
             _ => return Err(invalid()),
         }
         return Ok(0);

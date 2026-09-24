@@ -781,6 +781,28 @@ impl Conversation {
                 "a control session requires the launcher, the kit home and the bound slot",
             ));
         }
+        if plan.identity.model_provider.as_deref() == Some("xai") {
+            // app-server receives profile settings through -c and thread/start,
+            // so the launcher's --profile xai preparation never runs. Start the
+            // shared transport here, outside the app-server's owned Job.
+            let prepared = (|| -> io::Result<()> {
+                let launcher = plan.launcher.canonicalize()?;
+                let manager = launcher
+                    .parent()
+                    .ok_or_else(|| invalid("launcher has no build directory"))?
+                    .join("codex-harness.exe")
+                    .canonicalize()?;
+                harness_core::native_launcher::ensure_xai_shim(
+                    &manager,
+                    harness_core::xai_responses_shim::DEFAULT_PORT,
+                )
+            })();
+            prepared.map_err(|error| {
+                invalid(format!(
+                    "xAI compatibility shim preparation failed before app-server startup: {error}; check the installed launcher and its sibling codex-harness.exe"
+                ))
+            })?;
+        }
         let (process, connection, endpoint) = spawn_app_server(job, plan)?;
         let mut conversation = Self {
             connection,

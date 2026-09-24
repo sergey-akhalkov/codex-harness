@@ -104,6 +104,37 @@ fn fixture() -> Fixture {
     fixture_with(Answer::Result(thread_start_answer()))
 }
 
+#[test]
+fn xai_transport_failure_precedes_app_server_start() {
+    let mut fixture = fixture_with(Answer::Result(json!({
+        "thread": {"id": THREAD},
+        "model": "grok-4.7",
+        "modelProvider": "xai",
+        "reasoningEffort": "xhigh"
+    })));
+    fixture.plan.identity = BoundIdentity {
+        profile: "xai".into(),
+        model: Some("grok-4.7".into()),
+        model_provider: Some("xai".into()),
+        reasoning_effort: Some("xhigh".into()),
+    };
+    // A usable launcher without its shim manager. This owned directory must
+    // fail before probing the live shim port or spawning the app-server.
+    let launcher = fixture._root.path().join("codex.exe");
+    fs::copy(FIXTURE, &launcher).unwrap();
+    fixture.plan.launcher = launcher;
+    let error = match fixture.start() {
+        Ok(_) => panic!("xAI conversation started without preparing its transport"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("xAI compatibility shim"),
+        "{error}"
+    );
+    assert!(!fixture.marker.exists(), "app-server must not have started");
+    assert!(!fixture.endpoint_path().exists());
+}
+
 fn fixture_with(thread_start: Answer) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let slot = root.path().join("slot");
@@ -1623,6 +1654,94 @@ fn a_hosted_empty_final_message_is_an_output_defect() {
         "{receipt}"
     );
     assert!(!pooled.result_path().exists(), "{receipt}");
+}
+
+#[test]
+fn a_hosted_oversized_thread_read_keeps_the_delivered_message() {
+    let pooled = Pooled::new(
+        "host-oversized",
+        Answer::Result(thread_start_answer()),
+        true,
+    );
+    let mut read = thread_read_answer();
+    read["thread"]["turns"][0]["items"][1]["text"] = json!("x".repeat(1024 * 1024 + 8192));
+    pooled.server.answer("thread/read", Answer::Result(read));
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the host submits the assignment through turn/start",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("result: completed"), "{text}");
+    assert!(!text.contains("owned child tree was terminated"), "{text}");
+    assert!(!text.contains("final message could not be read"), "{text}");
+    assert_eq!(fs::read_to_string(pooled.result_path()).unwrap(), FINAL);
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
+}
+
+#[test]
+fn a_hosted_oversized_thread_read_without_a_message_is_a_defect() {
+    let pooled = Pooled::new(
+        "host-oversized-empty",
+        Answer::Result(thread_start_answer()),
+        true,
+    );
+    let mut read = thread_read_answer();
+    read["thread"]["turns"][0]["items"] =
+        json!([{"id":"c1","type":"commandExecution","command":"echo","exitCode":0}]);
+    read["padding"] = json!("x".repeat(1024 * 1024 + 8192));
+    pooled.server.answer("thread/read", Answer::Result(read));
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the host submits the assignment through turn/start",
+    );
+    pooled
+        .server
+        .push(json!({"method":"thread/started","params":{"thread":{"id":THREAD}}}));
+    pooled.server.push(json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":TURN,"status":"completed"}}}));
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(3), "{text}");
+    assert!(text.contains("result: defect:"), "{text}");
+    assert!(text.contains("transport limit"), "{text}");
+    assert!(!text.contains("owned child tree was terminated"), "{text}");
+    assert!(!pooled.result_path().exists(), "{text}");
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "defect", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 3, "{receipt}");
+}
+
+#[test]
+fn a_hosted_thread_read_rejection_still_fails_the_host() {
+    let pooled = Pooled::new(
+        "host-read-rejected",
+        Answer::Result(thread_start_answer()),
+        true,
+    );
+    pooled.server.answer(
+        "thread/read",
+        Answer::Error(json!({"code": -32603, "message": "thread read refused"})),
+    );
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the host submits the assignment through turn/start",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(text.contains("final message could not be read"), "{text}");
+    assert!(text.contains("owned child tree was terminated"), "{text}");
+    assert!(!pooled.result_path().exists(), "{text}");
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "failed", "{receipt}");
 }
 
 #[test]

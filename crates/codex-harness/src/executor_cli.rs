@@ -62,9 +62,9 @@ const USAGE: &str = concat!(
     "codex-harness executor run LAUNCHER [ARG...]\n",
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
-    "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default exec mode hosts one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, starts the conversation thread at the bound slot with the resolved profile binding pinned on it, submits the assignment through `turn/start`, and renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a startup, read, render or record failure fails the host with its cause instead of running another backend or reporting a successful run. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
-    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. ",
+    "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
+    "The default exec mode hosts one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, starts the conversation thread at the bound slot with the resolved profile binding pinned on it, submits the assignment through `turn/start`, and renders the assignment header, the actual profile/model/provider/effort, assistant messages, tool activity and lifecycle states readably in the session's own titled terminal. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read, render or record failure fails the host with its cause instead of running another backend or reporting a successful run. The tui mode keeps an interactive conversation; its receipt records coverage as unavailable instead of guessing an identity, as do legacy receipts written before observation existed. ",
+    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
     "`executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifies each by the recorded identity and boundedly terminates survivors so a child command is reported actually terminated instead of assumed ended with the host. The stopped run's tab closes because that run's own host process ends, and the recorded tab identity is verified closed through the terminal-surface owner; no terminal command is ever sent, so the lead's window, sibling tabs and other conversations are untouched. The receipt gets a stop record with outcome stopped, already-stopped, already-completed, partial or error, honest timestamps, the measured duration, the observed exit code (one that was never observed stays unknown), the pending-message undelivered marking, and the named survivor, cause and next action on partial failure; a repeated stop reports the recorded state and keeps the first stop's outcome, timestamps and measured duration, a stop racing natural completion reports the completed result, and nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). ",
@@ -1955,9 +1955,12 @@ fn tree_state(path: &Path) -> &'static str {
 }
 
 /// Tab host: forward argv to the launcher and exit with the child's own
-/// status, so an autonomous dispatch observes the real outcome instead of a
-/// fabricated success. Windows Terminal observes that code too, so a failed
-/// session stays visible instead of closing as if it had succeeded.
+/// status, so an owned console and a direct `executor run` observe the real
+/// outcome instead of a fabricated success. A Windows Terminal tab passes
+/// `--close-tab`: that process exits 0 after the session returns, including a
+/// recorded failure, because the terminal's graceful close-on-exit otherwise
+/// leaves the tab open. The receipt keeps the run's state and exit code; the
+/// tab process code is only the close signal.
 ///
 /// The host is the process that lives for one dispatched session - a terminal
 /// tab started by the terminal, or the owned console of a dispatch - and it is
@@ -1968,6 +1971,22 @@ fn tree_state(path: &Path) -> &'static str {
 /// Admission failure keeps the visible fail-open contract: the session still
 /// starts once, outside verified coverage.
 fn run_exec(args: &[OsString]) -> io::Result<i32> {
+    if args.iter().any(|arg| arg == "--close-tab") {
+        let kept: Vec<OsString> = args
+            .iter()
+            .filter(|arg| *arg != "--close-tab")
+            .cloned()
+            .collect();
+        // The receipt is already the outcome. Exit 0 so Windows Terminal
+        // closes the tab; do not let that code be read as a successful run.
+        return match run_exec(&kept) {
+            Ok(_) => Ok(0),
+            Err(error) => {
+                eprintln!("codex-harness: {error}");
+                Ok(0)
+            }
+        };
+    }
     if args.len() == 2 && args[0] == "--file" {
         return run_receipt(&args[1]);
     }
@@ -2395,7 +2414,7 @@ fn host_control_conversation(
         &mut stdout,
         &mut cache_monitor,
     ) {
-        Ok(state) => state,
+        Ok(driven) => driven,
         Err(error) => {
             if error
                 .get_ref()
@@ -2417,6 +2436,7 @@ fn host_control_conversation(
             );
         }
     };
+    let (state, streamed_message) = state;
     // The turn's own status is terminal. The final message comes from the
     // thread's items, never from a transport acknowledgement.
     let (final_message, cause) = match state {
@@ -2438,6 +2458,30 @@ fn host_control_conversation(
             }
             Ok(FinalMessage::Empty) => (Some(observation::FinalMessage::Empty), None),
             Ok(FinalMessage::Missing) => (Some(observation::FinalMessage::Missing), None),
+            Err(error) if transport_limit_exceeded(&error) => {
+                if let Some(text) = streamed_message {
+                    if let Err(write_error) = observation::write_final_message(&result, &text) {
+                        return fail_control(
+                            receipt,
+                            &mut tracker,
+                            format!(
+                                "the final message could not be recorded at {}: {write_error}",
+                                result.display()
+                            ),
+                            plan,
+                            Some(job),
+                        );
+                    }
+                    (Some(observation::FinalMessage::Present), None)
+                } else {
+                    (
+                        Some(observation::FinalMessage::Missing),
+                        Some(format!(
+                            "the full-thread final-message read exceeded the transport limit and the turn delivered no assistant message: {error}"
+                        )),
+                    )
+                }
+            }
             Err(error) => {
                 return fail_control(
                     receipt,
@@ -2533,9 +2577,10 @@ fn drive_control(
     detail: Option<&Path>,
     stdout: &mut io::Stdout,
     cache_monitor: &mut Option<observation::cache::Monitor>,
-) -> io::Result<Lifecycle> {
+) -> io::Result<(Lifecycle, Option<String>)> {
     let mut truncation_noted = false;
     let mut grace: Option<Instant> = None;
+    let mut streamed_message = None;
     loop {
         let events = conversation.pump()?;
         let empty = events.is_empty();
@@ -2575,6 +2620,9 @@ fn drive_control(
                 }
             }
             event.render(stdout)?;
+            if let Some(text) = completed_agent_message(event) {
+                streamed_message = Some(text);
+            }
             let state = event.lifecycle.map(Lifecycle::receipt_state);
             let completed = (event.method.as_deref() == Some("item/completed"))
                 .then(|| event.raw["params"]["item"]["type"].as_str())
@@ -2588,11 +2636,37 @@ fn drive_control(
         {
             match grace {
                 None => grace = Some(Instant::now() + CONTROL_TAIL_GRACE),
-                Some(until) if empty || Instant::now() >= until => return Ok(state),
+                Some(until) if empty || Instant::now() >= until => {
+                    return Ok((state, streamed_message));
+                }
                 Some(_) => {}
             }
         }
     }
+}
+
+/// The full text of a completed assistant item already delivered on this turn.
+/// Token deltas are not a message; the completed item carries the text.
+fn completed_agent_message(event: &control::ControlEvent) -> Option<String> {
+    if event.method.as_deref() != Some("item/completed") {
+        return None;
+    }
+    let item = &event.raw["params"]["item"];
+    if item["type"] != "agentMessage" {
+        return None;
+    }
+    let text = item["text"].as_str()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+/// True when the control transport rejected one record for exceeding its size
+/// limit. Other read failures are not this condition.
+fn transport_limit_exceeded(error: &io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Space limit exceeded") || text.contains("Message too long")
 }
 
 /// Fails one control-backed run honestly: the receipt records a failed state
@@ -2927,6 +3001,7 @@ fn terminal_tab_args(
         "run".into(),
         "--file".into(),
         escape_wt_commandline(&native_path(receipt)?),
+        "--close-tab".into(),
     ]);
     if args.iter().any(|arg| {
         arg == "--focus"
@@ -4224,6 +4299,7 @@ mod tests {
         assert_eq!(args[wrapper + 2], "run");
         assert_eq!(args[wrapper + 3], "--file");
         assert_eq!(args[wrapper + 4], r"C:\wt\xai\executor-spawn.json");
+        assert_eq!(args[wrapper + 5], "--close-tab");
         assert!(
             !args.iter().any(|arg| {
                 arg == "--focus" || arg == "-f" || arg == "--maximized" || arg == "-M"
@@ -4801,6 +4877,7 @@ mod tests {
         assert!(joined.contains(
             r"D:\harness\codex-harness.exe executor run --file C:\wt\xai\executor-spawn.json",
         ));
+        assert!(joined.contains("--close-tab"));
         assert!(!joined.contains('/'));
         let profile = args
             .iter()
@@ -4830,6 +4907,43 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(code, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn close_tab_exits_zero_after_a_failed_child() {
+        let root = std::env::temp_dir().join(format!("executor-close-tab-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let receipt = root.join("executor-spawn.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "launcher": r"C:/Windows/System32/cmd.exe",
+                "args": ["/c", "exit 2"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let failed = run_exec(&[
+            OsString::from("--file"),
+            OsString::from(receipt.as_os_str()),
+        ])
+        .unwrap();
+        assert_eq!(
+            failed, 2,
+            "without the tab flag the child exit code is preserved"
+        );
+        let closed = run_exec(&[
+            OsString::from("--close-tab"),
+            OsString::from("--file"),
+            OsString::from(receipt.as_os_str()),
+        ])
+        .unwrap();
+        assert_eq!(
+            closed, 0,
+            "the tab host exits 0 so the terminal closes the tab"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

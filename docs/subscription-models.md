@@ -51,8 +51,12 @@ codex --profile zai
 Ordinary `codex` uses the shared GPT-6 Astra default. Grok is opt-in via
 `--profile xai` (model `grok-4.7`, provider `xai`, reasoning `xhigh`).
 Z.AI GLM-5.3 is opt-in via `--profile zai`. The launcher starts the shim
-only for `xai`-profile invocations; it self-exits when no `codex.exe` process
-remains.
+for `xai`-profile invocations. An observed executor with the resolved `xai`
+provider prepares the same shim before starting its app-server, independently
+of an interactive session. The shim starts outside that app-server's cleanup
+Job so ending one executor preserves the shared transport. The existing native
+service bootstrap also keeps it outside temporary preflight/tool Jobs and
+releases caller output pipes.
 Role routing for orchestrated executors lives in
 [orchestration configuration](agent-delegation.md#orchestration-configuration).
 The started process is the selected build's `codex-harness.exe`. A leftover
@@ -149,6 +153,21 @@ only shared state is an atomic connection counter. Multiple concurrent Grok
 sessions are safe.
 
 ## Update, stop and recovery
+
+`Reconnecting... waiting for network` with no HTTP status can indicate an
+unavailable local shim, rather than an OAuth refusal. Check its identity
+endpoint before changing credentials. Executor startup verifies the shim and
+reports preparation errors before submitting the assignment. Opening an
+interactive xAI session also prepares the shim, but is not a required executor
+warmup. A recovered connection alone does not establish why a prior shim exited.
+
+The [transport regression](../crates/codex-harness/tests/xai_transport.rs) runs
+real shim processes on owned ephemeral ports, covering concurrent cold start,
+reuse, preflight Job cleanup and output EOF without OAuth or provider requests:
+`codex-harness heavy -- cargo test --locked -p codex-harness --test xai_transport --jobs 1 -- --test-threads=1`.
+For installed acceptance, set `HARNESS_ACCEPTANCE_XAI_MANAGER` to the installed
+manager and run that compiled test executable from an owned directory outside
+the checkout. The helper test is invoked internally; do not add `--ignored`.
 
 ```powershell
 & <build>\codex-harness.exe update     --subscriptions-only --source . --codex-home <CODEX_HOME> --user-home <USER_HOME>
