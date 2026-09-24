@@ -417,6 +417,50 @@ fn pooled_spawn_derives_and_synchronizes_a_slot_before_launch() {
 }
 
 #[test]
+fn pooled_spawn_defaults_to_the_native_tui_and_qualifies_both_spellings() {
+    let fixture = Fixture::new("presentation", 1);
+    fs::write(
+        fixture.home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+    )
+    .unwrap();
+    for (extra, mode, presentation) in [
+        (&[][..], "tui", "native-tui"),
+        (&["--mode", "tui"][..], "tui", "native-tui"),
+        (&["--mode", "exec"][..], "exec", "native-inline"),
+    ] {
+        let out = fixture.spawn(extra);
+        let text = output_text(&out);
+        assert!(!out.status.success(), "{mode}: {text}");
+        assert!(
+            text.contains("installed Codex launcher is missing"),
+            "{mode}: dispatch must stop before a model request: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "executor presentation: mode={mode} presentation={presentation} model=deepseek-flash provider=deepseek effort=max cwd="
+            )),
+            "{mode}: {text}"
+        );
+        assert!(
+            text.contains(&fixture.slot(1).display().to_string()),
+            "{mode}: cwd is not the bound slot: {text}"
+        );
+        assert!(!text.contains("coverage=unavailable"), "{mode}: {text}");
+        assert!(!text.contains("interactive launcher"), "{mode}: {text}");
+        assert!(
+            !text.contains("turn/start") && !text.contains("assignment was submitted"),
+            "{mode}: {text}"
+        );
+    }
+    let unknown = fixture.spawn(&["--mode", "headless"]);
+    let text = output_text(&unknown);
+    assert!(text.contains("unknown executor mode"), "{text}");
+    assert!(!text.contains("executor presentation:"), "{text}");
+    fixture.drop();
+}
+
+#[test]
 fn a_live_session_host_keeps_its_slot_from_other_dispatches() {
     let fixture = Fixture::new("liveness", 1);
     assert!(!fixture.spawn(&["--owner", "exec-live"]).status.success());
@@ -1111,10 +1155,9 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
         "the dispatch receipt is kit-local state, not executor work"
     );
     assert_eq!(receipt["profile"], "xai");
-    assert_eq!(receipt["args"][0], "--profile");
-    assert_eq!(receipt["args"][1], "xai");
-    assert_eq!(receipt["args"][2], "-c");
-    assert_eq!(receipt["args"][3], "agents.enabled=false");
+    assert_eq!(receipt["mode"], "tui");
+    assert_eq!(receipt["control"]["presentation"], "native-tui");
+    assert_eq!(receipt["args"], json!([]));
     assert_eq!(receipt["model"], "grok-4.6");
     assert_eq!(receipt["modelProvider"], "xai");
     assert_eq!(receipt["reasoningEffort"], "xhigh");
@@ -1122,23 +1165,6 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
     assert_eq!(receipt["slot"]["owner"], "exec-xai-live-probe");
     assert_eq!(receipt["slot"]["index"], 1);
     assert_eq!(receipt["slot"]["path"], slot.to_str().unwrap());
-    // The recorded args run the observed exec form: the tab host renders the
-    // event stream readably while the same stream records the lifecycle, so a
-    // raw JSON log is never the visible surface.
-    let args = receipt["args"].as_array().unwrap();
-    assert!(args.iter().any(|arg| arg == "exec"), "{receipt}");
-    assert!(args.iter().any(|arg| arg == "--json"), "{receipt}");
-    let result = args
-        .iter()
-        .position(|arg| arg == "--output-last-message")
-        .expect("the dispatch records the final-message file");
-    assert!(
-        args[result + 1]
-            .as_str()
-            .unwrap()
-            .ends_with("message-1.txt"),
-        "{receipt}"
-    );
     assert_eq!(receipt["observation"]["coverage"], "native", "{receipt}");
     assert!(
         !receipt["observation"]["result"].is_null(),
