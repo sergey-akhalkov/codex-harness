@@ -2,7 +2,8 @@
 use harness_core::{
     cancellable_pipe::{CancellablePipe, PipeIoError, anonymous_pipe},
     process::{
-        Cancellation, CommandSpec, Deadline, Job, Limits, SHARED_CPU_PERCENT, SharedCpuBudget,
+        Cancellation, CommandSpec, Deadline, Job, Limits, OwnedProcess, SHARED_CPU_PERCENT,
+        SharedCpuBudget,
     },
     process_service::{
         ServiceProcess, SharedCpuCoverage, creation_clock, current_user, shared_cpu_coverage,
@@ -52,7 +53,9 @@ fn account(root: &Path) -> PathBuf {
 }
 
 fn start(root: &Path, mode: &str) -> (Job, CancellablePipe, ServiceProcess, u64) {
-    start_with_account(root, mode, Some(&account(root)))
+    let (job, input, _starter, service, began) =
+        start_with_account(root, mode, Some(&account(root)));
+    (job, input, service, began)
 }
 
 /// `account` is the CPU allowance the service joins through the client's
@@ -63,7 +66,7 @@ fn start_with_account(
     root: &Path,
     mode: &str,
     account: Option<&Path>,
-) -> (Job, CancellablePipe, ServiceProcess, u64) {
+) -> (Job, CancellablePipe, OwnedProcess, ServiceProcess, u64) {
     let (stdin, write) = anonymous_pipe(4096).unwrap();
     let (read, stdout) = anonymous_pipe(4096).unwrap();
     let mut command = CommandSpec::new(FIXTURE);
@@ -139,7 +142,7 @@ fn start_with_account(
         !job.owns(service.identity()).unwrap(),
         "service still belongs to first client Job"
     );
-    (job, input, service, began)
+    (job, input, child, service, began)
 }
 
 fn exchange(root: &Path, value: &str) {
@@ -652,11 +655,156 @@ fn service_joins_allowance_already_anchored_by_ordinary_participant() {
     assert!(service.wait_for_exit(deadline(8)).unwrap());
 }
 
+fn terminate_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        assert!(!handle.is_null(), "OpenProcess({pid})");
+        assert_ne!(TerminateProcess(handle, 1), 0, "TerminateProcess({pid})");
+        assert_ne!(CloseHandle(handle), 0);
+    }
+}
+
+struct RestoredAccountEnv(Option<std::ffi::OsString>);
+impl RestoredAccountEnv {
+    fn set(account: &Path) -> Self {
+        let previous = std::env::var_os("CODEX_HARNESS_CPU_ACCOUNT");
+        unsafe { std::env::set_var("CODEX_HARNESS_CPU_ACCOUNT", account) };
+        Self(previous)
+    }
+}
+impl Drop for RestoredAccountEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("CODEX_HARNESS_CPU_ACCOUNT", value),
+                None => std::env::remove_var("CODEX_HARNESS_CPU_ACCOUNT"),
+            }
+        }
+    }
+}
+
+#[test]
+fn service_peer_survives_abrupt_client_death_rejoin_and_incomplete_activation() {
+    let root = tempfile::Builder::new()
+        .prefix("abrupt service Русский-日本-")
+        .tempdir()
+        .unwrap();
+    let _stop = StopService(root.path());
+    let account = account(root.path());
+    let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+    let name = budget.name().to_owned();
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    let (job, input, starter, service, began) =
+        start_with_account(root.path(), "serve", Some(&account));
+    let report = wait_json(&root.path().join("endpoint.json"));
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    let leaf = ServiceProcess::observe(
+        report["child"].as_u64().unwrap() as u32,
+        Path::new(FIXTURE),
+        began,
+        &current_user().unwrap(),
+    )
+    .unwrap();
+    assert!(leaf.in_shared_cpu_budget(&budget).unwrap());
+    exchange(root.path(), "before abrupt death");
+    // Kill the client process without Job::terminate, so no owned cleanup runs.
+    terminate_pid(starter.identity().pid);
+    assert!(starter.wait_for_exit(Duration::from_secs(5)).unwrap());
+    assert!(service.is_running().unwrap() && leaf.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert!(leaf.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert!(budget.snapshot().unwrap().cpu_hard_cap && !budget.snapshot().unwrap().kill_on_close);
+    assert_eq!(
+        SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT)
+            .unwrap()
+            .name(),
+        name,
+        "client death must not create a second allowance"
+    );
+    exchange(root.path(), "after abrupt death 日本");
+    let policy =
+        br#"{"schema":1,"ceiling_percent":75.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#;
+    fs::write(account.join("shared-cpu-policy.json"), policy).unwrap();
+    let _env = RestoredAccountEnv::set(&account);
+    let outside_marker = root.path().join("outside.json");
+    let mut outside = std::process::Command::new(env!("CARGO_BIN_EXE_harness-process-fixture"))
+        .arg("hold")
+        .arg(&outside_marker)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let outside_receipt = wait_json(&outside_marker);
+    let outside_pid = outside_receipt["pid"].as_u64().unwrap();
+    let inspected = harness_core::core_install::inspect_cpu_policy(&[
+        PathBuf::from(FIXTURE),
+        PathBuf::from(env!("CARGO_BIN_EXE_harness-process-fixture")),
+    ]);
+    assert_eq!(inspected.activation, "incomplete", "{inspected:?}");
+    assert!(!inspected.wrote_policy);
+    assert_eq!(inspected.model_calls, 0);
+    assert!(
+        inspected
+            .restart_boundary
+            .contains(&format!("pid {outside_pid}")),
+        "{}",
+        inspected.restart_boundary
+    );
+    assert!(
+        inspected.restart_boundary.contains("does not terminate"),
+        "{}",
+        inspected.restart_boundary
+    );
+    assert!(
+        !inspected
+            .restart_boundary
+            .contains(&format!("pid {}", service.identity().pid)),
+        "admitted service was reported uncovered: {}",
+        inspected.restart_boundary
+    );
+    assert!(
+        inspected.kernel_configuration.contains(&name)
+            && inspected.kernel_configuration.contains("cpu_rate 7500"),
+        "{}",
+        inspected.kernel_configuration
+    );
+    assert!(service.is_running().unwrap() && leaf.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert!(outside.try_wait().unwrap().is_none());
+    assert_eq!(
+        fs::read(account.join("shared-cpu-policy.json")).unwrap(),
+        policy
+    );
+    let _ = outside.kill();
+    let _ = outside.wait();
+    assert_eq!(
+        job.terminate(130, Duration::from_secs(3))
+            .unwrap()
+            .active_processes,
+        0
+    );
+    drop(input);
+    assert!(
+        service.is_running().unwrap() && leaf.is_running().unwrap(),
+        "client-job cleanup must not reap the sibling service"
+    );
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    fs::write(root.path().join("stop"), []).unwrap();
+    assert!(service.wait_for_exit(deadline(8)).unwrap());
+    assert!(leaf.wait_for_exit(deadline(5)).unwrap());
+}
+
 #[test]
 fn service_without_account_storage_starts_degraded_with_a_visible_warning() {
     let root = tempfile::tempdir().unwrap();
     let _stop = StopService(root.path());
-    let (job, input, service, _began) = start_with_account(root.path(), "serve", None);
+    let (job, input, _starter, service, _began) = start_with_account(root.path(), "serve", None);
     let report = wait_json(&root.path().join("endpoint.json"));
     // Fail-open: the requested payload is unchanged, and an unadmitted service
     // keeps its own host-relative ceiling instead of claiming the 75% one.

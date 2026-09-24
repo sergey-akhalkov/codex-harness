@@ -1452,3 +1452,178 @@ fn unadmitted_pre_existing_broker_is_reported_with_restart_guidance() {
     starter.terminate();
     joining.terminate();
 }
+
+fn terminate_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        assert!(!handle.is_null(), "OpenProcess({pid})");
+        assert_ne!(TerminateProcess(handle, 1), 0, "TerminateProcess({pid})");
+        assert_ne!(CloseHandle(handle), 0);
+    }
+}
+
+struct RestoredAccountEnv(Option<std::ffi::OsString>);
+impl RestoredAccountEnv {
+    fn set(account: &Path) -> Self {
+        let previous = std::env::var_os("CODEX_HARNESS_CPU_ACCOUNT");
+        unsafe { std::env::set_var("CODEX_HARNESS_CPU_ACCOUNT", account) };
+        Self(previous)
+    }
+}
+impl Drop for RestoredAccountEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("CODEX_HARNESS_CPU_ACCOUNT", value),
+                None => std::env::remove_var("CODEX_HARNESS_CPU_ACCOUNT"),
+            }
+        }
+    }
+}
+
+#[test]
+fn broker_peer_survives_abrupt_client_death_rejoin_and_incomplete_activation() {
+    let prepared = Prepared::new();
+    let budget = SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT).unwrap();
+    let name = budget.name().to_owned();
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    let mut first = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        "8000",
+        "echo",
+        Some(&json!({ "text": UNICODE }).to_string()),
+        None,
+        "abrupt-first.stderr",
+    );
+    let started = first.read_json(40);
+    secret_free(&started);
+    let service = observe_service(
+        started["identity"]["pid"].as_u64().unwrap() as u32,
+        started["identity"]["creation_time"].as_u64().unwrap(),
+    );
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    let Observation::Ready { endpoint, owner } = broker_endpoint::observe(prepared.root()).unwrap()
+    else {
+        panic!("ready endpoint missing")
+    };
+    assert!(owner.in_shared_cpu_budget(&budget).unwrap());
+    let status = control(&endpoint, "status", &json!({}));
+    let leaf = ServiceProcess::observe(
+        status["backend"]["child"].as_u64().unwrap() as u32,
+        &fixture_path(),
+        0,
+        &current_user().unwrap(),
+    )
+    .unwrap();
+    assert!(leaf.in_shared_cpu_budget(&budget).unwrap());
+    // Kill the client without Job::terminate, so owned cleanup does not run.
+    terminate_pid(first.child.identity().pid);
+    assert!(first.child.wait_for_exit(Duration::from_secs(5)).unwrap());
+    assert!(service.is_running().unwrap() && leaf.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert!(leaf.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert!(budget.snapshot().unwrap().cpu_hard_cap && !budget.snapshot().unwrap().kill_on_close);
+    assert_eq!(
+        SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT)
+            .unwrap()
+            .name(),
+        name
+    );
+    assert_eq!(
+        broker_rpc::invoke(
+            &endpoint,
+            "echo",
+            &json!({ "text": "still serving" }),
+            deadline(3),
+            &Cancellation::default()
+        )
+        .unwrap()["payload"]["text"],
+        "still serving"
+    );
+    let mut second = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        "8000",
+        "echo",
+        Some(&json!({ "text": "rejoined 日本" }).to_string()),
+        None,
+        "abrupt-second.stderr",
+    );
+    let rejoined = second.read_json(40);
+    secret_free(&rejoined);
+    assert_eq!(rejoined["identity"]["pid"], started["identity"]["pid"]);
+    assert_eq!(rejoined["result"]["payload"]["text"], "rejoined 日本");
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    let policy =
+        br#"{"schema":1,"ceiling_percent":75.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#;
+    fs::write(prepared.account().join("shared-cpu-policy.json"), policy).unwrap();
+    let _env = RestoredAccountEnv::set(&prepared.account());
+    let outside_marker = prepared.path().join("outside.json");
+    let mut outside = std::process::Command::new(env!("CARGO_BIN_EXE_harness-process-fixture"))
+        .arg("hold")
+        .arg(&outside_marker)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let outside_receipt = wait_json_file(&outside_marker);
+    let outside_pid = outside_receipt["pid"].as_u64().unwrap();
+    let inspected = harness_core::core_install::inspect_cpu_policy(&[
+        fixture_path(),
+        PathBuf::from(env!("CARGO_BIN_EXE_harness-process-fixture")),
+    ]);
+    assert_eq!(inspected.activation, "incomplete", "{inspected:?}");
+    assert!(!inspected.wrote_policy);
+    assert_eq!(inspected.model_calls, 0);
+    assert!(
+        inspected
+            .restart_boundary
+            .contains(&format!("pid {outside_pid}")),
+        "{}",
+        inspected.restart_boundary
+    );
+    assert!(
+        inspected.restart_boundary.contains("does not terminate"),
+        "{}",
+        inspected.restart_boundary
+    );
+    assert!(
+        !inspected
+            .restart_boundary
+            .contains(&format!("pid {}", service.identity().pid)),
+        "admitted broker was reported uncovered: {}",
+        inspected.restart_boundary
+    );
+    assert!(
+        inspected.kernel_configuration.contains(&name)
+            && inspected.kernel_configuration.contains("cpu_rate 7500"),
+        "{}",
+        inspected.kernel_configuration
+    );
+    assert!(service.is_running().unwrap() && leaf.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert!(outside.try_wait().unwrap().is_none());
+    assert_eq!(
+        fs::read(prepared.account().join("shared-cpu-policy.json")).unwrap(),
+        policy
+    );
+    let _ = outside.kill();
+    let _ = outside.wait();
+    if let Some(job) = first.job.take() {
+        let _ = job.terminate(130, Duration::from_secs(3));
+    }
+    assert!(
+        service.is_running().unwrap() && leaf.is_running().unwrap(),
+        "dead-client cleanup must not reap the broker"
+    );
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    second.terminate();
+}

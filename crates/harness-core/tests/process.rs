@@ -1295,4 +1295,306 @@ mod native {
             json!({"capped_cpu_seconds": cap_cpu, "free_cpu_seconds": free_cpu, "hold": hold_observer.identity.pid, "rejoin_after_last_handle": false}),
         );
     }
+
+    /// Child entry for the lifecycle tests. A normal suite run has no controller
+    /// environment and returns immediately. A spawned copy holds one account
+    /// handle until released or killed, and never runs session cleanup itself.
+    #[test]
+    fn shared_cpu_budget_controller() {
+        let Ok(account) = std::env::var("HARNESS_SHARED_CPU_CONTROLLER") else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var("HARNESS_SHARED_CPU_READY").unwrap());
+        let release = PathBuf::from(std::env::var("HARNESS_SHARED_CPU_RELEASE").unwrap());
+        let budget = SharedCpuBudget::acquire(Path::new(&account), SHARED_CPU_PERCENT).unwrap();
+        let rate = budget.snapshot().unwrap().cpu_rate;
+        std::fs::write(
+            &ready,
+            format!(
+                "{{\"pid\":{},\"name\":{},\"rate\":{rate}}}",
+                std::process::id(),
+                serde_json::to_string(budget.name()).unwrap()
+            ),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "controller was not released or killed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    }
+
+    fn spawn_controller(account: &Path, ready: &Path, release: &Path, stderr: &Path) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("native::shared_cpu_budget_controller")
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env("HARNESS_SHARED_CPU_CONTROLLER", account)
+            .env("HARNESS_SHARED_CPU_READY", ready)
+            .env("HARNESS_SHARED_CPU_RELEASE", release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(stderr).unwrap())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_controller(path: &Path) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "controller did not report its handle: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_child_exit(child: &mut Child) {
+        let deadline = Instant::now() + CLEANUP;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "controller did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    struct RestoredAccountEnv(Option<OsString>);
+    impl RestoredAccountEnv {
+        fn set(account: &Path) -> Self {
+            let previous = std::env::var_os(harness_core::process::CPU_BUDGET_ACCOUNT_ENV);
+            unsafe {
+                std::env::set_var(harness_core::process::CPU_BUDGET_ACCOUNT_ENV, account);
+            }
+            Self(previous)
+        }
+    }
+    impl Drop for RestoredAccountEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => {
+                        std::env::set_var(harness_core::process::CPU_BUDGET_ACCOUNT_ENV, value);
+                    }
+                    None => std::env::remove_var(harness_core::process::CPU_BUDGET_ACCOUNT_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cpu_budget_normal_exit_keeps_peer_allowance() {
+        let root = root("shared-normal-exit");
+        let account = root.join("account");
+        let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let name = budget.name().to_owned();
+        let peer_job = Job::new(Limits::default()).unwrap();
+        let peer_marker = root.join("peer.json");
+        let peer = budget
+            .spawn(&peer_job, &spec("hold", &peer_marker))
+            .unwrap();
+        assert_eq!(receipt(&peer_marker)["in_job"], true);
+        let peer_observer = Observer::open(peer.identity().pid);
+        let ready = root.join("controller-ready.json");
+        let release = root.join("controller-release");
+        let mut controller =
+            spawn_controller(&account, &ready, &release, &root.join("controller.stderr"));
+        let reported = wait_controller(&ready);
+        assert_eq!(reported["name"], name);
+        assert_eq!(reported["rate"], 7500);
+        std::fs::write(&release, []).unwrap();
+        wait_child_exit(&mut controller);
+        assert_eq!(controller.wait().unwrap().code(), Some(0));
+        assert!(
+            peer_observer.alive(),
+            "normal controller exit killed the peer"
+        );
+        assert!(budget.contains(&peer).unwrap());
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+        let rejoined = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        assert_eq!(rejoined.name(), name, "normal exit created a second group");
+        assert!(rejoined.contains(&peer).unwrap());
+        assert!(!rejoined.snapshot().unwrap().kill_on_close);
+        peer_job.terminate(0, CLEANUP).unwrap();
+        assert!(peer.wait_for_exit(CLEANUP).unwrap());
+        record(
+            &root.join("verified.json"),
+            json!({"name": name, "peer": peer_observer.identity.pid, "controller": reported["pid"], "rate": 7500, "normal_exit": true}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_abrupt_owner_death_rejoins_with_ownership_validation() {
+        let root = root("shared-abrupt-death");
+        let account = root.join("account");
+        let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let name = budget.name().to_owned();
+        let peer_job = Job::new(Limits::default()).unwrap();
+        let peer_marker = root.join("peer.json");
+        let peer = budget
+            .spawn(&peer_job, &spec("hold", &peer_marker))
+            .unwrap();
+        assert_eq!(receipt(&peer_marker)["in_job"], true);
+        let peer_observer = Observer::open(peer.identity().pid);
+        let ready = root.join("controller-ready.json");
+        let release = root.join("controller-release");
+        let mut controller =
+            spawn_controller(&account, &ready, &release, &root.join("controller.stderr"));
+        let reported = wait_controller(&ready);
+        assert_eq!(reported["name"], name);
+        assert_eq!(reported["rate"], 7500);
+        // TerminateProcess: the controller Drop and any cleanup do not run.
+        controller.kill().unwrap();
+        wait_child_exit(&mut controller);
+        assert!(
+            !release.exists(),
+            "abrupt death must not take the release path"
+        );
+        assert!(
+            peer_observer.alive(),
+            "killing the control owner killed the peer"
+        );
+        assert!(budget.contains(&peer).unwrap());
+        let survived = budget.snapshot().unwrap();
+        assert_eq!(survived.cpu_rate, 7500);
+        assert!(survived.cpu_hard_cap && !survived.kill_on_close);
+        let rejoined = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        assert_eq!(rejoined.name(), name);
+        assert!(rejoined.contains(&peer).unwrap());
+        assert_eq!(rejoined.snapshot().unwrap().cpu_rate, 7500);
+        let wrong_rate = SharedCpuBudget::acquire(&account, 50.0).unwrap_err();
+        assert!(
+            wrong_rate.to_string().contains("already established"),
+            "{wrong_rate}"
+        );
+        assert_eq!(rejoined.snapshot().unwrap().cpu_rate, 7500);
+        let copied = root.join("copied-account");
+        std::fs::create_dir_all(&copied).unwrap();
+        std::fs::copy(
+            account.join("cpu-budget.json"),
+            copied.join("cpu-budget.json"),
+        )
+        .unwrap();
+        let copied_refusal = SharedCpuBudget::acquire(&copied, SHARED_CPU_PERCENT).unwrap_err();
+        assert!(
+            copied_refusal
+                .to_string()
+                .contains("does not describe this account"),
+            "{copied_refusal}"
+        );
+        assert!(
+            Job::new_named(Limits::default(), &name)
+                .unwrap_err()
+                .to_string()
+                .contains("already in use"),
+            "restart must not publish a second group name"
+        );
+        assert!(peer_observer.alive());
+        assert!(rejoined.contains(&peer).unwrap());
+        peer_job.terminate(0, CLEANUP).unwrap();
+        assert!(peer.wait_for_exit(CLEANUP).unwrap());
+        record(
+            &root.join("verified.json"),
+            json!({"name": name, "peer": peer_observer.identity.pid, "killed_controller": reported["pid"], "rate": 7500, "rejoined": true}),
+        );
+    }
+
+    #[test]
+    fn shared_cpu_budget_incomplete_activation_names_outside_route_and_keeps_peer() {
+        let root = root("shared-incomplete");
+        let account = root.join("account");
+        let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let name = budget.name().to_owned();
+        let policy =
+            br#"{"schema":1,"ceiling_percent":75.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#;
+        std::fs::write(account.join("shared-cpu-policy.json"), policy).unwrap();
+        let _account_env = RestoredAccountEnv::set(&account);
+        let peer_job = Job::new(Limits::default()).unwrap();
+        let peer_marker = root.join("peer.json");
+        let peer = budget
+            .spawn(&peer_job, &spec("hold", &peer_marker))
+            .unwrap();
+        assert_eq!(receipt(&peer_marker)["in_job"], true);
+        let peer_observer = Observer::open(peer.identity().pid);
+        let before = harness_core::core_install::inspect_cpu_policy(&[fixture()]);
+        assert_eq!(before.action, "inspected");
+        assert!(!before.wrote_policy);
+        assert!(
+            !before
+                .restart_boundary
+                .contains(&format!("pid {}", peer.identity().pid)),
+            "a covered peer must not be reported as needing restart: {}",
+            before.restart_boundary
+        );
+        let outside_marker = root.join("outside.json");
+        let mut outside = Foreign::spawn("hold", &outside_marker);
+        let outside_receipt = receipt(&outside_marker);
+        let outside_pid = outside_receipt["pid"].as_u64().unwrap();
+        let report = harness_core::core_install::inspect_cpu_policy(&[fixture()]);
+        assert_eq!(report.activation, "incomplete", "{report:?}");
+        assert_eq!(report.action, "inspected");
+        assert!(!report.wrote_policy);
+        assert_eq!(report.model_calls, 0);
+        assert_eq!(report.measured_consumption, "not-sampled");
+        assert!(
+            report
+                .restart_boundary
+                .contains(&format!("pid {outside_pid}")),
+            "{}",
+            report.restart_boundary
+        );
+        assert!(
+            report.restart_boundary.contains("does not terminate"),
+            "{}",
+            report.restart_boundary
+        );
+        assert!(
+            !report
+                .restart_boundary
+                .contains(&format!("pid {}", peer.identity().pid)),
+            "covered peer was listed as uncovered: {}",
+            report.restart_boundary
+        );
+        assert!(
+            report.kernel_configuration.contains(&name)
+                && report.kernel_configuration.contains("cpu_rate 7500"),
+            "{}",
+            report.kernel_configuration
+        );
+        assert_eq!(
+            std::fs::read(account.join("shared-cpu-policy.json")).unwrap(),
+            policy
+        );
+        assert!(peer_observer.alive() && budget.contains(&peer).unwrap());
+        assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+        assert!(
+            outside.0.try_wait().unwrap().is_none(),
+            "inspection stopped the outside route"
+        );
+        assert_eq!(
+            SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT)
+                .unwrap()
+                .name(),
+            name
+        );
+        outside.kill_and_wait();
+        peer_job.terminate(0, CLEANUP).unwrap();
+        assert!(peer.wait_for_exit(CLEANUP).unwrap());
+        record(
+            &root.join("verified.json"),
+            json!({"name": name, "peer": peer.identity().pid, "outside": outside_pid, "activation": report.activation, "rate": 7500}),
+        );
+    }
 }

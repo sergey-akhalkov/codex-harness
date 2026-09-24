@@ -1636,6 +1636,55 @@ fn process_in_named_job(pid: u32, name: &str) -> bool {
     }
 }
 
+fn pid_running(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let process = OpenProcess(0x1000, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        CloseHandle(process);
+        true
+    }
+}
+
+fn spawn_holding_session(
+    f: &Fixture,
+    payload: &Consumer,
+    job: &str,
+    spin_ms: u64,
+) -> std::process::Child {
+    let mut command = f.command();
+    command.env(CPU_PERCENT_ENV, TEST_RATE.to_string());
+    payload.configure(&mut command, job, 1, spin_ms, false, 0);
+    let stderr = fs::File::create(payload.directory.join("launcher.stderr")).unwrap();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .unwrap()
+}
+
+fn wait_admitted(payload: &Consumer) -> Value {
+    let path = payload.directory.join("tree.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !path.is_file() {
+        let stderr =
+            fs::read_to_string(payload.directory.join("launcher.stderr")).unwrap_or_default();
+        assert!(
+            Instant::now() < deadline,
+            "session did not report membership: {stderr}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    payload.tree()
+}
+
 fn write_shared_cpu_policy(account: &Path, body: &[u8]) {
     fs::create_dir_all(account).unwrap();
     fs::write(account.join("shared-cpu-policy.json"), body).unwrap();
@@ -1738,4 +1787,513 @@ fn malformed_policy_warns_without_substituting_bootstrap_ceiling() {
         fs::read(f.account.join("shared-cpu-policy.json")).unwrap(),
         body
     );
+}
+
+fn wait_child_status(child: &mut std::process::Child, stderr: &Path) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session did not exit: {}",
+            fs::read_to_string(stderr).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn session_exit_death_and_reconnect_keep_one_peer_allowance() {
+    let f = Fixture::new();
+    f.register_consumer(consumer());
+    let budget = SharedCpuBudget::acquire(&f.account, TEST_RATE).unwrap();
+    let name = budget.name().to_owned();
+    let rate = cpu_rate_units(TEST_RATE);
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    let peer_payload = Consumer::new(f.root.path(), "peer");
+    let peer = KillOnDrop(spawn_holding_session(&f, &peer_payload, &name, 60_000));
+    let peer_tree = wait_admitted(&peer_payload);
+    assert_eq!(peer_tree["in_shared"], json!(true), "{peer_tree}");
+    let peer_pid = peer_tree["pid"].as_u64().unwrap() as u32;
+    assert!(process_in_named_job(peer_pid, &name));
+
+    let exiting = Consumer::new(f.root.path(), "normal-exit");
+    let mut exiting_child = spawn_holding_session(&f, &exiting, &name, 200);
+    let exited = wait_admitted(&exiting);
+    assert_eq!(exited["in_shared"], json!(true), "{exited}");
+    let status = wait_child_status(
+        &mut exiting_child,
+        &exiting.directory.join("launcher.stderr"),
+    );
+    assert!(
+        status.success(),
+        "normal session exit changed status: {status}; {}",
+        fs::read_to_string(exiting.directory.join("launcher.stderr")).unwrap_or_default()
+    );
+    assert!(process_in_named_job(peer_pid, &name));
+    assert!(pid_running(peer_pid));
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    assert_eq!(
+        SharedCpuBudget::acquire(&f.account, TEST_RATE)
+            .unwrap()
+            .name(),
+        name,
+        "normal session exit created a second group"
+    );
+
+    let owner_payload = Consumer::new(f.root.path(), "control-owner");
+    let mut owner = KillOnDrop(spawn_holding_session(&f, &owner_payload, &name, 60_000));
+    let owner_tree = wait_admitted(&owner_payload);
+    assert_eq!(owner_tree["in_shared"], json!(true), "{owner_tree}");
+    let owner_pid = owner_tree["pid"].as_u64().unwrap() as u32;
+    assert!(process_in_named_job(owner_pid, &name));
+    // TerminateProcess on the launcher: its Drop and session cleanup do not run.
+    owner.0.kill().unwrap();
+    let killed = wait_child_status(
+        &mut owner.0,
+        &owner_payload.directory.join("launcher.stderr"),
+    );
+    assert!(
+        !killed.success(),
+        "abrupt launcher death looked like a clean exit: {killed}"
+    );
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    while pid_running(owner_pid) && Instant::now() < reap_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !pid_running(owner_pid),
+        "abrupt launcher death must reap that session's payload"
+    );
+    assert!(
+        process_in_named_job(peer_pid, &name) && pid_running(peer_pid),
+        "peer session lost its allowance when the other control owner died"
+    );
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    assert!(budget.snapshot().unwrap().cpu_hard_cap);
+    assert!(!budget.snapshot().unwrap().kill_on_close);
+    let rejoined = SharedCpuBudget::acquire(&f.account, TEST_RATE).unwrap();
+    assert_eq!(rejoined.name(), name);
+    let wrong = SharedCpuBudget::acquire(&f.account, 50.0).unwrap_err();
+    assert!(wrong.to_string().contains("already established"), "{wrong}");
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+
+    let again = Consumer::new(f.root.path(), "reconnect");
+    let reconnect = KillOnDrop(spawn_holding_session(&f, &again, &name, 60_000));
+    let again_tree = wait_admitted(&again);
+    assert_eq!(again_tree["in_shared"], json!(true), "{again_tree}");
+    let again_pid = again_tree["pid"].as_u64().unwrap() as u32;
+    assert!(process_in_named_job(again_pid, &name));
+    assert!(process_in_named_job(peer_pid, &name));
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    assert_eq!(
+        SharedCpuBudget::acquire(&f.account, TEST_RATE)
+            .unwrap()
+            .name(),
+        name
+    );
+    drop(reconnect);
+    drop(peer);
+}
+
+struct RestoredAccountEnv(Option<std::ffi::OsString>);
+impl RestoredAccountEnv {
+    fn set(account: &Path) -> Self {
+        let previous = env::var_os(CPU_ACCOUNT_ENV);
+        unsafe { env::set_var(CPU_ACCOUNT_ENV, account) };
+        Self(previous)
+    }
+}
+impl Drop for RestoredAccountEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.0.take() {
+                Some(value) => env::set_var(CPU_ACCOUNT_ENV, value),
+                None => env::remove_var(CPU_ACCOUNT_ENV),
+            }
+        }
+    }
+}
+
+#[test]
+fn incomplete_activation_names_outside_session_route_and_keeps_peer() {
+    let f = Fixture::new();
+    f.register_consumer(consumer());
+    let budget = SharedCpuBudget::acquire(&f.account, TEST_RATE).unwrap();
+    let name = budget.name().to_owned();
+    let rate = cpu_rate_units(TEST_RATE);
+    let policy =
+        br#"{"schema":1,"ceiling_percent":75.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#;
+    write_shared_cpu_policy(&f.account, policy);
+    let _env = RestoredAccountEnv::set(&f.account);
+    let peer_payload = Consumer::new(f.root.path(), "covered-peer");
+    let peer = KillOnDrop(spawn_holding_session(&f, &peer_payload, &name, 60_000));
+    let peer_tree = wait_admitted(&peer_payload);
+    let peer_pid = peer_tree["pid"].as_u64().unwrap() as u32;
+    assert!(process_in_named_job(peer_pid, &name));
+    let outside_dir = f.root.path().join("outside-route");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let mut outside = Command::new(consumer())
+        .env("HARNESS_CPU_FIXTURE_DIR", &outside_dir)
+        .env("HARNESS_CPU_FIXTURE_ROLE", "leaf")
+        .env("HARNESS_CPU_FIXTURE_LEAF", "0")
+        .env("HARNESS_CPU_FIXTURE_THREADS", "1")
+        .env("HARNESS_CPU_FIXTURE_SPIN_MS", "60000")
+        .env("HARNESS_CPU_FIXTURE_EXIT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_path(&outside_dir.join("leaf.json"), Duration::from_secs(20));
+    let outside_tree = receipt(&outside_dir.join("leaf.json"));
+    let outside_pid = outside_tree["pid"].as_u64().unwrap();
+    let report = harness_core::core_install::inspect_cpu_policy(&[consumer().to_path_buf()]);
+    assert_eq!(report.activation, "incomplete", "{report:?}");
+    assert_eq!(report.action, "inspected");
+    assert!(!report.wrote_policy);
+    assert_eq!(report.model_calls, 0);
+    assert_eq!(report.measured_consumption, "not-sampled");
+    assert!(
+        report
+            .restart_boundary
+            .contains(&format!("pid {outside_pid}")),
+        "{}",
+        report.restart_boundary
+    );
+    assert!(
+        report.restart_boundary.contains("does not terminate"),
+        "{}",
+        report.restart_boundary
+    );
+    assert!(
+        !report.restart_boundary.contains(&format!("pid {peer_pid}")),
+        "covered session was reported uncovered: {}",
+        report.restart_boundary
+    );
+    assert!(
+        report.kernel_configuration.contains(&name)
+            && report
+                .kernel_configuration
+                .contains(&format!("cpu_rate {rate}")),
+        "{}",
+        report.kernel_configuration
+    );
+    assert!(process_in_named_job(peer_pid, &name) && pid_running(peer_pid));
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, rate);
+    assert!(outside.try_wait().unwrap().is_none());
+    assert_eq!(
+        fs::read(f.account.join("shared-cpu-policy.json")).unwrap(),
+        policy
+    );
+    assert_eq!(
+        SharedCpuBudget::acquire(&f.account, TEST_RATE)
+            .unwrap()
+            .name(),
+        name
+    );
+    let _ = outside.kill();
+    let _ = outside.wait();
+    drop(peer);
+}
+
+fn compile_rust(dir: &Path, name: &str, source: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let input = dir.join(format!("{name}.rs"));
+    let output = dir.join(format!("{name}.exe"));
+    fs::write(&input, source).unwrap();
+    let log = dir.join(format!("{name}.err"));
+    let status = Command::new(rustc())
+        .arg(&input)
+        .args(["--edition=2024", "-o"])
+        .arg(&output)
+        .stderr(fs::File::create(&log).unwrap())
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{name} compile failed: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    output
+}
+
+fn rollback_upstream(version: &str) -> String {
+    format!(
+        r#"fn main() {{
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let view: Vec<&str> = args.iter().map(String::as_str).collect();
+    match view.as_slice() {{
+        ["--version"] => println!("codex-cli {version}"),
+        ["--help"] => println!("usage --profile <name>.config.toml"),
+        ["features", "disable", name] => {{
+            let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("home"));
+            let path = home.join("config.toml");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut lines: Vec<String> = text
+                .lines()
+                .filter(|line| !line.trim().starts_with(&format!("{{name}} ")))
+                .map(str::to_owned)
+                .collect();
+            lines.push(format!("{{name}} = false"));
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        }}
+        ["features", "list"] => {{
+            println!("hooks stable false");
+            println!("code_mode stable true");
+        }}
+        _ => std::process::exit(1),
+    }}
+}}
+"#
+    )
+}
+
+const ROLLBACK_LAUNCHER: &str = r#"fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let view: Vec<&str> = args.iter().map(String::as_str).collect();
+    match view.as_slice() {
+        ["--retained-session"] => std::thread::sleep(std::time::Duration::from_secs(180)),
+        ["debug", "prompt-input"] => {
+            let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("home"));
+            let instructions = std::fs::read_to_string(home.join("AGENTS.md")).unwrap_or_default();
+            let permissions = "Filesystem sandboxing defines which files can be read or written. sandbox_mode is danger-full-access. Approval policy is currently never.";
+            println!(
+                "[{{\"type\":\"message\",\"text\":\"{}\"}},{{\"type\":\"message\",\"text\":\"{}\"}}]",
+                escape(&instructions),
+                escape(permissions)
+            );
+        }
+        _ => std::process::exit(1),
+    }
+}
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+"#;
+
+fn rollback_cli(cpu: &Path, heavy: &Path, args: &[std::ffi::OsString]) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(args)
+        .env(CPU_ACCOUNT_ENV, cpu)
+        .env("CODEX_HARNESS_HEAVY_ACCOUNT", heavy)
+        .env_remove(CPU_PERCENT_ENV)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}\n{}",
+        args.first()
+            .map(|arg| arg.to_string_lossy())
+            .unwrap_or_default(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn rollback_preserves_live_peer_and_reports_coverage_loss() {
+    let root = tempfile::Builder::new()
+        .prefix("cpu-rollback-Юникод-")
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let build = root.path().join("build");
+    let home = root.path().join("home");
+    let user = root.path().join("user");
+    let cpu = root.path().join("cpu-account");
+    let heavy = root.path().join("heavy-account");
+    for dir in [
+        source.join("global/agents"),
+        source.join("skills/one"),
+        source.join("crates/one/src"),
+        source.join("tools/rtk-adapter/src"),
+        build.clone(),
+        home.clone(),
+        user.clone(),
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    for file in ["Cargo.toml", "Cargo.lock", "crates/one/src/lib.rs"] {
+        fs::write(source.join(file), b"fixture\n").unwrap();
+    }
+    fs::write(source.join("tools/rtk-adapter/src/lib.rs"), b"fixture\n").unwrap();
+    fs::write(
+        source.join("global/profile.toml"),
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/instructions.md"),
+        "Owned native core acceptance. Preserve foreign data.\n",
+    )
+    .unwrap();
+    for file in ["global/hooks.json", "global/token-hooks.json"] {
+        fs::write(source.join(file), b"{}\n").unwrap();
+    }
+    fs::write(
+        source.join("skills/one/SKILL.md"),
+        "---\nname: one\ndescription: Owned acceptance skill.\n---\nPreserve foreign data.\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/kit.json"),
+        serde_json::to_vec(&json!({
+            "schema": 1,
+            "profile_name": "harness",
+            "profile": "global/profile.toml",
+            "instructions": "global/instructions.md",
+            "skills": "skills",
+            "agents": "global/agents",
+            "hooks": "global/hooks.json",
+            "token_hooks": "global/token-hooks.json"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let compile_root = root.path().join("compile");
+    let launcher = compile_rust(&compile_root, "launcher", ROLLBACK_LAUNCHER);
+    fs::copy(&launcher, build.join("codex.exe")).unwrap();
+    for name in BINARIES {
+        let path = build.join(name);
+        if !path.exists() {
+            fs::write(&path, name.as_bytes()).unwrap();
+        }
+    }
+    let record = BuildRecord {
+        schema: SCHEMA,
+        source_root: source.clone(),
+        source: build_identity::source_identity(&source).unwrap(),
+        rustc: "fixture".into(),
+        cargo: "fixture".into(),
+        target: "x86_64-pc-windows-msvc".into(),
+        profile: "release".into(),
+        binaries: BINARIES
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    build_identity::hash_file(&build.join(name)).unwrap(),
+                )
+            })
+            .collect(),
+    };
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let upstream = compile_rust(&compile_root, "upstream", &rollback_upstream("0.153.4"));
+    let install = vec![
+        std::ffi::OsString::from("install"),
+        "--core-only".into(),
+        "--source".into(),
+        source.clone().into(),
+        "--build".into(),
+        build.clone().into(),
+        "--codex-home".into(),
+        home.clone().into(),
+        "--user-home".into(),
+        user.clone().into(),
+        "--dependency-user-home".into(),
+        user.clone().into(),
+        "--upstream".into(),
+        upstream.clone().into(),
+        "--path-scope".into(),
+        "process".into(),
+        "--timeout-seconds".into(),
+        "90".into(),
+    ];
+    let installed = rollback_cli(&cpu, &heavy, &install);
+    let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(installed["status"], "connected", "{installed}");
+    let edited =
+        br#"{"schema":1,"ceiling_percent":40.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#;
+    fs::create_dir_all(&cpu).unwrap();
+    fs::write(cpu.join("shared-cpu-policy.json"), edited).unwrap();
+    let budget = SharedCpuBudget::acquire(&cpu, SHARED_CPU_PERCENT).unwrap();
+    let name = budget.name().to_owned();
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    let peer_marker = root.path().join("peer.json");
+    let peer_job =
+        harness_core::process::Job::new(harness_core::process::Limits::default()).unwrap();
+    let mut peer_spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    peer_spec.args = vec!["hold".into(), peer_marker.clone().into()];
+    let peer = budget.spawn(&peer_job, &peer_spec).unwrap();
+    wait_for_path(&peer_marker, Duration::from_secs(10));
+    assert!(budget.contains(&peer).unwrap());
+    let mut sleeper = Command::new(build.join("codex.exe"))
+        .arg("--retained-session")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sleeper_pid = sleeper.id();
+    let disconnect_args = [
+        std::ffi::OsString::from("disconnect"),
+        "--core-only".into(),
+        "--codex-home".into(),
+        home.clone().into(),
+        "--user-home".into(),
+        user.clone().into(),
+        "--dependency-user-home".into(),
+        user.into(),
+    ];
+    let mut preview_args = disconnect_args.to_vec();
+    preview_args.push("--preview".into());
+    let preview = rollback_cli(&cpu, &heavy, &preview_args);
+    assert!(
+        !String::from_utf8_lossy(&preview.stderr).contains("no longer provided"),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(budget.contains(&peer).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert!(sleeper.try_wait().unwrap().is_none());
+    let disconnected = rollback_cli(&cpu, &heavy, &disconnect_args);
+    let stderr = String::from_utf8_lossy(&disconnected.stderr);
+    assert!(
+        stderr.contains("default coverage is no longer provided"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not-sampled"), "{stderr}");
+    assert!(
+        stderr.contains(&sleeper_pid.to_string()),
+        "coverage-loss report omitted the live route: {stderr}"
+    );
+    assert!(
+        stderr.contains("cpu_rate 7500"),
+        "coverage-loss report omitted the live kernel rate: {stderr}"
+    );
+    assert_eq!(
+        fs::read(cpu.join("shared-cpu-policy.json")).unwrap(),
+        edited
+    );
+    assert!(budget.contains(&peer).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert!(budget.snapshot().unwrap().cpu_hard_cap && !budget.snapshot().unwrap().kill_on_close);
+    assert_eq!(
+        SharedCpuBudget::acquire(&cpu, SHARED_CPU_PERCENT)
+            .unwrap()
+            .name(),
+        name,
+        "rollback created a second allowance"
+    );
+    assert!(peer.is_running().unwrap());
+    assert!(
+        sleeper.try_wait().unwrap().is_none(),
+        "rollback stopped live work"
+    );
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    peer_job.terminate(0, Duration::from_secs(3)).unwrap();
 }
