@@ -26,6 +26,9 @@ pub struct CheckReport {
     /// Loop delivery report: configured roles and limits, the guidance skills
     /// a fresh session discovers the workflow through, and the board tool.
     pub orchestration: crate::orchestration_lifecycle::CheckReport,
+    /// Computed shared CPU policy and coverage. Inspection does not write the
+    /// policy, create a job, or sample consumption.
+    pub cpu_policy: crate::core_install::CpuPolicyReport,
 }
 
 /// Observe an existing native schema-2 core installation. Pending recovery is
@@ -129,12 +132,30 @@ pub fn check(
             "native-launch registration changed during runtime observation",
         ));
     }
+    let mut routes = Vec::new();
+    for link in metadata.links() {
+        for path in [&link.object.path, &link.object.target] {
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            {
+                routes.push(path.clone());
+            }
+        }
+    }
+    if let Some(build) = &launch.build {
+        for name in build_identity::BINARIES {
+            routes.push(build.join(name));
+        }
+    }
+    let cpu_policy = crate::core_install::inspect_cpu_policy(&routes);
     Ok(CheckReport {
         status: "connected",
         model_calls: 0,
         links: metadata.links().len(),
         runtime,
         orchestration,
+        cpu_policy,
     })
 }
 

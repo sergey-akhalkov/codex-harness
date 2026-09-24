@@ -55,6 +55,7 @@ pub struct Report {
     pub changed_links: usize,
     pub path_change: bool,
     pub runtime: Option<core_runtime::RuntimeReceipt>,
+    pub cpu_policy: CpuPolicyReport,
 }
 
 #[derive(Serialize)]
@@ -253,6 +254,12 @@ impl Prior {
         &self,
         view: &crate::registration::metadata::MetadataView,
     ) -> io::Result<Vec<u8>> {
+        let routes = cpu_policy::exe_routes(
+            self.links()
+                .into_iter()
+                .flat_map(|(link, _)| [link.source, link.destination]),
+        );
+        cpu_policy::withdraw(&routes);
         match self {
             Self::Fresh => Err(conflict()),
             Self::Legacy(old) => installation_metadata::disconnect_legacy(old, view),
@@ -574,6 +581,7 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
     let _owners = InstallationLocks::acquire(&request.user_home, &request.dependency_user_home)?;
     let mut plan = Plan::prepare(request)?;
     if preview {
+        let cpu_policy = cpu_policy::preview(&plan_routes(&plan));
         return Ok(Report {
             status: "preview",
             model_calls: 0,
@@ -581,6 +589,7 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
             changed_links: plan.planned_changes,
             path_change: !plan.path.is_noop(),
             runtime: None,
+            cpu_policy,
         });
     }
     let manifest: crate::inventory::Manifest =
@@ -725,6 +734,7 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
         &request.user_home,
         &request.dependency_user_home,
     )?)?;
+    let cpu_policy = cpu_policy::establish(&plan_routes(&plan));
     Ok(Report {
         status: "connected",
         model_calls: 0,
@@ -737,7 +747,26 @@ pub fn connect(request: &Request, preview: bool) -> io::Result<Report> {
             + applied.changed_links.len(),
         path_change: !plan.path.is_noop(),
         runtime,
+        cpu_policy,
     })
+}
+
+mod cpu_policy;
+
+pub use cpu_policy::{CpuPolicyReport, inspect as inspect_cpu_policy};
+
+fn plan_routes(plan: &Plan) -> Vec<PathBuf> {
+    cpu_policy::exe_routes(
+        plan.desired
+            .iter()
+            .flat_map(|link| [link.source.clone(), link.destination.clone()])
+            .chain(
+                plan.prior
+                    .links()
+                    .into_iter()
+                    .flat_map(|(link, _)| [link.source, link.destination]),
+            ),
+    )
 }
 
 #[cfg(test)]

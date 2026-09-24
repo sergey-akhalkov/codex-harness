@@ -179,3 +179,73 @@ fn actual_inspection_serializes_a_distinct_shared_dependency_owner() {
     assert!(!dependency.exists());
     assert!(!codex_home.exists());
 }
+
+#[test]
+fn locked_install_and_check_do_not_create_cpu_policy() {
+    let root = root();
+    let home = root.join("User Юникод");
+    let cpu = root.join("cpu-account");
+    let heavy = root.join("heavy-account");
+    let source = root.join("missing-source");
+    let build = root.join("missing-build");
+    let codex = root.join("missing-codex");
+    let mut child = fixture(&root);
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .args(args)
+            .env("CODEX_HARNESS_CPU_ACCOUNT", &cpu)
+            .env("CODEX_HARNESS_HEAVY_ACCOUNT", &heavy)
+            .env_remove("CODEX_HARNESS_CPU_PERCENT")
+            .current_dir(&root)
+            .output()
+            .unwrap()
+    };
+    let home_arg = home.to_str().unwrap();
+    let preview = invoke(&[
+        "install",
+        "--core-only",
+        "--preview",
+        "--source",
+        source.to_str().unwrap(),
+        "--build",
+        build.to_str().unwrap(),
+        "--codex-home",
+        codex.to_str().unwrap(),
+        "--user-home",
+        home_arg,
+        "--dependency-user-home",
+        home_arg,
+        "--path-scope",
+        "process",
+        "--timeout-seconds",
+        "5",
+    ]);
+    assert_eq!(preview.status.code(), Some(2));
+    assert!(preview.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&preview.stderr).contains("another harness operation is active")
+    );
+    let checked = invoke(&[
+        "check",
+        "--core-only",
+        "--codex-home",
+        codex.to_str().unwrap(),
+        "--user-home",
+        home_arg,
+        "--dependency-user-home",
+        home_arg,
+        "--timeout-seconds",
+        "5",
+    ]);
+    assert_eq!(checked.status.code(), Some(2));
+    assert!(checked.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("another harness operation is active")
+    );
+    assert!(!cpu.exists());
+    assert!(!heavy.exists());
+    assert!(!codex.exists());
+    assert!(!home.exists());
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+}
