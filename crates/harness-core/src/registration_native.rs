@@ -1231,9 +1231,11 @@ fn symlink_target(bytes: &[u8]) -> io::Result<std::path::PathBuf> {
             .get(20 + start..20 + start + size)
             .ok_or_else(|| invalid("invalid reparse name bounds"))
     };
-    let target: Vec<u16> = range(8)?
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    let substitute = range(8)?;
+    let (chunks, _) = substitute.as_chunks::<2>();
+    let target: Vec<u16> = chunks
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     range(12)?; // Validate the ignored print name too; only the substitute controls traversal.
     let target = target.strip_prefix(&[92, 63, 63, 92]).unwrap_or(&target);

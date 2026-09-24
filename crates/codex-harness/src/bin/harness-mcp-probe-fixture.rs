@@ -50,13 +50,6 @@ mod windows {
             value
         }).collect()
     }
-    fn tool_result(value: Value, text: bool) -> Value {
-        if text {
-            json!({"content":[{"type":"text","text":value.to_string()}]})
-        } else {
-            json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false})
-        }
-    }
     fn owner_acl(root: &Path, protected: bool) -> bool {
         let wide: Vec<_> = root.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut buffer = [0u64; 1024];
@@ -237,7 +230,6 @@ mod windows {
         let mut initialized = false;
         let mut declared = false;
         let mut pages = 0;
-        let mut calls = 0;
         for line in io::stdin().lock().lines() {
             let request: Value = serde_json::from_str(&line?)?;
             assert_eq!(request["jsonrpc"], "2.0");
@@ -348,68 +340,7 @@ mod windows {
                         json!({"tools":tools})
                     }
                 }
-                "tools/call" => {
-                    assert!(false, "Nuphus must never receive tools/call");
-                    let names = [
-                        "index_repository",
-                        "list_projects",
-                        "get_graph_schema",
-                        "query_graph",
-                    ];
-                    assert_eq!(request["params"]["name"], names[calls]);
-                    calls += 1;
-                    match request["params"]["name"].as_str().unwrap() {
-                        "index_repository" => {
-                            let path = request["params"]["arguments"]["repo_path"]
-                                .as_str()
-                                .unwrap();
-                            assert_eq!(Path::new(path), root.join("fixture"));
-                            assert!(
-                                fs::read_to_string(Path::new(path).join("probe.rs"))?
-                                    .contains("fn inventory_probe(")
-                            );
-                            assert_eq!(request["params"]["arguments"]["mode"], "fast");
-                            if mode.starts_with("hold-state") {
-                                fs::write(root.join("held-by-test"), b"hold")?;
-                                let until = std::time::Instant::now() + Duration::from_secs(5);
-                                while !root.join("hold-ready").exists() {
-                                    assert!(
-                                        std::time::Instant::now() < until,
-                                        "test did not acquire its hold"
-                                    );
-                                    std::thread::sleep(Duration::from_millis(10));
-                                }
-                            }
-                            if mode == "index-error" {
-                                json!({"isError":true,"content":[{"type":"text","text":"SECRET_FOREIGN_TOKEN"}]})
-                            } else {
-                                tool_result(json!({"indexed":true}), false)
-                            }
-                        }
-                        "list_projects" => {
-                            let mut value = json!({"projects":[{"name":"fixture","root_path":root.join("fixture")}],"total":1,"has_more":false});
-                            if mode == "wrong-root" {
-                                value["projects"][0]["root_path"] = json!(root);
-                            }
-                            if mode == "multiple-projects" {
-                                value["total"] = json!(2);
-                            }
-                            tool_result(value, mode == "text-payload")
-                        }
-                        "get_graph_schema" => tool_result(json!({"labels":["Function"]}), false),
-                        "query_graph" => {
-                            assert_eq!(request["params"]["arguments"]["format"], "json");
-                            assert_eq!(request["params"]["arguments"]["project"], "fixture");
-                            let mut value = json!({"columns":["n.name"],"rows":[["inventory_probe"]],"total":1});
-                            if matches!(mode, "query-spoof" | "hold-state-query-spoof") {
-                                value["rows"] = json!([]);
-                                value["warning"] = json!("inventory_probe");
-                            }
-                            tool_result(value, mode == "text-payload")
-                        }
-                        _ => unreachable!(),
-                    }
-                }
+                "tools/call" => panic!("Nuphus must never receive tools/call"),
                 _ => panic!("unexpected protocol method"),
             };
             if mode == "missing-capability" {

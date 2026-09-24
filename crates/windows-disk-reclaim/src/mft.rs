@@ -575,8 +575,10 @@ fn parse_file_name(attr: &[u8]) -> Option<(u64, String, u8, bool)> {
     let namespace = value[65];
     let name_bytes = value.get(66..66 + name_len * 2)?;
     let units: Vec<u16> = name_bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
     let name = String::from_utf16_lossy(&units);
     if name.is_empty() {

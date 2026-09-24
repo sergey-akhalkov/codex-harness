@@ -101,10 +101,10 @@ impl Value {
         {
             return Err(invalid("registry PATH has an unsupported type or size"));
         }
-        let mut units: Vec<_> = self
-            .bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        let (chunks, _) = self.bytes.as_chunks::<2>();
+        let mut units: Vec<_> = chunks
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         // Fail before publication when Win32 string writing cannot promise an
         // exact round trip. Never normalize malformed foreign registry data.

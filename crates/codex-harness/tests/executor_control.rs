@@ -1864,3 +1864,19 @@ trust_level = "trusted"
     drop(conversation);
     let _ = job.terminate(0, Duration::from_secs(10));
 }
+
+#[test]
+fn active_turn_names_the_latest_in_progress_turn_or_none() {
+    let thread = json!({
+        "turns": [
+            {"id": "completed-turn", "status": "completed"},
+            {"id": TURN, "status": "inProgress"}
+        ]
+    });
+    assert_eq!(
+        executor_control::active_turn(&thread).as_deref(),
+        Some(TURN)
+    );
+    assert_eq!(executor_control::active_turn(&json!({"turns": []})), None);
+    assert_eq!(executor_control::active_turn(&json!({})), None);
+}

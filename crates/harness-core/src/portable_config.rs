@@ -148,7 +148,7 @@ mod tests {
         );
         assert!(text.contains("agents.worker.config_file="));
         assert!(!text.contains("agents="));
-        for pair in args.chunks_exact(2) {
+        for pair in args.as_chunks::<2>().0 {
             assert_eq!(pair[0], "-c");
             let (_, encoded) = pair[1].to_str().unwrap().split_once('=').unwrap();
             let parsed: toml::Table = format!("value={encoded}").parse().unwrap();

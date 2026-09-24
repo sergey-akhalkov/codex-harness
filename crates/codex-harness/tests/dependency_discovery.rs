@@ -245,14 +245,12 @@ fn native_payloads_are_observed_without_shims_or_runtimes_and_versions_must_matc
     fs::write(&native, b"inert native companion").unwrap();
     fs::write(companion.join("bin/onnxruntime.dll"), b"inert library").unwrap();
     let observed = fixture.observe(&["--no-process-environment"]);
-    for id in ["nuphus"] {
-        let row = record(&observed, id);
-        assert_eq!(row["status"], "adopted");
-        assert_eq!(row["command"].as_array().unwrap().len(), 1);
-        assert!(row["command"][0].as_str().unwrap().ends_with(".exe"));
-        assert_eq!(row["health"]["callable"], Value::Null);
-        assert_eq!(row["update_safe"], false);
-    }
+    let row = record(&observed, "nuphus");
+    assert_eq!(row["status"], "adopted");
+    assert_eq!(row["command"].as_array().unwrap().len(), 1);
+    assert!(row["command"][0].as_str().unwrap().ends_with(".exe"));
+    assert_eq!(row["health"]["callable"], Value::Null);
+    assert_eq!(row["update_safe"], false);
     assert_eq!(
         record(&observed, "nuphus")["health"]["onnxruntime_exists"],
         true

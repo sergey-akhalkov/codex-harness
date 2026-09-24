@@ -388,6 +388,66 @@ fn visible_progress(event: &Value) -> Option<String> {
     }
 }
 
+/// The event stream establishes the session identity. A filename only
+/// narrows candidates; the rollout's own metadata must match before use.
+fn find_usage(home: &Path, session: &str) -> io::Result<Option<SpoolTail>> {
+    if session.is_empty()
+        || !session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(io::Error::other(
+            "cache guard received an invalid native session id",
+        ));
+    }
+    let mut pending = vec![(home.join("sessions"), 0)];
+    let mut visited = 0;
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            visited += 1;
+            if visited > 20_000 {
+                return Err(io::Error::other(
+                    "cache guard session discovery exceeded 20000 entries",
+                ));
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() && depth < 3 {
+                pending.push((entry.path(), depth + 1));
+            } else if kind.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(&format!("-{session}.jsonl"))
+            {
+                let mut tail = SpoolTail::new(fs::File::open(entry.path())?);
+                for _ in 0..33 {
+                    if tail.read_available()? == 0 {
+                        break;
+                    }
+                    if let Some(line) = tail.take_line(false) {
+                        if let Line::Text(line) = line
+                            && let Ok(meta) = serde_json::from_str::<Value>(&line)
+                            && meta["type"] == "session_meta"
+                            && meta["payload"]["id"] == session
+                        {
+                            // Reopen at zero so bytes buffered past the header
+                            // are processed by the normal incremental reader.
+                            return Ok(Some(SpoolTail::new(fs::File::open(entry.path())?)));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,65 +677,4 @@ mod tests {
         assert!(find_usage(root.path(), "session-a").unwrap().is_some());
         assert!(find_usage(root.path(), "../session-a").is_err());
     }
-}
-
-/// The event stream establishes the session identity. A filename only
-/// narrows candidates; the rollout's own metadata must match before use.
-fn find_usage(home: &Path, session: &str) -> io::Result<Option<SpoolTail>> {
-    if session.is_empty()
-        || !session
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(io::Error::other(
-            "cache guard received an invalid native session id",
-        ));
-    }
-    let mut pending = vec![(home.join("sessions"), 0)];
-    let mut visited = 0;
-    while let Some((directory, depth)) = pending.pop() {
-        let entries = match fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            visited += 1;
-            if visited > 20_000 {
-                return Err(io::Error::other(
-                    "cache guard session discovery exceeded 20000 entries",
-                ));
-            }
-            let kind = entry.file_type()?;
-            if kind.is_dir() && depth < 3 {
-                pending.push((entry.path(), depth + 1));
-            } else if kind.is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(&format!("-{session}.jsonl"))
-            {
-                let mut tail = SpoolTail::new(fs::File::open(entry.path())?);
-                for _ in 0..33 {
-                    if tail.read_available()? == 0 {
-                        break;
-                    }
-                    if let Some(line) = tail.take_line(false) {
-                        if let Line::Text(line) = line
-                            && let Ok(meta) = serde_json::from_str::<Value>(&line)
-                            && meta["type"] == "session_meta"
-                            && meta["payload"]["id"] == session
-                        {
-                            // Reopen at zero so bytes buffered past the header
-                            // are processed by the normal incremental reader.
-                            return Ok(Some(SpoolTail::new(fs::File::open(entry.path())?)));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
 }

@@ -142,7 +142,8 @@ fn decode_base64(input: &str) -> io::Result<Vec<u8>> {
         return Err(invalid());
     }
     let mut output = Vec::with_capacity(filtered.len() / 4 * 3);
-    for chunk in filtered.chunks_exact(4) {
+    let (chunks, _) = filtered.as_chunks::<4>();
+    for chunk in chunks {
         let padding = usize::from(chunk[2] == b'=') + usize::from(chunk[3] == b'=');
         let a = six(chunk[0])?;
         let b = six(chunk[1])?;
