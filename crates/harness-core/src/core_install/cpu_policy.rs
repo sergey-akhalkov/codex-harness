@@ -494,8 +494,8 @@ fn process_ids() -> io::Result<Vec<u32>> {
 }
 
 fn image_path(pid: u32) -> io::Result<PathBuf> {
-    use std::os::windows::io::AsRawHandle;
     use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW};
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     // SAFETY: a successful open returns an owned process handle; failure is null.

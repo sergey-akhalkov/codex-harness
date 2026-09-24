@@ -328,6 +328,138 @@ pub fn cpu_policy_summary(budget: &Budget) -> String {
     }
 }
 
+/// Machine-local shared CPU policy record written by the installation lifecycle.
+/// Launch paths read it and never write it. The format is the installed schema:
+/// `schema` 1 and `ceiling_percent` in percent of total host CPU.
+const SHARED_CPU_POLICY_FILE: &str = "shared-cpu-policy.json";
+const SHARED_CPU_POLICY_SCHEMA: u64 = 1;
+/// Per-launch escape hatch. It wins over the policy record and is not a second record.
+pub(crate) const SHARED_CPU_ESCAPE_HATCH: &str = "CODEX_HARNESS_CPU_PERCENT";
+
+/// Ceiling a launch will actually request from the shared account group.
+#[derive(Debug)]
+pub(crate) struct SharedCpuCeiling {
+    pub percent: f64,
+    /// Text placed after "requested ceiling" in fail-open diagnostics.
+    pub requested: String,
+}
+
+/// The policy record or escape hatch cannot be used. Callers warn and must not
+/// substitute another ceiling.
+#[derive(Debug)]
+pub(crate) struct SharedCpuCeilingFault {
+    pub requested: String,
+    pub stage: &'static str,
+    pub cause: String,
+    pub recovery: String,
+}
+
+/// Compact percent text matching the existing diagnostics (`75`, `40`, `0.5`).
+pub(crate) fn shared_cpu_percent_label(percent: f64) -> String {
+    percent_text(percent)
+}
+
+/// `Some` when the per-launch escape hatch is set. A parse failure is a fault,
+/// not a fallthrough to the policy record: the explicit request stays the
+/// requested ceiling.
+pub(crate) fn shared_cpu_escape_hatch() -> Option<Result<SharedCpuCeiling, SharedCpuCeilingFault>> {
+    let value = std::env::var_os(SHARED_CPU_ESCAPE_HATCH).filter(|value| !value.is_empty())?;
+    let text = value.to_string_lossy().into_owned();
+    let requested = format!("{text}% of host CPU");
+    Some(match text.trim().parse::<f64>() {
+        Ok(percent) => Ok(SharedCpuCeiling { percent, requested }),
+        Err(_) => Err(SharedCpuCeilingFault {
+            requested,
+            stage: "ceiling configuration",
+            cause: format!("{SHARED_CPU_ESCAPE_HATCH} does not hold a number"),
+            recovery: format!(
+                "set {SHARED_CPU_ESCAPE_HATCH} to a percentage within 0.01..=100 or unset it to use the installed {SHARED_CPU_PERCENT}% default"
+            ),
+        }),
+    })
+}
+
+/// Ceiling from the account policy record. An absent record is the installed
+/// 75% default. A malformed or unreadable record is a fault and is not rewritten.
+pub(crate) fn shared_cpu_policy_ceiling(
+    directory: &Path,
+) -> Result<SharedCpuCeiling, SharedCpuCeilingFault> {
+    let path = directory.join(SHARED_CPU_POLICY_FILE);
+    match read_shared_cpu_policy(&path) {
+        Ok(None) => Ok(SharedCpuCeiling {
+            percent: SHARED_CPU_PERCENT,
+            requested: format!("{SHARED_CPU_PERCENT}% of host CPU"),
+        }),
+        Ok(Some(percent)) => Ok(SharedCpuCeiling {
+            percent,
+            requested: format!("{}% of host CPU", percent_text(percent)),
+        }),
+        Err(error) => Err(SharedCpuCeilingFault {
+            requested: format!(
+                "unreadable shared CPU policy record {} (not a substitute ceiling)",
+                path.display()
+            ),
+            stage: "ceiling configuration",
+            cause: error.to_string(),
+            recovery: format!(
+                "repair {} so it is an ordinary schema {SHARED_CPU_POLICY_SCHEMA} file with ceiling_percent within 0.01..=100, or remove it to use the installed {SHARED_CPU_PERCENT}% default; {SHARED_CPU_ESCAPE_HATCH} remains the per-launch escape hatch",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn read_shared_cpu_policy(path: &Path) -> io::Result<Option<f64>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "shared CPU policy record could not be read ({error}); it was preserved"
+            )));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::other(
+                "shared CPU policy record is a link; preserving it",
+            ));
+        }
+        Ok(_) => {}
+    }
+    build_identity::ordinary(path).map_err(|error| {
+        io::Error::other(format!(
+            "shared CPU policy record is not an ordinary file ({error}); it was preserved"
+        ))
+    })?;
+    let bytes = fs::read(path).map_err(|error| {
+        io::Error::other(format!(
+            "shared CPU policy record could not be read ({error}); it was preserved"
+        ))
+    })?;
+    parse_shared_cpu_policy(&bytes).map(Some)
+}
+
+fn parse_shared_cpu_policy(bytes: &[u8]) -> io::Result<f64> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        io::Error::other(format!(
+            "shared CPU policy record is not JSON ({error}); it was preserved and was not replaced with the installed default"
+        ))
+    })?;
+    let schema_ok =
+        value.get("schema").and_then(serde_json::Value::as_u64) == Some(SHARED_CPU_POLICY_SCHEMA);
+    let ceiling = value
+        .get("ceiling_percent")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|percent| percent.is_finite() && (0.01..=100.0).contains(percent));
+    match (schema_ok, ceiling) {
+        (true, Some(percent)) => Ok(percent),
+        (false, _) => Err(io::Error::other(
+            "shared CPU policy record schema is not 1; the record was preserved and was not replaced with the installed default",
+        )),
+        (true, None) => Err(io::Error::other(
+            "shared CPU policy record has no ceiling_percent within 0.01..=100; the record was preserved and was not replaced with the installed default",
+        )),
+    }
+}
+
 /// The local policy file for one account directory.
 pub fn policy_path(account: &Path) -> PathBuf {
     account.join(POLICY_FILE)
@@ -481,22 +613,39 @@ impl SharedCpu {
     /// exists. Called after the account heavy-command queue, so the documented
     /// lock order (queue first, budget second) always holds.
     fn join(cancellation: &Cancellation) -> Self {
+        if let Some(hatch) = shared_cpu_escape_hatch() {
+            return match hatch {
+                Ok(ceiling) => Self::join_at(ceiling, cancellation),
+                Err(fault) => Self::policy_fault(&fault),
+            };
+        }
         let directory = match cpu_budget_directory(None) {
             Ok(directory) => directory,
             Err(error) => return Self::degraded(&error),
         };
+        match shared_cpu_policy_ceiling(&directory) {
+            Ok(ceiling) => Self::join_at(ceiling, cancellation),
+            Err(fault) => Self::policy_fault(&fault),
+        }
+    }
+
+    fn join_at(ceiling: SharedCpuCeiling, cancellation: &Cancellation) -> Self {
+        let directory = match cpu_budget_directory(None) {
+            Ok(directory) => directory,
+            Err(error) => return Self::degraded_at(ceiling.percent, &error),
+        };
         let deadline = match Deadline::after(CPU_BUDGET_LOCK_WAIT) {
             Ok(deadline) => deadline,
-            Err(error) => return Self::degraded(&error),
+            Err(error) => return Self::degraded_at(ceiling.percent, &error),
         };
         let budget = match SharedCpuBudget::acquire_within(
             &directory,
-            SHARED_CPU_PERCENT,
+            ceiling.percent,
             deadline,
             cancellation,
         ) {
             Ok(budget) => budget,
-            Err(error) => return Self::degraded(&error),
+            Err(error) => return Self::degraded_at(ceiling.percent, &error),
         };
         let mut state = Self {
             budget: Some(budget),
@@ -511,8 +660,27 @@ impl SharedCpu {
     /// Degraded state: the heavy-command contracts stay in force, the CPU
     /// policy does not, and the cause is on the diagnostic channel.
     fn degraded(error: &io::Error) -> Self {
+        Self::degraded_at(SHARED_CPU_PERCENT, error)
+    }
+
+    fn degraded_at(percent: f64, error: &io::Error) -> Self {
         eprintln!(
-            "heavy: warning: the shared account CPU budget is unavailable ({error}); this command runs outside the shared {SHARED_CPU_PERCENT}% ceiling and its coverage is degraded"
+            "heavy: warning: the shared account CPU budget is unavailable ({error}); this command runs outside the shared {}% ceiling and its coverage is degraded",
+            percent_text(percent)
+        );
+        Self {
+            budget: None,
+            parent_rate: HOST_RATE,
+            admitted: false,
+        }
+    }
+
+    /// The record could not be used. Do not acquire at the installed default:
+    /// that would silently replace the requested ceiling.
+    fn policy_fault(fault: &SharedCpuCeilingFault) -> Self {
+        eprintln!(
+            "heavy: warning: shared CPU policy record is not usable ({}); requested ceiling {}; this command runs once outside a verified shared ceiling and no substitute ceiling was applied; recovery: {}",
+            fault.cause, fault.requested, fault.recovery
         );
         Self {
             budget: None,
@@ -1409,6 +1577,44 @@ mod tests {
             "the ambiguous legacy value must be reported, not silently changed: {summary}"
         );
         assert!(!legacy_default_cpu_percent(&Budget::default()));
+    }
+
+    #[test]
+    fn shared_cpu_policy_record_selects_the_ceiling_without_a_silent_substitute() {
+        let temp = tempfile::tempdir().unwrap();
+        let account = temp.path();
+        let absent = shared_cpu_policy_ceiling(account).unwrap();
+        assert_eq!(absent.percent, SHARED_CPU_PERCENT);
+        assert_eq!(absent.requested, "75% of host CPU");
+
+        let path = account.join(SHARED_CPU_POLICY_FILE);
+        fs::write(&path, br#"{"schema":1,"ceiling_percent":40.0}"#).unwrap();
+        let edited = shared_cpu_policy_ceiling(account).unwrap();
+        assert_eq!(edited.percent, 40.0);
+        assert_eq!(edited.requested, "40% of host CPU");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            br#"{"schema":1,"ceiling_percent":40.0}"#
+        );
+
+        fs::write(&path, b"{not json").unwrap();
+        let fault = shared_cpu_policy_ceiling(account).unwrap_err();
+        assert!(
+            fault.requested.contains("not a substitute ceiling"),
+            "{fault:?}"
+        );
+        assert!(fault.cause.contains("not JSON"), "{fault:?}");
+        assert_eq!(fault.stage, "ceiling configuration");
+        assert!(fault.recovery.contains("repair"), "{fault:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"{not json");
+
+        fs::write(&path, br#"{"schema":2,"ceiling_percent":40.0}"#).unwrap();
+        let fault = shared_cpu_policy_ceiling(account).unwrap_err();
+        assert!(fault.cause.contains("schema is not 1"), "{fault:?}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            br#"{"schema":2,"ceiling_percent":40.0}"#
+        );
     }
 
     #[test]

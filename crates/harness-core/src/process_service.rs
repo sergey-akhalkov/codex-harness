@@ -743,9 +743,19 @@ impl SharedCpuCoverage {
 /// only reads kernel state: it never assigns, adopts or restarts a process, and
 /// a service that is not a member is reported instead of being enrolled.
 pub fn shared_cpu_coverage(service: &ServiceProcess, account: Option<&Path>) -> SharedCpuCoverage {
-    let budget = match crate::process::cpu_budget_directory(account)
-        .and_then(|directory| SharedCpuBudget::acquire(&directory, SHARED_CPU_PERCENT))
-    {
+    let directory = match crate::process::cpu_budget_directory(account) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return SharedCpuCoverage::Unverified {
+                cause: error.to_string(),
+            };
+        }
+    };
+    let percent = match shared_cpu_ceiling_for_account(&directory) {
+        Ok(percent) => percent,
+        Err(cause) => return SharedCpuCoverage::Unverified { cause },
+    };
+    let budget = match SharedCpuBudget::acquire(&directory, percent) {
         Ok(budget) => budget,
         Err(error) => {
             return SharedCpuCoverage::Unverified {
@@ -947,13 +957,19 @@ pub fn spawn(
 /// failed allowance, not a retry or an assumed cap. WMI fallback can still land
 /// in such a job, and that refusal stays visible.
 fn join_shared_cpu(deadline: Deadline) -> io::Result<(SharedCpuBudget, u32, bool)> {
-    let directory = crate::process::cpu_budget_directory(None)?;
-    let budget = SharedCpuBudget::acquire_within(
-        &directory,
-        SHARED_CPU_PERCENT,
-        deadline,
-        &Cancellation::default(),
-    )?;
+    let percent = if let Some(hatch) = crate::heavy_command::shared_cpu_escape_hatch() {
+        hatch.map_err(policy_join_error)?.percent
+    } else {
+        let directory = crate::process::cpu_budget_directory(None)?;
+        crate::heavy_command::shared_cpu_policy_ceiling(&directory)
+            .map_err(policy_join_error)?
+            .percent
+    };
+    let directory = crate::process::cpu_budget_directory(None)
+        .map_err(|error| ceiling_error(percent, error))?;
+    let budget =
+        SharedCpuBudget::acquire_within(&directory, percent, deadline, &Cancellation::default())
+            .map_err(|error| ceiling_error(percent, error))?;
     let snapshot = budget.snapshot()?;
     if !snapshot.cpu_hard_cap
         || snapshot.kill_on_close
@@ -961,8 +977,11 @@ fn join_shared_cpu(deadline: Deadline) -> io::Result<(SharedCpuBudget, u32, bool
         || snapshot.breakaway_ok
         || snapshot.silent_breakaway_ok
     {
-        return Err(io::Error::other(
-            "the account CPU allowance does not carry the required CPU-only settings; preserving it",
+        return Err(ceiling_error(
+            percent,
+            io::Error::other(
+                "the account CPU allowance does not carry the required CPU-only settings; preserving it",
+            ),
         ));
     }
     // Recorded for reporting: a service that starts inside another job nests the
@@ -972,16 +991,50 @@ fn join_shared_cpu(deadline: Deadline) -> io::Result<(SharedCpuBudget, u32, bool
     let assigned = unsafe { AssignProcessToJobObject(handle.as_raw_handle(), GetCurrentProcess()) };
     if assigned == 0 {
         let error = io::Error::last_os_error();
-        return Err(io::Error::other(format!(
-            "the kernel refused joining the account allowance ({error}); the service already belongs to another job ({contained}), and a contained process can only join an empty allowance or one inside its own job hierarchy"
-        )));
+        return Err(ceiling_error(
+            percent,
+            io::Error::other(format!(
+                "the kernel refused joining the account allowance ({error}); the service already belongs to another job ({contained}), and a contained process can only join an empty allowance or one inside its own job hierarchy"
+            )),
+        ));
     }
     if !in_job(unsafe { GetCurrentProcess() }, handle.as_raw_handle())? {
-        return Err(io::Error::other(
-            "shared CPU allowance assignment was not observed",
+        return Err(ceiling_error(
+            percent,
+            io::Error::other("shared CPU allowance assignment was not observed"),
         ));
     }
     Ok((budget, snapshot.cpu_rate, contained))
+}
+
+fn shared_cpu_ceiling_for_account(directory: &Path) -> Result<f64, String> {
+    if let Some(hatch) = crate::heavy_command::shared_cpu_escape_hatch() {
+        return match hatch {
+            Ok(ceiling) => Ok(ceiling.percent),
+            Err(fault) => Err(policy_join_error(fault).to_string()),
+        };
+    }
+    match crate::heavy_command::shared_cpu_policy_ceiling(directory) {
+        Ok(ceiling) => Ok(ceiling.percent),
+        Err(fault) => Err(policy_join_error(fault).to_string()),
+    }
+}
+
+fn policy_join_error(fault: crate::heavy_command::SharedCpuCeilingFault) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "shared CPU policy record is not usable ({}); requested ceiling {}; this service runs once outside a verified shared ceiling and no substitute ceiling was applied; recovery: {}",
+            fault.cause, fault.requested, fault.recovery
+        ),
+    )
+}
+
+fn ceiling_error(percent: f64, error: io::Error) -> io::Error {
+    io::Error::other(format!(
+        "shared {}% ceiling: {error}",
+        crate::heavy_command::shared_cpu_percent_label(percent)
+    ))
 }
 
 /// Ceiling for the service's own lifecycle Job. Windows expresses a nested
@@ -1003,8 +1056,18 @@ fn nested_cpu_percent(requested: Option<f64>, host_rate: u32) -> Option<f64> {
 /// ceiling, cause, affected scope and recovery step. It never claims that the
 /// ceiling is enforced and never implies that a peer lost its own allowance.
 fn shared_cpu_service_warning(error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::InvalidData {
+        return format!("coding-agents-harness: {error}");
+    }
+    let ceiling = error
+        .to_string()
+        .strip_prefix("shared ")
+        .and_then(|rest| rest.split(" ceiling:").next())
+        .filter(|label| label.ends_with('%'))
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{SHARED_CPU_PERCENT}%"));
     format!(
-        "coding-agents-harness: this service and its children run outside the shared {SHARED_CPU_PERCENT}% CPU allowance for this account: {error}. Other sessions keep their own allowance, and coverage stays incomplete until the account CPU budget is usable and this service is restarted into it."
+        "coding-agents-harness: this service and its children run outside the shared {ceiling} CPU allowance for this account: {error}. Other sessions keep their own allowance, and coverage stays incomplete until the account CPU budget is usable and this service is restarted into it."
     )
 }
 

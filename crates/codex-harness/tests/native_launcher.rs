@@ -142,6 +142,7 @@ impl Fixture {
             .env("CODEX_HOME", &self.home)
             .env(CPU_ACCOUNT_ENV, &self.account)
             .env_remove(CPU_PERCENT_ENV)
+            .env_remove("HARNESS_EXECUTOR_SESSION")
             .env_remove("HARNESS_LAUNCH_FIXTURE_MODE");
         c
     }
@@ -167,6 +168,7 @@ impl Fixture {
         // Absent means "inherit the caller's ceiling override", which a test
         // must not pick up from the developer's environment.
         c.env.insert(CPU_PERCENT_ENV.into(), None);
+        c.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
         c.env
             .insert("HARNESS_LAUNCH_FIXTURE_MODE".into(), Some(mode.into()));
         ConsoleSession::spawn(ConsoleSpec::new(c)).unwrap()
@@ -1632,4 +1634,108 @@ fn process_in_named_job(pid: u32, name: &str) -> bool {
         CloseHandle(job);
         queried != 0 && member != 0
     }
+}
+
+fn write_shared_cpu_policy(account: &Path, body: &[u8]) {
+    fs::create_dir_all(account).unwrap();
+    fs::write(account.join("shared-cpu-policy.json"), body).unwrap();
+}
+
+/// Hold one admitted bootstrap payload long enough to read the kernel rate the
+/// launcher actually established, then stop it. The ownership record is checked
+/// before this process joins, so the assertion cannot be satisfied by creating
+/// the group here.
+fn assert_bootstrap_rate(f: &Fixture, expected: f64, percent_env: Option<&str>) {
+    let started = f.root.path().join(format!("policy-started-{expected}"));
+    let mut command = f.command();
+    if let Some(value) = percent_env {
+        command.env(CPU_PERCENT_ENV, value);
+    }
+    let child = command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "30000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _child = KillOnDrop(child);
+    wait_for_path(&started, Duration::from_secs(30));
+    let record_path = f.account.join("cpu-budget.json");
+    wait_for_path(&record_path, Duration::from_secs(5));
+    let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        record["cpu_rate"],
+        json!(cpu_rate_units(expected)),
+        "launcher ownership record {record}"
+    );
+    let budget = SharedCpuBudget::acquire(&f.account, expected).expect("launcher rate must match");
+    let snapshot = budget.snapshot().unwrap();
+    assert_eq!(snapshot.cpu_rate, cpu_rate_units(expected));
+    assert!(snapshot.cpu_hard_cap);
+    assert!(
+        snapshot.active_processes >= 1,
+        "the launcher was not holding the group it established: {snapshot:?}"
+    );
+}
+
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn preserved_policy_edit_changes_bootstrap_admission() {
+    let absent = Fixture::new();
+    assert_bootstrap_rate(&absent, SHARED_CPU_PERCENT, None);
+
+    let edited = Fixture::new();
+    write_shared_cpu_policy(
+        &edited.account,
+        br#"{"schema":1,"ceiling_percent":40.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#,
+    );
+    assert_bootstrap_rate(&edited, 40.0, None);
+
+    let overridden = Fixture::new();
+    write_shared_cpu_policy(
+        &overridden.account,
+        br#"{"schema":1,"ceiling_percent":40.0}"#,
+    );
+    assert_bootstrap_rate(&overridden, 20.0, Some("20"));
+}
+
+#[test]
+fn malformed_policy_warns_without_substituting_bootstrap_ceiling() {
+    let f = Fixture::new();
+    let body = b"{\"schema\":1}";
+    write_shared_cpu_policy(&f.account, body);
+    let (code, report, stderr) = launch_session(&f, &["exec"], None);
+    assert_eq!(code, 19, "{stderr}");
+    assert!(report.get("args").is_some(), "{report}");
+    assert_eq!(stderr.matches(CAP_WARNING).count(), 1, "{stderr}");
+    assert!(stderr.contains("not a substitute ceiling"), "{stderr}");
+    assert!(
+        stderr.contains("failed stage: ceiling configuration"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cause: "), "{stderr}");
+    assert!(stderr.contains("recovery: "), "{stderr}");
+    assert!(
+        !stderr.contains("requested ceiling 75% of host CPU"),
+        "a malformed record must not be reported as the installed default: {stderr}"
+    );
+    assert!(
+        !f.account.join("cpu-budget.json").exists(),
+        "fail-open must not establish a substitute group: {}",
+        account_state(&f.account)
+    );
+    assert_eq!(
+        fs::read(f.account.join("shared-cpu-policy.json")).unwrap(),
+        body
+    );
 }

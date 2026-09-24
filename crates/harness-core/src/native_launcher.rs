@@ -462,6 +462,11 @@ fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
         }
         #[cfg(windows)]
         if !service.is_running()? {
+            // The peer can bind between the preceding probe and this exit
+            // observation. Recheck readiness after observing the losing child.
+            if matches!(shim_probe(port), ShimProbe::Ours(exe) if same_executable(&exe, manager)) {
+                return Ok(());
+            }
             return Err(io::Error::other(format!(
                 "xAI compatibility shim exited before readiness (exit {:?})",
                 service.exit_code()?
@@ -563,13 +568,12 @@ fn interactive_spec(command: &Command) -> io::Result<crate::process::CommandSpec
     Ok(spec)
 }
 
-/// Machine-local ceiling override for the shared account CPU budget, expressed
-/// like [`crate::process::SHARED_CPU_PERCENT`] as a percent of total host CPU.
-/// The value never comes from tracked source: an absent override keeps the
-/// installed default and an unusable one degrades to the warned fallback
-/// instead of silently changing the requested policy.
-#[cfg(windows)]
-const CPU_PERCENT_ENV: &str = "CODEX_HARNESS_CPU_PERCENT";
+// [`crate::heavy_command::SHARED_CPU_ESCAPE_HATCH`] is the per-launch ceiling
+// override, expressed like [`crate::process::SHARED_CPU_PERCENT`] as a percent
+// of total host CPU. It never comes from tracked source and wins over the
+// machine-local policy record. An absent hatch reads that record; an absent
+// record keeps the installed default. An unusable hatch or record degrades to
+// the warned fallback instead of silently changing the requested ceiling.
 
 /// Bound on the account critical section (one object create plus one small
 /// ownership-record write) before this launch reports the failed stage and
@@ -614,37 +618,51 @@ struct CpuAdmission {
 /// their own handles, membership and settings.
 #[cfg(windows)]
 fn session_cpu_admission() -> CpuAdmission {
-    use crate::process::{
-        CPU_BUDGET_ACCOUNT_ENV, Cancellation, Deadline, SHARED_CPU_PERCENT, SharedCpuBudget,
-        cpu_budget_directory,
-    };
-    let (requested, percent) = match env::var_os(CPU_PERCENT_ENV).filter(|value| !value.is_empty())
-    {
-        None => (
-            format!("{SHARED_CPU_PERCENT}% of host CPU"),
-            SHARED_CPU_PERCENT,
-        ),
-        Some(value) => {
-            let text = value.to_string_lossy().into_owned();
-            let requested = format!("{text}% of host CPU");
-            match text.trim().parse::<f64>() {
-                Ok(percent) => (requested, percent),
-                Err(_) => {
-                    warn_cpu_fallback(
-                        &requested,
-                        "ceiling configuration",
-                        &format!("{CPU_PERCENT_ENV} does not hold a number"),
-                        &format!(
-                            "set {CPU_PERCENT_ENV} to a percentage within 0.01..=100 or unset it to use the installed {SHARED_CPU_PERCENT}% default"
-                        ),
-                    );
-                    return CpuAdmission {
-                        requested,
-                        budget: None,
-                    };
-                }
-            }
+    use crate::heavy_command::{shared_cpu_escape_hatch, shared_cpu_policy_ceiling};
+    use crate::process::{CPU_BUDGET_ACCOUNT_ENV, SHARED_CPU_PERCENT, cpu_budget_directory};
+    if let Some(hatch) = shared_cpu_escape_hatch() {
+        return match hatch {
+            Ok(ceiling) => admit_shared_cpu(ceiling.percent, ceiling.requested),
+            Err(fault) => warn_ceiling_fault(fault),
+        };
+    }
+    let directory = match cpu_budget_directory(None) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let requested = format!("{SHARED_CPU_PERCENT}% of host CPU");
+            warn_cpu_fallback(
+                &requested,
+                "account storage",
+                &error.to_string(),
+                &format!(
+                    "point {CPU_BUDGET_ACCOUNT_ENV} at a writable absolute account directory or restore LOCALAPPDATA"
+                ),
+            );
+            return CpuAdmission {
+                requested,
+                budget: None,
+            };
         }
+    };
+    match shared_cpu_policy_ceiling(&directory) {
+        Ok(ceiling) => admit_shared_cpu(ceiling.percent, ceiling.requested),
+        Err(fault) => warn_ceiling_fault(fault),
+    }
+}
+
+#[cfg(windows)]
+fn warn_ceiling_fault(fault: crate::heavy_command::SharedCpuCeilingFault) -> CpuAdmission {
+    warn_cpu_fallback(&fault.requested, fault.stage, &fault.cause, &fault.recovery);
+    CpuAdmission {
+        requested: fault.requested,
+        budget: None,
+    }
+}
+
+#[cfg(windows)]
+fn admit_shared_cpu(percent: f64, requested: String) -> CpuAdmission {
+    use crate::process::{
+        CPU_BUDGET_ACCOUNT_ENV, Cancellation, Deadline, SharedCpuBudget, cpu_budget_directory,
     };
     let directory = match cpu_budget_directory(None) {
         Ok(directory) => directory,
@@ -835,10 +853,40 @@ pub fn take_uncapped_session_selector(args: &[OsString]) -> io::Result<(bool, Ve
 /// stderr notice for one explicit exception. It names the shared ceiling and
 /// the consequence for combined load, and it is not the fail-open warning.
 pub fn uncapped_notice(scope: &str) -> String {
-    use crate::process::SHARED_CPU_PERCENT;
     format!(
-        "codex-harness: explicit uncapped invocation: this {scope} runs outside the shared {SHARED_CPU_PERCENT}% account CPU allowance; combined host agent load can exceed that ceiling while this exception runs; other sessions and shared services keep their allowance, and the next invocation without this selector is capped by default"
+        "codex-harness: explicit uncapped invocation: this {scope} runs outside the shared {} account CPU allowance; combined host agent load can exceed that ceiling while this exception runs; other sessions and shared services keep their allowance, and the next invocation without this selector is capped by default",
+        configured_shared_ceiling_label()
     )
+}
+
+fn configured_shared_ceiling_label() -> String {
+    #[cfg(windows)]
+    {
+        use crate::heavy_command::{
+            shared_cpu_escape_hatch, shared_cpu_percent_label, shared_cpu_policy_ceiling,
+        };
+        use crate::process::{SHARED_CPU_PERCENT, cpu_budget_directory};
+        if let Some(hatch) = shared_cpu_escape_hatch() {
+            return match hatch {
+                Ok(ceiling) => format!("{}%", shared_cpu_percent_label(ceiling.percent)),
+                Err(_) => "configured".to_owned(),
+            };
+        }
+        if let Ok(directory) = cpu_budget_directory(None)
+            && let Ok(ceiling) = shared_cpu_policy_ceiling(&directory)
+        {
+            return format!("{}%", shared_cpu_percent_label(ceiling.percent));
+        }
+        if cpu_budget_directory(None).is_ok() {
+            return "configured".to_owned();
+        }
+        format!("{SHARED_CPU_PERCENT}%")
+    }
+    #[cfg(not(windows))]
+    {
+        use crate::process::SHARED_CPU_PERCENT;
+        format!("{SHARED_CPU_PERCENT}%")
+    }
 }
 
 /// Wrapper entry. The process that owns the lifecycle Job waits on this
@@ -1041,9 +1089,15 @@ fn exception_request(
 
 #[cfg(windows)]
 fn shared_cpu_job_name() -> Option<String> {
-    use crate::process::{SHARED_CPU_PERCENT, SharedCpuBudget, cpu_budget_directory};
+    use crate::heavy_command::{shared_cpu_escape_hatch, shared_cpu_policy_ceiling};
+    use crate::process::{SharedCpuBudget, cpu_budget_directory};
     let directory = cpu_budget_directory(None).ok()?;
-    SharedCpuBudget::acquire(&directory, SHARED_CPU_PERCENT)
+    let ceiling = if let Some(hatch) = shared_cpu_escape_hatch() {
+        hatch.ok()?
+    } else {
+        shared_cpu_policy_ceiling(&directory).ok()?
+    };
+    SharedCpuBudget::acquire(&directory, ceiling.percent)
         .ok()
         .map(|budget| budget.name().to_owned())
 }

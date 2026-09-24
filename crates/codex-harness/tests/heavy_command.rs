@@ -44,6 +44,8 @@ const JOB_OBJECT_QUERY: u32 = 0x0004;
 /// The account CPU budget override: heavy callers must never join the machine's
 /// real budget from a test.
 const CPU_ACCOUNT_ENV: &str = "CODEX_HARNESS_CPU_ACCOUNT";
+/// Per-launch escape hatch. Tests remove it unless they are proving that it wins.
+const CPU_PERCENT_ENV: &str = "CODEX_HARNESS_CPU_PERCENT";
 
 fn manager() -> &'static str {
     env!("CARGO_BIN_EXE_codex-harness")
@@ -74,6 +76,7 @@ fn heavy(account: &Path, current_dir: &Path) -> Command {
         .arg(fixture_target())
         .current_dir(current_dir)
         .env(CPU_ACCOUNT_ENV, cpu_account(account))
+        .env_remove(CPU_PERCENT_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
@@ -991,6 +994,7 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
         .arg(fixture_target())
         .current_dir(&work)
         .env(CPU_ACCOUNT_ENV, cpu_account(&account))
+        .env_remove(CPU_PERCENT_ENV)
         .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
         .env("HARNESS_HEAVY_FIXTURE_MS", "2500")
         .env("HARNESS_HEAVY_FIXTURE_STARTED", &nested_started)
@@ -1206,6 +1210,7 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
         .arg(&state)
         .env("CODEX_HARNESS_HEAVY_ACCOUNT", &account)
         .env(CPU_ACCOUNT_ENV, cpu_account(&account))
+        .env_remove(CPU_PERCENT_ENV)
         .env("HARNESS_HEAVY_TEST_NESTED", manager())
         .env("HARNESS_HEAVY_TEST_EVIDENCE", &evidence)
         .env("HARNESS_HEAVY_TEST_SHARED_JOB", &shared_job)
@@ -1774,4 +1779,114 @@ fn capped_allowance_peer() {
         assert!(Instant::now() < deadline, "capped peer was not stopped");
         sleep(Duration::from_millis(50));
     }
+}
+
+fn write_shared_cpu_policy(account: &Path, body: &[u8]) {
+    let cpu = cpu_account(account);
+    fs::create_dir_all(&cpu).unwrap();
+    fs::write(cpu.join("shared-cpu-policy.json"), body).unwrap();
+}
+
+#[test]
+fn preserved_policy_edit_changes_heavy_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    write_shared_cpu_policy(
+        &account,
+        br#"{"schema":1,"ceiling_percent":40.0,"escape_hatch":"CODEX_HARNESS_CPU_PERCENT"}"#,
+    );
+    let log = root.join("heavy.log");
+    let payload_pid = root.join("payload.pid");
+    let mut command = heavy_logged(&account, &work, &log);
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "20000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &payload_pid);
+    let child = command.spawn().unwrap();
+    let _child = KillOnDrop(child);
+    let payload = wait_for_payload(&payload_pid, Duration::from_secs(30));
+    let text = wait_for_log(
+        &log,
+        "shared account CPU budget job=",
+        Duration::from_secs(30),
+    );
+    let shared_job = field(&text, "shared account CPU budget job=");
+    assert_eq!(job_cpu_rate(&shared_job), 4_000, "{text}");
+    assert!(
+        process_in_job(payload, &shared_job),
+        "the payload must be admitted at the preserved policy ceiling"
+    );
+    unsafe { CloseHandle(payload) };
+}
+
+#[test]
+fn escape_hatch_wins_over_heavy_policy_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    write_shared_cpu_policy(&account, br#"{"schema":1,"ceiling_percent":40.0}"#);
+    let log = root.join("heavy.log");
+    let payload_pid = root.join("payload.pid");
+    let mut command = heavy_logged(&account, &work, &log);
+    command
+        .env(CPU_PERCENT_ENV, "20")
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "20000")
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &payload_pid);
+    let child = command.spawn().unwrap();
+    let _child = KillOnDrop(child);
+    let payload = wait_for_payload(&payload_pid, Duration::from_secs(30));
+    let text = wait_for_log(
+        &log,
+        "shared account CPU budget job=",
+        Duration::from_secs(30),
+    );
+    let shared_job = field(&text, "shared account CPU budget job=");
+    assert_eq!(job_cpu_rate(&shared_job), 2_000, "{text}");
+    assert!(process_in_job(payload, &shared_job));
+    unsafe { CloseHandle(payload) };
+}
+
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn malformed_policy_warns_without_substituting_heavy_ceiling() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let body = b"{\"schema\":1}";
+    write_shared_cpu_policy(&account, body);
+    let mut command = heavy(&account, &work);
+    let output = run(&mut command, Duration::from_secs(60));
+    let err = stderr(&output);
+    assert_eq!(output.status.code(), Some(0), "{err}");
+    assert!(err.contains("no substitute ceiling"), "{err}");
+    assert!(err.contains("cause") || err.contains("not usable"), "{err}");
+    assert!(err.contains("recovery:"), "{err}");
+    assert!(
+        !err.contains("shared account CPU budget job="),
+        "a malformed record must not establish a group: {err}"
+    );
+    assert!(
+        !cpu_account(&account).join("cpu-budget.json").exists(),
+        "fail-open must not write an ownership record for a substitute ceiling"
+    );
+    assert_eq!(
+        fs::read(cpu_account(&account).join("shared-cpu-policy.json")).unwrap(),
+        body
+    );
 }

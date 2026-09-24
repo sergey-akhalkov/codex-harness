@@ -179,22 +179,40 @@ impl SessionCpuAllowance {
     /// Unrelated processes stay outside: only this session owner is assigned,
     /// never the terminal tab, console or shell that started it.
     pub fn join(scope: &str) -> Self {
+        if let Some(hatch) = crate::heavy_command::shared_cpu_escape_hatch() {
+            return match hatch {
+                Ok(ceiling) => Self::join_at(scope, ceiling.percent),
+                Err(fault) => Self::policy_fault(scope, &fault),
+            };
+        }
         let directory = match cpu_budget_directory(None) {
             Ok(directory) => directory,
-            Err(error) => return Self::degraded(scope, &error),
+            Err(error) => return Self::degraded(scope, SHARED_CPU_PERCENT, &error),
+        };
+        let percent = match crate::heavy_command::shared_cpu_policy_ceiling(&directory) {
+            Ok(ceiling) => ceiling.percent,
+            Err(fault) => return Self::policy_fault(scope, &fault),
+        };
+        Self::join_at(scope, percent)
+    }
+
+    fn join_at(scope: &str, percent: f64) -> Self {
+        let directory = match cpu_budget_directory(None) {
+            Ok(directory) => directory,
+            Err(error) => return Self::degraded(scope, percent, &error),
         };
         let deadline = match Deadline::after(CPU_ADMISSION_WAIT) {
             Ok(deadline) => deadline,
-            Err(error) => return Self::degraded(scope, &error),
+            Err(error) => return Self::degraded(scope, percent, &error),
         };
         let budget = match SharedCpuBudget::acquire_within(
             &directory,
-            SHARED_CPU_PERCENT,
+            percent,
             deadline,
             &Cancellation::default(),
         ) {
             Ok(budget) => budget,
-            Err(error) => return Self::degraded(scope, &error),
+            Err(error) => return Self::degraded(scope, percent, &error),
         };
         match budget.snapshot() {
             Ok(snapshot)
@@ -206,12 +224,13 @@ impl SessionCpuAllowance {
             Ok(_) => {
                 return Self::degraded(
                     scope,
+                    percent,
                     &io::Error::other(
                         "the account allowance does not carry the required CPU-only settings; it is preserved unchanged",
                     ),
                 );
             }
-            Err(error) => return Self::degraded(scope, &error),
+            Err(error) => return Self::degraded(scope, percent, &error),
         }
         // Kernel membership, never a copied marker: a session owner started
         // inside another admitted session is confirmed instead of being
@@ -231,7 +250,7 @@ impl SessionCpuAllowance {
                     // through it are still admitted before they run, which is
                     // a real cap even though this process is outside.
                     eprintln!(
-                        "codex-harness: warning: the shared {SHARED_CPU_PERCENT}% account CPU allowance \"{}\" could not admit {scope} itself ({error}); only payloads that are admitted through that allowance before they run are capped, so {scope} and anything it starts outside that path run without the shared ceiling. Other sessions keep their own allowance, and coverage stays degraded until the cause is fixed and this session is restarted into the allowance",
+                        "codex-harness: warning: the shared {percent}% account CPU allowance \"{}\" could not admit {scope} itself ({error}); only payloads that are admitted through that allowance before they run are capped, so {scope} and anything it starts outside that path run without the shared ceiling. Other sessions keep their own allowance, and coverage stays degraded until the cause is fixed and this session is restarted into the allowance",
                         budget.name()
                     );
                     Self {
@@ -240,7 +259,7 @@ impl SessionCpuAllowance {
                     }
                 }
             },
-            Err(error) => Self::degraded(scope, &error),
+            Err(error) => Self::degraded(scope, percent, &error),
         }
     }
 
@@ -270,9 +289,20 @@ impl SessionCpuAllowance {
         spawn_admitted(self.budget.as_ref(), lifecycle, scope, command)
     }
 
-    fn degraded(scope: &str, error: &io::Error) -> Self {
+    fn degraded(scope: &str, percent: f64, error: &io::Error) -> Self {
         eprintln!(
-            "codex-harness: warning: {scope} runs outside the shared {SHARED_CPU_PERCENT}% account CPU allowance for this account ({error}); other sessions keep their allowance and were not affected, and coverage stays degraded until the account allowance is usable and this session is restarted into it"
+            "codex-harness: warning: {scope} runs outside the shared {percent}% account CPU allowance for this account ({error}); other sessions keep their allowance and were not affected, and coverage stays degraded until the account allowance is usable and this session is restarted into it"
+        );
+        Self {
+            budget: None,
+            admitted: false,
+        }
+    }
+
+    fn policy_fault(scope: &str, fault: &crate::heavy_command::SharedCpuCeilingFault) -> Self {
+        eprintln!(
+            "codex-harness: warning: shared agent CPU cap not verified: requested ceiling {}; failed stage: {}; cause: {}; scope: {scope} starts outside the verified account CPU group, so its own CPU use is not bounded by a substitute ceiling while other sessions keep theirs; recovery: {}",
+            fault.requested, fault.stage, fault.cause, fault.recovery
         );
         Self {
             budget: None,
@@ -305,8 +335,14 @@ pub fn spawn_admitted(
     match budget.spawn(lifecycle, command) {
         Ok(process) => Ok(process),
         Err(error) => {
+            let ceiling = budget
+                .snapshot()
+                .ok()
+                .filter(|snapshot| snapshot.cpu_rate > 0)
+                .map(|snapshot| f64::from(snapshot.cpu_rate) / 100.0)
+                .unwrap_or(SHARED_CPU_PERCENT);
             eprintln!(
-                "codex-harness: warning: {scope} could not be admitted to the shared {SHARED_CPU_PERCENT}% account CPU allowance \"{}\" before it ran ({error}); it starts once with its ordinary lifecycle, so any ceiling it has is unverified. Other sessions keep their allowance, and coverage stays degraded until the cause is fixed and this session is restarted into the allowance",
+                "codex-harness: warning: {scope} could not be admitted to the shared {ceiling}% account CPU allowance \"{}\" before it ran ({error}); it starts once with its ordinary lifecycle, so any ceiling it has is unverified. Other sessions keep their allowance, and coverage stays degraded until the cause is fixed and this session is restarted into the allowance",
                 budget.name()
             );
             lifecycle.spawn(command)
