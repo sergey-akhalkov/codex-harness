@@ -787,6 +787,16 @@ impl RunTracker {
         self.observation.updated_ms = now_ms();
     }
 
+    /// Records that the only frontend exited during active work. Session
+    /// identity, the result locator and partial files stay. This is an
+    /// unsuccessful outcome, never a successful exit.
+    pub(crate) fn session_interrupted(&mut self, cause: String) {
+        self.observation.state = STATE_INTERRUPTED.into();
+        self.observation.exit_code = None;
+        self.observation.cause = Some(cause);
+        self.observation.updated_ms = now_ms();
+    }
+
     /// Applies one control-backed record: the receipt state the record
     /// establishes (when it establishes one), the activity of a completed
     /// item, and the exact native thread identity. Returns true when the
@@ -1219,6 +1229,44 @@ pub(crate) fn commit_stop(
             exit_code: stop.exit_code,
         })
     })
+}
+
+/// Commits frontend loss unless a terminal result is already retained.
+///
+/// The receipt is re-read under its lock, so a completion recorded while the
+/// frontend was closing keeps that result. Frontend exit never manufactures
+/// success. Returns true when the retained result was left unchanged.
+pub(crate) fn commit_frontend_loss(
+    receipt: &Path,
+    tracker: &mut RunTracker,
+    cause: String,
+) -> io::Result<bool> {
+    with_receipt_lock(receipt, || {
+        let mut value = read_receipt_value(receipt)?;
+        if let Some(retained) = RunObservation::from_receipt(&value)
+            && retained_terminal_result(&retained)
+        {
+            tracker.observation = retained;
+            return Ok(true);
+        }
+        tracker.session_interrupted(cause);
+        value["observation"] =
+            serde_json::to_value(&tracker.observation).map_err(io::Error::other)?;
+        write_receipt(receipt, &value)?;
+        Ok(false)
+    })
+}
+
+/// A settled terminal outcome. A completed run counts only after its exit code
+/// was recorded, so a bare in-progress state cannot be promoted by frontend exit.
+fn retained_terminal_result(run: &RunObservation) -> bool {
+    match run.state.as_str() {
+        STATE_COMPLETED => run.exit_code == Some(0),
+        STATE_FAILED | STATE_DEFECT | STATE_INTERRUPTED | STATE_STOPPED | STATE_PARTIAL_STOP => {
+            run.exit_code.is_some()
+        }
+        _ => false,
+    }
 }
 
 /// Adds one cause sentence without repeating text a repeated stop already
@@ -2425,6 +2473,90 @@ mod tests {
         );
         // The recorded result stays readable for the lead.
         assert_eq!(value["observation"]["result"], r"C:\state\message-1.txt");
+    }
+
+    #[test]
+    fn frontend_loss_keeps_a_retained_completion_and_otherwise_interrupts() {
+        let root = tempfile::tempdir().unwrap();
+        let result = root.path().join("message-1.txt");
+        fs::write(&result, "kept result").unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "slot": {"owner": "exec-ds-7"},
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": STATE_COMPLETED,
+                    "exitCode": 0,
+                    "session": "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+                    "result": &result,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut tracker = RunTracker::new(RunObservation::accepted(
+            result.clone(),
+            root.path().join("stream.jsonl"),
+        ));
+        tracker.observation.session = Some("should-not-replace".into());
+        tracker.observation.state = STATE_RUNNING.into();
+        let kept = commit_frontend_loss(&receipt, &mut tracker, "frontend exited".into()).unwrap();
+        assert!(kept);
+        assert_eq!(tracker.observation.state, STATE_COMPLETED);
+        assert_eq!(tracker.observation.exit_code, Some(0));
+        assert_eq!(
+            tracker.observation.session.as_deref(),
+            Some("01a0c719-f4d4-7880-a9d2-1a96ee0f23f4")
+        );
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_COMPLETED, "{value}");
+        assert_eq!(value["observation"]["exitCode"], 0, "{value}");
+        assert_eq!(value["slot"]["owner"], "exec-ds-7");
+
+        let running = root.path().join("spawn-2.json");
+        fs::write(
+            &running,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": STATE_RUNNING,
+                    "session": "session-kept",
+                    "result": &result,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let recorded = RunObservation::from_receipt(
+            &serde_json::from_slice::<Value>(&fs::read(&running).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut tracker = RunTracker::new(recorded);
+        let kept = commit_frontend_loss(
+            &running,
+            &mut tracker,
+            "the owned native frontend exited".into(),
+        )
+        .unwrap();
+        assert!(!kept);
+        assert_eq!(tracker.observation.state, STATE_INTERRUPTED);
+        assert_eq!(tracker.observation.session.as_deref(), Some("session-kept"));
+        assert!(tracker.observation.exit_code.is_none());
+        let value: Value = serde_json::from_slice(&fs::read(&running).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_INTERRUPTED, "{value}");
+        assert_eq!(value["observation"]["session"], "session-kept");
+        assert!(
+            value["observation"]["cause"]
+                .as_str()
+                .is_some_and(|cause| cause.contains("frontend exited")),
+            "{value}"
+        );
     }
 
     #[test]
