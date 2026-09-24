@@ -96,6 +96,8 @@ A new Codex process SHALL consume edited contents of already connected source-ow
 
 These harness health checks SHALL NOT block ordinary upstream Codex CLI launch. An installed command bootstrap independent of checkout availability SHALL preserve access to the original CLI when harness source, shared configuration or its required build is unavailable. It SHALL report the degraded harness and use native arguments/local settings without running unverified harness extensions, rebuilding, downloading or rewriting user configuration. Missing upstream Codex itself and recursive command discovery SHALL remain explicit failures, not reasons to invoke an arbitrary replacement.
 
+The installed bootstrap SHALL apply the shared agent CPU policy independently of optional harness feature availability. When it cannot establish or verify the requested cap, it SHALL preserve upstream launch availability with the visible degraded fallback specified by `shared-agent-cpu-budget`; it SHALL NOT report that launch as capped or silently change the normal policy. Explicit uncapped invocation SHALL remain available independently of the shared checkout. Fallback SHALL start the original requested payload at most once and SHALL preserve unrelated sessions' CPU policy and lifecycle.
+
 #### Scenario: A connected file changes
 - **WHEN** a shared setting, principle, skill body or agent definition is edited in the checkout and a new process starts
 - **THEN** Codex observes the new source content without a reinstall
@@ -119,6 +121,16 @@ These harness health checks SHALL NOT block ordinary upstream Codex CLI launch. 
 #### Scenario: Harness is unavailable during an ordinary Codex launch
 - **WHEN** the installed launcher encounters missing, altered or metadata-incompatible shared build inputs, an unavailable checkout/module, or missing or malformed harness registration while the original CLI remains installed
 - **THEN** ordinary Codex launches once with the user's native arguments, local settings, cwd and streams preserved, reports degraded harness behavior, and does not require a successful harness update first
+- **AND** the bootstrap establishes the shared CPU cap when possible and otherwise warns that CPU enforcement is not guaranteed
+
+#### Scenario: CPU admission fails during an ordinary launch
+- **WHEN** the installed bootstrap cannot establish or verify the shared CPU allowance before starting a usable original CLI
+- **THEN** it warns with the cause and recovery action, starts that CLI once without claiming the cap is active, and reports incomplete CPU coverage
+- **AND** it preserves the default policy for later launches and does not disable another session's limit
+
+#### Scenario: An explicit uncapped launch is requested during recovery
+- **WHEN** the user explicitly requests an uncapped invocation while the shared checkout is unavailable
+- **THEN** the installed bootstrap starts the original CLI with the visible requested exception and preserves other sessions and their CPU budgets
 
 #### Scenario: A running process uses the previous build
 - **WHEN** an explicit update validates a new native build while another session still uses the old executable
