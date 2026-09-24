@@ -340,6 +340,82 @@ fn wait_marker(path: &Path) {
     );
 }
 
+fn wait_json_file(path: &Path) -> Value {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        {
+            return value;
+        }
+        assert!(Instant::now() < until, "missing {}", path.display());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn launch_ordinary_outside_caller_job(account: &Path, marker: &Path) -> u32 {
+    let dir = marker.parent().unwrap();
+    let script = dir.join("launch-ordinary.ps1");
+    let exe = std::env::current_exe().unwrap();
+    let body = format!(
+        "$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()\r\n$startup.CreateFlags = 150995968\r\n$startup.ShowWindow = 0\r\n$startup.EnvironmentVariables = @('SystemRoot={system_root}','TEMP={temp}','HARNESS_ORDINARY_ACCOUNT={account}','HARNESS_ORDINARY_MARKER={marker}')\r\n$exe = '{exe}'\r\n$cmd = [char]34 + $exe + [char]34 + ' ordinary_chain_worker --exact --test-threads=1'\r\n$result = ([wmiclass]'Win32_Process').Create($cmd, '{dir}', $startup)\r\nif ($result.ReturnValue -ne 0) {{ exit $result.ReturnValue }}\r\nWrite-Output $result.ProcessId\r\n",
+        system_root = std::env::var("SystemRoot").unwrap(),
+        temp = std::env::var("TEMP").unwrap_or_else(|_| dir.display().to_string()),
+        account = account.display(),
+        marker = marker.display(),
+        exe = exe.display(),
+        dir = dir.display(),
+    );
+    fs::write(&script, &body).unwrap();
+    let output = std::process::Command::new("pwsh")
+        .args(["-NoProfile", "-File"])
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "outside-job ordinary host failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn ordinary_chain_worker() {
+    let Ok(account) = std::env::var("HARNESS_ORDINARY_ACCOUNT") else {
+        return;
+    };
+    let marker = PathBuf::from(std::env::var("HARNESS_ORDINARY_MARKER").unwrap());
+    let done = marker.with_extension("done");
+    let receipt_path = marker.with_extension("worker.json");
+    let budget = SharedCpuBudget::acquire(Path::new(&account), SHARED_CPU_PERCENT).unwrap();
+    let job = Job::new(Limits::default()).unwrap();
+    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    spec.args = vec!["hold".into(), marker.into_os_string()];
+    let member = budget
+        .spawn(&job, &spec)
+        .expect("ordinary spawn outside the caller job");
+    assert!(budget.contains(&member).unwrap());
+    fs::write(
+        &receipt_path,
+        format!(
+            "{{\"pid\":{},\"creation_time\":{},\"budget\":{},\"rate\":{}}}",
+            member.identity().pid,
+            member.identity().creation_time,
+            serde_json::to_string(budget.name()).unwrap(),
+            budget.snapshot().unwrap().cpu_rate
+        ),
+    )
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(40);
+    while !done.exists() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = job.terminate(0, Duration::from_secs(3));
+}
 #[test]
 #[ignore = "creates owned Windows WMI service fixtures"]
 fn reservation_prevents_late_and_duplicate_invocation() {
@@ -1094,10 +1170,10 @@ fn admitted_broker_and_backend_keep_the_account_allowance_after_one_client_exits
     let pid = first_json["identity"]["pid"].as_u64().unwrap() as u32;
     let creation_time = first_json["identity"]["creation_time"].as_u64().unwrap();
     let service = observe_service(pid, creation_time);
-    // The WMI sibling start admits itself before the service does payload work.
+    // The sibling start admits itself before the service does payload work.
     assert!(
         service.in_shared_cpu_budget(&budget).unwrap(),
-        "the WMI sibling start must join the account allowance"
+        "the sibling start must join the account allowance"
     );
     let Observation::Ready { endpoint, owner } = broker_endpoint::observe(prepared.root()).unwrap()
     else {
@@ -1178,7 +1254,7 @@ fn admitted_broker_and_backend_keep_the_account_allowance_after_one_client_exits
 }
 
 #[test]
-fn foreign_chain_join_after_service_admission_is_real_or_refused() {
+fn ordinary_participant_joins_allowance_anchored_by_sibling_service() {
     let prepared = Prepared::new();
     let budget = SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT).unwrap();
     let mut client = Client::connect(
@@ -1195,28 +1271,25 @@ fn foreign_chain_join_after_service_admission_is_real_or_refused() {
     let pid = started["identity"]["pid"].as_u64().unwrap() as u32;
     let service = observe_service(pid, started["identity"]["creation_time"].as_u64().unwrap());
     assert!(service.in_shared_cpu_budget(&budget).unwrap());
-    // A service that admitted itself is inside the WMI provider container, so the
-    // allowance is nested under that container. Measured Windows behavior: a
-    // participant from another job chain may join only if the kernel accepts the
-    // resulting hierarchy. Either outcome must be a real membership or a kernel
-    // refusal; neither may damage the anchored service or the allowance, and
-    // neither may pass as capped coverage without membership.
-    let marker = prepared.path().join("foreign-member.json");
-    let job = Job::new(Limits::default()).unwrap();
-    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
-    spec.args = vec!["hold".into(), marker.clone().into_os_string()];
-    match budget.spawn(&job, &spec) {
-        Ok(member) => {
-            let receipt: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
-            assert_eq!(receipt["in_job"], true);
-            assert!(budget.contains(&member).unwrap());
-            println!("foreign chain join: admitted pid={}", member.identity().pid);
-            job.terminate(0, Duration::from_secs(3)).unwrap();
-        }
-        Err(error) => {
-            println!("foreign chain join: refused ({error})");
-        }
-    }
+    // Service-first: an ordinary-chain participant joins the same allowance
+    // object after the sibling service anchored it. The ordinary spawn is hosted
+    // outside this test's machine-account job, which cannot cross into that chain.
+    let marker = prepared.path().join("ordinary-member.json");
+    let worker = launch_ordinary_outside_caller_job(&prepared.account(), &marker);
+    let receipt = wait_json_file(&marker.with_extension("worker.json"));
+    assert_eq!(receipt["budget"], budget.name());
+    assert_eq!(receipt["rate"], 7500);
+    let member = ServiceProcess::observe(
+        receipt["pid"].as_u64().unwrap() as u32,
+        Path::new(env!("CARGO_BIN_EXE_harness-process-fixture")),
+        0,
+        &current_user().unwrap(),
+    )
+    .unwrap();
+    assert!(member.in_shared_cpu_budget(&budget).unwrap());
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    fs::write(marker.with_extension("done"), []).unwrap();
+    let _worker = ServiceProcess::observe(worker, &std::env::current_exe().unwrap(), 0, &current_user().unwrap()).unwrap();
     let snapshot = budget.snapshot().unwrap();
     assert_eq!(snapshot.cpu_rate, 7500);
     assert!(snapshot.cpu_hard_cap && !snapshot.kill_on_close);
@@ -1242,6 +1315,59 @@ fn foreign_chain_join_after_service_admission_is_real_or_refused() {
     client.terminate();
 }
 
+#[test]
+fn sibling_service_joins_allowance_anchored_by_ordinary_participant() {
+    let prepared = Prepared::new();
+    let budget = SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT).unwrap();
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    let marker = prepared.path().join("ordinary-first.json");
+    let ordinary_job = Job::new(Limits::default()).unwrap();
+    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    spec.args = vec!["hold".into(), marker.clone().into_os_string()];
+    let member = budget.spawn(&ordinary_job, &spec).unwrap();
+    wait_marker(&marker);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&marker).unwrap()).unwrap()["in_job"],
+        true
+    );
+    assert!(budget.contains(&member).unwrap());
+    let mut client = Client::connect(
+        prepared.path(),
+        SOURCE_A,
+        IDLE_MS,
+        "echo",
+        Some(&json!({ "text": UNICODE }).to_string()),
+        None,
+        "session-first.stderr",
+    );
+    let started = client.read_json(40);
+    secret_free(&started);
+    assert_eq!(started["result"]["payload"]["text"], UNICODE);
+    let service = observe_service(
+        started["identity"]["pid"].as_u64().unwrap() as u32,
+        started["identity"]["creation_time"].as_u64().unwrap(),
+    );
+    assert!(
+        service.in_shared_cpu_budget(&budget).unwrap(),
+        "the sibling service must join the allowance the ordinary participant anchored"
+    );
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert_eq!(
+        SharedCpuBudget::acquire(&prepared.account(), SHARED_CPU_PERCENT)
+            .unwrap()
+            .name(),
+        budget.name()
+    );
+    let starter = fs::read_to_string(prepared.path().join("session-first.stderr")).unwrap();
+    assert!(
+        !starter.contains("shared CPU allowance"),
+        "an admitted service must not be reported degraded: {starter}"
+    );
+    client.terminate();
+    assert!(service.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    ordinary_job.terminate(0, Duration::from_secs(3)).unwrap();
+}
 #[test]
 fn unadmitted_pre_existing_broker_is_reported_with_restart_guidance() {
     let prepared = Prepared::new();

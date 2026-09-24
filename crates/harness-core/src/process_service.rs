@@ -1,7 +1,9 @@
-//! Independent local services: a bounded WMI helper starts the same trusted
-//! Rust executable outside its client's Job. That executable must dispatch
-//! RUN_ARGUMENT to ServiceGuard before loading its service implementation.
-//! Neither WMI's PID receipt nor the observation handle grants kill authority.
+//! Independent local services. A bounded helper starts the same trusted Rust
+//! executable as a sibling outside the client's job and outside the helper's
+//! own kill-on-close job. The payload inherits a same-user anchor's job chain
+//! rather than being created by WMI, then joins the account CPU allowance
+//! before service work. WMI remains only when that sibling creation is refused.
+//! Neither a PID receipt nor the observation handle grants kill authority.
 use crate::{
     cancellable_pipe::{CancellablePipe, PipeIoError, anonymous_pipe},
     dependency_mcp_probe::strict_json,
@@ -275,10 +277,196 @@ fn read_bounded(
     }
 }
 
+/// Internal marker for the one-shot creation anchor. It is not a service and
+/// never receives a request. The payload is created with an explicit environment
+/// that does not include this name.
+const ANCHOR_ENV: &str = "HARNESS_SERVICE_CREATION_ANCHOR";
+const PROCESS_CREATE_PROCESS: u32 = 0x0080;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// Hold a same-user process outside the helper's kill-on-close job so one
+/// payload can inherit that process's job chain instead of the helper's.
+fn hold_creation_anchor() -> ! {
+    let bound = Deadline::after(Duration::from_secs(30)).ok();
+    while bound.as_ref().is_none_or(|deadline| !deadline.expired()) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::process::exit(0);
+}
+
+fn environment_block(environment: &BTreeMap<String, String>) -> Vec<u16> {
+    let mut block = Vec::new();
+    for (name, value) in environment {
+        block.extend(name.encode_utf16());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+fn anchor_command(program: &Path) -> io::Result<Vec<u16>> {
+    let mut command = Vec::new();
+    crate::process::quote_argument(program.as_os_str(), &mut command)?;
+    command.push(32);
+    crate::process::quote_argument(OsStr::new(CREATE_ARGUMENT), &mut command)?;
+    Ok(command)
+}
+
+struct CreationAnchor(OwnedHandle);
+impl Drop for CreationAnchor {
+    fn drop(&mut self) {
+        unsafe { TerminateProcess(self.0.as_raw_handle(), 0) };
+    }
+}
+
+struct SuspendedPayload {
+    process: OwnedHandle,
+    thread: OwnedHandle,
+    pid: u32,
+    resumed: bool,
+}
+impl Drop for SuspendedPayload {
+    fn drop(&mut self) {
+        if !self.resumed {
+            unsafe { TerminateProcess(self.process.as_raw_handle(), 0) };
+        }
+    }
+}
+
+fn same_executable(process: HANDLE, program: &Path) -> io::Result<bool> {
+    let mut buffer = vec![0u16; 1024];
+    let mut length = buffer.len() as u32;
+    checked(unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) })?;
+    let image = String::from_utf16_lossy(&buffer[..length as usize]);
+    let image = image.trim_start_matches(r"\\?\");
+    let expected = program.to_string_lossy();
+    let expected = expected.trim_start_matches(r"\\?\");
+    Ok(image.eq_ignore_ascii_case(expected))
+}
+
+/// Start one payload outside the helper's job. Breakaway and a creation-time
+/// job list cannot do this: both leave the child in every ancestor that does
+/// not release members, including the helper's kill-on-close job. A same-user
+/// anchor created by WMI does not inherit that job. Naming it as the creation
+/// parent makes the payload inherit the anchor's chain instead, so closing the
+/// helper does not kill the service and the payload is not itself a WMI
+/// `Win32_Process.Create` child.
+fn create_sibling(
+    program: &Path,
+    command: &[u16],
+    directory: &str,
+    environment: &BTreeMap<String, String>,
+) -> io::Result<u32> {
+    let mut anchor_environment = Vec::new();
+    if let Ok(root) = std::env::var("SystemRoot") {
+        anchor_environment.push(format!("SystemRoot={root}"));
+    }
+    anchor_environment.push(format!("{ANCHOR_ENV}=1"));
+    let anchor_pid = wmi::create(&anchor_command(program)?, directory, &anchor_environment)?;
+    let anchor = CreationAnchor(owned(unsafe {
+        OpenProcess(
+            PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            anchor_pid,
+        )
+    })?);
+    if !same_executable(anchor.0.as_raw_handle(), program)? {
+        return Err(io::Error::other(
+            "service creation anchor is not the trusted executable",
+        ));
+    }
+    let application = wide(
+        program
+            .to_str()
+            .ok_or_else(|| invalid("service executable is not Unicode"))?,
+    )?;
+    let mut line = command.to_vec();
+    line.push(0);
+    let directory = wide(directory)?;
+    let environment = environment_block(environment);
+    let mut bytes = 0usize;
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes);
+    }
+    if bytes == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut attributes = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+    unsafe {
+        checked(InitializeProcThreadAttributeList(
+            attributes.as_mut_ptr().cast(),
+            1,
+            0,
+            &mut bytes,
+        ))?;
+    }
+    let parent = anchor.0.as_raw_handle();
+    let updated = unsafe {
+        UpdateProcThreadAttribute(
+            attributes.as_mut_ptr().cast(),
+            0,
+            PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+            (&parent as *const HANDLE).cast(),
+            std::mem::size_of::<HANDLE>(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if updated == 0 {
+        let error = io::Error::last_os_error();
+        unsafe { DeleteProcThreadAttributeList(attributes.as_mut_ptr().cast()) };
+        return Err(error);
+    }
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.lpAttributeList = attributes.as_mut_ptr().cast();
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_SUSPENDED
+                | EXTENDED_STARTUPINFO_PRESENT,
+            environment.as_ptr().cast(),
+            directory.as_ptr(),
+            &startup.StartupInfo,
+            &mut info,
+        )
+    };
+    unsafe { DeleteProcThreadAttributeList(attributes.as_mut_ptr().cast()) };
+    if created == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut payload = SuspendedPayload {
+        process: owned(info.hProcess)?,
+        thread: owned(info.hThread)?,
+        pid: info.dwProcessId,
+        resumed: false,
+    };
+    let resumed = unsafe { ResumeThread(payload.thread.as_raw_handle()) };
+    if resumed == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    payload.resumed = true;
+    Ok(payload.pid)
+}
+
 /// Run only as an early command in a trusted native executable. The outer
-/// spawn() call owns this helper's Job and bounds even a blocked COM provider.
-/// Environment values travel through stdin and COM, never argv or handoff files.
+/// spawn() call owns this helper's Job and bounds even a blocked provider.
+/// Environment values travel through stdin, never argv or handoff files.
+/// The payload is created as a sibling outside this helper's job. WMI remains
+/// only when that creation is refused; a later join refusal stays visible.
 pub fn create_helper() -> io::Result<u32> {
+    if std::env::var_os(ANCHOR_ENV).is_some() {
+        hold_creation_anchor();
+    }
     let cancel = Cancellation::default();
     let mut input = CancellablePipe::reader(
         File::from(io::stdin().as_handle().try_clone_to_owned()?),
@@ -309,9 +497,16 @@ pub fn create_helper() -> io::Result<u32> {
         .iter()
         .map(|(name, value)| format!("{name}={value}"))
         .collect();
-    // Do not invoke WMI if validation/setup already consumed the deadline.
+    // Do not start a payload if validation already consumed the deadline.
     startup_remaining(request.startup_until)?;
-    wmi::create(&command, directory, &environment)
+    match create_sibling(&program, &command, directory, &request.environment) {
+        Ok(pid) => Ok(pid),
+        Err(sibling) => wmi::create(&command, directory, &environment).map_err(|fallback| {
+            io::Error::other(format!(
+                "job-free sibling creation failed ({sibling}); WMI fallback failed ({fallback})"
+            ))
+        }),
+    }
 }
 
 /// Fixed bootstrap protocol. Validation errors never include the request body.
@@ -735,13 +930,12 @@ pub fn spawn(
 /// return the handle the service keeps for its whole lifetime, the verified
 /// host rate, and whether this process already belonged to another job.
 ///
-/// A WMI-started service is a sibling of its client and inherits no job from it,
-/// so the service joins the allowance itself and only then creates its own
-/// lifecycle Job inside it. Windows associates a process already in a job with
-/// another job only while that job is empty or already inside the process's own
-/// hierarchy, so a service that starts inside a provider container can join an
-/// allowance that no foreign containment chain anchored yet; a kernel refusal
-/// is reported as a failed allowance instead of being retried or assumed.
+/// The sibling creation path leaves this process outside the helper and client
+/// jobs. It joins the allowance itself and only then creates its lifecycle job
+/// inside that allowance. A process already in another job can join only an
+/// empty allowance or one already in its own hierarchy. A kernel refusal is a
+/// failed allowance, not a retry or an assumed cap. WMI fallback can still land
+/// in such a job, and that refusal stays visible.
 fn join_shared_cpu(deadline: Deadline) -> io::Result<(SharedCpuBudget, u32, bool)> {
     let directory = crate::process::cpu_budget_directory(None)?;
     let budget = SharedCpuBudget::acquire_within(
@@ -942,8 +1136,8 @@ impl ServiceGuard {
     pub fn shared_cpu(&self) -> Option<&SharedCpuBudget> {
         self.shared.as_ref()
     }
-    /// True when this service already belonged to another job at bootstrap (the
-    /// WMI provider container), so the account allowance is nested inside that
+    /// True when this service already belonged to another job at bootstrap (a
+    /// session or provider job), so the account allowance is nested inside that
     /// container instead of standing at the root of the hierarchy. Membership,
     /// settings and lifecycle ownership are unaffected; the nesting position
     /// decides which later participants can still join the same allowance, so

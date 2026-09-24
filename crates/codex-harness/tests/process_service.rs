@@ -154,6 +154,70 @@ fn exchange(root: &Path, value: &str) {
     }
 }
 
+fn launch_ordinary_outside_caller_job(account: &Path, marker: &Path) -> u32 {
+    let dir = marker.parent().unwrap();
+    let script = dir.join("launch-ordinary.ps1");
+    let exe = std::env::current_exe().unwrap();
+    let system_root = std::env::var("SystemRoot").unwrap();
+    let temp = std::env::var("TEMP").unwrap_or_else(|_| dir.display().to_string());
+    let body = format!(
+        "$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()\r\n$startup.CreateFlags = 150995968\r\n$startup.ShowWindow = 0\r\n$startup.EnvironmentVariables = @('SystemRoot={system_root}','TEMP={temp}','HARNESS_ORDINARY_ACCOUNT={account}','HARNESS_ORDINARY_MARKER={marker}')\r\n$exe = '{exe}'\r\n$cmd = [char]34 + $exe + [char]34 + ' ordinary_chain_worker --exact --test-threads=1'\r\n$result = ([wmiclass]'Win32_Process').Create($cmd, '{dir}', $startup)\r\nif ($result.ReturnValue -ne 0) {{ exit $result.ReturnValue }}\r\nWrite-Output $result.ProcessId\r\n",
+        system_root = system_root,
+        temp = temp,
+        account = account.display(),
+        marker = marker.display(),
+        exe = exe.display(),
+        dir = dir.display(),
+    );
+    fs::write(&script, &body).unwrap();
+    let output = std::process::Command::new("pwsh")
+        .args(["-NoProfile", "-File"])
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "outside-job ordinary host failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+#[test]
+fn ordinary_chain_worker() {
+    let Ok(account) = std::env::var("HARNESS_ORDINARY_ACCOUNT") else {
+        return;
+    };
+    let marker = PathBuf::from(std::env::var("HARNESS_ORDINARY_MARKER").unwrap());
+    let done = marker.with_extension("done");
+    let receipt_path = marker.with_extension("worker.json");
+    let budget = SharedCpuBudget::acquire(Path::new(&account), SHARED_CPU_PERCENT).unwrap();
+    let job = Job::new(Limits::default()).unwrap();
+    let mut spec = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    spec.args = vec!["hold".into(), marker.into_os_string()];
+    let member = budget
+        .spawn(&job, &spec)
+        .expect("ordinary spawn outside the caller job");
+    assert!(budget.contains(&member).unwrap());
+    fs::write(
+        &receipt_path,
+        format!(
+            "{{\"pid\":{},\"creation_time\":{},\"budget\":{},\"rate\":{}}}",
+            member.identity().pid,
+            member.identity().creation_time,
+            serde_json::to_string(budget.name()).unwrap(),
+            budget.snapshot().unwrap().cpu_rate
+        ),
+    )
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(40);
+    while !done.exists() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = job.terminate(0, Duration::from_secs(3));
+}
 #[test]
 #[ignore = "actual local WMI launch, owned native fixture only"]
 fn service_survives_first_client_job_and_reclaims_its_child() {
@@ -459,12 +523,33 @@ fn admitted_service_and_backend_keep_the_account_allowance_after_their_client_ex
     let (job, input, service, began) = start(root.path(), "serve");
     let report = wait_json(&root.path().join("endpoint.json"));
     assert_eq!(report["pid"], service.identity().pid);
-    // The WMI sibling start inherits no client job, so the service admits itself
+    // The sibling start inherits no client job, so the service admits itself
     // from its own bootstrap before it does any payload work.
     assert!(
         service.in_shared_cpu_budget(&budget).unwrap(),
-        "the WMI sibling start must join the account allowance"
+        "the sibling start must join the account allowance"
     );
+    // Service-first: an ordinary-chain participant started after the service
+    // joins the same allowance object, including its 7500 readback. This test
+    // itself runs inside the machine account budget, so the ordinary spawn is
+    // hosted by a sibling process that is not in that chain.
+    let ordinary_marker = root.path().join("ordinary.json");
+    let worker = launch_ordinary_outside_caller_job(&account(root.path()), &ordinary_marker);
+    let receipt = wait_json(&ordinary_marker.with_extension("worker.json"));
+    assert_eq!(receipt["budget"], budget.name());
+    assert_eq!(receipt["rate"], 7500);
+    let ordinary_member = ServiceProcess::observe(
+        receipt["pid"].as_u64().unwrap() as u32,
+        Path::new(env!("CARGO_BIN_EXE_harness-process-fixture")),
+        0,
+        &current_user().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ordinary_member.in_shared_cpu_budget(&budget).unwrap(),
+        "an ordinary-chain participant must join the allowance the service anchored"
+    );
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
     // Its own lower ceiling is expressed against the verified parent rate, so
     // 25% of host stays 25% of host inside the 75% allowance.
     assert_eq!(report["job"]["cpu_rate"], 3333);
@@ -511,10 +596,54 @@ fn admitted_service_and_backend_keep_the_account_allowance_after_their_client_ex
     }
     fs::write(root.path().join("stop"), []).unwrap();
     assert!(service.wait_for_exit(deadline(8)).unwrap());
+    fs::write(ordinary_marker.with_extension("done"), []).unwrap();
+    let _worker = ServiceProcess::observe(worker, &std::env::current_exe().unwrap(), 0, &current_user().unwrap()).unwrap();
     assert!(
         leaf.wait_for_exit(deadline(5)).unwrap(),
         "service cleanup still reclaims its own child"
     );
+}
+
+#[test]
+fn service_joins_allowance_already_anchored_by_ordinary_participant() {
+    let root = tempfile::Builder::new()
+        .prefix("anchored allowance Русский-日本-")
+        .tempdir()
+        .unwrap();
+    let _stop = StopService(root.path());
+    let budget = SharedCpuBudget::acquire(&account(root.path()), SHARED_CPU_PERCENT).unwrap();
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    let marker = root.path().join("ordinary.json");
+    let ordinary_job = Job::new(Limits::default()).unwrap();
+    let mut ordinary = CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    ordinary.args = vec!["hold".into(), marker.clone().into_os_string()];
+    let member = budget.spawn(&ordinary_job, &ordinary).unwrap();
+    assert_eq!(wait_json(&marker)["in_job"], true);
+    assert!(budget.contains(&member).unwrap());
+    let (job, _input, service, _began) = start(root.path(), "serve");
+    assert!(
+        service.in_shared_cpu_budget(&budget).unwrap(),
+        "a sibling service must join the allowance an ordinary participant anchored"
+    );
+    assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
+    assert_eq!(
+        SharedCpuBudget::acquire(&account(root.path()), SHARED_CPU_PERCENT)
+            .unwrap()
+            .name(),
+        budget.name()
+    );
+    exchange(root.path(), "anchored client 日本");
+    let starter = fs::read_to_string(root.path().join("starter.stderr")).unwrap();
+    assert!(
+        !starter.contains("shared CPU allowance"),
+        "an admitted service must not be reported degraded: {starter}"
+    );
+    job.terminate(130, Duration::from_secs(3)).unwrap();
+    assert!(service.is_running().unwrap());
+    assert!(service.in_shared_cpu_budget(&budget).unwrap());
+    ordinary_job.terminate(0, Duration::from_secs(3)).unwrap();
+    fs::write(root.path().join("stop"), []).unwrap();
+    assert!(service.wait_for_exit(deadline(8)).unwrap());
 }
 
 #[test]
