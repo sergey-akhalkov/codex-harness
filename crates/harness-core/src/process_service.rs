@@ -911,13 +911,23 @@ pub fn spawn(
     match (outcome.exit_code, receipt.pid, receipt.error) {
         (0, Some(pid), None) => {
             let service = ServiceProcess::observe(pid, &program, began, &request.user)?;
+            // Admission runs in the payload after this receipt. Do not report a
+            // miss while that bootstrap is still joining.
+            let mut coverage = shared_cpu_coverage(&service, None);
+            let settle = std::time::Instant::now() + Duration::from_secs(2);
+            while matches!(coverage, SharedCpuCoverage::Unadmitted { .. })
+                && std::time::Instant::now() < settle
+            {
+                std::thread::sleep(Duration::from_millis(20));
+                coverage = shared_cpu_coverage(&service, None);
+            }
             // Fail-open reporting: a service that could not join the allowance
             // still starts and stays usable, and this client says so instead of
             // implying that the requested ceiling holds.
             warn_shared_cpu(
                 &format!("the service started from {} (pid {pid})", program.display()),
                 service.identity(),
-                &shared_cpu_coverage(&service, None),
+                &coverage,
             );
             Ok(service)
         }

@@ -171,7 +171,7 @@ fn launch_ordinary_outside_caller_job(account: &Path, marker: &Path) -> u32 {
     );
     fs::write(&script, &body).unwrap();
     let output = std::process::Command::new("pwsh")
-        .args(["-NoProfile", "-File"])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .output()
         .unwrap();
@@ -597,7 +597,13 @@ fn admitted_service_and_backend_keep_the_account_allowance_after_their_client_ex
     fs::write(root.path().join("stop"), []).unwrap();
     assert!(service.wait_for_exit(deadline(8)).unwrap());
     fs::write(ordinary_marker.with_extension("done"), []).unwrap();
-    let _worker = ServiceProcess::observe(worker, &std::env::current_exe().unwrap(), 0, &current_user().unwrap()).unwrap();
+    let _worker = ServiceProcess::observe(
+        worker,
+        &std::env::current_exe().unwrap(),
+        0,
+        &current_user().unwrap(),
+    )
+    .unwrap();
     assert!(
         leaf.wait_for_exit(deadline(5)).unwrap(),
         "service cleanup still reclaims its own child"

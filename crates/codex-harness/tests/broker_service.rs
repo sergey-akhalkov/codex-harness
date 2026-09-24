@@ -368,7 +368,7 @@ fn launch_ordinary_outside_caller_job(account: &Path, marker: &Path) -> u32 {
     );
     fs::write(&script, &body).unwrap();
     let output = std::process::Command::new("pwsh")
-        .args(["-NoProfile", "-File"])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .output()
         .unwrap();
@@ -1289,7 +1289,13 @@ fn ordinary_participant_joins_allowance_anchored_by_sibling_service() {
     assert!(member.in_shared_cpu_budget(&budget).unwrap());
     assert_eq!(budget.snapshot().unwrap().cpu_rate, 7500);
     fs::write(marker.with_extension("done"), []).unwrap();
-    let _worker = ServiceProcess::observe(worker, &std::env::current_exe().unwrap(), 0, &current_user().unwrap()).unwrap();
+    let _worker = ServiceProcess::observe(
+        worker,
+        &std::env::current_exe().unwrap(),
+        0,
+        &current_user().unwrap(),
+    )
+    .unwrap();
     let snapshot = budget.snapshot().unwrap();
     assert_eq!(snapshot.cpu_rate, 7500);
     assert!(snapshot.cpu_hard_cap && !snapshot.kill_on_close);
