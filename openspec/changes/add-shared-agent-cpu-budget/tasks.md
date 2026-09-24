@@ -6,7 +6,7 @@
 
 ## 2. Complete agent and service coverage
 
-- [ ] 2.1 Connect task-control, executor, resume and terminal-dispatch routes through `crates/harness-core/src/task_runtime.rs` and the existing executor owners under `crates/codex-harness/src`. Extend `crates/codex-harness/tests/task_control_launch.rs` and applicable executor tests to show that independently started sessions share the same group while unrelated terminal tabs remain outside it.
+- [x] 2.1 Connect task-control, executor, resume and terminal-dispatch routes through `crates/harness-core/src/task_runtime.rs` and the existing executor owners under `crates/codex-harness/src`. Extend `crates/codex-harness/tests/task_control_launch.rs` and applicable executor tests to show that independently started sessions share the same group while unrelated terminal tabs remain outside it.
 - [ ] 2.2 Add OpenCode to the installed native launch/connection lifecycle without coupling it to Codex model or configuration choices. Verify direct installed OpenCode invocation, native child work, upstream resolution/update, warning fallback and recoverable registration from a synthetic consumer; inspect the installed OpenCode interface used by these tests before adding forwarding behavior.
 - [ ] 2.3 Admit kit-owned shared MCP/backends through `crates/harness-core/src/process_service.rs`, `process_service_wmi.rs` and `broker_launch.rs`, including sibling starts outside ordinary inheritance. Extend `crates/codex-harness/tests/process_service.rs` and `broker_service.rs`; verify real retained MCP calls, group membership and backend survival when one of two clients exits. Validate both launch-time admission and reporting/restart of pre-existing unadmitted services.
 
