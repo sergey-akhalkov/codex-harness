@@ -385,10 +385,10 @@ mod tests {
         assert_eq!(config.vote_threshold, 3);
         assert_eq!(config.incubator_size_cap, 32);
         assert_eq!(config.feedback_batch_limit, 8);
-        validate(&config, &installed(&["default", "ds", "zai"])).unwrap();
+        validate(&config, &installed(&["default", "xai", "zai"])).unwrap();
         let error = validate(&config, &installed(&["default", "zai"])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("profile 'ds' is not installed"));
+        assert!(error.to_string().contains("profile 'xai' is not installed"));
         assert!(!error.to_string().contains("substitut"));
     }
 
@@ -462,15 +462,15 @@ mod tests {
             include_bytes!("../../../global/orchestration.toml"),
         )
         .unwrap();
-        fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
+        fs::write(home.join("xai.config.toml"), "model = 'grok-4.7'\n").unwrap();
         fs::write(home.join("zai.config.toml"), "model = 'glm-5.3'\n").unwrap();
         check_installation(&source, &home).unwrap();
-        fs::remove_file(home.join("ds.config.toml")).unwrap();
+        fs::remove_file(home.join("xai.config.toml")).unwrap();
         let error = check_installation(&source, &home).unwrap_err();
-        assert!(error.to_string().contains("profile 'ds' is not installed"));
+        assert!(error.to_string().contains("profile 'xai' is not installed"));
         fs::write(
             home.join("config.toml"),
-            "[profiles.ds]\nmodel = 'deepseek-flash'\n\n[profiles.zai]\nmodel = 'glm-5.3'\n",
+            "[profiles.xai]\nmodel = 'grok-4.7'\n\n[profiles.zai]\nmodel = 'glm-5.3'\n",
         )
         .unwrap();
         check_installation(&source, &home).unwrap();
@@ -551,12 +551,12 @@ mod tests {
         )
         .unwrap();
         let profile = executor_profile(&config, None).unwrap();
-        assert_eq!(profile, "ds");
-        assert_eq!(profile_args(&profile).unwrap(), ["--profile", "ds"]);
+        assert_eq!(profile, "xai");
+        assert_eq!(profile_args(&profile).unwrap(), ["--profile", "xai"]);
         assert!(profile_args("default").unwrap().is_empty());
         assert_eq!(
             executor_session_args(&profile).unwrap(),
-            ["--profile", "ds", "-c", "agents.enabled=false"]
+            ["--profile", "xai", "-c", "agents.enabled=false"]
         );
         assert_eq!(
             executor_session_args("default").unwrap(),

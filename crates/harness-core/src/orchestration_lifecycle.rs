@@ -150,7 +150,7 @@ mod tests {
 
     fn installed_profiles(home: &Path) {
         fs::create_dir_all(home).unwrap();
-        fs::write(home.join("ds.config.toml"), "model = 'deepseek-flash'\n").unwrap();
+        fs::write(home.join("xai.config.toml"), "model = 'grok-4.7'\n").unwrap();
         fs::write(home.join("zai.config.toml"), "model = 'glm-5.3'\n").unwrap();
     }
 
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(walkdir(&home), before);
         let connected = check(&source, &home, &user, false).unwrap();
         assert_eq!(connected.status, "Orchestration connected");
-        assert_eq!(connected.executor_profiles, ["ds"]);
+        assert_eq!(connected.executor_profiles, ["xai"]);
         assert_eq!(connected.vote_threshold, Some(3));
         assert_eq!(connected.guidance, ["team-lead", "board-workflow"]);
         assert!(connected.guidance_missing.is_empty());
@@ -220,7 +220,7 @@ mod tests {
             fs::read(home.join("worktrees/exec/repo/partial.txt")).unwrap(),
             b"keep"
         );
-        assert!(home.join("ds.config.toml").is_file());
+        assert!(home.join("xai.config.toml").is_file());
     }
 
     #[test]
@@ -262,10 +262,10 @@ mod tests {
         let user = root.path().join("user");
         installed_profiles(&home);
         fs::remove_file(home.join("zai.config.toml")).unwrap();
-        let before = fs::read(home.join("ds.config.toml")).unwrap();
+        let before = fs::read(home.join("xai.config.toml")).unwrap();
         let error = check(&source, &home, &user, false).unwrap_err();
         assert!(error.to_string().contains("profile 'zai' is not installed"));
-        assert_eq!(fs::read(home.join("ds.config.toml")).unwrap(), before);
+        assert_eq!(fs::read(home.join("xai.config.toml")).unwrap(), before);
         assert!(!user.exists());
     }
 
