@@ -738,6 +738,14 @@ fn restart_preserves_dirty_worktree_reuses_assignment_and_refuses_a_stale_sessio
         "{text}"
     );
     assert!(
+        text.contains("presentation=native-tui"),
+        "restart must keep the managed presentation: {text}"
+    );
+    assert!(
+        text.contains("previous-session="),
+        "restart must name the predecessor: {text}"
+    );
+    assert!(
         text.contains("installed Codex launcher is missing"),
         "{text}"
     );
@@ -820,6 +828,10 @@ fn resume_rebinds_the_interrupted_slot_without_resetting_partial_work() {
     assert!(
         text.contains("installed Codex launcher is missing"),
         "{text}"
+    );
+    assert!(
+        text.contains("presentation=native-tui"),
+        "resume must select the managed native presentation: {text}"
     );
     assert!(text.contains("owner=exec-ds-52"), "{text}");
     assert!(partial.is_file(), "resume must preserve partial work");

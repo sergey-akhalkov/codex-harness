@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 #[path = "fixtures/cache_usage.rs"]
 mod cache_usage;
 use std::{
-    fs,
+    fs, io,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
@@ -642,6 +643,10 @@ fn resume_consumes_the_recorded_identity_and_preserves_partial_work() {
             "executor resume: slot=1 owner=exec-1 session={session} identity=recorded dispatch receipt"
         )),
         "{output}"
+    );
+    assert!(
+        output.contains("presentation=native-tui"),
+        "resume must select the managed native presentation: {output}"
     );
     assert!(
         output.contains("installed Codex launcher is missing"),
@@ -2880,4 +2885,398 @@ fn unresolved_reply_hold_keeps_the_tui_open_until_one_reply_continues_the_run() 
     let watched_text = text(&watched);
     assert_eq!(watched.status.code(), Some(0), "{watched_text}");
     assert!(watched_text.contains(REPLY_FINAL), "{watched_text}");
+}
+const CONTINUATION_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2601";
+const FRESH_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2702";
+const CONTINUATION_PROMPT: &str = "Continue from the partial edits; do not redo completed checks.";
+const PRIOR_FINAL: &str = "COMPLETED_PRIOR_WORK";
+const CONTINUATION_FINAL: &str = "CONTINUATION_NOT_REPLAY";
+const STALE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+struct StaleEndpoint {
+    listener: TcpListener,
+    port: u16,
+}
+
+fn plant_stale_endpoint(host: &ControlHost, thread_id: &str) -> StaleEndpoint {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    fs::write(
+        host.state.join("endpoint-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "port": port,
+            "token": STALE_TOKEN,
+            "threadId": thread_id,
+            "process": {
+                "pid": 1,
+                "creationTime": 1,
+                "program": r"C:\stale\codex.exe"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    StaleEndpoint { listener, port }
+}
+
+fn stale_endpoint_untouched(stale: &StaleEndpoint) {
+    match stale.listener.accept() {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        other => panic!("the stale control endpoint accepted a successor connection: {other:?}"),
+    }
+}
+
+fn assert_successor_endpoint(host: &ControlHost, thread_id: &str, stale: &StaleEndpoint) {
+    stale_endpoint_untouched(stale);
+    let endpoint = receipt_json(&host.state.join("endpoint-1.json"));
+    assert_eq!(endpoint["threadId"], thread_id, "{endpoint}");
+    assert_eq!(endpoint["port"], host.server().port, "{endpoint}");
+    assert_ne!(endpoint["port"], stale.port, "{endpoint}");
+    assert_ne!(endpoint["token"], STALE_TOKEN, "{endpoint}");
+    assert_ne!(endpoint["process"]["pid"], 1, "{endpoint}");
+}
+
+fn write_receipt(host: &ControlHost, receipt: &Value) {
+    fs::write(&host.receipt, serde_json::to_vec_pretty(receipt).unwrap()).unwrap();
+}
+
+fn resume_receipt(host: &ControlHost, assignment: &str) -> Value {
+    let mut receipt = receipt_json(&host.receipt);
+    receipt["mode"] = json!("tui");
+    receipt["control"]["presentation"] = json!("native-tui");
+    receipt["control"]["assignment"] = json!(assignment);
+    receipt["control"]["resumeSession"] = json!(CONTROL_THREAD);
+    receipt["observation"]["previousSession"] = json!(CONTROL_THREAD);
+    receipt["observation"]["session"] = Value::Null;
+    receipt
+}
+
+fn restart_handoff() -> String {
+    format!(
+        "Continue the original assignment in this same preserved worktree. This is a fresh conversation; do not reset or replay completed work. Predecessor session {CONTROL_THREAD}.\n\nOriginal assignment:\n{CONTROL_ASSIGNMENT}"
+    )
+}
+
+fn spawn_hosted(host: &ControlHost) -> ConsoleSession {
+    ConsoleSession::spawn(ConsoleSpec::new(host_spec(host))).unwrap()
+}
+
+fn wait_for_turn(host: &ControlHost) {
+    let until = Instant::now() + Duration::from_secs(25);
+    while host.server().requests_for("turn/start").is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn finish_turn(
+    host: &ControlHost,
+    session: ConsoleSession,
+    thread_id: &str,
+    turn: &str,
+    final_text: &str,
+) {
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": thread_id,
+            "item": {"id": "m-new", "type": "agentMessage", "text": final_text}
+        }
+    }));
+    host.server().push(json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": thread_id,
+            "turn": {"id": turn, "status": "completed"}
+        }
+    }));
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert!(
+        !finished.transcript.contains("conversation=control"),
+        "controller output corrupted the frontend surface: {}",
+        finished.transcript
+    );
+}
+
+#[test]
+fn exact_session_resume_attaches_the_native_frontend_without_reset_or_replay() {
+    let host = ControlHost::new("exact-resume");
+    write_receipt(&host, &resume_receipt(&host, CONTINUATION_PROMPT));
+    host.server().answer(
+        "thread/start",
+        control_endpoint::Answer::Result(json!({
+            "thread": {"id": FRESH_THREAD, "cwd": host.slot},
+            "model": CONTROL_MODEL,
+            "modelProvider": CONTROL_PROVIDER,
+            "reasoningEffort": CONTROL_EFFORT
+        })),
+    );
+    host.server().answer(
+        "thread/resume",
+        control_endpoint::Answer::Result(json!({
+            "thread": {"id": CONTROL_THREAD, "cwd": host.slot},
+            "model": CONTROL_MODEL,
+            "modelProvider": CONTROL_PROVIDER,
+            "reasoningEffort": CONTROL_EFFORT
+        })),
+    );
+    host.server().answer(
+        "turn/start",
+        control_endpoint::Answer::Result(
+            json!({"turn": {"id": CONTINUATION_TURN, "status": "inProgress"}}),
+        ),
+    );
+    host.server().answer(
+        "thread/read",
+        control_endpoint::Answer::Result(json!({"thread": {
+            "id": CONTROL_THREAD,
+            "cwd": host.slot,
+            "turns": [
+                {
+                    "id": "prior-turn",
+                    "status": "completed",
+                    "items": [{"id": "old", "type": "agentMessage", "text": PRIOR_FINAL}]
+                },
+                {
+                    "id": CONTINUATION_TURN,
+                    "status": "completed",
+                    "items": [{"id": "new", "type": "agentMessage", "text": CONTINUATION_FINAL}]
+                }
+            ]
+        }})),
+    );
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let stale = plant_stale_endpoint(&host, CONTROL_THREAD);
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = spawn_hosted(&host);
+    wait_for_turn(&host);
+    let turns = host.server().requests_for("turn/start");
+    assert_eq!(turns.len(), 1, "one continuation prompt: {turns:?}");
+    assert_eq!(turns[0]["params"]["threadId"], CONTROL_THREAD);
+    assert_eq!(
+        turns[0]["params"]["input"],
+        json!([{"type": "text", "text": CONTINUATION_PROMPT}])
+    );
+    assert!(
+        host.server().requests_for("thread/start").is_empty(),
+        "resume must not start another conversation: {:?}",
+        host.server().requests()
+    );
+    let resumes = host.server().requests_for("thread/resume");
+    assert!(!resumes.is_empty(), "the exact session was not resumed");
+    assert!(
+        resumes
+            .iter()
+            .all(|request| request["params"]["threadId"] == CONTROL_THREAD),
+        "frontend resume left the recorded session: {resumes:?}"
+    );
+    let argv = fs::read_to_string(host.home.join("frontend-argv.txt")).unwrap();
+    assert!(
+        argv.contains("resume") && argv.contains(CONTROL_THREAD),
+        "{argv}"
+    );
+    assert!(!argv.contains(FRESH_THREAD), "{argv}");
+    assert!(!argv.contains("--no-alt-screen"), "{argv}");
+    assert!(!argv.contains(CONTINUATION_PROMPT), "{argv}");
+    finish_turn(
+        &host,
+        session,
+        CONTROL_THREAD,
+        CONTINUATION_TURN,
+        CONTINUATION_FINAL,
+    );
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CONTINUATION_FINAL
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    assert_eq!(
+        receipt_json(&host.state.join("slot-1.json"))["owner"],
+        CONTROL_OWNER
+    );
+    let observed = receipt_json(&host.receipt);
+    assert_eq!(observed["observation"]["session"], CONTROL_THREAD);
+    assert_eq!(observed["observation"]["previousSession"], CONTROL_THREAD);
+    assert_successor_endpoint(&host, CONTROL_THREAD, &stale);
+    assert_frontend_gone(&host, &double);
+    assert_backend_released(&host);
+}
+
+#[test]
+fn restart_starts_a_fresh_session_and_ignores_the_stale_endpoint() {
+    let host = ControlHost::new("fresh-restart");
+    let handoff = restart_handoff();
+    let mut receipt = receipt_json(&host.receipt);
+    receipt["mode"] = json!("tui");
+    receipt["control"]["presentation"] = json!("native-tui");
+    receipt["control"]["assignment"] = json!(handoff);
+    receipt["control"]["originalAssignment"] = json!(CONTROL_ASSIGNMENT);
+    receipt["observation"]["previousSession"] = json!(CONTROL_THREAD);
+    receipt["observation"]["session"] = Value::Null;
+    write_receipt(&host, &receipt);
+    host.server().answer(
+        "thread/start",
+        control_endpoint::Answer::Result(json!({
+            "thread": {"id": FRESH_THREAD, "cwd": host.slot},
+            "model": CONTROL_MODEL,
+            "modelProvider": CONTROL_PROVIDER,
+            "reasoningEffort": CONTROL_EFFORT
+        })),
+    );
+    host.server().answer(
+        "thread/resume",
+        control_endpoint::Answer::Result(json!({
+            "thread": {"id": FRESH_THREAD, "cwd": host.slot},
+            "model": CONTROL_MODEL,
+            "modelProvider": CONTROL_PROVIDER,
+            "reasoningEffort": CONTROL_EFFORT
+        })),
+    );
+    host.server().answer(
+        "turn/start",
+        control_endpoint::Answer::Result(
+            json!({"turn": {"id": CONTINUATION_TURN, "status": "inProgress"}}),
+        ),
+    );
+    host.server().answer_sequence(
+        "thread/read",
+        vec![
+            control_endpoint::Answer::Result(json!({"thread": {
+                "id": FRESH_THREAD,
+                "cwd": host.slot,
+                "turns": []
+            }})),
+            control_endpoint::Answer::Result(json!({"thread": {
+                "id": FRESH_THREAD,
+                "cwd": host.slot,
+                "turns": [{
+                    "id": CONTINUATION_TURN,
+                    "status": "completed",
+                    "items": [{"id": "new", "type": "agentMessage", "text": CONTINUATION_FINAL}]
+                }]
+            }})),
+        ],
+    );
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let stale = plant_stale_endpoint(&host, CONTROL_THREAD);
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = spawn_hosted(&host);
+    wait_for_turn(&host);
+    let started = host.server().requests_for("thread/start");
+    assert_eq!(
+        started.len(),
+        1,
+        "restart must start one fresh thread: {started:?}"
+    );
+    let turns = host.server().requests_for("turn/start");
+    assert_eq!(turns.len(), 1, "one handoff, not a replay: {turns:?}");
+    assert_eq!(turns[0]["params"]["threadId"], FRESH_THREAD);
+    assert_eq!(
+        turns[0]["params"]["input"][0]["text"], handoff,
+        "restart submitted the original assignment instead of the bounded handoff"
+    );
+    assert_ne!(turns[0]["params"]["input"][0]["text"], CONTROL_ASSIGNMENT);
+    let argv = fs::read_to_string(host.home.join("frontend-argv.txt")).unwrap();
+    assert!(
+        argv.contains("resume") && argv.contains(FRESH_THREAD),
+        "{argv}"
+    );
+    assert!(!argv.contains(CONTROL_THREAD), "{argv}");
+    finish_turn(
+        &host,
+        session,
+        FRESH_THREAD,
+        CONTINUATION_TURN,
+        CONTINUATION_FINAL,
+    );
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CONTINUATION_FINAL
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    assert_eq!(
+        receipt_json(&host.state.join("slot-1.json"))["owner"],
+        CONTROL_OWNER
+    );
+    let observed = receipt_json(&host.receipt);
+    assert_eq!(observed["observation"]["session"], FRESH_THREAD);
+    assert_eq!(observed["observation"]["previousSession"], CONTROL_THREAD);
+    assert_ne!(
+        observed["observation"]["session"],
+        observed["observation"]["previousSession"]
+    );
+    assert_successor_endpoint(&host, FRESH_THREAD, &stale);
+    assert_frontend_gone(&host, &double);
+    assert_backend_released(&host);
+}
+
+#[test]
+fn exact_session_resume_keeps_the_recorded_session_when_resume_returns_another_thread() {
+    let host = ControlHost::new("resume-mismatch");
+    write_receipt(&host, &resume_receipt(&host, CONTINUATION_PROMPT));
+    host.server().answer(
+        "thread/resume",
+        control_endpoint::Answer::Result(json!({
+            "thread": {"id": FRESH_THREAD, "cwd": host.slot},
+            "model": CONTROL_MODEL,
+            "modelProvider": CONTROL_PROVIDER,
+            "reasoningEffort": CONTROL_EFFORT
+        })),
+    );
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let stale = plant_stale_endpoint(&host, CONTROL_THREAD);
+    let out = lead_command()
+        .args(["executor", "run", "--file"])
+        .arg(&host.receipt)
+        .env("CODEX_HOME", &host.home)
+        .env("HARNESS_EXECUTOR_FIXTURE_MODE", "render")
+        .env_remove("WT_SESSION")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let output = text(&out);
+    assert_ne!(out.status.code(), Some(0), "{output}");
+    assert!(
+        output.contains("another thread") || output.contains("was not resumed"),
+        "{output}"
+    );
+    assert!(
+        host.server().requests_for("turn/start").is_empty(),
+        "a refused resume submitted the assignment: {:?}",
+        host.server().requests()
+    );
+    assert!(
+        host.server().requests_for("thread/start").is_empty(),
+        "a refused resume started another conversation: {:?}",
+        host.server().requests_for("thread/start")
+    );
+    let observed = receipt_json(&host.receipt);
+    assert!(
+        observed["observation"]["session"].is_null(),
+        "the wrong thread replaced the recorded session: {observed}"
+    );
+    assert_eq!(observed["observation"]["previousSession"], CONTROL_THREAD);
+    assert!(
+        !host.state.join("endpoint-1.json").exists(),
+        "a stale or foreign endpoint remained addressable"
+    );
+    stale_endpoint_untouched(&stale);
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
 }
