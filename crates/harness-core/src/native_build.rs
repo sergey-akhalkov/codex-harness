@@ -256,6 +256,16 @@ pub(crate) fn directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Start the admitted compiler tree. Held admissions use the aggregate owner;
+/// nested admissions do not acquire a second aggregate limit.
+pub(crate) fn start_admitted_compiler(
+    admission: &heavy_command::Admission,
+    job: &Job,
+    command: &CommandSpec,
+) -> io::Result<crate::process::OwnedProcess> {
+    admission.spawn_in_envelope(job, command)?.resume()
+}
+
 /// Reclaim scratch trees abandoned by interrupted explicit management.
 ///
 /// `TempDir` cleanup only runs when the manager unwinds normally, so a killed
@@ -738,18 +748,18 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     command.stdout = Some(log.try_clone()?);
     command.stderr = Some(log);
     // Release LTO of every manager binary exceeds a 4 GiB Job. The compiler Job
-    // is the one this admission owns - named and carrying the aggregate limits
-    // when this process holds the lease (installed defaults: 8 GiB / 50% / 30
-    // minutes), anonymous containment only when an admitted parent already
-    // applies them - and the compilation tree inherits the same marker, so a
-    // nested native consumer reuses this admission instead of queueing on it.
+    // is the lifecycle job inside the admitted envelope. A held admission places
+    // the compiler in the shared CPU job when present, then the account
+    // aggregate, then this lifecycle job. A nested build stays on the inherited
+    // path and does not acquire a second slot or aggregate limit. The compilation
+    // tree inherits the same marker, so a nested native consumer reuses this
+    // admission instead of queueing on it.
     let (job, marker) = admission.owned_job(&budget, &account)?;
     command
         .env
         .insert(heavy_command::LEASE_ENV.into(), Some(marker));
     eprintln!("{}", admission.job_line(&job)?);
-    let child = job
-        .spawn(&command)
+    let child = start_admitted_compiler(&admission, &job, &command)
         .map_err(|e| io::Error::other(format!("Starting bounded Cargo failed: {e}")))?;
     let status = job.wait(
         &child,
@@ -1032,5 +1042,52 @@ mod tests {
         sweep_stale_scratch(root.path(), Duration::from_millis(100));
         assert!(link.is_dir());
         assert!(target.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn admitted_compiler_spawn_uses_the_aggregate_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let account = temp.path().join("account");
+        heavy_command::prepare(&account).unwrap();
+        let budget = heavy_command::Budget {
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            aggregate_memory_limit_bytes: 2 * 1024 * 1024 * 1024,
+            max_concurrent_trees: 1,
+            deadline_seconds: 60,
+            queue_wait_seconds: 30,
+            cpu_percent: None,
+        };
+        let admission = heavy_command::Admission::acquire(
+            &account,
+            &budget,
+            "compiler",
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let (job, _) = admission.owned_job(&budget, &account).unwrap();
+        let mut command = CommandSpec::new(std::env::current_exe().unwrap());
+        command.args = [
+            "--exact",
+            "heavy_command::tests::direct_exit_probe",
+            "--ignored",
+            "--nocapture",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let child = start_admitted_compiler(&admission, &job, &command)
+            .unwrap_or_else(|error| panic!("admitted compiler spawn failed: {error}"));
+        assert!(
+            admission.payload_is_in_aggregate(&child).unwrap(),
+            "the compiler payload is outside the account aggregate"
+        );
+
+        let source = include_str!("native_build.rs");
+        let start = source
+            .find("let (job, marker) = admission.owned_job")
+            .expect("compiler spawn site");
+        let window = &source[start..start + 700];
+        assert!(window.contains("start_admitted_compiler("), "{window}");
+        assert!(!window.contains(".spawn("), "{window}");
     }
 }

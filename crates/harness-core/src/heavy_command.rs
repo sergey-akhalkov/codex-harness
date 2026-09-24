@@ -1120,6 +1120,74 @@ impl Admission {
         };
         Ok(serde_json::to_string(&marker)?.into())
     }
+
+    /// Whether this held admission's aggregate job contains `process`. A nested
+    /// admission has no second aggregate handle and cannot answer.
+    pub(crate) fn payload_is_in_aggregate(
+        &self,
+        process: &crate::process::OwnedProcess,
+    ) -> io::Result<bool> {
+        match self {
+            Self::Held(holder) => holder.aggregate.contains(process),
+            Self::Inherited(_) => Err(io::Error::other(
+                "a nested admission does not hold a second aggregate handle",
+            )),
+        }
+    }
+
+    /// Create a suspended payload in the admitted envelope. A held admission
+    /// places it in the shared CPU job when one exists, then the account
+    /// aggregate, then `lifecycle`. Membership that is false or unreadable is
+    /// refused here, before the caller can resume the payload. A nested
+    /// admission does not acquire a second aggregate limit.
+    pub fn spawn_in_envelope(
+        &self,
+        lifecycle: &Job,
+        command: &CommandSpec,
+    ) -> io::Result<crate::process::SuspendedProcess> {
+        let suspended = match self {
+            Self::Held(holder) => {
+                holder
+                    .aggregate
+                    .spawn_suspended(holder.cpu.budget(), lifecycle, command)?
+            }
+            Self::Inherited(_) => match self.budget() {
+                Some(shared) => shared.spawn_suspended(lifecycle, command)?,
+                None => lifecycle.spawn_suspended(command)?,
+            },
+        };
+        if let Self::Held(holder) = self {
+            aggregate_membership_gate(
+                self.payload_is_in_aggregate(suspended.process()),
+                suspended.process().identity().pid,
+                holder.aggregate.name(),
+            )?;
+            eprintln!(
+                "heavy: payload pid={} is a kernel-verified member of the account aggregate job=\"{}\"",
+                suspended.process().identity().pid,
+                holder.aggregate.name()
+            );
+        }
+        Ok(suspended)
+    }
+}
+
+/// False or unreadable aggregate membership refuses the start. A warning is not
+/// acceptance: the caller must not resume the payload after this returns an error.
+fn aggregate_membership_gate(
+    observed: io::Result<bool>,
+    pid: u32,
+    job_name: &str,
+) -> io::Result<()> {
+    match observed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(io::Error::other(format!(
+            "payload pid={pid} is outside the account aggregate job=\"{job_name}\"; refusing to start"
+        ))),
+        Err(error) => Err(io::Error::other(format!(
+            "account aggregate membership could not be read ({error}); refusing to start"
+        ))),
+    }
 }
 
 /// Verified containment, not identity: the marker is honored only while its
@@ -1324,11 +1392,9 @@ pub fn label(program: &OsStr, args: &[OsString]) -> String {
 ///
 /// The payload is created while it is still suspended, in the shared account
 /// CPU budget (outermost, when established), the account aggregate Job, and this
-/// operation's lifecycle Job (innermost). The kernel is asked whether the payload
-/// really belongs to those jobs before any payload code runs. A nested call does
-/// not acquire another aggregate limit; it keeps an anonymous containment Job
-/// because its ancestors already carry the envelope, and a second inner rate is
-/// never applied because a nested Job's rate is a proportion of its parent's.
+/// operation's lifecycle Job (innermost). A held payload whose aggregate
+/// membership is false or unreadable fails as [`RunError::Start`] before any
+/// payload code runs. A nested call does not acquire another aggregate limit.
 pub fn execute(
     budget: &Budget,
     account: &Path,
@@ -1349,41 +1415,9 @@ pub fn execute(
     command.env.insert(OsString::from(LEASE_ENV), Some(marker));
     eprintln!("{}", admission.job_line(&job).map_err(RunError::Start)?);
     eprintln!("{}", admission.cpu_report(budget));
-    let suspended = match admission {
-        // Slot, CPU budget and aggregate handle are already held. Create the
-        // payload in that order: CPU when present, aggregate, then containment.
-        Admission::Held(holder) => holder
-            .aggregate
-            .spawn_suspended(holder.cpu.budget(), &job, &command)
-            .map_err(RunError::Start)?,
-        // Nested admission inherited the outer slot and aggregate limit. Do not
-        // join a second envelope; the containment Job is the only new owner.
-        Admission::Inherited(_) => match admission.budget() {
-            Some(shared) => shared
-                .spawn_suspended(&job, &command)
-                .map_err(RunError::Start)?,
-            None => job.spawn_suspended(&command).map_err(RunError::Start)?,
-        },
-    };
-    // Kernel membership of the actual payload, asked while it is still
-    // suspended: a marker or a copied name is never the evidence.
-    if let Admission::Held(holder) = admission {
-        match holder.aggregate.contains(suspended.process()) {
-            Ok(true) => eprintln!(
-                "heavy: payload pid={} is a kernel-verified member of the account aggregate job=\"{}\"",
-                suspended.process().identity().pid,
-                holder.aggregate.name()
-            ),
-            Ok(false) => eprintln!(
-                "heavy: warning: payload pid={} is outside the account aggregate job=\"{}\"",
-                suspended.process().identity().pid,
-                holder.aggregate.name()
-            ),
-            Err(error) => eprintln!(
-                "heavy: warning: account aggregate membership could not be read ({error})"
-            ),
-        }
-    }
+    let suspended = admission
+        .spawn_in_envelope(&job, &command)
+        .map_err(RunError::Start)?;
     match admission.budget() {
         Some(shared)
             if shared
@@ -2242,5 +2276,74 @@ mod tests {
     #[ignore = "child of direct_run_exits_with_the_payload_code_inside_both_jobs"]
     fn direct_exit_probe() {
         std::process::exit(3);
+    }
+
+    #[test]
+    fn held_spawn_outside_the_aggregate_is_refused_before_resume() {
+        let (temp, account) = owned_account();
+        let other = temp.path().join("other-account");
+        prepare(&other).unwrap();
+        let budget = Budget {
+            memory_bytes: 64 * MIB,
+            aggregate_memory_limit_bytes: 64 * MIB,
+            deadline_seconds: 30,
+            queue_wait_seconds: 30,
+            ..test_budget(1, 30)
+        };
+        let admission =
+            Admission::acquire(&account, &budget, "held", &Cancellation::default()).unwrap();
+        let Admission::Held(holder) = &admission else {
+            panic!("the refusal fixture must hold a slot");
+        };
+        let outside =
+            crate::process::HeavyAggregate::acquire(&other, budget.aggregate_memory_limit_bytes)
+                .unwrap();
+        let lifecycle = Job::new(Limits {
+            memory_bytes: Some(64 * MIB),
+            cpu_percent: None,
+        })
+        .unwrap();
+        let program = PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows")),
+        )
+        .join("System32")
+        .join("cmd.exe");
+        let suspended = outside
+            .spawn_suspended(None, &lifecycle, &CommandSpec::new(program))
+            .unwrap_or_else(|error| {
+                panic!("could not create a payload outside the admission aggregate: {error}")
+            });
+        let error = aggregate_membership_gate(
+            holder.aggregate.contains(suspended.process()),
+            suspended.process().identity().pid,
+            holder.aggregate.name(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("outside the account aggregate"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("refusing to start"), "{error}");
+        let start = RunError::Start(io::Error::other(error.to_string()));
+        assert!(
+            start.to_string().contains("could not be started"),
+            "{start}"
+        );
+        assert!(suspended.process().is_running().unwrap());
+        drop(suspended);
+
+        let unread = aggregate_membership_gate(
+            Err(io::Error::other("snapshot failed")),
+            7,
+            holder.aggregate.name(),
+        )
+        .unwrap_err();
+        assert!(unread.to_string().contains("could not be read"), "{unread}");
+        assert!(unread.to_string().contains("refusing to start"), "{unread}");
+        let start = RunError::Start(unread);
+        assert!(
+            start.to_string().contains("could not be started"),
+            "{start}"
+        );
     }
 }
