@@ -89,6 +89,7 @@ The current requirement-to-check map lives in
 [rust-requirement-checks.json](evidence/rust-requirement-checks.json).
 
 Run heavy builds and checks through the [shared account queue](#heavy-command-budget).
+Those admitted commands also join the [shared CPU allowance](#shared-agent-cpu-allowance).
 `--jobs 1` also bounds compiler concurrency within the admitted command.
 A failed compilation retains its log and does not alter the active
 installation. Windows can keep a running test executable locked after Cargo
@@ -108,25 +109,122 @@ use the same admission path. Route heavyweight commands from free-text executor
 assignments through this entry point too; structured briefs include it already.
 
 ```powershell
+codex-harness heavy --help
 codex-harness heavy budget --json
 codex-harness heavy -- cargo test --locked --jobs 1 -- --test-threads=1
 ```
 
-Defaults are 8 GiB aggregate Job memory, 50% CPU, a 30-minute execution deadline
-and a one-hour queue wait. `heavy budget` prints the effective values and local
-policy path. Explicit `--memory-bytes`, `--cpu-percent`, `--deadline-seconds` and
-`--queue-wait-seconds` update that machine policy; `--preview` shows the proposed
-change. The policy stays under the account's local application data, outside
-the kit and consuming repositories. `--account DIRECTORY` selects an isolated
-account for owned tests; normal callers retain the default shared account.
+Defaults are 8 GiB aggregate Job memory, a 30-minute execution deadline and a
+one-hour queue wait. There is no per-operation CPU default. Admitted commands
+use the shared account ceiling, 75% of host CPU, in
+[Shared agent CPU allowance](#shared-agent-cpu-allowance). The top-level
+`codex-harness --help` summary does not list `--uncapped`; `heavy --help` does.
+
+`heavy budget` prints the effective memory, deadline, queue wait, CPU policy
+and local policy path. With no heavy-command policy file, `cpu_percent` is
+absent, `shared_cpu_percent` is 75 and `cpu_policy` says there is no
+per-operation CPU limit. Inspection creates no account state. Explicit
+`--memory-bytes`, `--cpu-percent`, `--deadline-seconds` and
+`--queue-wait-seconds` update that machine policy; `--preview` shows the
+proposed change and does not write it. `--cpu-percent shared` removes a
+per-operation CPU limit. A lower `--cpu-percent P` is a deliberate ceiling in
+percent of host CPU, translated against the kernel-verified parent rate,
+rounding down, and reported with its effective host-relative value. A recorded
+value of 50 cannot be
+distinguished from the retired batch default: it is preserved, `legacy_default_cpu_percent`
+is true, and it is not silently rewritten.
+
+The heavy-command policy stays at
+`$env:LOCALAPPDATA\coding-agents-harness\heavy-command\budget.json`, outside
+the kit and consuming repositories. It is not the shared CPU policy record.
+`--account DIRECTORY` selects an isolated heavy-command account for owned
+tests; normal callers retain the default shared account.
 
 Queue messages identify the current holder. Child output is streamed and the
 child's exit code is preserved. Deadline or queue expiry returns 124, memory
 exhaustion 125, incomplete cleanup 126, start failure 127 and interruption 130.
 Normal completion and termination release admission. Nested heavy commands
 verify their actual membership in the holder's Job and share its budget without
-applying a second CPU cap. Arbitrary commands launched outside this entry point
-are not covered by its budget.
+applying a second default CPU cap. Commands launched outside this entry point
+are not in the heavy queue. Descendants of an admitted agent route still share
+the account CPU allowance; the queue does not cover arbitrary processes started
+outside those routes.
+
+```powershell
+codex-harness heavy --uncapped -- cargo test --locked --jobs 1 -- --test-threads=1
+```
+
+`--uncapped` is an exception for that one command, not the normal test path.
+It is not saved. Other sessions and shared services keep their allowance, and
+the next command without it is capped. Combined host agent load can exceed the
+shared ceiling while the exception runs.
+
+## Shared agent CPU allowance
+
+On Windows, ordinary installed routes share one account CPU allowance: 75% of
+total host CPU, not 75% per session. The routes are the Codex bootstrap,
+task-control, executor and resume session hosts, `codex-harness heavy`, and
+kit-owned shared MCP services and backends. Direct native descendants are
+covered from the start of execution. An unrelated terminal tab or desktop
+application is not enrolled. Shared services stay in the allowance even when an
+uncapped client calls them. Executor, resume and task-control have no separate
+uncapped flag; they join automatically.
+
+The machine-local record is
+`$env:LOCALAPPDATA\coding-agents-harness\cpu-budget\shared-cpu-policy.json`.
+It is not `cpu-budget.json`. Core install creates it only when absent. See
+[Shared CPU policy](installation.md#shared-cpu-policy) for creation, preservation,
+safe restart and disconnect. `CODEX_HARNESS_CPU_PERCENT` overrides the ceiling
+for the launch that reads it when the value is a percentage from 0.01 through
+100. It is not written into `shared-cpu-policy.json`. If the account job does
+not exist yet, that admission establishes the job at the requested rate; the
+kernel ownership record is `cpu-budget.json`, not the policy file. An existing
+job at another rate is preserved and not modified, and that launch is not
+admitted. Unset the variable to request the policy ceiling, or 75% when the
+policy record is absent. A non-numeric or out-of-range value does not fall
+through to the policy record. That failure, an unusable record or a failed
+admission warns on stderr and starts the requested payload once outside the
+verified group. It does not substitute another ceiling, and it is not the
+uncapped notice. The session warning names the requested
+ceiling, failed stage, cause, scope and recovery. A heavy command continues
+once under its queue, memory and deadline contracts without a verified shared
+ceiling. The next normal launch still attempts the default. Other sessions
+keep their caps. If the Codex bootstrap cannot open account storage, its
+recovery names `CODEX_HARNESS_CPU_ACCOUNT` or restoring `LOCALAPPDATA`. That
+variable selects the account directory; it is not a second ceiling.
+
+Request one uncapped session or command explicitly. The session selector is
+consumed in the harness-option prefix, including beside `--harness-effort`,
+and is not forwarded to the payload:
+
+```powershell
+codex --harness-cpu uncapped
+codex --harness-cpu=uncapped
+codex-harness heavy --uncapped -- PROGRAM ARGS
+```
+
+`uncapped` is the only accepted mode, case-insensitive. Any other value is a
+usage error and does not start the payload. The exception is not saved, does
+not raise other sessions or shared services, and the following invocation
+without it is capped. Combined host agent load can exceed 75% while it runs.
+A copied marker that leaves the process inside the shared group is not a
+successful exception.
+
+Coverage inspection is core check, not `check --diagnose` and not a separate
+status command:
+
+```powershell
+codex-harness check --core-only --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
+```
+
+`cpu_budget` reports configured ceiling, kernel readback, covered and uncovered
+routes, explicit exceptions, degraded starts, unknown members and
+`restart_boundary`. `cpu_policy.escape_hatch` is `CODEX_HARNESS_CPU_PERCENT`.
+`measured_consumption` is `not-sampled`. Do not treat configuration readback as
+measured enforcement. Inspection does not write policy, create a job, sample
+CPU or call a model. What incomplete activation and the disconnect notice mean
+is in [installation](installation.md#shared-cpu-policy). The decision is in
+[project decisions](project-decisions.md#shared-agent-cpu-budget).
 
 ## Structured executor assignments
 
@@ -959,8 +1057,9 @@ skill descriptors remain live; accepted skill revisions must be delivered in an
 existing session without reloading the entire initial prompt. Ordinary hooks
 remain off. The accepted RTK exception and explicit Serena Python/Rust
 selection are preserved. The current resource selection must survive every
-native port: shared project-isolated Serena workers with their Job and CPU
-caps, and ownership-aware cleanup. Retired graph tools impose no runtime
+native port: shared project-isolated Serena workers with their Job and inner
+CPU caps under the [shared account allowance](#shared-agent-cpu-allowance),
+and ownership-aware cleanup. Retired graph tools impose no runtime
 resource selection anymore.
 
 The original RTK script lifecycle now reads the root workspace manifest/lock

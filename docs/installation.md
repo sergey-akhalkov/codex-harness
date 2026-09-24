@@ -32,7 +32,10 @@ The launcher reads shared settings live; it creates no deployed configuration
 copy. If harness preparation fails, ordinary `codex` falls back to the original
 CLI with the supplied native arguments and local settings, prints a short
 degraded notice and never compiles or downloads anything. Check reports the
-degraded state instead of treating it as a healthy kit consumer.
+degraded state instead of treating it as a healthy kit consumer. If the shared
+CPU cap cannot be verified, the requested payload still starts once and the
+warning says the cap is not guaranteed. See
+[Shared CPU policy](#shared-cpu-policy).
 
 The [MCP extension](code-tools.md) is globally connected by the code-tools
 component. On an existing installation, core Install/Update also retains
@@ -202,6 +205,44 @@ After moving the checkout, run `update` from its new location; broken source
 references are diagnosed by Check. If Codex itself moved, pass `--upstream` with
 its real entry point - never the harness launcher.
 
+## Shared CPU policy
+
+Core `install` and `update` connect the account CPU policy. They create
+`$env:LOCALAPPDATA\coding-agents-harness\cpu-budget\shared-cpu-policy.json`
+only when that record is absent, with a 75% host ceiling. An existing record
+is preserved, including a later edit and a ceiling equal to the retired 50%
+batch default. A 50% ceiling sets `cpu_policy.ambiguous_shared_ceiling` and is
+not rewritten. If account storage cannot be opened, install reports the policy
+unavailable, writes nothing and terminates nothing. `--preview` does not write
+the record, create a job or stop a process.
+Code-tools-only update does not establish this policy, and neither install nor
+update rewrites the heavy-command budget.
+
+```powershell
+& <build>\codex-harness.exe install --core-only --preview --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
+& <build>\codex-harness.exe update --core-only --source . --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
+& <build>\codex-harness.exe check --core-only --codex-home "$env:USERPROFILE\.codex" --user-home "$env:USERPROFILE"
+```
+
+Install and update JSON field `cpu_policy`, and core check fields `cpu_policy`
+and `cpu_budget`, report the ceiling, escape hatch, activation and restart
+boundary. `measured_consumption` stays `not-sampled`: kernel readback is not a
+consumption measurement. Check does not write policy, create a job, sample CPU
+or call a model. Activation stays `incomplete` while an ordinary registered
+route is outside the account job, while the policy record is not usable, or
+while process enumeration does not finish. A route outside the job is named in
+`restart_boundary`, which says the installation does not terminate it; restart
+that process after its work can stop.
+Unknown or inaccessible members are not counted as covered.
+
+A committed `disconnect --core-only` prints a stderr notice that default
+coverage is no longer provided, preserves the policy record and running work,
+and does not change the heavy-command budget. `disconnect --preview` does not
+print that notice. `recover` finishes installation journals; it is not the CPU
+coverage withdrawal. Selectors and batch safeguards are in
+[Rust native](rust-native.md#shared-agent-cpu-allowance). The decision is in
+[project decisions](project-decisions.md#shared-agent-cpu-budget).
+
 ## Disconnect and recovery
 
 ```powershell
@@ -216,6 +257,8 @@ registrations and releases this `CODEX_HOME` from the account resource receipt;
 other owners keep the policy active. Externally replaced destinations are
 reported and left intact, repository files are preserved, and connections that
 already existed before installation stay untouched.
+Committed core disconnect also prints the shared CPU coverage withdrawal in
+[Shared CPU policy](#shared-cpu-policy). Preview does not.
 
 A local operation lock serializes installation per user. Recover rolls back an
 unfinished activation or finishes journal cleanup after a durable commit;
