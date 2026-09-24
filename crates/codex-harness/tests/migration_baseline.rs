@@ -41,11 +41,19 @@ fn desktop_pwsh() -> PathBuf {
         }
     }
     let path = PathBuf::from(DESKTOP_PWSH);
-    assert!(
-        path.is_file(),
-        "desktop PowerShell is required at {DESKTOP_PWSH}"
-    );
-    path
+    if path.is_file() {
+        return path;
+    }
+    // Store-distributed PowerShell 7 keeps the same executable name on PATH
+    // without installing the classic per-machine location.
+    if let Some(found) = env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|entry| entry.join("pwsh.exe"))
+            .find(|entry| entry.is_file())
+    }) {
+        return found;
+    }
+    panic!("desktop PowerShell is required at {DESKTOP_PWSH} or on PATH")
 }
 
 fn sha256_file(path: &Path) -> String {

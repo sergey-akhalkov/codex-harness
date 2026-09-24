@@ -35,11 +35,19 @@ fn desktop_pwsh() -> PathBuf {
         }
     }
     let path = PathBuf::from(DESKTOP_PWSH);
-    assert!(
-        path.is_file(),
-        "desktop PowerShell is required at {DESKTOP_PWSH}"
-    );
-    path
+    if path.is_file() {
+        return path;
+    }
+    // Store-distributed PowerShell 7 keeps the same executable name on PATH
+    // without installing the classic per-machine location.
+    if let Some(found) = env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|entry| entry.join("pwsh.exe"))
+            .find(|entry| entry.is_file())
+    }) {
+        return found;
+    }
+    panic!("desktop PowerShell is required at {DESKTOP_PWSH} or on PATH")
 }
 
 fn child_path(prefix: &Path) -> std::ffi::OsString {
@@ -269,7 +277,14 @@ fn isolated_path_resolves_the_linked_ordinary_codex_command() {
     let entry = home.root.join("entry.ps1");
     fs::write(
         &entry,
-        "Write-Output ('HARNESS_ENTRY=' + (Get-Command codex).Source)\nexit 0\n",
+        // The isolated path deliberately contains non-ASCII characters. A
+        // plain text round-trip depends on whatever output encoding the child
+        // PowerShell picks for a redirected stream, so the resolved command is
+        // transported as base64 of its exact UTF-16 bytes instead.
+        "$path = (Get-Command codex).Source\n\
+         $units = [int[]][char[]]$path -join ','\n\
+         Write-Output \"HARNESS_ENTRY=$units\"\n\
+         exit 0\n",
     )
     .unwrap();
     let output = Command::new(desktop_pwsh())
@@ -292,6 +307,11 @@ fn isolated_path_resolves_the_linked_ordinary_codex_command() {
         .find(|line| line.starts_with("HARNESS_ENTRY="))
         .map(|line| line.trim_start_matches("HARNESS_ENTRY="))
         .expect("HARNESS_ENTRY");
+    let units: Vec<u16> = reported
+        .split(',')
+        .map(|unit| unit.parse::<u16>().expect("HARNESS_ENTRY code unit"))
+        .collect();
+    let reported = String::from_utf16(&units).expect("HARNESS_ENTRY UTF-16");
     assert_eq!(
         PathBuf::from(reported).canonicalize().unwrap(),
         home.launcher.canonicalize().unwrap(),
