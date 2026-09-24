@@ -1,12 +1,12 @@
-//! One account-wide heavy-command slot: a single local machine budget, one
-//! serialized admission queue and one bounded process tree per admitted command.
+//! One account-wide heavy-command budget: a bounded slot set and one containment
+//! tree per admitted command.
 //!
 //! The queue lives in a machine-local account directory outside every checkout,
 //! worktree and Codex home, so concurrent callers share one allowance instead of
 //! multiplying it per consumer. Interactive sessions and model conversations stay
-//! outside this slot: an admitted command is a bounded batch operation whose whole
-//! Windows Job is terminated, and whose lease is released, before the next caller
-//! is admitted. A command that bypasses this entry point is outside the enforced
+//! outside these slots: an admitted command is a bounded batch operation whose
+//! containment Job is terminated, and whose slot is released, before that slot can
+//! be taken again. A command that bypasses this entry point is outside the enforced
 //! scope.
 //!
 //! Every native caller that both queues heavy work and mutates build state uses
@@ -14,20 +14,18 @@
 //! inside an admitted tree is accepted only after the kernel confirms that its
 //! process belongs to the admitted named Job the inherited marker names; a live
 //! peer identity or a copied name is not containment. Nested callers then add only
-//! kill-on-close containment, because a nested Windows Job's CPU rate is a
-//! proportion of its parent's rate: the caller that owns the lease applies the
-//! aggregate budget exactly once for the whole tree. That keeps the order
-//! deadlock-free and the allowance single; a heavy command must not nest a
-//! different account directory.
+//! kill-on-close containment. They do not take a second slot or a second aggregate
+//! limit, because a nested Windows Job's CPU rate is a proportion of its parent's
+//! rate and the outer admission already holds the account envelope. A heavy command
+//! must not nest a different account directory.
 //!
-//! Composition with the shared account CPU owner: an admitted heavy tree joins
-//! one account-wide CPU budget as its outer Job and keeps its own lifecycle Job
-//! as the inner Job, so the batch keeps its memory, deadline, cancellation and
-//! cleanup contracts while the account ceiling covers it. Lock order is always
-//! the heavy-queue lease first and the shared budget lock second: a caller that
-//! waits for the account slot holds no budget lock, the budget lock itself is
-//! bounded, and no path takes the two owners in the opposite order, so admission
-//! cannot deadlock.
+//! Admission order is slot, then the shared CPU budget, then the account aggregate
+//! Job, then the payload. A caller waiting for a slot holds no Job handle and no
+//! CPU budget lock. The aggregate Job is `JOB_OBJECT_LIMIT_JOB_MEMORY` only; the
+//! shared CPU job is not given a memory limit. Payload creation nests outermost
+//! first: the shared CPU job when it exists, then the aggregate job, then the
+//! per-tree containment job. Slot count 1 takes the legacy lock exclusively and
+//! creates no slot file.
 //!
 //! The retired per-batch CPU default (50%) is not a second default. With no
 //! explicit per-operation limit the shared ceiling is the CPU policy and the
@@ -42,10 +40,10 @@ use crate::{
     build_identity,
     native_build::{directory, ordinary_ancestors, resolve_tool},
     process::{
-        Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, ProcessIdentity,
+        Cancellation, CommandSpec, Deadline, HeavyAggregate, Job, Limits, Outcome, ProcessIdentity,
         SHARED_CPU_PERCENT, SharedCpuBudget, cpu_budget_directory,
     },
-    resource_admission::{Lease, Resource},
+    resource_admission::HeavyAdmission,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -82,8 +80,10 @@ const OWNER: &[u8] = b"codex-harness-heavy-command-v1\n";
 const OWNER_FILE: &str = "owner";
 const POLICY_FILE: &str = "budget.json";
 const HOLDER_FILE: &str = "holder.json";
+const HOLDER_EXCLUSIVE_FILE: &str = "holder.exclusive.json";
 const MAX_RECORD: u64 = 64 * 1024;
 const MAX_LABEL: usize = 400;
+const MAX_DIAGNOSTIC: usize = 480;
 /// Documented JOB_OBJECT_QUERY right (winnt.h). windows-sys does not export the
 /// job access rights; a query handle can neither terminate nor assign, so a
 /// verified member never receives cleanup authority over the admitted tree.
@@ -96,6 +96,7 @@ const JOB_OBJECT_ASSIGN_PROCESS: u32 = 0x0001;
 const JOB_NAME_PREFIX: &str = "CodingAgentsHarness.HeavyCommand.";
 const MIB: usize = 1024 * 1024;
 const DEFAULT_MEMORY_BYTES: usize = 8 * 1024 * MIB;
+const DEFAULT_MAX_CONCURRENT_TREES: u32 = 2;
 const DEFAULT_DEADLINE_SECONDS: u64 = 1800;
 const DEFAULT_QUEUE_WAIT_SECONDS: u64 = 3600;
 const MIN_MEMORY_BYTES: usize = 16 * MIB;
@@ -125,6 +126,9 @@ fn foreign(message: &str) -> io::Error {
 /// The one machine budget. Memory and CPU are enforced by one Windows Job per
 /// admitted command, `deadline_seconds` bounds the command and
 /// `queue_wait_seconds` bounds how long a caller waits for the account slot.
+/// `max_concurrent_trees` is the positive slot bound (1 restores the exclusive
+/// legacy lock). `aggregate_memory_limit_bytes` is the account envelope; a missing
+/// policy field uses the effective per-tree limit.
 /// An absent `cpu_percent` is the installed default: no per-operation CPU limit
 /// exists, so the shared account ceiling is the CPU policy and the command's Job
 /// must not add a second rate. A present value is a deliberate per-operation
@@ -136,6 +140,8 @@ pub struct Budget {
     pub cpu_percent: Option<f64>,
     pub deadline_seconds: u64,
     pub queue_wait_seconds: u64,
+    pub max_concurrent_trees: u32,
+    pub aggregate_memory_limit_bytes: usize,
 }
 
 impl Default for Budget {
@@ -145,6 +151,8 @@ impl Default for Budget {
             cpu_percent: None,
             deadline_seconds: DEFAULT_DEADLINE_SECONDS,
             queue_wait_seconds: DEFAULT_QUEUE_WAIT_SECONDS,
+            max_concurrent_trees: DEFAULT_MAX_CONCURRENT_TREES,
+            aggregate_memory_limit_bytes: DEFAULT_MEMORY_BYTES,
         }
     }
 }
@@ -162,6 +170,10 @@ struct Policy {
     deadline_seconds: Option<u64>,
     #[serde(default)]
     queue_wait_seconds: Option<u64>,
+    #[serde(default)]
+    max_concurrent_trees: Option<u32>,
+    #[serde(default)]
+    aggregate_memory_limit_bytes: Option<usize>,
 }
 
 impl Budget {
@@ -190,11 +202,29 @@ impl Budget {
                 )));
             }
         }
+        if self.max_concurrent_trees == 0 {
+            return Err(invalid(format!(
+                "{source}: max_concurrent_trees must be positive"
+            )));
+        }
+        if self.aggregate_memory_limit_bytes < self.memory_bytes {
+            return Err(invalid(format!(
+                "{source}: aggregate_memory_limit_bytes {} is below the per-tree memory limit {}; refusing before admission",
+                self.aggregate_memory_limit_bytes, self.memory_bytes
+            )));
+        }
+        if !(MIN_MEMORY_BYTES..=MAX_MEMORY_BYTES).contains(&self.aggregate_memory_limit_bytes) {
+            return Err(invalid(format!(
+                "{source}: aggregate_memory_limit_bytes must be within {MIN_MEMORY_BYTES}..={MAX_MEMORY_BYTES}"
+            )));
+        }
         Ok(())
     }
 
-    /// Absent local policy keeps the installed defaults. Errors name the policy
-    /// file instead of silently running with a different budget.
+    /// Absent local policy keeps the installed defaults. A file that omits the
+    /// newer fields still parses: missing slot count is 2 and a missing aggregate
+    /// equals the effective per-tree limit. This read never rewrites the file.
+    /// Errors name the policy file instead of silently running with a different budget.
     pub fn read(account: &Path) -> io::Result<Self> {
         if !account_is_owned(account)? {
             return Ok(Self::default());
@@ -223,6 +253,12 @@ impl Budget {
             queue_wait_seconds: policy
                 .queue_wait_seconds
                 .unwrap_or(DEFAULT_QUEUE_WAIT_SECONDS),
+            max_concurrent_trees: policy
+                .max_concurrent_trees
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_TREES),
+            aggregate_memory_limit_bytes: policy
+                .aggregate_memory_limit_bytes
+                .unwrap_or(policy.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES)),
         };
         budget.validate(&path.display().to_string())?;
         Ok(budget)
@@ -244,6 +280,8 @@ impl Budget {
             cpu_percent: budget.cpu_percent,
             deadline_seconds: Some(budget.deadline_seconds),
             queue_wait_seconds: Some(budget.queue_wait_seconds),
+            max_concurrent_trees: Some(budget.max_concurrent_trees),
+            aggregate_memory_limit_bytes: Some(budget.aggregate_memory_limit_bytes),
         };
         let staging = policy_staging(account);
         if staging.exists() {
@@ -786,11 +824,14 @@ fn admit_current_process(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// A held account slot. Drop clears the diagnostic holder record while the slot
-/// is still owned and then releases the lease.
+/// A held account slot. Drop removes only this admission's holder record, then
+/// releases the slot and the aggregate handle. It does not clear another
+/// holder's record.
 pub struct Holder {
-    _lease: Lease,
-    account: PathBuf,
+    _admission: HeavyAdmission,
+    slot_index: Option<u32>,
+    aggregate: HeavyAggregate,
+    record: PathBuf,
     identity: ProcessIdentity,
     job: String,
     cpu: SharedCpu,
@@ -807,35 +848,44 @@ impl Holder {
         // The same OS-random key source the broker endpoint uses; the name is
         // unguessable so it cannot be squatted by an unrelated caller.
         let job = format!("{JOB_NAME_PREFIX}{}", crate::broker_endpoint::random_key()?);
-        let lease = Lease::acquire_reporting(
+        let slot_count = budget.max_concurrent_trees;
+        // Slot first. The waiting callback runs before this returns, so a waiter
+        // holds no CPU budget lock and no aggregate Job handle.
+        let admission = HeavyAdmission::acquire(
             account,
-            Resource::HeavyCommand,
+            slot_count,
             budget.queue_deadline()?,
             cancellation,
             || {
-                eprintln!(
-                    "heavy: waiting for the account heavy-command slot; holder {}",
-                    holder_description(account)
-                );
+                eprintln!("{}", queue_diagnostic(account, slot_count));
             },
         )?;
-        let holder = Self {
-            _lease: lease,
-            account: account.to_owned(),
-            identity,
-            job,
-            cpu: SharedCpu::join(cancellation),
-        };
-        if let Err(error) = write_holder(account, identity, label, &holder.job) {
+        let cpu = SharedCpu::join(cancellation);
+        let aggregate = HeavyAggregate::acquire_within(
+            account,
+            budget.aggregate_memory_limit_bytes,
+            Deadline::after(CPU_BUDGET_LOCK_WAIT)?,
+            cancellation,
+        )?;
+        let record = holder_record_path(account, admission.slot_index());
+        if let Err(error) = write_holder(&record, identity, label, &job) {
             eprintln!("heavy: holder record not written: {error}");
         }
-        Ok(holder)
+        Ok(Self {
+            slot_index: admission.slot_index(),
+            _admission: admission,
+            aggregate,
+            record,
+            identity,
+            job,
+            cpu,
+        })
     }
 }
 
 impl Drop for Holder {
     fn drop(&mut self) {
-        let _ = fs::remove_file(self.account.join(HOLDER_FILE));
+        let _ = fs::remove_file(&self.record);
     }
 }
 
@@ -851,7 +901,7 @@ pub struct Inherited {
 /// Account admission for one native operation.
 pub enum Admission {
     /// This process holds the account slot and releases it when dropped.
-    Held(Holder),
+    Held(Box<Holder>),
     Inherited(Inherited),
 }
 
@@ -859,13 +909,15 @@ impl Admission {
     /// Queue for the account slot, or join the live lease this process tree
     /// already inherited from an admitted Job. The account heavy-command queue
     /// is taken first and the shared CPU budget second; a caller that waits for
-    /// the slot holds no budget lock, so the two owners cannot deadlock.
+    /// the slot holds no budget lock and no Job handle. The aggregate Job is
+    /// joined only after both of those, and a nested call does not acquire a slot.
     pub fn acquire(
         account: &Path,
         budget: &Budget,
         label: &str,
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
+        budget.validate("heavy-command budget")?;
         prepare(account)?;
         if let Some(marker) = inherited(std::env::var_os(LEASE_ENV).as_deref(), account) {
             eprintln!(
@@ -878,12 +930,9 @@ impl Admission {
                 cpu: SharedCpu::join(cancellation),
             }));
         }
-        Ok(Self::Held(Holder::acquire(
-            account,
-            budget,
-            label,
-            cancellation,
-        )?))
+        Ok(Self::Held(
+            Holder::acquire(account, budget, label, cancellation)?.into(),
+        ))
     }
 
     fn cpu(&self) -> &SharedCpu {
@@ -967,10 +1016,11 @@ impl Admission {
         }
     }
 
-    /// Limits for one owned Job. The caller that holds the lease applies the
-    /// aggregate machine budget once for the whole tree; a verified nested
-    /// caller adds containment only, because Windows applies a nested Job's CPU
-    /// rate as a proportion of its parent's rate
+    /// Limits for the per-tree containment Job. The account aggregate envelope
+    /// is a separate Job the slot owner already holds. This Job keeps the
+    /// per-tree memory limit and any translated per-operation CPU rate. A
+    /// verified nested caller adds containment only, because Windows applies a
+    /// nested Job's CPU rate as a proportion of its parent's rate
     /// (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION Remarks). With no explicit
     /// per-operation limit the shared outer ceiling is the CPU policy, so the
     /// Job carries no rate at all.
@@ -1029,17 +1079,34 @@ impl Admission {
     }
 
     /// One diagnostics line describing the Job that actually enforces this
-    /// budget for the current tree.
+    /// tree, plus the account aggregate readback when this process holds it.
     pub fn job_line(&self, job: &Job) -> io::Result<String> {
         let snapshot = job.snapshot()?;
-        Ok(format!(
+        let mut line = format!(
             "heavy: job scope={} name={} memory_limit_bytes={} cpu_rate={} kill_on_close={}",
             self.scope(),
             self.job_name(),
             snapshot.memory_limit_bytes,
             snapshot.cpu_rate,
             snapshot.kill_on_close
-        ))
+        );
+        if let Self::Held(holder) = self {
+            let aggregate = holder.aggregate.snapshot()?;
+            line.push_str(&format!(
+                " slot={} aggregate_job=\"{}\" aggregate_limit_flags={} aggregate_memory_limit_bytes={} aggregate_process_memory_limit_bytes={} aggregate_cpu_rate={} aggregate_kill_on_close={}",
+                match holder.slot_index {
+                    Some(index) => index.to_string(),
+                    None => "exclusive".to_owned(),
+                },
+                holder.aggregate.name(),
+                aggregate.limit_flags,
+                aggregate.job_memory_limit_bytes,
+                aggregate.process_memory_limit_bytes,
+                aggregate.cpu_rate,
+                aggregate.kill_on_close
+            ));
+        }
+        Ok(line)
     }
 
     /// The marker every admitted process passes to its children so nested native
@@ -1105,12 +1172,7 @@ fn same_directory(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn write_holder(
-    account: &Path,
-    identity: ProcessIdentity,
-    label: &str,
-    job: &str,
-) -> io::Result<()> {
+fn write_holder(path: &Path, identity: ProcessIdentity, label: &str, job: &str) -> io::Result<()> {
     let record = HolderRecord {
         schema: SCHEMA,
         pid: identity.pid,
@@ -1119,29 +1181,84 @@ fn write_holder(
         command: label.to_owned(),
         job: job.to_owned(),
     };
-    let staging = account.join("holder.json.tmp");
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid("holder record path has no file name".to_owned()))?;
+    let staging = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
     ordinary_ancestors(&staging)?;
     fs::write(&staging, serde_json::to_vec(&record)?)?;
-    fs::rename(&staging, account.join(HOLDER_FILE))
+    fs::rename(&staging, path)
 }
 
-/// Best-effort description of the recorded slot holder for queue diagnostics.
-fn holder_description(account: &Path) -> String {
-    let path = account.join(HOLDER_FILE);
-    let Ok(Some(bytes)) = read_bounded(&path) else {
-        return "is not recorded".into();
+fn holder_record_path(account: &Path, slot: Option<u32>) -> PathBuf {
+    match slot {
+        Some(index) => account.join(format!("holder.slot-{index}.json")),
+        None => account.join(HOLDER_EXCLUSIVE_FILE),
+    }
+}
+
+/// Live holder descriptions only. A dead or unreadable record is not a current
+/// holder. `holder.json` is still read so a legacy exclusive holder can be named.
+fn live_holder_descriptions(account: &Path, slot_count: u32) -> Vec<String> {
+    let mut paths = vec![
+        account.join(HOLDER_FILE),
+        account.join(HOLDER_EXCLUSIVE_FILE),
+    ];
+    for index in 0..slot_count {
+        paths.push(holder_record_path(account, Some(index)));
+    }
+    let mut descriptions = Vec::new();
+    for path in paths {
+        let Some(description) = describe_live_holder(&path) else {
+            continue;
+        };
+        if !descriptions.contains(&description) {
+            descriptions.push(description);
+        }
+    }
+    descriptions
+}
+
+fn describe_live_holder(path: &Path) -> Option<String> {
+    let Ok(Some(bytes)) = read_bounded(path) else {
+        return None;
     };
     let Ok(record) = serde_json::from_slice::<HolderRecord>(&bytes) else {
-        return "record is unreadable".into();
+        return None;
     };
     let identity = ProcessIdentity {
         pid: record.pid,
         creation_time: record.creation_time,
     };
     if record.schema != SCHEMA || !live_process(identity) {
-        return "is no longer running".into();
+        return None;
     }
-    format!("pid={} command={}", record.pid, record.command)
+    Some(format!("pid={} command={}", record.pid, record.command))
+}
+
+/// One bounded queue line. Busy and total slots are always present. When no
+/// current holder record exists, the line says the legacy lock is held instead
+/// of inventing a holder.
+fn queue_diagnostic(account: &Path, slot_count: u32) -> String {
+    let holders = live_holder_descriptions(account, slot_count);
+    let detail = if holders.is_empty() {
+        "the legacy lock is held".to_owned()
+    } else {
+        format!("holders {}", holders.join("; "))
+    };
+    bound_line(format!(
+        "heavy: waiting for a free heavy-command slot; {}/{slot_count} busy; {detail}",
+        holders.len()
+    ))
+}
+
+fn bound_line(line: String) -> String {
+    let line = line.replace(['\r', '\n'], " ");
+    if line.chars().count() > MAX_DIAGNOSTIC {
+        line.chars().take(MAX_DIAGNOSTIC).collect::<String>() + "..."
+    } else {
+        line
+    }
 }
 
 /// One admitted command's outcome and wall-clock duration.
@@ -1206,11 +1323,11 @@ pub fn label(program: &OsStr, args: &[OsString]) -> String {
 /// is reported as `Cleanup`.
 ///
 /// The payload is created while it is still suspended, in the shared account
-/// CPU budget (outer) and this operation's lifecycle Job (inner) whenever the
-/// account budget is available, and the kernel is asked whether the payload
-/// really belongs to that budget before any payload code runs. A nested call
-/// inside an admitted tree keeps an anonymous containment Job instead: its
-/// ancestors already carry the aggregate budget, and a second inner rate is
+/// CPU budget (outermost, when established), the account aggregate Job, and this
+/// operation's lifecycle Job (innermost). The kernel is asked whether the payload
+/// really belongs to those jobs before any payload code runs. A nested call does
+/// not acquire another aggregate limit; it keeps an anonymous containment Job
+/// because its ancestors already carry the envelope, and a second inner rate is
 /// never applied because a nested Job's rate is a proportion of its parent's.
 pub fn execute(
     budget: &Budget,
@@ -1232,19 +1349,41 @@ pub fn execute(
     command.env.insert(OsString::from(LEASE_ENV), Some(marker));
     eprintln!("{}", admission.job_line(&job).map_err(RunError::Start)?);
     eprintln!("{}", admission.cpu_report(budget));
-    let suspended = match admission.budget() {
-        // The declared order creates the payload in the account budget and the
-        // lifecycle Job at once; the process owner verifies the whole list
-        // before this call returns.
-        Some(shared) => shared
-            .spawn_suspended(&job, &command)
+    let suspended = match admission {
+        // Slot, CPU budget and aggregate handle are already held. Create the
+        // payload in that order: CPU when present, aggregate, then containment.
+        Admission::Held(holder) => holder
+            .aggregate
+            .spawn_suspended(holder.cpu.budget(), &job, &command)
             .map_err(RunError::Start)?,
-        // Without an established account budget the tree keeps the lifecycle
-        // Job and its inherited ancestry; the degraded state is already warned.
-        None => job.spawn_suspended(&command).map_err(RunError::Start)?,
+        // Nested admission inherited the outer slot and aggregate limit. Do not
+        // join a second envelope; the containment Job is the only new owner.
+        Admission::Inherited(_) => match admission.budget() {
+            Some(shared) => shared
+                .spawn_suspended(&job, &command)
+                .map_err(RunError::Start)?,
+            None => job.spawn_suspended(&command).map_err(RunError::Start)?,
+        },
     };
     // Kernel membership of the actual payload, asked while it is still
     // suspended: a marker or a copied name is never the evidence.
+    if let Admission::Held(holder) = admission {
+        match holder.aggregate.contains(suspended.process()) {
+            Ok(true) => eprintln!(
+                "heavy: payload pid={} is a kernel-verified member of the account aggregate job=\"{}\"",
+                suspended.process().identity().pid,
+                holder.aggregate.name()
+            ),
+            Ok(false) => eprintln!(
+                "heavy: warning: payload pid={} is outside the account aggregate job=\"{}\"",
+                suspended.process().identity().pid,
+                holder.aggregate.name()
+            ),
+            Err(error) => eprintln!(
+                "heavy: warning: account aggregate membership could not be read ({error})"
+            ),
+        }
+    }
     match admission.budget() {
         Some(shared)
             if shared
@@ -1392,10 +1531,21 @@ mod tests {
         );
         assert_eq!(budget.deadline_seconds, 1800);
         assert_eq!(budget.queue_wait_seconds, 3600);
+        assert_eq!(budget.max_concurrent_trees, 2);
+        assert_eq!(budget.aggregate_memory_limit_bytes, budget.memory_bytes);
         budget.validate("default").unwrap();
         for invalid in [
             Budget {
                 memory_bytes: 0,
+                ..budget
+            },
+            Budget {
+                max_concurrent_trees: 0,
+                ..budget
+            },
+            Budget {
+                memory_bytes: 32 * MIB,
+                aggregate_memory_limit_bytes: 16 * MIB,
                 ..budget
             },
             Budget {
@@ -1424,6 +1574,8 @@ mod tests {
         assert!(
             Budget {
                 cpu_percent: Some(100.0),
+                max_concurrent_trees: 1,
+                aggregate_memory_limit_bytes: budget.memory_bytes + MIB,
                 ..budget
             }
             .validate("fixture")
@@ -1643,5 +1795,452 @@ mod tests {
         assert!(text.starts_with("cargo --release "), "{text}");
         assert!(text.len() <= MAX_LABEL + 8, "{}", text.len());
         assert!(!text.contains('\n'));
+    }
+
+    fn owned_account() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let account = temp.path().join("account");
+        prepare(&account).unwrap();
+        (temp, account)
+    }
+
+    fn test_budget(slots: u32, queue_wait_seconds: u64) -> Budget {
+        Budget {
+            memory_bytes: 64 * MIB,
+            aggregate_memory_limit_bytes: 64 * MIB,
+            max_concurrent_trees: slots,
+            queue_wait_seconds,
+            deadline_seconds: 30,
+            cpu_percent: None,
+        }
+    }
+
+    struct RestoreEnv {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl RestoreEnv {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            // Tests run with one thread. The installed Windows contract permits
+            // this process-global mutation; Drop restores the previous value.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            // Same single-thread contract as `set`.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn expect_admission_err(result: io::Result<Admission>) -> io::Error {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("admission succeeded; expected an error"),
+        }
+    }
+
+    #[test]
+    fn legacy_policy_keeps_new_defaults_without_rewriting_bytes() {
+        let (_temp, account) = owned_account();
+        let path = policy_path(&account);
+        let bytes = br#"{"schema":1,"memory_bytes":16777216}"#;
+        fs::write(&path, bytes).unwrap();
+        let budget = Budget::read(&account).unwrap();
+        assert_eq!(budget.memory_bytes, 16 * MIB);
+        assert_eq!(budget.max_concurrent_trees, 2);
+        assert_eq!(budget.aggregate_memory_limit_bytes, budget.memory_bytes);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let explicit = Budget {
+            memory_bytes: 16 * MIB,
+            aggregate_memory_limit_bytes: 32 * MIB,
+            max_concurrent_trees: 1,
+            ..Budget::default()
+        };
+        Budget::write(&account, &explicit).unwrap();
+        assert_eq!(Budget::read(&account).unwrap(), explicit);
+
+        let rejected =
+            br#"{"schema":1,"memory_bytes":33554432,"aggregate_memory_limit_bytes":16777216}"#;
+        fs::write(&path, rejected).unwrap();
+        let error = Budget::read(&account).unwrap_err().to_string();
+        assert!(error.contains("refusing before admission"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), rejected);
+    }
+
+    #[test]
+    fn invalid_policy_is_refused_before_any_admission_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let account = temp.path().join("missing");
+        for budget in [
+            Budget {
+                max_concurrent_trees: 0,
+                ..Budget::default()
+            },
+            Budget {
+                memory_bytes: 32 * MIB,
+                aggregate_memory_limit_bytes: 16 * MIB,
+                ..Budget::default()
+            },
+        ] {
+            let error = Admission::acquire(&account, &budget, "invalid", &Cancellation::default())
+                .map_or_else(|error| error, |_| panic!("invalid budget was admitted"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert!(!account.exists(), "{error}");
+        }
+    }
+
+    #[test]
+    fn slot_admission_preserves_timeout_and_cancellation_kinds() {
+        let (_temp, account) = owned_account();
+        let budget = test_budget(1, 1);
+        let held =
+            Admission::acquire(&account, &budget, "holder", &Cancellation::default()).unwrap();
+        assert!(matches!(&held, Admission::Held(holder) if holder.slot_index.is_none()));
+        assert!(account.join("heavy-command.lock").is_file());
+        assert!(!account.join("heavy-command.slot-0.lock").exists());
+
+        let started = Instant::now();
+        let timed_out = expect_admission_err(Admission::acquire(
+            &account,
+            &budget,
+            "waiter",
+            &Cancellation::default(),
+        ));
+        assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut, "{timed_out}");
+        assert!(
+            timed_out.to_string().contains("resource busy"),
+            "{timed_out}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4), "{timed_out}");
+        assert!(account.join(HOLDER_EXCLUSIVE_FILE).is_file());
+
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let interrupted =
+            expect_admission_err(Admission::acquire(&account, &budget, "cancelled", &cancel));
+        assert_eq!(
+            interrupted.kind(),
+            io::ErrorKind::Interrupted,
+            "{interrupted}"
+        );
+        drop(held);
+        assert!(!account.join(HOLDER_EXCLUSIVE_FILE).exists());
+    }
+
+    #[test]
+    fn per_slot_records_release_only_their_own_holder() {
+        let (_temp, account) = owned_account();
+        let budget = test_budget(2, 1);
+        let first =
+            Admission::acquire(&account, &budget, "first", &Cancellation::default()).unwrap();
+        let second =
+            Admission::acquire(&account, &budget, "second", &Cancellation::default()).unwrap();
+        let (released, kept) = {
+            let (Admission::Held(first_holder), Admission::Held(second_holder)) = (&first, &second)
+            else {
+                panic!("both direct admissions must hold a slot");
+            };
+            assert_ne!(first_holder.slot_index, second_holder.slot_index);
+            assert_eq!(
+                first_holder.aggregate.name(),
+                second_holder.aggregate.name()
+            );
+            let aggregate = first_holder.aggregate.snapshot().unwrap();
+            assert_eq!(
+                aggregate.job_memory_limit_bytes,
+                budget.aggregate_memory_limit_bytes
+            );
+            assert!(first_holder.record.is_file());
+            assert!(second_holder.record.is_file());
+            assert_ne!(first_holder.record, second_holder.record);
+            assert!(!account.join(HOLDER_FILE).exists());
+            (first_holder.record.clone(), second_holder.record.clone())
+        };
+        drop(first);
+        assert!(
+            !released.exists(),
+            "dropped admission left its holder record"
+        );
+        assert!(
+            kept.is_file(),
+            "dropping one admission removed the other record"
+        );
+        let third =
+            Admission::acquire(&account, &budget, "third", &Cancellation::default()).unwrap();
+        assert!(matches!(third, Admission::Held(_)));
+    }
+
+    #[test]
+    fn queue_diagnostic_names_holders_or_the_legacy_lock() {
+        let (_temp, account) = owned_account();
+        let empty = queue_diagnostic(&account, 2);
+        assert_eq!(
+            empty,
+            "heavy: waiting for a free heavy-command slot; 0/2 busy; the legacy lock is held"
+        );
+        assert!(!empty.contains('\n'));
+
+        let identity = current_identity().unwrap();
+        let record = serde_json::json!({
+            "schema": SCHEMA,
+            "pid": identity.pid,
+            "creation_time": identity.creation_time,
+            "started_unix_ms": 1,
+            "command": "cargo test",
+            "job": format!("{JOB_NAME_PREFIX}fixture"),
+        });
+        fs::write(
+            account.join("holder.slot-0.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let busy = queue_diagnostic(&account, 2);
+        assert!(busy.contains("1/2 busy"), "{busy}");
+        assert!(busy.contains("holders pid="), "{busy}");
+        assert!(busy.contains("command=cargo test"), "{busy}");
+        assert!(!busy.contains("legacy lock"), "{busy}");
+        assert!(!busy.contains('\n'));
+
+        let long = "x".repeat(600);
+        let record = serde_json::json!({
+            "schema": SCHEMA,
+            "pid": identity.pid,
+            "creation_time": identity.creation_time,
+            "started_unix_ms": 1,
+            "command": long,
+            "job": format!("{JOB_NAME_PREFIX}fixture"),
+        });
+        fs::write(
+            account.join("holder.slot-1.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let bounded = queue_diagnostic(&account, 2);
+        assert!(
+            bounded.chars().count() <= MAX_DIAGNOSTIC + 3,
+            "{}",
+            bounded.chars().count()
+        );
+        assert!(!bounded.contains('\n'));
+    }
+
+    #[test]
+    fn slot_waiter_does_not_hold_the_cpu_or_aggregate_lock() {
+        let (temp, account) = owned_account();
+        let cpu_account = temp.path().join("cpu");
+        fs::create_dir_all(&cpu_account).unwrap();
+        let _cpu_env = RestoreEnv::set(
+            crate::process::CPU_BUDGET_ACCOUNT_ENV,
+            cpu_account.as_os_str(),
+        );
+        let budget = test_budget(1, 1);
+        let held =
+            Admission::acquire(&account, &budget, "holder", &Cancellation::default()).unwrap();
+        let cpu_lock = crate::process::ExclusiveFileLock::acquire(
+            &cpu_account.join("cpu-budget.lock"),
+            Deadline::after(Duration::from_secs(2)).unwrap(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let aggregate_lock = crate::process::ExclusiveFileLock::acquire(
+            &account.join("heavy-aggregate.lock"),
+            Deadline::after(Duration::from_secs(2)).unwrap(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            Admission::acquire(&account, &budget, "waiter", &Cancellation::default())
+        });
+        let error = expect_admission_err(waiter.join().unwrap());
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "a slot waiter blocked on a CPU or aggregate lock: {error} after {:?}",
+            started.elapsed()
+        );
+        drop(cpu_lock);
+        drop(aggregate_lock);
+        drop(held);
+    }
+
+    #[test]
+    fn run_diagnostics_include_aggregate_and_per_tree_readback() {
+        use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_MEMORY;
+
+        let (_temp, account) = owned_account();
+        let budget = test_budget(1, 30);
+        let admission =
+            Admission::acquire(&account, &budget, "readback", &Cancellation::default()).unwrap();
+        let (job, _) = admission.owned_job(&budget, &account).unwrap();
+        let line = admission.job_line(&job).unwrap();
+        assert!(line.starts_with("heavy: job scope=aggregate "), "{line}");
+        assert!(
+            line.contains(&format!("memory_limit_bytes={}", budget.memory_bytes)),
+            "{line}"
+        );
+        assert!(line.contains("kill_on_close=true"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "aggregate_memory_limit_bytes={}",
+                budget.aggregate_memory_limit_bytes
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains("aggregate_process_memory_limit_bytes=0"),
+            "{line}"
+        );
+        assert!(line.contains("aggregate_cpu_rate=0"), "{line}");
+        assert!(line.contains("aggregate_kill_on_close=false"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "aggregate_limit_flags={JOB_OBJECT_LIMIT_JOB_MEMORY}"
+            )),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "{line}");
+        let Admission::Held(holder) = &admission else {
+            panic!("readback admission must hold the slot");
+        };
+        let aggregate = holder.aggregate.snapshot().unwrap();
+        assert_eq!(aggregate.limit_flags, JOB_OBJECT_LIMIT_JOB_MEMORY);
+        assert_eq!(aggregate.process_memory_limit_bytes, 0);
+        assert_eq!(aggregate.cpu_rate, 0);
+        assert!(!aggregate.kill_on_close);
+    }
+
+    #[test]
+    fn direct_run_exits_with_the_payload_code_inside_both_jobs() {
+        use crate::process::StopReason;
+        use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_MEMORY;
+
+        let (_temp, account) = owned_account();
+        let budget = Budget {
+            memory_bytes: 4 * 1024 * MIB,
+            aggregate_memory_limit_bytes: 4 * 1024 * MIB,
+            deadline_seconds: 60,
+            ..test_budget(1, 30)
+        };
+        let admission =
+            Admission::acquire(&account, &budget, "cmd", &Cancellation::default()).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let run = execute(
+            &budget,
+            &account,
+            &program,
+            &[
+                OsString::from("--exact"),
+                OsString::from("heavy_command::tests::direct_exit_probe"),
+                OsString::from("--ignored"),
+                OsString::from("--nocapture"),
+            ],
+            &admission,
+            &Cancellation::default(),
+        )
+        .unwrap_or_else(|error| panic!("direct run failed: {error}"));
+        assert_eq!(run.outcome.reason, StopReason::Exited);
+        assert_eq!(run.outcome.exit_code, 3, "exit codes must pass through");
+        assert_eq!(run.outcome.job.memory_limit_bytes, budget.memory_bytes);
+        assert!(run.outcome.job.kill_on_close);
+        let Admission::Held(holder) = &admission else {
+            panic!("direct run must hold a slot");
+        };
+        let aggregate = holder.aggregate.snapshot().unwrap();
+        assert_eq!(
+            aggregate.job_memory_limit_bytes,
+            budget.aggregate_memory_limit_bytes
+        );
+        assert_eq!(aggregate.limit_flags, JOB_OBJECT_LIMIT_JOB_MEMORY);
+        assert_eq!(aggregate.process_memory_limit_bytes, 0);
+        assert_eq!(aggregate.cpu_rate, 0);
+        assert!(!aggregate.kill_on_close);
+    }
+
+    #[test]
+    fn nested_run_inherits_the_outer_admission() {
+        let (temp, account) = owned_account();
+        let result = temp.path().join("nested-result");
+        let budget = Budget {
+            memory_bytes: 4 * 1024 * MIB,
+            aggregate_memory_limit_bytes: 4 * 1024 * MIB,
+            max_concurrent_trees: 1,
+            queue_wait_seconds: 5,
+            deadline_seconds: 60,
+            cpu_percent: None,
+        };
+        Budget::write(&account, &budget).unwrap();
+        let _account_env = RestoreEnv::set("HARNESS_HEAVY_PROBE_ACCOUNT", account.as_os_str());
+        let _result_env = RestoreEnv::set("HARNESS_HEAVY_PROBE_RESULT", result.as_os_str());
+        let admission =
+            Admission::acquire(&account, &budget, "outer", &Cancellation::default()).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let run = execute(
+            &budget,
+            &account,
+            &program,
+            &[
+                OsString::from("--exact"),
+                OsString::from("heavy_command::tests::nested_heavy_admission_probe"),
+                OsString::from("--ignored"),
+                OsString::from("--nocapture"),
+            ],
+            &admission,
+            &Cancellation::default(),
+        )
+        .unwrap_or_else(|error| panic!("nested run failed to start: {error}"));
+        let recorded = fs::read_to_string(&result).unwrap_or_else(|_| "<missing>".to_owned());
+        assert_eq!(run.outcome.exit_code, 0, "{recorded}");
+        assert_eq!(recorded, "inherited");
+        // The outer slot is still held, so a nested call that took a second slot
+        // would still be waiting. A new direct caller must now be the one that waits.
+        let peer_budget = Budget {
+            queue_wait_seconds: 1,
+            ..budget
+        };
+        let peer = expect_admission_err(Admission::acquire(
+            &account,
+            &peer_budget,
+            "peer",
+            &Cancellation::default(),
+        ));
+        assert_eq!(peer.kind(), io::ErrorKind::TimedOut, "{peer}");
+    }
+
+    #[test]
+    #[ignore = "child of nested_run_inherits_the_outer_admission"]
+    fn nested_heavy_admission_probe() {
+        let account = PathBuf::from(std::env::var_os("HARNESS_HEAVY_PROBE_ACCOUNT").unwrap());
+        let result = PathBuf::from(std::env::var_os("HARNESS_HEAVY_PROBE_RESULT").unwrap());
+        let budget = Budget::read(&account).unwrap();
+        let admission =
+            Admission::acquire(&account, &budget, "nested-probe", &Cancellation::default())
+                .unwrap();
+        let kind = match &admission {
+            Admission::Inherited(_) => "inherited",
+            Admission::Held(_) => "held",
+        };
+        fs::write(&result, kind).unwrap();
+        assert_eq!(kind, "inherited");
+        assert_eq!(admission.scope(), "containment");
+        assert!(admission.limits(&budget).memory_bytes.is_none());
+        assert!(admission.limits(&budget).cpu_percent.is_none());
+    }
+
+    #[test]
+    #[ignore = "child of direct_run_exits_with_the_payload_code_inside_both_jobs"]
+    fn direct_exit_probe() {
+        std::process::exit(3);
     }
 }
