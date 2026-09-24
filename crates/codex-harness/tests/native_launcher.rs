@@ -1597,6 +1597,7 @@ fn uncapped_session_escapes_a_capped_caller_without_lifting_peers() {
     assert_eq!(again.tree()["in_shared"], json!(true), "{:?}", again.tree());
     let _ = service.terminate(0);
     let _ = peer_child.kill();
+    let _ = peer_child.wait();
 }
 
 fn process_in_named_job(pid: u32, name: &str) -> bool {
