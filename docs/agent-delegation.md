@@ -401,13 +401,18 @@ host is reported with its reason and an unknown exit code, never as a
 completion. `executor pool` adds `run=<state> session=<id>` per slot, and
 `executor release` prints the last observed run beside the disposition it
 records while still refusing to reset a live or unreviewed slot.
-Waiting follows that one-event shape: one blocking watch call covers the
-whole wait - omit `--timeout` (default 1800s) or match the assignment's
-expected duration, keep the calling shell's own timeout long enough to cover
-it, and rerun the same watch when a boundary arrives with the run still
-running. Watch prints nothing while the run continues; short fixed-interval
-watch polling (for example every 50 seconds) is waste, and `executor pool`
-already provides the compact between-work snapshot.
+Waiting follows that one-event shape: retain one native watch per run, with
+`--timeout 900` for the 15-minute supervision boundary. Completion or failure
+can return earlier. Short tool yields resume the same pending wait; they do
+not justify another watcher, worktree inspection or status-only update.
+At the boundary, batch one compact state/activity check across active executors;
+`executor pool` supplies the state snapshot. If progress is unclear, inspect
+the latest bounded activity/error evidence once, identify a concrete blocker
+or report what evidence is missing, and choose the next action. A live process,
+growing log or missing patch alone proves neither progress nor a stall.
+Resume watching ongoing work; elapsed time alone is no reason to steer or stop it.
+The shared supervision rule lives in
+[`global/harness.config.toml`](../global/harness.config.toml).
 
 An observed `executor run --file` - the process a tab or console hosts - exits
 0 only for a completed turn with a nonempty final message, otherwise propagates
@@ -506,9 +511,11 @@ inside a delegated slice's boundaries remains executor work.
 
 Combine related routine into one substantial assignment. Splitting a pair of
 short functions between two children increased parent time and spend in the
-first comparison. State material input bounds up front. When only waiting
-remains, use a bounded 30–60 second wait instead of frequent polling; lack of
-progress must be visible.
+first comparison. State material input bounds up front. Routine supervision
+runs once every 15 minutes, as described with `executor watch` above. Check
+earlier only for a delivered result, explicit error, help request, new user
+instruction or concrete risk to correctness or shared resources. Do independent
+work between events; do not repeatedly reread worker source, diffs or logs.
 
 That interval is not the assignment deadline. A message to a working agent must
 add facts, correct an established error or change the task. An empty or
