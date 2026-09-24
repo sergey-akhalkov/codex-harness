@@ -63,7 +63,7 @@ const USAGE: &str = concat!(
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
     "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend; a finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
+    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the existing terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. A finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
     "Resume continues one exact interrupted session on its recorded slot through the verified non-interactive `codex exec resume SESSION_ID` path without fetch, reset or clean, so partial work survives; without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
@@ -2429,6 +2429,41 @@ impl OwnedFrontend {
         }
         Ok(())
     }
+
+    /// Ends this frontend, or names it when cleanup cannot confirm that.
+    /// The observation fixture marker forces that survivor path for the
+    /// frontend double only; a real Codex frontend never matches its name.
+    fn close_for_release(self, home: &Path) -> Result<(), observation::CleanupSurvivor> {
+        let identity = self.identity();
+        let image = self.program.clone();
+        let forced = home.join("frontend-cleanup-fail").is_file()
+            && self
+                .program
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("harness-frontend-double"));
+        if forced {
+            return Err(frontend_survivor(
+                identity,
+                image,
+                format!(
+                    "surviving owned frontend pid {} was still running; cleanup did not confirm it ended",
+                    identity.pid
+                ),
+            ));
+        }
+        match self.close() {
+            Ok(()) => Ok(()),
+            Err(error) => Err(frontend_survivor(
+                identity,
+                image,
+                format!(
+                    "surviving owned frontend pid {} could not be ended: {error}",
+                    identity.pid
+                ),
+            )),
+        }
+    }
 }
 
 impl Drop for OwnedFrontend {
@@ -2911,17 +2946,20 @@ fn host_control_conversation(
     {
         let _ = write_frontend_record(plan, frontend, conversation.thread_id(), "persisted");
     }
-    // A finished turn is not a closed frontend. Persist first, then end only
-    // this owned surface, then the backend.
-    if let Some(frontend) = frontend.take() {
-        let _ = frontend.close();
-    }
-    if let Err(error) = end_owned_child(job, &conversation, Path::new(&plan.launcher)) {
-        if attached {
-            note_log(&plan.paths.log, &format!("note: {error}"));
-        } else {
-            writeln!(stdout, "note: {error}")?;
-        }
+    // Persist first. Then end only this owned frontend and this run's backend.
+    // `run_exec` still applies the terminal-host close policy after this
+    // returns: `--close-tab` exits 0, and this exit stays the receipt's code.
+    if let Some(note) = release_owned_surface(
+        receipt,
+        plan,
+        frontend.take(),
+        job,
+        &conversation,
+        attached,
+        record.is_ok(),
+    ) && !attached
+    {
+        let _ = writeln!(stdout, "note: {note}");
     }
     if attached {
         note_log(
@@ -3201,6 +3239,109 @@ fn end_owned_child(job: Job, conversation: &Conversation, program: &Path) -> io:
     }
     job.wait_session_root(child)?;
     Ok(())
+}
+
+fn frontend_survivor(
+    identity: harness_core::process::ProcessIdentity,
+    image: PathBuf,
+    cause: String,
+) -> observation::CleanupSurvivor {
+    observation::CleanupSurvivor {
+        kind: "frontend".into(),
+        pid: identity.pid,
+        created: identity.creation_time,
+        image,
+        cause,
+        next_action: observation::CLEANUP_RECOVERY.into(),
+    }
+}
+
+fn backend_survivor(
+    conversation: &Conversation,
+    program: &Path,
+    cause: String,
+) -> observation::CleanupSurvivor {
+    let (pid, created) = conversation
+        .process()
+        .map(|child| {
+            let identity = child.identity();
+            (identity.pid, identity.creation_time)
+        })
+        .unwrap_or((0, 0));
+    observation::CleanupSurvivor {
+        kind: "backend".into(),
+        pid,
+        created,
+        image: program.to_path_buf(),
+        cause,
+        next_action: observation::CLEANUP_RECOVERY.into(),
+    }
+}
+
+/// Closes the owned frontend and releases only this run's backend child.
+/// A failure is recorded beside the assignment outcome and returned as a note.
+/// It does not change the recorded state or exit code. `--close-tab` still
+/// turns the returned run code into the tab-host close signal.
+fn release_owned_surface(
+    receipt: &Path,
+    plan: &ControlPlan,
+    frontend: Option<OwnedFrontend>,
+    job: Job,
+    conversation: &Conversation,
+    attached: bool,
+    outcome_recorded: bool,
+) -> Option<String> {
+    let mut survivors = Vec::new();
+    if let Some(frontend) = frontend
+        && let Err(survivor) = frontend.close_for_release(&plan.home)
+    {
+        survivors.push(survivor);
+    }
+    if let Err(error) = end_owned_child(job, conversation, Path::new(&plan.launcher)) {
+        survivors.push(backend_survivor(
+            conversation,
+            Path::new(&plan.launcher),
+            format!("surviving owned backend could not be released: {error}"),
+        ));
+    }
+    if survivors.is_empty() {
+        return None;
+    }
+    let named = survivors
+        .iter()
+        .map(|item| {
+            format!(
+                "surviving {} pid {} creation {} image {}",
+                item.kind,
+                item.pid,
+                item.created,
+                item.image.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut note = format!(
+        "cleanup failed; {} surviving owned resource(s); recorded assignment outcome unchanged. {} {named}",
+        survivors.len(),
+        observation::CLEANUP_RECOVERY
+    );
+    if outcome_recorded {
+        let record = observation::CleanupRecord {
+            schema: observation::CLEANUP_SCHEMA,
+            closed: false,
+            survivors,
+            recovery: observation::CLEANUP_RECOVERY.into(),
+        };
+        if let Err(error) = observation::record_cleanup(receipt, &record) {
+            note.push_str(&format!(
+                "; the cleanup failure record could not be written: {error}"
+            ));
+        }
+    }
+    if attached {
+        note_log(&plan.paths.log, &note);
+    }
+    Some(note)
 }
 
 /// The terminal summary of one control-backed run, in the shape the observed
