@@ -1926,6 +1926,14 @@ fn assert_managed_presentation(name: &str, mode: &str, presentation: &str, inlin
         !watched_text.contains("no native coverage"),
         "{mode}: native presentation must stay observable: {watched_text}"
     );
+    let receipt = receipt_json(&host.receipt);
+    assert!(
+        receipt.get("cleanup").is_none() || receipt["cleanup"].is_null(),
+        "{mode}: successful close recorded a cleanup failure: {receipt}"
+    );
+    assert_eq!(receipt["observation"]["exitCode"], 0, "{mode}: {receipt}");
+    assert_frontend_gone(&host, &double);
+    assert_backend_released(&host);
     let _ = host.source;
 }
 
@@ -1969,4 +1977,297 @@ fn losing_the_frontend_does_not_leave_the_run_working() {
         .output()
         .unwrap();
     assert_eq!(watched.status.code(), Some(1), "{}", text(&watched));
+}
+
+fn host_command(host: &ControlHost, close_tab: bool) -> CommandSpec {
+    let mut spec = host_spec(host);
+    if close_tab {
+        spec.args.push("--close-tab".into());
+    }
+    spec
+}
+
+fn process_gone(pid: u32, created: u64, program: &Path) -> bool {
+    let user = harness_core::process_service::current_user().unwrap();
+    harness_core::process_service::ServiceProcess::inspect(
+        harness_core::process::ProcessIdentity {
+            pid,
+            creation_time: created,
+        },
+        program,
+        &user,
+    )
+    .unwrap()
+    .is_none()
+}
+
+fn endpoint_backend(host: &ControlHost) -> (u32, u64, PathBuf) {
+    let value = receipt_json(&host.state.join("endpoint-1.json"));
+    let process = &value["process"];
+    (
+        process["pid"].as_u64().expect("endpoint pid") as u32,
+        process["creationTime"].as_u64().expect("endpoint creation"),
+        PathBuf::from(process["program"].as_str().expect("endpoint program")),
+    )
+}
+
+fn wait_turn(host: &ControlHost) {
+    let until = Instant::now() + Duration::from_secs(25);
+    while host.server.requests_for("turn/start").is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert_eq!(host.server.requests_for("turn/start").len(), 1);
+}
+
+fn assert_frontend_gone(host: &ControlHost, double: &Path) {
+    let phases = frontend_phases(host);
+    let pid = phases[0]["pid"].as_u64().unwrap() as u32;
+    let created = phases[0]["creationTime"].as_u64().unwrap();
+    assert!(
+        process_gone(pid, created, double),
+        "owned frontend still running: {phases:?}"
+    );
+}
+
+fn assert_backend_released(host: &ControlHost) {
+    let (pid, created, program) = endpoint_backend(host);
+    assert!(
+        process_gone(pid, created, &program),
+        "closing the owned frontend left this run's backend running: pid {pid}"
+    );
+    assert!(
+        !host.server.requests_for("turn/start").is_empty(),
+        "releasing this run's backend dropped the neighboring control session"
+    );
+}
+
+fn spawn_neighbor() -> std::process::Child {
+    Command::new("pwsh")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 90"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn successful_and_unsuccessful_results_survive_tab_closure() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    for (name, failed) in [("tab-close-ok", false), ("tab-close-failed", true)] {
+        let host = ControlHost::new(name);
+        host.register_frontend(&double);
+        let mut neighbor = spawn_neighbor();
+        let session = ConsoleSession::spawn(ConsoleSpec::new(host_command(&host, true))).unwrap();
+        wait_turn(&host);
+        if failed {
+            host.server.push(json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": CONTROL_THREAD,
+                    "turn": {
+                        "id": CONTROL_TURN,
+                        "status": "failed",
+                        "error": {"message": "fixture turn failed"}
+                    }
+                }
+            }));
+        } else {
+            completion_burst(&host.server);
+        }
+        let finished = session
+            .wait(
+                Deadline::after(Duration::from_secs(20)).unwrap(),
+                &Cancellation::default(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            finished.outcome.exit_code, 0,
+            "{name}: the tab host must exit 0 so the tab closes: {}",
+            finished.transcript
+        );
+        let receipt = receipt_json(&host.receipt);
+        let observation = &receipt["observation"];
+        if failed {
+            assert_eq!(observation["state"], "failed", "{name}: {receipt}");
+            assert_eq!(observation["exitCode"], 1, "{name}: {receipt}");
+            assert!(
+                observation["cause"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("fixture turn failed"),
+                "{name}: {receipt}"
+            );
+        } else {
+            assert_eq!(observation["state"], "completed", "{name}: {receipt}");
+            assert_eq!(observation["exitCode"], 0, "{name}: {receipt}");
+            assert_eq!(
+                fs::read_to_string(host.state.join("message-1.txt"))
+                    .unwrap()
+                    .trim(),
+                CONTROL_FINAL
+            );
+        }
+        assert!(
+            receipt.get("cleanup").is_none() || receipt["cleanup"].is_null(),
+            "{name}: a successful close must not be recorded as a cleanup failure: {receipt}"
+        );
+        assert_frontend_gone(&host, &double);
+        assert_backend_released(&host);
+        assert!(
+            neighbor.try_wait().unwrap().is_none(),
+            "{name}: closing this run stopped a neighboring process"
+        );
+        let _ = neighbor.kill();
+        let watched = lead_command()
+            .args(["executor", "watch", "--receipt"])
+            .arg(&host.receipt)
+            .output()
+            .unwrap();
+        let watched_text = text(&watched);
+        if failed {
+            assert_eq!(watched.status.code(), Some(1), "{name}: {watched_text}");
+            assert!(
+                watched_text.contains("state=failed") && watched_text.contains("exit: 1"),
+                "{name}: {watched_text}"
+            );
+        } else {
+            assert_eq!(watched.status.code(), Some(0), "{name}: {watched_text}");
+            assert!(
+                watched_text.contains("state=completed") && watched_text.contains(CONTROL_FINAL),
+                "{name}: {watched_text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_console_returns_the_failed_run_exit_code() {
+    let host = ControlHost::new("console-failed");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let mut neighbor = spawn_neighbor();
+    let session = ConsoleSession::spawn(ConsoleSpec::new(host_command(&host, false))).unwrap();
+    wait_turn(&host);
+    host.server.push(json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "turn": {
+                "id": CONTROL_TURN,
+                "status": "failed",
+                "error": {"message": "fixture turn failed"}
+            }
+        }
+    }));
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(
+        finished.outcome.exit_code, 1,
+        "an owned console must return the run exit code, not the tab close signal: {}",
+        finished.transcript
+    );
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "failed", "{receipt}");
+    assert_eq!(receipt["observation"]["exitCode"], 1, "{receipt}");
+    assert_frontend_gone(&host, &double);
+    assert_backend_released(&host);
+    assert!(neighbor.try_wait().unwrap().is_none());
+    let _ = neighbor.kill();
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    assert_eq!(watched.status.code(), Some(1), "{}", text(&watched));
+    assert!(text(&watched).contains("exit: 1"), "{}", text(&watched));
+}
+
+#[test]
+fn cleanup_failure_names_survivors_without_changing_the_outcome() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    for (name, close_tab) in [("cleanup-console", false), ("cleanup-tab", true)] {
+        let host = ControlHost::new(name);
+        host.register_frontend(&double);
+        let mut neighbor = spawn_neighbor();
+        let session =
+            ConsoleSession::spawn(ConsoleSpec::new(host_command(&host, close_tab))).unwrap();
+        wait_turn(&host);
+        fs::write(host.home.join("frontend-cleanup-fail"), "fail").unwrap();
+        completion_burst(&host.server);
+        let finished = session
+            .wait(
+                Deadline::after(Duration::from_secs(20)).unwrap(),
+                &Cancellation::default(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            finished.outcome.exit_code, 0,
+            "{name}: cleanup must not replace the run exit; a tab host still exits 0: {}",
+            finished.transcript
+        );
+        let receipt = receipt_json(&host.receipt);
+        assert_eq!(
+            receipt["observation"]["state"], "completed",
+            "{name}: {receipt}"
+        );
+        assert_eq!(receipt["observation"]["exitCode"], 0, "{name}: {receipt}");
+        assert_eq!(
+            fs::read_to_string(host.state.join("message-1.txt"))
+                .unwrap()
+                .trim(),
+            CONTROL_FINAL,
+            "{name}: the final message was lost"
+        );
+        assert_eq!(receipt["cleanup"]["closed"], false, "{name}: {receipt}");
+        let survivor = &receipt["cleanup"]["survivors"][0];
+        let phases = frontend_phases(&host);
+        assert_eq!(survivor["kind"], "frontend", "{name}: {receipt}");
+        assert_eq!(survivor["pid"], phases[0]["pid"], "{name}: {receipt}");
+        assert_eq!(
+            survivor["created"], phases[0]["creationTime"],
+            "{name}: {receipt}"
+        );
+        assert!(
+            survivor["cause"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("surviving"),
+            "{name}: {receipt}"
+        );
+        let recovery = receipt["cleanup"]["recovery"].as_str().unwrap_or_default();
+        assert!(
+            recovery.contains("does not change the recorded assignment outcome"),
+            "{name}: {recovery}"
+        );
+        let log = fs::read_to_string(host.state.join("endpoint-1.log")).unwrap_or_default();
+        assert!(
+            log.contains("cleanup failed") && log.contains("surviving"),
+            "{name}: cleanup failure was not reported: {log}"
+        );
+        assert_backend_released(&host);
+        assert!(
+            neighbor.try_wait().unwrap().is_none(),
+            "{name}: cleanup stopped a neighboring process"
+        );
+        let _ = neighbor.kill();
+        let watched = lead_command()
+            .args(["executor", "watch", "--receipt"])
+            .arg(&host.receipt)
+            .output()
+            .unwrap();
+        let watched_text = text(&watched);
+        assert_eq!(watched.status.code(), Some(0), "{name}: {watched_text}");
+        assert!(
+            watched_text.contains("state=completed") && watched_text.contains(CONTROL_FINAL),
+            "{name}: {watched_text}"
+        );
+    }
 }

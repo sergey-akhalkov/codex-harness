@@ -298,6 +298,37 @@ pub(crate) struct StopSurvivor {
     pub next_action: String,
 }
 
+/// Schema of a cleanup failure recorded beside, not inside, the assignment outcome.
+pub(crate) const CLEANUP_SCHEMA: u32 = 1;
+
+/// Recovery named with a cleanup failure. It is not a new assignment outcome.
+pub(crate) const CLEANUP_RECOVERY: &str = "confirm each surviving owned process by its recorded pid and creation time and end it if it is still running; this cleanup failure does not change the recorded assignment outcome";
+
+/// One owned frontend or backend resource a terminal cleanup could not confirm
+/// ended. The assignment outcome stays in the observation record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CleanupSurvivor {
+    /// `frontend` or `backend`.
+    pub kind: String,
+    pub pid: u32,
+    pub created: u64,
+    pub image: PathBuf,
+    pub cause: String,
+    pub next_action: String,
+}
+
+/// A failed owned-surface cleanup. `closed` is false: this record never claims
+/// that closure succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CleanupRecord {
+    pub schema: u32,
+    pub closed: bool,
+    pub survivors: Vec<CleanupSurvivor>,
+    pub recovery: String,
+}
+
 /// Honest stop lifecycle of one executor run, written under `stop` in the
 /// kit-local dispatch receipt beside the observation it explains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -979,6 +1010,17 @@ pub(crate) fn update_receipt_field(receipt: &Path, name: &str, field: Value) -> 
         value[name] = field;
         write_receipt(receipt, &value)
     })
+}
+
+/// Records a cleanup failure beside the assignment outcome. The observation
+/// state and exit code are left untouched.
+pub(crate) fn record_cleanup(receipt: &Path, record: &CleanupRecord) -> io::Result<()> {
+    let field = serde_json::to_value(record).map_err(|error| {
+        io::Error::other(format!(
+            "cleanup failure record is not serializable: {error}"
+        ))
+    })?;
+    update_receipt_field(receipt, "cleanup", field)
 }
 
 /// Writes a complete receipt document under the same lock: the dispatcher's
@@ -2086,6 +2128,63 @@ mod tests {
             "{value}"
         );
         assert_ne!(value["stop"]["outcome"], STOP_STOPPED);
+    }
+
+    #[test]
+    fn cleanup_failure_record_does_not_rewrite_the_assignment_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "slot": {"owner": "exec-ds-7"},
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": STATE_DEFECT,
+                    "exitCode": EXIT_DEFECT,
+                    "session": "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+                    "result": r"C:\state\message-1.txt"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        record_cleanup(
+            &receipt,
+            &CleanupRecord {
+                schema: CLEANUP_SCHEMA,
+                closed: false,
+                survivors: vec![CleanupSurvivor {
+                    kind: "frontend".into(),
+                    pid: 77,
+                    created: 88,
+                    image: PathBuf::from(r"C:\kit\harness-frontend-double.exe"),
+                    cause: "surviving owned frontend pid 77 was still running".into(),
+                    next_action: CLEANUP_RECOVERY.into(),
+                }],
+                recovery: CLEANUP_RECOVERY.into(),
+            },
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(value["observation"]["state"], STATE_DEFECT, "{value}");
+        assert_eq!(value["observation"]["exitCode"], EXIT_DEFECT, "{value}");
+        assert_eq!(
+            value["observation"]["session"],
+            "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4"
+        );
+        assert_eq!(value["slot"]["owner"], "exec-ds-7");
+        assert_eq!(value["cleanup"]["closed"], false, "{value}");
+        assert_eq!(value["cleanup"]["survivors"][0]["pid"], 77);
+        assert!(
+            value["cleanup"]["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("does not change the recorded assignment outcome"),
+            "{value}"
+        );
     }
 
     #[test]
