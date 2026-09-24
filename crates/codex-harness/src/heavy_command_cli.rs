@@ -27,20 +27,29 @@ const EXIT_INTERRUPTED: i32 = 130;
 
 const USAGE: &str = "\
 codex-harness heavy [--account DIRECTORY] [--uncapped] -- PROGRAM [ARGS...]
-  Run one batch command under the account-wide heavy-command slot: one local
-  machine budget, one serialized queue and one bounded Windows Job per admitted
-  command. The command tree is terminated and the slot released before the next
-  caller is admitted. Interactive sessions and model conversations belong
-  outside this slot. Exit codes: the command's own code; 124 deadline or queue
-  wait expired; 125 memory budget exceeded; 126 the command tree could not be
-  cleaned; 127 the command could not be resolved or started; 130 interrupted.
+  Run one batch command under the account-wide heavy-command slot set: one local
+  machine budget, a bounded queue and one bounded Windows Job per admitted
+  command. The default admits 2 concurrent trees. A policy slot count of 1
+  restores the exclusive legacy lock and creates no slot file. A caller beyond
+  the bound prints one queue line naming the busy-slot count, the total slots
+  and available holder descriptions, then waits. When no holder record is
+  available, that line says the legacy lock is held. The admitted tree is
+  terminated and its slot released on exit. Interactive sessions and model
+  conversations belong outside this slot. Exit codes: the command's own code;
+  124 deadline or queue wait expired; 125 memory budget exceeded; 126 the
+  command tree could not be cleaned; 127 the command could not be resolved or
+  started; 130 interrupted.
   --uncapped runs this one command outside the shared account CPU allowance.
   It is not saved, does not raise the allowance for other sessions or shared
   services, and the next command without it is capped by default. Combined
   host agent load can exceed the shared ceiling while the exception runs.
 
 codex-harness heavy budget [--account DIRECTORY] [--json]
-  Show the effective local machine budget and where it comes from.
+  Show the effective local machine budget and where it comes from. Text and JSON
+  report max_concurrent_trees, aggregate_memory_limit_bytes and per-tree
+  memory_bytes, and whether each came from the policy file (policy-file) or the
+  default. A missing aggregate limit is the default equal to the effective
+  per-tree limit. Inspection does not rewrite policy or start work.
 
 codex-harness heavy budget [--account DIRECTORY] [--memory-bytes N]
   [--cpu-percent P] [--deadline-seconds N] [--queue-wait-seconds N] [--preview]
@@ -364,12 +373,12 @@ fn budget(args: &[OsString]) -> io::Result<i32> {
         }
     }
     let account = heavy_command::account_dir(account.as_deref())?;
-    let effective = heavy_command::Budget::read(&account)?;
+    let mut queried = heavy_command::Budget::query(&account)?;
     if updates.is_empty() {
         let source = budget_source(&account);
-        return report(&account, &effective, &source, json);
+        return report(&account, &queried, &source, json);
     }
-    let mut updated = effective;
+    let mut updated = queried.budget;
     for (name, value) in &updates {
         let text = value
             .to_str()
@@ -399,11 +408,13 @@ fn budget(args: &[OsString]) -> io::Result<i32> {
     let path = heavy_command::policy_path(&account);
     if preview {
         eprintln!("heavy: preview; {} not written", path.display());
+        queried.budget = updated;
     } else {
         heavy_command::Budget::write(&account, &updated)?;
         eprintln!("heavy: local budget written to {}", path.display());
+        queried = heavy_command::Budget::query(&account)?;
     }
-    report(&account, &updated, &path.display().to_string(), json)
+    report(&account, &queried, &path.display().to_string(), json)
 }
 
 fn budget_source(account: &Path) -> String {
@@ -435,43 +446,158 @@ fn budget_policy_text(budget: &heavy_command::Budget) -> String {
 
 fn report(
     account: &Path,
-    budget: &heavy_command::Budget,
+    query: &heavy_command::BudgetQuery,
     source: &str,
     json: bool,
 ) -> io::Result<i32> {
+    let (values, sources) = budget_lines(account, query, source);
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema": 2,
-                "memory_bytes": budget.memory_bytes,
-                "cpu_percent": budget.cpu_percent,
-                "deadline_seconds": budget.deadline_seconds,
-                "queue_wait_seconds": budget.queue_wait_seconds,
-                "shared_cpu_percent": SHARED_CPU_PERCENT,
-                "cpu_policy": heavy_command::cpu_policy_summary(budget),
-                "legacy_default_cpu_percent": heavy_command::legacy_default_cpu_percent(budget),
-                "source": source,
-            }))?
+            serde_json::to_string_pretty(&budget_json(query, source))?
         );
     } else {
+        println!("{values}");
+        println!("{sources}");
         println!(
-            "memory_bytes={} cpu_percent={} deadline_seconds={} queue_wait_seconds={} shared_cpu_percent={} source={source} account={}",
-            budget.memory_bytes,
-            budget_policy_text(budget),
-            budget.deadline_seconds,
-            budget.queue_wait_seconds,
-            SHARED_CPU_PERCENT,
-            account.display()
+            "cpu_policy: {}",
+            heavy_command::cpu_policy_summary(&query.budget)
         );
-        println!("cpu_policy: {}", heavy_command::cpu_policy_summary(budget));
     }
     Ok(0)
+}
+
+fn budget_lines(
+    account: &Path,
+    query: &heavy_command::BudgetQuery,
+    source: &str,
+) -> (String, String) {
+    let budget = &query.budget;
+    let values = format!(
+        "memory_bytes={} max_concurrent_trees={} aggregate_memory_limit_bytes={} cpu_percent={} deadline_seconds={} queue_wait_seconds={} shared_cpu_percent={} source={source} account={}",
+        budget.memory_bytes,
+        budget.max_concurrent_trees,
+        budget.aggregate_memory_limit_bytes,
+        budget_policy_text(budget),
+        budget.deadline_seconds,
+        budget.queue_wait_seconds,
+        SHARED_CPU_PERCENT,
+        account.display()
+    );
+    let sources = format!(
+        "field_sources memory_bytes={} max_concurrent_trees={} aggregate_memory_limit_bytes={}",
+        query.memory_bytes.as_str(),
+        query.max_concurrent_trees.as_str(),
+        query.aggregate_memory_limit_bytes.as_str()
+    );
+    (values, sources)
+}
+
+fn budget_json(query: &heavy_command::BudgetQuery, source: &str) -> serde_json::Value {
+    let budget = &query.budget;
+    json!({
+        "schema": 2,
+        "memory_bytes": budget.memory_bytes,
+        "max_concurrent_trees": budget.max_concurrent_trees,
+        "aggregate_memory_limit_bytes": budget.aggregate_memory_limit_bytes,
+        "field_sources": {
+            "memory_bytes": query.memory_bytes.as_str(),
+            "max_concurrent_trees": query.max_concurrent_trees.as_str(),
+            "aggregate_memory_limit_bytes": query.aggregate_memory_limit_bytes.as_str(),
+        },
+        "cpu_percent": budget.cpu_percent,
+        "deadline_seconds": budget.deadline_seconds,
+        "queue_wait_seconds": budget.queue_wait_seconds,
+        "shared_cpu_percent": SHARED_CPU_PERCENT,
+        "cpu_policy": heavy_command::cpu_policy_summary(budget),
+        "legacy_default_cpu_percent": heavy_command::legacy_default_cpu_percent(budget),
+        "source": source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_matches_budget_reporting_and_adds_no_setter_flags() {
+        assert!(USAGE.contains("max_concurrent_trees"));
+        assert!(USAGE.contains("aggregate_memory_limit_bytes"));
+        assert!(USAGE.contains("memory_bytes"));
+        assert!(USAGE.contains("policy-file"));
+        assert!(USAGE.contains("busy-slot count"));
+        assert!(USAGE.contains("available holder descriptions"));
+        assert!(!USAGE.contains("--max-concurrent-trees"));
+        assert!(!USAGE.contains("--aggregate-memory"));
+        assert_eq!(run(&[OsString::from("--help")]).unwrap(), 0);
+        assert_eq!(run(&[OsString::from("-h")]).unwrap(), 0);
+        assert_eq!(
+            run(&[OsString::from("budget"), OsString::from("--help")]).unwrap(),
+            0
+        );
+        assert_eq!(
+            run(&[OsString::from("budget"), OsString::from("-h")]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn budget_text_and_json_name_each_field_source() {
+        let account = Path::new(r"D:\heavy-budget-report");
+        let query = heavy_command::BudgetQuery {
+            budget: heavy_command::Budget {
+                memory_bytes: 33_554_432,
+                max_concurrent_trees: 2,
+                aggregate_memory_limit_bytes: 33_554_432,
+                ..heavy_command::Budget::default()
+            },
+            memory_bytes: heavy_command::PolicyFieldSource::PolicyFile,
+            max_concurrent_trees: heavy_command::PolicyFieldSource::Default,
+            aggregate_memory_limit_bytes: heavy_command::PolicyFieldSource::Default,
+        };
+        let (values, sources) = budget_lines(account, &query, "defaults");
+        assert!(values.contains("memory_bytes=33554432"), "{values}");
+        assert!(values.contains("max_concurrent_trees=2"), "{values}");
+        assert!(
+            values.contains("aggregate_memory_limit_bytes=33554432"),
+            "{values}"
+        );
+        assert!(values.contains("source=defaults"), "{values}");
+        assert_eq!(
+            sources,
+            "field_sources memory_bytes=policy-file max_concurrent_trees=default aggregate_memory_limit_bytes=default"
+        );
+        let document = budget_json(&query, "defaults");
+        assert_eq!(document["schema"], 2);
+        assert_eq!(document["memory_bytes"], 33_554_432);
+        assert_eq!(document["max_concurrent_trees"], 2);
+        assert_eq!(document["aggregate_memory_limit_bytes"], 33_554_432);
+        assert_eq!(document["field_sources"]["memory_bytes"], "policy-file");
+        assert_eq!(document["field_sources"]["max_concurrent_trees"], "default");
+        assert_eq!(
+            document["field_sources"]["aggregate_memory_limit_bytes"],
+            "default"
+        );
+        assert_eq!(document["source"], "defaults");
+    }
+
+    #[test]
+    fn budget_read_leaves_a_legacy_policy_byte_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let account = temp.path().join("account");
+        heavy_command::Budget::write(&account, &heavy_command::Budget::default()).unwrap();
+        let path = heavy_command::policy_path(&account);
+        let legacy = br#"{"schema":1,"memory_bytes":33554432}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let code = budget(&[
+            OsString::from("--account"),
+            account.as_os_str().to_owned(),
+            OsString::from("--json"),
+        ])
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+    }
 
     #[test]
     fn a_failed_cleanup_verification_is_not_reported_as_proof_of_no_survivors() {

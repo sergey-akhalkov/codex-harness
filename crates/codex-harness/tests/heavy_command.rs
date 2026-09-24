@@ -286,6 +286,34 @@ fn budget_cli(account: &Path, options: &[&str]) -> Output {
     command.output().unwrap()
 }
 
+/// The installed default admits two trees. Tests that prove a waiter must fill
+/// that bound, which slot count 1 does without changing admission order.
+fn exclusive_slots(account: &Path) {
+    let mut budget = Budget::read(account).unwrap();
+    budget.max_concurrent_trees = 1;
+    Budget::write(account, &budget).unwrap();
+}
+
+fn queue_line(text: &str) -> String {
+    text.lines()
+        .find(|line| line.contains("waiting for a free heavy-command slot"))
+        .unwrap_or_else(|| panic!("missing queue diagnostic: {text}"))
+        .to_owned()
+}
+
+fn live_holder_record(account: &Path) -> PathBuf {
+    let candidates = [
+        account.join("holder.exclusive.json"),
+        account.join("holder.json"),
+        account.join("holder.slot-0.json"),
+        account.join("holder.slot-1.json"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no holder record in {}", account.display()))
+}
+
 fn wait_for_path(path: &Path, timeout: Duration) {
     let started = Instant::now();
     while !path.exists() {
@@ -336,6 +364,7 @@ fn two_callers_share_one_account_queue_across_checkouts() {
     for name in ["checkout-one", "checkout-two"] {
         fs::create_dir_all(root.join(name)).unwrap();
     }
+    exclusive_slots(&account);
     let first_log = root.join("first.log");
     let first_started = root.join("first.started");
     let first_ended = root.join("first.ended");
@@ -393,15 +422,20 @@ fn two_callers_share_one_account_queue_across_checkouts() {
     assert_eq!(first.status.code(), Some(0), "{first_stderr}");
     assert_eq!(second.status.code(), Some(0), "{second_stderr}");
     assert!(
-        !first_stderr.contains("waiting for the account heavy-command slot"),
+        !first_stderr.contains("waiting for a free heavy-command slot"),
         "the first caller must be admitted immediately: {first_stderr}"
     );
     assert!(
-        second_stderr.contains("waiting for the account heavy-command slot"),
+        second_stderr.contains("waiting for a free heavy-command slot"),
         "the second caller must report actual queue waiting: {second_stderr}"
     );
+    let queued = queue_line(&second_stderr);
+    assert!(queued.contains("1/1 busy"), "{queued}");
+    assert!(queued.contains("holders pid="), "{queued}");
+    assert!(queued.contains("command="), "{queued}");
+    assert!(!queued.contains("legacy lock"), "{queued}");
     assert!(
-        second_stderr.contains("holder pid=") && second_stderr.contains("command="),
+        second_stderr.contains("holders pid=") && second_stderr.contains("command="),
         "the queued diagnostic must name the running holder: {second_stderr}"
     );
     assert!(
@@ -497,7 +531,7 @@ fn stop_reasons_and_startup_failures_are_distinct_and_release_the_slot() {
     let released = run(&mut released, Duration::from_secs(120));
     assert_eq!(released.status.code(), Some(0), "{}", stderr(&released));
     assert!(
-        !stderr(&released).contains("waiting for the account heavy-command slot"),
+        !stderr(&released).contains("waiting for a free heavy-command slot"),
         "{}",
         stderr(&released)
     );
@@ -572,6 +606,7 @@ fn cancelled_queue_waiter_and_interrupted_tree_release_the_slot() {
     let work = root.join("work");
     fs::create_dir_all(&work).unwrap();
 
+    exclusive_slots(&account);
     let holder_started = root.join("holder.started");
     let holder_ended = root.join("holder.ended");
     let mut holder = heavy(&account, &work);
@@ -598,7 +633,7 @@ fn cancelled_queue_waiter_and_interrupted_tree_release_the_slot() {
     waiter.kill().unwrap();
     let cancelled = waiter.wait_with_output().unwrap();
     assert!(
-        stderr(&cancelled).contains("waiting for the account heavy-command slot"),
+        stderr(&cancelled).contains("waiting for a free heavy-command slot"),
         "{}",
         stderr(&cancelled)
     );
@@ -814,6 +849,287 @@ fn invalid_local_policy_fails_before_the_command_starts() {
 }
 
 #[test]
+fn budget_reports_field_sources_and_leaves_legacy_policy_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let account = temp.path().join("account");
+    let absent = budget_cli(&account, &["--json"]);
+    assert_eq!(absent.status.code(), Some(0), "{}", stderr(&absent));
+    let effective: Value = serde_json::from_slice(&absent.stdout).unwrap();
+    let budget = Budget::default();
+    assert_eq!(effective["schema"], 2);
+    assert_eq!(effective["memory_bytes"], budget.memory_bytes);
+    assert_eq!(
+        effective["max_concurrent_trees"],
+        budget.max_concurrent_trees
+    );
+    assert_eq!(
+        effective["aggregate_memory_limit_bytes"],
+        budget.memory_bytes
+    );
+    assert_eq!(effective["field_sources"]["memory_bytes"], "default");
+    assert_eq!(
+        effective["field_sources"]["max_concurrent_trees"],
+        "default"
+    );
+    assert_eq!(
+        effective["field_sources"]["aggregate_memory_limit_bytes"],
+        "default"
+    );
+    assert_eq!(effective["source"], "defaults");
+    assert!(!account.exists(), "an inspection creates no account state");
+
+    let text = String::from_utf8(budget_cli(&account, &[]).stdout).unwrap();
+    assert!(
+        text.contains(&format!(
+            "max_concurrent_trees={}",
+            budget.max_concurrent_trees
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "aggregate_memory_limit_bytes={}",
+            budget.aggregate_memory_limit_bytes
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "field_sources memory_bytes=default max_concurrent_trees=default aggregate_memory_limit_bytes=default"
+        ),
+        "{text}"
+    );
+
+    let help = Command::new(manager())
+        .args(["heavy", "--help"])
+        .output()
+        .unwrap();
+    let budget_help = Command::new(manager())
+        .args(["heavy", "budget", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+    assert_eq!(
+        budget_help.status.code(),
+        Some(0),
+        "{}",
+        stderr(&budget_help)
+    );
+    assert_eq!(help.stdout, budget_help.stdout);
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    assert!(help_text.contains("max_concurrent_trees"), "{help_text}");
+    assert!(
+        help_text.contains("aggregate_memory_limit_bytes"),
+        "{help_text}"
+    );
+    assert!(help_text.contains("policy-file"), "{help_text}");
+    assert!(help_text.contains("memory_bytes"), "{help_text}");
+    assert!(help_text.contains("busy-slot count"), "{help_text}");
+    assert!(!help_text.contains("--max-concurrent-trees"), "{help_text}");
+    assert!(!help_text.contains("--aggregate-memory"), "{help_text}");
+
+    Budget::write(&account, &Budget::default()).unwrap();
+    let path = account.join("budget.json");
+    let legacy = br#"{"schema":1,"memory_bytes":33554432}"#;
+    fs::write(&path, legacy).unwrap();
+    let reported = budget_cli(&account, &["--json"]);
+    assert_eq!(reported.status.code(), Some(0), "{}", stderr(&reported));
+    assert_eq!(fs::read(&path).unwrap(), legacy);
+    let reported: Value = serde_json::from_slice(&reported.stdout).unwrap();
+    assert_eq!(reported["memory_bytes"], 33_554_432);
+    assert_eq!(reported["max_concurrent_trees"], 2);
+    assert_eq!(reported["aggregate_memory_limit_bytes"], 33_554_432);
+    assert_eq!(reported["field_sources"]["memory_bytes"], "policy-file");
+    assert_eq!(reported["field_sources"]["max_concurrent_trees"], "default");
+    assert_eq!(
+        reported["field_sources"]["aggregate_memory_limit_bytes"],
+        "default"
+    );
+    let legacy_text = String::from_utf8(budget_cli(&account, &[]).stdout).unwrap();
+    assert!(
+        legacy_text.contains("memory_bytes=33554432"),
+        "{legacy_text}"
+    );
+    assert!(
+        legacy_text.contains("max_concurrent_trees=2"),
+        "{legacy_text}"
+    );
+    assert!(
+        legacy_text.contains("aggregate_memory_limit_bytes=33554432"),
+        "{legacy_text}"
+    );
+    assert!(
+        legacy_text.contains(
+            "field_sources memory_bytes=policy-file max_concurrent_trees=default aggregate_memory_limit_bytes=default"
+        ),
+        "{legacy_text}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), legacy);
+
+    let mixed = br#"{"schema":1,"memory_bytes":33554432,"max_concurrent_trees":1}"#;
+    fs::write(&path, mixed).unwrap();
+    let mixed_out = budget_cli(&account, &["--json"]);
+    assert_eq!(mixed_out.status.code(), Some(0), "{}", stderr(&mixed_out));
+    assert_eq!(fs::read(&path).unwrap(), mixed);
+    let mixed_out: Value = serde_json::from_slice(&mixed_out.stdout).unwrap();
+    assert_eq!(mixed_out["max_concurrent_trees"], 1);
+    assert_eq!(mixed_out["aggregate_memory_limit_bytes"], 33_554_432);
+    assert_eq!(mixed_out["field_sources"]["memory_bytes"], "policy-file");
+    assert_eq!(
+        mixed_out["field_sources"]["max_concurrent_trees"],
+        "policy-file"
+    );
+    assert_eq!(
+        mixed_out["field_sources"]["aggregate_memory_limit_bytes"],
+        "default"
+    );
+
+    // 9 GiB is above the installed per-tree default, so an explicit aggregate
+    // with an omitted per-tree field is valid and still reports that omission.
+    let explicit =
+        br#"{"schema":1,"max_concurrent_trees":3,"aggregate_memory_limit_bytes":9663676416}"#;
+    fs::write(&path, explicit).unwrap();
+    let explicit_out = budget_cli(&account, &["--json"]);
+    assert_eq!(
+        explicit_out.status.code(),
+        Some(0),
+        "{}",
+        stderr(&explicit_out)
+    );
+    assert_eq!(fs::read(&path).unwrap(), explicit);
+    let explicit_out: Value = serde_json::from_slice(&explicit_out.stdout).unwrap();
+    assert_eq!(explicit_out["memory_bytes"], budget.memory_bytes);
+    assert_eq!(explicit_out["max_concurrent_trees"], 3);
+    assert_eq!(
+        explicit_out["aggregate_memory_limit_bytes"],
+        9_663_676_416_u64
+    );
+    assert_eq!(explicit_out["field_sources"]["memory_bytes"], "default");
+    assert_eq!(
+        explicit_out["field_sources"]["max_concurrent_trees"],
+        "policy-file"
+    );
+    assert_eq!(
+        explicit_out["field_sources"]["aggregate_memory_limit_bytes"],
+        "policy-file"
+    );
+
+    let other = temp.path().join("other");
+    let other_out = budget_cli(&other, &["--json"]);
+    assert_eq!(other_out.status.code(), Some(0), "{}", stderr(&other_out));
+    let other_out: Value = serde_json::from_slice(&other_out.stdout).unwrap();
+    assert_eq!(other_out["max_concurrent_trees"], 2);
+    assert_eq!(other_out["source"], "defaults");
+    assert_eq!(
+        other_out["field_sources"]["max_concurrent_trees"],
+        "default"
+    );
+    assert_eq!(fs::read(&path).unwrap(), explicit);
+    assert!(
+        !other.exists(),
+        "the other account inspection creates no state"
+    );
+}
+
+#[test]
+fn account_flag_isolates_slots_and_the_aggregate_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    exclusive_slots(&left);
+
+    let left_log = root.join("left.log");
+    let left_started = root.join("left.started");
+    let left_ended = root.join("left.ended");
+    let left_pid = root.join("left.pid");
+    let mut left_cmd = heavy_logged(&left, &work, &left_log);
+    left_cmd
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "15000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &left_started)
+        .env("HARNESS_HEAVY_FIXTURE_ENDED", &left_ended)
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &left_pid);
+    let left_child = left_cmd.spawn().unwrap();
+    wait_for_path(&left_started, Duration::from_secs(30));
+    let left_payload = wait_for_payload(&left_pid, Duration::from_secs(30));
+    let left_text = wait_for_log(&left_log, "aggregate_job=", Duration::from_secs(30));
+    let left_aggregate = field(&left_text, "aggregate_job=");
+
+    let right_log = root.join("right.log");
+    let right_started = root.join("right.started");
+    let right_pid = root.join("right.pid");
+    let mut right_cmd = heavy_logged(&right, &work, &right_log);
+    right_cmd
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "4000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &right_started)
+        .env("HARNESS_LAUNCH_FIXTURE_STARTED", &right_pid);
+    let right_child = right_cmd.spawn().unwrap();
+    wait_for_path(&right_started, Duration::from_secs(30));
+    assert!(
+        !left_ended.exists(),
+        "the other account must start while the first slot is still held"
+    );
+    let right_payload = wait_for_payload(&right_pid, Duration::from_secs(30));
+    let right_text = wait_for_log(&right_log, "aggregate_job=", Duration::from_secs(30));
+    let right_aggregate = field(&right_text, "aggregate_job=");
+    assert_ne!(left_aggregate, right_aggregate, "{left_text}\n{right_text}");
+    assert!(
+        !right_text.contains("waiting for a free heavy-command slot"),
+        "a free account must not wait on another account's slot: {right_text}"
+    );
+    assert!(
+        process_in_job(left_payload, &left_aggregate),
+        "left payload must belong to its own aggregate envelope"
+    );
+    assert!(
+        process_in_job(right_payload, &right_aggregate),
+        "right payload must belong to its own aggregate envelope"
+    );
+    assert!(
+        !process_in_job(right_payload, &left_aggregate),
+        "right payload must not join the other account envelope"
+    );
+    assert!(
+        !process_in_job(left_payload, &right_aggregate),
+        "left payload must not join the other account envelope"
+    );
+    unsafe {
+        CloseHandle(left_payload);
+        CloseHandle(right_payload);
+    }
+
+    let mut blocked = heavy(&left, &work);
+    blocked
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let mut blocked = blocked.spawn().unwrap();
+    sleep(Duration::from_millis(800));
+    assert!(
+        blocked.try_wait().unwrap().is_none(),
+        "the first account's only slot must still be busy"
+    );
+    blocked.kill().unwrap();
+    let blocked = blocked.wait_with_output().unwrap();
+    let queued = queue_line(&stderr(&blocked));
+    assert!(queued.contains("1/1 busy"), "{queued}");
+    assert!(queued.contains("holders "), "{queued}");
+
+    let left_done = finish(left_child, Duration::from_secs(120));
+    let right_done = finish(right_child, Duration::from_secs(120));
+    assert_eq!(left_done.status.code(), Some(0), "{}", log_text(&left_log));
+    assert_eq!(
+        right_done.status.code(),
+        Some(0),
+        "{}",
+        log_text(&right_log)
+    );
+}
+
+#[test]
 fn direct_heavy_call_joins_the_shared_budget_without_a_second_cap() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -974,6 +1290,7 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
     let work = root.join("work");
     fs::create_dir_all(&work).unwrap();
 
+    exclusive_slots(&account);
     // A real nested CLI call: the outer caller owns the lease and joins the
     // shared account budget; the inner caller adds containment only, because a
     // nested Windows Job's CPU rate is a proportion of its parent's rate.
@@ -1071,7 +1388,7 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
     );
     assert_eq!(peer.status.code(), Some(0), "{}", stderr(&peer));
     assert!(
-        stderr(&peer).contains("waiting for the account heavy-command slot"),
+        stderr(&peer).contains("waiting for a free heavy-command slot"),
         "the peer must queue for the one account slot: {}",
         stderr(&peer)
     );
@@ -1093,7 +1410,7 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
     let holder = holder.spawn().unwrap();
     wait_for_path(&holder_started, Duration::from_secs(30));
     let record: Value =
-        serde_json::from_slice(&fs::read(account.join("holder.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(live_holder_record(&account)).unwrap()).unwrap();
     let forged = serde_json::json!({
         "schema": 1,
         "account": account.display().to_string(),
@@ -1121,7 +1438,7 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
         "a live peer identity and a copied Job name are not containment: {forged_stderr}"
     );
     assert!(
-        forged_stderr.contains("waiting for the account heavy-command slot"),
+        forged_stderr.contains("waiting for a free heavy-command slot"),
         "the forged marker must queue for the real slot: {forged_stderr}"
     );
     assert!(
@@ -1184,6 +1501,7 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
     // reusable, this nested caller would report a queue wait instead.
     let policy = budget_cli(&account, &["--queue-wait-seconds", "20"]);
     assert_eq!(policy.status.code(), Some(0), "{}", stderr(&policy));
+    exclusive_slots(&account);
     let evidence = root.join("nested-heavy.txt");
     let holder_started = root.join("holder.started");
     let holder_log = root.join("holder.log");
@@ -1224,11 +1542,11 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
         root.display()
     );
     assert!(
-        build_stderr.contains("waiting for the account heavy-command slot"),
+        build_stderr.contains("waiting for a free heavy-command slot"),
         "a native build must queue under the shared slot: {build_stderr}"
     );
     assert!(
-        build_stderr.contains("holder pid="),
+        build_stderr.contains("holders pid="),
         "the build must observe the running heavy caller: {build_stderr}"
     );
     assert!(
@@ -1259,7 +1577,7 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
         "the build tree must read the shared ceiling back from the kernel: {nested}"
     );
     assert!(
-        !nested.contains("waiting for the account heavy-command slot"),
+        !nested.contains("waiting for a free heavy-command slot"),
         "the build's child must not queue on its own admission: {nested}"
     );
     let prepared: Value = serde_json::from_slice(&build.stdout).unwrap();
@@ -1277,7 +1595,7 @@ fn native_build_waits_for_and_releases_the_shared_slot() {
     let text = stderr(&after);
     assert_eq!(after.status.code(), Some(0), "{text}");
     assert!(
-        !text.contains("waiting for the account heavy-command slot"),
+        !text.contains("waiting for a free heavy-command slot"),
         "a finished build must release the slot: {text}"
     );
     println!("heavy-command build evidence {}", root.display());

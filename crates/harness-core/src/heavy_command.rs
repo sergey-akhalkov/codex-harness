@@ -176,6 +176,57 @@ struct Policy {
     aggregate_memory_limit_bytes: Option<usize>,
 }
 
+/// Whether one reported budget field was present in the policy file.
+///
+/// A missing file and a file that omits the field are both [`Self::Default`].
+/// Inspection never rewrites the file to record that default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyFieldSource {
+    /// The field was present in the account policy file.
+    PolicyFile,
+    /// The field was absent, so the effective value is the installed default.
+    Default,
+}
+
+impl PolicyFieldSource {
+    /// Stable text and JSON token: `policy-file` or `default`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyFile => "policy-file",
+            Self::Default => "default",
+        }
+    }
+
+    const fn from_present(present: bool) -> Self {
+        if present {
+            Self::PolicyFile
+        } else {
+            Self::Default
+        }
+    }
+}
+
+/// Effective budget plus the origin of each concurrency field. Query-only:
+/// constructing this does not admit a slot, join a Job or rewrite policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BudgetQuery {
+    pub budget: Budget,
+    pub memory_bytes: PolicyFieldSource,
+    pub max_concurrent_trees: PolicyFieldSource,
+    pub aggregate_memory_limit_bytes: PolicyFieldSource,
+}
+
+impl BudgetQuery {
+    fn installed_defaults() -> Self {
+        Self {
+            budget: Budget::default(),
+            memory_bytes: PolicyFieldSource::Default,
+            max_concurrent_trees: PolicyFieldSource::Default,
+            aggregate_memory_limit_bytes: PolicyFieldSource::Default,
+        }
+    }
+}
+
 impl Budget {
     /// Machine values stay local; an invalid or out-of-range policy is an error
     /// before any command starts.
@@ -226,12 +277,19 @@ impl Budget {
     /// equals the effective per-tree limit. This read never rewrites the file.
     /// Errors name the policy file instead of silently running with a different budget.
     pub fn read(account: &Path) -> io::Result<Self> {
+        Ok(Self::query(account)?.budget)
+    }
+
+    /// Effective values and the policy-file or default origin of each concurrency
+    /// field. A missing aggregate is the default equal to the effective per-tree
+    /// limit. This query never rewrites the file, admits a slot or starts work.
+    pub fn query(account: &Path) -> io::Result<BudgetQuery> {
         if !account_is_owned(account)? {
-            return Ok(Self::default());
+            return Ok(BudgetQuery::installed_defaults());
         }
         let path = account.join(POLICY_FILE);
         let Some(bytes) = read_bounded(&path)? else {
-            return Ok(Self::default());
+            return Ok(BudgetQuery::installed_defaults());
         };
         let policy: Policy = serde_json::from_slice(&bytes).map_err(|error| {
             invalid(format!(
@@ -246,8 +304,12 @@ impl Budget {
                 policy.schema
             )));
         }
+        let memory_present = policy.memory_bytes.is_some();
+        let slots_present = policy.max_concurrent_trees.is_some();
+        let aggregate_present = policy.aggregate_memory_limit_bytes.is_some();
+        let memory_bytes = policy.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES);
         let budget = Self {
-            memory_bytes: policy.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES),
+            memory_bytes,
             cpu_percent: policy.cpu_percent,
             deadline_seconds: policy.deadline_seconds.unwrap_or(DEFAULT_DEADLINE_SECONDS),
             queue_wait_seconds: policy
@@ -258,10 +320,15 @@ impl Budget {
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_TREES),
             aggregate_memory_limit_bytes: policy
                 .aggregate_memory_limit_bytes
-                .unwrap_or(policy.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES)),
+                .unwrap_or(memory_bytes),
         };
         budget.validate(&path.display().to_string())?;
-        Ok(budget)
+        Ok(BudgetQuery {
+            budget,
+            memory_bytes: PolicyFieldSource::from_present(memory_present),
+            max_concurrent_trees: PolicyFieldSource::from_present(slots_present),
+            aggregate_memory_limit_bytes: PolicyFieldSource::from_present(aggregate_present),
+        })
     }
 
     /// Persist one complete local policy; the account directory stays outside
@@ -1893,6 +1960,15 @@ mod tests {
         assert_eq!(budget.memory_bytes, 16 * MIB);
         assert_eq!(budget.max_concurrent_trees, 2);
         assert_eq!(budget.aggregate_memory_limit_bytes, budget.memory_bytes);
+        let query = Budget::query(&account).unwrap();
+        assert_eq!(query.budget, budget);
+        assert_eq!(query.memory_bytes, PolicyFieldSource::PolicyFile);
+        assert_eq!(query.max_concurrent_trees, PolicyFieldSource::Default);
+        assert_eq!(
+            query.aggregate_memory_limit_bytes,
+            PolicyFieldSource::Default
+        );
+        assert_eq!(query.aggregate_memory_limit_bytes.as_str(), "default");
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let explicit = Budget {
@@ -1903,13 +1979,45 @@ mod tests {
         };
         Budget::write(&account, &explicit).unwrap();
         assert_eq!(Budget::read(&account).unwrap(), explicit);
+        let written = Budget::query(&account).unwrap();
+        assert_eq!(written.memory_bytes, PolicyFieldSource::PolicyFile);
+        assert_eq!(written.max_concurrent_trees, PolicyFieldSource::PolicyFile);
+        assert_eq!(
+            written.aggregate_memory_limit_bytes,
+            PolicyFieldSource::PolicyFile
+        );
+
+        let mixed_bytes = br#"{"schema":1,"memory_bytes":16777216,"max_concurrent_trees":1}"#;
+        fs::write(&path, mixed_bytes).unwrap();
+        let mixed = Budget::query(&account).unwrap();
+        assert_eq!(mixed.budget.memory_bytes, 16 * MIB);
+        assert_eq!(mixed.budget.max_concurrent_trees, 1);
+        assert_eq!(mixed.budget.aggregate_memory_limit_bytes, 16 * MIB);
+        assert_eq!(mixed.memory_bytes, PolicyFieldSource::PolicyFile);
+        assert_eq!(mixed.max_concurrent_trees, PolicyFieldSource::PolicyFile);
+        assert_eq!(
+            mixed.aggregate_memory_limit_bytes,
+            PolicyFieldSource::Default
+        );
+        assert_eq!(fs::read(&path).unwrap(), mixed_bytes);
 
         let rejected =
             br#"{"schema":1,"memory_bytes":33554432,"aggregate_memory_limit_bytes":16777216}"#;
         fs::write(&path, rejected).unwrap();
         let error = Budget::read(&account).unwrap_err().to_string();
         assert!(error.contains("refusing before admission"), "{error}");
+        let query_error = Budget::query(&account).unwrap_err().to_string();
+        assert!(
+            query_error.contains("refusing before admission"),
+            "{query_error}"
+        );
         assert_eq!(fs::read(&path).unwrap(), rejected);
+
+        let missing = tempfile::tempdir().unwrap();
+        let absent = missing.path().join("absent");
+        let defaults = Budget::query(&absent).unwrap();
+        assert_eq!(defaults, BudgetQuery::installed_defaults());
+        assert!(!absent.exists(), "a query must not create an account");
     }
 
     #[test]
