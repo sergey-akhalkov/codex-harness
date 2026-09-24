@@ -49,23 +49,33 @@ fn jobs_explicitly_reject_non_windows() {
             .kind(),
         std::io::ErrorKind::Unsupported
     );
+    assert_eq!(
+        harness_core::process::HeavyAggregate::acquire(std::path::Path::new("."), 1)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
 }
 
 #[cfg(windows)]
 mod native {
     use super::*;
     use harness_core::process::{
-        CommandSpec, Job, Limits, OwnedProcess, ProcessIdentity, SHARED_CPU_PERCENT,
-        SharedCpuBudget, SharedCpuSnapshot, StopReason,
+        CommandSpec, HeavyAggregate, Job, Limits, OwnedProcess, ProcessIdentity,
+        SHARED_CPU_PERCENT, SharedCpuBudget, SharedCpuSnapshot, StopReason,
     };
     use serde_json::{Value, json};
     use std::ffi::OsString;
     use std::io;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::Instant;
     use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY, OpenJobObjectW,
+    };
     use windows_sys::Win32::System::Threading::*;
 
     const CLEANUP: Duration = Duration::from_secs(5);
@@ -1595,6 +1605,303 @@ mod native {
         record(
             &root.join("verified.json"),
             json!({"name": name, "peer": peer.identity().pid, "outside": outside_pid, "activation": report.activation, "rate": 7500}),
+        );
+    }
+
+    const AGGREGATE_LIMIT: usize = 128 * 1024 * 1024;
+    const OTHER_AGGREGATE_LIMIT: usize = 96 * 1024 * 1024;
+
+    fn canonical_account(root: &Path, name: &str) -> PathBuf {
+        let account = root.join(name);
+        std::fs::create_dir_all(&account).unwrap();
+        account.canonicalize().unwrap()
+    }
+
+    fn job_name_exists(name: &str) -> bool {
+        let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe { OpenJobObjectW(4, 0, wide.as_ptr()) };
+        if handle.is_null() {
+            false
+        } else {
+            unsafe { CloseHandle(handle) };
+            true
+        }
+    }
+
+    #[test]
+    fn heavy_aggregate_nests_two_processes_between_cpu_and_lifecycle() {
+        let root = root("heavy-aggregate-nest");
+        let account = root.join("account");
+        let budget = SharedCpuBudget::acquire(&account, SHARED_CPU_PERCENT).unwrap();
+        let cpu_before = budget.snapshot().unwrap();
+        let aggregate = HeavyAggregate::acquire(&account, AGGREGATE_LIMIT).unwrap();
+        assert!(
+            ExclusiveFileLock::try_acquire(&aggregate.directory().join("heavy-aggregate.lock"))
+                .unwrap()
+                .is_some(),
+            "the returned owner must not hold heavy-aggregate.lock"
+        );
+        let name = aggregate.name().to_owned();
+        assert!(
+            name.starts_with("CodingAgentsHarness.HeavyAggregate.")
+                && name.len() == "CodingAgentsHarness.HeavyAggregate.".len() + 16,
+            "{name}"
+        );
+        assert!(job_name_exists(&name), "named aggregate was not openable");
+
+        let job_a = Job::new(Limits::default()).unwrap();
+        let marker_a = root.join("member-a.json");
+        let suspended_a = aggregate
+            .spawn_suspended(Some(&budget), &job_a, &spec("hold", &marker_a))
+            .unwrap();
+        assert!(budget.contains(suspended_a.process()).unwrap());
+        assert!(aggregate.contains(suspended_a.process()).unwrap());
+        assert!(job_a.contains(suspended_a.process()).unwrap());
+        let member_a = suspended_a.resume().unwrap();
+        assert_eq!(receipt(&marker_a)["in_job"], true);
+
+        let peer = HeavyAggregate::acquire(&account, AGGREGATE_LIMIT).unwrap();
+        assert_eq!(peer.name(), name);
+        assert!(peer.contains(&member_a).unwrap());
+        let job_b = Job::new(Limits::default()).unwrap();
+        let marker_b = root.join("member-b.json");
+        let member_b = aggregate
+            .spawn_suspended(Some(&budget), &job_b, &spec("hold", &marker_b))
+            .unwrap()
+            .resume()
+            .unwrap();
+        assert_eq!(receipt(&marker_b)["in_job"], true);
+        assert_ne!(member_a.identity().pid, member_b.identity().pid);
+        for (label, member) in [("a", &member_a), ("b", &member_b)] {
+            assert!(
+                aggregate.contains(member).unwrap(),
+                "{label} missing from first handle"
+            );
+            assert!(
+                peer.contains(member).unwrap(),
+                "{label} missing from second handle"
+            );
+            assert!(
+                budget.contains(member).unwrap(),
+                "{label} missing from shared CPU job"
+            );
+        }
+        assert!(job_a.contains(&member_a).unwrap() && !job_a.contains(&member_b).unwrap());
+        assert!(job_b.contains(&member_b).unwrap() && !job_b.contains(&member_a).unwrap());
+
+        let snapshot = aggregate.snapshot().unwrap();
+        assert_eq!(snapshot.limit_flags, JOB_OBJECT_LIMIT_JOB_MEMORY);
+        assert_eq!(
+            snapshot.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            0,
+            "per-process memory limit must stay unset"
+        );
+        assert_eq!(snapshot.job_memory_limit_bytes, AGGREGATE_LIMIT);
+        assert_eq!(snapshot.process_memory_limit_bytes, 0);
+        assert_eq!(snapshot.cpu_rate, 0);
+        assert!(!snapshot.cpu_hard_cap);
+        assert!(!snapshot.kill_on_close);
+        assert!(!snapshot.breakaway_ok && !snapshot.silent_breakaway_ok);
+        assert!(snapshot.active_processes >= 2);
+
+        let cpu_after = budget.snapshot().unwrap();
+        assert_eq!(cpu_after.cpu_rate, cpu_before.cpu_rate);
+        assert_eq!(cpu_after.cpu_hard_cap, cpu_before.cpu_hard_cap);
+        assert_eq!(cpu_after.kill_on_close, cpu_before.kill_on_close);
+        assert_eq!(
+            cpu_after.job_memory_limit_bytes,
+            cpu_before.job_memory_limit_bytes
+        );
+        assert_eq!(cpu_after.breakaway_ok, cpu_before.breakaway_ok);
+        assert_eq!(
+            cpu_after.silent_breakaway_ok,
+            cpu_before.silent_breakaway_ok
+        );
+        assert_eq!(cpu_before.job_memory_limit_bytes, 0);
+        assert!(!cpu_before.kill_on_close);
+
+        let lone_job = Job::new(Limits::default()).unwrap();
+        let lone_marker = root.join("lone.json");
+        let lone_suspended = aggregate
+            .spawn_suspended(None, &lone_job, &spec("hold", &lone_marker))
+            .unwrap();
+        assert!(aggregate.contains(lone_suspended.process()).unwrap());
+        assert!(lone_job.contains(lone_suspended.process()).unwrap());
+        let lone = lone_suspended.resume().unwrap();
+        assert_eq!(receipt(&lone_marker)["in_job"], true);
+        // Absence from the shared CPU job is not asserted. This suite runs
+        // under `codex-harness heavy`, whose process is already a member, and
+        // Windows inherits that membership independently of the optional
+        // argument. The `None` path still proves aggregate-plus-lifecycle
+        // assignment above.
+
+        let observer_a = Observer::open(member_a.identity().pid);
+        let observer_b = Observer::open(member_b.identity().pid);
+        drop(aggregate);
+        drop(peer);
+        assert!(
+            !job_name_exists(&name),
+            "last aggregate handle must release the kernel name"
+        );
+        assert!(
+            observer_a.alive() && observer_b.alive(),
+            "aggregate close must not reap a peer tree"
+        );
+        assert_eq!(budget.snapshot().unwrap().job_memory_limit_bytes, 0);
+        job_a.terminate(0, CLEANUP).unwrap();
+        job_b.terminate(0, CLEANUP).unwrap();
+        lone_job.terminate(0, CLEANUP).unwrap();
+        assert!(member_a.wait_for_exit(CLEANUP).unwrap());
+        assert!(member_b.wait_for_exit(CLEANUP).unwrap());
+        assert!(lone.wait_for_exit(CLEANUP).unwrap());
+        record(
+            &root.join("verified.json"),
+            json!({
+                "name": name,
+                "job_memory_limit_bytes": AGGREGATE_LIMIT,
+                "limit_flags": JOB_OBJECT_LIMIT_JOB_MEMORY,
+                "process_memory_limited": false,
+                "cpu_rate": 0,
+                "kill_on_close": false,
+                "members": [member_a.identity().pid, member_b.identity().pid, lone.identity().pid],
+                "cpu_job_memory_limit_bytes": 0
+            }),
+        );
+    }
+
+    #[test]
+    fn heavy_aggregate_limit_and_name_conflicts_fail_closed() {
+        let root = root("heavy-aggregate-conflict");
+        let missing = root.join("missing-account");
+        let invalid = HeavyAggregate::acquire(&missing, 0).unwrap_err();
+        assert_eq!(invalid.kind(), io::ErrorKind::InvalidInput, "{invalid}");
+        assert!(
+            !missing.exists(),
+            "an invalid limit must not create account state"
+        );
+
+        let blocked = canonical_account(&root, "blocked");
+        let held = ExclusiveFileLock::acquire(
+            &blocked.join("heavy-aggregate.lock"),
+            Deadline::after(Duration::from_secs(2)).unwrap(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let blocked_for_thread = blocked.clone();
+        let started = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            HeavyAggregate::acquire(&blocked_for_thread, AGGREGATE_LIMIT)
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !waiter.is_finished(),
+            "establish did not wait for heavy-aggregate.lock"
+        );
+        drop(held);
+        let established = waiter.join().unwrap().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "lock wait exceeded the establish bound"
+        );
+        assert!(
+            ExclusiveFileLock::try_acquire(&established.directory().join("heavy-aggregate.lock"))
+                .unwrap()
+                .is_some()
+        );
+        let name = established.name().to_owned();
+        let record_path = established.directory().join("heavy-aggregate.json");
+        let record_bytes = std::fs::read(&record_path).unwrap();
+        let conflict =
+            HeavyAggregate::acquire(established.directory(), OTHER_AGGREGATE_LIMIT).unwrap_err();
+        assert!(
+            conflict.to_string().contains("limit mismatch")
+                && conflict.to_string().contains("preserving"),
+            "{conflict}"
+        );
+        assert_eq!(
+            established.snapshot().unwrap().job_memory_limit_bytes,
+            AGGREGATE_LIMIT
+        );
+        assert_eq!(
+            established.snapshot().unwrap().limit_flags,
+            JOB_OBJECT_LIMIT_JOB_MEMORY
+        );
+        assert_eq!(std::fs::read(&record_path).unwrap(), record_bytes);
+
+        let copied = root.join("copied-account");
+        std::fs::create_dir(&copied).unwrap();
+        let copied_record = copied.join("heavy-aggregate.json");
+        std::fs::copy(&record_path, &copied_record).unwrap();
+        let copied_bytes = std::fs::read(&copied_record).unwrap();
+        let copied_refusal = HeavyAggregate::acquire(&copied, AGGREGATE_LIMIT).unwrap_err();
+        assert!(
+            copied_refusal.to_string().contains("name mismatch")
+                && copied_refusal.to_string().contains("preserving"),
+            "{copied_refusal}"
+        );
+        assert_eq!(std::fs::read(&copied_record).unwrap(), copied_bytes);
+        assert_eq!(
+            established.snapshot().unwrap().job_memory_limit_bytes,
+            AGGREGATE_LIMIT
+        );
+
+        assert!(job_name_exists(&name));
+        drop(established);
+        assert!(
+            !job_name_exists(&name),
+            "last handle must release the aggregate name"
+        );
+
+        let foreign = Job::new_named(
+            Limits {
+                memory_bytes: Some(32 * 1024 * 1024),
+                cpu_percent: Some(10.0),
+            },
+            &name,
+        )
+        .unwrap();
+        let foreign_before = foreign.snapshot().unwrap();
+        let foreign_refusal = HeavyAggregate::acquire(&blocked, AGGREGATE_LIMIT).unwrap_err();
+        assert!(
+            foreign_refusal.to_string().contains("preserving"),
+            "{foreign_refusal}"
+        );
+        let foreign_after = foreign.snapshot().unwrap();
+        assert_eq!(
+            foreign_after.memory_limit_bytes,
+            foreign_before.memory_limit_bytes
+        );
+        assert_eq!(foreign_after.cpu_rate, foreign_before.cpu_rate);
+        assert_eq!(foreign_after.kill_on_close, foreign_before.kill_on_close);
+        assert!(foreign_after.kill_on_close && foreign_after.cpu_rate == 1000);
+        drop(foreign);
+        assert!(!job_name_exists(&name));
+
+        let renewed = HeavyAggregate::acquire(&blocked, OTHER_AGGREGATE_LIMIT).unwrap();
+        assert_eq!(renewed.name(), name);
+        assert_eq!(
+            renewed.snapshot().unwrap().job_memory_limit_bytes,
+            OTHER_AGGREGATE_LIMIT
+        );
+        assert_eq!(
+            renewed.snapshot().unwrap().limit_flags,
+            JOB_OBJECT_LIMIT_JOB_MEMORY
+        );
+        let other = canonical_account(&root, "other-account");
+        let other_aggregate = HeavyAggregate::acquire(&other, AGGREGATE_LIMIT).unwrap();
+        assert_ne!(other_aggregate.name(), name);
+        drop(renewed);
+        drop(other_aggregate);
+        record(
+            &root.join("verified.json"),
+            json!({
+                "name": name,
+                "refusals": ["different limit", "copied record", "foreign object"],
+                "released_name": true,
+                "foreign_memory_limit_bytes": foreign_before.memory_limit_bytes,
+                "foreign_cpu_rate": foreign_before.cpu_rate
+            }),
         );
     }
 }

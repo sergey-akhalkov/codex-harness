@@ -5,9 +5,11 @@
 //! and, unless `inherit_console` is set, inherit only allow-listed standard
 //! file handles. Interactive console inheritance stays inside the same Job.
 //! Besides those exclusive lifecycle jobs, this owner provides one account-wide
-//! CPU-rate-only budget Job: participants join one object, create their payload
-//! with their own lifecycle Job inside it, and gain no termination authority
-//! over peers from the shared allowance.
+//! CPU-rate-only budget Job and one account-wide aggregate memory Job.
+//! Participants join those objects, create their payload with their lifecycle
+//! Job innermost, and gain no termination authority over peers. The shared CPU
+//! job stays rate-only; the aggregate job carries only
+//! `JOB_OBJECT_LIMIT_JOB_MEMORY`.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -295,6 +297,25 @@ pub struct SharedCpuSnapshot {
     pub cpu_time: Duration,
 }
 
+/// Kernel readback of one account's aggregate memory job. Readback proves
+/// configuration, not measured consumption. A matching object has
+/// `JOB_OBJECT_LIMIT_JOB_MEMORY` set, `JobMemoryLimit` equal to the requested
+/// envelope, and no per-process memory limit, CPU rate, kill-on-close or
+/// breakaway flag.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct HeavyAggregateSnapshot {
+    /// `JOBOBJECT_BASIC_LIMIT_INFORMATION::LimitFlags`.
+    pub limit_flags: u32,
+    pub job_memory_limit_bytes: usize,
+    pub process_memory_limit_bytes: usize,
+    pub cpu_rate: u32,
+    pub cpu_hard_cap: bool,
+    pub kill_on_close: bool,
+    pub breakaway_ok: bool,
+    pub silent_breakaway_ok: bool,
+    pub active_processes: u32,
+}
+
 #[cfg(not(windows))]
 #[derive(Debug)]
 pub struct SharedCpuBudget;
@@ -310,6 +331,24 @@ impl SharedCpuBudget {
 
     pub fn acquire_within(_: &Path, _: f64, _: Deadline, _: &Cancellation) -> io::Result<Self> {
         Self::acquire(Path::new("."), 0.0)
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+pub struct HeavyAggregate;
+
+#[cfg(not(windows))]
+impl HeavyAggregate {
+    pub fn acquire(_: &Path, _: usize) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows 10+ Job Objects are required",
+        ))
+    }
+
+    pub fn acquire_within(_: &Path, _: usize, _: Deadline, _: &Cancellation) -> io::Result<Self> {
+        Self::acquire(Path::new("."), 0)
     }
 }
 
@@ -334,7 +373,7 @@ impl Job {
 #[cfg(windows)]
 pub(crate) use windows::quote as quote_argument;
 #[cfg(windows)]
-pub use windows::{Job, OwnedProcess, SharedCpuBudget, SuspendedProcess};
+pub use windows::{HeavyAggregate, Job, OwnedProcess, SharedCpuBudget, SuspendedProcess};
 
 #[cfg(windows)]
 mod windows {
@@ -802,10 +841,10 @@ mod windows {
     }
 
     /// Create one suspended payload in an ordered job list, outermost first, so
-    /// the aggregate ceiling covers the lifecycle job and its descendants. Both
-    /// `Job` and `SharedCpuBudget` create payloads through this one owner; the
-    /// kernel assigns the whole list atomically at creation, before any payload
-    /// code runs.
+    /// the aggregate ceiling covers the lifecycle job and its descendants.
+    /// `Job`, `SharedCpuBudget` and `HeavyAggregate` create payloads through this
+    /// one owner. The kernel assigns the whole list atomically at creation,
+    /// before any payload code runs.
     fn spawn_suspended_in(
         jobs: &[HANDLE],
         command: &CommandSpec,
@@ -1535,6 +1574,280 @@ mod windows {
                 self.handle.as_raw_handle(),
                 lifecycle.handle.as_raw_handle(),
             ]
+        }
+    }
+
+    const HEAVY_AGGREGATE_PREFIX: &str = "CodingAgentsHarness.HeavyAggregate.";
+    const AGGREGATE_RECORD: &str = "heavy-aggregate.json";
+    const AGGREGATE_LOCK: &str = "heavy-aggregate.lock";
+    const AGGREGATE_SCHEMA: u32 = 1;
+
+    fn heavy_aggregate_job_name(directory: &Path) -> String {
+        let account = directory.to_string_lossy().to_lowercase();
+        format!("{HEAVY_AGGREGATE_PREFIX}{:016x}", budget_key(&account))
+    }
+
+    /// Account ownership record for the aggregate memory job. The kernel object
+    /// remains the live conflict: a released name is not a frozen limit, but an
+    /// existing object is never adopted unless this record names this account.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AggregateRecord {
+        schema: u32,
+        account: PathBuf,
+        job: String,
+        memory_bytes: usize,
+        pid: u32,
+        creation_time: u64,
+    }
+
+    fn read_aggregate_record(
+        path: &Path,
+        directory: &Path,
+        name: &str,
+    ) -> io::Result<Option<AggregateRecord>> {
+        use std::io::Read;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => crate::build_identity::ordinary(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(MAX_BUDGET_RECORD + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BUDGET_RECORD {
+            return Err(io::Error::other(
+                "the heavy aggregate ownership record exceeds its bound",
+            ));
+        }
+        let record: AggregateRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::other(format!(
+                "heavy aggregate name mismatch: ownership record at {} is unreadable ({error}); preserving the existing object",
+                path.display()
+            ))
+        })?;
+        if record.schema != AGGREGATE_SCHEMA
+            || record.account.as_path() != directory
+            || record.job != name
+        {
+            return Err(io::Error::other(format!(
+                "heavy aggregate name mismatch: ownership record at {} does not describe this account directory; preserving the existing object",
+                path.display()
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    fn write_aggregate_record(
+        path: &Path,
+        directory: &Path,
+        name: &str,
+        memory_bytes: usize,
+    ) -> io::Result<()> {
+        let identity = current_identity()?;
+        let record = AggregateRecord {
+            schema: AGGREGATE_SCHEMA,
+            account: directory.to_owned(),
+            job: name.to_owned(),
+            memory_bytes,
+            pid: identity.pid,
+            creation_time: identity.creation_time,
+        };
+        let staging = path.with_file_name(format!("{AGGREGATE_RECORD}.staging"));
+        std::fs::write(&staging, serde_json::to_vec_pretty(&record)?)?;
+        std::fs::rename(&staging, path)
+    }
+
+    fn heavy_aggregate_snapshot(handle: HANDLE) -> io::Result<HeavyAggregateSnapshot> {
+        let extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            query_job(handle, JobObjectExtendedLimitInformation)?;
+        let accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+            query_job(handle, JobObjectBasicAccountingInformation)?;
+        let cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
+            query_job(handle, JobObjectCpuRateControlInformation)?;
+        let flags = extended.BasicLimitInformation.LimitFlags;
+        Ok(HeavyAggregateSnapshot {
+            limit_flags: flags,
+            job_memory_limit_bytes: extended.JobMemoryLimit,
+            process_memory_limit_bytes: extended.ProcessMemoryLimit,
+            cpu_rate: if cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0 {
+                unsafe { cpu.Anonymous.CpuRate }
+            } else {
+                0
+            },
+            cpu_hard_cap: cpu.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP != 0,
+            kill_on_close: flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0,
+            breakaway_ok: flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0,
+            silent_breakaway_ok: flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0,
+            active_processes: accounting.ActiveProcesses,
+        })
+    }
+
+    /// An existing named object is this account's memory-only aggregate, or it
+    /// is preserved. This never calls `SetInformationJobObject`.
+    fn verify_heavy_aggregate(handle: HANDLE, name: &str, memory_bytes: usize) -> io::Result<()> {
+        let snapshot = heavy_aggregate_snapshot(handle)?;
+        let process_memory = snapshot.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0;
+        if snapshot.limit_flags == JOB_OBJECT_LIMIT_JOB_MEMORY
+            && !process_memory
+            && snapshot.job_memory_limit_bytes == memory_bytes
+            && snapshot.process_memory_limit_bytes == 0
+            && snapshot.cpu_rate == 0
+            && !snapshot.cpu_hard_cap
+            && !snapshot.kill_on_close
+            && !snapshot.breakaway_ok
+            && !snapshot.silent_breakaway_ok
+        {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "heavy aggregate limit mismatch: job object named {name} has flags {:#x}, job memory {} bytes, process memory {} bytes and cpu rate {}; preserving it",
+            snapshot.limit_flags,
+            snapshot.job_memory_limit_bytes,
+            snapshot.process_memory_limit_bytes,
+            snapshot.cpu_rate
+        )))
+    }
+
+    /// The account-wide aggregate commit-memory job. Callers create or open one
+    /// named object, hold its handle for the tree lifetime, and nest it between
+    /// the optional shared CPU job and the per-tree lifecycle job. This owner
+    /// has no terminate API: closing one handle cannot kill a peer.
+    #[derive(Debug)]
+    pub struct HeavyAggregate {
+        handle: OwnedHandle,
+        name: String,
+        directory: PathBuf,
+        memory_bytes: usize,
+    }
+
+    impl HeavyAggregate {
+        /// Join or establish this account's aggregate memory job.
+        /// `memory_bytes` is the job-wide commit limit (`JobMemoryLimit`).
+        /// Concurrent callers converge through `heavy-aggregate.lock`; the
+        /// returned owner holds the job handle, not that lock.
+        pub fn acquire(directory: &Path, memory_bytes: usize) -> io::Result<Self> {
+            Self::acquire_within(
+                directory,
+                memory_bytes,
+                Deadline::after(BUDGET_LOCK_WAIT)?,
+                &Cancellation::default(),
+            )
+        }
+
+        /// Bounded form of `acquire`. A caller that cannot enter the establish
+        /// lock within its deadline reports the failure instead of creating a
+        /// second envelope.
+        pub fn acquire_within(
+            directory: &Path,
+            memory_bytes: usize,
+            deadline: Deadline,
+            cancellation: &Cancellation,
+        ) -> io::Result<Self> {
+            if memory_bytes == 0 {
+                return Err(invalid("aggregate memory limit must be positive"));
+            }
+            let directory = owned_budget_directory(directory)?;
+            let name = heavy_aggregate_job_name(&directory);
+            // The lock file is stable and never deleted: unlinking it would let
+            // two callers lock different objects under one path. It covers
+            // establish only and is dropped before this function returns.
+            let _lock = ExclusiveFileLock::acquire(
+                &directory.join(AGGREGATE_LOCK),
+                deadline,
+                cancellation,
+            )?;
+            Self::establish(&directory, &name, memory_bytes)
+        }
+
+        fn establish(directory: &Path, name: &str, memory_bytes: usize) -> io::Result<Self> {
+            let record_path = directory.join(AGGREGATE_RECORD);
+            let recorded = read_aggregate_record(&record_path, directory, name)?;
+            let object = wide(OsStr::new(name))?;
+            unsafe { SetLastError(0) };
+            let handle = owned(unsafe { CreateJobObjectW(null(), object.as_ptr()) })?;
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                // CreateJobObjectW opens a same-named object instead of failing.
+                // Adopt it only when this account's record and the kernel
+                // readback both describe the requested envelope. Never set
+                // limits on this path.
+                let Some(record) = recorded else {
+                    return Err(io::Error::other(format!(
+                        "heavy aggregate name mismatch: a job object named {name} already exists without this account's ownership record; preserving it"
+                    )));
+                };
+                if record.memory_bytes != memory_bytes {
+                    return Err(io::Error::other(format!(
+                        "heavy aggregate limit mismatch: already established at {} bytes; preserving it",
+                        record.memory_bytes
+                    )));
+                }
+                verify_heavy_aggregate(handle.as_raw_handle(), name, memory_bytes)?;
+            } else {
+                // A fresh object takes the job-wide memory limit and nothing
+                // else: no per-process memory limit, no CPU rate, no
+                // kill-on-close and no breakaway authority.
+                let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+                extended.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+                extended.JobMemoryLimit = memory_bytes;
+                set_job(
+                    handle.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    &extended,
+                )?;
+                verify_heavy_aggregate(handle.as_raw_handle(), name, memory_bytes)?;
+                // A failed record write drops this handle and therefore destroys
+                // the memberless object instead of leaving an unowned name.
+                write_aggregate_record(&record_path, directory, name, memory_bytes)?;
+            }
+            Ok(Self {
+                handle,
+                name: name.to_owned(),
+                directory: directory.to_owned(),
+                memory_bytes,
+            })
+        }
+
+        /// Session-local kernel name of this aggregate object.
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// Canonical account directory that owns this aggregate.
+        pub fn directory(&self) -> &Path {
+            &self.directory
+        }
+
+        /// Kernel readback of the memory limit, containment flags and membership.
+        pub fn snapshot(&self) -> io::Result<HeavyAggregateSnapshot> {
+            heavy_aggregate_snapshot(self.handle.as_raw_handle())
+        }
+
+        /// Kernel membership check against this exact object.
+        pub fn contains(&self, process: &OwnedProcess) -> io::Result<bool> {
+            in_job(process.handle.as_raw_handle(), self.handle.as_raw_handle())
+        }
+
+        /// Create a suspended payload in the optional shared CPU job (outermost),
+        /// this aggregate job, and the per-tree lifecycle job (innermost).
+        /// Readback is verified again before creation. This does not change the
+        /// shared CPU job's limits or its own job list.
+        pub fn spawn_suspended(
+            &self,
+            cpu: Option<&SharedCpuBudget>,
+            lifecycle: &Job,
+            command: &CommandSpec,
+        ) -> io::Result<SuspendedProcess> {
+            verify_heavy_aggregate(self.handle.as_raw_handle(), &self.name, self.memory_bytes)?;
+            let jobs = [
+                cpu.map(|budget| budget.handle.as_raw_handle())
+                    .unwrap_or(null_mut()),
+                self.handle.as_raw_handle(),
+                lifecycle.handle.as_raw_handle(),
+            ];
+            let list = if cpu.is_some() { &jobs[..] } else { &jobs[1..] };
+            spawn_suspended_in(list, command, None)
         }
     }
 }
