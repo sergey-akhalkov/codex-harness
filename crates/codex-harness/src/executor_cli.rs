@@ -2382,6 +2382,15 @@ fn run_control_receipt(
         plan.args.push(config.into());
     }
     plan.env.insert("PATH".into(), Some(shell.path.clone()));
+    // The host's fixture-mode switch selects the compatibility renderer and
+    // must stay unset while a native frontend owns the terminal. An explicit
+    // child mode is forwarded only to the app-server, so an owned tool can
+    // keep running under that frontend. `executor message` and `executor stop`
+    // address this child; they do not get a second controller.
+    if let Some(mode) = std::env::var_os("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE") {
+        plan.env
+            .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), Some(mode));
+    }
     plan.port = control.port;
     host_control_conversation(receipt, control, &plan, run, result, header)
 }
@@ -2589,6 +2598,8 @@ fn attach_owned_frontend(
     }
     spec.env
         .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
+    spec.env
+        .insert("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE".into(), None);
     let job = Job::new(Limits::default())?;
     let process = job.spawn(&spec).map_err(|error| {
         invalid(&format!(

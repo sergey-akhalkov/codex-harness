@@ -7,6 +7,7 @@
 use harness_core::process::ProcessIdentity;
 use harness_core::process_service::{self, ServiceProcess};
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,6 +15,13 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[path = "fixtures/control_endpoint.rs"]
+mod control_endpoint;
+
+use control_endpoint::{Answer, Bearer, Server};
+use harness_core::console::{ConsoleSession, ConsoleSpec};
+use harness_core::process::{Cancellation, CommandSpec, Deadline};
 
 const SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
 
@@ -510,6 +518,391 @@ fn stop_terminates_the_owned_tree_and_preserves_the_run() {
     assert_eq!(repeated["observation"]["state"], "stopped", "{repeated}");
     assert!(!is_alive(identity_of(&owned), &launcher()));
     fixture.drop();
+}
+
+const TOOL_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24cc";
+const NEIGHBOR_SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f25aa";
+const PARTIAL_TEXT: &str = "partial work kept by stop\n";
+
+/// One managed TUI run with a live owned tool. Urgent stop addresses this
+/// run's recorded session; it does not grow a second controller.
+struct AttachedRun {
+    owner: String,
+    thread: String,
+    source: PathBuf,
+    home: PathBuf,
+    slot: PathBuf,
+    state: PathBuf,
+    receipt: PathBuf,
+    release: PathBuf,
+    tool_marker: PathBuf,
+    partial: PathBuf,
+    server: Server,
+    session: Option<ConsoleSession>,
+    _root: tempfile::TempDir,
+}
+
+impl AttachedRun {
+    fn new(name: &str, owner: &str, thread: &str) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(format!("proj-{name}"));
+        fs::create_dir_all(source.join("global")).unwrap();
+        git(&source, &["init", "-q", "--initial-branch=main"]);
+        fs::write(source.join("global/orchestration.toml"), orchestration(1)).unwrap();
+        let source = source.canonicalize().unwrap();
+        let home = root.path().join("home");
+        let slot = root.path().join("slot");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&slot).unwrap();
+        let home = home.canonicalize().unwrap();
+        let slot = slot.canonicalize().unwrap();
+        let state = harness_core::task_worktree::pool_state_dir(&home, &source).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("slot-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "source": source,
+                "index": 1,
+                "path": slot,
+                "state": "occupied",
+                "owner": owner,
+                "base": "abc123",
+                "disposition": null,
+                "reason": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = Server::start(Bearer::File(state.join("endpoint-1.token")));
+        server.answer("initialize", Answer::Result(json!({})));
+        server.answer("thread/name/set", Answer::Result(json!({})));
+        server.answer(
+            "thread/start",
+            Answer::Result(json!({
+                "thread": {"id": thread, "cwd": slot},
+                "model": "deepseek-flash",
+                "modelProvider": "deepseek",
+                "reasoningEffort": "max"
+            })),
+        );
+        server.answer(
+            "thread/resume",
+            Answer::Result(json!({
+                "thread": {"id": thread, "cwd": slot},
+                "model": "deepseek-flash",
+                "modelProvider": "deepseek",
+                "reasoningEffort": "max"
+            })),
+        );
+        server.answer(
+            "turn/start",
+            Answer::Result(json!({"turn": {"id": TOOL_TURN, "status": "inProgress"}})),
+        );
+        server.answer("turn/interrupt", Answer::Result(json!({})));
+        server.answer_sequence(
+            "thread/read",
+            vec![
+                Answer::Result(json!({"thread": {"id": thread, "cwd": slot, "turns": []}})),
+                Answer::Result(json!({"thread": {
+                    "id": thread,
+                    "cwd": slot,
+                    "turns": [{
+                        "id": TOOL_TURN,
+                        "status": "inProgress",
+                        "items": [{
+                            "id": "tool-1",
+                            "type": "commandExecution",
+                            "command": "fixture long command",
+                            "status": "inProgress"
+                        }]
+                    }]
+                }})),
+            ],
+        );
+        let receipt = state.join("spawn-1.json");
+        let release = root.path().join("release");
+        let tool_marker = root.path().join("tool.json");
+        let partial = slot.join("partial.txt");
+        fs::write(&partial, PARTIAL_TEXT).unwrap();
+        fs::write(slot.join("untracked.txt"), "keep me\n").unwrap();
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "launcher": launcher(),
+                "profile": "deepseek",
+                "mode": "tui",
+                "args": [],
+                "visible": true,
+                "host": "owned-console",
+                "control": {
+                    "schema": 1,
+                    "assignment": "fixture assignment text",
+                    "identity": {
+                        "profile": "deepseek",
+                        "model": "deepseek-flash",
+                        "modelProvider": "deepseek",
+                        "reasoningEffort": "max"
+                    },
+                    "presentation": "native-tui",
+                    "port": server.port
+                },
+                "terminal": null,
+                "isolation": false,
+                "slot": {
+                    "index": 1,
+                    "path": slot,
+                    "source": source,
+                    "owner": owner,
+                    "base": "abc123",
+                    "remote": "origin",
+                    "branch": "main"
+                },
+                "model": "deepseek-flash",
+                "modelProvider": "deepseek",
+                "reasoningEffort": "max",
+                "window": null,
+                "shell": {
+                    "path": std::env::var_os("PATH").unwrap(),
+                    "executable": launcher(),
+                    "version": "fixture",
+                    "sandbox_mode": "danger-full-access"
+                },
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": "dispatch-accepted",
+                    "session": thread,
+                    "result": state.join("message-1.txt"),
+                    "detail": state.join("stream-1.jsonl")
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+        let launch = home.join("harness");
+        fs::create_dir_all(&launch).unwrap();
+        fs::write(
+            launch.join("native-launch.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 2,
+                "upstream": {"executable": double}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            home.join("frontend-title.txt"),
+            format!("CEx (deepseek) - {owner}"),
+        )
+        .unwrap();
+        let mut spec = CommandSpec::new(manager());
+        spec.args = vec![
+            OsString::from("executor"),
+            OsString::from("run"),
+            OsString::from("--file"),
+            receipt.as_os_str().to_owned(),
+        ];
+        spec.env
+            .insert("CODEX_HOME".into(), Some(home.as_os_str().to_owned()));
+        spec.env
+            .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
+        spec.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
+        spec.env.insert("WT_SESSION".into(), None);
+        spec.env.insert(
+            "HARNESS_EXECUTOR_CHILD_FIXTURE_MODE".into(),
+            Some("descendant".into()),
+        );
+        spec.env.insert(
+            "HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER".into(),
+            Some(tool_marker.as_os_str().to_owned()),
+        );
+        spec.env.insert(
+            "HARNESS_EXECUTOR_FIXTURE_RELEASE".into(),
+            Some(release.as_os_str().to_owned()),
+        );
+        let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+        Self {
+            owner: owner.to_owned(),
+            thread: thread.to_owned(),
+            source,
+            home,
+            slot,
+            state,
+            receipt,
+            release,
+            tool_marker,
+            partial,
+            server,
+            session: Some(session),
+            _root: root,
+        }
+    }
+
+    fn wait_attached(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let attached = self.frontend_phases().iter().any(|phase| {
+                phase["phase"] == "attached"
+                    && phase["threadId"] == self.thread
+                    && phase["alive"] == true
+            });
+            let host_recorded = self.receipt()["observation"]["host"]["pid"]
+                .as_u64()
+                .is_some();
+            let assigned = self.server.requests_for("turn/start").len() == 1;
+            if attached && host_recorded && assigned && self.tool_marker.is_file() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "frontend did not attach for {}: phases={:?} receipt={} log={}",
+                self.owner,
+                self.frontend_phases(),
+                self.receipt(),
+                fs::read_to_string(self.state.join("endpoint-1.log")).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    fn stop(&self) -> Output {
+        lead_command()
+            .args([
+                "executor",
+                "stop",
+                "--source",
+                self.source.to_str().unwrap(),
+                "--codex-home",
+                self.home.to_str().unwrap(),
+                "--slot",
+                "1",
+                "--owner",
+                &self.owner,
+                "--session",
+                &self.thread,
+            ])
+            .output()
+            .unwrap()
+    }
+
+    fn receipt(&self) -> Value {
+        receipt_json(&self.receipt)
+    }
+
+    fn frontend_phases(&self) -> Vec<Value> {
+        fs::read_to_string(self.state.join("frontend-1.json"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn tool_identity(&self) -> ProcessIdentity {
+        identity_of(&serde_json::from_slice(&fs::read(&self.tool_marker).unwrap()).unwrap())
+    }
+
+    fn frontend_identity(&self) -> (ProcessIdentity, PathBuf) {
+        let phase = self
+            .frontend_phases()
+            .into_iter()
+            .find(|phase| phase["phase"] == "attached")
+            .expect("attached frontend record");
+        (
+            ProcessIdentity {
+                pid: phase["pid"].as_u64().unwrap() as u32,
+                creation_time: phase["creationTime"].as_u64().unwrap(),
+            },
+            PathBuf::from(phase["program"].as_str().unwrap()),
+        )
+    }
+}
+
+impl Drop for AttachedRun {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, b"release");
+        let _ = fs::write(self.home.join("frontend-release"), b"release");
+        if let Some(session) = self.session.take() {
+            let cancel = Cancellation::default();
+            cancel.cancel();
+            if let Ok(deadline) = Deadline::after(Duration::from_secs(8)) {
+                let _ = session.wait(deadline, &cancel, Duration::from_secs(3));
+            }
+        }
+    }
+}
+
+#[test]
+fn stop_interrupts_the_active_tool_and_leaves_the_neighbor_running() {
+    let run = AttachedRun::new("stop-attached", "exec-stop-frontend", SESSION);
+    let neighbor = AttachedRun::new("stop-neighbor", "exec-stop-neighbor", NEIGHBOR_SESSION);
+    run.wait_attached();
+    neighbor.wait_attached();
+    let tool = run.tool_identity();
+    let (frontend, frontend_program) = run.frontend_identity();
+    let neighbor_tool = neighbor.tool_identity();
+    let (neighbor_frontend, neighbor_frontend_program) = neighbor.frontend_identity();
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(run.state.join("endpoint-1.json")).unwrap()).unwrap();
+    let child = ProcessIdentity {
+        pid: endpoint["process"]["pid"].as_u64().unwrap() as u32,
+        creation_time: endpoint["process"]["creationTime"].as_u64().unwrap(),
+    };
+    let child_program = PathBuf::from(endpoint["process"]["program"].as_str().unwrap());
+
+    let out = run.stop();
+    let output = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{output}");
+    assert!(output.contains(": stopped in "), "{output}");
+    assert!(output.contains("turn/interrupt accepted"), "{output}");
+    assert!(
+        output.contains("no reset, clean, release or completion claim"),
+        "{output}"
+    );
+    let interrupts = run.server.requests_for("turn/interrupt");
+    assert_eq!(interrupts.len(), 1, "{interrupts:?}");
+    assert_eq!(
+        interrupts[0]["params"]["threadId"], SESSION,
+        "{interrupts:?}"
+    );
+    assert_eq!(
+        interrupts[0]["params"]["turnId"], TOOL_TURN,
+        "{interrupts:?}"
+    );
+    assert!(neighbor.server.requests_for("turn/interrupt").is_empty());
+
+    wait_gone(tool, &launcher(), "the owned tool");
+    wait_gone(frontend, &frontend_program, "the owned frontend");
+    wait_gone(child, &child_program, "the owned app-server");
+    assert_eq!(fs::read_to_string(&run.partial).unwrap(), PARTIAL_TEXT);
+    assert_eq!(
+        fs::read_to_string(run.slot.join("untracked.txt")).unwrap(),
+        "keep me\n"
+    );
+    let recorded = run.receipt();
+    assert_eq!(recorded["observation"]["state"], "stopped", "{recorded}");
+    assert_eq!(recorded["stop"]["outcome"], "stopped", "{recorded}");
+    assert_eq!(recorded["stop"]["survivors"], json!([]), "{recorded}");
+    assert_eq!(recorded["observation"]["session"], SESSION, "{recorded}");
+    let slot_record: Value =
+        serde_json::from_slice(&fs::read(run.state.join("slot-1.json")).unwrap()).unwrap();
+    assert_eq!(slot_record["owner"], "exec-stop-frontend");
+    assert!(slot_record["disposition"].is_null(), "{slot_record}");
+
+    assert!(
+        is_alive(neighbor_tool, &launcher()),
+        "stop ended the neighbor's tool"
+    );
+    assert!(
+        is_alive(neighbor_frontend, &neighbor_frontend_program),
+        "stop ended the neighbor's frontend"
+    );
+    assert_eq!(fs::read_to_string(&neighbor.partial).unwrap(), PARTIAL_TEXT);
+    assert_ne!(neighbor.receipt()["observation"]["state"], "stopped");
+    assert_eq!(neighbor.server.requests_for("turn/start").len(), 1);
 }
 
 #[test]
