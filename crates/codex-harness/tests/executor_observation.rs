@@ -5,6 +5,8 @@
 //! provider or a subscription.
 #![cfg(windows)]
 
+use harness_core::console::{ConsoleSession, ConsoleSpec};
+use harness_core::process::{Cancellation, CommandSpec, Deadline};
 use serde_json::{Value, json};
 #[path = "fixtures/cache_usage.rs"]
 mod cache_usage;
@@ -12,6 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -1372,4 +1375,530 @@ fn installed_native_cache_loss_stops_before_more_requests() {
     println!(
         "native cache stop: {requests} local requests; per-response counters persisted and the guard stopped the live CLI"
     );
+}
+
+#[path = "fixtures/control_endpoint.rs"]
+mod control_endpoint;
+
+const CONTROL_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+const CONTROL_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2401";
+const CONTROL_MODEL: &str = "deepseek-v4-flash";
+const CONTROL_PROVIDER: &str = "deepseek-fixture";
+const CONTROL_EFFORT: &str = "max";
+const CONTROL_ASSIGNMENT: &str = "fixture control assignment text";
+const CONTROL_FINAL: &str = "CONTROL_FIXTURE_FINAL_MESSAGE";
+const CONTROL_OWNER: &str = "exec-deepseek-host";
+
+struct ControlHost {
+    home: PathBuf,
+    source: PathBuf,
+    slot: PathBuf,
+    state: PathBuf,
+    receipt: PathBuf,
+    server: control_endpoint::Server,
+}
+
+impl ControlHost {
+    fn new(name: &str) -> Self {
+        let root = tempfile::tempdir().unwrap().keep();
+        let source = root.join(format!("source-{name}"));
+        let home = root.join("home");
+        let slot = root.join("slot");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&slot).unwrap();
+        let source = source.canonicalize().unwrap();
+        let home = home.canonicalize().unwrap();
+        let slot = slot.canonicalize().unwrap();
+        let state = harness_core::task_worktree::pool_state_dir(&home, &source).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("slot-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "source": source,
+                "index": 1,
+                "path": slot,
+                "state": "occupied",
+                "owner": CONTROL_OWNER,
+                "base": "abc123",
+                "disposition": null,
+                "reason": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = control_endpoint::Server::start(control_endpoint::Bearer::File(
+            state.join("endpoint-1.token"),
+        ));
+        server.answer("initialize", control_endpoint::Answer::Result(json!({})));
+        server.answer(
+            "thread/start",
+            control_endpoint::Answer::Result(json!({
+                "thread": {"id": CONTROL_THREAD, "cwd": slot},
+                "model": CONTROL_MODEL,
+                "modelProvider": CONTROL_PROVIDER,
+                "reasoningEffort": CONTROL_EFFORT
+            })),
+        );
+        server.answer(
+            "thread/name/set",
+            control_endpoint::Answer::Result(json!({})),
+        );
+        server.answer(
+            "thread/resume",
+            control_endpoint::Answer::Result(json!({
+                "thread": {"id": CONTROL_THREAD, "cwd": slot},
+                "model": CONTROL_MODEL,
+                "modelProvider": CONTROL_PROVIDER,
+                "reasoningEffort": CONTROL_EFFORT
+            })),
+        );
+        server.answer(
+            "turn/start",
+            control_endpoint::Answer::Result(
+                json!({"turn": {"id": CONTROL_TURN, "status": "inProgress"}}),
+            ),
+        );
+        server.answer(
+            "turn/interrupt",
+            control_endpoint::Answer::Result(json!({})),
+        );
+        server.answer_sequence(
+            "thread/read",
+            vec![
+                control_endpoint::Answer::Result(json!({"thread": {
+                    "id": CONTROL_THREAD,
+                    "cwd": slot,
+                    "turns": []
+                }})),
+                control_endpoint::Answer::Result(json!({"thread": {
+                    "id": CONTROL_THREAD,
+                    "cwd": slot,
+                    "turns": [{
+                        "id": CONTROL_TURN,
+                        "status": "completed",
+                        "items": [{"id": "m1", "type": "agentMessage", "text": CONTROL_FINAL}]
+                    }]
+                }})),
+            ],
+        );
+        let receipt = state.join("spawn-1.json");
+        fs::write(
+            &receipt,
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "launcher": fixture(),
+                "profile": "deepseek",
+                "mode": "exec",
+                "args": [],
+                "visible": true,
+                "host": "owned-console",
+                "control": {
+                    "schema": 1,
+                    "assignment": CONTROL_ASSIGNMENT,
+                    "identity": {
+                        "profile": "deepseek",
+                        "model": CONTROL_MODEL,
+                        "modelProvider": CONTROL_PROVIDER,
+                        "reasoningEffort": CONTROL_EFFORT
+                    },
+                    "port": server.port
+                },
+                "terminal": null,
+                "isolation": false,
+                "slot": {
+                    "index": 1,
+                    "path": slot,
+                    "source": source,
+                    "owner": CONTROL_OWNER,
+                    "base": "abc123",
+                    "remote": "origin",
+                    "branch": "main"
+                },
+                "model": CONTROL_MODEL,
+                "modelProvider": CONTROL_PROVIDER,
+                "reasoningEffort": CONTROL_EFFORT,
+                "window": null,
+                "shell": {
+                    "path": std::env::var_os("PATH").unwrap(),
+                    "executable": fixture(),
+                    "version": "fixture",
+                    "sandbox_mode": "danger-full-access"
+                },
+                "observation": {
+                    "schema": 1,
+                    "coverage": "native",
+                    "state": "dispatch-accepted",
+                    "result": state.join("message-1.txt"),
+                    "detail": state.join("stream-1.jsonl")
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            home,
+            source,
+            slot,
+            state,
+            receipt,
+            server,
+        }
+    }
+
+    fn title(&self) -> String {
+        format!("CEx (deepseek) - {CONTROL_OWNER}")
+    }
+
+    fn register_frontend(&self, program: &Path) {
+        let launch = self.home.join("harness");
+        fs::create_dir_all(&launch).unwrap();
+        fs::write(
+            launch.join("native-launch.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 2,
+                "upstream": {"executable": program}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(self.home.join("frontend-title.txt"), self.title()).unwrap();
+    }
+}
+
+fn host_spec(host: &ControlHost) -> CommandSpec {
+    let mut spec = CommandSpec::new(manager());
+    spec.args = vec![
+        "executor".into(),
+        "run".into(),
+        "--file".into(),
+        host.receipt.as_os_str().to_owned(),
+    ];
+    spec.env
+        .insert("CODEX_HOME".into(), Some(host.home.as_os_str().to_owned()));
+    spec.env
+        .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
+    spec.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
+    spec.env.insert("WT_SESSION".into(), None);
+    spec
+}
+
+fn completion_burst(server: &control_endpoint::Server) {
+    server.push(
+        json!({"method":"item/completed","params":{"threadId":CONTROL_THREAD,"item":{
+            "id":"c1","type":"commandExecution","command":"fixture check","exitCode":0
+        }}}),
+    );
+    server.push(
+        json!({"method":"item/completed","params":{"threadId":CONTROL_THREAD,"item":{
+            "id":"m1","type":"agentMessage","text":CONTROL_FINAL
+        }}}),
+    );
+    server.push(json!({"method":"turn/completed","params":{"threadId":CONTROL_THREAD,"turn":{"id":CONTROL_TURN,"status":"completed"}}}));
+}
+
+fn frontend_phases(host: &ControlHost) -> Vec<Value> {
+    let path = host.state.join("frontend-1.json");
+    fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn attachment_failure_is_reported_before_the_assignment() {
+    let host = ControlHost::new("attach-fail");
+    let out = lead_command()
+        .args(["executor", "run", "--file"])
+        .arg(&host.receipt)
+        .env("CODEX_HOME", &host.home)
+        .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let output = text(&out);
+    assert_ne!(out.status.code(), Some(0), "{output}");
+    assert!(
+        output.contains("no live terminal surface")
+            && output.contains("assignment was not submitted"),
+        "{output}"
+    );
+    assert!(
+        host.server.requests_for("turn/start").is_empty(),
+        "a failed attachment must not submit the assignment: {:?}",
+        host.server.requests_for("turn/start")
+    );
+    assert_eq!(host.server.requests_for("thread/start").len(), 1);
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    assert_eq!(watched.status.code(), Some(1), "{}", text(&watched));
+}
+
+#[path = "fixtures/control_responses.rs"]
+mod native_responses;
+
+/// The actual spawn host, native TUI and watch path. The canned Responses
+/// provider supplies the tool and final answer; no subscription is used.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned native TUI and canned responses"]
+fn installed_native_frontend_shows_the_assignment_and_watch_keeps_the_result() {
+    let exe = PathBuf::from(
+        std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
+    );
+    assert!(exe.is_absolute() && exe.is_file(), "{}", exe.display());
+    let host = ControlHost::new("native-tui");
+    let evidence = host.home.join("evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    let responses = native_responses::Responses::start(evidence.clone(), true);
+    let trusted = host.slot.to_string_lossy().to_lowercase();
+    fs::write(
+        host.home.join("config.toml"),
+        format!(
+            "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"low\"\nmodel_provider = \"control_fixture\"\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n[model_providers.control_fixture]\nname = \"Owned observation fixture\"\nbase_url = \"http://127.0.0.1:{}/v1\"\nwire_api = \"responses\"\nenv_key = \"HARNESS_CONTROL_FIXTURE_KEY\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{trusted}']\ntrust_level = \"trusted\"\n",
+            responses.port
+        ),
+    )
+    .unwrap();
+    host.register_frontend(&exe);
+    let mut receipt = receipt_json(&host.receipt);
+    receipt["launcher"] = json!(exe);
+    receipt["profile"] = json!("default");
+    receipt["model"] = json!("gpt-6-astra");
+    receipt["modelProvider"] = json!("control_fixture");
+    receipt["reasoningEffort"] = json!("low");
+    receipt["control"]["identity"] = json!({
+        "profile": "default",
+        "model": "gpt-6-astra",
+        "modelProvider": "control_fixture",
+        "reasoningEffort": "low"
+    });
+    receipt["control"]["assignment"] =
+        json!("Perform the owned proof command and return its consumed result.");
+    receipt["control"]["port"] = Value::Null;
+    receipt["shell"]["sandbox_mode"] = json!("danger-full-access");
+    fs::write(&host.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    fs::write(
+        host.home.join("frontend-title.txt"),
+        format!("CEx (default) - {CONTROL_OWNER}"),
+    )
+    .unwrap();
+    let mut spec = host_spec(&host);
+    spec.env.insert(
+        "HARNESS_CONTROL_FIXTURE_KEY".into(),
+        Some("synthetic-owned-fixture".into()),
+    );
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let until = Instant::now() + Duration::from_secs(90);
+    let result = host.state.join("message-1.txt");
+    while !result.is_file() && Instant::now() < until {
+        let recorded = receipt_json(&host.receipt);
+        if recorded["observation"]["state"] == "failed" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(30)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let transcript = finished.transcript;
+    assert_eq!(
+        finished.outcome.exit_code,
+        0,
+        "{transcript}\n{}",
+        fs::read_to_string(host.state.join("endpoint-1.log")).unwrap_or_default()
+    );
+    assert!(
+        transcript.contains(native_responses::FINAL),
+        "native TUI did not show the final answer: {transcript}"
+    );
+    assert!(
+        transcript.contains("exec") || transcript.contains("proof"),
+        "native TUI did not show tool activity: {transcript}"
+    );
+    assert!(
+        !transcript.contains("conversation=control"),
+        "controller output corrupted the TUI: {transcript}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.slot.join("proof.txt")).unwrap(),
+        "one"
+    );
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(
+        watched_text.contains(native_responses::FINAL),
+        "{watched_text}"
+    );
+    let _ = responses;
+}
+
+#[test]
+fn managed_host_attaches_one_frontend_then_watch_returns_the_persisted_result() {
+    let host = ControlHost::new("attach-watch");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let mut neighbor = Command::new("pwsh")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 90"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
+    let until = Instant::now() + Duration::from_secs(25);
+    while host.server.requests_for("turn/start").is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(40));
+    }
+    let turns = host.server.requests_for("turn/start");
+    assert_eq!(turns.len(), 1, "one assignment: {turns:?}");
+    assert_eq!(turns[0]["params"]["threadId"], CONTROL_THREAD);
+    assert_eq!(
+        turns[0]["params"]["input"],
+        json!([{"type": "text", "text": CONTROL_ASSIGNMENT}])
+    );
+    let started = host.server.requests_for("thread/start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["params"]["model"], CONTROL_MODEL);
+    assert_eq!(started[0]["params"]["modelProvider"], CONTROL_PROVIDER);
+    assert_eq!(
+        started[0]["params"]["config"]["model_reasoning_effort"],
+        CONTROL_EFFORT
+    );
+    assert!(
+        started[0]["params"]["cwd"]
+            .as_str()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(&host.slot.to_string_lossy()),
+        "{started:?}"
+    );
+    let argv = fs::read_to_string(host.home.join("frontend-argv.txt")).unwrap();
+    assert!(argv.contains("resume"), "{argv}");
+    assert!(argv.contains(CONTROL_THREAD), "{argv}");
+    assert!(!argv.contains(CONTROL_ASSIGNMENT), "{argv}");
+    assert!(!argv.contains("--sandbox"), "{argv}");
+    assert!(!argv.to_lowercase().contains("token="), "{argv}");
+    let token = fs::read_to_string(host.state.join("endpoint-1.token")).unwrap();
+    assert!(
+        !argv.contains(token.trim()),
+        "the capability token leaked into argv"
+    );
+    completion_burst(&host.server);
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert!(
+        !finished.transcript.contains("conversation=control"),
+        "controller output corrupted the frontend surface: {}",
+        finished.transcript
+    );
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        CONTROL_FINAL
+    );
+    let phases = frontend_phases(&host);
+    assert!(
+        phases
+            .iter()
+            .any(|phase| phase["phase"] == "attached" && phase["alive"] == true),
+        "{phases:?}"
+    );
+    assert!(
+        phases
+            .iter()
+            .any(|phase| phase["phase"] == "persisted" && phase["alive"] == true),
+        "{phases:?}"
+    );
+    let pid = phases[0]["pid"].as_u64().unwrap() as u32;
+    let created = phases[0]["creationTime"].as_u64().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let gone = harness_core::process_service::ServiceProcess::inspect(
+        harness_core::process::ProcessIdentity {
+            pid,
+            creation_time: created,
+        },
+        &double,
+        &user,
+    )
+    .unwrap();
+    assert!(gone.is_none(), "the owned frontend was still running");
+    assert!(
+        neighbor.try_wait().unwrap().is_none(),
+        "closing the owned frontend stopped a neighboring process"
+    );
+    let _ = neighbor.kill();
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains("state=completed"), "{watched_text}");
+    assert!(watched_text.contains(CONTROL_FINAL), "{watched_text}");
+    assert!(watched_text.contains(CONTROL_THREAD), "{watched_text}");
+    let _ = host.source;
+}
+
+#[test]
+fn losing_the_frontend_does_not_leave_the_run_working() {
+    let host = ControlHost::new("frontend-loss");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(host_spec(&host))).unwrap();
+    let until = Instant::now() + Duration::from_secs(25);
+    while host.server.requests_for("turn/start").is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert_eq!(host.server.requests_for("turn/start").len(), 1);
+    fs::write(host.home.join("frontend-release"), "release").unwrap();
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert!(
+        finished.transcript.contains("frontend exited")
+            || fs::read_to_string(&host.receipt)
+                .unwrap()
+                .contains("frontend exited"),
+        "{}",
+        finished.transcript
+    );
+    let receipt = receipt_json(&host.receipt);
+    assert_ne!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert!(
+        host.server.requests_for("turn/start").len() == 1,
+        "loss must not submit another assignment"
+    );
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    assert_eq!(watched.status.code(), Some(1), "{}", text(&watched));
 }

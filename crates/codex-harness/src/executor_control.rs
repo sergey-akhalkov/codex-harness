@@ -1139,6 +1139,53 @@ impl Conversation {
         Ok(())
     }
 
+    /// Materializes the named empty thread through `thread/resume` before any
+    /// model request. Remote resume has no rollout to open until this returns
+    /// the same thread, model and provider the start pinned.
+    // The host uses these. The fixture test binary compiles this file alone.
+    #[allow(dead_code)]
+    pub fn prepare_named_empty(&mut self, slot: &Path) -> io::Result<()> {
+        let resumed = self.call("thread/resume", json!({"threadId": self.thread_id}))?;
+        if resumed["thread"]["id"].as_str() != Some(self.thread_id.as_str()) {
+            return Err(invalid(
+                "thread/resume returned another thread; refusing to attach a frontend to a different conversation",
+            ));
+        }
+        if let Some(identity) = &self.identity
+            && let Err(mismatch) = confirm_resumed(identity, &resumed, slot)
+        {
+            return Err(invalid(format!(
+                "preparing the named empty thread changed the bound routing: {mismatch}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stops the turn that is actually in progress. A thread with no active
+    /// turn is already idle; this does not start a model request.
+    #[allow(dead_code)]
+    pub fn interrupt_active(&mut self) -> io::Result<bool> {
+        let thread = self.thread_state()?;
+        let Some(turn) = active_turn(&thread) else {
+            return Ok(false);
+        };
+        self.call(
+            "turn/interrupt",
+            json!({"threadId": self.thread_id, "turnId": turn}),
+        )?;
+        Ok(true)
+    }
+
+    /// Whether the bound thread already contains a turn. The assignment must
+    /// not be submitted again when it does.
+    #[allow(dead_code)]
+    pub fn has_turns(&mut self) -> io::Result<bool> {
+        let thread = self.thread_state()?;
+        Ok(thread["turns"]
+            .as_array()
+            .is_some_and(|turns| !turns.is_empty()))
+    }
+
     fn observe(&mut self, value: Value) -> ControlEvent {
         let method = value
             .get("method")
@@ -1335,6 +1382,50 @@ fn thread_params(plan: &ControlPlan) -> Value {
         params.insert("config".into(), Value::Object(config));
     }
     Value::Object(params)
+}
+
+#[allow(dead_code)]
+fn confirm_resumed(identity: &BoundIdentity, resumed: &Value, slot: &Path) -> Result<(), String> {
+    if let Some(model) = &identity.model {
+        compare_field(&resumed["model"], model, "model")?;
+    }
+    if let Some(provider) = &identity.model_provider {
+        compare_field(&resumed["modelProvider"], provider, "modelProvider")?;
+    }
+    if let Some(effort) = &identity.reasoning_effort
+        && resumed
+            .get("reasoningEffort")
+            .is_some_and(|value| !value.is_null())
+    {
+        compare_field(&resumed["reasoningEffort"], effort, "reasoningEffort")?;
+    }
+    if let Some(cwd) = resumed["thread"]["cwd"]
+        .as_str()
+        .or_else(|| resumed["cwd"].as_str())
+        && !same_slot(cwd, slot)
+    {
+        return Err(format!(
+            "the resumed thread cwd is {cwd}, not the bound slot {}",
+            slot.display()
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn same_slot(reported: &str, slot: &Path) -> bool {
+    normalize_slot(reported).eq_ignore_ascii_case(&normalize_slot(&slot.to_string_lossy()))
+}
+
+#[allow(dead_code)]
+fn normalize_slot(path: &str) -> String {
+    let mut text = path.replace('/', "\\");
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        text = format!(r"\\{rest}");
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        text = rest.to_owned();
+    }
+    text.trim_end_matches('\\').to_owned()
 }
 
 /// The final assistant message of the last turn of one thread record.
