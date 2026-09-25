@@ -64,7 +64,7 @@ const USAGE: &str = concat!(
     "codex-harness executor run LAUNCHER [ARG...]\n",
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
-    "Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
+    "The originating lead is the dispatching process CODEX_THREAD_ID, captured before the host environment is cleared. A missing or blank id, a caller-supplied lead or recipient, and a copied, stale, or sibling run marker are refused before any model request. Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
     "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the existing terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. A finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An unfocused or unselected tab is not frontend loss, and a completion already retained is not overwritten or reported as success because the frontend closed. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
     "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
     "Resume continues one exact interrupted session on its recorded slot through the managed native TUI: the host starts a control-backed app-server, resumes that exact thread, retires any stale control endpoint, and attaches one native Codex TUI to that session without fetch, reset, clean, a new conversation or a replay of completed work. Without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
@@ -181,6 +181,11 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         let key = arg
             .to_str()
             .ok_or_else(|| invalid("invalid native executor options"))?;
+        if control::supplied_lead_option(key) {
+            return Err(invalid(
+                "caller-supplied lead id or recipient is not authority; refusing before a model request",
+            ));
+        }
         let value = iter
             .next()
             .ok_or_else(|| invalid("invalid native executor options"))?;
@@ -294,6 +299,11 @@ fn continue_slot(args: &[OsString], fresh: bool) -> io::Result<i32> {
         let key = arg
             .to_str()
             .ok_or_else(|| invalid("invalid native executor options"))?;
+        if control::supplied_lead_option(key) {
+            return Err(invalid(
+                "caller-supplied lead id or recipient is not authority; refusing before a model request",
+            ));
+        }
         let value = iter
             .next()
             .ok_or_else(|| invalid("invalid native executor options"))?;
@@ -829,6 +839,13 @@ fn launch_bound(
     bound: &ProfileBinding,
     paths: &RunPaths,
 ) -> io::Result<i32> {
+    let state_dir = paths.receipt.parent().ok_or_else(|| {
+        invalid("dispatch receipt has no state directory; refusing before a model request")
+    })?;
+    // Capture before either host path clears the dispatching process's
+    // session environment. The child thread id is never the return address.
+    let lead = control::establish_originating_lead(state_dir)?;
+    record_originating_lead(&paths.receipt, &lead)?;
     println!("{}", slot_summary(binding, request.named_slot));
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
@@ -890,10 +907,11 @@ fn launch_bound(
             bound,
             &shell,
             &run,
+            &lead,
         )
     } else {
         dispatch_owned_console(
-            &launcher, request, binding, &receipt, bound, &route, &shell, &run,
+            &launcher, request, binding, &receipt, bound, &route, &shell, &run, &lead,
         )
     }
 }
@@ -2291,6 +2309,7 @@ fn run_observed_receipt(
     // The hosted Codex process and everything it starts are an executor tree.
     spec.env
         .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
+    drop_inherited_session_spec(&mut spec);
     if let Some(shell) = shell {
         spec.env.insert("PATH".into(), Some(shell.path.clone()));
     }
@@ -2404,6 +2423,17 @@ fn run_control_receipt(
         plan.args.push(config.into());
     }
     plan.env.insert("PATH".into(), Some(shell.path.clone()));
+    if let Some(generation) = value["originatingLead"]["runGeneration"]
+        .as_str()
+        .filter(|generation| !generation.is_empty())
+    {
+        // Per-run context only. The lead thread id stays on the receipt.
+        plan.env
+            .insert(control::EXECUTOR_RUN_ENV.into(), Some(generation.into()));
+    }
+    for name in ["CODEX_SESSION_ID", "CODEX_THREAD_ID"] {
+        plan.env.insert((*name).into(), None);
+    }
     // The host's fixture-mode switch selects the compatibility renderer and
     // must stay unset while a native frontend owns the terminal. An explicit
     // child mode is forwarded only to the app-server, so an owned tool can
@@ -3630,6 +3660,9 @@ fn run_child(
     // the installed launcher reads this marker to keep the agent tools off, and
     // the kit's dispatch commands refuse to originate under it.
     command.env(EXECUTOR_SESSION_ENV, "1");
+    for name in INHERITED_SESSION_ENV {
+        command.env_remove(name);
+    }
     if let Some(shell) = shell {
         command.env("PATH", &shell.path);
     }
@@ -3810,15 +3843,43 @@ fn apply_host_env(
     spec: &mut CommandSpec,
     codex_home: &Path,
     shell: &crate::executor_shell::PreparedShell,
+    run_generation: &str,
 ) {
     spec.env
         .insert("CODEX_HOME".into(), Some(codex_home.as_os_str().to_owned()));
-    for name in INHERITED_SESSION_ENV {
-        spec.env.insert(name.into(), None);
-    }
+    drop_inherited_session_spec(spec);
+    // The run token is not the lead thread id and is not a return address.
+    spec.env.insert(
+        control::EXECUTOR_RUN_ENV.into(),
+        Some(run_generation.into()),
+    );
     spec.env
         .insert("COLORTERM".into(), Some("truecolor".into()));
     spec.env.insert("PATH".into(), Some(shell.path.clone()));
+}
+
+fn drop_inherited_session_spec(spec: &mut CommandSpec) {
+    for name in INHERITED_SESSION_ENV {
+        spec.env.insert((*name).into(), None);
+    }
+}
+
+fn record_originating_lead(receipt: &Path, lead: &control::OriginatingLead) -> io::Result<()> {
+    let field = serde_json::to_value(lead)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if receipt.is_file() {
+        return observation::update_receipt_field(receipt, "originatingLead", field);
+    }
+    if let Some(dir) = receipt.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    observation::write_receipt_document(
+        receipt,
+        &json!({
+            "schema": 1,
+            "originatingLead": field,
+        }),
+    )
 }
 
 /// Codex blocks an untrusted project directory behind an interactive prompt
@@ -3855,6 +3916,7 @@ fn dispatch_terminal_tab(
     bound: &ProfileBinding,
     shell: &crate::executor_shell::PreparedShell,
     run: &RunObservation,
+    lead: &control::OriginatingLead,
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let wrapper = std::env::current_exe()
@@ -3903,6 +3965,7 @@ fn dispatch_terminal_tab(
         Some(binding),
         shell,
         run,
+        lead,
     )?;
     suppress_loader_dialogs();
     let mut cmd = Command::new(wt);
@@ -3917,6 +3980,7 @@ fn dispatch_terminal_tab(
     for name in INHERITED_SESSION_ENV {
         cmd.env_remove(name);
     }
+    cmd.env(control::EXECUTOR_RUN_ENV, &lead.run_generation);
     cmd.env("COLORTERM", "truecolor");
     let status = match target_lead_window {
         Some(window) => task_view::run_terminal_tab_in_window(
@@ -3959,6 +4023,7 @@ fn dispatch_owned_console(
     route: &HostRoute,
     shell: &crate::executor_shell::PreparedShell,
     run: &RunObservation,
+    lead: &control::OriginatingLead,
 ) -> io::Result<i32> {
     let workspace = binding.path.as_path();
     let profile = request.profile;
@@ -3980,6 +4045,7 @@ fn dispatch_owned_console(
             Some(binding),
             shell,
             run,
+            lead,
         )?;
         println!(
             "{}",
@@ -4000,7 +4066,7 @@ fn dispatch_owned_console(
             ];
             spec.current_dir = Some(workspace.to_path_buf());
             spec.new_console = Some(title.clone().into());
-            apply_host_env(&mut spec, request.codex_home, shell);
+            apply_host_env(&mut spec, request.codex_home, shell, &lead.run_generation);
             let placements = task_view::layout(1)?;
             let bounds = placements
                 .first()
@@ -4105,6 +4171,7 @@ fn save_receipt(
     slot: Option<&SlotBinding>,
     shell: &crate::executor_shell::PreparedShell,
     run: &RunObservation,
+    lead: &control::OriginatingLead,
 ) -> io::Result<()> {
     let args = route.args();
     let control = serde_json::to_value(route.control())
@@ -4145,6 +4212,7 @@ fn save_receipt(
             "window": window,
             "shell": shell,
             "observation": run,
+            "originatingLead": lead,
         }),
     )
 }
@@ -5481,7 +5549,12 @@ mod tests {
             version: "PowerShell 7.6.6".into(),
             sandbox_mode: "danger-full-access".into(),
         };
-        apply_host_env(&mut spec, Path::new(r"C:\codex-home"), &shell);
+        apply_host_env(
+            &mut spec,
+            Path::new(r"C:\codex-home"),
+            &shell,
+            "run-generation-synthetic",
+        );
         for name in INHERITED_SESSION_ENV {
             assert_eq!(spec.env.get(std::ffi::OsStr::new(name)), Some(&None));
         }
@@ -5498,6 +5571,11 @@ mod tests {
         assert_eq!(
             spec.env.get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
             None
+        );
+        assert_eq!(
+            spec.env
+                .get(std::ffi::OsStr::new(control::EXECUTOR_RUN_ENV)),
+            Some(&Some("run-generation-synthetic".into()))
         );
     }
 
