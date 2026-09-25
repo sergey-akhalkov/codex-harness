@@ -108,6 +108,8 @@ struct Request {
     /// it is verified against the receipt, otherwise the recorded one.
     session: Option<String>,
     text: String,
+    /// The lead-message id this invocation answers, when it is a correlated reply.
+    reply_to: Option<String>,
 }
 
 impl Request {
@@ -192,6 +194,7 @@ impl Request {
             owner: owner.ok_or_else(|| invalid("--owner ID is required"))?,
             session,
             text,
+            reply_to: None,
         })
     }
 }
@@ -1276,6 +1279,38 @@ fn report_unaddressable(
     Ok(2)
 }
 
+/// Marks the one answered lead-message request resolved. Other requests stay
+/// as recorded. A message that is not a correlated reply changes nothing.
+/// Queued, refused, and indeterminate attempts do not call this: only observed
+/// delivery clears that request's hold.
+fn resolve_observed_reply(request: &Request, receipt: &Path) -> io::Result<()> {
+    let Some(id) = request.reply_to.as_deref() else {
+        return Ok(());
+    };
+    let current = read_receipt_value(receipt)?;
+    let Some(existing) = current.get("leadMessages").and_then(Value::as_array) else {
+        return Err(invalid(&format!(
+            "delivered reply {id} was observed, but the receipt has no leadMessages record to resolve"
+        )));
+    };
+    let mut messages = existing.clone();
+    let Some(entry) = messages
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return Err(invalid(&format!(
+            "delivered reply {id} was observed, but that request is not on the receipt"
+        )));
+    };
+    if entry.get("kind").and_then(Value::as_str) != Some(KIND_REQUEST) {
+        return Err(invalid(&format!(
+            "delivered reply {id} was observed, but the record is not a reply-request"
+        )));
+    }
+    entry["status"] = Value::String("resolved".into());
+    observation::update_receipt_field(receipt, "leadMessages", Value::Array(messages))
+}
+
 /// A previously recorded delivery stands: the same content is not sent again.
 fn report_repeat(
     request: &Request,
@@ -1308,6 +1343,9 @@ fn report_repeat(
         out,
         "nothing was sent again: the same literal text addressed to the same conversation is one input, so a repeat cannot deliver it twice"
     )?;
+    if status == STATUS_DELIVERED {
+        resolve_observed_reply(request, receipt)?;
+    }
     writeln!(out, "receipt: {}", receipt.display())?;
     Ok(0)
 }
@@ -1318,6 +1356,7 @@ fn report_delivered(
     evidence: &InputEvidence,
     started: Instant,
 ) -> io::Result<i32> {
+    resolve_observed_reply(request, receipt)?;
     let mut out = io::stdout();
     writeln!(
         out,
@@ -2296,6 +2335,7 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
         owner,
         session: Some(session),
         text,
+        reply_to: Some(id.to_owned()),
     };
     reject_contradictory(explicit, &request)?;
     Ok(request)

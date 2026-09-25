@@ -2268,6 +2268,33 @@ fn reply_to_starts_an_idle_executor_thread_from_a_utf8_file() {
 }
 
 #[test]
+fn reply_to_resolves_only_the_answered_request() {
+    let run = ReplyRoundTrip::new("reply-one");
+    let answered = run.issue("which contract applies to sample-17?");
+    let open = "lead-0123456789abcdef01234567";
+    run.rewrite_receipt(|receipt| {
+        let mut other = receipt["leadMessages"][0].clone();
+        other["id"] = json!(open);
+        other["status"] = json!("delivered");
+        receipt["leadMessages"].as_array_mut().unwrap().push(other);
+    });
+    let answer = "use the versioned input contract";
+    script_executor_reply(&run.fixture, true, answer);
+    let out = run.reply(LEAD_THREAD, &["--reply-to", &answered, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    let receipt = run.fixture.receipt();
+    let messages = receipt["leadMessages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{receipt}");
+    assert_eq!(messages[0]["id"], answered);
+    assert_eq!(messages[0]["status"], "resolved", "{messages:?}");
+    assert_eq!(messages[1]["id"], open);
+    assert_eq!(messages[1]["status"], "delivered", "{messages:?}");
+    assert_eq!(messages[1]["kind"], "reply-request");
+}
+
+#[test]
 fn reply_to_refuses_unknown_retired_reused_and_contradictory_addresses_before_send() {
     let run = ReplyRoundTrip::new("reply-refuse");
     let unknown = run.reply(

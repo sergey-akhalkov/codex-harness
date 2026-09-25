@@ -871,6 +871,51 @@ fn a_notification_alone_does_not_keep_the_turn_open() {
 }
 
 #[test]
+fn one_open_reply_request_holds_until_the_last_one_is_resolved() {
+    let (root, server, mut conversation, job) = start_held(json!([
+        {
+            "id": "lead-answered",
+            "kind": "reply-request",
+            "status": "resolved"
+        },
+        {
+            "id": "lead-open",
+            "kind": "reply-request",
+            "status": "delivered"
+        }
+    ]));
+    conversation.assign("one request is still open").unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Defect));
+
+    let path = root.path().join("spawn-1.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    receipt["leadMessages"][1]["status"] = json!("resolved");
+    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": "reply-turn", "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": "reply-turn", "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_eq!(conversation.thread_id(), THREAD);
+    drop(job);
+}
+
+#[test]
 fn failed_and_interrupted_turns_are_distinguished() {
     let recorded = recorded();
     let mut conversation = recorded.attach();
