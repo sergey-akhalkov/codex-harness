@@ -42,6 +42,24 @@
 //! repeat and names the next action, and only a definite error allows another
 //! attempt. A local file write is never presented as model delivery.
 //!
+//! One stored identity is one addressed input: a correlated reply carries its
+//! addressed request in the identity, so the same words answering another
+//! request, or a later resolved exchange, are a new input. A refused attempt is
+//! disposed of before any other record, so a bounded receipt never silently
+//! evicts a pending request; when nothing disposable remains, a new attempt is
+//! refused instead of evicting an unresolved one.
+//!
+//! The same classification and reconciliation own `lead message`, the
+//! executor's question to its originating lead: `delivered` requires the lead
+//! conversation's own observed item, `queued` is native acceptance without it,
+//! `error` is a definite refusal, and `indeterminate` means the request may or
+//! may not have been applied. A repeat of the same question reconciles that
+//! attempt's identity against the lead conversation before anything is sent
+//! again; a resolved exchange or a definite refusal is terminal, so the same
+//! words may be sent later as a new message with their own identity. Every
+//! lead-message write merges under the receipt lock, so a concurrent request or
+//! answer is never replaced by a stale snapshot.
+//!
 //! A completed, stopped, interrupted or unavailable run gets its actual state
 //! with the exact-session `executor resume` remedy, and a surface without a
 //! recorded control endpoint (tui mode, legacy receipts) is reported as
@@ -98,6 +116,9 @@ const STATUS_QUEUED: &str = "queued";
 const STATUS_DELIVERED: &str = "delivered";
 const STATUS_ERROR: &str = "error";
 const STATUS_INDETERMINATE: &str = "indeterminate";
+/// The status the stop path writes for an input that was in the conversation
+/// but never confirmed as applied.
+const STATUS_UNDELIVERED: &str = "undelivered";
 
 struct Request {
     source: PathBuf,
@@ -477,10 +498,14 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     let thread = conversation.thread_state()?;
     verify_live_thread(&value, &thread, &request)?;
     let mut stdout = io::stdout();
-    // What this content already established: a delivered or queued text is
-    // never submitted again, an indeterminate attempt must be resolved by
-    // evidence before anything repeats it, and a definite error is retryable.
-    let client_message_id = content_id(&thread_id, &request.text);
+    // What this input already established: a delivered or queued text is never
+    // submitted again, an indeterminate attempt must be resolved by evidence
+    // before anything repeats it, and a definite error is retryable. A
+    // correlated reply carries its addressed request in the identity, so the
+    // same words answering another request are a new input while re-running
+    // the same reply stays one input.
+    let client_message_id =
+        attempt_identity(&thread_id, &request.text, request.reply_to.as_deref());
     let previous = read_attempts(&value)
         .into_iter()
         .find(|attempt| attempt["id"].as_str() == Some(client_message_id.as_str()));
@@ -816,6 +841,17 @@ fn content_id(thread_id: &str, text: &str) -> String {
     format!("msg-{hex}")
 }
 
+/// The identity of one submission to one conversation. A correlated reply adds
+/// its addressed request to the identity: answering the same request with the
+/// same words is a repeat, while the same words answering another request - or
+/// a later, already resolved exchange - is a new input with its own identity.
+fn attempt_identity(thread_id: &str, text: &str, reply_to: Option<&str>) -> String {
+    match reply_to {
+        Some(id) => content_id(thread_id, &format!("reply-to {id}\n{text}")),
+        None => content_id(thread_id, text),
+    }
+}
+
 /// The request of one delivery round: `turn/steer` with the active turn as its
 /// precondition when a turn is running (it is applied at the nearest supported
 /// point and does not interrupt it), otherwise `turn/start` on the same thread.
@@ -1140,7 +1176,7 @@ fn record_attempt(receipt: &Path, entry: Value) -> io::Result<()> {
     let mut document: Value = serde_json::from_slice(&fs::read(receipt)?)?;
     let id = entry["id"].as_str().unwrap_or_default().to_owned();
     let mut messages = read_attempts(&document);
-    match messages
+    let added = match messages
         .iter()
         .position(|message| message["id"].as_str() == Some(id.as_str()))
     {
@@ -1163,23 +1199,34 @@ fn record_attempt(receipt: &Path, entry: Value) -> io::Result<()> {
                 merged["requestedMs"] = Value::from(requested);
             }
             messages[index] = merged;
+            false
         }
-        None => messages.push(entry),
-    }
+        None => {
+            messages.push(entry);
+            true
+        }
+    };
     while messages.len() > MAX_ATTEMPTS {
-        // A failed attempt is retryable, so it is the oldest disposable record;
-        // a delivered, queued or indeterminate one is what prevents a repeat of
-        // the same content, so it is dropped only when nothing else can be.
-        match messages
-            .iter()
-            .position(|message| recorded_status(message) == STATUS_ERROR)
-        {
+        // A refused attempt applied nothing (and a stop already marked its own
+        // queued input undelivered), so those are the disposable records. A
+        // pending, delivered, queued or indeterminate one is what prevents a
+        // repeat of the same content from being delivered twice, so an
+        // unresolved request is never silently evicted: a new identity is
+        // refused instead, while an outcome being merged into its own recorded
+        // attempt is always committed.
+        match messages.iter().position(|message| {
+            matches!(recorded_status(message), STATUS_ERROR | STATUS_UNDELIVERED)
+        }) {
             Some(index) => {
                 messages.remove(index);
             }
-            None => {
-                messages.remove(0);
+            None if added => {
+                return Err(invalid(&format!(
+                    "the dispatch receipt {} already records {MAX_ATTEMPTS} attempts that each still prevent a repeat of their content, and none is a definite refusal or an undelivered input; refusing to evict a pending request or an unresolved question, so nothing was sent. Next action: inspect the run's own conversation and resolve or retire the outstanding attempts before sending further text",
+                    receipt.display()
+                )));
             }
+            None => break,
         }
     }
     document["messages"] = Value::Array(messages);
@@ -1480,15 +1527,36 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     }
     let input = parse_lead_input(args)?;
     let run = resolve_spawned_run()?;
-    let endpoint = verified_lead_endpoint(&run)?;
     let payload = lead_payload(&input)?;
     let kind = if input.notify {
         KIND_NOTICE
     } else {
         KIND_REQUEST
     };
-    let nonce = recorded_lead_messages(&run.receipt)?.len() as u64 + 1;
-    let id = lead_message_id(&run.generation, kind, nonce, &payload);
+    // The content identity of this message, without its nonce: a repeat of the
+    // same words reconciles that identity with the lead conversation's own
+    // items instead of sending a second copy.
+    let content = lead_content_id(&run.generation, kind, &payload);
+    let previous = unresolved_lead_message(&run.receipt, &run.generation, &content)?;
+    // A resolved exchange or a definite refusal is terminal, so the same words
+    // may be sent again as a new message with its own identity; content-only
+    // matching never suppresses a later legitimate exchange.
+    let id = match previous.as_ref().and_then(|entry| entry["id"].as_str()) {
+        Some(id) => id.to_owned(),
+        None => {
+            let nonce = recorded_lead_messages(&run.receipt)?.len() as u64 + 1;
+            lead_message_id(&run.generation, kind, nonce, &payload)
+        }
+    };
+    // A recorded delivery stands on its own evidence: a repeat of it is
+    // reported from the record, without needing the lead endpoint to still be
+    // listening, and never sends a second copy.
+    if let Some(previous) = previous.as_ref()
+        && recorded_status(previous) == STATUS_DELIVERED
+    {
+        return report_recorded_lead_repeat(&run, &id, kind, previous, payload.len());
+    }
+    let endpoint = verified_lead_endpoint(&run)?;
     let reply = if input.notify {
         "not-requested".to_owned()
     } else {
@@ -1519,7 +1587,16 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
             "lead message exceeds the {MAX_TEXT}-byte bound; nothing was sent"
         )));
     }
-    deliver_to_recorded_lead(&run, &endpoint, &id, kind, &envelope, &payload)
+    deliver_to_recorded_lead(
+        &run,
+        &endpoint,
+        &id,
+        kind,
+        &content,
+        &envelope,
+        &payload,
+        previous.as_ref(),
+    )
 }
 
 fn parse_lead_input(args: &[OsString]) -> io::Result<LeadInput> {
@@ -1922,14 +1999,392 @@ fn recorded_lead_messages(receipt: &Path) -> io::Result<Vec<Value>> {
         .unwrap_or_default())
 }
 
+/// The content identity of one lead message: the run generation, the kind and
+/// the exact payload, without the nonce an id carries. A digest is recorded
+/// instead of the message text, so the receipt never carries the payload.
+fn lead_content_id(generation: &str, kind: &str, payload: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(generation.as_bytes());
+    hasher.update([0]);
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(payload.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("lead-content-{hex}")
+}
+
+/// The recorded attempt of this exact message that still holds it: its identity
+/// is reconciled before anything could be sent again. A resolved exchange or a
+/// definite refusal is terminal and does not hold; a pending, queued, delivered
+/// or indeterminate attempt does, because it may already be in the lead
+/// conversation.
+fn unresolved_lead_message(
+    receipt: &Path,
+    generation: &str,
+    content: &str,
+) -> io::Result<Option<Value>> {
+    let value = read_receipt_value(receipt)?;
+    Ok(value["leadMessages"]
+        .as_array()
+        .and_then(|messages| {
+            messages.iter().rev().find(|entry| {
+                entry["contentId"].as_str() == Some(content)
+                    && entry["runGeneration"].as_str() == Some(generation)
+                    && matches!(
+                        recorded_status(entry),
+                        STATUS_PENDING | STATUS_QUEUED | STATUS_DELIVERED | STATUS_INDETERMINATE
+                    )
+            })
+        })
+        .cloned())
+}
+
+/// Reads, edits and writes one receipt document under the receipt's own lock,
+/// so a concurrently recorded request, answer or resolution is preserved
+/// instead of being replaced by a stale snapshot: a pending request is never
+/// silently evicted and a resolved one is never silently reopened.
+fn update_receipt_document<T>(
+    receipt: &Path,
+    edit: impl FnOnce(&mut Value) -> io::Result<T>,
+) -> io::Result<T> {
+    let lock = receipt.with_extension("lock");
+    if let Some(parent) = lock.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let deadline = Deadline::after(LOCK_WAIT)?;
+    let _lock =
+        ExclusiveFileLock::acquire(&lock, deadline, &Cancellation::default()).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("receipt lock {} was not acquired: {error}", lock.display()),
+            )
+        })?;
+    let mut document: Value = serde_json::from_slice(&fs::read(receipt)?)?;
+    let outcome = edit(&mut document)?;
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    // A fresh temp name per writer keeps a stale leftover from a killed writer
+    // from being replaced under an unrelated rename.
+    let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temp, bytes)?;
+    fs::rename(&temp, receipt)?;
+    Ok(outcome)
+}
+
+/// Commits one lead-message attempt, merged by identity so the pending record,
+/// its outcome and an evidence upgrade describe the same one attempt.
+fn record_lead_message(
+    run: &SpawnedRun,
+    id: &str,
+    kind: &str,
+    content: &str,
+    method: &str,
+    status: &str,
+    detail: &str,
+    attempts: u64,
+) -> io::Result<()> {
+    update_receipt_document(&run.receipt, |document| {
+        let generation = document["originatingLead"]["runGeneration"]
+            .as_str()
+            .unwrap_or(UNAVAILABLE);
+        let session = document["observation"]["session"]
+            .as_str()
+            .unwrap_or(UNAVAILABLE);
+        let owner = document["slot"]["owner"].as_str().unwrap_or(UNAVAILABLE);
+        let slot = document["slot"]["index"].as_u64().unwrap_or(0);
+        let mut messages = document["leadMessages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let previous = messages
+            .iter()
+            .position(|entry| entry["id"].as_str() == Some(id))
+            .map(|index| messages[index].clone());
+        let now = now_ms();
+        let mut entry = previous.unwrap_or_else(|| {
+            json!({
+                "schema": SCHEMA,
+                "id": id,
+                "contentId": content,
+                "kind": kind,
+                "requestedMs": now,
+            })
+        });
+        entry["status"] = Value::String(status.into());
+        entry["method"] = Value::String(method.into());
+        entry["detail"] = Value::String(detail.into());
+        entry["attempts"] = Value::from(entry["attempts"].as_u64().unwrap_or(0).max(attempts));
+        entry["leadThreadId"] = Value::String(run.lead_thread.clone());
+        entry["runGeneration"] = Value::String(generation.into());
+        entry["session"] = Value::String(session.into());
+        entry["slot"] = Value::from(slot);
+        entry["owner"] = Value::String(owner.into());
+        if status == STATUS_DELIVERED {
+            entry["deliveredMs"] = Value::from(now);
+        }
+        entry["recordedMs"] = Value::from(now);
+        match messages
+            .iter()
+            .position(|message| message["id"].as_str() == Some(id))
+        {
+            Some(index) => messages[index] = entry,
+            None => messages.push(entry),
+        }
+        document["leadMessages"] = Value::Array(messages);
+        Ok(())
+    })?;
+    if kind == KIND_REQUEST {
+        write_reply_index(&run.receipt, id)?;
+    }
+    Ok(())
+}
+
+/// One lead-message attempt as the command reports and records it: the honest
+/// delivery class, how it was submitted, how many rounds were sent and the
+/// bounded evidence behind the class.
+struct LeadAttempt {
+    status: &'static str,
+    method: String,
+    attempts: u64,
+    detail: String,
+}
+
+/// The one bounded receipt of one lead-message attempt. The status is an honest
+/// class - delivered (observed in the lead conversation's own items), queued
+/// (accepted by the native transport, not yet observed), error (the native
+/// endpoint refused; nothing was delivered) or indeterminate (the request may
+/// or may not have been applied) - and is never presented as the lead having
+/// acted on the message.
+fn report_lead_message(
+    run: &SpawnedRun,
+    id: &str,
+    kind: &str,
+    attempt: &LeadAttempt,
+    payload_bytes: usize,
+    note: Option<String>,
+) -> io::Result<i32> {
+    let mut out = io::stdout();
+    writeln!(out, "lead message: {}", attempt.status)?;
+    writeln!(out, "id: {id}")?;
+    writeln!(out, "kind: {kind}")?;
+    writeln!(out, "owner: {}", run.owner)?;
+    writeln!(out, "runGeneration: {}", run.generation)?;
+    writeln!(out, "session: {}", run.session)?;
+    writeln!(out, "checkout: {}", run.checkout)?;
+    writeln!(out, "worktree: {}", run.worktree)?;
+    writeln!(out, "slot: {}", run.slot)?;
+    writeln!(out, "leadThreadId: {}", run.lead_thread)?;
+    writeln!(out, "assignment: {}", run.assignment)?;
+    writeln!(out, "bd: {}", run.bd)?;
+    writeln!(
+        out,
+        "method: {}",
+        if attempt.method.is_empty() {
+            "unrecorded"
+        } else {
+            attempt.method.as_str()
+        }
+    )?;
+    writeln!(out, "attempts: {}", attempt.attempts)?;
+    writeln!(out, "payloadBytes: {payload_bytes}")?;
+    if kind == KIND_REQUEST {
+        writeln!(
+            out,
+            "reply: codex-harness executor message --reply-to {id} --text TEXT"
+        )?;
+    } else {
+        writeln!(out, "reply: not-requested")?;
+    }
+    writeln!(out, "detail: {}", attempt.detail)?;
+    if let Some(note) = note {
+        writeln!(out, "{note}")?;
+    }
+    Ok(match attempt.status {
+        STATUS_ERROR | STATUS_INDETERMINATE => 1,
+        _ => 0,
+    })
+}
+
+/// A recorded delivery stands on its own evidence: a repeat of it is reported
+/// without connecting to the lead endpoint and without sending anything, so it
+/// cannot be delivered twice even after the lead session stopped listening.
+fn report_recorded_lead_repeat(
+    run: &SpawnedRun,
+    id: &str,
+    kind: &str,
+    previous: &Value,
+    payload_bytes: usize,
+) -> io::Result<i32> {
+    let attempt = LeadAttempt {
+        status: STATUS_DELIVERED,
+        method: previous["method"].as_str().unwrap_or_default().to_owned(),
+        attempts: previous["attempts"].as_u64().unwrap_or(0),
+        detail: previous["detail"].as_str().unwrap_or_default().to_owned(),
+    };
+    report_lead_message(
+        run,
+        id,
+        kind,
+        &attempt,
+        payload_bytes,
+        Some(
+            "nothing was sent again: the same literal text addressed to the same lead conversation is one input, so a repeat cannot deliver it twice".to_owned(),
+        ),
+    )
+}
+
+/// Nothing is sent again while an earlier attempt of the same message may be in
+/// the lead conversation: its identity is reconciled with the conversation's
+/// own items first. Observed evidence upgrades the recorded attempt to
+/// delivered, words the native transport already accepted stay one input, and
+/// an attempt whose fate is unknown stays unresolved under its own identity, so
+/// an uncertain retry can neither deliver a second copy nor drop the hold.
+fn reconcile_recorded_lead(
+    run: &SpawnedRun,
+    endpoint: &Endpoint,
+    id: &str,
+    kind: &str,
+    content: &str,
+    envelope: &str,
+    payload: &str,
+    previous: &Value,
+) -> io::Result<i32> {
+    let status = recorded_status(previous).to_owned();
+    let method = previous["method"].as_str().unwrap_or_default().to_owned();
+    let attempts = previous["attempts"].as_u64().unwrap_or(0);
+    let detail = previous["detail"].as_str().unwrap_or_default().to_owned();
+    if status == STATUS_DELIVERED {
+        return report_recorded_lead_repeat(run, id, kind, previous, payload.len());
+    }
+    let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
+        invalid(&format!(
+            "the recorded lead endpoint did not accept a connection: {error}; nothing was sent and no second conversation was started"
+        ))
+    })?;
+    let thread = conversation.thread_state().map_err(|error| {
+        invalid(&format!(
+            "the recorded lead thread could not be read: {error}; nothing was sent"
+        ))
+    })?;
+    if thread["id"].as_str() != Some(run.lead_thread.as_str()) {
+        return Err(invalid(&format!(
+            "the live lead conversation is not originating thread {}; nothing was sent",
+            run.lead_thread
+        )));
+    }
+    let evidence = observe_input(
+        &mut conversation,
+        id,
+        envelope,
+        Instant::now() + EVIDENCE_WINDOW,
+    );
+    if let Some(evidence) = evidence {
+        let detail = format!(
+            "the input is in the lead conversation's own items ({}); the recorded attempt was upgraded from {status} by that evidence, and whether the lead applied it is the lead's own report",
+            evidence.detail()
+        );
+        record_lead_message(
+            run,
+            id,
+            kind,
+            content,
+            &method,
+            STATUS_DELIVERED,
+            &detail,
+            attempts,
+        )?;
+        let attempt = LeadAttempt {
+            status: STATUS_DELIVERED,
+            method,
+            attempts,
+            detail,
+        };
+        return report_lead_message(
+            run,
+            id,
+            kind,
+            &attempt,
+            payload.len(),
+            Some(
+                "nothing was sent: the earlier attempt is in the lead conversation, so the same words cannot be delivered twice".to_owned(),
+            ),
+        );
+    }
+    match status.as_str() {
+        STATUS_QUEUED => {
+            let attempt = LeadAttempt {
+                status: STATUS_QUEUED,
+                method,
+                attempts,
+                detail,
+            };
+            report_lead_message(
+                run,
+                id,
+                kind,
+                &attempt,
+                payload.len(),
+                Some(
+                    "nothing was sent again: the native transport accepted the earlier attempt, which is in the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly".to_owned(),
+                ),
+            )
+        }
+        // A pending attempt stopped before its outcome was recorded, and an
+        // indeterminate one lost its answer: both may or may not have reached
+        // the lead, so the recorded identity stays unresolved and the repeat is
+        // refused rather than risking a second copy.
+        _ => {
+            let detail = format!(
+                "the earlier attempt ({method}) is recorded as {status} and the lead conversation's own items do not show it, so whether it reached the lead is unknown"
+            );
+            record_lead_message(
+                run,
+                id,
+                kind,
+                content,
+                &method,
+                STATUS_INDETERMINATE,
+                &detail,
+                attempts,
+            )?;
+            let attempt = LeadAttempt {
+                status: STATUS_INDETERMINATE,
+                method,
+                attempts,
+                detail,
+            };
+            report_lead_message(
+                run,
+                id,
+                kind,
+                &attempt,
+                payload.len(),
+                Some(
+                    "nothing was sent again: an earlier attempt of this exact text may already be in the lead conversation, so a repeat could deliver it twice. Next action: inspect the lead conversation; if the words are genuinely absent, send them again with a distinguishing first line".to_owned(),
+                ),
+            )
+        }
+    }
+}
+
 fn deliver_to_recorded_lead(
     run: &SpawnedRun,
     endpoint: &Endpoint,
     id: &str,
     kind: &str,
+    content: &str,
     envelope: &str,
     payload: &str,
+    previous: Option<&Value>,
 ) -> io::Result<i32> {
+    if let Some(previous) = previous {
+        return reconcile_recorded_lead(
+            run, endpoint, id, kind, content, envelope, payload, previous,
+        );
+    }
     let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
         invalid(&format!(
             "the recorded lead endpoint did not accept a connection: {error}; nothing was sent and no second conversation was started"
@@ -1946,116 +2401,134 @@ fn deliver_to_recorded_lead(
             run.lead_thread
         )));
     }
+    // The attempt is recorded before the request, so an invocation that is
+    // interrupted mid-request leaves its identity behind instead of an
+    // invitation to deliver the same words again.
+    record_lead_message(
+        run,
+        id,
+        kind,
+        content,
+        "",
+        STATUS_PENDING,
+        "the input is being submitted to the lead conversation and its own items are being read",
+        0,
+    )?;
     let mut sent_method = String::new();
-    let mut outcome = None;
+    let mut sent = 0u64;
+    let mut refused = String::new();
+    let mut outcome: Option<LeadAttempt> = None;
     for _ in 0..DELIVERY_ROUNDS {
         let active = active_turn(&thread);
         let (method, params) = request_params(&run.lead_thread, id, envelope, &active);
         sent_method = method.to_owned();
+        sent += 1;
         match conversation.request(method, params) {
             Ok(control::Reply::Result(result)) => {
+                let turn = answer_turn(&result);
                 let evidence = observe_input(
                     &mut conversation,
                     id,
                     envelope,
                     Instant::now() + EVIDENCE_WINDOW,
                 );
-                outcome = Some(if evidence.is_some() {
-                    "delivered"
-                } else {
-                    let _ = answer_turn(&result);
-                    "queued"
+                // Transport acceptance is never delivery; only the lead
+                // conversation's own items are.
+                outcome = Some(match evidence {
+                    Some(evidence) => LeadAttempt {
+                        status: STATUS_DELIVERED,
+                        method: sent_method.clone(),
+                        attempts: sent,
+                        detail: format!(
+                            "the input is in the lead conversation's own items ({}); whether the lead applied it is the lead's own report",
+                            evidence.detail()
+                        ),
+                    },
+                    // An acceptance without a turn identity leaves the input's
+                    // fate to the conversation's own items, exactly like an
+                    // answer that never arrived.
+                    None if turn.is_empty() => LeadAttempt {
+                        status: STATUS_INDETERMINATE,
+                        method: sent_method.clone(),
+                        attempts: sent,
+                        detail: format!(
+                            "{method} answered without a turn identity, so which turn holds the input is unknown"
+                        ),
+                    },
+                    None => LeadAttempt {
+                        status: STATUS_QUEUED,
+                        method: sent_method.clone(),
+                        attempts: sent,
+                        detail: format!(
+                            "accepted by {method} for turn {turn}; the lead conversation's own items do not show the input yet"
+                        ),
+                    },
                 });
                 break;
             }
-            Ok(control::Reply::Rejected(_)) => match conversation.thread_state() {
-                Ok(refreshed) if refreshed["id"].as_str() == Some(run.lead_thread.as_str()) => {
-                    thread = refreshed;
+            Ok(control::Reply::Rejected(error)) => {
+                refused = observation::excerpt(&error.to_string(), 400);
+                match conversation.thread_state() {
+                    Ok(refreshed) if refreshed["id"].as_str() == Some(run.lead_thread.as_str()) => {
+                        thread = refreshed;
+                    }
+                    Err(error) => {
+                        outcome = Some(LeadAttempt {
+                            status: STATUS_ERROR,
+                            method: sent_method.clone(),
+                            attempts: sent,
+                            detail: format!(
+                                "{method} was refused ({refused}) and the lead conversation could not be re-read: {error}; nothing was delivered"
+                            ),
+                        });
+                        break;
+                    }
+                    Ok(_) => {
+                        outcome = Some(LeadAttempt {
+                            status: STATUS_ERROR,
+                            method: sent_method.clone(),
+                            attempts: sent,
+                            detail: format!(
+                                "{method} was refused ({refused}) and the recorded lead conversation is no longer the live one; nothing was delivered"
+                            ),
+                        });
+                        break;
+                    }
                 }
-                _ => {
-                    outcome = Some("error");
-                    break;
-                }
-            },
+            }
             Ok(control::Reply::Unanswered) | Err(_) => {
-                outcome = Some("indeterminate");
+                outcome = Some(LeadAttempt {
+                    status: STATUS_INDETERMINATE,
+                    method: sent_method.clone(),
+                    attempts: sent,
+                    detail: format!(
+                        "{method} was not answered within {}s, so whether the input reached the lead conversation is unknown",
+                        CONTROL_BOUND.as_secs()
+                    ),
+                });
                 break;
             }
         }
     }
-    let status = outcome.unwrap_or("error");
+    let attempt = outcome.unwrap_or(LeadAttempt {
+        status: STATUS_ERROR,
+        method: sent_method.clone(),
+        attempts: sent,
+        detail: format!(
+            "{sent_method} was refused in every delivery round ({refused}); nothing was delivered"
+        ),
+    });
     record_lead_message(
-        &run.receipt,
+        run,
         id,
         kind,
-        &sent_method,
-        status,
-        &run.lead_thread,
+        content,
+        &attempt.method,
+        attempt.status,
+        &attempt.detail,
+        attempt.attempts,
     )?;
-    let mut out = io::stdout();
-    writeln!(out, "lead message: {status}")?;
-    writeln!(out, "id: {id}")?;
-    writeln!(out, "kind: {kind}")?;
-    writeln!(out, "owner: {}", run.owner)?;
-    writeln!(out, "runGeneration: {}", run.generation)?;
-    writeln!(out, "session: {}", run.session)?;
-    writeln!(out, "checkout: {}", run.checkout)?;
-    writeln!(out, "worktree: {}", run.worktree)?;
-    writeln!(out, "slot: {}", run.slot)?;
-    writeln!(out, "leadThreadId: {}", run.lead_thread)?;
-    writeln!(out, "assignment: {}", run.assignment)?;
-    writeln!(out, "bd: {}", run.bd)?;
-    writeln!(out, "method: {sent_method}")?;
-    writeln!(out, "payloadBytes: {}", payload.len())?;
-    if kind == KIND_REQUEST {
-        writeln!(
-            out,
-            "reply: codex-harness executor message --reply-to {id} --text TEXT"
-        )?;
-    } else {
-        writeln!(out, "reply: not-requested")?;
-    }
-    Ok(if status == "error" || status == "indeterminate" {
-        1
-    } else {
-        0
-    })
-}
-
-fn record_lead_message(
-    receipt: &Path,
-    id: &str,
-    kind: &str,
-    method: &str,
-    status: &str,
-    lead_thread: &str,
-) -> io::Result<()> {
-    let current = read_receipt_value(receipt)?;
-    let generation = current["originatingLead"]["runGeneration"]
-        .as_str()
-        .unwrap_or("unavailable");
-    let session = current["observation"]["session"]
-        .as_str()
-        .unwrap_or("unavailable");
-    let owner = current["slot"]["owner"].as_str().unwrap_or("unavailable");
-    let slot = current["slot"]["index"].as_u64().unwrap_or(0);
-    let mut messages = recorded_lead_messages(receipt)?;
-    messages.push(json!({
-        "id": id,
-        "kind": kind,
-        "method": method,
-        "status": status,
-        "leadThreadId": lead_thread,
-        "runGeneration": generation,
-        "session": session,
-        "slot": slot,
-        "owner": owner,
-    }));
-    observation::update_receipt_field(receipt, "leadMessages", Value::Array(messages))?;
-    if kind == KIND_REQUEST {
-        write_reply_index(receipt, id)?;
-    }
-    Ok(())
+    report_lead_message(run, id, kind, &attempt, payload.len(), None)
 }
 
 /// Address fields supplied beside `--reply-to`. A present field that does not
