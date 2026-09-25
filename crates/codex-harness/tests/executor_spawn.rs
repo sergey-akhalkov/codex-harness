@@ -1673,7 +1673,7 @@ fn lead_start_reports_its_options_and_refuses_unusable_ones() {
     assert!(help.status.success(), "{text}");
     assert!(text.contains("codex-harness lead start"), "{text}");
     assert!(text.contains("codex-harness lead message"), "{text}");
-    assert!(text.contains("harness/lead-endpoints"), "{text}");
+    assert!(text.contains("kit-local endpoint"), "{text}");
 
     let usage = lead_command()
         .args(["lead", "start", "--help"])
@@ -1682,7 +1682,8 @@ fn lead_start_reports_its_options_and_refuses_unusable_ones() {
     let text = output_text(&usage);
     assert!(usage.status.success(), "{text}");
     assert!(text.contains("--session THREAD_ID"), "{text}");
-    assert!(text.contains("native agent capability"), "{text}");
+    assert!(text.contains("--exec PROMPT"), "{text}");
+    assert!(text.contains("after the frontend attaches"), "{text}");
 
     let bad = lead_command()
         .args(["lead", "start", "--profile", "ds"])

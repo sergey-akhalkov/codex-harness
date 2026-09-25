@@ -158,11 +158,12 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 /// endpoint of its own. `lead message` is the other direction and keeps its
 /// own usage beside it.
 const LEAD_START_USAGE: &str = "\
-codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID]
+codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT]
   Host the configured lead profile in this terminal via one native app-server/TUI.
   The exact thread records a kit-local endpoint inherited by executors from its shells;
   lead message reaches it. Resume the exact THREAD_ID after its endpoint ends. Native
-  routing and cwd stay unchanged; no daemon or second conversation.
+  routing and cwd stay unchanged; no daemon or second conversation. PROMPT is
+  submitted only after the frontend attaches.
 ";
 
 /// `codex-harness lead`: the lead side of the executor exchange.
@@ -211,6 +212,8 @@ struct LeadStart {
     /// The exact existing conversation to resume, when this launch continues
     /// one instead of creating a new thread.
     session: Option<String>,
+    /// Optional first turn, submitted only after the native frontend attaches.
+    prompt: Option<String>,
 }
 
 fn lead_start(args: &[OsString]) -> io::Result<i32> {
@@ -261,6 +264,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
     let mut source = None;
     let mut codex_home = None;
     let mut session = None;
+    let mut prompt = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
@@ -273,6 +277,15 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
             "--source" => source = Some(PathBuf::from(value)),
             "--codex-home" => codex_home = Some(PathBuf::from(value)),
             "--session" => session = Some(option_text(value)?),
+            "--exec" => {
+                let text = option_text(value)?;
+                if text.trim().is_empty() {
+                    return Err(invalid(
+                        "lead start --exec needs the first prompt for this conversation",
+                    ));
+                }
+                prompt = Some(text);
+            }
             _ => return Err(invalid(&invalid_lead_option(key))),
         }
     }
@@ -297,6 +310,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
         source,
         codex_home,
         session,
+        prompt,
     };
     // An identity that cannot name a registry record is refused before any
     // process, listener or conversation exists.
@@ -313,7 +327,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
 
 fn invalid_lead_option(key: &str) -> String {
     format!(
-        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY and --session THREAD_ID only"
+        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID and --exec PROMPT only"
     )
 }
 
@@ -384,6 +398,16 @@ fn host_lead_session(
     };
     let thread = conversation.thread_id().to_owned();
     let (frontend, registry) = expose_lead_conversation(&plan, request, &title, &mut conversation)?;
+    if let Some(prompt) = request.prompt.as_deref()
+        && let Err(error) = conversation.assign(prompt)
+    {
+        let _ = frontend.close();
+        let _ = control::retire_lead_endpoint(&request.codex_home, &thread);
+        retire_lead_session_files(&plan);
+        return Err(invalid(&format!(
+            "the managed lead conversation did not accept its first prompt: {error}"
+        )));
+    }
     note_log(
         &plan.paths.log,
         &format!(
@@ -5895,7 +5919,7 @@ mod tests {
             message.contains("invalid lead start option --thread"),
             "{message}"
         );
-        for name in ["--source", "--codex-home", "--session"] {
+        for name in ["--source", "--codex-home", "--session", "--exec"] {
             assert!(message.contains(name), "{message}");
         }
         let missing = lead_start(&[OsString::from("--session")]).unwrap_err();
@@ -5905,12 +5929,12 @@ mod tests {
                 .contains("invalid lead start option --session"),
             "{missing}"
         );
-        // The usage a lead reads names the command, the resume option and where
-        // its endpoint is recorded, without a bearer or a thread identity.
+        // The usage a lead reads names the command and both continuation
+        // inputs without a bearer or a thread identity.
         assert!(LEAD_START_USAGE.contains("codex-harness lead start"));
         assert!(LEAD_START_USAGE.contains("--session THREAD_ID"));
-        assert!(LEAD_START_USAGE.contains("harness/lead-endpoints"));
-        assert!(LEAD_START_USAGE.contains("native agent capability"));
+        assert!(LEAD_START_USAGE.contains("--exec PROMPT"));
+        assert!(LEAD_START_USAGE.contains("after the frontend attaches"));
         assert!(lead_start(&[OsString::from("--help")]).is_ok());
         // The title a managed conversation carries names its profile and the
         // checkout it works in, exactly as an executor title names its owner.
