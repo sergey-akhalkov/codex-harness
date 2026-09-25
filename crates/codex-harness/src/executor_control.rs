@@ -1960,16 +1960,39 @@ fn final_message_for(thread: &Value, turn_id: Option<&str>) -> FinalMessage {
 
 const RECEIPT_LOCK_WAIT: Duration = Duration::from_secs(5);
 
-/// Same hold record the observation owner reads. Kept here because this file
-/// is also compiled alone by the control fixture tests.
+/// Same hold record the observation owner reads, including an unanswered
+/// `leadMessages` reply-request. Kept here because this file is also compiled
+/// alone by the control fixture tests.
 fn unresolved_reply_hold(receipt: &Value) -> bool {
-    let Some(requests) = receipt.get("replyRequests").and_then(Value::as_array) else {
+    reply_request_hold(receipt.get("replyRequests"))
+        || lead_message_hold(receipt.get("leadMessages"))
+}
+
+/// `replyRequests` is the explicit hold record. A missing field is not a hold.
+fn reply_request_hold(requests: Option<&Value>) -> bool {
+    let Some(requests) = requests.and_then(Value::as_array) else {
         return false;
     };
     requests.iter().any(|request| {
         request.get("status").and_then(Value::as_str) == Some("unresolved")
             && request.get("kind").and_then(Value::as_str) != Some("notify")
             && request.get("requiresReply").and_then(Value::as_bool) != Some(false)
+    })
+}
+
+/// `lead message` writes `leadMessages`, not `replyRequests`. A reply-request
+/// that was not refused and not resolved is the same hold. A notification is not.
+fn lead_message_hold(messages: Option<&Value>) -> bool {
+    let Some(messages) = messages.and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message.get("kind").and_then(Value::as_str) == Some("reply-request")
+            && message.get("requiresReply").and_then(Value::as_bool) != Some(false)
+            && !matches!(
+                message.get("status").and_then(Value::as_str),
+                Some("resolved" | "error" | "refused")
+            )
     })
 }
 
