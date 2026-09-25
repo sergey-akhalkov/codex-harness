@@ -10,6 +10,11 @@
 //! brief carries the actual checkout, the committed base and the exact
 //! relative paths together with the executor's own work cycle and the compact
 //! evidence result the consumer expects back.
+//!
+//! This module owns the installed exchange guidance for both dispatch paths:
+//! the structured brief renders it with the declared consumer, and a free-text
+//! assignment receives the identical rule, so the lead channel, its waiting
+//! behavior and the board-first rule are stated once instead of per caller.
 
 use serde::Deserialize;
 use std::{
@@ -43,6 +48,54 @@ pub const STANDING_ESCALATIONS: [&str; 4] = [
     "missing authority or access",
     "a concrete dependency you cannot obtain",
 ];
+
+/// The one escalation channel every assignment names. The installed command
+/// addresses the originating lead itself, so no recipient, slot, session,
+/// checkout or endpoint is discovered, supplied or taught here.
+pub const LEAD_CHANNEL_COMMAND: &str = "codex-harness lead message";
+
+/// What one question costs and how it is answered: the run stays live and
+/// independent work continues, so no polling loop, keep-alive ritual or resume
+/// is needed to wait. One owner for this wording, so the structured brief and
+/// the free-text assignment teach the same rule.
+const WAITING_RULE: &str = "An unanswered request keeps the run, session and worktree available while it waits for the reply - no polling, keep-alive loop or resume - and independent authorized work may continue. An executor watch result of 3 means answer that request; it is not completion, failure or a resume trigger.\n";
+
+/// The standing boundaries every assignment carries, without the declared
+/// additions.
+fn standing_escalations() -> Vec<String> {
+    STANDING_ESCALATIONS.map(str::to_owned).to_vec()
+}
+
+/// The escalation rule that precedes the boundary list: the single installed
+/// command, its default reply request and its no-reply notice form, when asking
+/// is justified at all, and what stays with the executor and the bd board.
+fn lead_channel_heading(consumer: &str) -> String {
+    format!(
+        "escalate to {consumer} through {LEAD_CHANNEL_COMMAND} --text '...' (or --file FILE for literal UTF-8), the installed command that addresses the originating lead itself and needs no recipient, slot, session or endpoint supplied; it asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours, and durable blockers, decisions and results stay on the bd issue"
+    )
+}
+
+/// Renders the escalation rule, its boundary list and the waiting rule that
+/// every newly dispatched or continued executor receives, whether it was
+/// dispatched as free text or as a structured assignment. Escalation stays
+/// exceptional: routine progress, repeated status and ordinary implementation
+/// errors belong to the executor.
+fn push_lead_channel(text: &mut String, consumer: &str, escalations: &[String]) {
+    push_list(text, &lead_channel_heading(consumer), escalations);
+    text.push_str(WAITING_RULE);
+}
+
+/// The free-text assignment one session receives: the caller's own text stays
+/// first and literal, and the installed guidance follows it, so a free-text
+/// caller does not have to restate the rule by hand. Resume and restart render
+/// through this same function, and a restart keeps the text it recorded, so no
+/// path needs a second copy of the guidance.
+pub fn free_text_brief(text: &str) -> String {
+    let mut rendered = text.trim_end().to_owned();
+    rendered.push_str("\n\n");
+    push_lead_channel(&mut rendered, DEFAULT_CONSUMER, &standing_escalations());
+    rendered
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,7 +212,7 @@ impl Assignment {
 pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Result<String> {
     assignment.validate_paths(context.checkout)?;
     let consumer = consumer_text(assignment);
-    let mut escalations = STANDING_ESCALATIONS.map(str::to_owned).to_vec();
+    let mut escalations = standing_escalations();
     escalations.extend(
         assignment
             .escalate
@@ -186,13 +239,7 @@ pub fn brief(assignment: &Assignment, context: &AssignmentContext<'_>) -> io::Re
     );
     push_list(&mut text, "invariants", &assignment.invariants);
     push_list(&mut text, "acceptance", &assignment.acceptance);
-    push_list(
-        &mut text,
-        &format!(
-            "escalate to {consumer} (everything else, including ordinary implementation errors, is yours to resolve)"
-        ),
-        &escalations,
-    );
+    push_lead_channel(&mut text, consumer, &escalations);
     text.push_str(
         "work cycle (yours): read the declared inputs yourself - source bodies are supplied only when reading is unavailable - investigate the current source and callers before editing, implement the outcome you own, run the applicable checks through the real entry point, then correct your own local errors and repeat.\n",
     );
@@ -460,6 +507,21 @@ mod tests {
         Assignment::load(&path).unwrap()
     }
 
+    /// The escalation wording this change replaces. The rule must replace it
+    /// rather than grow beside it, so the renderer keeps no copy.
+    const SUPERSEDED_ESCALATION_HEADING: &str = "escalate to {consumer} (everything else, including ordinary implementation errors, is yours to resolve)";
+
+    /// The exact rule and waiting behavior an assignment must render. The
+    /// acceptance for this change is this rendered text, so the expectation is
+    /// literal: a wording change has to update it deliberately.
+    fn expected_lead_channel(consumer: &str) -> String {
+        format!(
+            "escalate to {consumer} through codex-harness lead message --text '...' (or --file FILE for literal UTF-8), the installed command that addresses the originating lead itself and needs no recipient, slot, session or endpoint supplied; it asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours, and durable blockers, decisions and results stay on the bd issue:\n"
+        )
+    }
+
+    const EXPECTED_WAITING_RULE: &str = "An unanswered request keeps the run, session and worktree available while it waits for the reply - no polling, keep-alive loop or resume - and independent authorized work may continue. An executor watch result of 3 means answer that request; it is not completion, failure or a resume trigger.\n";
+
     #[test]
     fn schema_version_fields_and_limits_are_strict() {
         let root = temp_root("strict");
@@ -595,11 +657,14 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("escalate to the lead that dispatched this assignment"),
+            text.contains(&expected_lead_channel(DEFAULT_CONSUMER)),
             "{text}"
         );
         for boundary in STANDING_ESCALATIONS {
-            assert!(text.contains(boundary), "{boundary}\n{text}");
+            assert!(
+                text.contains(&format!("- {boundary}\n")),
+                "{boundary}\n{text}"
+            );
         }
         assert!(
             text.contains("work cycle (yours): read the declared inputs yourself"),
@@ -636,7 +701,7 @@ mod tests {
         assert!(minimal.escalate.is_empty());
         let text = brief(&minimal, &context).unwrap();
         assert!(
-            text.contains("escalate to the lead that dispatched this assignment"),
+            text.contains(&expected_lead_channel(DEFAULT_CONSUMER)),
             "{text}"
         );
         assert!(
@@ -658,7 +723,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("escalate to the lead of epic sample-3mu"),
+            text.contains(&expected_lead_channel("the lead of epic sample-3mu")),
             "{text}"
         );
         assert!(
@@ -741,6 +806,244 @@ mod tests {
             error.contains(&format!("the limit is {MAX_BRIEF_BYTES}")),
             "{error}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The guidance an executor receives must stay a small, bounded addition to
+    /// one fixed payload: this test binds the canonical payload, the rendered
+    /// size and the replacement of the superseded escalation wording, so the
+    /// instruction-size report can be reproduced from the source.
+    #[test]
+    fn one_fixed_payload_keeps_the_rendered_guidance_concise() {
+        let root = std::env::temp_dir().join("executor-assignment-measure-fixed");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for input in [
+            "openspec/changes/sample/design.md",
+            "crates/sample/src/first.rs",
+            "crates/sample/src/second.rs",
+            "crates/sample/tests/first.rs",
+        ] {
+            let path = root.join(input);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "// declared input\n").unwrap();
+        }
+        let document = serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "objective": "Implement the structured-renderer half of sample change 9.9: add concise installed guidance to generated structured assignment briefs and leave the free-text renderer to the other worker.",
+            "inputs": [
+                "openspec/changes/sample/design.md",
+                "crates/sample/src/first.rs",
+                "crates/sample/src/second.rs",
+                "crates/sample/tests/first.rs"
+            ],
+            "outputs": ["crates/sample/src/first.rs"],
+            "invariants": [
+                "Rendered structured briefs must concisely explain the sample command, its default reply request, its notice switch, automatic waiting with no keep-alive or polling, independent work, board ownership, and the answer-required watch result.",
+                "Guidance is exceptional only: material ambiguity, an authority or access boundary, or an unresolvable dependency after investigation; ordinary implementation errors and routine progress stay off-channel.",
+                "Do not teach address discovery, receipt editing, process identity checks, resume rituals, recursive delegation or re-enabling native agent tools.",
+                "Keep the addition within MAX_BRIEF_BYTES and replace superseded wording rather than appending a second workflow where possible.",
+                "Do not edit the free-text renderer: another worker owns it and the free-text half remains for lead integration."
+            ],
+            "acceptance": [
+                "Existing and new assignment tests prove the exact rendered guidance, limits, Unicode and default consumer behavior.",
+                "cargo fmt --all -- --check passes.",
+                "codex-harness heavy -- cargo test --locked -p codex-harness executor_assignment --jobs 1 -- --test-threads=1 passes."
+            ]
+        }))
+        .unwrap();
+        let assignment = checked_in(&root, "assignment.json", &document);
+        let text = brief(
+            &assignment,
+            &AssignmentContext {
+                checkout: &root,
+                base: "d01df098da47c0d87e5f6268210ab1f2401e152d",
+                owner: "exec-measure",
+                source: &root,
+            },
+        )
+        .unwrap();
+        let guidance = format!(
+            "{}{}",
+            expected_lead_channel(DEFAULT_CONSUMER),
+            EXPECTED_WAITING_RULE
+        );
+        println!("CANONICAL_BRIEF_BYTES {}", text.len());
+        println!("CANONICAL_GUIDANCE_BYTES {}", guidance.len());
+        assert!(
+            text.len() <= MAX_BRIEF_BYTES,
+            "the canonical brief is {} bytes",
+            text.len()
+        );
+        assert!(
+            guidance.len() <= 1024,
+            "the added guidance is {} bytes; keep it concise",
+            guidance.len()
+        );
+        assert!(
+            !text.contains(SUPERSEDED_ESCALATION_HEADING),
+            "the superseded escalation wording is replaced, not kept beside the rule: {text}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The guidance a real dispatch renders: the one lead command, its default
+    /// reply request and its notice form, when asking is justified, what stays
+    /// with the executor, and the waiting rule that removes every keep-alive
+    /// ritual - with no address, process or resume mechanics taught beside it.
+    #[test]
+    fn the_rendered_guidance_names_the_lead_channel_and_nothing_else() {
+        let root = temp_root("guidance");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let assignment = checked_in(
+            &root,
+            "assignment.json",
+            &document("Ship the outcome", &["input.txt"], &[]),
+        );
+        let text = brief(
+            &assignment,
+            &AssignmentContext {
+                checkout: &root,
+                base: "0123456789abcdef0123456789abcdef01234567",
+                owner: "exec-ds-7",
+                source: &root,
+            },
+        )
+        .unwrap();
+        let start = text.find("escalate to").expect("the rule is rendered");
+        let end = text
+            .find("work cycle (yours)")
+            .expect("the executor's cycle follows the rule");
+        let rendered = &text[start..end];
+        assert_eq!(rendered.matches("escalate to").count(), 1, "{rendered}");
+        assert!(
+            rendered.starts_with(&expected_lead_channel(DEFAULT_CONSUMER)),
+            "{rendered}"
+        );
+        assert!(rendered.ends_with(EXPECTED_WAITING_RULE), "{rendered}");
+        for required in [
+            "codex-harness lead message",
+            "--text '...'",
+            "--file FILE for literal UTF-8",
+            "asks for a reply unless --notify marks a notice that needs none",
+            "after investigating the available facts",
+            "a material ambiguity, or an authority/access boundary",
+            "ordinary implementation errors and routine progress, is yours",
+            "durable blockers, decisions and results stay on the bd issue",
+            "no polling, keep-alive loop or resume",
+            "independent authorized work may continue",
+            "An executor watch result of 3 means answer that request",
+        ] {
+            assert!(rendered.contains(required), "{required}\n{rendered}");
+        }
+        // The rule is the whole workflow: nothing teaches recipient or session
+        // discovery, receipt editing, process identity checks, a resume ritual,
+        // recursive delegation or re-enabling the native agent tools.
+        for forbidden in [
+            "--session",
+            "CODEX_",
+            "PID",
+            "endpoint-",
+            "turn/steer",
+            "executor spawn",
+            "sub-agent",
+            "agent tool",
+            "receipt",
+            "reply-to",
+        ] {
+            assert!(!rendered.contains(forbidden), "{forbidden}\n{rendered}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Free text is a supported dispatch path, so it receives the identical
+    /// rule: the caller's text stays first and literal and the same block
+    /// follows it. One owner for the wording means the structured brief and a
+    /// free-text assignment cannot drift into two workflows.
+    #[test]
+    fn free_text_and_structured_assignments_teach_one_guidance_rule() {
+        let literal = "Réparer le contrat - keep 'quoted' text and --notify literal, суммарный контроль\nsecond line";
+        let free = free_text_brief(literal);
+        assert!(free.starts_with(literal), "{free}");
+        let mut block = expected_lead_channel(DEFAULT_CONSUMER);
+        for boundary in STANDING_ESCALATIONS {
+            block.push_str(&format!("- {boundary}\n"));
+        }
+        block.push_str(EXPECTED_WAITING_RULE);
+        assert!(free.contains(&block), "{free}");
+        assert_eq!(free.matches("escalate to").count(), 1, "{free}");
+
+        // The same rendered block reaches the structured path, so an executor
+        // cannot receive two versions of the rule.
+        let root = temp_root("one-rule");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let assignment = checked_in(
+            &root,
+            "assignment.json",
+            &document("Ship the outcome", &["input.txt"], &[]),
+        );
+        let structured = brief(
+            &assignment,
+            &AssignmentContext {
+                checkout: &root,
+                base: "0123456789abcdef0123456789abcdef01234567",
+                owner: "exec-ds-7",
+                source: &root,
+            },
+        )
+        .unwrap();
+        assert!(structured.contains(&block), "{structured}");
+        // A caller's trailing blank line is dropped instead of being rendered
+        // into the rule; nothing else about the text is rewritten.
+        let padded = free_text_brief("do the work\n\n");
+        assert!(padded.starts_with("do the work\n"), "{padded}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every limit is a byte limit. These two documents hold the same number of
+    /// characters per item; the multibyte one is refused for its bytes while
+    /// its ASCII twin renders, so the budget cannot be mistaken for characters.
+    #[test]
+    fn multibyte_assignment_content_is_measured_in_bytes() {
+        let root = temp_root("multibyte");
+        fs::write(root.join("input.txt"), "input\n").unwrap();
+        let context = AssignmentContext {
+            checkout: &root,
+            base: "0123456789abcdef0123456789abcdef01234567",
+            owner: "exec-ds-7",
+            source: &root,
+        };
+        let items = 60;
+        let mut wide = checked_in(
+            &root,
+            "wide.json",
+            &document("Ship the outcome", &["input.txt"], &[]),
+        );
+        wide.invariants = vec!["é".repeat(200); items];
+        assert_eq!(wide.invariants[0].chars().count(), 200);
+        assert!(wide.invariants[0].len() <= MAX_ITEM_BYTES);
+        let error = brief(&wide, &context).unwrap_err().to_string();
+        assert!(
+            error.contains("the rendered assignment brief is"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("the limit is {MAX_BRIEF_BYTES}")),
+            "{error}"
+        );
+
+        let mut ascii = checked_in(
+            &root,
+            "ascii.json",
+            &document("Ship the outcome", &["input.txt"], &[]),
+        );
+        ascii.invariants = vec!["x".repeat(200); items];
+        assert_eq!(ascii.invariants[0].chars().count(), 200);
+        let text = brief(&ascii, &context).unwrap();
+        assert!(text.len() <= MAX_BRIEF_BYTES, "{}", text.len());
+        for boundary in STANDING_ESCALATIONS {
+            assert!(text.contains(boundary), "{boundary}\n{text}");
+        }
         let _ = fs::remove_dir_all(root);
     }
 }
