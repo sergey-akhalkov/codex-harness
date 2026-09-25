@@ -291,14 +291,17 @@ Resume retains partial work. Free text remains supported.
 For an existing pool slot, `codex-harness executor assignment --source CHECKOUT
 --slot N --base REV --assignment FILE` validates/renders without allocating,
 resetting, writing or launching a conversation. Normal dispatch still uses the
-installed profile and visible terminal contract.
+installed profile. Omitting `--mode` selects the native TUI; explicit
+`--mode exec` is the inline presentation on the same lifecycle.
 
 The observed lifecycle of dispatched sessions is a native command, not a log
 search: `codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY
 --slot N` (or `--receipt FILE`) blocks on the receipt's recorded lifecycle and
-prints bounded review data, and `codex-harness executor run --file RECEIPT` is
-the tab/console host that renders the native `exec --json` stream readably
-while recording it. States, exit codes and the resume identity rules live in
+prints bounded review data. `--receipt` must be an absolute path.
+`codex-harness executor run --file RECEIPT` is the tab or console host: it
+attaches the native TUI, inline when spawn selected exec, and records that
+lifecycle rather than launching an unobserved `codex exec`. States, exit codes,
+automatic closure and exact-session resume are in
 [agent delegation](agent-delegation.md#observed-executor-lifecycle).
 
 A live run is then addressed and controlled through its recorded identity:

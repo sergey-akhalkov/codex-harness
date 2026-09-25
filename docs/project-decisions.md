@@ -549,7 +549,7 @@ host-local and out of Git. The consuming item keeps every vote, merge and route
 comment as history, so promotion never deletes evidence. This resolves the
 design.md open question for OFAP task 3.2.
 
-**2026-09-20, confirmed:** executor assignments run in `codex exec` mode
+**2026-09-20, confirmed (presentation superseded 2026-09-25):** executor assignments run in `codex exec` mode
 inside a visible terminal tab by default: the output streams while the
 executor works, the process exits on completion and the tab closes itself, so
 finished tabs never linger and the lead has no manual close step. Corrections
@@ -559,6 +559,8 @@ Prompt-level `/goal` prefixes are not used for spawned executors: the CLI has
 no argv goal hook, so such a prefix is inert text; crash recovery is owned by
 the lead's watcher plus exact-session resume. Interactive `--mode tui` remains
 available for human-attended executors.
+
+**2026-09-25, confirmed (supersedes the 2026-09-20 text-default choice):** pooled `executor spawn`, `resume` and `restart` present the native Codex TUI by default. Explicit `spawn --mode exec` is the native inline TUI on that same observed lifecycle, not an unobserved launcher. Watch, automatic closure and exact-session `executor resume` stay the current path, and the 2026-09-24 tab-close policy still applies. Operating detail: [observed executor lifecycle](agent-delegation.md#observed-executor-lifecycle). Change: [add observed executor TUI](../openspec/changes/add-observed-executor-tui/proposal.md).
 
 **2026-09-24, confirmed:** a failed executor tab closes too. Windows Terminal's
 graceful close-on-exit was leaving the tab open after a non-zero host exit,
