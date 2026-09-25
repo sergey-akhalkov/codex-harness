@@ -1365,6 +1365,613 @@ fn report_error(
     Ok(1)
 }
 
+/// Usage for `codex-harness lead message`. No recipient, slot, session,
+/// checkout, or lead address is accepted.
+pub(crate) const LEAD_USAGE: &str = "\
+codex-harness lead message (--text TEXT | --file FILE) [--notify]
+  Send one literal payload to the originating lead of this spawned run.
+  The caller supplies no recipient, slot, session, checkout, or lead address.
+  The default kind is reply-request. --notify does not request a reply.
+";
+
+const PAYLOAD_MARK: &str = "\n---payload---\n";
+const KIND_REQUEST: &str = "reply-request";
+const KIND_NOTICE: &str = "notification";
+const UNAVAILABLE: &str = "unavailable";
+
+struct LeadInput {
+    text: Option<String>,
+    file: Option<PathBuf>,
+    notify: bool,
+}
+
+struct SpawnedRun {
+    receipt: PathBuf,
+    lead_thread: String,
+    generation: String,
+    owner: String,
+    session: String,
+    checkout: String,
+    worktree: String,
+    slot: u32,
+    assignment: String,
+    bd: String,
+}
+
+/// Sends one payload from a verified member of a live spawned run to that
+/// run's recorded originating lead. Authority is the run-generation marker,
+/// the live dispatcher identity, and membership in the recorded host's process
+/// lineage. A copied marker, cwd, label, or most recent session is not
+/// authority. Delivery uses the existing app-server owner: `turn/steer` on an
+/// active turn and `turn/start` on an idle thread. No listener is started.
+pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!("{LEAD_USAGE}");
+        return Ok(0);
+    }
+    let input = parse_lead_input(args)?;
+    let run = resolve_spawned_run()?;
+    let endpoint = verified_lead_endpoint(&run)?;
+    let payload = lead_payload(&input)?;
+    let kind = if input.notify {
+        KIND_NOTICE
+    } else {
+        KIND_REQUEST
+    };
+    let nonce = recorded_lead_messages(&run.receipt)?.len() as u64 + 1;
+    let id = lead_message_id(&run.generation, kind, nonce, &payload);
+    let reply = if input.notify {
+        "not-requested".to_owned()
+    } else {
+        format!("codex-harness executor message --reply-to {id} --text TEXT")
+    };
+    let header = json!({
+        "id": id,
+        "kind": kind,
+        "owner": run.owner,
+        "runGeneration": run.generation,
+        "session": run.session,
+        "checkout": run.checkout,
+        "worktree": run.worktree,
+        "slot": run.slot,
+        "leadThreadId": run.lead_thread,
+        "assignment": run.assignment,
+        "bd": run.bd,
+        "reply": reply,
+    });
+    let header = serde_json::to_string(&header).map_err(|error| {
+        invalid(&format!(
+            "lead message header could not be encoded: {error}; nothing was sent"
+        ))
+    })?;
+    let envelope = format!("{header}{PAYLOAD_MARK}{payload}");
+    if envelope.len() as u64 > MAX_TEXT {
+        return Err(invalid(&format!(
+            "lead message exceeds the {MAX_TEXT}-byte bound; nothing was sent"
+        )));
+    }
+    deliver_to_recorded_lead(&run, &endpoint, &id, kind, &envelope, &payload)
+}
+
+fn parse_lead_input(args: &[OsString]) -> io::Result<LeadInput> {
+    let mut text = None;
+    let mut file = None;
+    let mut notify = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| lead_override("an option was not Unicode"))?;
+        match key {
+            "--notify" => notify = true,
+            "--text" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| invalid("--text needs its literal TEXT; nothing was sent"))?;
+                text = Some(option_text(value)?);
+            }
+            "--file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| invalid("--file needs its FILE; nothing was sent"))?;
+                file = Some(PathBuf::from(value));
+            }
+            "--help" => {
+                return Err(lead_override(
+                    "--help cannot be combined with another argument",
+                ));
+            }
+            _ => return Err(lead_override(key)),
+        }
+    }
+    match (&text, &file) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "give either --text TEXT or --file FILE, not both; nothing was sent",
+            ));
+        }
+        (None, None) => {
+            return Err(invalid(
+                "a lead message needs its literal content: --text TEXT or --file FILE; nothing was sent",
+            ));
+        }
+        _ => {}
+    }
+    Ok(LeadInput { text, file, notify })
+}
+
+fn lead_override(what: &str) -> io::Error {
+    invalid(&format!(
+        "lead message accepts only --text, --file, or --notify; a recipient, slot, session, checkout, or lead override is not accepted ({what}); refusing before any send"
+    ))
+}
+
+fn lead_payload(input: &LeadInput) -> io::Result<String> {
+    let text = match (&input.text, &input.file) {
+        (Some(text), None) => text.clone(),
+        (None, Some(file)) => read_message_file(file)?,
+        _ => {
+            return Err(invalid(
+                "a lead message needs exactly one of --text or --file; nothing was sent",
+            ));
+        }
+    };
+    if text.is_empty() {
+        return Err(invalid(
+            "the message is empty; nothing would be delivered; nothing was sent",
+        ));
+    }
+    if text.len() as u64 > MAX_TEXT {
+        return Err(invalid(&format!(
+            "lead message exceeds the {MAX_TEXT}-byte bound; nothing was sent"
+        )));
+    }
+    Ok(text)
+}
+
+fn resolve_spawned_run() -> io::Result<SpawnedRun> {
+    let marker = std::env::var(control::EXECUTOR_RUN_ENV).map_err(|_| {
+        invalid(
+            "not a member of a live spawned executor run: HARNESS_EXECUTOR_RUN is missing; cwd, a label, and the most recent session are not authority; refusing before any send",
+        )
+    })?;
+    let marker = marker.trim();
+    if marker.is_empty() {
+        return Err(invalid(
+            "not a member of a live spawned executor run: HARNESS_EXECUTOR_RUN is blank; a copied marker is not authority; refusing before any send",
+        ));
+    }
+    let home = std::env::var_os("CODEX_HOME").ok_or_else(|| {
+        invalid(
+            "spawned run context is missing: CODEX_HOME is not set, so the run marker cannot name a recorded lead; refusing before any send",
+        )
+    })?;
+    let matches = matching_receipts(Path::new(&home), marker)?;
+    let receipt = match matches.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            return Err(invalid(
+                "no live spawned run records this run generation; a copied or stale marker is not authority; refusing before any send",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "this run generation matches more than one spawned run; refusing before any send",
+            ));
+        }
+    };
+    let value = read_receipt_value(&receipt)?;
+    let lead: control::OriginatingLead = serde_json::from_value(value["originatingLead"].clone())
+        .map_err(|error| {
+        invalid(&format!(
+            "recorded originating lead is not usable: {error}; refusing before any send"
+        ))
+    })?;
+    if lead.run_generation != marker {
+        return Err(invalid(
+            "recorded run generation does not match the caller marker; refusing before any send",
+        ));
+    }
+    require_live(
+        lead.dispatcher.pid,
+        lead.dispatcher.creation_time,
+        &lead.dispatcher.program,
+        "stale sender: the recorded dispatcher is not the live dispatching process",
+    )?;
+    let host: observation::HostIdentity =
+        serde_json::from_value(value["observation"]["host"].clone()).map_err(|error| {
+            invalid(&format!(
+                "the spawned run records no host identity: {error}; refusing before any send"
+            ))
+        })?;
+    require_live(
+        host.pid,
+        host.created,
+        &host.program,
+        "stale sender: the recorded host is not live",
+    )?;
+    if !caller_in_lineage(host.pid) {
+        return Err(invalid(
+            "caller is not in the spawned run's process lineage; a copied marker, sibling, or unrelated process is not a member of this run; refusing before any send",
+        ));
+    }
+    let slot = value["slot"]["index"]
+        .as_u64()
+        .ok_or_else(|| invalid("the spawned run records no slot; refusing before any send"))?;
+    let slot = u32::try_from(slot).map_err(|_| {
+        invalid("the spawned run records a slot that is not an index; refusing before any send")
+    })?;
+    Ok(SpawnedRun {
+        receipt,
+        lead_thread: lead.thread_id,
+        generation: lead.run_generation,
+        owner: registered_text(&value["slot"]["owner"]),
+        session: registered_text(&value["observation"]["session"]),
+        checkout: registered_text(&value["slot"]["source"]),
+        worktree: registered_text(&value["slot"]["path"]),
+        slot,
+        assignment: registered_text(&value["assignmentId"]),
+        bd: registered_text(&value["bd"]),
+    })
+}
+
+fn registered_text(value: &Value) -> String {
+    value
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(UNAVAILABLE)
+        .to_owned()
+}
+
+fn matching_receipts(home: &Path, marker: &str) -> io::Result<Vec<PathBuf>> {
+    let root = home.join("harness/executor-pool");
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for checkout in fs::read_dir(&root)? {
+        let checkout = checkout?;
+        if !checkout.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(checkout.path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("spawn-") && name.ends_with(".json")) {
+                continue;
+            }
+            let Ok(value) = read_receipt_value(&entry.path()) else {
+                continue;
+            };
+            if value["originatingLead"]["runGeneration"].as_str() == Some(marker) {
+                found.push(entry.path());
+                if found.len() > 8 {
+                    return Err(invalid(
+                        "this run generation matches more than one spawned run; refusing before any send",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn read_receipt_value(path: &Path) -> io::Result<Value> {
+    let bytes = fs::read(path).map_err(|error| {
+        invalid(&format!(
+            "spawn receipt {} is unreadable: {error}; refusing before any send",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(&format!(
+            "spawn receipt {} is not JSON: {error}; refusing before any send",
+            path.display()
+        ))
+    })
+}
+
+fn require_live(pid: u32, created: u64, program: &Path, reason: &str) -> io::Result<()> {
+    if pid == 0 || created == 0 || !program.is_file() {
+        return Err(invalid(&format!("{reason}; refusing before any send")));
+    }
+    let user = process_service::current_user().map_err(|error| {
+        invalid(&format!(
+            "{reason}: the caller account is unavailable: {error}; refusing before any send"
+        ))
+    })?;
+    match ServiceProcess::inspect(
+        ProcessIdentity {
+            pid,
+            creation_time: created,
+        },
+        program,
+        &user,
+    ) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(invalid(&format!("{reason}; refusing before any send"))),
+        Err(error) => Err(invalid(&format!(
+            "{reason}: {error}; refusing before any send"
+        ))),
+    }
+}
+
+fn caller_in_lineage(host_pid: u32) -> bool {
+    ancestor_pids().contains(&host_pid)
+}
+
+fn ancestor_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut current = std::process::id();
+    for _ in 0..64 {
+        if current == 0 || pids.contains(&current) {
+            break;
+        }
+        pids.push(current);
+        let Some(parent) = parent_process_id(current) else {
+            break;
+        };
+        current = parent;
+    }
+    pids
+}
+
+fn parent_process_id(pid: u32) -> Option<u32> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        peb_base_address: *mut std::ffi::c_void,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+    type NtQuery = unsafe extern "system" fn(
+        windows_sys::Win32::Foundation::HANDLE,
+        u32,
+        *mut std::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+    let ntdll = unsafe { GetModuleHandleW(windows_sys::core::w!("ntdll.dll")) };
+    if ntdll.is_null() {
+        return None;
+    }
+    let symbol = unsafe { GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast()) }?;
+    let query =
+        unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, NtQuery>(symbol) };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut basic = ProcessBasicInformation {
+        exit_status: 0,
+        peb_base_address: std::ptr::null_mut(),
+        affinity_mask: 0,
+        base_priority: 0,
+        unique_process_id: 0,
+        inherited_from_unique_process_id: 0,
+    };
+    let mut used = 0u32;
+    let status = unsafe {
+        query(
+            handle,
+            0,
+            (&mut basic as *mut ProcessBasicInformation).cast(),
+            size_of::<ProcessBasicInformation>() as u32,
+            &mut used,
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if status != 0 {
+        return None;
+    }
+    u32::try_from(basic.inherited_from_unique_process_id).ok()
+}
+
+fn verified_lead_endpoint(run: &SpawnedRun) -> io::Result<Endpoint> {
+    let path = run
+        .receipt
+        .parent()
+        .ok_or_else(|| fresh_launch(&run.lead_thread, "the receipt has no directory"))?
+        .join(format!("lead-endpoint-{}.json", run.slot));
+    let endpoint = match Endpoint::read(&path) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(fresh_launch(
+                &run.lead_thread,
+                "no lead-endpoint record exists beside the spawn receipt",
+            ));
+        }
+        Err(error) => {
+            return Err(invalid(&format!(
+                "recorded lead endpoint {} is not usable: {error}; nothing was sent and no daemon, listener, or second conversation was started",
+                path.display()
+            )));
+        }
+    };
+    if endpoint.thread_id.as_deref() != Some(run.lead_thread.as_str()) {
+        return Err(invalid(&format!(
+            "recorded lead endpoint names a different thread than originating lead {}; refusing before any send",
+            run.lead_thread
+        )));
+    }
+    let Some(process) = endpoint.process.as_ref() else {
+        return Err(fresh_launch(
+            &run.lead_thread,
+            "the endpoint record names no process",
+        ));
+    };
+    require_live(
+        process.pid,
+        process.creation_time,
+        &process.program,
+        "no verified lead endpoint is recorded: its process is not live",
+    )
+    .map_err(|_| {
+        fresh_launch(
+            &run.lead_thread,
+            "the recorded endpoint process is not live",
+        )
+    })?;
+    Ok(endpoint)
+}
+
+fn fresh_launch(thread: &str, reason: &str) -> io::Error {
+    invalid(&format!(
+        "no verified lead endpoint is recorded for originating lead thread {thread}: {reason}. Ordinary leads expose no delivery endpoint. This command does not start a daemon, listener, or second conversation. Next action: fresh-launch the lead session so this same thread records a verified app-server endpoint, then dispatch the executor again. Nothing was sent"
+    ))
+}
+
+fn lead_message_id(generation: &str, kind: &str, nonce: u64, payload: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(generation.as_bytes());
+    hasher.update([0]);
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(nonce.to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(payload.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("lead-{hex}")
+}
+
+fn recorded_lead_messages(receipt: &Path) -> io::Result<Vec<Value>> {
+    let value = read_receipt_value(receipt)?;
+    Ok(value["leadMessages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn deliver_to_recorded_lead(
+    run: &SpawnedRun,
+    endpoint: &Endpoint,
+    id: &str,
+    kind: &str,
+    envelope: &str,
+    payload: &str,
+) -> io::Result<i32> {
+    let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
+        invalid(&format!(
+            "the recorded lead endpoint did not accept a connection: {error}; nothing was sent and no second conversation was started"
+        ))
+    })?;
+    let mut thread = conversation.thread_state().map_err(|error| {
+        invalid(&format!(
+            "the recorded lead thread could not be read: {error}; nothing was sent"
+        ))
+    })?;
+    if thread["id"].as_str() != Some(run.lead_thread.as_str()) {
+        return Err(invalid(&format!(
+            "the live lead conversation is not originating thread {}; nothing was sent",
+            run.lead_thread
+        )));
+    }
+    let mut sent_method = String::new();
+    let mut outcome = None;
+    for _ in 0..DELIVERY_ROUNDS {
+        let active = active_turn(&thread);
+        let (method, params) = request_params(&run.lead_thread, id, envelope, &active);
+        sent_method = method.to_owned();
+        match conversation.request(method, params) {
+            Ok(control::Reply::Result(result)) => {
+                let evidence = observe_input(
+                    &mut conversation,
+                    id,
+                    envelope,
+                    Instant::now() + EVIDENCE_WINDOW,
+                );
+                outcome = Some(if evidence.is_some() {
+                    "delivered"
+                } else {
+                    let _ = answer_turn(&result);
+                    "queued"
+                });
+                break;
+            }
+            Ok(control::Reply::Rejected(_)) => match conversation.thread_state() {
+                Ok(refreshed) if refreshed["id"].as_str() == Some(run.lead_thread.as_str()) => {
+                    thread = refreshed;
+                }
+                _ => {
+                    outcome = Some("error");
+                    break;
+                }
+            },
+            Ok(control::Reply::Unanswered) | Err(_) => {
+                outcome = Some("indeterminate");
+                break;
+            }
+        }
+    }
+    let status = outcome.unwrap_or("error");
+    record_lead_message(
+        &run.receipt,
+        id,
+        kind,
+        &sent_method,
+        status,
+        &run.lead_thread,
+    )?;
+    let mut out = io::stdout();
+    writeln!(out, "lead message: {status}")?;
+    writeln!(out, "id: {id}")?;
+    writeln!(out, "kind: {kind}")?;
+    writeln!(out, "owner: {}", run.owner)?;
+    writeln!(out, "runGeneration: {}", run.generation)?;
+    writeln!(out, "session: {}", run.session)?;
+    writeln!(out, "checkout: {}", run.checkout)?;
+    writeln!(out, "worktree: {}", run.worktree)?;
+    writeln!(out, "slot: {}", run.slot)?;
+    writeln!(out, "leadThreadId: {}", run.lead_thread)?;
+    writeln!(out, "assignment: {}", run.assignment)?;
+    writeln!(out, "bd: {}", run.bd)?;
+    writeln!(out, "method: {sent_method}")?;
+    writeln!(out, "payloadBytes: {}", payload.len())?;
+    if kind == KIND_REQUEST {
+        writeln!(
+            out,
+            "reply: codex-harness executor message --reply-to {id} --text TEXT"
+        )?;
+    } else {
+        writeln!(out, "reply: not-requested")?;
+    }
+    Ok(if status == "error" || status == "indeterminate" {
+        1
+    } else {
+        0
+    })
+}
+
+fn record_lead_message(
+    receipt: &Path,
+    id: &str,
+    kind: &str,
+    method: &str,
+    status: &str,
+    lead_thread: &str,
+) -> io::Result<()> {
+    let mut messages = recorded_lead_messages(receipt)?;
+    messages.push(json!({
+        "id": id,
+        "kind": kind,
+        "method": method,
+        "status": status,
+        "leadThreadId": lead_thread,
+    }));
+    observation::update_receipt_field(receipt, "leadMessages", Value::Array(messages))
+}
+
 fn report_indeterminate(
     request: &Request,
     receipt: &Path,

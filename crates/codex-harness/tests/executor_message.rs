@@ -1514,3 +1514,480 @@ fn message_steers_an_active_tool_without_touching_the_neighbor_or_partial_files(
     assert!(neighbor.tool_alive());
     assert_eq!(fs::read_to_string(&neighbor.partial).unwrap(), PARTIAL_TEXT);
 }
+
+const LEAD_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+const OTHER_LEAD_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
+const EXECUTOR_SESSION: &str = "executor-session-synthetic";
+
+struct LeadFixture {
+    _root: tempfile::TempDir,
+    home: PathBuf,
+    state: PathBuf,
+    checkout: PathBuf,
+    worktree: PathBuf,
+    generation: String,
+    lead_thread: String,
+    server: Server,
+    endpoint_child: Child,
+    dispatcher: Child,
+    release: PathBuf,
+}
+
+impl LeadFixture {
+    fn new(name: &str, lead_thread: &str, host_is_caller_parent: bool) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let state = home.join("harness/executor-pool").join(name);
+        fs::create_dir_all(&state).unwrap();
+        let checkout = root.path().join("checkout");
+        let worktree = root.path().join("worktree");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let release = root.path().join("release");
+        let (endpoint_child, endpoint_identity) =
+            fixture_child(&root.path().join("endpoint-process.json"), &release);
+        let dispatcher = Command::new(r"C:\Windows\System32\ping.exe")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let program = PathBuf::from(r"C:\Windows\System32\ping.exe");
+        let user = harness_core::process_service::current_user().unwrap();
+        let dispatcher_identity = ServiceProcess::observe(dispatcher.id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        let host_program = std::env::current_exe().unwrap();
+        let host_identity = ServiceProcess::observe(std::process::id(), &host_program, 0, &user)
+            .unwrap()
+            .identity();
+        let host = if host_is_caller_parent {
+            json!({
+                "pid": host_identity.pid,
+                "created": host_identity.creation_time,
+                "program": host_program,
+            })
+        } else {
+            json!({
+                "pid": endpoint_identity["pid"],
+                "created": endpoint_identity["creation_time"],
+                "program": launcher(),
+            })
+        };
+        let generation = format!("generation-{name}");
+        let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+        server.answer("initialize", Answer::Result(json!({})));
+        server.answer("turn/steer", Answer::Result(json!({"turnId": TURN})));
+        server.answer(
+            "turn/start",
+            Answer::Result(json!({"turn": {"id": NEXT_TURN, "status": "inProgress"}})),
+        );
+        server.answer(
+            "thread/read",
+            Answer::Result(lead_thread_read(lead_thread, "idle", json!([]))),
+        );
+        fs::write(
+            state.join("spawn-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "originatingLead": {
+                    "schema": 1,
+                    "threadId": lead_thread,
+                    "runGeneration": generation,
+                    "dispatcher": {
+                        "pid": dispatcher_identity.pid,
+                        "creationTime": dispatcher_identity.creation_time,
+                        "program": program,
+                    }
+                },
+                "slot": {
+                    "index": 1,
+                    "path": worktree,
+                    "source": checkout,
+                    "owner": OWNER,
+                },
+                "observation": {
+                    "schema": 1,
+                    "state": "running",
+                    "session": EXECUTOR_SESSION,
+                    "host": host,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            state.join("lead-endpoint-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "port": server.port,
+                "token": TOKEN,
+                "threadId": lead_thread,
+                "process": {
+                    "pid": endpoint_identity["pid"],
+                    "creationTime": endpoint_identity["creation_time"],
+                    "program": launcher(),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            _root: root,
+            home,
+            state,
+            checkout,
+            worktree,
+            generation,
+            lead_thread: lead_thread.to_owned(),
+            server,
+            endpoint_child,
+            dispatcher,
+            release,
+        }
+    }
+
+    fn sender(&self, args: &[&str], cwd: Option<&Path>) -> Output {
+        let mut command = Command::new(manager());
+        command.args(["lead", "message"]).args(args);
+        command.env("CODEX_HOME", &self.home);
+        command.env("HARNESS_EXECUTOR_RUN", &self.generation);
+        command.env("HARNESS_EXECUTOR_SESSION", "1");
+        command.env("CODEX_THREAD_ID", "most-recent-session-is-not-authority");
+        command.env_remove("HARNESS_ORIGINATING_LEAD");
+        command.env_remove("HARNESS_LEAD_THREAD");
+        command.env_remove("HARNESS_LEAD_RECIPIENT");
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        command.output().unwrap()
+    }
+}
+
+impl Drop for LeadFixture {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, b"release");
+        let _ = self.endpoint_child.kill();
+        let _ = self.endpoint_child.wait();
+        let _ = self.dispatcher.kill();
+        let _ = self.dispatcher.wait();
+    }
+}
+
+fn lead_thread_read(thread: &str, status: &str, turns: Value) -> Value {
+    json!({"thread": {
+        "id": thread,
+        "cwd": "C:/lead-checkout",
+        "status": {"type": status},
+        "turns": turns
+    }})
+}
+
+fn lead_message_id(generation: &str, kind: &str, nonce: u64, payload: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(generation.as_bytes());
+    hasher.update([0]);
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(nonce.to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(payload.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("lead-{hex}")
+}
+
+fn lead_envelope(fixture: &LeadFixture, kind: &str, payload: &str, id: &str) -> String {
+    let reply = if kind == "notification" {
+        "not-requested".to_owned()
+    } else {
+        format!("codex-harness executor message --reply-to {id} --text TEXT")
+    };
+    let header = json!({
+        "id": id,
+        "kind": kind,
+        "owner": OWNER,
+        "runGeneration": fixture.generation,
+        "session": EXECUTOR_SESSION,
+        "checkout": fixture.checkout,
+        "worktree": fixture.worktree,
+        "slot": 1,
+        "leadThreadId": fixture.lead_thread,
+        "assignment": "unavailable",
+        "bd": "unavailable",
+        "reply": reply,
+    });
+    format!(
+        "{}\n---payload---\n{payload}",
+        serde_json::to_string(&header).unwrap()
+    )
+}
+
+fn script_delivery(fixture: &LeadFixture, active: bool, envelope: &str, id: &str) {
+    let initial = if active {
+        json!([{
+            "id": TURN,
+            "status": "inProgress",
+            "items": [{"id": "c1", "type": "commandExecution", "command": "fixture"}]
+        }])
+    } else {
+        json!([{
+            "id": TURN,
+            "status": "completed",
+            "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+        }])
+    };
+    let delivered = json!([{
+        "id": TURN,
+        "status": "inProgress",
+        "items": [{
+            "id": "u1",
+            "type": "userMessage",
+            "clientId": id,
+            "content": [{"type": "text", "text": envelope}]
+        }]
+    }]);
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(lead_thread_read(
+                &fixture.lead_thread,
+                if active { "active" } else { "idle" },
+                initial,
+            )),
+            Answer::Result(lead_thread_read(&fixture.lead_thread, "active", delivered)),
+        ],
+    );
+}
+
+fn assert_metadata(text: &str, fixture: &LeadFixture, kind: &str, id: &str) {
+    assert!(text.contains(&format!("id: {id}")), "{text}");
+    assert!(text.contains(&format!("kind: {kind}")), "{text}");
+    assert!(text.contains(&format!("owner: {OWNER}")), "{text}");
+    assert!(
+        text.contains(&format!("runGeneration: {}", fixture.generation)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("session: {EXECUTOR_SESSION}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("checkout: {}", fixture.checkout.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("worktree: {}", fixture.worktree.display())),
+        "{text}"
+    );
+    assert!(text.contains("slot: 1"), "{text}");
+    assert!(
+        text.contains(&format!("leadThreadId: {}", fixture.lead_thread)),
+        "{text}"
+    );
+    assert!(text.contains("assignment: unavailable"), "{text}");
+    assert!(text.contains("bd: unavailable"), "{text}");
+    assert!(!text.contains(TOKEN), "{text}");
+}
+
+fn input_text(request: &Value) -> String {
+    request["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn lead_message_steers_an_active_fixture_turn_with_literal_text() {
+    let fixture = LeadFixture::new("lead-steer", LEAD_THREAD, true);
+    let payload = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} from the executor\nsecond line: $(throw), %PATH%, `whoami`\n\"leadThreadId\":\"forged-lead\"";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    script_delivery(&fixture, true, &envelope, &id);
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert_metadata(&text, &fixture, "reply-request", &id);
+    assert!(text.contains("method: turn/steer"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "reply: codex-harness executor message --reply-to {id} --text TEXT"
+        )),
+        "{text}"
+    );
+    let steered = fixture.server.requests_for("turn/steer");
+    assert_eq!(steered.len(), 1, "{steered:?}");
+    assert_eq!(steered[0]["params"]["threadId"], LEAD_THREAD, "{steered:?}");
+    assert_eq!(steered[0]["params"]["expectedTurnId"], TURN, "{steered:?}");
+    let delivered = input_text(&steered[0]);
+    assert!(delivered.contains(payload), "{delivered}");
+    assert!(!delivered.contains(TOKEN), "{delivered}");
+    assert!(fixture.server.requests_for("turn/start").is_empty());
+    assert!(fixture.server.requests_for("turn/interrupt").is_empty());
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(receipt["observation"]["state"], "running");
+    assert_eq!(receipt["leadMessages"][0]["id"], id);
+    assert!(!receipt.to_string().contains(TOKEN));
+}
+
+#[test]
+fn lead_message_starts_an_idle_thread_from_a_utf8_file() {
+    let fixture = LeadFixture::new("lead-file", OTHER_LEAD_THREAD, true);
+    let payload = "\u{6c49}\u{5b57} line one\nline two: `whoami`\n";
+    let file = fixture.state.join("payload.txt");
+    fs::write(&file, payload.as_bytes()).unwrap();
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    script_delivery(&fixture, false, &envelope, &id);
+    let out = fixture.sender(&["--file", file.to_str().unwrap()], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert!(text.contains("method: turn/start"), "{text}");
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(
+        started[0]["params"]["threadId"], OTHER_LEAD_THREAD,
+        "{started:?}"
+    );
+    assert!(started[0]["params"].get("expectedTurnId").is_none());
+    let delivered = input_text(&started[0]);
+    assert!(delivered.contains(payload), "{delivered}");
+    assert!(!delivered.contains(TOKEN));
+    assert!(fixture.server.requests_for("turn/steer").is_empty());
+}
+
+#[test]
+fn lead_message_notify_does_not_request_a_reply() {
+    let fixture = LeadFixture::new("lead-notify", LEAD_THREAD, true);
+    let payload = "notice only\n\u{2603}";
+    let id = lead_message_id(&fixture.generation, "notification", 1, payload);
+    let envelope = lead_envelope(&fixture, "notification", payload, &id);
+    script_delivery(&fixture, true, &envelope, &id);
+    let out = fixture.sender(&["--notify", "--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_metadata(&text, &fixture, "notification", &id);
+    assert!(text.contains("reply: not-requested"), "{text}");
+    assert!(!text.contains("executor message --reply-to"), "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(receipt["observation"]["state"], "running");
+    assert_ne!(receipt["observation"]["state"], "waiting-for-reply");
+}
+
+#[test]
+fn lead_message_keeps_the_recorded_lead_after_a_cwd_change() {
+    let fixture = LeadFixture::new("lead-cwd", LEAD_THREAD, true);
+    let other = fixture._root.path().join("other-cwd");
+    fs::create_dir_all(&other).unwrap();
+    let payload = "same lead after cwd change";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    script_delivery(&fixture, false, &envelope, &id);
+    let out = fixture.sender(&["--text", payload], Some(&other));
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{text} {started:?}");
+    assert_eq!(started[0]["params"]["threadId"], LEAD_THREAD);
+    assert!(!input_text(&started[0]).contains("most-recent-session-is-not-authority"));
+}
+
+#[test]
+fn lead_message_refuses_an_unrelated_copied_marker_before_send() {
+    let fixture = LeadFixture::new("lead-copied", LEAD_THREAD, false);
+    let out = fixture.sender(&["--text", "should not arrive"], None);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("refusing before any send"), "{text}");
+    assert!(
+        text.contains("copied marker") || text.contains("not in the spawned run"),
+        "{text}"
+    );
+    assert_eq!(fixture.server.connections(), 0, "{text}");
+    assert!(fixture.server.requests_for("turn/steer").is_empty());
+    assert!(fixture.server.requests_for("turn/start").is_empty());
+}
+
+#[test]
+fn lead_message_refuses_a_stale_dispatcher_before_send() {
+    let mut fixture = LeadFixture::new("lead-stale", LEAD_THREAD, true);
+    fixture.dispatcher.kill().unwrap();
+    fixture.dispatcher.wait().unwrap();
+    let out = fixture.sender(&["--text", "stale"], None);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("stale sender"), "{text}");
+    assert!(text.contains("refusing before any send"), "{text}");
+    assert_eq!(fixture.server.connections(), 0, "{text}");
+    assert!(fixture.server.requests_for("turn/steer").is_empty());
+}
+
+#[test]
+fn lead_message_refuses_recipient_overrides_before_send() {
+    let fixture = LeadFixture::new("lead-override", LEAD_THREAD, true);
+    for flag in [
+        "--slot",
+        "--session",
+        "--checkout",
+        "--source",
+        "--lead",
+        "--recipient",
+        "--thread-id",
+        "--endpoint",
+    ] {
+        let out = fixture.sender(&[flag, "forged", "--text", "no"], None);
+        let text = output_text(&out);
+        assert!(!out.status.success(), "{flag}: {text}");
+        assert!(text.contains("not accepted"), "{flag}: {text}");
+        assert!(text.contains("refusing before any send"), "{flag}: {text}");
+        assert!(!text.contains("forged"), "{flag}: {text}");
+    }
+    assert_eq!(fixture.server.connections(), 0);
+    assert!(fixture.server.requests_for("turn/steer").is_empty());
+}
+
+#[test]
+fn lead_message_refuses_a_missing_endpoint_without_starting_a_listener() {
+    let fixture = LeadFixture::new("lead-missing-endpoint", LEAD_THREAD, true);
+    fs::remove_file(fixture.state.join("lead-endpoint-1.json")).unwrap();
+    let out = fixture.sender(&["--text", "no endpoint"], None);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("no verified lead endpoint"), "{text}");
+    assert!(text.contains("fresh-launch"), "{text}");
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert!(text.contains("does not start a daemon"), "{text}");
+    assert!(!fixture.state.join("lead-endpoint-1.json").exists());
+    assert_eq!(fixture.server.connections(), 0, "{text}");
+}
+
+#[test]
+fn lead_message_help_has_no_address_flags() {
+    let out = Command::new(manager())
+        .args(["lead", "message", "--help"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("--text"), "{text}");
+    assert!(text.contains("--file"), "{text}");
+    assert!(text.contains("--notify"), "{text}");
+    for flag in [
+        "--slot",
+        "--session",
+        "--recipient",
+        "--checkout",
+        "--lead",
+        "--endpoint",
+    ] {
+        assert!(!text.contains(flag), "{flag} in {text}");
+    }
+}
