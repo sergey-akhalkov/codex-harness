@@ -1979,17 +1979,21 @@ fn lead_message_refuses_an_unrelated_copied_marker_before_send() {
 }
 
 #[test]
-fn lead_message_refuses_a_stale_dispatcher_before_send() {
-    let mut fixture = LeadFixture::new("lead-stale", LEAD_THREAD, true);
+fn lead_message_survives_a_dead_dispatcher_while_its_host_lineage_is_live() {
+    let mut fixture = LeadFixture::new("dead-dispatcher", LEAD_THREAD, true);
     fixture.dispatcher.kill().unwrap();
     fixture.dispatcher.wait().unwrap();
-    let out = fixture.sender(&["--text", "stale"], None);
+    let payload = "question after the spawn command exited";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    script_delivery(&fixture, false, &envelope, &id);
+    let out = fixture.sender(&["--text", payload], None);
     let text = output_text(&out);
-    assert!(!out.status.success(), "{text}");
-    assert!(text.contains("stale sender"), "{text}");
-    assert!(text.contains("refusing before any send"), "{text}");
-    assert_eq!(fixture.server.connections(), 0, "{text}");
-    assert!(fixture.server.requests_for("turn/steer").is_empty());
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{text} {started:?}");
+    assert_eq!(started[0]["params"]["threadId"], LEAD_THREAD, "{started:?}");
 }
 
 #[test]
@@ -2634,35 +2638,6 @@ fn reply_to_refuses_unknown_retired_reused_and_contradictory_addresses_before_se
     );
     assert_refused_before_send(&other_lead, "another lead", &run.fixture);
 
-    let endpoint: Value = serde_json::from_slice(
-        &fs::read(
-            run.fixture
-                .receipt
-                .parent()
-                .unwrap()
-                .join("endpoint-1.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    run.rewrite_receipt(|receipt| {
-        receipt["originatingLead"]["dispatcher"] = endpoint["process"].clone();
-    });
-    let copied = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", "copied thread"]);
-    assert_refused_before_send(&copied, "another lead", &run.fixture);
-    run.rewrite_receipt(|receipt| {
-        let program = std::env::current_exe().unwrap();
-        let user = harness_core::process_service::current_user().unwrap();
-        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
-            .unwrap()
-            .identity();
-        receipt["originatingLead"]["dispatcher"] = json!({
-            "pid": identity.pid,
-            "creationTime": identity.creation_time,
-            "program": program,
-        });
-    });
-
     run.rewrite_receipt(|receipt| {
         receipt["originatingLead"]["runGeneration"] = json!("generation-reused");
     });
@@ -3066,6 +3041,30 @@ fn a_reply_delivered_before_a_stop_keeps_its_input_and_a_later_reply_is_refused(
         after["originatingLead"]["threadId"], LEAD_THREAD,
         "the stopped run was reparented: {after}"
     );
+}
+
+#[test]
+fn reply_by_id_uses_the_exact_lead_thread_after_its_dispatcher_exits() {
+    let run = ReplyRoundTrip::new("reply-dead-dispatcher");
+    let id = run.issue("question whose spawn command already exited");
+    run.rewrite_receipt(|receipt| {
+        receipt["originatingLead"]["dispatcher"] = json!({
+            "pid": 4242,
+            "creationTime": 1,
+            "program": r"C:\gone\codex-harness.exe",
+        });
+    });
+    let answer = "answer from the exact lead thread";
+    assert_refused_before_send(
+        &run.reply(OTHER_LEAD_THREAD, &["--reply-to", &id, "--text", answer]),
+        "another lead",
+        &run.fixture,
+    );
+    script_executor_reply(&run.fixture, true, answer);
+    let out = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
 }
 
 #[test]

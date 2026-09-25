@@ -1515,11 +1515,13 @@ struct SpawnedRun {
 }
 
 /// Sends one payload from a verified member of a live spawned run to that
-/// run's recorded originating lead. Authority is the run-generation marker,
-/// the live dispatcher identity, and membership in the recorded host's process
-/// lineage. A copied marker, cwd, label, or most recent session is not
-/// authority. Delivery uses the existing app-server owner: `turn/steer` on an
-/// active turn and `turn/start` on an idle thread. No listener is started.
+/// run's recorded originating lead. Authority is the unique run-generation
+/// receipt, a live recorded host, and membership in that host's process
+/// lineage. The recorded dispatcher is attribution metadata: the short-lived
+/// spawn command legitimately exits after starting the host. A copied marker,
+/// cwd, label, or most recent session is not authority. Delivery uses the
+/// existing app-server owner: `turn/steer` on an active turn and `turn/start`
+/// on an idle thread. No listener is started.
 pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!("{LEAD_USAGE}");
@@ -1716,12 +1718,6 @@ fn resolve_spawned_run() -> io::Result<SpawnedRun> {
             "recorded run generation does not match the caller marker; refusing before any send",
         ));
     }
-    require_live(
-        lead.dispatcher.pid,
-        lead.dispatcher.creation_time,
-        &lead.dispatcher.program,
-        "stale sender: the recorded dispatcher is not the live dispatching process",
-    )?;
     let host: observation::HostIdentity =
         serde_json::from_value(value["observation"]["host"].clone()).map_err(|error| {
             invalid(&format!(
@@ -2683,17 +2679,10 @@ fn verify_calling_lead(lead: &control::OriginatingLead) -> io::Result<()> {
             "another lead cannot use this reply reference; refusing before any send",
         ));
     }
-    require_live(
-        lead.dispatcher.pid,
-        lead.dispatcher.creation_time,
-        &lead.dispatcher.program,
-        "the originating lead is not the live dispatching process",
-    )?;
-    if !caller_in_lineage(lead.dispatcher.pid) {
-        return Err(invalid(
-            "another lead cannot use this reply reference; refusing before any send",
-        ));
-    }
+    // The native thread id is the lead identity. The dispatcher recorded by
+    // spawn is attribution metadata, not a process that must remain alive: a
+    // lead can answer later from a new tool shell that was not descended from
+    // the already-exited spawn command.
     Ok(())
 }
 
