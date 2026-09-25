@@ -7,7 +7,7 @@
 
 - [x] 2.1 Extend the existing dispatch/run identity and environment propagation in `crates/codex-harness/src/executor_cli.rs` and its process/control owners with the verified originating lead and immutable run context. Verify ordinary spawned descendants succeed, cwd changes are harmless, copied markers/references and stale or sibling processes fail, and spawn refuses an unverifiable lead channel before a model request.
 - [x] 2.2 Implement `codex-harness lead message` in the CLI command owner using the selected existing native transport, `--text`/UTF-8 `--file`, default reply-request semantics and optional `--notify`. Verify a minimal actual-native question reaches its exact lead with literal multiline/Unicode content and harness-owned sender/worktree metadata, without exposing credentials or accepting recipient overrides.
-- [ ] 2.3 Extend `crates/codex-harness/src/executor_message.rs` with `--reply-to MESSAGE_ID`, the compact lifecycle-owned lookup and correlated reply delivery. Verify a minimal native round trip needs only the message reference and text, rejects another lead/conflicting addresses/retired references, and preserves the existing fully addressed command behavior.
+- [x] 2.3 Extend `crates/codex-harness/src/executor_message.rs` with `--reply-to MESSAGE_ID`, the compact lifecycle-owned lookup and correlated reply delivery. Verify a minimal native round trip needs only the message reference and text, rejects another lead/conflicting addresses/retired references, and preserves the existing fully addressed command behavior.
 
 ## 3. Preserve waiting and delivery correctness
 
