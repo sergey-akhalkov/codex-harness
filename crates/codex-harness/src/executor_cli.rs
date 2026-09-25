@@ -151,6 +151,21 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
+/// `codex-harness lead message`: a spawned executor sends one payload to the
+/// originating lead recorded for its run. The caller supplies no address.
+pub fn lead(args: &[OsString]) -> io::Result<i32> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        None | Some("--help") => {
+            println!("{}", executor_message::LEAD_USAGE);
+            Ok(0)
+        }
+        Some("message") => executor_message::lead_message(&args[1..]),
+        _ => Err(invalid(
+            "invalid lead command: expected `codex-harness lead message` with --text or --file",
+        )),
+    }
+}
+
 /// Executor sessions are single-agent workers: the kit's dispatch commands
 /// refuse to originate anywhere inside an executor's process tree, so nested
 /// executor conversations cannot be created through the harness. The installed
