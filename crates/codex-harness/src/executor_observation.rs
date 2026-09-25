@@ -1074,25 +1074,47 @@ pub(crate) fn host_ended(host: &HostIdentity) -> bool {
     }
 }
 
-/// Messaging records unresolved required replies on the dispatch receipt.
+/// Messaging records an unresolved required reply on the dispatch receipt.
 /// A native turn that ends while one remains is not a completed run and must
-/// not be closed as an empty-output defect. Absence of the field is no hold.
+/// not be closed as an empty-output defect. Absence of both records is no hold.
 ///
-/// The messaging workflow owns writing this record. An entry retains the run
-/// when `status` is `unresolved`, it is not a notification (`kind` of
-/// `notify`), and `requiresReply` is not false. Watch exit 3 stays with that
-/// workflow; this reader only keeps the base lifecycle from treating the hold
-/// as completion. The control driver keeps an equivalent reader because that
-/// file is also compiled alone by its fixture tests.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `replyRequests` retains the run when `status` is `unresolved`, it is not a
+/// notification (`kind` of `notify`), and `requiresReply` is not false.
+/// `leadMessages` is what `lead message` writes: a `reply-request` that was not
+/// refused and not resolved is the same hold. A notification does not hold.
+/// Watch exit 3 stays with that workflow; this reader only keeps the base
+/// lifecycle from treating the hold as completion. The control driver keeps an
+/// equivalent reader because that file is also compiled alone by its fixture tests.
 pub(crate) fn unresolved_reply_hold(receipt: &Value) -> bool {
-    let Some(requests) = receipt.get("replyRequests").and_then(Value::as_array) else {
+    reply_request_hold(receipt.get("replyRequests"))
+        || lead_message_hold(receipt.get("leadMessages"))
+}
+
+/// `replyRequests` is the explicit hold record. A missing field is not a hold.
+fn reply_request_hold(requests: Option<&Value>) -> bool {
+    let Some(requests) = requests.and_then(Value::as_array) else {
         return false;
     };
     requests.iter().any(|request| {
         request.get("status").and_then(Value::as_str) == Some("unresolved")
             && request.get("kind").and_then(Value::as_str) != Some("notify")
             && request.get("requiresReply").and_then(Value::as_bool) != Some(false)
+    })
+}
+
+/// `lead message` writes `leadMessages`, not `replyRequests`. A reply-request
+/// that was not refused and not resolved is the same hold. A notification is not.
+fn lead_message_hold(messages: Option<&Value>) -> bool {
+    let Some(messages) = messages.and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message.get("kind").and_then(Value::as_str) == Some("reply-request")
+            && message.get("requiresReply").and_then(Value::as_bool) != Some(false)
+            && !matches!(
+                message.get("status").and_then(Value::as_str),
+                Some("resolved" | "error" | "refused")
+            )
     })
 }
 
@@ -2047,6 +2069,47 @@ mod tests {
         let resolved = json!({"replyRequests": [{"id": "q1", "status": "resolved"}]});
         assert!(!unresolved_reply_hold(&resolved));
         assert!(!unresolved_reply_hold(&json!({})));
+        let asked = json!({"leadMessages": [{
+            "id": "lead-asked",
+            "kind": "reply-request",
+            "status": "delivered"
+        }]});
+        assert!(unresolved_reply_hold(&asked));
+        let queued = json!({"leadMessages": [{
+            "id": "lead-queued",
+            "kind": "reply-request",
+            "status": "queued"
+        }]});
+        assert!(unresolved_reply_hold(&queued));
+        let uncertain = json!({"leadMessages": [{
+            "id": "lead-uncertain",
+            "kind": "reply-request",
+            "status": "indeterminate"
+        }]});
+        assert!(unresolved_reply_hold(&uncertain));
+        let lead_notice = json!({"leadMessages": [{
+            "id": "lead-notice",
+            "kind": "notification",
+            "status": "delivered"
+        }]});
+        assert!(!unresolved_reply_hold(&lead_notice));
+        let refused = json!({"leadMessages": [{
+            "id": "lead-refused",
+            "kind": "reply-request",
+            "status": "error"
+        }]});
+        assert!(!unresolved_reply_hold(&refused));
+        let answered = json!({"leadMessages": [{
+            "id": "lead-answered",
+            "kind": "reply-request",
+            "status": "resolved"
+        }]});
+        assert!(!unresolved_reply_hold(&answered));
+        let one_left = json!({"leadMessages": [
+            {"id": "lead-answered", "kind": "reply-request", "status": "resolved"},
+            {"id": "lead-open", "kind": "reply-request", "status": "delivered"}
+        ]});
+        assert!(unresolved_reply_hold(&one_left));
 
         let root = tempfile::tempdir().unwrap();
         let receipt = root.path().join("spawn-1.json");

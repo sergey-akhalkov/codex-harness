@@ -2556,6 +2556,69 @@ fn write_reply_hold(host: &ControlHost, unresolved: bool) {
     fs::write(&host.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
 }
 
+fn write_lead_message(host: &ControlHost, kind: &str, status: &str) {
+    let mut receipt = receipt_json(&host.receipt);
+    receipt["leadMessages"] = json!([{
+        "id": "lead-0123456789abcdef01234567",
+        "kind": kind,
+        "status": status,
+        "method": "turn/steer",
+        "leadThreadId": "01a0c719-f4d4-7880-a9d2-1a96ee0f2301",
+        "session": CONTROL_THREAD,
+        "owner": CONTROL_OWNER,
+        "slot": 1
+    }]);
+    fs::write(&host.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+}
+
+fn reply_on_same_thread(host: &ControlHost) {
+    let endpoint = receipt_json(&host.state.join("endpoint-1.json"));
+    let port = endpoint["port"].as_u64().expect("endpoint port") as u16;
+    let token = endpoint["token"].as_str().expect("endpoint token");
+    assert_eq!(endpoint["threadId"], CONTROL_THREAD);
+    let mut connection =
+        harness_core::task_control::ControlConnection::connect(port, token, Duration::from_secs(5))
+            .expect("the waiting endpoint accepts a reply connection");
+    host.server().answer(
+        "turn/start",
+        control_endpoint::Answer::Result(
+            json!({"turn": {"id": REPLY_TURN, "status": "inProgress"}}),
+        ),
+    );
+    connection
+        .send(
+            &json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "reply", "version": "1"}}
+            }),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let _ = connection.receive(Duration::from_secs(5));
+    connection
+        .send(
+            &json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": {
+                    "threadId": CONTROL_THREAD,
+                    "input": [{"type": "text", "text": "one reply"}]
+                }
+            }),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let answer = connection
+        .receive(Duration::from_secs(5))
+        .expect("reply turn/start answer");
+    assert!(
+        answer.is_some(),
+        "the idle thread did not accept turn/start"
+    );
+    drop(connection);
+}
+
 #[test]
 fn stale_completion_on_resume_does_not_finish_the_current_run() {
     let (host, session) = spawn_managed("stale-resume");
@@ -2885,6 +2948,153 @@ fn unresolved_reply_hold_keeps_the_tui_open_until_one_reply_continues_the_run() 
     let watched_text = text(&watched);
     assert_eq!(watched.status.code(), Some(0), "{watched_text}");
     assert!(watched_text.contains(REPLY_FINAL), "{watched_text}");
+}
+
+#[test]
+fn unanswered_lead_message_keeps_the_same_thread_reply_capable_without_a_model_call() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    let (host, session) = spawn_managed("lead-hold");
+    write_lead_message(&host, "reply-request", "delivered");
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    thread::sleep(Duration::from_millis(1600));
+    let mid = receipt_json(&host.receipt);
+    assert_ne!(mid["observation"]["state"], "completed", "{mid}");
+    assert_ne!(
+        mid["observation"]["state"], "defect",
+        "an unanswered reply-request was an empty-output defect: {mid}"
+    );
+    assert_ne!(mid["inputClosure"], "begun", "{mid}");
+    assert_eq!(mid["observation"]["session"], CONTROL_THREAD, "{mid}");
+    let slot = receipt_json(&host.state.join("slot-1.json"));
+    assert_eq!(slot["state"], "occupied", "{slot}");
+    assert_eq!(
+        PathBuf::from(slot["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        host.slot
+    );
+    let lease = receipt_json(&host.state.join("lease-1.json"));
+    assert_eq!(lease["owner"], CONTROL_OWNER, "{lease}");
+    assert_eq!(
+        PathBuf::from(lease["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        host.slot,
+        "waiting released the worktree"
+    );
+    let lease_pid = lease["pid"].as_u64().unwrap() as u32;
+    let lease_created = lease["created"].as_u64().unwrap();
+    let lease_program = PathBuf::from(lease["program"].as_str().unwrap());
+    assert!(
+        !process_gone(lease_pid, lease_created, &lease_program),
+        "the host left while a reply was unresolved"
+    );
+    let endpoint = receipt_json(&host.state.join("endpoint-1.json"));
+    assert_eq!(endpoint["threadId"], CONTROL_THREAD, "{endpoint}");
+    assert_eq!(
+        endpoint["port"].as_u64(),
+        Some(u64::from(host.server().port)),
+        "waiting replaced the conversation endpoint"
+    );
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    assert_eq!(
+        host.server().requests_for("thread/resume").len(),
+        1,
+        "waiting resumed the thread: {:?}",
+        host.server().requests_for("thread/resume")
+    );
+    let phases = frontend_phases(&host);
+    assert!(
+        phases.iter().any(|phase| phase["phase"] == "attached"),
+        "{phases:?}"
+    );
+    assert!(
+        !phases.iter().any(|phase| phase["phase"] == "persisted"),
+        "the owned frontend closed while the reply was unresolved: {phases:?}"
+    );
+    let frontend_pid = phases[0]["pid"].as_u64().unwrap() as u32;
+    let frontend_created = phases[0]["creationTime"].as_u64().unwrap();
+    assert!(
+        !process_gone(frontend_pid, frontend_created, &double),
+        "frontend closed during the unresolved reply hold"
+    );
+
+    reply_on_same_thread(&host);
+    let started = host.server().requests_for("turn/start");
+    assert_eq!(started.len(), 2, "{started:?}");
+    assert_eq!(
+        started[1]["params"]["threadId"], CONTROL_THREAD,
+        "{started:?}"
+    );
+    assert!(started[1]["params"].get("expectedTurnId").is_none());
+    assert_eq!(
+        host.server().requests_for("thread/resume").len(),
+        1,
+        "the reply resumed instead of continuing the idle thread"
+    );
+    assert!(
+        !process_gone(lease_pid, lease_created, &lease_program),
+        "the reply connection replaced the host"
+    );
+
+    write_lead_message(&host, "reply-request", "resolved");
+    answer_thread(&host, json!([agent_turn(REPLY_TURN, REPLY_FINAL)]));
+    push_user_input(&host, "reply-1", REPLY_TURN, "one reply");
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "reply-m", "type": "agentMessage", "text": REPLY_FINAL}
+        }
+    }));
+    push_completed(&host, REPLY_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(
+        fs::read_to_string(host.state.join("message-1.txt"))
+            .unwrap()
+            .trim(),
+        REPLY_FINAL
+    );
+    assert_eq!(
+        receipt_json(&host.receipt)["observation"]["session"],
+        CONTROL_THREAD,
+        "the reply started another session"
+    );
+    assert_frontend_gone(&host, &double);
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(0), "{watched_text}");
+    assert!(watched_text.contains(REPLY_FINAL), "{watched_text}");
+}
+
+#[test]
+fn a_notification_alone_completes_and_closes_the_owned_frontend() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    let (host, session) = spawn_managed("lead-notify");
+    write_lead_message(&host, "notification", "delivered");
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, CONTROL_FINAL)]));
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "m1", "type": "agentMessage", "text": CONTROL_FINAL}
+        }
+    }));
+    push_completed(&host, CONTROL_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "{receipt}"
+    );
+    assert_ne!(receipt["observation"]["state"], "waiting-for-reply");
+    assert_frontend_gone(&host, &double);
+    assert_eq!(host.server().requests_for("turn/start").len(), 1);
+    assert_eq!(host.server().requests_for("thread/resume").len(), 1);
 }
 const CONTINUATION_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2601";
 const FRESH_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f2702";

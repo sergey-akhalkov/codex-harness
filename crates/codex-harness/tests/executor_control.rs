@@ -737,6 +737,184 @@ fn lifecycle_mapping_follows_the_thread_records() {
     fixture.terminate();
 }
 
+fn hold_receipt(root: &Path, messages: Value) {
+    fs::write(
+        root.join("spawn-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "leadMessages": messages
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn start_held(messages: Value) -> (tempfile::TempDir, Server, Conversation, Job) {
+    let root = tempfile::tempdir().unwrap();
+    let slot = root.path().join("slot");
+    fs::create_dir_all(&slot).unwrap();
+    let paths = ControlPaths {
+        endpoint: root.path().join("endpoint-1.json"),
+        token: root.path().join("endpoint-1.token"),
+        log: root.path().join("endpoint-1.log"),
+    };
+    hold_receipt(root.path(), messages);
+    let server = Server::start(Bearer::File(paths.token.clone()));
+    server.answer("initialize", Answer::Result(json!({})));
+    server.answer("thread/start", Answer::Result(thread_start_answer()));
+    server.answer("thread/name/set", Answer::Result(json!({})));
+    server.answer(
+        "turn/start",
+        Answer::Result(json!({"turn": {"id": TURN, "status": "inProgress"}})),
+    );
+    server.answer("thread/read", Answer::Result(thread_read_answer()));
+    let marker = root.path().join("fixture-child.json");
+    let mut plan = ControlPlan::new(
+        FIXTURE,
+        root.path().join("home"),
+        &slot,
+        "control fixture assignment",
+        identity(),
+        paths,
+    );
+    plan.port = Some(server.port);
+    plan.bound = WAIT;
+    plan.poll = Duration::from_millis(50);
+    plan.env
+        .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), Some("hang".into()));
+    plan.env.insert(
+        "HARNESS_EXECUTOR_FIXTURE_STARTED".into(),
+        Some(marker.into_os_string()),
+    );
+    let job = Job::new(Limits::default()).unwrap();
+    let conversation = Conversation::start(&job, &plan).expect("held conversation starts");
+    (root, server, conversation, job)
+}
+
+#[test]
+fn an_unanswered_lead_message_keeps_the_idle_thread_reply_capable_without_resume() {
+    let (root, server, mut conversation, job) = start_held(json!([{
+        "id": "lead-0123456789abcdef01234567",
+        "kind": "reply-request",
+        "status": "delivered"
+    }]));
+    let assigned = conversation.assign("which contract applies").unwrap();
+    assert_eq!(assigned.turn_id, TURN);
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Defect));
+    assert_eq!(server.requests_for("turn/start").len(), 1);
+    assert!(
+        server.requests_for("thread/resume").is_empty(),
+        "waiting resumed: {:?}",
+        server.requests_for("thread/resume")
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(root.path().join("spawn-1.json")).unwrap()).unwrap();
+    assert_ne!(receipt["inputClosure"], "begun");
+
+    let endpoint = Endpoint::read(&root.path().join("endpoint-1.json")).unwrap();
+    assert_eq!(endpoint.thread_id.as_deref(), Some(THREAD));
+    let mut reply = Conversation::attach(&endpoint, WAIT).expect("reply attaches");
+    reply
+        .call(
+            "turn/start",
+            json!({
+                "threadId": THREAD,
+                "input": [{"type": "text", "text": "use the versioned contract"}]
+            }),
+        )
+        .expect("reply starts the next turn");
+    let started = server.requests_for("turn/start");
+    assert_eq!(started.len(), 2, "{started:?}");
+    assert_eq!(started[1]["params"]["threadId"], THREAD, "{started:?}");
+    assert!(server.requests_for("thread/resume").is_empty());
+    assert_eq!(conversation.thread_id(), THREAD);
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    drop(reply);
+    drop(conversation);
+    drop(job);
+}
+
+#[test]
+fn a_notification_alone_does_not_keep_the_turn_open() {
+    let (root, server, mut conversation, job) = start_held(json!([{
+        "id": "lead-notice",
+        "kind": "notification",
+        "status": "delivered"
+    }]));
+    conversation.assign("notice does not wait").unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let events = drain(&mut conversation, 2);
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.lifecycle == Some(Lifecycle::Completed))
+    );
+    let _ = (root, server, job);
+}
+
+#[test]
+fn one_open_reply_request_holds_until_the_last_one_is_resolved() {
+    let (root, server, mut conversation, job) = start_held(json!([
+        {
+            "id": "lead-answered",
+            "kind": "reply-request",
+            "status": "resolved"
+        },
+        {
+            "id": "lead-open",
+            "kind": "reply-request",
+            "status": "delivered"
+        }
+    ]));
+    conversation.assign("one request is still open").unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Defect));
+
+    let path = root.path().join("spawn-1.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    receipt["leadMessages"][1]["status"] = json!("resolved");
+    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": "reply-turn", "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": "reply-turn", "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_eq!(conversation.thread_id(), THREAD);
+    drop(job);
+}
+
 #[test]
 fn failed_and_interrupted_turns_are_distinguished() {
     let recorded = recorded();
