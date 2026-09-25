@@ -652,7 +652,9 @@ struct Dispatch<'a> {
     terminal_window: Option<&'a str>,
 }
 
-/// Either the unchanged free-text assignment or a validated structured one.
+/// Either the free-text assignment or a validated structured one; both reach the
+/// session through the instruction owner with the installed guidance beside the
+/// caller's own text.
 /// The structured variant is rendered into the brief against the bound slot
 /// after allocation, so the model never sees a checkout it is not running in.
 enum PromptSource {
@@ -791,12 +793,14 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
     launch_bound(request, &binding, route, &bound, &paths)
 }
 
-/// The dispatch text for the bound slot: free text passes through unchanged,
-/// while a structured assignment is validated and rendered with the actual
-/// checkout, the committed base and the exact relative paths.
+/// The dispatch text for the bound slot: free text keeps the caller's own words
+/// and gains the installed escalation and waiting guidance, while a structured
+/// assignment is validated and rendered with the actual checkout, the committed
+/// base and the exact relative paths. Both paths render the same rule, so a
+/// caller never has to carry addressing or waiting instructions by hand.
 fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<String> {
     match &request.prompt {
-        PromptSource::FreeText(text) => Ok(text.clone()),
+        PromptSource::FreeText(text) => Ok(executor_assignment::free_text_brief(text)),
         PromptSource::Structured(assignment) => executor_assignment::brief(
             assignment,
             &executor_assignment::AssignmentContext {
@@ -5237,6 +5241,60 @@ mod tests {
             control.original_assignment.as_deref(),
             Some("Finish the original task")
         );
+    }
+
+    /// Free text renders through the instruction owner: the caller's words stay
+    /// first and the installed rule follows, so `--exec` carries the lead
+    /// channel, the waiting behavior and the answer-required watch result
+    /// without the caller repeating them or teaching address discovery.
+    #[test]
+    fn free_text_assignment_renders_the_executor_assignment_guidance() {
+        let root = std::env::temp_dir().join(format!("executor-free-text-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let request = Dispatch {
+            codex_home: &root,
+            source: &root,
+            pool_size: 2,
+            named_slot: None,
+            owner: "exec-ds-7",
+            base: None,
+            profile: "ds",
+            prompt: PromptSource::FreeText("finish the sample outcome".into()),
+            mode: SpawnMode::Exec,
+            resumed_session: None,
+            terminal_profile: None,
+            terminal_window: None,
+        };
+        let binding = SlotBinding {
+            index: 1,
+            path: root.clone(),
+            source: root.clone(),
+            owner: "exec-ds-7".into(),
+            base: "abc123".into(),
+            remote: "origin".into(),
+            branch: Some("main".into()),
+        };
+        let text = resolve_prompt(&request, &binding).unwrap();
+        assert!(text.starts_with("finish the sample outcome"), "{text}");
+        assert!(
+            text.contains("codex-harness lead message --text '...'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("asks for a reply unless --notify marks a notice that needs none"),
+            "{text}"
+        );
+        assert!(
+            text.contains("An executor watch result of 3 means answer that request"),
+            "{text}"
+        );
+        assert!(
+            text.contains("durable blockers, decisions and results stay on the bd issue"),
+            "{text}"
+        );
+        assert!(!text.contains("--session"), "{text}");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
