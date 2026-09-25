@@ -54,6 +54,82 @@ impl Responses {
         Self::configured(evidence, true, false, Quota::None, true)
     }
 
+    /// Serves one owned provider whose answer to every request comes from the
+    /// caller's handler: the request identity is verified and the exact body is
+    /// kept beside the evidence before the handler's item is streamed back,
+    /// exactly as the scripted cases above are served. The installed two-lead
+    /// isolation acceptance uses it where one owned provider serves both native
+    /// sessions of one lead root, so a request for any other conversation
+    /// reaches the handler instead of a script that assumes its own thread.
+    #[allow(dead_code)] // Also compiled into the independent transport contract.
+    pub fn routed(evidence: PathBuf, handler: impl Fn(&Value) -> Value + Send + 'static) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = thread::spawn(move || {
+            let mut sequence = 0;
+            while !stopping.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let (_headers, request_body) = read_request(&mut stream);
+                let request: Value = serde_json::from_slice(&request_body).unwrap();
+                let _identity = harness_core::task_request::RequestIdentity::from_request(&request)
+                    .expect("native provider request must carry consistent conversation and attempt identity");
+                sequence += 1;
+                fs::create_dir_all(&evidence).unwrap();
+                fs::write(
+                    evidence.join(format!("provider-{sequence}.json")),
+                    &request_body,
+                )
+                .unwrap();
+                let item = handler(&request);
+                let events = [
+                    json!({"type":"response.created","response":{"id":format!("resp-{sequence}")}}),
+                    json!({"type":"response.output_item.done","item":item}),
+                    json!({"type":"response.completed","response":{"id":format!("resp-{sequence}"),"usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}),
+                ];
+                let body = events
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().unwrap()
+                        )
+                    })
+                    .collect::<String>();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+        Self {
+            port,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
     fn configured(
         evidence: PathBuf,
         direct: bool,
