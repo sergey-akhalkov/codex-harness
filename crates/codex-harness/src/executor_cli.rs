@@ -501,6 +501,9 @@ fn expose_lead_conversation(
             Some(session) => resumed_caption(conversation, session, title)?,
             None => title.to_owned(),
         };
+        if request.session.is_none() {
+            conversation.prepare_named_empty(&plan.slot)?;
+        }
         let frontend = attach_owned_frontend(
             plan,
             conversation,
