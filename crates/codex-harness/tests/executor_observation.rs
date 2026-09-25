@@ -14,7 +14,7 @@ use std::{
     fs, io,
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -3279,4 +3279,706 @@ fn exact_session_resume_keeps_the_recorded_session_when_resume_returns_another_t
     );
     stale_endpoint_untouched(&stale);
     assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+}
+
+const ACCEPTANCE_ASSIGNMENT: &str =
+    "Perform the owned proof command and return its consumed result.";
+const ACCEPTANCE_CORRECTION: &str = "Keep the owned proof and do not run the tool again.";
+const ACCEPTANCE_RESUME: &str =
+    "Continue only the previously authorized task and return its consumed result.";
+
+fn terminate_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        let _ = TerminateProcess(handle, 1);
+        let _ = CloseHandle(handle);
+    }
+}
+
+struct Evidence {
+    path: PathBuf,
+}
+
+impl Drop for Evidence {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("native acceptance evidence: {}", self.path.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct AcceptanceRun {
+    name: &'static str,
+    owner: String,
+    session: String,
+    source: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    receipt: PathBuf,
+    slot: PathBuf,
+    spawn: Option<Child>,
+    resume: Option<Child>,
+    responses: Option<native_responses::Responses>,
+}
+
+impl Drop for AcceptanceRun {
+    fn drop(&mut self) {
+        self.stop_processes();
+    }
+}
+
+impl AcceptanceRun {
+    fn launch(root: &Path, name: &'static str, exe: &Path) -> Self {
+        let run_root = root.join(name);
+        let source = prepare_acceptance_source(&run_root);
+        let home = run_root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let evidence = home.join("evidence");
+        fs::create_dir_all(&evidence).unwrap();
+        let responses = native_responses::Responses::with_view_loss(evidence);
+        write_acceptance_home(&home, exe, responses.port, &source);
+        let owner = format!("acceptance-{name}");
+        let stdout = fs::File::create(run_root.join("spawn-stdout.txt")).unwrap();
+        let stderr = fs::File::create(run_root.join("spawn-stderr.txt")).unwrap();
+        let mut command = lead_command();
+        command
+            .args([
+                "executor",
+                "spawn",
+                "--source",
+                source.to_str().unwrap(),
+                "--codex-home",
+                home.to_str().unwrap(),
+                "--profile",
+                "default",
+                "--owner",
+                &owner,
+                "--mode",
+                "tui",
+                "--exec",
+                ACCEPTANCE_ASSIGNMENT,
+            ])
+            .current_dir(&source)
+            .env("CODEX_HOME", &home)
+            .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")
+            .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+            .env_remove("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("CODEX_API_KEY")
+            .env_remove("CODEX_ACCESS_TOKEN")
+            .env_remove("OPENAI_BASE_URL")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+        let spawn = command.spawn().expect("executor spawn");
+        Self {
+            name,
+            owner,
+            session: String::new(),
+            source,
+            home,
+            state: PathBuf::new(),
+            receipt: PathBuf::new(),
+            slot: PathBuf::new(),
+            spawn: Some(spawn),
+            resume: None,
+            responses: Some(responses),
+        }
+    }
+
+    fn wait_until_running(&mut self) {
+        let until = Instant::now() + Duration::from_secs(180);
+        loop {
+            if self.child_exited("spawn") {
+                panic!(
+                    "{}: executor spawn exited early\n{}",
+                    self.name,
+                    self.diagnostics()
+                );
+            }
+            if let Some(receipt) = find_receipt(&self.home) {
+                self.receipt = receipt;
+                self.state = self.receipt.parent().unwrap().to_path_buf();
+                let recorded = receipt_json(&self.receipt);
+                let state = recorded["observation"]["state"].as_str().unwrap_or("");
+                if matches!(state, "failed" | "defect" | "interrupted" | "stopped") {
+                    panic!(
+                        "{}: run failed before the sequence\n{}",
+                        self.name,
+                        self.diagnostics()
+                    );
+                }
+                let session = recorded["observation"]["session"].as_str().unwrap_or("");
+                self.slot = recorded["slot"]["path"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                if state == "running"
+                    && !session.is_empty()
+                    && self.slot.join("proof.txt").is_file()
+                    && self.state.join("frontend-1.json").is_file()
+                    && self.state.join("endpoint-1.json").is_file()
+                {
+                    self.session = session.to_owned();
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "{}: native TUI did not reach a running canned assignment\n{}",
+                self.name,
+                self.diagnostics()
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn session(&self) -> String {
+        self.session.clone()
+    }
+
+    fn host_alive(&self) -> bool {
+        let lease = self.state.join("lease-1.json");
+        if !lease.is_file() {
+            return false;
+        }
+        let value = receipt_json(&lease);
+        let pid = value["pid"].as_u64().unwrap_or(0) as u32;
+        let created = value["created"].as_u64().unwrap_or(0);
+        let program = PathBuf::from(value["program"].as_str().unwrap_or(""));
+        pid != 0 && !process_gone(pid, created, &program)
+    }
+
+    fn child_exited(&mut self, which: &str) -> bool {
+        let child = match which {
+            "spawn" => self.spawn.as_mut(),
+            _ => self.resume.as_mut(),
+        };
+        child.is_some_and(|child| child.try_wait().unwrap().is_some())
+    }
+
+    fn command(&self, args: &[&str]) -> Output {
+        let mut command = lead_command();
+        command
+            .args(args)
+            .env("CODEX_HOME", &self.home)
+            .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")
+            .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+            .stdin(Stdio::null());
+        command.output().expect("executor command")
+    }
+
+    fn address(&self) -> Vec<String> {
+        vec![
+            "--source".into(),
+            self.source.display().to_string(),
+            "--codex-home".into(),
+            self.home.display().to_string(),
+            "--slot".into(),
+            "1".into(),
+            "--owner".into(),
+            self.owner.clone(),
+            "--session".into(),
+            self.session(),
+        ]
+    }
+
+    fn watch_while_running(&self) {
+        let watched = self.watch(Some("1"));
+        let text = text(&watched);
+        let recorded = receipt_json(&self.receipt);
+        let state = recorded["observation"]["state"].as_str().unwrap_or("");
+        assert_eq!(
+            watched.status.code(),
+            Some(2),
+            "{}: a live watch must time out without stopping the run: {text}\n{}",
+            self.name,
+            self.diagnostics()
+        );
+        assert_eq!(
+            state, "running",
+            "{}: watch stopped the run: {text}",
+            self.name
+        );
+        assert!(
+            text.contains(&self.session()),
+            "{}: watch did not name the session: {text}",
+            self.name
+        );
+    }
+
+    fn watch(&self, timeout: Option<&str>) -> Output {
+        let mut args = vec![
+            "executor".to_owned(),
+            "watch".to_owned(),
+            "--source".to_owned(),
+            self.source.display().to_string(),
+            "--codex-home".to_owned(),
+            self.home.display().to_string(),
+            "--slot".to_owned(),
+            "1".to_owned(),
+            "--owner".to_owned(),
+            self.owner.clone(),
+        ];
+        if let Some(timeout) = timeout {
+            args.push("--timeout".to_owned());
+            args.push(timeout.to_owned());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.command(&refs)
+    }
+
+    fn message(&self) {
+        let mut args = vec!["executor".into(), "message".into()];
+        args.extend(self.address());
+        args.extend(["--text".into(), ACCEPTANCE_CORRECTION.into()]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let sent = self.command(&refs);
+        let body = text(&sent);
+        assert!(
+            sent.status.success() && (body.contains("delivered") || body.contains("queued")),
+            "{}: message was not delivered to the live native thread: {body}\n{}",
+            self.name,
+            self.diagnostics()
+        );
+    }
+
+    fn stop(&self) {
+        let mut args = vec!["executor".into(), "stop".into()];
+        args.extend(self.address());
+        args.extend(["--timeout".into(), "45".into()]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stopped = self.command(&refs);
+        let body = text(&stopped);
+        assert!(
+            stopped.status.success(),
+            "{}: executor stop failed: {body}\n{}",
+            self.name,
+            self.diagnostics()
+        );
+        assert!(
+            body.contains("stopped") || body.contains("interrupted"),
+            "{}: stop did not report the run outcome: {body}",
+            self.name
+        );
+    }
+
+    fn close_frontend(&self) {
+        let path = self.state.join("frontend-1.json");
+        let phases = fs::read_to_string(&path).unwrap_or_default();
+        let Some(last) = phases.lines().rev().find(|line| !line.is_empty()) else {
+            panic!("{}: no frontend record\n{}", self.name, self.diagnostics());
+        };
+        let value: Value = serde_json::from_str(last).unwrap();
+        let pid = value["pid"].as_u64().unwrap() as u32;
+        let created = value["creationTime"].as_u64().unwrap();
+        let program = PathBuf::from(value["program"].as_str().unwrap());
+        if !process_gone(pid, created, &program) {
+            terminate_pid(pid);
+        }
+        let until = Instant::now() + Duration::from_secs(15);
+        while !process_gone(pid, created, &program) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            process_gone(pid, created, &program),
+            "{}: manual TUI closure left frontend pid {pid} running",
+            self.name
+        );
+    }
+
+    fn resume(&mut self) {
+        let run_root = self.home.parent().unwrap();
+        let stdout = fs::File::create(run_root.join("resume-stdout.txt")).unwrap();
+        let stderr = fs::File::create(run_root.join("resume-stderr.txt")).unwrap();
+        let mut args = vec![
+            "executor".to_owned(),
+            "resume".to_owned(),
+            "--exec".to_owned(),
+            ACCEPTANCE_RESUME.to_owned(),
+        ];
+        args.extend(self.address());
+        let mut command = lead_command();
+        command
+            .args(&args)
+            .env("CODEX_HOME", &self.home)
+            .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")
+            .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+        self.resume = Some(command.spawn().expect("executor resume"));
+    }
+
+    fn wait_resumed(&mut self) {
+        let until = Instant::now() + Duration::from_secs(180);
+        loop {
+            if self.child_exited("resume") {
+                let status = self.resume.as_mut().unwrap().wait().unwrap();
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "{}: resume host did not close successfully\n{}",
+                    self.name,
+                    self.diagnostics()
+                );
+                return;
+            }
+            if self.receipt.is_file() {
+                let recorded = receipt_json(&self.receipt);
+                let state = recorded["observation"]["state"].as_str().unwrap_or("");
+                if matches!(state, "failed" | "defect") {
+                    panic!("{}: resumed run failed\n{}", self.name, self.diagnostics());
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "{}: exact-session resume did not finish\n{}",
+                self.name,
+                self.diagnostics()
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// The owned console is a pseudoconsole on this host, so another process
+    /// cannot attach and scrape it. The attached native frontend and the event
+    /// stream it renders are the readable content.
+    fn native_content(&self) -> String {
+        let phases = fs::read_to_string(self.state.join("frontend-1.json")).unwrap_or_default();
+        let attached = phases
+            .lines()
+            .rev()
+            .find(|line| line.contains("\"attached\""));
+        assert!(
+            attached.is_some(),
+            "{}: native frontend did not attach\n{}",
+            self.name,
+            self.diagnostics()
+        );
+        let value: Value = serde_json::from_str(attached.unwrap()).unwrap();
+        assert_eq!(value["threadId"].as_str(), Some(self.session.as_str()));
+        assert!(
+            value["alive"] == true,
+            "{}: attached frontend is not alive: {value}",
+            self.name
+        );
+        let titles = visible_window_titles();
+        assert!(
+            titles.iter().any(|title| title.contains(&self.owner)),
+            "{}: native TUI surface is not visible: {titles:?}\n{}",
+            self.name,
+            self.diagnostics()
+        );
+        fs::read_to_string(self.state.join("stream-1.jsonl")).unwrap_or_default()
+    }
+
+    fn stop_processes(&mut self) {
+        for name in ["lease-1.json", "endpoint-1.json"] {
+            let path = self.state.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let value = receipt_json(&path);
+            let process = if name.starts_with("endpoint") {
+                &value["process"]
+            } else {
+                &value
+            };
+            if let Some(pid) = process["pid"].as_u64() {
+                terminate_pid(pid as u32);
+            }
+        }
+        if let Some(mut child) = self.resume.take() {
+            let _ = child.kill();
+        }
+        if let Some(mut child) = self.spawn.take() {
+            let _ = child.kill();
+        }
+        self.responses.take();
+    }
+
+    fn diagnostics(&self) -> String {
+        let run_root = self.home.parent().unwrap_or(&self.home);
+        let mut parts = Vec::new();
+        for name in [
+            "spawn-stdout.txt",
+            "spawn-stderr.txt",
+            "resume-stdout.txt",
+            "resume-stderr.txt",
+        ] {
+            let path = run_root.join(name);
+            if path.is_file() {
+                let text = fs::read_to_string(&path).unwrap_or_default();
+                let tail = text.chars().rev().take(1500).collect::<String>();
+                let tail = tail.chars().rev().collect::<String>();
+                parts.push(format!("{name}: {tail}"));
+            }
+        }
+        if self.receipt.is_file() {
+            let recorded = receipt_json(&self.receipt);
+            parts.push(format!(
+                "state={} session={} cause={}",
+                recorded["observation"]["state"],
+                recorded["observation"]["session"],
+                recorded["observation"]["cause"]
+            ));
+        }
+        let log = self.state.join("endpoint-1.log");
+        if log.is_file() {
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            let tail = text.chars().rev().take(1500).collect::<String>();
+            parts.push(format!(
+                "endpoint log: {}",
+                tail.chars().rev().collect::<String>()
+            ));
+        }
+        parts.join("\n")
+    }
+}
+
+fn prepare_acceptance_source(root: &Path) -> PathBuf {
+    fs::create_dir_all(root).unwrap();
+    let bare = root.join("remote.git");
+    let seed = root.join("seed");
+    let source = root.join("proj");
+    git(
+        root,
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "--initial-branch=main",
+            bare.to_str().unwrap(),
+        ],
+    );
+    git(
+        root,
+        &[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            seed.to_str().unwrap(),
+        ],
+    );
+    git(&seed, &["config", "user.email", "executor@example.test"]);
+    git(&seed, &["config", "user.name", "Executor"]);
+    fs::write(seed.join("README.md"), "seed\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-qm", "seed"]);
+    git(&seed, &["remote", "add", "origin", &file_url(&bare)]);
+    git(&seed, &["push", "-q", "origin", "main"]);
+    git(
+        root,
+        &["clone", "-q", &file_url(&bare), source.to_str().unwrap()],
+    );
+    git(&source, &["config", "user.email", "executor@example.test"]);
+    git(&source, &["config", "user.name", "Executor"]);
+    fs::create_dir_all(source.join("global")).unwrap();
+    fs::write(
+        source.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"default\"]\nmax_concurrent_executors = 1\n",
+    )
+    .unwrap();
+    source
+}
+
+fn write_acceptance_home(home: &Path, exe: &Path, port: u16, source: &Path) {
+    let launch = home.join("harness/bin");
+    fs::create_dir_all(&launch).unwrap();
+    let launcher = launch.join("codex.exe");
+    if fs::hard_link(exe, &launcher).is_err() {
+        fs::copy(exe, &launcher).unwrap();
+    }
+    fs::write(
+        home.join("harness/native-launch.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 2,
+            "upstream": {"executable": exe}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let trusted = source.to_string_lossy().to_lowercase();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"low\"\nmodel_provider = \"control_fixture\"\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\ncli_auth_credentials_store = \"file\"\n[model_providers.control_fixture]\nname = \"Owned observation fixture\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nenv_key = \"HARNESS_CONTROL_FIXTURE_KEY\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{trusted}']\ntrust_level = \"trusted\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn find_receipt(home: &Path) -> Option<PathBuf> {
+    let pool = home.join("harness/executor-pool");
+    let entries = fs::read_dir(&pool).ok()?;
+    for entry in entries.flatten() {
+        let receipt = entry.path().join("spawn-1.json");
+        if receipt.is_file() {
+            return Some(receipt);
+        }
+    }
+    None
+}
+
+fn assert_readable(name: &str, screen: &str) {
+    let shown = screen.chars().take(2000).collect::<String>();
+    assert!(
+        screen.contains(ACCEPTANCE_ASSIGNMENT)
+            && (screen.contains("proof.txt") || screen.contains("commandExecution")),
+        "{name}: native content did not include the assignment and tool activity: {shown}"
+    );
+}
+
+fn visible_window_titles() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    };
+    unsafe extern "system" fn collect(window: HWND, parameter: LPARAM) -> i32 {
+        let titles = unsafe { &mut *(parameter as *mut Vec<String>) };
+        if unsafe { IsWindowVisible(window) } == 0 {
+            return 1;
+        }
+        let length = unsafe { GetWindowTextLengthW(window) };
+        if length <= 0 {
+            return 1;
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let read = unsafe { GetWindowTextW(window, buffer.as_mut_ptr(), buffer.len() as i32) };
+        if read > 0 {
+            titles.push(String::from_utf16_lossy(&buffer[..read as usize]));
+        }
+        1
+    }
+    let mut titles = Vec::new();
+    unsafe {
+        EnumWindows(Some(collect), &mut titles as *mut Vec<String> as LPARAM);
+    }
+    titles
+}
+
+/// Two isolated runs of the real spawn/watch/message/stop/manual-close/resume
+/// sequence. Both use the installed Codex TUI and app-server with canned
+/// Responses. Protocol mocks and conversation screenshots are not used.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; two isolated native TUI runs and canned responses"]
+fn native_acceptance_runs_the_command_sequence_twice_in_isolation() {
+    let exe = PathBuf::from(
+        std::env::var_os("HARNESS_CONTROL_CODEX_EXE").expect("explicit native Codex executable"),
+    );
+    assert!(exe.is_absolute() && exe.is_file(), "{}", exe.display());
+    let version = Command::new(&exe).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout);
+    eprintln!("codex version: {}", version.trim());
+    let root = std::env::temp_dir().join(format!("native-acceptance-{}", std::process::id()));
+    let _evidence = Evidence { path: root.clone() };
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("codex-version.txt"), version.trim().as_bytes()).unwrap();
+
+    let mut first = AcceptanceRun::launch(&root, "run-a", &exe);
+    let mut second = AcceptanceRun::launch(&root, "run-b", &exe);
+    first.wait_until_running();
+    second.wait_until_running();
+    assert_ne!(
+        first.session(),
+        second.session(),
+        "isolated runs shared a session"
+    );
+    assert_ne!(first.home, second.home);
+    let first_screen = first.native_content();
+    let second_screen = second.native_content();
+    assert_readable(first.name, &first_screen);
+    assert_readable(second.name, &second_screen);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| first.watch_while_running());
+        scope.spawn(|| second.watch_while_running());
+    });
+    std::thread::scope(|scope| {
+        scope.spawn(|| first.message());
+        scope.spawn(|| second.message());
+    });
+    assert!(second.host_alive(), "neighbor was already gone before stop");
+    first.stop();
+    first.close_frontend();
+    assert!(
+        second.host_alive() && !second.child_exited("spawn"),
+        "stopping and closing one TUI stopped the neighboring run\n{}",
+        second.diagnostics()
+    );
+    second.stop();
+    second.close_frontend();
+
+    first.resume();
+    first.wait_resumed();
+    second.resume();
+    second.wait_resumed();
+    for run in [&first, &second] {
+        assert_completed(run);
+    }
+}
+
+fn assert_completed(run: &AcceptanceRun) {
+    let proof = fs::read_to_string(run.slot.join("proof.txt")).unwrap_or_default();
+    assert_eq!(
+        proof, "one",
+        "{}: assignment effect was not exactly one write: {proof:?}",
+        run.name
+    );
+    let recorded = receipt_json(&run.receipt);
+    let session = recorded["observation"]["session"].as_str().unwrap_or("");
+    assert!(
+        !session.is_empty(),
+        "{}: missing session identity",
+        run.name
+    );
+    assert_eq!(
+        recorded["observation"]["state"], "completed",
+        "{}: {recorded}",
+        run.name
+    );
+    let result = fs::read_to_string(run.state.join("message-1.txt")).unwrap_or_default();
+    assert!(
+        result.contains(native_responses::FINAL),
+        "{}: persisted result {result:?} does not agree with the canned final",
+        run.name
+    );
+    let watched = run.watch(None);
+    let watched_text = text(&watched);
+    assert_eq!(
+        watched.status.code(),
+        Some(0),
+        "{}: watch disagreed with completion: {watched_text}",
+        run.name
+    );
+    assert!(
+        watched_text.contains(native_responses::FINAL) && watched_text.contains(session),
+        "{}: watch result/identity disagreed: {watched_text}",
+        run.name
+    );
+    let endpoint = run.state.join("endpoint-1.json");
+    if endpoint.is_file() {
+        let value = receipt_json(&endpoint);
+        if let Some(thread) = value["threadId"].as_str() {
+            assert_eq!(thread, session, "{}: endpoint thread disagrees", run.name);
+        }
+        if let Some(pid) = value["process"]["pid"].as_u64() {
+            let created = value["process"]["creationTime"].as_u64().unwrap_or(0);
+            let program = PathBuf::from(value["process"]["program"].as_str().unwrap_or(""));
+            assert!(
+                process_gone(pid as u32, created, &program),
+                "{}: automatic closure left the app-server running",
+                run.name
+            );
+        }
+    }
 }
