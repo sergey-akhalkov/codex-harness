@@ -257,7 +257,15 @@ fn lead_start(args: &[OsString]) -> io::Result<i32> {
         }
         control::retire_lead_endpoint(&request.codex_home, session)?;
     }
-    host_lead_session(&request, &profile, &bound, &launcher)
+    let result = host_lead_session(&request, &profile, &bound, &launcher);
+    if let Err(error) = &result {
+        let paths = ControlPaths::for_lead_host(&request.codex_home, std::process::id());
+        note_log(
+            &paths.log,
+            &format!("lead start failed after request parsing: {error}"),
+        );
+    }
+    result
 }
 
 fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
