@@ -2761,6 +2761,314 @@ fn reply_to_the_same_words_answers_two_requests_as_two_inputs() {
 }
 
 #[test]
+fn lead_message_reconnects_to_the_same_recorded_thread_after_its_endpoint_is_lost() {
+    let mut fixture = LeadFixture::new("lead-reconnect", LEAD_THREAD, true);
+    let payload = "reconnect question: is the recorded lead reachable again?";
+    // The recorded endpoint process is gone. Availability is reported
+    // truthfully: nothing is sent, started, reparented or recorded as a hold.
+    fixture.endpoint_child.kill().unwrap();
+    fixture.endpoint_child.wait().unwrap();
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("no verified lead endpoint") && text.contains("Nothing was sent"),
+        "{text}"
+    );
+    assert!(
+        text.contains(LEAD_THREAD),
+        "the recorded lead thread must be named: {text}"
+    );
+    assert!(
+        fixture.server.requests().is_empty(),
+        "an endpoint that is not live was addressed: {:?}",
+        fixture.server.requests()
+    );
+    let lost: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        lost["originatingLead"]["threadId"], LEAD_THREAD,
+        "the recorded lead relationship changed: {lost}"
+    );
+    assert!(
+        lost.get("leadMessages").is_none(),
+        "an unavailable endpoint recorded a phantom request: {lost}"
+    );
+
+    // The same lead thread reconnects through a new verified endpoint. The
+    // recorded relationship still names that thread, so the retry reaches it
+    // and nowhere else.
+    let release = fixture._root.path().join("reconnect-release");
+    let (mut child, identity) = fixture_child(
+        &fixture._root.path().join("reconnect-process.json"),
+        &release,
+    );
+    fs::write(
+        fixture.state.join("lead-endpoint-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "port": fixture.server.port,
+            "token": TOKEN,
+            "threadId": LEAD_THREAD,
+            "process": {
+                "pid": identity["pid"],
+                "creationTime": identity["creation_time"],
+                "program": launcher(),
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    script_delivery(&fixture, false, &envelope, &id);
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert_metadata(&text, &fixture, "reply-request", &id);
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(
+        started[0]["params"]["threadId"], LEAD_THREAD,
+        "the retry was delivered to another conversation: {started:?}"
+    );
+    let delivered: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        delivered["leadMessages"][0]["status"], "delivered",
+        "{delivered}"
+    );
+    assert_eq!(
+        delivered["leadMessages"][0]["leadThreadId"], LEAD_THREAD,
+        "{delivered}"
+    );
+    assert_eq!(
+        delivered["originatingLead"]["threadId"], LEAD_THREAD,
+        "the reconnected thread replaced the recorded lead: {delivered}"
+    );
+    assert_eq!(
+        delivered["originatingLead"]["runGeneration"], fixture.generation,
+        "{delivered}"
+    );
+
+    // A repeat of the same words is answered from the record: the reconnected
+    // conversation receives no second copy.
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert!(text.contains("cannot deliver it twice"), "{text}");
+    assert_eq!(
+        fixture.server.requests_for("turn/start").len(),
+        1,
+        "the repeat reached the reconnected lead endpoint: {text}"
+    );
+    let _ = fs::write(&release, b"release");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Installs the originating-lead relationship a reply is verified against, with
+/// this test process as the live dispatching lead.
+fn plant_lead_identity(fixture: &Fixture, generation: &str) {
+    let program = std::env::current_exe().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+        .unwrap()
+        .identity();
+    let mut receipt = fixture.receipt();
+    receipt["originatingLead"] = json!({
+        "schema": 1,
+        "threadId": LEAD_THREAD,
+        "runGeneration": generation,
+        "dispatcher": {
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "program": program,
+        }
+    });
+    fs::write(
+        &fixture.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Records one published reply-request on the receipt and the local lookup its
+/// reply reference resolves through, exactly as `lead message` publishes them.
+fn record_reply_request(fixture: &Fixture, id: &str, generation: &str) {
+    let mut receipt = fixture.receipt();
+    let session = receipt["observation"]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let entry = json!({
+        "schema": 1,
+        "id": id,
+        "kind": "reply-request",
+        "status": "delivered",
+        "requiresReply": true,
+        "leadThreadId": LEAD_THREAD,
+        "runGeneration": generation,
+        "session": session,
+        "owner": OWNER,
+        "slot": 1
+    });
+    let mut messages = receipt["leadMessages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    messages.push(entry);
+    receipt["leadMessages"] = Value::Array(messages);
+    fs::write(
+        &fixture.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let index = fixture
+        .home
+        .join("harness/executor-pool/message-index")
+        .join(format!("{id}.json"));
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    fs::write(
+        &index,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "id": id,
+            "receipt": fixture.receipt.to_str().unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// The reply invocation one lead uses: the message id and text, no address.
+fn reply_to(fixture: &Fixture, args: &[&str]) -> Output {
+    let cwd = fixture.home.join("lead-cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut command = lead_command();
+    command
+        .args(["executor", "message"])
+        .args(args)
+        .env("CODEX_HOME", &fixture.home)
+        .env("CODEX_THREAD_ID", LEAD_THREAD)
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .current_dir(&cwd);
+    command.output().unwrap()
+}
+
+#[test]
+fn a_reply_delivered_before_a_stop_keeps_its_input_and_a_later_reply_is_refused() {
+    let generation = "generation-reply-stop";
+    let fixture = Fixture::new("reply-stop", "running", true);
+    plant_lead_identity(&fixture, generation);
+    let answered = "lead-0123456789abcdef01234567";
+    let unanswered = "lead-fedcba9876543210fedcba98";
+    record_reply_request(&fixture, answered, generation);
+    record_reply_request(&fixture, unanswered, generation);
+
+    // One side of the race: the answer is observed in the conversation before
+    // the stop, so the stop cannot rewrite it into an undelivered input.
+    let answer = "use the versioned input contract";
+    script_executor_reply(&fixture, true, answer);
+    let out = reply_to(&fixture, &["--reply-to", answered, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(": delivered in") && text.contains(THREAD),
+        "{text}"
+    );
+    assert_unchanged_payload(&fixture.server.requests_for("turn/steer"), answer);
+    let live = fixture.receipt();
+    assert_eq!(
+        live["leadMessages"][0]["status"], "resolved",
+        "the answered request kept its hold: {live}"
+    );
+    assert_eq!(fixture.attempts()[0]["status"], "delivered", "{live}");
+
+    let out = lead_command()
+        .args([
+            "executor",
+            "stop",
+            "--source",
+            fixture.source.to_str().unwrap(),
+            "--codex-home",
+            fixture.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            OWNER,
+            "--timeout",
+            "20",
+        ])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let stopped = fixture.receipt();
+    assert_eq!(stopped["observation"]["state"], "stopped", "{stopped}");
+    assert_eq!(
+        fixture.attempts()[0]["status"],
+        "delivered",
+        "the stop rewrote an observed input: {stopped}"
+    );
+    assert!(
+        fixture.attempts()[0].get("undeliveredMs").is_none(),
+        "{stopped}"
+    );
+    assert_eq!(
+        stopped["leadMessages"][0]["status"], "resolved",
+        "{stopped}"
+    );
+
+    // The other side: the answer that had not landed is invalidated by the
+    // stop. It reaches neither the ended run nor a replacement conversation,
+    // and the unanswered request stays recorded for explicit recovery.
+    let steers = fixture.server.requests_for("turn/steer").len();
+    let turns = fixture.server.requests_for("turn/start").len();
+    let out = reply_to(&fixture, &["--reply-to", unanswered, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(&format!("retired message id {unanswered}")),
+        "{text}"
+    );
+    assert!(
+        text.contains("stopped"),
+        "the refusal must report the original run's state: {text}"
+    );
+    assert!(
+        text.contains("codex-harness executor resume --source") && text.contains(THREAD),
+        "the refusal must name the supported continuation of that exact session: {text}"
+    );
+    assert_eq!(
+        fixture.server.requests_for("turn/steer").len(),
+        steers,
+        "a refused reply reached the stopped thread: {text}"
+    );
+    assert_eq!(
+        fixture.server.requests_for("turn/start").len(),
+        turns,
+        "a refused reply started a conversation: {text}"
+    );
+    assert!(
+        fixture.server.requests_for("thread/resume").is_empty(),
+        "a refused reply resumed the thread"
+    );
+    let after = fixture.receipt();
+    assert_eq!(
+        after["leadMessages"][1]["status"], "delivered",
+        "the unanswered request was rewritten: {after}"
+    );
+    assert_eq!(
+        after["originatingLead"]["threadId"], LEAD_THREAD,
+        "the stopped run was reparented: {after}"
+    );
+}
+
+#[test]
 fn an_indeterminate_reply_is_never_sent_twice_and_resolves_nothing() {
     let run = ReplyRoundTrip::new("reply-uncertain");
     let id = run.issue("question whose answer never lands");
