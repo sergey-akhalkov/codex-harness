@@ -42,6 +42,14 @@ On 0.156.1, `codex queue --thread <exact id> --remote <owning endpoint>` accepts
 
 Selected route: the existing app-server transport owner. An active turn, including generation and a tool held for observation, receives `turn/steer`. An idle loaded thread receives `turn/start`. Queue is not a second delivery engine. It misses the busy-lead bar, and `turn/start` already covers the idle case it does meet.
 
+Final installed acceptance requalified the same selected route on the
+installation's actual `codex-cli 0.157.0` after an in-place upstream update.
+The two-lead check dispatched both executors through real installed
+`executor spawn`, and the real external consumer completed question delivery,
+watch exit 3, correlated reply, same-session continuation and durable board
+result on harness build `ff6f7f9c`. No private consumer identity or evidence
+belongs in this shared design; detailed receipts stay local.
+
 Queue acceptance, history injection and model delivery are distinct. `thread/inject_items` alone does not wake an idle conversation. A second server that resumes a saved copy of a live lead is not delivery to that lead. Tests must observe the owning conversation's items and next provider input, including a lead blocked in `executor watch`, rather than accepting a successful RPC as proof.
 
 Resolve an existing native endpoint when it is available. If an ordinary supported launch needs an endpoint, add only the minimal native app-server plus TUI attachment through the installed launcher, in the original terminal, reusing existing argument, process, authentication and connection code. Do not activate the old window-layout, quota or succession controller as a messaging prerequisite. Preserve profiles, user settings, cwd, sandbox, approval policy, native argument precedence and effective model/provider/effort. Explicit native remote sessions use their verified existing endpoint.
@@ -56,7 +64,7 @@ The dispatch receipt records the executor profile, slot, owner, source checkout,
 
 An executor control endpoint is the harness-recorded loopback app-server address created for that executor. It is not a lead endpoint. Ordinary installed lead launches, including explicit `--profile` and `resume`, do not listen. Installed native launch leaves `task_control` false. An app-server daemon version query does not connect, so no daemon endpoint is available. Explicit `--profile` / `-p` also bypasses managed app-server planning, and that controller performs window layout, so enabling it is not the integration. Explicit `--remote` stays on the native path. Executor remote attachment inserts `--remote` and `--remote-auth-token-env` and keeps the thread id as the resume positional; profile settings for a process without `--profile` already travel as `-c` overrides.
 
-Two explicit profiles on one checkout stay distinct through `executor spawn`: each dispatch names its own profile binding, and neither output contains the dispatching shell's thread id. The executor shell path preserves those explicit profile, checkout, and settings arguments and does not invent an endpoint. A lead delivery endpoint is still absent for an ordinary profile or resume launch. Creating one would be a layout-free app-server plus remote TUI attachment that preserves profiles, settings, and arguments. That is not a minimal edit of the current launcher, and it is not invented here.
+Two explicit profiles on one checkout stay distinct through `executor spawn`: each dispatch names its own profile binding, and neither output contains the dispatching shell's thread id. The executor shell path preserves those explicit profile, checkout, and settings arguments and does not invent an endpoint. `codex-harness lead start` supplies the missing lead side through one layout-free native app-server plus remote TUI attachment, preserving profiles, settings and arguments while recording a thread-keyed endpoint registry; spawn inherits that address. An ordinary unmanaged profile or resume launch still has no endpoint, so reverse messaging reports that condition and the managed fresh-launch remedy instead of guessing an address.
 
 **Alternatives:** prompts cannot enforce ownership or keep a native server alive; native multi-agent tools would change the independently spawned executor architecture and its disabled-agent-tool contract; a new message broker duplicates native transport. None is selected. The native capability check is a bounded choice between existing interfaces, not permission to invent a parallel service.
 
