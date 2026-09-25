@@ -3213,6 +3213,28 @@ fn spill_path(home: &Path, id: &str) -> PathBuf {
     messages_dir(home).join(format!("{id}.txt"))
 }
 
+/// The literal text of every input this run's conversation actually received, in
+/// request order, whichever native method carried it.
+fn submitted_texts(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .server
+        .requests()
+        .iter()
+        .filter(|request| {
+            matches!(
+                request["method"].as_str(),
+                Some("turn/start" | "turn/steer")
+            )
+        })
+        .map(|request| {
+            request["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
 impl Fixture {
     /// The addressed `executor message` command of this fixture.
     fn addressed_command(&self, extra: &[&str]) -> Command {
@@ -3584,6 +3606,95 @@ fn standard_input_that_is_not_utf8_is_refused_without_sending() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("is not UTF-8 text"), "{text}");
     assert!(fixture.server.requests().is_empty(), "{text}");
+}
+
+/// An explicit content flag always wins over the stream, and two content flags
+/// together are still refused: one message is one input.
+#[test]
+fn an_explicit_content_flag_wins_over_the_stream_and_both_together_are_refused() {
+    let fixture = Fixture::new("precedence", "running", true);
+    let typed = "typed correction\n";
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "idle",
+                json!([{
+                    "id": TURN,
+                    "status": "completed",
+                    "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+                }]),
+            )),
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "active",
+                turns_with_input(typed),
+            )),
+        ],
+    );
+    let out = piped(
+        &mut fixture.addressed_command(&["--text", typed]),
+        b"piped text that must not be used\n",
+    );
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(
+        submitted_texts(&fixture),
+        [typed],
+        "the typed flag is the message, not the stream: {text}"
+    );
+
+    // `--file` wins over the stream the same way.
+    let from_file = "file correction\n";
+    let file = fixture.home.join("explicit.txt");
+    fs::write(&file, from_file).unwrap();
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(thread_read(
+            &fixture.slot,
+            "active",
+            turns_with_input(from_file),
+        ))],
+    );
+    let out = piped(
+        &mut fixture.addressed_command(&["--file", file.to_str().unwrap()]),
+        b"piped text that must not be used\n",
+    );
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(
+        submitted_texts(&fixture),
+        [typed, from_file],
+        "the file flag is the message, not the stream: {text}"
+    );
+
+    // Both content flags together are refused before anything is sent.
+    let sent = submitted_texts(&fixture).len();
+    let out = fixture
+        .addressed_command(&["--text", "one", "--file", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("not both: one message is one input"),
+        "{text}"
+    );
+    assert_eq!(
+        submitted_texts(&fixture).len(),
+        sent,
+        "a refused pair must not reach the conversation: {text}"
+    );
+
+    // The lead direction refuses the same pair before it needs any run context.
+    let out = lead_command()
+        .args(["lead", "message", "--text", "one", "--file", "two"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("not both"), "{text}");
 }
 
 /// The spill directory is bounded honestly: a message that would push it past
