@@ -143,7 +143,13 @@ impl Client {
     /// tool can emit more events than the contract pending bound, and this
     /// comparison only needs to know whether the marker or turn completion was
     /// among them.
-    fn drain_seen(&mut self, until: Instant, thread: &str, turn: &str, marker: &str) -> (bool, bool) {
+    fn drain_seen(
+        &mut self,
+        until: Instant,
+        thread: &str,
+        turn: &str,
+        marker: &str,
+    ) -> (bool, bool) {
         let mut marker_event = false;
         let mut turn_completed = false;
         let note = |value: &Value, marker_event: &mut bool, turn_completed: &mut bool| {
@@ -1221,7 +1227,11 @@ fn provider_hits(root: &Path, marker: &str) -> Vec<ProviderHit> {
                 Ok(identity) => (identity.thread, identity.turn),
                 Err(_) => (String::new(), String::new()),
             };
-        hits.push(ProviderHit { file: name, thread, turn });
+        hits.push(ProviderHit {
+            file: name,
+            thread,
+            turn,
+        });
     }
     hits
 }
@@ -1247,9 +1257,8 @@ fn read_http_message(stream: &mut std::net::TcpStream) -> Vec<u8> {
                 key.eq_ignore_ascii_case("content-length")
                     .then(|| value.trim().parse::<usize>().unwrap())
             });
-            let length = length.unwrap_or_else(|| {
-                panic!("provider exchange has no Content-Length:\n{header}")
-            });
+            let length = length
+                .unwrap_or_else(|| panic!("provider exchange has no Content-Length:\n{header}"));
             assert!(length <= 2 * 1024 * 1024, "provider body limit");
             break (end + 4, length);
         }
@@ -1434,8 +1443,7 @@ fn start_owned_thread(client: &mut Client, workspace: &Path, proxy_port: Option<
 }
 
 fn thread_status(client: &mut Client, thread: &str) -> String {
-    client
-        .request("thread/read", json!({"threadId": thread}))["thread"]["status"]["type"]
+    client.request("thread/read", json!({"threadId": thread}))["thread"]["status"]["type"]
         .as_str()
         .unwrap_or_default()
         .to_owned()
@@ -1485,14 +1493,20 @@ fn watch_delivery(
                 .map(|hit| format!("{}:{}:{}", hit.file, hit.thread, hit.turn))
                 .collect();
         }
-        let (marker_event, completed) =
-            owner.drain_seen(Instant::now() + Duration::from_millis(80), thread, turn, marker);
+        let (marker_event, completed) = owner.drain_seen(
+            Instant::now() + Duration::from_millis(80),
+            thread,
+            turn,
+            marker,
+        );
         seen.marker_event |= marker_event;
         seen.turn_completed |= completed;
         if !seen.native_item {
             seen.native_item = thread_has_marker(owner, thread, marker);
         }
-        if seen.native_item && seen.provider_on_thread && (seen.turn_completed || seen.provider_before_completion)
+        if seen.native_item
+            && seen.provider_on_thread
+            && (seen.turn_completed || seen.provider_before_completion)
         {
             break;
         }
@@ -1520,8 +1534,8 @@ fn finish_probe(
 ) -> LeadProbe {
     let accepted = accepted_invocation(acceptance);
     let delivered = seen.native_item && seen.provider_on_thread;
-    let timely =
-        delivered && (state == "idle" || seen.provider_same_turn || seen.provider_before_completion);
+    let timely = delivered
+        && (state == "idle" || seen.provider_same_turn || seen.provider_before_completion);
     let probe = LeadProbe {
         state,
         route,
@@ -1597,11 +1611,10 @@ fn probe_generation(route: &'static str) -> LeadProbe {
     let gate = GenerationGate::start(fixture._responses.port, &root);
     let mut owner = Client::connect(fixture.port, &fixture.token, &root, "generation-owner");
     let thread = start_owned_thread(&mut owner, &fixture.workspace, Some(gate.port));
-    let turn = owner
-        .request(
-            "turn/start",
-            json!({"threadId": thread, "input": [{"type": "text", "text": PROOF_PROMPT}]}),
-        )["turn"]["id"]
+    let turn = owner.request(
+        "turn/start",
+        json!({"threadId": thread, "input": [{"type": "text", "text": PROOF_PROMPT}]}),
+    )["turn"]["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1636,7 +1649,15 @@ fn probe_generation(route: &'static str) -> LeadProbe {
         std::thread::sleep(Duration::from_secs(3));
         release.store(true, Ordering::SeqCst);
     });
-    let acceptance = inject_input(&fixture, &mut owner, route, &thread, &turn, marker, "generation");
+    let acceptance = inject_input(
+        &fixture,
+        &mut owner,
+        route,
+        &thread,
+        &turn,
+        marker,
+        "generation",
+    );
     let during_hold = provider_hits(&root, marker)
         .iter()
         .any(|hit| hit.thread == thread);
@@ -1668,14 +1689,17 @@ fn probe_tool_observation_wait(route: &'static str) -> LeadProbe {
     // The canned fixture's close-view gate keeps this tool blocked until the
     // observation release file appears. It does not emit `executor watch`, and
     // this comparison does not spawn an executor.
-    fs::write(root.join("close-view"), "hold the owned tool for observation\n").unwrap();
+    fs::write(
+        root.join("close-view"),
+        "hold the owned tool for observation\n",
+    )
+    .unwrap();
     let mut owner = Client::connect(fixture.port, &fixture.token, &root, "tool-owner");
     let thread = start_owned_thread(&mut owner, &fixture.workspace, None);
-    let turn = owner
-        .request(
-            "turn/start",
-            json!({"threadId": thread, "input": [{"type": "text", "text": PROOF_PROMPT}]}),
-        )["turn"]["id"]
+    let turn = owner.request(
+        "turn/start",
+        json!({"threadId": thread, "input": [{"type": "text", "text": PROOF_PROMPT}]}),
+    )["turn"]["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1708,7 +1732,15 @@ fn probe_tool_observation_wait(route: &'static str) -> LeadProbe {
     } else {
         "turn/steer"
     };
-    let acceptance = inject_input(&fixture, &mut owner, route, &thread, &turn, marker, "tool-wait");
+    let acceptance = inject_input(
+        &fixture,
+        &mut owner,
+        route,
+        &thread,
+        &turn,
+        marker,
+        "tool-wait",
+    );
     assert_eq!(
         thread_status(&mut owner, &thread),
         "active",
@@ -1772,7 +1804,16 @@ fn probe_idle(route: &'static str) -> LeadProbe {
         marker,
         Instant::now() + Duration::from_secs(20),
     );
-    finish_probe("idle", route, method, &thread, &turn, &acceptance, &seen, root)
+    finish_probe(
+        "idle",
+        route,
+        method,
+        &thread,
+        &turn,
+        &acceptance,
+        &seen,
+        root,
+    )
 }
 
 fn probe_json(probe: &LeadProbe) -> Value {
