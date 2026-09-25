@@ -1772,6 +1772,9 @@ impl Conversation {
             if fresh {
                 let text = user_message_text(&event.raw["params"]["item"]);
                 let turn_id = item_turn_id(&event.raw["params"]).map(str::to_owned);
+                if let Some(client_id) = item_client_id(&event.raw["params"]["item"]) {
+                    self.resolve_observed_reply(client_id, id, turn_id.as_deref());
+                }
                 self.note_user_input(id, turn_id.as_deref(), &text);
             }
         }
@@ -1975,6 +1978,18 @@ impl Conversation {
         } else {
             self.input_awaits_turn = true;
         }
+    }
+
+    /// Upgrades the one queued reply whose client id the conversation now
+    /// observes, then resolves only the lead request that reply names. This is
+    /// the late half of a queued `turn/steer`: transport acceptance alone could
+    /// not establish delivery, but the conversation's own item can do so after
+    /// the in-flight tool returns.
+    fn resolve_observed_reply(&self, client_id: &str, item_id: &str, turn_id: Option<&str>) {
+        let Some(receipt) = &self.receipt else {
+            return;
+        };
+        let _ = resolve_observed_reply(receipt, client_id, item_id, turn_id);
     }
 
     fn accept_observed_turn(&mut self, id: &str) {
@@ -2246,6 +2261,89 @@ fn unresolved_reply_hold_at(receipt: &Path) -> io::Result<bool> {
         let value =
             serde_json::from_slice::<Value>(&fs::read(receipt)?).map_err(io::Error::other)?;
         Ok(unresolved_reply_hold(&value))
+    })
+}
+
+fn item_client_id(item: &Value) -> Option<&str> {
+    item.get("clientId")
+        .or_else(|| item.get("client_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn receipt_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Reconciles one late queued reply from native evidence. Correlation is by the
+/// recorded client message id and the reply's named request; an ordinary
+/// steering input has no `replyTo` and never resolves a question.
+fn resolve_observed_reply(
+    receipt: &Path,
+    client_id: &str,
+    item_id: &str,
+    turn_id: Option<&str>,
+) -> io::Result<()> {
+    with_control_receipt_lock(receipt, || {
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(receipt)?).map_err(io::Error::other)?;
+        let messages = value
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| io::Error::other("dispatch receipt messages field is not an array"))?;
+        let Some(index) = messages.iter().position(|message| {
+            message
+                .get("clientMessageId")
+                .or_else(|| message.get("id"))
+                .and_then(Value::as_str)
+                == Some(client_id)
+        }) else {
+            return Ok(());
+        };
+        if messages[index]["status"] != Value::String("delivered".to_owned()) {
+            messages[index]["status"] = Value::String("delivered".to_owned());
+            messages[index]["evidence"] = Value::String(format!(
+                "observed as userMessage {item_id} of turn {}, correlated by the recorded client message id",
+                turn_id.unwrap_or("unrecorded")
+            ));
+            let now = receipt_now_ms();
+            messages[index]["deliveredMs"] = Value::from(now);
+            messages[index]["recordedMs"] = Value::from(now);
+            messages[index]["detail"] = Value::String(format!(
+                "the late queued input is in the conversation's own items (userMessage {item_id}); whether the executor applied it is the executor's own report"
+            ));
+        }
+        let Some(reply_to) = messages[index]
+            .get("replyTo")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            let bytes = serde_json::to_vec_pretty(&value)?;
+            let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
+            fs::write(&temp, bytes)?;
+            fs::rename(&temp, receipt)?;
+            return Ok(());
+        };
+        let now = receipt_now_ms();
+        if let Some(requests) = value.get_mut("leadMessages").and_then(Value::as_array_mut) {
+            for request in requests {
+                if request.get("id").and_then(Value::as_str) == Some(reply_to.as_str()) {
+                    request["status"] = Value::String("resolved".to_owned());
+                    request["resolvedMs"] = Value::from(now);
+                    request["resolvedBy"] = Value::String(client_id.to_owned());
+                    request["replyEvidence"] = Value::String(format!(
+                        "observed as userMessage {item_id} in the executor conversation"
+                    ));
+                }
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&value)?;
+        let temp = receipt.with_extension(format!("{}.tmp", std::process::id()));
+        fs::write(&temp, bytes)?;
+        fs::rename(&temp, receipt)
     })
 }
 

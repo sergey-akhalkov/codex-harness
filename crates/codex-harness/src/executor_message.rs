@@ -727,6 +727,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 &request.text,
                 attempts,
                 expected_turn.as_deref(),
+                request.reply_to.as_deref(),
             );
             record_attempt(&receipt, entry)?;
             report_delivered(&request, &receipt, evidence, started)
@@ -740,6 +741,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                     &request.text,
                     attempts,
                     expected_turn.as_deref(),
+                    request.reply_to.as_deref(),
                 ),
             )?;
             match &outcome {
@@ -1089,8 +1091,9 @@ fn delivered_entry_of(
     text: &str,
     attempts: u64,
     expected_turn: Option<&str>,
+    reply_to: Option<&str>,
 ) -> Value {
-    let mut entry = outcome_entry(id, outcome, text, attempts, expected_turn);
+    let mut entry = outcome_entry(id, outcome, text, attempts, expected_turn, reply_to);
     entry["status"] = Value::String(STATUS_DELIVERED.into());
     // The turn the conversation's own record places the input in is the turn
     // this attempt is known to have reached.
@@ -1111,6 +1114,7 @@ fn outcome_entry(
     text: &str,
     attempts: u64,
     expected_turn: Option<&str>,
+    reply_to: Option<&str>,
 ) -> Value {
     let (status, method, turn, cause) = match outcome {
         Delivery::Delivered { method, turn, .. } => (STATUS_DELIVERED, method, turn, ""),
@@ -1141,6 +1145,7 @@ fn outcome_entry(
         "schema": SCHEMA,
         "id": id,
         "clientMessageId": id,
+        "replyTo": reply_to,
         "status": status,
         "method": method,
         "expectedTurnId": expected_turn,
@@ -1230,6 +1235,37 @@ fn record_attempt(receipt: &Path, entry: Value) -> io::Result<()> {
         }
     }
     document["messages"] = Value::Array(messages);
+    let delivered_reply = document["messages"].as_array().and_then(|messages| {
+        messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message["status"].as_str() == Some(STATUS_DELIVERED)
+                    && message["replyTo"].as_str().is_some_and(|id| !id.is_empty())
+            })
+            .map(|message| {
+                (
+                    message["replyTo"].as_str().unwrap_or_default().to_owned(),
+                    message["id"].clone(),
+                    message["evidence"].clone(),
+                )
+            })
+    });
+    if let Some((reply_to, attempt_id, evidence)) = delivered_reply
+        && let Some(requests) = document
+            .get_mut("leadMessages")
+            .and_then(Value::as_array_mut)
+    {
+        let now = now_ms();
+        for request in requests {
+            if request["id"].as_str() == Some(reply_to.as_str()) {
+                request["status"] = Value::String("resolved".into());
+                request["resolvedMs"] = Value::from(now);
+                request["resolvedBy"] = attempt_id.clone();
+                request["replyEvidence"] = evidence.clone();
+            }
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&document)?;
     // A fresh temp name per writer keeps a stale leftover from a killed writer
     // from being replaced under an unrelated rename.

@@ -921,6 +921,64 @@ fn one_open_reply_request_holds_until_the_last_one_is_resolved() {
 }
 
 #[test]
+fn a_late_observed_queued_reply_resolves_only_its_named_request() {
+    let (root, server, mut conversation, job) = start_held(json!([{
+        "id": "lead-open",
+        "kind": "reply-request",
+        "status": "delivered"
+    }]));
+    conversation.assign("a queued reply arrives late").unwrap();
+    let path = root.path().join("spawn-1.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    receipt["messages"] = json!([{
+        "schema": 1,
+        "id": "msg-reply",
+        "clientMessageId": "msg-reply",
+        "replyTo": "lead-open",
+        "status": "queued",
+        "method": "turn/steer",
+        "turnId": TURN,
+        "attempts": 1
+    }]);
+    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+    server.push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": THREAD,
+            "turnId": TURN,
+            "item": {
+                "type": "userMessage",
+                "id": "reply-item",
+                "clientId": "msg-reply",
+                "content": [{"type": "text", "text": "use the committed route"}]
+            }
+        }
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    assert_eq!(
+        conversation.lifecycle(),
+        Some(Lifecycle::Completed),
+        "an observed correlated reply must release its hold"
+    );
+    let resolved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(resolved["messages"][0]["status"], "delivered", "{resolved}");
+    assert_eq!(
+        resolved["leadMessages"][0]["status"], "resolved",
+        "{resolved}"
+    );
+    assert_eq!(
+        resolved["leadMessages"][0]["resolvedBy"], "msg-reply",
+        "{resolved}"
+    );
+    drop(job);
+}
+
+#[test]
 fn a_hold_in_the_terminal_burst_keeps_the_run_live_and_the_exact_thread() {
     // The question is already unresolved when the whole terminal burst
     // arrives in one batch: the turn's own status must not finish the run
