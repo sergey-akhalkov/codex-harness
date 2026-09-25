@@ -4,7 +4,7 @@
 schema = 1
 lead_profile = "default"
 successor_lead_profile = "zai"
-executor_profiles = ["xai"]
+executor_profiles = ["ds"]
 # Also sizes the harness-owned executor worktree pool: dispatch creates,
 # synchronizes and binds sibling slots `<repository-name>-wt1` .. `-wtN`, and
 # refuses dispatch when all are held by live sessions instead of allocating
