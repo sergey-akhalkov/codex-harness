@@ -192,6 +192,20 @@ impl ControlPaths {
             log: directory.join(format!("endpoint-{index}.log")),
         })
     }
+
+    /// The working state of one managed lead session host, named by the host
+    /// process: the conversation's thread identity does not exist yet when the
+    /// app-server command is built. The registry record that other commands
+    /// resolve is published under that identity once `thread/start` or
+    /// `thread/resume` established it.
+    pub fn for_lead_host(codex_home: &Path, pid: u32) -> Self {
+        let directory = lead_host_dir(codex_home);
+        Self {
+            endpoint: directory.join(format!("{pid}.json")),
+            token: directory.join(format!("{pid}.token")),
+            log: directory.join(format!("{pid}.log")),
+        }
+    }
 }
 
 /// Identity of the process that dispatched one executor run. A pid alone is
@@ -499,6 +513,12 @@ pub struct ControlPlan {
     /// Environment overrides for the child; `None` removes a variable. The
     /// caller passes the prepared executor shell `PATH` here.
     pub env: BTreeMap<OsString, Option<OsString>>,
+    /// Whether this plan serves an executor conversation. An executor
+    /// conversation is marked with the executor session environment and runs
+    /// the single-agent override; a managed lead session keeps the native agent
+    /// capability and must not be mistaken for an executor by the launcher or
+    /// by the kit's own nested-dispatch refusal.
+    pub executor_session: bool,
     /// Bound for readiness and for every request's answer.
     pub bound: Duration,
     /// Record-read timeout of one pump step.
@@ -528,6 +548,7 @@ impl ControlPlan {
             args: Vec::new(),
             port: None,
             env: BTreeMap::new(),
+            executor_session: true,
             bound: DEFAULT_BOUND,
             poll: DEFAULT_POLL,
         }
@@ -535,10 +556,12 @@ impl ControlPlan {
 }
 
 /// The `codex app-server` command one control session spawns: the loopback
-/// listener, the capability-token file, the executor agent-tool override, the
-/// caller's extra arguments, the bound slot as working directory and the
-/// executor session environment. The lead's thread id is removed so the child
-/// cannot attach to the originating conversation.
+/// listener, the capability-token file, the caller's extra arguments, the bound
+/// slot as working directory, and - for an executor conversation - the executor
+/// session environment and the agent-tool override. A managed lead session gets
+/// neither, because the lead keeps the native agent capability. The parent's
+/// session and thread id are removed in both cases, so the child cannot attach
+/// to a conversation it does not serve.
 pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
     let mut command = CommandSpec::new(&plan.launcher);
     command.current_dir = Some(plan.slot.clone());
@@ -547,9 +570,11 @@ pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
         "CODEX_HOME".into(),
         Some(plan.home.clone().into_os_string()),
     );
-    command
-        .env
-        .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
+    if plan.executor_session {
+        command
+            .env
+            .insert(EXECUTOR_SESSION_ENV.into(), Some("1".into()));
+    }
     for (key, value) in &plan.env {
         command.env.insert(key.clone(), value.clone());
     }
@@ -583,7 +608,11 @@ fn app_server_args(plan: &ControlPlan, port: u16) -> Vec<OsString> {
         OsString::from("--ws-token-file"),
         plan.paths.token.clone().into_os_string(),
     ];
-    args.extend(EXECUTOR_AGENT_TOOLS_OFF.map(OsString::from));
+    if plan.executor_session {
+        // A managed lead session keeps the native agent capability: neither
+        // this override nor the session marker reaches its app-server child.
+        args.extend(EXECUTOR_AGENT_TOOLS_OFF.map(OsString::from));
+    }
     args.extend(plan.args.iter().cloned());
     args
 }
@@ -696,6 +725,158 @@ impl Endpoint {
             )));
         }
         Ok(endpoint)
+    }
+}
+
+/// Kit-local registry of managed lead sessions: one endpoint record per exact
+/// native lead thread, so an executor spawn running in that thread's own shell
+/// can inherit the address of the conversation that dispatched it. The registry
+/// holds addresses and their bearers only - never message text, transcripts or
+/// board state - and its records are local session state, not shared artifacts.
+pub fn lead_registry_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join("harness/lead-endpoints")
+}
+
+/// Working directory of one managed lead session host: the app-server's
+/// capability-token file, its combined log, and the transient endpoint record
+/// the driver writes before the conversation has a thread identity. It is not
+/// the registry: only the thread-keyed records beside it are addresses other
+/// commands resolve.
+pub fn lead_host_dir(codex_home: &Path) -> PathBuf {
+    lead_registry_dir(codex_home).join("host")
+}
+
+/// The exact thread id is the registry key. A value that cannot be a file name
+/// (a path, a reserved name, an unreasonable length) is refused before any
+/// record is written or read, so a spoofed `CODEX_THREAD_ID` cannot name state
+/// this registry does not own.
+fn lead_key(thread_id: &str) -> io::Result<String> {
+    let key = thread_id.trim();
+    if key.is_empty()
+        || key.len() > 128
+        || key == "."
+        || key == ".."
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(invalid(
+            "a lead session identity that is not a bounded registry key cannot name a registered endpoint",
+        ));
+    }
+    Ok(key.to_owned())
+}
+
+/// The registry file of one exact lead thread.
+pub fn lead_endpoint_path(codex_home: &Path, thread_id: &str) -> io::Result<PathBuf> {
+    Ok(lead_registry_dir(codex_home).join(format!("{}.json", lead_key(thread_id)?)))
+}
+
+/// What the registry reports for one exact lead thread.
+pub enum RegisteredLead {
+    /// A validated record whose recorded app-server process is still live.
+    Live(Box<Endpoint>),
+    /// No usable endpoint. The reason is bounded and names no bearer.
+    Unavailable(String),
+}
+
+/// Resolves the registered endpoint of one exact lead thread, failing closed: a
+/// missing, unreadable, malformed, mismatched or stale record is never reported
+/// as a usable address. Spawn inherits only a live record, and `lead message`
+/// refuses with this reason instead of guessing an address.
+pub fn registered_lead(codex_home: &Path, thread_id: &str) -> RegisteredLead {
+    let path = match lead_endpoint_path(codex_home, thread_id) {
+        Ok(path) => path,
+        Err(error) => return RegisteredLead::Unavailable(error.to_string()),
+    };
+    let endpoint = match Endpoint::read(&path) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return RegisteredLead::Unavailable(
+                "no lead endpoint is registered for the dispatching lead session".to_owned(),
+            );
+        }
+        // Every other failure is reported as the bounded fact: a malformed
+        // record's parse detail can echo record fields, and an unusable record
+        // is not an address in any case.
+        Err(_) => {
+            return RegisteredLead::Unavailable(
+                "the registered lead endpoint record is unreadable or malformed".to_owned(),
+            );
+        }
+    };
+    if endpoint.thread_id.as_deref() != Some(thread_id.trim()) {
+        return RegisteredLead::Unavailable(
+            "the registered lead endpoint belongs to another conversation".to_owned(),
+        );
+    }
+    let Some(process) = endpoint.process.as_ref() else {
+        return RegisteredLead::Unavailable(
+            "the registered lead endpoint records no app-server process".to_owned(),
+        );
+    };
+    if !endpoint_process_live(process) {
+        return RegisteredLead::Unavailable(
+            "the process registered for this lead session is no longer live".to_owned(),
+        );
+    }
+    RegisteredLead::Live(Box::new(endpoint))
+}
+
+/// Whether the recorded endpoint process is still the process that serves it:
+/// pid, creation time and image must match the current process table. A bare
+/// pid, a missing image, an unverifiable identity or a reused pid is not
+/// liveness, so a stale address can never be inherited or delivered to.
+pub fn endpoint_process_live(process: &EndpointProcess) -> bool {
+    if process.pid == 0 || process.creation_time == 0 || !process.program.is_file() {
+        return false;
+    }
+    let Ok(user) = harness_core::process_service::current_user() else {
+        return false;
+    };
+    matches!(
+        harness_core::process_service::ServiceProcess::inspect(
+            ProcessIdentity {
+                pid: process.pid,
+                creation_time: process.creation_time,
+            },
+            &process.program,
+            &user,
+        ),
+        Ok(Some(_))
+    )
+}
+
+/// Publishes one managed lead session's verified endpoint under its exact
+/// thread id, replacing an earlier record of that thread in one step. Refusing
+/// a thread without an identity keeps an unaddressable record out of the
+/// registry, where every resolver would have to guess what it belongs to.
+pub fn publish_lead_endpoint(codex_home: &Path, endpoint: &Endpoint) -> io::Result<PathBuf> {
+    let thread = endpoint
+        .thread_id
+        .clone()
+        .filter(|thread| !thread.trim().is_empty())
+        .ok_or_else(|| {
+            invalid(
+                "a lead endpoint can only be recorded for a conversation with a thread identity",
+            )
+        })?;
+    let path = lead_endpoint_path(codex_home, &thread)?;
+    endpoint.record(&path)?;
+    Ok(path)
+}
+
+/// Removes one thread's registry record. A missing record is the normal case of
+/// a session that never published, or already retired, its address.
+pub fn retire_lead_endpoint(codex_home: &Path, thread_id: &str) -> io::Result<()> {
+    let path = lead_endpoint_path(codex_home, thread_id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::other(format!(
+            "the lead endpoint record {} could not be retired: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -1040,6 +1221,27 @@ impl Conversation {
         Ok(conversation)
     }
 
+    /// Starts the app-server and resumes one exact existing thread while
+    /// keeping the routing and the directory that thread's own record already
+    /// established.
+    ///
+    /// This is the lead's own conversation: the kit gives it a delivery
+    /// endpoint and must not rewrite the model, provider, effort or working
+    /// directory a native session already has. Only the exact thread identity
+    /// and the selected checkout are verified, so a second conversation can
+    /// never be attached or described in this thread's place.
+    pub fn start_resuming_own(job: &Job, plan: &ControlPlan, session: &str) -> io::Result<Self> {
+        if session.is_empty() {
+            return Err(invalid(
+                "exact-session resume requires the recorded session id; refusing to start another conversation",
+            ));
+        }
+        let mut conversation = Self::open(job, plan)?;
+        conversation.resume_exact_own(session, plan)?;
+        conversation.record_endpoint(plan)?;
+        Ok(conversation)
+    }
+
     fn open(job: &Job, plan: &ControlPlan) -> io::Result<Self> {
         if plan.launcher.as_os_str().is_empty() || plan.slot.as_os_str().is_empty() {
             return Err(invalid(
@@ -1114,6 +1316,32 @@ impl Conversation {
         if let Err(mismatch) = confirm_resumed(&plan.identity, &resumed, &plan.slot) {
             return Err(invalid(format!(
                 "resuming the exact session changed the bound routing: {mismatch}"
+            )));
+        }
+        self.thread_id = session.to_owned();
+        self.endpoint.thread_id = Some(session.to_owned());
+        Ok(())
+    }
+
+    /// Adopts `session` through `thread/resume` for a conversation that keeps
+    /// its own routing, and refuses any other thread. The reported directory
+    /// must be the selected checkout or inside it: a session that runs outside
+    /// the selected source would make this command's own record wrong.
+    fn resume_exact_own(&mut self, session: &str, plan: &ControlPlan) -> io::Result<()> {
+        let resumed = self.call("thread/resume", json!({"threadId": session}))?;
+        if resumed["thread"]["id"].as_str() != Some(session) {
+            return Err(invalid(
+                "thread/resume returned another thread; refusing to attach a frontend to a different conversation",
+            ));
+        }
+        if let Some(cwd) = resumed["thread"]["cwd"]
+            .as_str()
+            .or_else(|| resumed["cwd"].as_str())
+            && !inside_checkout(cwd, &plan.slot)
+        {
+            return Err(invalid(format!(
+                "the resumed conversation runs in {cwd}, outside the selected checkout {}; name the checkout that conversation runs in as --source instead of exposing a session of another directory",
+                plan.slot.display()
             )));
         }
         self.thread_id = session.to_owned();
@@ -1449,7 +1677,7 @@ impl Conversation {
             .to_owned();
         if let Err(mismatch) = plan.identity.verify(&started) {
             return Err(invalid(format!(
-                "the executor profile binding was not preserved: {mismatch}; the conversation was refused instead of running with different routing"
+                "the profile binding was not preserved: {mismatch}; the conversation was refused instead of running with different routing"
             )));
         }
         self.call(
@@ -1930,6 +2158,20 @@ fn normalize_slot(path: &str) -> String {
     text.trim_end_matches('\\').to_owned()
 }
 
+/// Whether the reported directory is the selected checkout or one of its
+/// subdirectories. A lead session may work in a subdirectory of its checkout;
+/// a session outside the selected checkout is a different conversation than
+/// this command would record.
+#[allow(dead_code)]
+fn inside_checkout(reported: &str, checkout: &Path) -> bool {
+    let reported = normalize_slot(reported).to_ascii_lowercase();
+    let checkout = normalize_slot(&checkout.to_string_lossy()).to_ascii_lowercase();
+    reported == checkout
+        || reported
+            .strip_prefix(&checkout)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
 /// The final assistant message of one thread record.
 ///
 /// When `turn_id` is set, only that accepted turn is read. Falling back to
@@ -2218,4 +2460,213 @@ fn os_random(buffer: &mut [u8]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home(label: &str) -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("lead-registry-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    /// The live identity of this test process, in the shape an endpoint record
+    /// carries for the app-server it belongs to. The app-server itself is a
+    /// child of this host, so a live process needs no second server here.
+    fn live_process() -> EndpointProcess {
+        let program = std::env::current_exe().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = harness_core::process_service::ServiceProcess::observe(
+            std::process::id(),
+            &program,
+            0,
+            &user,
+        )
+        .unwrap()
+        .identity();
+        EndpointProcess {
+            pid: identity.pid,
+            creation_time: identity.creation_time,
+            program,
+        }
+    }
+
+    fn record(thread: &str, process: &EndpointProcess) -> Value {
+        json!({
+            "schema": 1,
+            "port": 51234,
+            "token": "d".repeat(TOKEN_BYTES * 2),
+            "threadId": thread,
+            "process": {
+                "pid": process.pid,
+                "creationTime": process.creation_time,
+                "program": process.program,
+            },
+        })
+    }
+
+    fn write_record(home: &Path, thread: &str, value: &Value) {
+        let path = lead_endpoint_path(home, thread).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_registered_lead_endpoint_is_resolved_only_for_its_own_live_thread() {
+        let home = home("live");
+        let process = live_process();
+        write_record(&home, "thread-live", &record("thread-live", &process));
+        match registered_lead(&home, "thread-live") {
+            RegisteredLead::Live(endpoint) => {
+                assert_eq!(endpoint.thread_id.as_deref(), Some("thread-live"));
+                assert_eq!(endpoint.port(), 51234);
+            }
+            RegisteredLead::Unavailable(cause) => panic!("a live record was refused: {cause}"),
+        }
+        // The same record is not an address of another conversation.
+        match registered_lead(&home, "thread-other") {
+            RegisteredLead::Live(_) => panic!("a record was resolved for another thread"),
+            RegisteredLead::Unavailable(cause) => {
+                assert!(cause.contains("no lead endpoint is registered"), "{cause}");
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn missing_malformed_mismatched_and_stale_lead_records_fail_closed() {
+        let home = home("failures");
+        match registered_lead(&home, "thread-missing") {
+            RegisteredLead::Live(_) => panic!("a missing record was resolved"),
+            RegisteredLead::Unavailable(cause) => {
+                assert!(cause.contains("no lead endpoint is registered"), "{cause}");
+            }
+        }
+        write_record(&home, "thread-malformed", &json!({"schema": 1}));
+        match registered_lead(&home, "thread-malformed") {
+            RegisteredLead::Live(_) => panic!("a malformed record was resolved"),
+            RegisteredLead::Unavailable(cause) => {
+                assert!(cause.contains("unreadable or malformed"), "{cause}");
+                assert!(
+                    !cause.contains(&"d".repeat(TOKEN_BYTES)),
+                    "a refusal must not carry the record's bearer: {cause}"
+                );
+            }
+        }
+        let process = live_process();
+        write_record(
+            &home,
+            "thread-mismatch",
+            &record("thread-elsewhere", &process),
+        );
+        match registered_lead(&home, "thread-mismatch") {
+            RegisteredLead::Live(_) => panic!("a record of another thread was resolved"),
+            RegisteredLead::Unavailable(cause) => {
+                assert!(cause.contains("another conversation"), "{cause}");
+            }
+        }
+        let dead = EndpointProcess {
+            pid: 1,
+            creation_time: 1,
+            program: process.program.clone(),
+        };
+        write_record(&home, "thread-stale", &record("thread-stale", &dead));
+        match registered_lead(&home, "thread-stale") {
+            RegisteredLead::Live(_) => panic!("a stale record was resolved"),
+            RegisteredLead::Unavailable(cause) => {
+                assert!(cause.contains("no longer live"), "{cause}");
+            }
+        }
+        // A record with no process identity is state, not an address.
+        write_record(
+            &home,
+            "thread-noprocess",
+            &json!({
+                "schema": 1,
+                "port": 51234,
+                "token": "d".repeat(TOKEN_BYTES * 2),
+                "threadId": "thread-noprocess",
+            }),
+        );
+        match registered_lead(&home, "thread-noprocess") {
+            RegisteredLead::Live(_) => panic!("a record with no process was resolved"),
+            RegisteredLead::Unavailable(cause) => {
+                assert!(cause.contains("records no app-server process"), "{cause}");
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_lead_identity_that_cannot_key_a_record_is_never_an_address() {
+        let home = home("keys");
+        for thread in ["", "  ", ".", "..", "a/b", r"a\b", "thread:1"] {
+            assert!(
+                lead_endpoint_path(&home, thread).is_err(),
+                "{thread:?} was accepted as a registry key"
+            );
+            assert!(matches!(
+                registered_lead(&home, thread),
+                RegisteredLead::Unavailable(_)
+            ));
+        }
+        assert!(lead_endpoint_path(&home, &"t".repeat(129)).is_err());
+        assert_eq!(
+            lead_endpoint_path(&home, "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4").unwrap(),
+            home.join("harness/lead-endpoints/01a0c719-f4d4-7880-a9d2-1a96ee0f23f4.json")
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn publishing_and_retiring_a_lead_endpoint_leaves_no_address_behind() {
+        let home = home("publish");
+        let process = live_process();
+        let path = lead_endpoint_path(&home, "thread-published").unwrap();
+        write_record(
+            &home,
+            "thread-published",
+            &record("thread-published", &process),
+        );
+        let endpoint = Endpoint::read(&path).unwrap();
+        let published = publish_lead_endpoint(&home, &endpoint).unwrap();
+        assert_eq!(published, path);
+        // Publishing a conversation without a thread identity would put an
+        // unaddressable record where every resolver looks for one.
+        let anonymous = Endpoint::read(&path).unwrap();
+        write_record(
+            &home,
+            "thread-anonymous",
+            &record("thread-anonymous", &process),
+        );
+        let mut anonymous = anonymous;
+        anonymous.thread_id = None;
+        assert!(publish_lead_endpoint(&home, &anonymous).is_err());
+        retire_lead_endpoint(&home, "thread-published").unwrap();
+        assert!(!path.exists());
+        // Retiring what is not there is the normal case, not a failure.
+        retire_lead_endpoint(&home, "thread-published").unwrap();
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_lead_session_is_attached_to_its_own_checkout() {
+        let checkout = PathBuf::from(r"D:\work\proj");
+        assert!(inside_checkout(r"D:\work\proj", &checkout));
+        assert!(inside_checkout(r"\\?\D:\work\proj", &checkout));
+        assert!(inside_checkout(r"d:/work/proj/src", &checkout));
+        assert!(!inside_checkout(r"D:\work\other", &checkout));
+        assert!(!inside_checkout(r"D:\work\project", &checkout));
+        // Host working files are not slot addresses: a registry lookup never
+        // resolves one.
+        let paths = ControlPaths::for_lead_host(Path::new(r"C:\home"), 4242);
+        assert_eq!(
+            paths.endpoint,
+            PathBuf::from(r"C:\home\harness\lead-endpoints\host\4242.json")
+        );
+    }
 }

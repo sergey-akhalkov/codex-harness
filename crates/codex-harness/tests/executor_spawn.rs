@@ -1477,6 +1477,262 @@ fn a_live_thread_id_is_recorded_and_the_child_does_not_keep_it() {
     );
 }
 
+/// The bearer of the inherited record. The copy beside the receipt carries it
+/// so the executor's own `lead message` can connect; it never reaches output.
+const LEAD_TOKEN: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+/// The live identity of this test process, in the shape a lead endpoint record
+/// carries for the app-server it belongs to. Inheritance only has to confirm
+/// that identity is live; the record is never connected to here.
+fn live_process() -> Value {
+    let program = std::env::current_exe().unwrap();
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &program,
+        0,
+        &user,
+    )
+    .unwrap()
+    .identity();
+    json!({
+        "pid": identity.pid,
+        "creationTime": identity.creation_time,
+        "program": program,
+    })
+}
+
+/// One managed lead session's registry record, exactly as `lead start`
+/// publishes it: the address of the exact native thread, never a message.
+fn lead_record(thread: &str, port: u16, process: &Value) -> Value {
+    json!({
+        "schema": 1,
+        "port": port,
+        "token": LEAD_TOKEN,
+        "threadId": thread,
+        "process": process,
+    })
+}
+
+fn write_lead_registry(home: &Path, thread: &str, record: &Value) {
+    let path = home.join(format!("harness/lead-endpoints/{thread}.json"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec_pretty(record).unwrap()).unwrap();
+}
+
+/// The dispatch inherits the live registered endpoint of the lead that runs in
+/// this shell: the copy beside the receipt is that exact record, and it is what
+/// lets a fresh spawned executor reach its own lead.
+#[test]
+fn a_live_registered_lead_endpoint_is_inherited_beside_the_receipt() {
+    let fixture = Fixture::new("lead-inherit", 1);
+    let process = live_process();
+    write_lead_registry(
+        &fixture.home,
+        "lead-thread-synthetic",
+        &lead_record("lead-thread-synthetic", 51234, &process),
+    );
+    let out = fixture.spawn(&["--owner", "exec-lead-inherit"]);
+    let text = output_text(&out);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the dispatch must still run its own checks: {text}"
+    );
+    assert!(text.contains("lead channel: inherited"), "{text}");
+    assert!(
+        !text.contains("lead-thread-synthetic"),
+        "dispatch leaked the lead thread id: {text}"
+    );
+    let state =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    let inherited: Value =
+        serde_json::from_slice(&fs::read(state.join("lead-endpoint-1.json")).unwrap()).unwrap();
+    assert_eq!(inherited["threadId"], "lead-thread-synthetic");
+    assert_eq!(inherited["port"], 51234);
+    assert_eq!(inherited["token"], LEAD_TOKEN);
+    assert_eq!(inherited["process"]["pid"], process["pid"]);
+    assert_eq!(
+        inherited["process"]["creationTime"],
+        process["creationTime"]
+    );
+    fixture.drop();
+}
+
+/// Endpoint inheritance fails closed: a stale record is not inherited, a
+/// leftover copy of another conversation is retired, and the spawn reports the
+/// unavailable channel with its remedy while the dispatch itself continues
+/// exactly as before.
+#[test]
+fn a_stale_lead_endpoint_is_refused_and_retired() {
+    let fixture = Fixture::new("lead-stale", 1);
+    let process = live_process();
+    let dead = json!({
+        "pid": 1,
+        "creationTime": 1,
+        "program": process["program"].clone(),
+    });
+    write_lead_registry(
+        &fixture.home,
+        "lead-thread-synthetic",
+        &lead_record("lead-thread-synthetic", 51234, &dead),
+    );
+    let state =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let leftover = state.join("lead-endpoint-1.json");
+    fs::write(
+        &leftover,
+        serde_json::to_vec_pretty(&json!({"threadId": "lead-thread-other"})).unwrap(),
+    )
+    .unwrap();
+    let out = fixture.spawn(&["--owner", "exec-lead-stale"]);
+    let text = output_text(&out);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the dispatch must still run its own checks: {text}"
+    );
+    assert!(text.contains("lead channel: unavailable"), "{text}");
+    assert!(
+        text.contains("no longer live"),
+        "the refusal must name the stale process: {text}"
+    );
+    assert!(
+        text.contains("codex-harness lead start"),
+        "the refusal must name the supported remedy: {text}"
+    );
+    assert!(
+        !text.contains("lead-thread-synthetic"),
+        "dispatch leaked the lead thread id: {text}"
+    );
+    assert!(
+        !leftover.exists(),
+        "a stale lead endpoint of this slot must not survive the dispatch"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(pooled_receipt_path(&fixture.home, 1)).unwrap()).unwrap();
+    assert_eq!(
+        receipt["originatingLead"]["threadId"], "lead-thread-synthetic",
+        "the dispatching lead is still recorded as attribution: {receipt}"
+    );
+    fixture.drop();
+}
+
+/// A record that names another conversation, or one that is not readable as an
+/// endpoint at all, is not this thread's address: both inherit nothing.
+#[test]
+fn a_mismatched_or_malformed_lead_endpoint_is_refused() {
+    let fixture = Fixture::new("lead-mismatch", 1);
+    let process = live_process();
+    write_lead_registry(
+        &fixture.home,
+        "lead-thread-synthetic",
+        &lead_record("lead-thread-elsewhere", 51234, &process),
+    );
+    let out = fixture.spawn(&["--owner", "exec-lead-mismatch"]);
+    let text = output_text(&out);
+    assert!(text.contains("lead channel: unavailable"), "{text}");
+    assert!(
+        text.contains("belongs to another conversation"),
+        "the refusal must name the mismatch: {text}"
+    );
+    assert!(
+        !text.contains("lead-thread-elsewhere") && !text.contains("lead-thread-synthetic"),
+        "dispatch leaked a lead thread id: {text}"
+    );
+    let state =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    assert!(!state.join("lead-endpoint-1.json").exists());
+    fixture.drop();
+
+    let fixture = Fixture::new("lead-malformed", 1);
+    write_lead_registry(
+        &fixture.home,
+        "lead-thread-synthetic",
+        &json!({"schema": 1, "token": LEAD_TOKEN}),
+    );
+    let out = fixture.spawn(&["--owner", "exec-lead-malformed"]);
+    let text = output_text(&out);
+    assert!(text.contains("lead channel: unavailable"), "{text}");
+    assert!(
+        text.contains("unreadable or malformed"),
+        "the refusal must name the unusable record: {text}"
+    );
+    assert!(
+        !text.contains(LEAD_TOKEN),
+        "a refusal must never print the record's bearer: {text}"
+    );
+    fixture.drop();
+}
+
+/// `lead start` reports its own options, refuses an option it does not own
+/// before anything starts, and an executor never hosts a lead session.
+#[test]
+fn lead_start_reports_its_options_and_refuses_unusable_ones() {
+    let help = lead_command().args(["lead", "--help"]).output().unwrap();
+    let text = output_text(&help);
+    assert!(help.status.success(), "{text}");
+    assert!(text.contains("codex-harness lead start"), "{text}");
+    assert!(text.contains("codex-harness lead message"), "{text}");
+    assert!(text.contains("harness/lead-endpoints"), "{text}");
+
+    let usage = lead_command()
+        .args(["lead", "start", "--help"])
+        .output()
+        .unwrap();
+    let text = output_text(&usage);
+    assert!(usage.status.success(), "{text}");
+    assert!(text.contains("--session THREAD_ID"), "{text}");
+    assert!(text.contains("native agent capability"), "{text}");
+
+    let bad = lead_command()
+        .args(["lead", "start", "--profile", "ds"])
+        .output()
+        .unwrap();
+    let text = output_text(&bad);
+    assert!(!bad.status.success(), "{text}");
+    assert!(
+        text.contains("invalid lead start option --profile"),
+        "{text}"
+    );
+    for option in [
+        "--source CHECKOUT",
+        "--codex-home DIRECTORY",
+        "--session THREAD_ID",
+    ] {
+        assert!(text.contains(option), "{text}");
+    }
+
+    let root = std::env::temp_dir().join(format!("lead-start-options-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let blank = lead_command()
+        .args(["lead", "start", "--codex-home"])
+        .arg(&root)
+        .args(["--session", " "])
+        .output()
+        .unwrap();
+    let text = output_text(&blank);
+    assert!(!blank.status.success(), "{text}");
+    assert!(
+        text.contains("--session needs the exact thread identity"),
+        "{text}"
+    );
+
+    let nested = lead_command()
+        .env("HARNESS_EXECUTOR_SESSION", "1")
+        .args(["lead", "start", "--help"])
+        .output()
+        .unwrap();
+    let text = output_text(&nested);
+    assert!(!nested.status.success(), "{text}");
+    assert!(
+        text.contains("executor sessions cannot host a lead session"),
+        "{text}"
+    );
+    assert!(text.contains("lead message"), "{text}");
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn missing_or_blank_lead_id_refuses_before_a_model_request() {
     let fixture = Fixture::new("lead-missing", 1);

@@ -154,19 +154,392 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
-/// `codex-harness lead message`: a spawned executor sends one payload to the
-/// originating lead recorded for its run. The caller supplies no address.
+/// Usage of the one command that gives an interactive lead an app-server
+/// endpoint of its own. `lead message` is the other direction and keeps its
+/// own usage beside it.
+const LEAD_START_USAGE: &str = "\
+codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID]
+  Host one managed native lead session in this terminal: resolve the configured lead
+  profile (CHECKOUT/global/orchestration.toml, default: this directory), start one
+  `codex app-server` on loopback, create the thread - or resume the exact THREAD_ID -
+  attach one native Codex TUI to it, and keep this host alive while that frontend runs.
+  The session records its verified endpoint under its exact thread identity in
+  <CODEX_HOME>/harness/lead-endpoints, so an executor dispatched from this session's own
+  shells inherits that address and `codex-harness lead message` reaches this conversation.
+  The lead keeps the native agent capability: no window layout, no second conversation, no
+  daemon and no substitute renderer is started, and profiles, settings, cwd, arguments and
+  effective model/provider/effort stay those of the native CLI. End the previous session
+  before resuming its thread with --session.
+";
+
+/// `codex-harness lead`: the lead side of the executor exchange.
+///
+/// `start` hosts one managed native lead session, and `message` is a spawned
+/// executor's own channel back to the lead that dispatched it; the caller of
+/// `message` supplies no address.
 pub fn lead(args: &[OsString]) -> io::Result<i32> {
     match args.first().and_then(|arg| arg.to_str()) {
         None | Some("--help") => {
-            println!("{}", executor_message::LEAD_USAGE);
+            println!("{LEAD_START_USAGE}\n{}", executor_message::LEAD_USAGE);
             Ok(0)
+        }
+        Some("start") => {
+            refuse_lead_hosting(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+            lead_start(&args[1..])
         }
         Some("message") => executor_message::lead_message(&args[1..]),
         _ => Err(invalid(
-            "invalid lead command: expected `codex-harness lead message` with --text or --file",
+            "invalid lead command: expected `codex-harness lead start` or `codex-harness lead message` with --text or --file",
         )),
     }
+}
+
+/// A managed lead session is the lead's own conversation. An executor that
+/// hosts one would create the second conversation the kit forbids, so the
+/// command refuses inside an executor's process tree and names the channel that
+/// exists there.
+fn refuse_lead_hosting(marker: Option<OsString>) -> io::Result<()> {
+    if marker.is_some() {
+        return Err(invalid(
+            "executor sessions cannot host a lead session: this process runs inside an executor (HARNESS_EXECUTOR_SESSION is set); ask the lead that dispatched this run through `codex-harness lead message` instead of creating a conversation",
+        ));
+    }
+    Ok(())
+}
+
+/// One managed lead session request, before anything is started.
+struct LeadStart {
+    /// The checkout this lead works in: its orchestration configuration names
+    /// the lead profile, and the conversation runs there.
+    source: PathBuf,
+    /// The kit home the app-server and the frontend load their configuration
+    /// from, and whose kit-local registry records this session's endpoint.
+    codex_home: PathBuf,
+    /// The exact existing conversation to resume, when this launch continues
+    /// one instead of creating a new thread.
+    session: Option<String>,
+}
+
+fn lead_start(args: &[OsString]) -> io::Result<i32> {
+    if args == ["--help"] {
+        println!("{LEAD_START_USAGE}");
+        return Ok(0);
+    }
+    let request = parse_lead_start(args)?;
+    let config = orchestration_config::load(&request.source).map_err(|error| {
+        invalid(&format!(
+            "the orchestration configuration of {} is not readable: {error}; pass --source CHECKOUT with the checkout that holds global/orchestration.toml",
+            request.source.display()
+        ))
+    })?;
+    let profile = config.lead_profile;
+    let bound = orchestration_config::binding(&request.codex_home, &profile)?;
+    let launcher = request.codex_home.join("harness/bin/codex.exe");
+    if !launcher.is_file() {
+        return Err(invalid(&format!(
+            "installed Codex launcher is missing: {} does not exist; restore the kit installation recorded for {} before hosting a lead session",
+            launcher.display(),
+            request.codex_home.display()
+        )));
+    }
+    // A thread that answers on a live registered endpoint is a session that
+    // already exists: this command never attaches a second app-server to one
+    // conversation, and a stale record of the same thread is retired instead
+    // of being reused as this session's address.
+    if let Some(session) = request.session.as_deref() {
+        if let control::RegisteredLead::Live(endpoint) =
+            control::registered_lead(&request.codex_home, session)
+        {
+            let pid = endpoint
+                .process
+                .as_ref()
+                .map(|process| process.pid)
+                .unwrap_or(0);
+            return Err(invalid(&format!(
+                "thread {session} is already served by a live managed lead session (app-server pid {pid}); end that session before resuming its thread, or start a new conversation without --session"
+            )));
+        }
+        control::retire_lead_endpoint(&request.codex_home, session)?;
+    }
+    host_lead_session(&request, &profile, &bound, &launcher)
+}
+
+fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
+    let mut source = None;
+    let mut codex_home = None;
+    let mut session = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let key = arg
+            .to_str()
+            .ok_or_else(|| invalid(&invalid_lead_option("<not Unicode>")))?;
+        let value = iter
+            .next()
+            .ok_or_else(|| invalid(&invalid_lead_option(key)))?;
+        match key {
+            "--source" => source = Some(PathBuf::from(value)),
+            "--codex-home" => codex_home = Some(PathBuf::from(value)),
+            "--session" => session = Some(option_text(value)?),
+            _ => return Err(invalid(&invalid_lead_option(key))),
+        }
+    }
+    let source = match source {
+        Some(source) => source,
+        None => std::env::current_dir().map_err(|error| {
+            invalid(&format!(
+                "the checkout this lead session runs in is unavailable: {error}; pass --source CHECKOUT"
+            ))
+        })?,
+    };
+    let codex_home = match codex_home.or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+    {
+        Some(home) => home,
+        None => {
+            return Err(invalid(
+                "the kit home is unavailable: CODEX_HOME is not set; pass --codex-home DIRECTORY",
+            ));
+        }
+    };
+    let request = LeadStart {
+        source,
+        codex_home,
+        session,
+    };
+    // An identity that cannot name a registry record is refused before any
+    // process, listener or conversation exists.
+    if let Some(session) = request.session.as_deref() {
+        if session.trim().is_empty() {
+            return Err(invalid(
+                "--session needs the exact thread identity to resume; refusing to start another conversation",
+            ));
+        }
+        control::lead_endpoint_path(&request.codex_home, session)?;
+    }
+    Ok(request)
+}
+
+fn invalid_lead_option(key: &str) -> String {
+    format!(
+        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY and --session THREAD_ID only"
+    )
+}
+
+/// The title a managed lead conversation carries, so the native frontend's
+/// named-thread caption identifies this session exactly as an executor title
+/// identifies its assignment.
+fn lead_title(profile: &str, source: &Path) -> String {
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkout");
+    format!("CLead ({profile}) - {name}")
+}
+
+/// Hosts the managed session: one app-server child on loopback, the exact
+/// thread, one native TUI in this terminal, and the registry record that makes
+/// the conversation addressable from its own shells. The conversation is
+/// exposed only after the frontend is attached to that same thread, and its
+/// address is retired before this host exits.
+fn host_lead_session(
+    request: &LeadStart,
+    profile: &str,
+    bound: &ProfileBinding,
+    launcher: &Path,
+) -> io::Result<i32> {
+    let title = lead_title(profile, &request.source);
+    let paths = ControlPaths::for_lead_host(&request.codex_home, std::process::id());
+    let mut plan = ControlPlan::new(
+        launcher,
+        &request.codex_home,
+        &request.source,
+        title.clone(),
+        BoundIdentity::resolve(bound),
+        paths,
+    );
+    // The lead keeps the native agent capability and the native settings: this
+    // plan carries neither the executor session marker nor a permission
+    // override. The app-server has no `--profile` flag, so the resolved
+    // profile's routing travels as configuration overrides exactly as it does
+    // for an executor conversation.
+    plan.executor_session = false;
+    for config in orchestration_config::profile_config_overrides(&request.codex_home, profile)? {
+        plan.args.push("-c".into());
+        plan.args.push(config.into());
+    }
+    println!(
+        "lead session: profile={profile} model={} provider={} effort={} cwd={}",
+        bound.model.as_deref().unwrap_or("default"),
+        bound.model_provider.as_deref().unwrap_or("default"),
+        bound.reasoning_effort.as_deref().unwrap_or("default"),
+        request.source.display()
+    );
+    let job = Job::new(Limits::default())?;
+    let started = match request.session.as_deref() {
+        Some(session) => Conversation::start_resuming_own(&job, &plan, session),
+        None => Conversation::start(&job, &plan),
+    };
+    let mut conversation = match started {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            // This host's Job owns the app-server child: dropping it ends
+            // whatever started, and nothing was exposed.
+            retire_lead_session_files(&plan);
+            return Err(invalid(&format!(
+                "the managed lead conversation did not start: {error}"
+            )));
+        }
+    };
+    let thread = conversation.thread_id().to_owned();
+    let (frontend, registry) = expose_lead_conversation(&plan, request, &title, &mut conversation)?;
+    note_log(
+        &plan.paths.log,
+        &format!(
+            "lead session: thread {thread} profile {profile} cwd {} endpoint {}",
+            request.source.display(),
+            registry
+        ),
+    );
+    // The frontend owns this terminal until it ends. Pumping keeps the
+    // conversation's own transport drained without asking the model anything;
+    // a backend that ends first gets a short grace so the frontend can leave
+    // the terminal surface by itself.
+    let mut failure: Option<String> = None;
+    let mut deadline: Option<Instant> = None;
+    while frontend.is_running()? {
+        if failure.is_none() {
+            if let Err(error) = conversation.pump() {
+                failure = Some(error.to_string());
+                deadline = Some(Instant::now() + FRONTEND_TAIL_GRACE);
+            }
+        } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        thread::sleep(control::DEFAULT_POLL);
+    }
+    let frontend_code = frontend.exit_code().ok().flatten();
+    let mut notes = Vec::new();
+    if let Err(error) = frontend.close() {
+        notes.push(format!("the native frontend could not be ended: {error}"));
+    }
+    // The address of a session that ended must not outlive it: a later spawn in
+    // this thread resolves it before inheriting, and `lead message` refuses it.
+    if let Err(error) = control::retire_lead_endpoint(&request.codex_home, &thread) {
+        notes.push(error.to_string());
+    }
+    for path in [&plan.paths.endpoint, &plan.paths.token] {
+        if let Err(error) = retire_stale_endpoint(path) {
+            notes.push(error.to_string());
+        }
+    }
+    if let Err(error) = end_owned_child(job, &conversation, launcher) {
+        notes.push(error.to_string());
+    }
+    for note in &notes {
+        println!("lead session note: {note}");
+    }
+    match failure {
+        None => {
+            println!(
+                "lead session: ended thread {thread} profile {profile} frontend-exit {}",
+                frontend_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unrecorded".to_owned())
+            );
+            println!(
+                "lead endpoint: {} was retired; the app-server child ended and no address of this conversation remains",
+                registry
+            );
+            Ok(0)
+        }
+        Some(cause) => {
+            println!(
+                "lead session: the app-server child ended while the native frontend was attached: {cause}; the conversation and its partial work stay in the native session, and this address was retired"
+            );
+            Ok(1)
+        }
+    }
+}
+
+/// Names the conversation, attaches its native frontend and publishes the
+/// registry record that makes the exact thread addressable - in that order, so
+/// the address never exists before the surface that shows it. A failure leaves
+/// nothing exposed and retires the session's own address files: a refused start
+/// must not leave a bearer or an endpoint record behind.
+fn expose_lead_conversation(
+    plan: &ControlPlan,
+    request: &LeadStart,
+    title: &str,
+    conversation: &mut Conversation,
+) -> io::Result<(OwnedFrontend, String)> {
+    let exposed = (|| -> io::Result<(OwnedFrontend, String)> {
+        let caption = match request.session.as_deref() {
+            Some(session) => resumed_caption(conversation, session, title)?,
+            None => title.to_owned(),
+        };
+        let frontend = attach_owned_frontend(
+            plan,
+            conversation,
+            NativePresentation::NativeTui,
+            FrontendRole::Lead,
+        )?;
+        wait_for_frontend(&frontend, conversation, request.session.is_some(), &caption)?;
+        let registry =
+            control::publish_lead_endpoint(&request.codex_home, conversation.endpoint())?;
+        Ok((frontend, unicode(&registry)?))
+    })();
+    if exposed.is_err() {
+        retire_lead_session_files(plan);
+    }
+    exposed
+}
+
+/// Retires the working address files of a lead session host whose conversation
+/// never became addressable: the transient endpoint record and its capability
+/// token. The app-server's log stays beside them as the locator of the failure.
+fn retire_lead_session_files(plan: &ControlPlan) {
+    let _ = retire_stale_endpoint(&plan.paths.endpoint);
+    let _ = retire_stale_endpoint(&plan.paths.token);
+}
+
+/// The console caption a resumed conversation's native frontend will report,
+/// and the routing that conversation's own record keeps.
+///
+/// A resumed lead session must stay the profile, settings and directory its
+/// native record established, so this reads them back and reports what the
+/// conversation itself says instead of repeating the configured profile. The
+/// native TUI names itself after the thread it shows: an existing name is kept,
+/// and only a conversation whose record reports no name is named here.
+fn resumed_caption(
+    conversation: &mut Conversation,
+    session: &str,
+    title: &str,
+) -> io::Result<String> {
+    let read = conversation.call("thread/read", json!({"threadId": session}))?;
+    if read["thread"]["id"].as_str() != Some(session) {
+        return Err(invalid(
+            "thread/read answered for another conversation; refusing to attach a frontend to it",
+        ));
+    }
+    let thread = &read["thread"];
+    println!(
+        "lead session: resumed thread {session} model={} provider={} effort={} cwd={}",
+        thread["model"].as_str().unwrap_or("default"),
+        thread["modelProvider"].as_str().unwrap_or("default"),
+        thread["reasoningEffort"].as_str().unwrap_or("default"),
+        thread["cwd"].as_str().unwrap_or("unrecorded")
+    );
+    if let Some(name) = thread["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return Ok(name.to_owned());
+    }
+    conversation.call(
+        "thread/name/set",
+        json!({"threadId": thread, "name": title}),
+    )?;
+    Ok(title.to_owned())
 }
 
 /// Executor sessions are single-agent workers: the kit's dispatch commands
@@ -868,6 +1241,7 @@ fn launch_bound(
     // session environment. The child thread id is never the return address.
     let lead = control::establish_originating_lead(state_dir)?;
     record_originating_lead(&paths.receipt, &lead)?;
+    inherit_lead_endpoint(state_dir, request.codex_home, &lead, binding.index)?;
     println!("{}", slot_summary(binding, request.named_slot));
     report_inventory(request)?;
     ensure_workspace_trust(request.codex_home, &binding.path)?;
@@ -2541,6 +2915,9 @@ const CONTROL_TAIL_GRACE: Duration = Duration::from_secs(1);
 /// never on the command line, in a receipt, or in a diagnostic.
 const FRONTEND_TOKEN_ENV: &str = "HARNESS_EXECUTOR_FRONTEND_TOKEN";
 const FRONTEND_ATTACH: Duration = Duration::from_secs(30);
+/// A frontend whose backend ended first gets this long to notice and leave the
+/// terminal surface by itself before this host ends it.
+const FRONTEND_TAIL_GRACE: Duration = Duration::from_secs(5);
 
 /// Hosts one control-backed exec run: the recorded dispatch identity is
 /// verified, one `codex app-server` child starts inside this host's Job with
@@ -2669,6 +3046,27 @@ struct OwnedFrontend {
     program: PathBuf,
 }
 
+/// How an owned native frontend relates to the conversation it presents. An
+/// executor surface stays single-agent; a managed lead session keeps the native
+/// agent capability of the interactive CLI it hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendRole {
+    Executor,
+    Lead,
+}
+
+impl FrontendRole {
+    /// What this host reports as unfinished when the frontend cannot be
+    /// attached: an executor dispatch has not submitted its assignment, and a
+    /// lead session has not exposed a conversation.
+    fn unfinished(self) -> &'static str {
+        match self {
+            Self::Executor => "The assignment was not submitted",
+            Self::Lead => "No lead session was exposed",
+        }
+    }
+}
+
 impl OwnedFrontend {
     fn identity(&self) -> harness_core::process::ProcessIdentity {
         self.process.identity()
@@ -2676,6 +3074,11 @@ impl OwnedFrontend {
 
     fn is_running(&self) -> io::Result<bool> {
         self.process.is_running()
+    }
+
+    /// The frontend's own exit code, when it already exited.
+    fn exit_code(&self) -> io::Result<Option<u32>> {
+        self.process.exit_code()
     }
 
     fn close(mut self) -> io::Result<()> {
@@ -2812,23 +3215,27 @@ fn attach_owned_frontend(
     plan: &ControlPlan,
     conversation: &Conversation,
     presentation: NativePresentation,
+    role: FrontendRole,
 ) -> io::Result<OwnedFrontend> {
     // A redirected standard stream can still inherit the caller's console.
     // That is not a surface this host may give the TUI.
     if !io::stdout().is_terminal() || harness_core::task_control::console_caption()?.is_none() {
-        return Err(invalid(
-            "the executor host has no live terminal surface for the native frontend; run it in its terminal tab or owned console instead of a redirected pipe. The assignment was not submitted",
-        ));
+        return Err(invalid(&format!(
+            "this host has no live terminal surface for the native frontend; run it in its own terminal instead of a redirected pipe. {}",
+            role.unfinished()
+        )));
     }
     let upstream = upstream_executable(&plan.home).map_err(|error| {
         invalid(&format!(
-            "native frontend attachment is unavailable ({error}); the assignment was not submitted. Remedy: restore harness/native-launch.json for this CODEX_HOME and retry the dispatch"
+            "native frontend attachment is unavailable ({error}). {}. Remedy: restore harness/native-launch.json for this CODEX_HOME and retry",
+            role.unfinished()
         ))
     })?;
     if !upstream.is_file() {
         return Err(invalid(&format!(
-            "the registered native Codex frontend is missing: {}; restore the installed upstream and retry the dispatch. The assignment was not submitted",
-            upstream.display()
+            "the registered native Codex frontend is missing: {}; restore the installed upstream and retry. {}",
+            upstream.display(),
+            role.unfinished()
         )));
     }
     let mut spec = CommandSpec::new(&upstream);
@@ -2838,6 +3245,7 @@ fn attach_owned_frontend(
         conversation.endpoint().port(),
         conversation.thread_id(),
         presentation,
+        role,
     )
     .into_iter()
     .map(Into::into)
@@ -2856,6 +3264,14 @@ fn attach_owned_frontend(
     for name in INHERITED_SESSION_ENV {
         spec.env.insert((*name).into(), None);
     }
+    if role == FrontendRole::Lead {
+        // The lead's own session must not inherit an executor marker: its
+        // app-server has none, and a frontend that carried one would make the
+        // lead's own nested CLI invocations look like executor sessions. An
+        // executor frontend keeps the marker it was started with.
+        spec.env.insert(EXECUTOR_SESSION_ENV.into(), None);
+        spec.env.insert(control::EXECUTOR_RUN_ENV.into(), None);
+    }
     spec.env
         .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
     spec.env
@@ -2863,7 +3279,8 @@ fn attach_owned_frontend(
     let job = Job::new(Limits::default())?;
     let process = job.spawn(&spec).map_err(|error| {
         invalid(&format!(
-            "the native frontend did not start: {error}; the assignment was not submitted"
+            "the native frontend did not start: {error}; {}",
+            role.unfinished()
         ))
     })?;
     Ok(OwnedFrontend {
@@ -2875,15 +3292,22 @@ fn attach_owned_frontend(
 
 /// Global options before `resume`. The thread id is the only positional, so
 /// the frontend cannot submit the assignment.
-fn frontend_args(port: u16, thread_id: &str, presentation: NativePresentation) -> Vec<String> {
+fn frontend_args(
+    port: u16,
+    thread_id: &str,
+    presentation: NativePresentation,
+    role: FrontendRole,
+) -> Vec<String> {
     let mut args = vec![
         "--remote".into(),
         format!("ws://127.0.0.1:{port}"),
         "--remote-auth-token-env".into(),
         FRONTEND_TOKEN_ENV.into(),
-        "-c".into(),
-        "agents.enabled=false".into(),
     ];
+    if role == FrontendRole::Executor {
+        args.push("-c".into());
+        args.push("agents.enabled=false".into());
+    }
     if presentation.inline() {
         args.push("--no-alt-screen".into());
     }
@@ -2894,9 +3318,9 @@ fn frontend_args(port: u16, thread_id: &str, presentation: NativePresentation) -
 
 fn wait_for_frontend(
     frontend: &OwnedFrontend,
-    plan: &ControlPlan,
     conversation: &mut Conversation,
     resume_existing: bool,
+    caption: &str,
 ) -> io::Result<()> {
     let until = Instant::now() + FRONTEND_ATTACH;
     let pid = frontend.identity().pid;
@@ -2906,7 +3330,7 @@ fn wait_for_frontend(
                 "the native frontend exited before it attached to the bound thread. The assignment was not submitted. Remedy: retry the dispatch; no text stream was substituted",
             ));
         }
-        if harness_core::task_control::frontend_loaded(pid, &plan.title)? {
+        if harness_core::task_control::frontend_loaded(pid, caption)? {
             // A fresh thread must still be empty. An exact-session resume
             // already holds completed work; those turns are not a replay and
             // must not block the one continuation prompt.
@@ -3063,13 +3487,18 @@ fn host_control_conversation(
                 Some(job),
             );
         }
-        match attach_owned_frontend(plan, &conversation, control.presentation) {
+        match attach_owned_frontend(
+            plan,
+            &conversation,
+            control.presentation,
+            FrontendRole::Executor,
+        ) {
             Ok(attached) => {
                 if let Err(error) = wait_for_frontend(
                     &attached,
-                    plan,
                     &mut conversation,
                     control.resume_session.is_some(),
+                    &plan.title,
                 ) {
                     let _ = attached.close();
                     return fail_control(receipt, &mut tracker, error.to_string(), plan, Some(job));
@@ -4074,6 +4503,43 @@ fn record_originating_lead(receipt: &Path, lead: &control::OriginatingLead) -> i
             "originatingLead": field,
         }),
     )
+}
+
+/// Copies the dispatching lead's live registered endpoint beside this run's
+/// receipt, so the executor's own `lead message` has the exact address of the
+/// conversation that dispatched it - the address an ordinary lead launch does
+/// not expose.
+///
+/// Inheritance is fail-closed and never a claim: a missing, unreadable,
+/// malformed, mismatched or stale registry record inherits nothing and retires
+/// any record of this slot, while the dispatch itself continues exactly as
+/// before. The executor's message command then reports that condition with its
+/// remedy instead of sending into an address that does not answer.
+fn inherit_lead_endpoint(
+    state_dir: &Path,
+    codex_home: &Path,
+    lead: &control::OriginatingLead,
+    index: u32,
+) -> io::Result<()> {
+    let target = state_dir.join(format!("lead-endpoint-{index}.json"));
+    match control::registered_lead(codex_home, &lead.thread_id) {
+        control::RegisteredLead::Live(endpoint) => {
+            endpoint.record(&target)?;
+            println!(
+                "executor lead channel: inherited the registered app-server endpoint of the dispatching lead session"
+            );
+        }
+        control::RegisteredLead::Unavailable(cause) => {
+            let mut note = String::new();
+            if let Err(error) = retire_stale_endpoint(&target) {
+                note = format!("; a previous record of this slot could not be retired: {error}");
+            }
+            println!(
+                "executor lead channel: unavailable ({cause}); `codex-harness lead message` reports this condition and its remedy instead of sending, and this dispatch continues as before{note}. Remedy: host the lead session through `codex-harness lead start`, which records a verified endpoint for its exact thread, then dispatch again"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Codex blocks an untrusted project directory behind an interactive prompt
@@ -5381,7 +5847,12 @@ mod tests {
 
     #[test]
     fn frontend_args_qualify_inline_exec_and_keep_the_full_tui_single_agent() {
-        let inline = frontend_args(9, "thread-1", NativePresentation::NativeInline);
+        let inline = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeInline,
+            FrontendRole::Executor,
+        );
         assert!(inline.contains(&"--remote".to_string()), "{inline:?}");
         assert!(
             inline.contains(&"--no-alt-screen".to_string()),
@@ -5398,7 +5869,12 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "exec" || arg == "--json" || arg == "--worktree")
         );
-        let full = frontend_args(9, "thread-1", NativePresentation::NativeTui);
+        let full = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeTui,
+            FrontendRole::Executor,
+        );
         assert!(!full.contains(&"--no-alt-screen".to_string()), "{full:?}");
         assert!(
             full.contains(&"agents.enabled=false".to_string()),
@@ -5416,6 +5892,172 @@ mod tests {
         );
         let resume = inline.iter().position(|arg| arg == "resume").unwrap();
         assert!(inline[..resume].iter().any(|arg| arg == "--no-alt-screen"));
+    }
+
+    #[test]
+    fn lead_start_accepts_its_own_options_and_reports_them() {
+        let error = lead_start(&[OsString::from("--thread"), OsString::from("x")]).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid lead start option --thread"),
+            "{message}"
+        );
+        for name in ["--source", "--codex-home", "--session"] {
+            assert!(message.contains(name), "{message}");
+        }
+        let missing = lead_start(&[OsString::from("--session")]).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("invalid lead start option --session"),
+            "{missing}"
+        );
+        // The usage a lead reads names the command, the resume option and where
+        // its endpoint is recorded, without a bearer or a thread identity.
+        assert!(LEAD_START_USAGE.contains("codex-harness lead start"));
+        assert!(LEAD_START_USAGE.contains("--session THREAD_ID"));
+        assert!(LEAD_START_USAGE.contains("harness/lead-endpoints"));
+        assert!(LEAD_START_USAGE.contains("native agent capability"));
+        assert!(lead_start(&[OsString::from("--help")]).is_ok());
+        // The title a managed conversation carries names its profile and the
+        // checkout it works in, exactly as an executor title names its owner.
+        assert_eq!(
+            lead_title("default", Path::new(r"D:\work\proj")),
+            "CLead (default) - proj"
+        );
+    }
+
+    #[test]
+    fn an_executor_never_hosts_a_lead_session() {
+        refuse_lead_hosting(None).unwrap();
+        let error = refuse_lead_hosting(Some("1".into())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("executor sessions cannot host a lead session"),
+            "{message}"
+        );
+        assert!(message.contains("lead message"), "{message}");
+    }
+
+    /// The one asymmetry the lead's own session needs: it keeps the native
+    /// agent capability and the native settings, while an executor
+    /// conversation stays marked and single-agent.
+    #[test]
+    fn a_lead_session_is_not_an_executor_session() {
+        let home = PathBuf::from(r"C:\harness-home");
+        let slot = PathBuf::from(r"D:\checkout");
+        let identity = BoundIdentity {
+            profile: "default".to_owned(),
+            model: None,
+            model_provider: None,
+            reasoning_effort: None,
+        };
+        let executor = ControlPlan::new(
+            Path::new("codex.exe"),
+            &home,
+            &slot,
+            executor_title("default", "owner"),
+            identity.clone(),
+            ControlPaths {
+                endpoint: home.join("endpoint-1.json"),
+                token: home.join("endpoint-1.token"),
+                log: home.join("endpoint-1.log"),
+            },
+        );
+        let mut lead = ControlPlan::new(
+            Path::new("codex.exe"),
+            &home,
+            &slot,
+            lead_title("default", &slot),
+            identity,
+            ControlPaths::for_lead_host(&home, 4242),
+        );
+        lead.executor_session = false;
+        let executor_spec = control::app_server_spec(&executor, 51234);
+        let lead_spec = control::app_server_spec(&lead, 51235);
+        let args = |spec: &harness_core::process::CommandSpec| {
+            spec.args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            args(&executor_spec)
+                .windows(2)
+                .any(|pair| pair == ["-c", "agents.enabled=false"]),
+            "{:?}",
+            args(&executor_spec)
+        );
+        assert!(
+            !args(&lead_spec)
+                .iter()
+                .any(|arg| arg == "agents.enabled=false"),
+            "{:?}",
+            args(&lead_spec)
+        );
+        assert_eq!(
+            executor_spec
+                .env
+                .get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
+            Some(&Some(OsString::from("1")))
+        );
+        assert_eq!(
+            lead_spec
+                .env
+                .get(std::ffi::OsStr::new(EXECUTOR_SESSION_ENV)),
+            None
+        );
+        for spec in [&executor_spec, &lead_spec] {
+            // Neither child inherits a session identity that is not its own,
+            // and both run in the checkout they serve.
+            assert_eq!(
+                spec.env.get(std::ffi::OsStr::new("CODEX_HOME")),
+                Some(&Some(home.clone().into_os_string()))
+            );
+            assert_eq!(
+                spec.env.get(std::ffi::OsStr::new("CODEX_SESSION_ID")),
+                Some(&None)
+            );
+            assert_eq!(
+                spec.env.get(std::ffi::OsStr::new("CODEX_THREAD_ID")),
+                Some(&None)
+            );
+            assert_eq!(spec.current_dir.as_deref(), Some(slot.as_path()));
+        }
+        let lead_frontend = frontend_args(
+            9,
+            "thread-1",
+            NativePresentation::NativeTui,
+            FrontendRole::Lead,
+        );
+        assert!(
+            !lead_frontend
+                .iter()
+                .any(|arg| arg == "agents.enabled=false"),
+            "{lead_frontend:?}"
+        );
+        assert!(lead_frontend.iter().any(|arg| arg == "--remote"));
+        assert_eq!(lead_frontend.last().unwrap(), "thread-1");
+        assert!(
+            frontend_args(
+                9,
+                "thread-1",
+                NativePresentation::NativeTui,
+                FrontendRole::Executor,
+            )
+            .iter()
+            .any(|arg| arg == "agents.enabled=false")
+        );
+        // The host's working files are its own, never a slot address, and the
+        // conversation's registry record is written under the thread identity.
+        assert_eq!(
+            lead.paths.endpoint,
+            home.join("harness/lead-endpoints/host/4242.json")
+        );
+        assert_ne!(
+            lead.paths.endpoint,
+            control::lead_registry_dir(&home).join("thread-1.json")
+        );
     }
 
     #[test]
