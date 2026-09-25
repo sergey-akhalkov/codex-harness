@@ -10,12 +10,16 @@
 //!
 //! `installed_two_leads_keep_questions_waiting_and_replies_isolated` is the
 //! installed two-lead isolation acceptance: two independent lead roots, each
-//! with its own native lead session, its own spawned executor relationship with
-//! its own worktree and session records, and its own owned canned Responses
-//! provider. The questions are issued by the executor's own native session
-//! through the installed entry point and the answer is issued by the lead's own
-//! native session; every delivery is established by the receiving
-//! conversation's own provider input, never by a local record alone.
+//! with its own native lead session, its own owned canned Responses provider
+//! and its own fresh `codex-harness executor spawn` of the installed entry
+//! point. That dispatch itself records the originating lead, inherits the
+//! registered lead endpoint, synchronizes the checkout's pool slot, hosts the
+//! native executor session and writes the receipt, lease and control endpoint;
+//! nothing about the executor is handwritten by this check. The questions are
+//! issued by the executor's own native session through the installed entry point
+//! and the answer is issued by the lead's own native session; every delivery is
+//! established by the receiving conversation's own provider input, never by a
+//! local record alone.
 
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
@@ -32,13 +36,24 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 const WAIT: Duration = Duration::from_secs(20);
+/// One fresh dispatch runs the executor shell preflight before its session
+/// exists, so the first record takes longer than a watch step.
+const DISPATCH_WAIT: Duration = Duration::from_secs(300);
+/// An answered executor continues on its own thread and completes; that turn
+/// plus the run's own closure is bounded well below a live model call.
+const ANSWER_WAIT: Duration = Duration::from_secs(120);
 const PAYLOAD: &str = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} from the executor\nsecond line: $(throw), %PATH%, `whoami`";
+/// One native lead root: how long a request from a conversation the root has
+/// not identified yet waits for the dispatch's own session record. The record
+/// is written before the assignment is submitted, so a real run never reaches
+/// this bound; a foreign conversation does.
+const EXECUTOR_IDENTITY_WAIT: Duration = Duration::from_secs(60);
 
 struct Fixture {
     exe: PathBuf,
@@ -104,17 +119,16 @@ fn contains_payload(value: &Value, payload: &str) -> bool {
     }
 }
 
-/// The installed `codex.exe` is the harness launcher. It reads
-/// `harness/native-launch.json` from `CODEX_HOME` before it starts the
-/// registered app-server. The fixture home is empty, so copy that existing
-/// registration in; this does not add a listener or launcher.
+/// Copies the installed launcher registration into an owned home: it names the
+/// native upstream an owned frontend attaches to, and it is what lets an owned
+/// home host the installed native CLI. Copying it adds no listener or launcher.
 fn seed_launcher_registration(home: &Path) {
     let source = harness_core::native_launcher::codex_home()
         .expect("installed launcher home")
         .join("harness/native-launch.json");
     assert!(
         source.is_file(),
-        "installed launcher registration harness/native-launch.json is missing; the 0.156.1 launcher cannot host this fixture"
+        "installed launcher registration harness/native-launch.json is missing; the installed native CLI cannot host this fixture"
     );
     let destination = home.join("harness");
     fs::create_dir_all(&destination).unwrap();
@@ -134,8 +148,8 @@ fn fixture() -> Fixture {
     seed_launcher_registration(&home);
     let version = version_text(&exe);
     assert!(
-        version.contains("codex-cli 0.156.1"),
-        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.156.1 binary: {version}"
+        version.contains("codex-cli 0.157.0"),
+        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.157.0 binary: {version}"
     );
     let responses = control_responses::Responses::start(root.into(), true);
     let trusted = serde_json::to_string(&workspace.to_string_lossy()).unwrap();
@@ -417,7 +431,9 @@ struct RouteHit {
 /// The recorded exchange of one lead root, shared with its owned provider. Only
 /// the root's own lead thread and its own executor session may be answered;
 /// every other conversation is recorded as itself so the isolation assertion
-/// can name it.
+/// can name it. The lead session exists before the dispatch, so its thread is
+/// known first; the executor's thread is the one the real dispatch records
+/// beside the receipt, before it submits the assignment.
 #[derive(Default)]
 struct LeadRoute {
     lead_thread: String,
@@ -432,6 +448,15 @@ struct LeadRoute {
     question_hold: Duration,
     reply_hold: Duration,
     hits: Vec<RouteHit>,
+}
+
+impl LeadRoute {
+    /// Whether this root's own dispatch has already recorded the conversation:
+    /// the lead session before the dispatch exists, the executor once the
+    /// dispatch wrote its endpoint beside its receipt.
+    fn identified(&self, thread: &str) -> bool {
+        thread == self.lead_thread || thread == self.exec_thread
+    }
 }
 
 enum RouteAnswer {
@@ -451,10 +476,17 @@ fn two_lead_router(state: Arc<Mutex<LeadRoute>>) -> impl Fn(&Value) -> Value + S
     move |request: &Value| {
         let identity = RequestIdentity::from_request(request)
             .expect("owned provider request carries one conversation identity");
+        let thread = identity.thread.clone();
+        // A conversation this root has not identified yet waits for the
+        // dispatch's own record instead of being answered as the executor or
+        // recorded as a foreign conversation.
+        let until = Instant::now() + EXECUTOR_IDENTITY_WAIT;
+        while !state.lock().unwrap().identified(&thread) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let input = input_text(&request["input"]);
         let (answer, hold) = {
             let mut route = state.lock().unwrap();
-            let thread = identity.thread.clone();
             let lead = thread == route.lead_thread;
             let exec = thread == route.exec_thread;
             let (kind, answer, hold) = if lead && input.contains("ANSWER-THE-EXECUTOR") {
@@ -570,14 +602,16 @@ struct SessionAddress {
     port: u16,
 }
 
-/// One isolated lead root: its own kit home, checkout, worktree, owned provider
-/// and both native sessions (the lead and its spawned executor) served by the
-/// installed upstream CLI.
+/// One isolated lead root: its own kit home, checkout, owned provider and its
+/// own native lead session, plus the fresh executor the installed dispatch
+/// started for that lead. Every executor record this check reads - the dispatch
+/// receipt, the slot record, the lease, the control endpoint, the inherited lead
+/// endpoint and the observation - was written by that dispatch or by the host it
+/// owns; none of them is written here.
 struct LeadRoot {
-    // Processes first: the jobs reap both owned sessions before the evidence
-    // directory is removed or kept.
+    // Processes first: the dispatch is stopped, then the job reaps the owned
+    // lead session, before the evidence directory is removed or kept.
     _lead_job: Job,
-    _exec_job: Job,
     evidence: RootEvidence,
     role: &'static str,
     exe: PathBuf,
@@ -588,7 +622,7 @@ struct LeadRoot {
     worktree: PathBuf,
     state: PathBuf,
     owner: String,
-    generation: String,
+    assignment: String,
     question: String,
     answer: String,
     route: Arc<Mutex<LeadRoute>>,
@@ -599,9 +633,18 @@ struct LeadRoot {
     exec_client: Client,
     lead_thread: String,
     exec_thread: String,
+    /// The installed `executor spawn` that hosts this root's executor: it owns
+    /// the console surface, the lease and the run's lifetime.
+    dispatch: Child,
+    /// Recorded by that dispatch, never chosen here.
+    generation: String,
 }
 
 impl LeadRoot {
+    /// Builds one isolated lead root and dispatches its own fresh executor
+    /// through the installed entry point. Everything about the executor - the
+    /// slot, the lease, the receipt with its originating lead, the control
+    /// endpoint and the observation - is written by that dispatch, never here.
     fn start(
         role: &'static str,
         exe: &Path,
@@ -618,46 +661,82 @@ impl LeadRoot {
         let evidence = RootEvidence { path: root.clone() };
         let home = root.join("home");
         let workspace = root.join("workspace");
-        let checkout = root.join("checkout");
-        // The pool position of slot 1 of this checkout, exactly as the
-        // configured pool names it.
-        let worktree = root.join("checkout-wt1");
-        for dir in [&home, &workspace, &checkout] {
+        for dir in [&home, &workspace] {
             fs::create_dir_all(dir).unwrap();
         }
-        // The installed launcher registration is what lets an owned home host
-        // the installed native CLI; a synthetic home is not a launcher.
+        // The installed launcher registration lets an owned home host the
+        // installed native CLI and names the native upstream the owned frontend
+        // attaches; a synthetic home is neither.
         seed_launcher_registration(&home);
-        // A real checkout with one committed base and the pool slot as its own
-        // worktree, so the recorded mapping is the one a dispatch records.
-        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        let launcher = home.join("harness/bin/codex.exe");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        if fs::hard_link(exe, &launcher).is_err() {
+            fs::copy(exe, &launcher).unwrap_or_else(|error| {
+                panic!("{role}: the fixture home could not install the native CLI: {error}")
+            });
+        }
+        // A real checkout of a real upstream: the dispatch creates and
+        // synchronizes the pool slot '<checkout>-wt1' from it itself.
+        let upstream = root.join("upstream.git");
+        git(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "-q",
+                "--initial-branch=main",
+                upstream.to_str().unwrap(),
+            ],
+        );
+        let seed = root.join("seed");
+        git(
+            &root,
+            &[
+                "init",
+                "-q",
+                "--initial-branch=main",
+                seed.to_str().unwrap(),
+            ],
+        );
+        git(&seed, &["config", "user.email", "executor@example.test"]);
+        git(&seed, &["config", "user.name", "Executor"]);
+        fs::create_dir_all(seed.join("global")).unwrap();
+        fs::write(seed.join("README.md"), "seed\n").unwrap();
+        fs::write(seed.join("global/orchestration.toml"), orchestration()).unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-qm", "seed"]);
+        git(&seed, &["remote", "add", "origin", &file_url(&upstream)]);
+        git(&seed, &["push", "-q", "origin", "main"]);
+        let checkout = root.join("checkout");
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                &file_url(&upstream),
+                checkout.to_str().unwrap(),
+            ],
+        );
         git(
             &checkout,
             &["config", "user.email", "executor@example.test"],
         );
         git(&checkout, &["config", "user.name", "Executor"]);
-        fs::create_dir_all(checkout.join("global")).unwrap();
-        fs::write(checkout.join("global/orchestration.toml"), orchestration()).unwrap();
-        fs::write(checkout.join("README.md"), "seed\n").unwrap();
-        git(&checkout, &["add", "."]);
-        git(&checkout, &["commit", "-qm", "seed"]);
-        let base = git_text(&checkout, &["rev-parse", "HEAD"]);
-        git(
-            &checkout,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "--detach",
-                worktree.to_str().unwrap(),
-            ],
-        );
         let home = home.canonicalize().unwrap();
         let workspace = workspace.canonicalize().unwrap();
-        let checkout = checkout.canonicalize().unwrap();
-        let worktree = worktree.canonicalize().unwrap();
+        // The resolved spelling the pool itself records for this checkout:
+        // canonical, with the Windows verbatim prefix removed.
+        let checkout = native_path(&checkout.canonicalize().unwrap());
+        // The pool position of slot 1 of this checkout, exactly as the
+        // configured pool names it. The dispatch creates it.
+        let worktree = checkout.parent().unwrap().join(format!(
+            "{}-wt1",
+            checkout.file_name().unwrap().to_str().unwrap()
+        ));
         let owner = format!("exec-two-lead-{role}");
-        let generation = format!("generation-two-lead-{role}-{}", now_ms());
+        let assignment = format!(
+            "Apply the recorded contract of this worktree and report its consumed result ({role})."
+        );
         let route = Arc::new(Mutex::new(LeadRoute {
             harness: entry.to_path_buf(),
             question: question.clone(),
@@ -670,168 +749,54 @@ impl LeadRoot {
             root.join("provider"),
             two_lead_router(route.clone()),
         );
-        write_root_config(&home, provider.port, &[&workspace, &worktree, &checkout]);
+        write_root_config(&home, provider.port, &[&workspace, &checkout]);
+        // This root's own installed native lead session: its own home, its own
+        // thread and its own owned provider root.
         let (lead_job, lead, lead_client, lead_thread) =
             launch_native_session(exe, &home, &workspace, &root, "lead", &[]);
-        let (exec_job, executor, exec_client, exec_thread) = launch_native_session(
-            exe,
+        // Its verified endpoint, exactly as a managed `lead start` publishes it.
+        // An ordinary lead exposes none, so this check owns the lead session's
+        // own address; the dispatch under test is what inherits it.
+        write_lead_endpoint(
             &home,
-            &worktree,
-            &root,
-            "executor",
-            &[
-                ("HARNESS_EXECUTOR_RUN", generation.as_str()),
-                ("HARNESS_EXECUTOR_SESSION", "1"),
-            ],
+            &lead_thread,
+            lead.port,
+            &read_token(&root.join("lead-ws-token")),
+            &lead.identity,
+            exe,
         );
-        {
-            let mut route = route.lock().unwrap();
-            route.lead_thread = lead_thread.clone();
-            route.exec_thread = exec_thread.clone();
-        }
+        route.lock().unwrap().lead_thread = lead_thread.clone();
+        // The fresh dispatch: the installed entry point, run with the lead's own
+        // thread id and kit home and with no executor marker.
+        let mut dispatch = lead_shell(entry, &home, &checkout)
+            .args([
+                "executor",
+                "spawn",
+                "--source",
+                checkout.to_str().unwrap(),
+                "--codex-home",
+                home.to_str().unwrap(),
+                "--workspace",
+                worktree.to_str().unwrap(),
+                "--owner",
+                &owner,
+                "--mode",
+                "tui",
+                "--exec",
+                &assignment,
+            ])
+            .env("CODEX_THREAD_ID", &lead_thread)
+            .stdout(fs::File::create(root.join("dispatch-stdout.txt")).unwrap())
+            .stderr(fs::File::create(root.join("dispatch-stderr.txt")).unwrap())
+            .spawn()
+            .unwrap_or_else(|error| {
+                panic!("{role}: the installed dispatch could not start: {error}")
+            });
         let state = harness_core::task_worktree::pool_state_dir(&home, &checkout).unwrap();
-        fs::create_dir_all(&state).unwrap();
-        fs::write(
-            state.join("slot-1.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema": 1,
-                "source": checkout,
-                "index": 1,
-                "path": worktree,
-                "state": "occupied",
-                "owner": owner,
-                "base": base,
-                "disposition": null,
-                "reason": null,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // The live identity of this run: its own host process (the app-server
-        // that serves the conversation) and the lead session that dispatched
-        // it. Both are real, live and distinct per root.
-        let lease = json!({
-            "schema": 1,
-            "owner": owner,
-            "index": 1,
-            "path": worktree,
-            "pid": executor.identity.pid,
-            "created": executor.identity.creation_time,
-            "program": exe,
-        });
-        fs::write(
-            state.join("lease-1.json"),
-            serde_json::to_vec_pretty(&lease).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            state.join("endpoint-1.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema": 1,
-                "port": executor.port,
-                "token": read_token(&root.join("executor-ws-token")),
-                "threadId": exec_thread,
-                "process": {
-                    "pid": executor.identity.pid,
-                    "creationTime": executor.identity.creation_time,
-                    "program": exe,
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // The lead's verified existing endpoint: the real native session this
-        // root's executor reports to. Ordinary installed leads expose none, so
-        // the acceptance owns this one exactly as the single-lead check does.
-        fs::write(
-            state.join("lead-endpoint-1.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema": 1,
-                "port": lead.port,
-                "token": read_token(&root.join("lead-ws-token")),
-                "threadId": lead_thread,
-                "process": {
-                    "pid": lead.identity.pid,
-                    "creationTime": lead.identity.creation_time,
-                    "program": exe,
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            state.join("spawn-1.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema": 1,
-                "launcher": exe,
-                "profile": "default",
-                "mode": "exec",
-                "args": [],
-                "visible": true,
-                "host": "owned-console",
-                "control": {
-                    "schema": 1,
-                    "assignment": "Execute the recorded proof command and report its consumed result.",
-                    "identity": {
-                        "profile": "default",
-                        "model": "gpt-6-astra",
-                        "modelProvider": "control_fixture",
-                        "reasoningEffort": "low"
-                    }
-                },
-                "terminal": null,
-                "isolation": false,
-                "slot": {
-                    "index": 1,
-                    "path": worktree,
-                    "source": checkout,
-                    "owner": owner,
-                    "base": base,
-                    "remote": "origin",
-                    "branch": "main"
-                },
-                "model": "gpt-6-astra",
-                "modelProvider": "control_fixture",
-                "reasoningEffort": "low",
-                "window": null,
-                "shell": null,
-                "observation": {
-                    "schema": 1,
-                    "coverage": "native",
-                    "state": "running",
-                    "session": exec_thread,
-                    "exitCode": null,
-                    "events": 4,
-                    "messages": 1,
-                    "toolCalls": 1,
-                    "malformed": 0,
-                    "cause": null,
-                    "host": {
-                        "pid": executor.identity.pid,
-                        "created": executor.identity.creation_time,
-                        "program": exe,
-                    },
-                    "result": state.join("message-1.txt"),
-                    "detail": state.join("stream-1.jsonl"),
-                    "updatedMs": now_ms(),
-                },
-                "originatingLead": {
-                    "schema": 1,
-                    "threadId": lead_thread,
-                    "runGeneration": generation,
-                    "dispatcher": {
-                        "pid": lead.identity.pid,
-                        "creationTime": lead.identity.creation_time,
-                        "program": exe,
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let records = wait_for_dispatch(role, &mut dispatch, &root, &state, &route);
+        let exec_client = Client::connect(records.address.port, &records.token);
         Self {
             _lead_job: lead_job,
-            _exec_job: exec_job,
             evidence,
             role,
             exe: exe.to_path_buf(),
@@ -842,17 +807,19 @@ impl LeadRoot {
             worktree,
             state,
             owner,
-            generation,
+            assignment,
             question,
             answer,
             route,
             _provider: provider,
             lead,
-            executor,
+            executor: records.address,
             lead_client,
             exec_client,
             lead_thread,
-            exec_thread,
+            exec_thread: records.thread,
+            dispatch,
+            generation: records.generation,
         }
     }
 
@@ -927,20 +894,124 @@ impl LeadRoot {
         }
     }
 
-    /// The executor's own native session submits its assignment. This is what
-    /// the installed host does; the canned provider then issues the recorded
-    /// `lead message` command through the executor's own shell.
-    fn ask(&mut self) {
-        self.exec_client.request(
-            "turn/start",
-            json!({
-                "threadId": self.exec_thread,
-                "input": [{
-                    "type": "text",
-                    "text": "Execute the recorded proof command and report its consumed result."
-                }]
+    /// One dispatch-written record of this root's run, read from the kit-local
+    /// state directory the dispatch itself names.
+    fn record(&self, name: &str) -> Value {
+        serde_json::from_slice(
+            &fs::read(self.state.join(name)).unwrap_or_else(|error| {
+                panic!("{}: the dispatch wrote no {name}: {error}", self.role)
             }),
+        )
+        .unwrap_or_else(|error| panic!("{}: {name} is not JSON: {error}", self.role))
+    }
+
+    /// The control endpoint the dispatch recorded for its executor session: the
+    /// address `executor message` and this check both use.
+    fn endpoint(&self) -> Value {
+        self.record("endpoint-1.json")
+    }
+
+    /// The lead endpoint this run inherited from the dispatching lead's
+    /// registered session.
+    fn lead_endpoint(&self) -> Value {
+        self.record("lead-endpoint-1.json")
+    }
+
+    /// The run's own native frontend record, as the dispatch appended it: the
+    /// visible conversation this run owns, named by its exact thread.
+    fn frontend_record(&self) -> Value {
+        let text = fs::read_to_string(self.state.join("frontend-1.json")).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .next_back()
+            .unwrap_or_else(|| panic!("{}: the dispatch wrote no frontend record", self.role))
+    }
+
+    /// Whether that record still names a live surface: the spawn-written
+    /// evidence that this run's own visible conversation is open.
+    fn frontend_alive(&self) -> bool {
+        let record = self.frontend_record();
+        record["alive"] == true
+    }
+
+    /// The answered executor's own run reaches its recorded completion: the
+    /// dispatch persists the final message and ends the run's own surface.
+    /// Returns the persisted final message.
+    fn wait_completed(&mut self) -> String {
+        let ended = self.wait_dispatch_ended(ANSWER_WAIT);
+        assert!(
+            ended.success(),
+            "{}: the answered dispatch exited {ended}: {}{}",
+            self.role,
+            self.receipt(),
+            self.dispatch_output()
         );
+        let receipt = self.receipt();
+        assert_eq!(
+            receipt["observation"]["state"], "completed",
+            "{}: the answered run recorded another state: {receipt}",
+            self.role
+        );
+        fs::read_to_string(self.state.join("message-1.txt")).unwrap_or_else(|error| {
+            panic!(
+                "{}: the completed run recorded no final message: {error}",
+                self.role
+            )
+        })
+    }
+
+    /// Ends this root's fresh executor through the installed stop command: a
+    /// run waiting for its reply keeps its session, slot and worktree until the
+    /// lead stops it, and the dispatch that hosted that run ends with its own
+    /// surface.
+    fn stop(&mut self) -> String {
+        let output = self
+            .installed_command()
+            .args([
+                "executor",
+                "stop",
+                "--source",
+                self.checkout.to_str().unwrap(),
+                "--codex-home",
+                self.home.to_str().unwrap(),
+                "--slot",
+                "1",
+                "--owner",
+                &self.owner,
+                "--session",
+                &self.exec_thread,
+                "--timeout",
+                "30",
+            ])
+            .output()
+            .unwrap();
+        let text = output_text(&output);
+        assert!(output.status.success(), "{}: {text}", self.role);
+        self.wait_dispatch_ended(WAIT);
+        text
+    }
+
+    /// The dispatch that hosted this root's run ends when that run's own
+    /// surface closes.
+    fn wait_dispatch_ended(&mut self, bound: Duration) -> std::process::ExitStatus {
+        let until = Instant::now() + bound;
+        loop {
+            if let Some(status) = self.dispatch.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < until,
+                "{}: the dispatch that hosted this run is still live: {}",
+                self.role,
+                self.dispatch_output()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// What the installed dispatch itself reported while it ran this root.
+    fn dispatch_output(&self) -> String {
+        dispatch_text(&self.evidence.path)
     }
 
     /// The lead's own native session answers with the one recorded reply
@@ -1059,17 +1130,271 @@ impl LeadRoot {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
 /// The configured pool of one fixture checkout: the single default profile the
 /// two-lead acceptance binds, and one pool slot.
 fn orchestration() -> String {
     "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"default\"]\nmax_concurrent_executors = 1\n".to_owned()
+}
+
+/// One Git remote URL for an owned local upstream.
+fn file_url(path: &Path) -> String {
+    format!("file:///{}", path.to_str().unwrap().replace('\\', "/"))
+}
+
+/// A check that fails before its own cleanup must not leave a fresh executor
+/// running: this ends exactly the run the root's own dispatch recorded, through
+/// the installed stop path, and waits for the dispatch that hosted it to end.
+/// Any failure here is reported by the failing check's own output, never by a
+/// second panic.
+impl Drop for LeadRoot {
+    fn drop(&mut self) {
+        if self.dispatch.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        let _ = self
+            .installed_command()
+            .args([
+                "executor",
+                "stop",
+                "--source",
+                self.checkout.to_str().unwrap_or_default(),
+                "--codex-home",
+                self.home.to_str().unwrap_or_default(),
+                "--slot",
+                "1",
+                "--owner",
+                &self.owner,
+                "--session",
+                &self.exec_thread,
+                "--timeout",
+                "15",
+            ])
+            .output();
+        let until = Instant::now() + WAIT;
+        while Instant::now() < until {
+            if self.dispatch.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.dispatch.kill();
+        let _ = self.dispatch.wait();
+    }
+}
+
+/// A path in the spelling the harness records: the canonical path without the
+/// Windows verbatim prefix, exactly as the worktree pool resolves one.
+fn native_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    PathBuf::from(text.replace('/', "\\"))
+}
+
+/// The lead's own shell as the installed entry point sees it: the dispatching
+/// session's kit home, and neither an executor marker nor a terminal-tab
+/// address (this check opens owned consoles, never the owner's terminal).
+fn lead_shell(entry: &Path, home: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(entry);
+    for key in [
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+        "CODEX_SESSION_ID",
+        "WT_SESSION",
+    ] {
+        command.env_remove(key);
+    }
+    command.env("CODEX_HOME", home);
+    command.env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture");
+    command.current_dir(cwd);
+    command.stdin(Stdio::null());
+    command
+}
+
+/// The live endpoint of one managed lead session, in the registry layout the
+/// installed `lead start` publishes: the address of the exact native thread and
+/// the app-server process that serves it. An ordinary unmanaged lead exposes
+/// none, so this check owns the lead session's own address; the dispatch under
+/// test is what inherits it.
+fn write_lead_endpoint(
+    home: &Path,
+    thread: &str,
+    port: u16,
+    token: &str,
+    process: &ProcessIdentity,
+    exe: &Path,
+) {
+    let path = home.join(format!("harness/lead-endpoints/{thread}.json"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "port": port,
+            "token": token,
+            "threadId": thread,
+            "process": {
+                "pid": process.pid,
+                "creationTime": process.creation_time,
+                "program": exe,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// One dispatch record while it is being replaced is not read as fact.
+fn read_json(path: &Path) -> Option<Value> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// The exact process identity a record names, in either spelling the harness
+/// records for a host or an app-server child.
+fn recorded_identity(value: &Value) -> ProcessIdentity {
+    ProcessIdentity {
+        pid: value["pid"].as_u64().unwrap_or(0) as u32,
+        creation_time: value["creationTime"]
+            .as_u64()
+            .or_else(|| value["created"].as_u64())
+            .unwrap_or(0),
+    }
+}
+
+/// Nothing of a run survives it: the exact recorded identity no longer runs.
+fn assert_process_gone(identity: ProcessIdentity, program: &Path, user: &str, label: &str) {
+    let live = ServiceProcess::inspect(identity, program, user)
+        .map(|process| process.is_some())
+        .unwrap_or(true);
+    assert!(!live, "{label} (pid {})", identity.pid);
+}
+
+/// The surface the dispatch recorded is a real, non-minimized window of the
+/// exact process it names - not a claim inside a record.
+fn assert_visible_surface(root: &LeadRoot) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+    };
+    let receipt = root.receipt();
+    let surface = &receipt["window"];
+    let window = surface["window"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "{}: the dispatch recorded no visible surface: {receipt}",
+            root.role
+        )
+    });
+    let pid = surface["process"]["pid"].as_u64().unwrap_or(0) as u32;
+    let mut owner = 0u32;
+    let bounds = &surface["bounds"];
+    assert!(
+        unsafe { IsWindow(window as HWND) } != 0
+            && unsafe { GetWindowThreadProcessId(window as HWND, &mut owner) } != 0
+            && owner == pid
+            && unsafe { IsWindowVisible(window as HWND) } != 0
+            && unsafe { IsIconic(window as HWND) } == 0
+            && bounds["width"].as_i64().unwrap_or(0) > 0
+            && bounds["height"].as_i64().unwrap_or(0) > 0,
+        "{}: the recorded surface is not this run's own live window: {surface}",
+        root.role
+    );
+}
+
+/// What the real dispatch recorded for one root's fresh executor: the run
+/// generation it chose itself, the exact native session it started, and the
+/// control endpoint this check and `executor message` both address.
+struct DispatchRecords {
+    generation: String,
+    thread: String,
+    address: SessionAddress,
+    token: String,
+}
+
+/// Waits for the dispatch's own records - the receipt and slot it writes before
+/// the session starts, the control endpoint of that session, the lead endpoint
+/// it inherits and the attached native frontend - instead of writing any of
+/// them. A dispatch that exits, or records no live run, fails with its own
+/// output as evidence.
+fn wait_for_dispatch(
+    role: &str,
+    dispatch: &mut Child,
+    root: &Path,
+    state: &Path,
+    route: &Arc<Mutex<LeadRoute>>,
+) -> DispatchRecords {
+    let until = Instant::now() + DISPATCH_WAIT;
+    loop {
+        if let Some(status) = dispatch.try_wait().unwrap() {
+            panic!(
+                "{role}: the installed dispatch exited {status} before its run was up: {}",
+                dispatch_text(root)
+            );
+        }
+        if let (Some(receipt), Some(endpoint)) = (
+            read_json(&state.join("spawn-1.json")),
+            read_json(&state.join("endpoint-1.json")),
+        ) {
+            let thread = receipt["observation"]["session"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let port = endpoint["port"].as_u64().unwrap_or(0) as u16;
+            let token = endpoint["token"].as_str().unwrap_or_default().to_owned();
+            let ready = !thread.is_empty()
+                && port != 0
+                && !token.is_empty()
+                && endpoint["threadId"].as_str() == Some(thread.as_str())
+                && state.join("slot-1.json").is_file()
+                && state.join("lease-1.json").is_file()
+                && state.join("lead-endpoint-1.json").is_file()
+                && state.join("frontend-1.json").is_file();
+            if ready {
+                // The root's own provider keys this conversation as its
+                // executor from the dispatch's record, never from a guess.
+                route.lock().unwrap().exec_thread = thread.clone();
+                return DispatchRecords {
+                    generation: receipt["originatingLead"]["runGeneration"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    thread,
+                    address: SessionAddress {
+                        identity: ProcessIdentity {
+                            pid: endpoint["process"]["pid"].as_u64().unwrap_or(0) as u32,
+                            creation_time: endpoint["process"]["creationTime"]
+                                .as_u64()
+                                .unwrap_or(0),
+                        },
+                        port,
+                    },
+                    token,
+                };
+            }
+        }
+        assert!(
+            Instant::now() < until,
+            "{role}: the installed dispatch recorded no live run within {}s: {}",
+            DISPATCH_WAIT.as_secs(),
+            dispatch_text(root)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The bounded tail of what an installed dispatch itself reported.
+fn dispatch_text(root: &Path) -> String {
+    let tail = |name: &str| {
+        let text = fs::read_to_string(root.join(name)).unwrap_or_default();
+        let start = text.len().saturating_sub(1500);
+        text[start..].to_owned()
+    };
+    format!(
+        "\ndispatch stdout: {}\ndispatch stderr: {}",
+        tail("dispatch-stdout.txt"),
+        tail("dispatch-stderr.txt")
+    )
 }
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -1349,18 +1674,22 @@ fn same_directory(reported: &str, expected: &Path) -> bool {
     let normalize = |text: &str| {
         text.trim_start_matches(r"\\?\")
             .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
             .to_ascii_lowercase()
     };
     normalize(reported) == normalize(&expected.to_string_lossy())
 }
 
-/// Two actual installed native lead sessions, each with its own spawned
-/// executor relationship, worktree, session records and owned provider root.
-/// Each executor's own native session asks its own lead through the installed
-/// entry point; the blocked executor stays waiting while the lead answers
-/// through the recorded reply reference. Every step is established inside the
-/// receiving conversation's own provider input, and the two roots never see
-/// each other's exchange.
+/// Two actual installed native lead sessions, each with its own owned canned
+/// Responses provider and its own real installed `executor spawn`. Each
+/// dispatch records that lead as the originating lead, inherits the lead's
+/// registered endpoint, synchronizes its pool slot, hosts the native executor
+/// session and writes every executor record read here; nothing about an
+/// executor is handwritten by this check. Each executor's own native session
+/// asks its own lead through the installed entry point, the blocked executor
+/// stays waiting while its lead answers through the recorded reply reference,
+/// every step is established inside the receiving conversation's own provider
+/// input, and the two roots never see each other's exchange.
 #[test]
 #[ignore = "requires HARNESS_CONTROL_CODEX_EXE as the installation-record upstream and the deployed kit; two native lead roots with owned canned Responses; no live model"]
 fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
@@ -1373,8 +1702,8 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
     );
     let version = version_text(&exe);
     assert!(
-        version.contains("codex-cli 0.156.1"),
-        "the installation-record upstream must be Codex 0.156.1: {version}"
+        version.contains("codex-cli 0.157.0"),
+        "the installation-record upstream must be Codex 0.157.0: {version}"
     );
     let entry = installed_entry();
     eprintln!(
@@ -1383,6 +1712,10 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
         exe.display(),
         version.trim()
     );
+    // Each root starts its own installed native lead session and its own owned
+    // provider, then dispatches its own fresh executor through the installed
+    // entry point. The dispatch - not this check - writes the executor's slot,
+    // lease, receipt, control endpoint and observation.
     let mut lead_a = LeadRoot::start(
         "a",
         &exe,
@@ -1401,31 +1734,28 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
         lead_a.lead_thread, lead_b.lead_thread,
         "the two leads must be distinct native sessions"
     );
+    assert_ne!(
+        lead_a.exec_thread, lead_b.exec_thread,
+        "the two dispatches must have started distinct native sessions"
+    );
     assert_ne!(lead_a.worktree, lead_b.worktree);
     assert_ne!(lead_a.generation, lead_b.generation);
-
-    // Each executor's own native session submits its assignment and asks its
-    // own lead through the installed entry point; its turn then ends blocked.
-    lead_a.ask();
-    lead_b.ask();
-    lead_a.wait_kind("lead-question");
-    lead_b.wait_kind("lead-question");
-    let id_a = lead_a.wait_question_recorded();
-    let id_b = lead_b.wait_question_recorded();
-    lead_a.wait_kind("exec-waiting");
-    lead_b.wait_kind("exec-waiting");
-    lead_a.wait_executor_idle();
-    lead_b.wait_executor_idle();
-    assert_ne!(
-        id_a, id_b,
-        "the two requests must have their own identities"
-    );
-
-    // Each root's owned provider served exactly its own exchange, in the order
-    // the two native sessions produced it: the assignment asked, the question
-    // was delivered into the lead's own conversation, and the recorded tool
-    // result ended the executor's turn waiting for the answer.
     for root in [&lead_a, &lead_b] {
+        assert!(
+            !root.generation.is_empty(),
+            "{}: the dispatch recorded no run generation",
+            root.role
+        );
+    }
+
+    // Each root's own dispatch submitted the assignment to its own executor's
+    // native session; the question was delivered into its own lead's
+    // conversation; and the blocked executor's own turn ended with the request
+    // unresolved.
+    for root in [&lead_a, &lead_b] {
+        root.wait_kind("exec-question");
+        root.wait_kind("lead-question");
+        root.wait_kind("exec-waiting");
         assert_eq!(
             root.kinds(),
             ["exec-question", "lead-question", "exec-waiting"],
@@ -1438,6 +1768,14 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
             root.role
         );
     }
+    let id_a = lead_a.wait_question_recorded();
+    let id_b = lead_b.wait_question_recorded();
+    assert_ne!(
+        id_a, id_b,
+        "the two requests must have their own identities"
+    );
+    lead_a.wait_executor_idle();
+    lead_b.wait_executor_idle();
 
     // The delivered envelope identifies the sender run exactly, and no word of
     // the other root's exchange appears in this lead's own conversation.
@@ -1550,65 +1888,273 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
     assert_eq!(lead_a.hits(), quiet_a, "waiting produced model traffic");
     assert_eq!(lead_b.hits(), quiet_b, "waiting produced model traffic");
 
-    // One command from the correct lead, inside its own native session,
-    // continues only that lead's executor on the same thread.
-    lead_a.reply(&id_a);
-    lead_a.wait_kind("lead-answer-done");
-    assert_eq!(
-        lead_a.kinds(),
-        [
-            "exec-question",
-            "lead-question",
-            "exec-waiting",
-            "lead-answer-command",
-            "exec-reply-continued",
-            "lead-answer-done"
-        ],
-        "root a: unexpected provider traffic"
-    );
-    let continued = lead_a.executor_request(&lead_a.answer);
-    assert!(
-        input_text(&continued["input"]).contains(&lead_a.answer),
-        "the answer did not reach the executor's own conversation"
-    );
-    let answered = lead_a.lead_request("lead-reply-1");
-    let answered_text = input_text(&answered["input"]);
-    assert!(
-        answered_text.contains(&format!(
-            "slot 1 owner {} session {}",
-            lead_a.owner, lead_a.exec_thread
-        )) && answered_text.contains("delivered in"),
-        "the lead's own turn kept no delivered receipt: {}",
-        excerpt(&answered_text, 2000)
-    );
-    assert!(
-        answered_text.contains(&format!("receipt: {}", lead_a.state.display())),
-        "the reply did not name the addressed run's receipt: {}",
-        excerpt(&answered_text, 2000)
-    );
-
-    // The answer reached nothing else: the neighbor root produced no further
-    // traffic, never saw the answer or the answered identity, and its own
-    // executor stays waiting on its own request.
-    assert_eq!(
-        lead_b.kinds(),
-        ["exec-question", "lead-question", "exec-waiting"],
-        "root b: the neighbor's reply changed its traffic"
-    );
-    for body in lead_b.provider_bodies() {
-        let text = input_text(&body["input"]);
+    // Everything about each executor was written by its own real dispatch and
+    // is verified against the live processes those records name: the pool slot
+    // it selected, created and synchronized, the originating lead it captured
+    // before the session existed, the lease, the control endpoint, the lead
+    // endpoint it inherited and the native session it started.
+    let user = process_service::current_user().unwrap();
+    for root in [&mut lead_a, &mut lead_b] {
+        // The slot: this checkout's slot 1, synchronized to the committed base
+        // and registered as a worktree of this checkout, occupied by this run.
+        let slot = root.record("slot-1.json");
+        assert_eq!(slot["index"], 1, "{}: {slot}", root.role);
+        assert_eq!(slot["state"], "occupied", "{}: {slot}", root.role);
+        assert_eq!(slot["owner"], root.owner.as_str(), "{}: {slot}", root.role);
         assert!(
-            !text.contains(&lead_a.answer) && !text.contains(&id_a),
-            "root b saw root a's exchange: {text}"
+            same_directory(slot["path"].as_str().unwrap_or_default(), &root.worktree),
+            "{}: the dispatch synchronized another tree: {slot}",
+            root.role
         );
+        assert!(
+            same_directory(slot["source"].as_str().unwrap_or_default(), &root.checkout),
+            "{}: the dispatch recorded another checkout: {slot}",
+            root.role
+        );
+        assert_eq!(
+            slot["base"],
+            git_text(&root.checkout, &["rev-parse", "HEAD"]).as_str(),
+            "{}: the dispatch synchronized another base: {slot}",
+            root.role
+        );
+        let registered = git_text(&root.checkout, &["worktree", "list", "--porcelain"]);
+        assert!(
+            registered
+                .lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .any(|path| same_directory(path, &root.worktree)),
+            "{}: slot 1 is not a worktree this checkout registered: {registered}",
+            root.role
+        );
+        // The originating lead the dispatch captured: this root's own lead
+        // thread, a generation the dispatch chose itself, and the dispatching
+        // process's own verified identity.
+        let receipt = root.receipt();
+        let lead = &receipt["originatingLead"];
+        assert_eq!(
+            lead["threadId"],
+            root.lead_thread.as_str(),
+            "{}: {receipt}",
+            root.role
+        );
+        assert_eq!(
+            lead["runGeneration"],
+            root.generation.as_str(),
+            "{}: {receipt}",
+            root.role
+        );
+        assert_eq!(
+            lead["dispatcher"]["pid"].as_u64(),
+            Some(root.dispatch.id() as u64),
+            "{}: the receipt names another dispatcher: {receipt}",
+            root.role
+        );
+        assert!(
+            same_executable(
+                Path::new(lead["dispatcher"]["program"].as_str().unwrap_or_default()),
+                &root.entry
+            ),
+            "{}: the recorded dispatcher is not the installed entry point: {receipt}",
+            root.role
+        );
+        assert_ne!(
+            lead["dispatcher"]["creationTime"].as_u64().unwrap_or(0),
+            0,
+            "{}: {receipt}",
+            root.role
+        );
+        assert_eq!(receipt["slot"]["index"], 1, "{}: {receipt}", root.role);
+        assert_eq!(
+            receipt["slot"]["owner"],
+            root.owner.as_str(),
+            "{}: {receipt}",
+            root.role
+        );
+        assert_eq!(
+            receipt["slot"]["path"], slot["path"],
+            "{}: the receipt and the slot record disagree: {receipt}",
+            root.role
+        );
+        assert_eq!(
+            receipt["slot"]["source"], slot["source"],
+            "{}: the receipt and the slot record disagree: {receipt}",
+            root.role
+        );
+        // The run's own surface: an owned console this dispatch opened, never a
+        // tab or rearrangement of the lead's terminal.
+        assert_eq!(receipt["host"], "owned-console", "{}: {receipt}", root.role);
+        assert!(
+            receipt["terminal"].is_null(),
+            "{}: the dispatch rearranged a terminal: {receipt}",
+            root.role
+        );
+        assert!(
+            same_executable(
+                Path::new(receipt["launcher"].as_str().unwrap_or_default()),
+                &root.home.join("harness/bin/codex.exe")
+            ),
+            "{}: the receipt names another launcher: {receipt}",
+            root.role
+        );
+        assert!(
+            receipt["control"]["assignment"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(&root.assignment),
+            "{}: the dispatch submitted another assignment: {receipt}",
+            root.role
+        );
+        assert_eq!(
+            receipt["mode"], "tui",
+            "{}: the dispatch selected another presentation: {receipt}",
+            root.role
+        );
+        assert_visible_surface(root);
+        // The lease is this run's live host, and the observation names the exact
+        // native session and app-server child the dispatch started.
+        let lease = root.record("lease-1.json");
+        assert_eq!(
+            lease["owner"],
+            root.owner.as_str(),
+            "{}: {lease}",
+            root.role
+        );
+        assert_eq!(lease["index"], 1, "{}: {lease}", root.role);
+        assert_eq!(lease["path"], slot["path"], "{}: {lease}", root.role);
+        let lease_program = PathBuf::from(lease["program"].as_str().unwrap_or_default());
+        assert!(
+            ServiceProcess::inspect(recorded_identity(&lease), &lease_program, &user)
+                .unwrap()
+                .is_some(),
+            "{}: the run's lease host was stopped",
+            root.role
+        );
+        assert_eq!(
+            receipt["observation"]["session"],
+            root.exec_thread.as_str(),
+            "{}: {receipt}",
+            root.role
+        );
+        assert_eq!(
+            receipt["observation"]["state"], "running",
+            "{}: the waiting run is not running: {receipt}",
+            root.role
+        );
+        let host = receipt["observation"]["host"].clone();
+        assert!(
+            same_executable(
+                Path::new(host["program"].as_str().unwrap_or_default()),
+                &root.entry
+            ),
+            "{}: the observation names another host program: {receipt}",
+            root.role
+        );
+        assert!(
+            ServiceProcess::inspect(
+                recorded_identity(&host),
+                Path::new(host["program"].as_str().unwrap_or_default()),
+                &user
+            )
+            .unwrap()
+            .is_some(),
+            "{}: the run's own host process was stopped",
+            root.role
+        );
+        // The visible surface belongs to that same host, and the app-server
+        // child the endpoint names is live under this run's own launcher.
+        assert_eq!(
+            receipt["window"]["process"]["pid"], host["pid"],
+            "{}: the recorded surface belongs to another process: {receipt}",
+            root.role
+        );
+        assert!(
+            ServiceProcess::inspect(
+                root.executor.identity,
+                &root.home.join("harness/bin/codex.exe"),
+                &user
+            )
+            .unwrap()
+            .is_some(),
+            "{}: the run's own app-server child is not live",
+            root.role
+        );
+        // The control endpoint addresses exactly that child and conversation;
+        // the inherited lead endpoint is this root's own registered lead.
+        let endpoint = root.endpoint();
+        assert_eq!(
+            endpoint["threadId"],
+            root.exec_thread.as_str(),
+            "{}: {endpoint}",
+            root.role
+        );
+        assert_eq!(
+            endpoint["port"].as_u64().unwrap_or(0) as u16,
+            root.executor.port,
+            "{}: {endpoint}",
+            root.role
+        );
+        assert_eq!(
+            recorded_identity(&endpoint["process"]),
+            root.executor.identity,
+            "{}: {endpoint}",
+            root.role
+        );
+        assert_ne!(
+            endpoint["port"].as_u64().unwrap_or(0) as u16,
+            root.lead.port,
+            "{}: the run kept the lead's own port",
+            root.role
+        );
+        let lead_endpoint = root.lead_endpoint();
+        assert_eq!(
+            lead_endpoint["threadId"],
+            root.lead_thread.as_str(),
+            "{}: {lead_endpoint}",
+            root.role
+        );
+        assert_eq!(
+            lead_endpoint["port"].as_u64().unwrap_or(0) as u16,
+            root.lead.port,
+            "{}: the inherited lead endpoint is not this root's lead: {lead_endpoint}",
+            root.role
+        );
+        assert_eq!(
+            recorded_identity(&lead_endpoint["process"]),
+            root.lead.identity,
+            "{}: {lead_endpoint}",
+            root.role
+        );
+        // Both native sessions of this root are still live, and the run's own
+        // visible conversation is the frontend the dispatch attached.
+        let observed = ServiceProcess::inspect(root.lead.identity, &root.exe, &user)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{}: the lead session is no longer live", root.role));
+        assert_eq!(observed.identity(), root.lead.identity, "{}", root.role);
+        let frontend = root.frontend_record();
+        assert!(
+            root.frontend_alive(),
+            "{}: the run's own native frontend is not live: {frontend}",
+            root.role
+        );
+        assert!(
+            same_executable(
+                Path::new(frontend["program"].as_str().unwrap_or_default()),
+                &exe
+            ),
+            "{}: the run's frontend is not the registered native CLI: {frontend}",
+            root.role
+        );
+        assert_eq!(
+            frontend["threadId"],
+            root.exec_thread.as_str(),
+            "{}: {frontend}",
+            root.role
+        );
+        // Routing is unchanged on the exact native session the dispatch
+        // started, addressed through the endpoint it recorded.
+        let (thread, cwd) = (root.exec_thread.clone(), root.worktree.clone());
+        assert_bound_thread(&mut root.exec_client, &thread, &cwd, root.role);
     }
-    let still_waiting = lead_b.watch("30");
-    let still_waiting_text = output_text(&still_waiting);
-    assert_eq!(still_waiting.status.code(), Some(3), "{still_waiting_text}");
-    assert!(
-        still_waiting_text.contains(&format!("id={id_b}")),
-        "{still_waiting_text}"
-    );
 
     // Isolation refusals through the installed entry point: another lead, a
     // reference recorded in another kit home, a copied marker outside the run's
@@ -1678,14 +2224,16 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
             "{label}: {text}"
         );
     }
+    // A refused attempt reached no conversation: both waiting runs still own
+    // exactly the exchange their own dispatch and question produced.
     assert_eq!(
-        lead_a.kinds().len(),
-        6,
+        lead_a.kinds(),
+        ["exec-question", "lead-question", "exec-waiting"],
         "a refused attempt reached a conversation"
     );
     assert_eq!(
-        lead_b.kinds().len(),
-        3,
+        lead_b.kinds(),
+        ["exec-question", "lead-question", "exec-waiting"],
         "a refused attempt reached a conversation"
     );
     for root in [&lead_a, &lead_b] {
@@ -1705,6 +2253,117 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
         }
     }
 
+    // One command from the correct lead, inside its own native session,
+    // continues only that lead's executor on the same thread, and that run then
+    // completes normally on the conversation the dispatch started.
+    lead_a.reply(&id_a);
+    lead_a.wait_kind("lead-answer-done");
+    assert_eq!(
+        lead_a.kinds(),
+        [
+            "exec-question",
+            "lead-question",
+            "exec-waiting",
+            "lead-answer-command",
+            "exec-reply-continued",
+            "lead-answer-done"
+        ],
+        "root a: unexpected provider traffic"
+    );
+    let continued = lead_a.executor_request(&lead_a.answer);
+    assert!(
+        input_text(&continued["input"]).contains(&lead_a.answer),
+        "the answer did not reach the executor's own conversation"
+    );
+    assert_eq!(
+        lead_a.receipt()["observation"]["session"],
+        lead_a.exec_thread.as_str(),
+        "the answer replaced the answered conversation"
+    );
+    let answered = lead_a.lead_request("lead-reply-1");
+    let answered_text = input_text(&answered["input"]);
+    assert!(
+        answered_text.contains(&format!(
+            "slot 1 owner {} session {}",
+            lead_a.owner, lead_a.exec_thread
+        )) && answered_text.contains("delivered in"),
+        "the lead's own turn kept no delivered receipt: {}",
+        excerpt(&answered_text, 2000)
+    );
+    assert!(
+        answered_text.contains(&format!("receipt: {}", lead_a.state.display())),
+        "the reply did not name the addressed run's receipt: {}",
+        excerpt(&answered_text, 2000)
+    );
+    let result_message = lead_a.wait_completed();
+    assert!(
+        result_message.contains("EXECUTOR_CONTINUED"),
+        "the answered run persisted another result: {result_message}"
+    );
+    let settled = lead_a.watch("30");
+    let settled_text = output_text(&settled);
+    assert_eq!(settled.status.code(), Some(0), "{settled_text}");
+    assert!(
+        settled_text.contains("EXECUTOR_CONTINUED"),
+        "the same watch command did not report the answered run's own result: {settled_text}"
+    );
+    // The answered run's own reference is retired with its recorded outcome: a
+    // later reply to it is refused and names the state and the continuation
+    // remedy instead of delivering into a conversation that has ended.
+    let retired = lead_a
+        .installed_command()
+        .args([
+            "executor",
+            "message",
+            "--reply-to",
+            &id_a,
+            "--text",
+            "retired reference attempt",
+        ])
+        .env("CODEX_THREAD_ID", &lead_a.lead_thread)
+        .output()
+        .unwrap();
+    let retired_text = output_text(&retired);
+    assert!(
+        !retired.status.success()
+            && retired_text.contains("retired message id")
+            && retired_text.contains("completed")
+            && retired_text.contains("executor resume"),
+        "a retired reference was not refused with its outcome and remedy: {retired_text}"
+    );
+
+    // The answer reached nothing else: the neighbor root produced no further
+    // traffic, never saw the answer or the answered identity, and its own
+    // executor stays waiting on its own request with its own surface live.
+    assert_eq!(
+        lead_b.kinds(),
+        ["exec-question", "lead-question", "exec-waiting"],
+        "root b: the neighbor's reply changed its traffic"
+    );
+    for body in lead_b.provider_bodies() {
+        let text = input_text(&body["input"]);
+        assert!(
+            !text.contains(&lead_a.answer) && !text.contains(&id_a),
+            "root b saw root a's exchange: {text}"
+        );
+    }
+    let still_waiting = lead_b.watch("30");
+    let still_waiting_text = output_text(&still_waiting);
+    assert_eq!(still_waiting.status.code(), Some(3), "{still_waiting_text}");
+    assert!(
+        still_waiting_text.contains(&format!("id={id_b}")),
+        "{still_waiting_text}"
+    );
+    assert_eq!(
+        lead_b.receipt()["observation"]["state"],
+        "running",
+        "the neighbor's waiting run stopped when its neighbor was answered"
+    );
+    assert!(
+        lead_b.frontend_alive(),
+        "root b: the waiting run's own visible conversation was closed"
+    );
+
     // Unchanged effective routing for every request either conversation made,
     // and both conversations still report the bound model, provider, effort and
     // their own checkout.
@@ -1722,105 +2381,53 @@ fn installed_two_leads_keep_questions_waiting_and_replies_isolated() {
     }
     let (thread, cwd) = (lead_a.lead_thread.clone(), lead_a.workspace.clone());
     assert_bound_thread(&mut lead_a.lead_client, &thread, &cwd, "lead a");
-    let (thread, cwd) = (lead_a.exec_thread.clone(), lead_a.worktree.clone());
-    assert_bound_thread(&mut lead_a.exec_client, &thread, &cwd, "executor a");
     let (thread, cwd) = (lead_b.lead_thread.clone(), lead_b.workspace.clone());
     assert_bound_thread(&mut lead_b.lead_client, &thread, &cwd, "lead b");
-    let (thread, cwd) = (lead_b.exec_thread.clone(), lead_b.worktree.clone());
-    assert_bound_thread(&mut lead_b.exec_client, &thread, &cwd, "executor b");
 
-    // The runs keep their own host, session, lease, slot and worktree: waiting
-    // and answering changed no lifecycle record, started no resume and left no
-    // terminal surface to rearrange.
-    let user = process_service::current_user().unwrap();
-    for root in [&lead_a, &lead_b] {
-        let receipt = root.receipt();
-        assert_eq!(
-            receipt["observation"]["state"], "running",
-            "{}: {receipt}",
-            root.role
-        );
-        assert_eq!(
-            receipt["observation"]["session"],
-            root.exec_thread.as_str(),
-            "{}: {receipt}",
-            root.role
-        );
-        assert_eq!(
-            receipt["slot"]["owner"],
-            root.owner.as_str(),
-            "{}: {receipt}",
-            root.role
-        );
-        assert_eq!(
-            receipt["slot"]["path"],
-            root.worktree.to_string_lossy().as_ref(),
-            "{}: {receipt}",
-            root.role
-        );
-        assert!(receipt["terminal"].is_null(), "{}: {receipt}", root.role);
-        assert!(receipt["window"].is_null(), "{}: {receipt}", root.role);
-        for address in [&root.lead, &root.executor] {
-            let observed = ServiceProcess::inspect(address.identity, &root.exe, &user)
-                .unwrap()
-                .unwrap_or_else(|| panic!("{}: a native session is no longer live", root.role));
-            assert_eq!(observed.identity(), address.identity, "{}", root.role);
-        }
-        let lease: Value =
-            serde_json::from_slice(&fs::read(root.state.join("lease-1.json")).unwrap()).unwrap();
-        let lease_identity = ProcessIdentity {
-            pid: lease["pid"].as_u64().unwrap() as u32,
-            creation_time: lease["created"].as_u64().unwrap(),
-        };
-        assert!(
-            ServiceProcess::inspect(lease_identity, &root.exe, &user)
-                .unwrap()
-                .is_some(),
-            "{}: the run's lease host was stopped",
-            root.role
-        );
-        let endpoint: Value =
-            serde_json::from_slice(&fs::read(root.state.join("endpoint-1.json")).unwrap()).unwrap();
-        assert_eq!(
-            endpoint["threadId"],
-            root.exec_thread.as_str(),
-            "{}",
-            root.role
-        );
-        assert_eq!(
-            endpoint["port"].as_u64().unwrap() as u16,
-            root.executor.port,
-            "{}: the executor's conversation was replaced",
-            root.role
-        );
-        let lead_endpoint: Value =
-            serde_json::from_slice(&fs::read(root.state.join("lead-endpoint-1.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            lead_endpoint["threadId"],
-            root.lead_thread.as_str(),
-            "{}",
-            root.role
-        );
-        for unexpected in [
-            "spawn-2.json",
-            "endpoint-2.json",
-            "frontend-1.json",
-            "message-2.txt",
-        ] {
-            assert!(
-                !root.state.join(unexpected).exists(),
-                "{}: an unexpected record appeared: {unexpected}",
-                root.role
-            );
-        }
-    }
+    // The answered run ended by itself and left nothing of its own behind; the
+    // still-waiting run keeps its session, slot and worktree until its lead
+    // stops it through the installed command.
+    assert!(
+        lead_a.receipt()["observation"]["state"] == "completed",
+        "a: the answered run is not completed"
+    );
+    assert!(
+        !lead_a.state.join("lease-1.json").exists(),
+        "a: the ended run kept its slot lease"
+    );
+    assert_process_gone(
+        lead_a.executor.identity,
+        &lead_a.home.join("harness/bin/codex.exe"),
+        &user,
+        "a: the answered run left its app-server child running",
+    );
+    let stopped = lead_b.stop();
+    eprintln!("root b's waiting executor was stopped by its lead:\n{stopped}");
+    assert_ne!(
+        lead_b.receipt()["observation"]["state"],
+        "running",
+        "b: the stopped run still reports running"
+    );
+    assert_process_gone(
+        lead_b.executor.identity,
+        &lead_b.home.join("harness/bin/codex.exe"),
+        &user,
+        "b: the stopped run left its app-server child running",
+    );
+    let stopped_frontend = lead_b.frontend_record();
+    assert_process_gone(
+        recorded_identity(&stopped_frontend),
+        Path::new(stopped_frontend["program"].as_str().unwrap_or_default()),
+        &user,
+        "b: the stopped run left its native frontend running",
+    );
 
     eprintln!(
-        "two-lead isolation: requests a={} b={}; lead a answered {}; lead b request {} stayed waiting; no cross-root conversation",
+        "two-lead isolation: requests a={} b={}; lead a answered {} ({}); lead b request {} stayed waiting and was stopped; no cross-root conversation",
         lead_a.kinds().len(),
         lead_b.kinds().len(),
         id_a,
+        lead_a.state.display(),
         id_b
     );
 }
