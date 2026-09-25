@@ -1240,6 +1240,184 @@ fn executor_host_marks_the_session_environment() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Two leads, one checkout, explicit profiles. Spawn must not collapse them
+/// by checkout or leak the dispatching thread id. The executor shell path
+/// then preserves those explicit arguments and does not invent an endpoint.
+/// No launcher or native thread is started.
+#[test]
+fn two_leads_sharing_a_checkout_keep_explicit_profiles_on_the_shell_path() {
+    let fixture = Fixture::new("two-leads", 2);
+    fs::write(
+        fixture.home.join("lead-b.config.toml"),
+        "model = 'lead-b-model'\nmodel_provider = 'lead-b-provider'\nmodel_reasoning_effort = 'low'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.source.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"lead-a\", \"lead-b\"]\nmax_concurrent_executors = 2\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 1\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.home.join("lead-a.config.toml"),
+        "model = 'lead-a-model'\nmodel_provider = 'lead-a-provider'\nmodel_reasoning_effort = 'high'\n",
+    )
+    .unwrap();
+    let source = fixture.source.display().to_string();
+    let mut recorded_sources = Vec::new();
+    for (profile, model, thread) in [
+        ("lead-a", "lead-a-model", "lead-thread-a"),
+        ("lead-b", "lead-b-model", "lead-thread-b"),
+    ] {
+        let mut command = lead_command();
+        command.env_remove("WT_SESSION");
+        command.env("CODEX_THREAD_ID", thread);
+        command.env("CODEX_SESSION_ID", thread);
+        command.args([
+            "executor",
+            "spawn",
+            "--source",
+            fixture.source.to_str().unwrap(),
+            "--codex-home",
+            fixture.home.to_str().unwrap(),
+            "--profile",
+            profile,
+            "--exec",
+            "assignment text",
+        ]);
+        let out = command.output().unwrap();
+        let text = output_text(&out);
+        assert!(!out.status.success(), "{profile}: {text}");
+        assert!(
+            text.contains("installed Codex launcher is missing"),
+            "{profile}: dispatch must stop before a model request: {text}"
+        );
+        assert!(
+            text.contains(&format!("owner=exec-{profile}-")),
+            "{profile}: caller was not attributed by its explicit profile: {text}"
+        );
+        assert!(
+            text.contains(&format!("model={model}")),
+            "{profile}: profile settings were not kept: {text}"
+        );
+        assert!(
+            text.contains("source="),
+            "{profile}: dispatch record has no checkout: {text}"
+        );
+        let recorded_source = text
+            .split("source=")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or("")
+            .trim();
+        assert!(
+            recorded_source.contains("proj"),
+            "{profile}: shared checkout was not recorded: {recorded_source}"
+        );
+        recorded_sources.push(recorded_source.to_owned());
+        assert!(
+            !text.contains(thread),
+            "{profile}: dispatch leaked the lead thread id: {text}"
+        );
+        assert!(
+            !text.contains("endpoint-"),
+            "{profile}: spawn invented an endpoint before a launcher: {text}"
+        );
+    }
+    assert_eq!(
+        recorded_sources[0], recorded_sources[1],
+        "two leads did not share one checkout"
+    );
+
+    let shell = owner_powershell();
+    let script = fixture.root.join("identity.ps1");
+    fs::write(
+        &script,
+        "$report, $profile, $checkout, $settings = $args\nif ($args.Count -ne 4) { throw \"expected four shell arguments\" }\n$thread = [string]$env:CODEX_THREAD_ID\n$marker = [string]$env:HARNESS_EXECUTOR_SESSION\n@(\"marker=$marker\", \"thread=$thread\", \"profile=$profile\", \"checkout=$checkout\", \"settings=$settings\") | Set-Content -LiteralPath $report -Encoding ascii\n",
+    )
+    .unwrap();
+    for (profile, settings) in [
+        ("lead-a", "model=\"lead-a-model\""),
+        ("lead-b", "model=\"lead-b-model\""),
+    ] {
+        let report = fixture.root.join(format!("shell-{profile}.txt"));
+        let receipt = fixture.root.join(format!("shell-{profile}.json"));
+        fs::write(
+            &receipt,
+            serde_json::to_vec(&json!({
+                "launcher": shell.to_string_lossy(),
+                "args": [
+                    "-NoProfile",
+                    "-File",
+                    script.to_string_lossy(),
+                    report.to_string_lossy(),
+                    profile,
+                    source,
+                    settings
+                ],
+                "slot": Value::Null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = lead_command()
+            .args(["executor", "run", "--file", receipt.to_str().unwrap()])
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("CODEX_SESSION_ID")
+            .env_remove("WT_SESSION")
+            .current_dir(&fixture.source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{profile}: {}",
+            output_text(&output)
+        );
+        let recorded = fs::read_to_string(&report).unwrap();
+        assert!(
+            recorded.contains("marker=1"),
+            "{profile}: shell was not the executor host: {recorded}"
+        );
+        assert!(
+            recorded.contains("thread=\n") || recorded.contains("thread=\r\n"),
+            "{profile}: shell reused a lead thread id: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("profile={profile}\n"))
+                || recorded.contains(&format!("profile={profile}\r\n")),
+            "{profile}: explicit profile was not preserved: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("checkout={source}")),
+            "{profile}: shared checkout was not preserved: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("settings={settings}")),
+            "{profile}: settings argument was rewritten: {recorded}"
+        );
+        assert!(
+            !fixture
+                .root
+                .join(format!("endpoint-{profile}.json"))
+                .exists(),
+            "{profile}: shell path invented an endpoint"
+        );
+    }
+    fixture.drop();
+}
+
+fn owner_powershell() -> PathBuf {
+    let listed = Command::new("where.exe")
+        .arg("pwsh.exe")
+        .output()
+        .expect("where.exe");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::trim)
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("PowerShell 7 pwsh.exe must be on PATH for the executor shell path")
+}
+
 /// Owned native child double: the launch fixture is a Rust binary, so these
 /// checks never put a shell program into a dispatch receipt.
 fn launch_fixture() -> PathBuf {
