@@ -69,13 +69,13 @@
 use super::control::{
     self, BoundIdentity, ControlPaths, Conversation, Endpoint, Reply, active_turn,
 };
+use super::executor_input::{self, INLINE_BOUND, Spill};
 use super::observation::{
     self, HostIdentity, RunObservation, STATE_COMPLETED, STATE_DEFECT, STATE_FAILED,
     STATE_INTERRUPTED, STATE_PARTIAL_STOP, STATE_STOPPED,
 };
 use super::{
     SessionLease, invalid, lease_path, option_text, read_lease, receipt_binding, receipt_path,
-    required,
 };
 use harness_core::orchestration_config;
 use harness_core::process::{Cancellation, Deadline, ExclusiveFileLock, ProcessIdentity};
@@ -99,9 +99,11 @@ const CONTROL_BOUND: Duration = Duration::from_secs(20);
 /// before the acceptance answer is reported as queued instead of delivered.
 const EVIDENCE_WINDOW: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(200);
-/// One lead message is bounded, and what is sent is always this literal text:
-/// a file is a correction, not a task re-send.
-const MAX_TEXT: u64 = 256 * 1024;
+/// The inline delivery bound of one message: what is sent below it is always the
+/// literal text (a file is a correction, not a task re-send), and above it the
+/// shared spill owner delivers the complete payload as a pointer envelope. The
+/// same number bounds `lead start --exec-file`, whose prompt is not a message.
+const MAX_TEXT: u64 = INLINE_BOUND;
 /// Bound on recorded message attempts kept in the receipt.
 const MAX_ATTEMPTS: usize = 64;
 /// Bound on delivery rounds: a rejected steer means the active turn changed, so
@@ -169,13 +171,12 @@ impl Request {
                     "give either --text TEXT or --file FILE, not both: one message is one input",
                 ));
             }
-            (None, None) => {
-                return Err(invalid(
-                    "a message needs its literal content: --text TEXT or --file FILE",
-                ));
-            }
+            // `--text -`, or no content flag at all, reads the message from the
+            // piped standard input: the caller never has to know a size limit.
+            (Some(text), None) if text == "-" => executor_input::literal_content(Some(text), None)?,
+            (None, None) => executor_input::literal_content(None, None)?,
             (Some(text), None) => text,
-            (None, Some(file)) => read_message_file(&file)?,
+            (None, Some(file)) => executor_input::read_content_file(&file)?,
         };
         if text.is_empty() {
             return Err(invalid(
@@ -208,11 +209,18 @@ impl Request {
                 text,
             );
         }
+        // The address fields are optional: what is not given is resolved from
+        // the kit home, the installation record and the recorded live run, and
+        // then verified exactly as an explicitly typed value is.
+        let codex_home = executor_input::codex_home(codex_home)?;
+        let source = executor_input::source(source, &codex_home)?;
+        let run =
+            executor_input::resolve_run(&codex_home, &source, slot, owner.as_deref(), "message")?;
         Ok(Self {
-            source: required(source, "--source")?,
-            codex_home: required(codex_home, "--codex-home")?,
-            slot: slot.ok_or_else(|| invalid("--slot is required"))?,
-            owner: owner.ok_or_else(|| invalid("--owner ID is required"))?,
+            source,
+            codex_home,
+            slot: run.slot,
+            owner: run.owner,
             session,
             text,
             reply_to: None,
@@ -220,9 +228,12 @@ impl Request {
     }
 }
 
-/// The literal UTF-8 content of `--file`: whatever the file holds, with its
+/// The literal UTF-8 content of one `--file`: whatever the file holds, with its
 /// real line breaks. A file that is not UTF-8 text is refused instead of being
-/// lossily rewritten; a leading byte-order mark is not content.
+/// lossily rewritten; a leading byte-order mark is not content. Message content
+/// goes through the shared reader, which also spills an oversized payload; this
+/// bounded reader remains for `lead start --exec-file`, which takes a first
+/// prompt rather than a message.
 pub(crate) fn read_message_file(path: &Path) -> io::Result<String> {
     let bytes = observation::read_bounded(path, MAX_TEXT + 1)
         .map_err(|error| invalid(&format!("message file {}: {error}", path.display())))?;
@@ -506,6 +517,16 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     // the same reply stays one input.
     let client_message_id =
         attempt_identity(&thread_id, &request.text, request.reply_to.as_deref());
+    // The composed delivery: at or below the inline bound the conversation
+    // receives the literal text exactly as before, and above it the complete
+    // payload is persisted once under the harness message state and the
+    // conversation receives the pointer envelope that names it.
+    let delivery = executor_input::compose(
+        &request.codex_home,
+        &client_message_id,
+        &request.text,
+        |body| body.to_owned(),
+    )?;
     let previous = read_attempts(&value)
         .into_iter()
         .find(|attempt| attempt["id"].as_str() == Some(client_message_id.as_str()));
@@ -528,7 +549,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         let evidence = observe_input(
             &mut conversation,
             &client_message_id,
-            &request.text,
+            &delivery.text,
             Instant::now() + EVIDENCE_WINDOW,
         );
         let attempt = previous
@@ -536,7 +557,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             .expect("a recorded status has its attempt");
         if let Some(evidence) = evidence {
             record_attempt(&receipt, delivered_entry(attempt, &evidence))?;
-            return report_delivered(&request, &receipt, &evidence, started);
+            return report_delivered(&request, &receipt, &evidence, &delivery, started);
         }
         return match previous_status.as_str() {
             STATUS_QUEUED => report_repeat(&request, &receipt, attempt, STATUS_QUEUED, started),
@@ -554,7 +575,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         let evidence = observe_input(
             &mut conversation,
             &client_message_id,
-            &request.text,
+            &delivery.text,
             Instant::now() + EVIDENCE_WINDOW,
         );
         let attempt = previous
@@ -562,7 +583,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             .expect("a recorded status has its attempt");
         if let Some(evidence) = evidence {
             record_attempt(&receipt, delivered_entry(attempt, &evidence))?;
-            return report_delivered(&request, &receipt, &evidence, started);
+            return report_delivered(&request, &receipt, &evidence, &delivery, started);
         }
         return report_indeterminate(
             &request,
@@ -584,20 +605,20 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         let active = active_turn(&thread);
         expected_turn = active.clone();
         let (method, params) =
-            request_params(&thread_id, &client_message_id, &request.text, &active);
+            request_params(&thread_id, &client_message_id, &delivery.text, &active);
         sent += 1;
         // The attempt is recorded before the request, so an invocation that is
         // interrupted mid-request leaves its content identity, method and turn
         // behind instead of an invitation to deliver the same text again.
         record_attempt(
             &receipt,
-            pending_entry(
+            delivery.recorded(pending_entry(
                 &client_message_id,
                 method,
                 active.as_deref(),
                 &request.text,
                 previous_attempts + sent,
-            ),
+            )),
         )?;
         let (turn, rejection, unanswered) = match conversation.request(method, params) {
             Ok(Reply::Result(result)) => {
@@ -653,7 +674,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         let evidence = observe_input(
             &mut conversation,
             &client_message_id,
-            &request.text,
+            &delivery.text,
             Instant::now() + window,
         );
         if let Some(evidence) = evidence {
@@ -720,7 +741,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     let attempts = previous_attempts + sent;
     match &outcome {
         Delivery::Delivered { evidence, .. } => {
-            let entry = delivered_entry_of(
+            let entry = delivery.recorded(delivered_entry_of(
                 &client_message_id,
                 &outcome,
                 evidence,
@@ -728,42 +749,55 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 attempts,
                 expected_turn.as_deref(),
                 request.reply_to.as_deref(),
-            );
+            ));
             record_attempt(&receipt, entry)?;
-            report_delivered(&request, &receipt, evidence, started)
+            report_delivered(&request, &receipt, evidence, &delivery, started)
         }
         Delivery::Queued { .. } | Delivery::Error { .. } | Delivery::Indeterminate { .. } => {
             record_attempt(
                 &receipt,
-                outcome_entry(
+                delivery.recorded(outcome_entry(
                     &client_message_id,
                     &outcome,
                     &request.text,
                     attempts,
                     expected_turn.as_deref(),
                     request.reply_to.as_deref(),
-                ),
+                )),
             )?;
             match &outcome {
-                Delivery::Queued { method, turn } => {
-                    report_queued(&request, &receipt, method, turn.as_deref(), started)
-                }
+                Delivery::Queued { method, turn } => report_queued(
+                    &request,
+                    &receipt,
+                    method,
+                    turn.as_deref(),
+                    &delivery,
+                    started,
+                ),
                 Delivery::Error {
                     method,
                     turn,
                     cause,
-                } => report_error(&request, &receipt, method, turn.as_deref(), cause, started),
+                } => report_error(
+                    &request,
+                    &receipt,
+                    method,
+                    turn.as_deref(),
+                    cause,
+                    &delivery,
+                    started,
+                ),
                 Delivery::Indeterminate {
                     method,
                     turn,
                     cause,
                 } => {
-                    let attempt = json!({
+                    let attempt = delivery.recorded(json!({
                         "id": client_message_id,
                         "status": STATUS_INDETERMINATE,
                         "method": method,
                         "turnId": turn,
-                    });
+                    }));
                     report_indeterminate(&request, &receipt, &attempt, cause, &remedy, started)
                 }
                 Delivery::Delivered { .. } => unreachable!(),
@@ -1422,6 +1456,7 @@ fn report_repeat(
     if let Some(detail) = previous["detail"].as_str() {
         writeln!(out, "detail: {detail}")?;
     }
+    write_spill_detail(&mut out, recorded_spill(previous).as_ref())?;
     writeln!(
         out,
         "nothing was sent again: the same literal text addressed to the same conversation is one input, so a repeat cannot deliver it twice"
@@ -1437,6 +1472,7 @@ fn report_delivered(
     request: &Request,
     receipt: &Path,
     evidence: &InputEvidence,
+    delivery: &executor_input::Delivery,
     started: Instant,
 ) -> io::Result<i32> {
     resolve_observed_reply(request, receipt)?;
@@ -1450,6 +1486,7 @@ fn report_delivered(
         started.elapsed().as_millis()
     )?;
     writeln!(out, "delivery: {}", evidence.detail())?;
+    write_spill_detail(&mut out, delivery.spill.as_ref())?;
     writeln!(
         out,
         "the input is in the conversation; whether the executor already applied it is the executor's own report, not this command's"
@@ -1463,6 +1500,7 @@ fn report_queued(
     receipt: &Path,
     method: &str,
     turn: Option<&str>,
+    delivery: &executor_input::Delivery,
     started: Instant,
 ) -> io::Result<i32> {
     let mut out = io::stdout();
@@ -1483,6 +1521,7 @@ fn report_queued(
         out,
         "the tool call in flight was not interrupted: the input is applied at the nearest supported point"
     )?;
+    write_spill_detail(&mut out, delivery.spill.as_ref())?;
     writeln!(out, "receipt: {}", receipt.display())?;
     Ok(0)
 }
@@ -1493,6 +1532,7 @@ fn report_error(
     method: &str,
     turn: Option<&str>,
     cause: &str,
+    delivery: &executor_input::Delivery,
     started: Instant,
 ) -> io::Result<i32> {
     let mut out = io::stdout();
@@ -1513,15 +1553,48 @@ fn report_error(
         out,
         "the recorded attempt is retryable: a refusal applied nothing, so the same text may be sent again"
     )?;
+    write_spill_detail(&mut out, delivery.spill.as_ref())?;
     writeln!(out, "receipt: {}", receipt.display())?;
     Ok(1)
+}
+
+/// The honest evidence of a spilled delivery: the conversation carries the
+/// pointer envelope and the complete payload is in the harness-owned file. A
+/// local write is still never presented as model delivery, and whether the
+/// recipient read the file is the recipient's own report.
+fn write_spill_detail(out: &mut impl Write, spill: Option<&Spill>) -> io::Result<()> {
+    let Some(spill) = spill else {
+        return Ok(());
+    };
+    writeln!(out, "payloadPath: {}", spill.path.display())?;
+    writeln!(
+        out,
+        "delivery: spill - the complete {}-byte literal message is in that file and the conversation received the pointer to it; reading it is the recipient's own step, so this is not model application",
+        spill.bytes
+    )
+}
+
+/// The spill one recorded attempt carries, so a repeat or an unresolved retry
+/// reports the same file and size it recorded.
+fn recorded_spill(entry: &Value) -> Option<Spill> {
+    let path = entry["payloadPath"].as_str()?;
+    Some(Spill {
+        id: entry["id"].as_str().unwrap_or_default().to_owned(),
+        path: PathBuf::from(path),
+        bytes: entry["payloadBytes"].as_u64().unwrap_or(0),
+    })
 }
 
 /// Usage for `codex-harness lead message`. No recipient, slot, session,
 /// checkout, or lead address is accepted.
 pub(crate) const LEAD_USAGE: &str = "\
-codex-harness lead message (--text TEXT | --file FILE) [--notify]
+codex-harness lead message [--text TEXT | --file FILE] [--notify]
   Send one literal payload to the originating lead of this spawned run.
+  Content is TEXT, a UTF-8 FILE, or the piped standard input of a command run
+  without a content flag (--text - selects the stream explicitly); no size
+  limit needs to be known, because a payload too large for one conversation
+  input is delivered as a pointer to the harness-owned file that holds it
+  complete and can be read with ordinary file tools.
   The caller supplies no recipient, slot, session, checkout, or lead address.
   The default kind is reply-request. --notify does not request a reply.
 ";
@@ -1539,6 +1612,9 @@ struct LeadInput {
 
 struct SpawnedRun {
     receipt: PathBuf,
+    /// The kit home this run's records live under: the owner of the spill
+    /// directory a message too large for one conversation input is written to.
+    home: PathBuf,
     lead_thread: String,
     generation: String,
     owner: String,
@@ -1619,18 +1695,19 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
             "lead message header could not be encoded: {error}; nothing was sent"
         ))
     })?;
-    let envelope = format!("{header}{PAYLOAD_MARK}{payload}");
-    if envelope.len() as u64 > MAX_TEXT {
-        return Err(invalid(&format!(
-            "lead message exceeds the {MAX_TEXT}-byte bound; nothing was sent"
-        )));
-    }
+    // The delivered envelope is the recorded header plus either the literal
+    // payload or, above the inline bound, the pointer to the harness-owned file
+    // that carries it complete: the caller never creates or names a file.
+    let delivery = executor_input::compose(&run.home, &id, &payload, |body| {
+        format!("{header}{PAYLOAD_MARK}{body}")
+    })?;
     let message = LeadMessage {
         id: &id,
         kind,
         content: &content,
-        envelope: &envelope,
+        envelope: &delivery.text,
         payload: &payload,
+        spill: delivery.spill.as_ref(),
     };
     deliver_to_recorded_lead(&run, &endpoint, &message, previous.as_ref())
 }
@@ -1666,47 +1743,28 @@ fn parse_lead_input(args: &[OsString]) -> io::Result<LeadInput> {
             _ => return Err(lead_override(key)),
         }
     }
-    match (&text, &file) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                "give either --text TEXT or --file FILE, not both; nothing was sent",
-            ));
-        }
-        (None, None) => {
-            return Err(invalid(
-                "a lead message needs its literal content: --text TEXT or --file FILE; nothing was sent",
-            ));
-        }
-        _ => {}
+    // `--text -`, or no content flag at all, reads the payload from the piped
+    // standard input through the shared bounded reader.
+    if let (Some(_), Some(_)) = (&text, &file) {
+        return Err(invalid(
+            "give either --text TEXT or --file FILE, not both; nothing was sent",
+        ));
     }
     Ok(LeadInput { text, file, notify })
 }
 
 fn lead_override(what: &str) -> io::Error {
     invalid(&format!(
-        "lead message accepts only --text, --file, or --notify; a recipient, slot, session, checkout, or lead override is not accepted ({what}); refusing before any send"
+        "lead message accepts only --text, --file, or --notify (or piped standard input with no content flag); a recipient, slot, session, checkout, or lead override is not accepted ({what}); refusing before any send"
     ))
 }
 
 fn lead_payload(input: &LeadInput) -> io::Result<String> {
-    let text = match (&input.text, &input.file) {
-        (Some(text), None) => text.clone(),
-        (None, Some(file)) => read_message_file(file)?,
-        _ => {
-            return Err(invalid(
-                "a lead message needs exactly one of --text or --file; nothing was sent",
-            ));
-        }
-    };
+    let text = executor_input::literal_content(input.text.clone(), input.file.clone())?;
     if text.is_empty() {
         return Err(invalid(
             "the message is empty; nothing would be delivered; nothing was sent",
         ));
-    }
-    if text.len() as u64 > MAX_TEXT {
-        return Err(invalid(&format!(
-            "lead message exceeds the {MAX_TEXT}-byte bound; nothing was sent"
-        )));
     }
     Ok(text)
 }
@@ -1779,6 +1837,7 @@ fn resolve_spawned_run() -> io::Result<SpawnedRun> {
     })?;
     Ok(SpawnedRun {
         receipt,
+        home: PathBuf::from(&home),
         lead_thread: lead.thread_id,
         generation: lead.run_generation,
         owner: registered_text(&value["slot"]["owner"]),
@@ -2113,6 +2172,9 @@ struct LeadMessage<'a> {
     content: &'a str,
     envelope: &'a str,
     payload: &'a str,
+    /// Set when the payload did not fit one conversation input and is delivered
+    /// as a pointer to its harness-owned file instead.
+    spill: Option<&'a Spill>,
 }
 
 /// Commits one lead-message attempt, merged by identity so the pending record,
@@ -2153,6 +2215,11 @@ fn record_lead_message(
         entry["status"] = Value::String(attempt.status.into());
         entry["method"] = Value::String(attempt.method.clone());
         entry["detail"] = Value::String(attempt.detail.clone());
+        if let Some(spill) = message.spill {
+            entry["delivery"] = Value::String("spill".into());
+            entry["payloadPath"] = Value::String(spill.path.display().to_string());
+            entry["payloadBytes"] = Value::from(spill.bytes);
+        }
         entry["attempts"] = Value::from(
             entry["attempts"]
                 .as_u64()
@@ -2206,6 +2273,7 @@ fn report_lead_message(
     kind: &str,
     attempt: &LeadAttempt,
     payload_bytes: usize,
+    spill: Option<&Spill>,
     note: Option<String>,
 ) -> io::Result<i32> {
     let mut out = io::stdout();
@@ -2232,6 +2300,7 @@ fn report_lead_message(
     )?;
     writeln!(out, "attempts: {}", attempt.attempts)?;
     writeln!(out, "payloadBytes: {payload_bytes}")?;
+    write_spill_detail(&mut out, spill)?;
     if kind == KIND_REQUEST {
         writeln!(
             out,
@@ -2272,6 +2341,7 @@ fn report_recorded_lead_repeat(
         kind,
         &attempt,
         payload_bytes,
+        recorded_spill(previous).as_ref(),
         Some(
             "nothing was sent again: the same literal text addressed to the same lead conversation is one input, so a repeat cannot deliver it twice".to_owned(),
         ),
@@ -2342,6 +2412,7 @@ fn reconcile_recorded_lead(
             message.kind,
             &attempt,
             message.payload.len(),
+            message.spill,
             Some(
                 "nothing was sent: the earlier attempt is in the lead conversation, so the same words cannot be delivered twice".to_owned(),
             ),
@@ -2361,6 +2432,7 @@ fn reconcile_recorded_lead(
                 message.kind,
                 &attempt,
                 message.payload.len(),
+                message.spill,
                 Some(
                     "nothing was sent again: the native transport accepted the earlier attempt, which is in the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly".to_owned(),
                 ),
@@ -2387,6 +2459,7 @@ fn reconcile_recorded_lead(
                 message.kind,
                 &attempt,
                 message.payload.len(),
+                message.spill,
                 Some(
                     "nothing was sent again: an earlier attempt of this exact text may already be in the lead conversation, so a repeat could deliver it twice. Next action: inspect the lead conversation; if the words are genuinely absent, send them again with a distinguishing first line".to_owned(),
                 ),
@@ -2544,6 +2617,7 @@ fn deliver_to_recorded_lead(
         message.kind,
         &attempt,
         message.payload.len(),
+        message.spill,
         None,
     )
 }
@@ -2906,6 +2980,7 @@ fn report_indeterminate(
         out,
         "repeat: the same literal text addressed to this conversation stays refused while the attempt is indeterminate, so it cannot be delivered twice"
     )?;
+    write_spill_detail(&mut out, recorded_spill(previous).as_ref())?;
     writeln!(
         out,
         "next action: inspect the conversation (the run's own tab, or `codex-harness executor watch --source {} --codex-home {} --slot {}`); if the input is genuinely absent, send the correction again with a distinguishing first line, or continue the exact session with `{remedy}`",

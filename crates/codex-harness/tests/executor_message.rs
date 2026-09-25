@@ -3118,3 +3118,1100 @@ fn an_indeterminate_reply_is_never_sent_twice_and_resolves_nothing() {
     );
     assert_eq!(run.fixture.attempts()[0]["status"], "indeterminate");
 }
+
+// ---------------------------------------------------------------------------
+// Minimal content sourcing, automatic spill and recorded-address defaults.
+//
+// Every check below runs the real command entry point: the content arrives on a
+// pipe or in a file exactly as a caller would supply it, and the run it is
+// addressed to is the fixture's own recorded receipt, lease, slot binding, host
+// process and canned control endpoint.
+// ---------------------------------------------------------------------------
+
+/// One literal payload of exactly `bytes` bytes with real line breaks, shell
+/// metacharacters and a multibyte character. The size is the point: nothing in
+/// it is interpreted, and a shell would visibly rewrite it.
+fn payload_of(bytes: usize) -> String {
+    assert!(bytes > 65);
+    let line = "CORRECTION_LINE: $(throw), %PATH%, `whoami`, \u{00e4}\u{00f6}\u{00fc} literal\n";
+    let mut text = String::new();
+    while text.len() + line.len() < bytes {
+        text.push_str(line);
+    }
+    while text.len() + 1 < bytes {
+        text.push('x');
+    }
+    text.push('\n');
+    assert_eq!(text.len(), bytes);
+    text
+}
+
+/// Runs one command with this standard input, as a shell pipe delivers it. The
+/// writer is detached, so a command that refuses the stream early can never
+/// block the check on a full pipe.
+fn piped(command: &mut Command, input: &[u8]) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let bytes = input.to_vec();
+    let writer = thread::spawn(move || {
+        use std::io::Write as _;
+        let _ = stdin.write_all(&bytes);
+    });
+    let out = child.wait_with_output().unwrap();
+    let _ = writer.join();
+    out
+}
+
+/// The pointer envelope one spilled message delivers, as the command composes
+/// it: the identity, the exact size and the absolute path of the complete
+/// payload, with the instruction the recipient needs.
+fn pointer_envelope(id: &str, bytes: usize, path: &Path) -> String {
+    format!(
+        "[message {id} is {bytes} bytes - larger than one conversation input, so the complete literal payload was written to a harness file and must be read now]\npath: {}\nbytes: {bytes}\nread: open that file with your ordinary file tools and treat its whole content as this message; nothing was truncated, summarized or split",
+        path.display()
+    )
+}
+
+/// The fixture thread's own record of one delivered input whose conversation
+/// text is not what the command correlates: the identity the input carries is
+/// what makes it evidence.
+fn turns_with_input_identity(identity: &str, text: &str) -> Value {
+    json!([
+        {
+            "id": TURN,
+            "status": "inProgress",
+            "items": [
+                {"id": "c1", "type": "commandExecution", "command": "fixture long command"},
+                {
+                    "id": "u1",
+                    "type": "userMessage",
+                    "clientId": identity,
+                    "content": [{"type": "text", "text": text}]
+                }
+            ]
+        },
+        {
+            "id": NEXT_TURN,
+            "status": "completed",
+            "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+        }
+    ])
+}
+
+/// The message directory of one kit home: where spilled payloads live.
+fn messages_dir(home: &Path) -> PathBuf {
+    home.join("harness/messages")
+}
+
+/// The spilled payload file of one message identity.
+fn spill_path(home: &Path, id: &str) -> PathBuf {
+    messages_dir(home).join(format!("{id}.txt"))
+}
+
+impl Fixture {
+    /// The addressed `executor message` command of this fixture.
+    fn addressed_command(&self, extra: &[&str]) -> Command {
+        let mut command = lead_command();
+        command
+            .args([
+                "executor",
+                "message",
+                "--source",
+                self.source.to_str().unwrap(),
+                "--codex-home",
+                self.home.to_str().unwrap(),
+                "--slot",
+                "1",
+                "--owner",
+                OWNER,
+            ])
+            .args(extra)
+            .current_dir(self.source.as_path())
+            .env_remove("CODEX_HOME");
+        command
+    }
+
+    /// The address-free form: the kit home comes from the environment, and the
+    /// checkout and the run are resolved from the recorded installation, lease,
+    /// slot binding and receipt.
+    fn unaddressed_command(&self, extra: &[&str]) -> Command {
+        let mut command = lead_command();
+        command
+            .args(["executor", "message"])
+            .args(extra)
+            .env("CODEX_HOME", &self.home)
+            .current_dir(self.source.as_path());
+        command
+    }
+
+    /// Records the installation whose source checkout this fixture uses.
+    fn record_installation(&self) {
+        fs::create_dir_all(self.home.join("harness")).unwrap();
+        fs::write(
+            self.home.join("harness/installation.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 2,
+                "settings": {"sourceRoot": self.source},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Adds a second live pooled run in slot 2, recorded exactly as a dispatch
+    /// records one, so an address that names no slot is genuinely ambiguous.
+    fn add_live_run(&self, owner: &str, session: &str) -> Child {
+        let state_dir =
+            harness_core::task_worktree::pool_state_dir(&self.home, &self.source).unwrap();
+        fs::write(
+            state_dir.join("slot-2.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "source": self.source,
+                "index": 2,
+                "path": self.slot,
+                "state": "occupied",
+                "owner": owner,
+                "base": "abc123",
+                "disposition": null,
+                "reason": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (child, identity) =
+            fixture_child(&self._root.path().join("host-2.json"), &self.release);
+        fs::write(
+            state_dir.join("lease-2.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "owner": owner,
+                "index": 2,
+                "path": self.slot,
+                "pid": identity["pid"],
+                "created": identity["creation_time"],
+                "program": launcher(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut receipt = self.receipt();
+        receipt["slot"]["index"] = json!(2);
+        receipt["slot"]["owner"] = json!(owner);
+        receipt["observation"]["session"] = json!(session);
+        receipt["observation"]["host"] = json!({
+            "pid": identity["pid"],
+            "created": identity["creation_time"],
+            "program": launcher(),
+        });
+        fs::write(
+            state_dir.join("spawn-2.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        child
+    }
+}
+
+#[test]
+fn message_content_is_piped_literally_and_an_empty_stream_is_no_content() {
+    let fixture = Fixture::new("stdin", "running", true);
+    let delivered = "piped correction \u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}\n\
+$(throw), %PATH%, `whoami`, \u{00e4}\u{00f6}\u{00fc} \u{2713}\r\nsecond line\n";
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "idle",
+                json!([{
+                    "id": TURN,
+                    "status": "completed",
+                    "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+                }]),
+            )),
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "active",
+                turns_with_input(delivered),
+            )),
+        ],
+    );
+    // No content flag at all: the piped stream is the message.
+    let out = piped(&mut fixture.addressed_command(&[]), delivered.as_bytes());
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(
+        started[0]["params"]["input"],
+        json!([{"type": "text", "text": delivered}]),
+        "the piped content must arrive verbatim, without shell evaluation: {started:?}"
+    );
+    assert_eq!(
+        started[0]["params"]["clientUserMessageId"],
+        content_id(delivered),
+        "{started:?}"
+    );
+    // An inline-sized message keeps exactly the delivery evidence it always had:
+    // no spill fields are invented for it.
+    let attempt = fixture.attempts().into_iter().next().unwrap();
+    assert_eq!(attempt["status"], "delivered", "{attempt}");
+    assert!(attempt.get("delivery").is_none(), "{attempt}");
+    assert!(attempt.get("payloadPath").is_none(), "{attempt}");
+
+    // `--text -` selects the same source explicitly.
+    let explicit = "explicit stream selection\n";
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(thread_read(
+            &fixture.slot,
+            "active",
+            turns_with_input(explicit),
+        ))],
+    );
+    let out = piped(
+        &mut fixture.addressed_command(&["--text", "-"]),
+        explicit.as_bytes(),
+    );
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    assert_eq!(
+        fixture.server.requests_for("turn/start").len()
+            + fixture.server.requests_for("turn/steer").len(),
+        2,
+        "the explicit stream form delivers its own message: {text}"
+    );
+
+    // An empty stream is no content: nothing is sent.
+    let out = piped(&mut fixture.addressed_command(&[]), b"");
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("the message is empty"), "{text}");
+    assert_eq!(
+        fixture.server.requests_for("turn/start").len()
+            + fixture.server.requests_for("turn/steer").len(),
+        2,
+        "an empty stream must not reach the conversation: {text}"
+    );
+    assert_eq!(fixture.attempts().len(), 2, "no attempt is recorded for it");
+}
+
+#[test]
+fn a_terminal_or_absent_standard_input_never_blocks_and_sends_nothing() {
+    let fixture = Fixture::new("terminal", "running", true);
+    // The caller's own standard input, whatever it is: an interactive terminal
+    // refuses with the supported sources, an empty non-terminal stream refuses
+    // as no content. Either way the command must return by itself.
+    let mut child = fixture
+        .addressed_command(&[])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a standard input with no content must not block the command"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let out = child.wait_with_output().unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("interactive terminal") || text.contains("the message is empty"),
+        "the refusal must name the supported content sources: {text}"
+    );
+    assert!(
+        fixture.server.requests().is_empty(),
+        "nothing may be sent without content: {text}"
+    );
+
+    // A null device is a non-terminal stream with no content: the same refusal,
+    // reached without blocking.
+    let out = fixture
+        .addressed_command(&[])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("the message is empty"), "{text}");
+    assert!(fixture.server.requests().is_empty(), "{text}");
+}
+
+#[test]
+fn an_oversized_message_is_delivered_as_a_pointer_to_its_harness_file() {
+    let fixture = Fixture::new("spill", "running", true);
+    let payload = payload_of(300 * 1024);
+    let id = content_id(&payload);
+    let path = spill_path(&fixture.home, &id);
+    // The conversation's own record carries the recorded identity, which is what
+    // the command correlates the delivered pointer envelope by.
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "idle",
+                json!([{
+                    "id": TURN,
+                    "status": "completed",
+                    "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+                }]),
+            )),
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "active",
+                turns_with_input_identity(&id, &payload),
+            )),
+        ],
+    );
+    let file = fixture.home.join("correction.txt");
+    fs::write(&file, &payload).unwrap();
+    let out = fixture.message(&["--file", file.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    assert!(text.contains("delivery: spill"), "{text}");
+    assert!(
+        text.contains(&format!("payloadPath: {}", path.display())),
+        "{text}"
+    );
+
+    // The complete payload is in the harness-owned file, byte for byte, and it
+    // is outside every worktree and repository.
+    let stored = fs::read(&path).unwrap();
+    assert_eq!(
+        stored,
+        payload.as_bytes(),
+        "the spill must persist the complete literal payload"
+    );
+    assert!(path.starts_with(messages_dir(&fixture.home)), "{path:?}");
+    assert!(
+        !path.starts_with(&fixture.slot),
+        "the payload must not be written into the executor's worktree"
+    );
+
+    // The conversation receives the pointer envelope, never the payload, and the
+    // envelope names the identity, the exact size and the absolute path.
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    let submitted = started[0]["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        submitted,
+        pointer_envelope(&id, payload.len(), &path),
+        "the delivered text must be the compact pointer envelope"
+    );
+    assert!(!submitted.contains("CORRECTION_LINE"), "{submitted}");
+
+    // The receipt records spilled delivery as its own class, with the path and
+    // the exact size, and still never copies the payload.
+    let attempt = fixture.attempts().into_iter().next().unwrap();
+    assert_eq!(attempt["status"], "delivered", "{attempt}");
+    assert_eq!(attempt["delivery"], "spill", "{attempt}");
+    assert_eq!(
+        attempt["payloadBytes"],
+        json!(payload.len() as u64),
+        "{attempt}"
+    );
+    assert_eq!(
+        attempt["payloadPath"],
+        json!(path.to_str().unwrap()),
+        "{attempt}"
+    );
+    assert_eq!(attempt["bytes"], json!(payload.len()), "{attempt}");
+    assert!(
+        !fixture.receipt().to_string().contains("CORRECTION_LINE"),
+        "the receipt must not copy the spilled payload"
+    );
+}
+
+#[test]
+fn an_oversized_payload_above_the_ceiling_is_refused_without_sending() {
+    let fixture = Fixture::new("ceiling", "running", true);
+    let ceiling = 8 * 1024 * 1024;
+    let payload = payload_of(ceiling + 1);
+    let out = piped(&mut fixture.addressed_command(&[]), payload.as_bytes());
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("8388608") && text.contains("ceiling of one message"),
+        "the refusal must name the actual ceiling: {text}"
+    );
+    assert!(
+        text.contains("nothing was truncated"),
+        "the refusal must say nothing partial was sent: {text}"
+    );
+    assert!(
+        fixture.server.requests().is_empty(),
+        "nothing may be sent above the ceiling: {text}"
+    );
+    assert!(
+        !messages_dir(&fixture.home).exists(),
+        "a refused payload leaves no spill file"
+    );
+    assert!(
+        fixture.receipt().get("messages").is_none(),
+        "a refused payload leaves no phantom attempt"
+    );
+}
+
+#[test]
+fn standard_input_that_is_not_utf8_is_refused_without_sending() {
+    let fixture = Fixture::new("nonutf8", "running", true);
+    let out = piped(
+        &mut fixture.addressed_command(&[]),
+        b"correction \xff\xfe not text\n",
+    );
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("is not UTF-8 text"), "{text}");
+    assert!(fixture.server.requests().is_empty(), "{text}");
+}
+
+/// The spill directory is bounded honestly: a message that would push it past
+/// its bound is refused with the numbers, and nothing already there is evicted
+/// to make room.
+#[test]
+fn a_full_message_directory_is_refused_honestly_before_anything_is_sent() {
+    let fixture = Fixture::new("messages-bound", "running", true);
+    let payload = payload_of(300 * 1024);
+    let id = content_id(&payload);
+    let file = fixture.home.join("correction.txt");
+    fs::write(&file, &payload).unwrap();
+    // Unrelated messages already occupy the directory beyond its bound; sparse
+    // files hold the recorded size without writing that much data.
+    let dir = messages_dir(&fixture.home);
+    fs::create_dir_all(&dir).unwrap();
+    for index in 0..4 {
+        fs::File::create(dir.join(format!("occupied-{index}.txt")))
+            .unwrap()
+            .set_len(40 * 1024 * 1024)
+            .unwrap();
+    }
+    let out = fixture.message(&["--file", file.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("would exceed its 134217728-byte bound"),
+        "the refusal must name the occupied size and the bound: {text}"
+    );
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(
+        !spill_path(&fixture.home, &id).exists(),
+        "no payload may be written past the bound"
+    );
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        4,
+        "nothing already recorded may be evicted to make room"
+    );
+    assert!(
+        fixture.receipt().get("messages").is_none(),
+        "a refused payload leaves no phantom attempt"
+    );
+    assert!(
+        fixture.server.requests_for("turn/start").is_empty()
+            && fixture.server.requests_for("turn/steer").is_empty(),
+        "a refused payload must not reach the conversation: {text}"
+    );
+}
+
+/// The lead-side half of the spill: an oversized reply and an oversized question
+/// both travel as pointer envelopes naming their harness-owned file, and the
+/// reply still resolves the request it answers.
+impl ReplyRoundTrip {
+    fn reply_piped(&self, lead_thread: &str, args: &[&str], input: &[u8]) -> Output {
+        let cwd = self.fixture.home.join("lead-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut command = lead_command();
+        command
+            .args(["executor", "message"])
+            .args(args)
+            .env("CODEX_HOME", &self.fixture.home)
+            .env("CODEX_THREAD_ID", lead_thread)
+            .env_remove("HARNESS_EXECUTOR_RUN")
+            .env_remove("HARNESS_ORIGINATING_LEAD")
+            .env_remove("HARNESS_LEAD_THREAD")
+            .env_remove("HARNESS_LEAD_RECIPIENT")
+            .current_dir(&cwd);
+        piped(&mut command, input)
+    }
+
+    /// Sends one real oversized lead message from a file and returns its id.
+    fn issue_oversized(&self, payload: &str) -> String {
+        let file = self.fixture.home.join("oversized-question.txt");
+        fs::write(&file, payload).unwrap();
+        let id = lead_message_id(&self.generation, "reply-request", 1, payload);
+        self.lead_server.answer_sequence(
+            "thread/read",
+            vec![Answer::Result(lead_thread_read(
+                LEAD_THREAD,
+                "active",
+                json!([{
+                    "id": TURN,
+                    "status": "inProgress",
+                    "items": [{
+                        "id": "u1",
+                        "type": "userMessage",
+                        "clientId": id,
+                        "content": [{"type": "text", "text": payload}]
+                    }]
+                }]),
+            ))],
+        );
+        let mut command = Command::new(manager());
+        command.args(["lead", "message", "--file", file.to_str().unwrap()]);
+        command.env("CODEX_HOME", &self.fixture.home);
+        command.env("HARNESS_EXECUTOR_RUN", &self.generation);
+        command.env("HARNESS_EXECUTOR_SESSION", "1");
+        command.env("CODEX_THREAD_ID", "most-recent-session-is-not-authority");
+        command.env_remove("HARNESS_ORIGINATING_LEAD");
+        command.env_remove("HARNESS_LEAD_THREAD");
+        command.env_remove("HARNESS_LEAD_RECIPIENT");
+        command.current_dir(&self.fixture.slot);
+        let out = command.output().unwrap();
+        let text = output_text(&out);
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        id
+    }
+}
+
+#[test]
+fn an_oversized_reply_is_a_pointer_envelope_and_still_resolves_the_request() {
+    let run = ReplyRoundTrip::new("spill-reply");
+    let question = "answer this before the long path is used";
+    let id = run.issue(question);
+    let answer = payload_of(300 * 1024);
+    let identity = content_id_for(THREAD, &format!("reply-to {id}\n{answer}"));
+    let path = spill_path(&run.fixture.home, &identity);
+    run.fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(&run.fixture.slot, "active", active_turns())),
+            Answer::Result(thread_read(
+                &run.fixture.slot,
+                "active",
+                turns_with_input_identity(&identity, &answer),
+            )),
+        ],
+    );
+    let out = run.reply_piped(LEAD_THREAD, &["--reply-to", &id], answer.as_bytes());
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    assert!(text.contains("delivery: spill"), "{text}");
+    assert!(
+        text.contains(&format!("payloadPath: {}", path.display())),
+        "{text}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        answer.as_bytes(),
+        "the reply's complete payload is in its harness-owned file"
+    );
+    let steer = run.fixture.server.requests_for("turn/steer");
+    assert_eq!(steer.len(), 1, "{steer:?}");
+    assert_eq!(
+        steer[0]["params"]["input"][0]["text"].as_str().unwrap(),
+        pointer_envelope(&identity, answer.len(), &path),
+        "the conversation receives the pointer envelope, not the payload"
+    );
+
+    // The delivered reply resolves exactly the request it answered, and its
+    // attempt records the spill as its own class.
+    let receipt = run.fixture.receipt();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "resolved",
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["leadMessages"][0]["resolvedBy"],
+        json!(identity),
+        "{receipt}"
+    );
+    let attempt = &receipt["messages"][0];
+    assert_eq!(attempt["status"], "delivered", "{attempt}");
+    assert_eq!(attempt["delivery"], "spill", "{attempt}");
+    assert_eq!(
+        attempt["payloadBytes"],
+        json!(answer.len() as u64),
+        "{attempt}"
+    );
+
+    // A repeat of the same reply cannot deliver it twice, and it still reports
+    // the recorded spill instead of pretending an inline delivery.
+    let out = run.reply_piped(LEAD_THREAD, &["--reply-to", &id], answer.as_bytes());
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": already delivered in"), "{text}");
+    assert!(text.contains("payloadPath:"), "{text}");
+    assert_eq!(
+        run.fixture.server.requests_for("turn/steer").len(),
+        1,
+        "the repeat must not reach the executor conversation: {text}"
+    );
+}
+
+#[test]
+fn an_oversized_question_is_a_pointer_envelope_and_appears_in_watch() {
+    let run = ReplyRoundTrip::new("spill-question");
+    run.fixture.record_installation();
+    let question = payload_of(300 * 1024);
+    let id = run.issue_oversized(&question);
+    let path = spill_path(&run.fixture.home, &id);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        question.as_bytes(),
+        "the question's complete payload is in its harness-owned file"
+    );
+    let steer = run.lead_server.requests_for("turn/steer");
+    assert_eq!(steer.len(), 1, "{steer:?}");
+    assert_eq!(
+        steer[0]["params"]["input"][0]["text"].as_str().unwrap(),
+        {
+            let header = steer[0]["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap()
+                .split("\n---payload---\n")
+                .next()
+                .unwrap()
+                .to_owned();
+            format!(
+                "{header}\n---payload---\n{}",
+                pointer_envelope(&id, question.len(), &path)
+            )
+        },
+        "the lead conversation receives the recorded header plus the pointer"
+    );
+    let recorded = run.fixture.receipt();
+    assert_eq!(
+        recorded["leadMessages"][0]["delivery"], "spill",
+        "{recorded}"
+    );
+    assert_eq!(
+        recorded["leadMessages"][0]["payloadBytes"],
+        json!(question.len() as u64),
+        "{recorded}"
+    );
+
+    // The existing watch surface shows the spilled request: its path and size,
+    // and the one-command reply. The address comes from recorded state alone.
+    let mut watch = lead_command();
+    watch
+        .args(["executor", "watch", "--timeout", "10"])
+        .env("CODEX_HOME", &run.fixture.home)
+        .current_dir(&run.fixture.slot);
+    let out = watch.output().unwrap();
+    let text = output_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a live run with an unanswered request is action required: {text}"
+    );
+    assert!(
+        text.contains("action required: waiting for reply"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "payloadPath: {} payloadBytes: {}",
+            path.display(),
+            question.len()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("--reply-to {id}")),
+        "the request keeps its one-command reply: {text}"
+    );
+}
+
+#[test]
+fn an_indeterminate_spilled_message_is_never_delivered_twice() {
+    let fixture = Fixture::new("spill-indeterminate", "running", true);
+    let payload = payload_of(300 * 1024);
+    let id = content_id(&payload);
+    let path = spill_path(&fixture.home, &id);
+    let file = fixture.home.join("correction.txt");
+    fs::write(&file, &payload).unwrap();
+    // The native endpoint never answers the steering request, so whether the
+    // input reached the conversation is unknown.
+    fixture.server.answer("turn/steer", Answer::Silence);
+    let out = fixture.message(&["--file", file.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains(": indeterminate in"), "{text}");
+    assert!(
+        text.contains(&format!("payloadPath: {}", path.display())),
+        "an unresolved spilled attempt reports its own file: {text}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        payload.as_bytes(),
+        "the payload is persisted complete before the attempt"
+    );
+    assert_eq!(fixture.server.requests_for("turn/steer").len(), 1);
+    let attempt = fixture.attempts().into_iter().next().unwrap();
+    assert_eq!(attempt["status"], "indeterminate", "{attempt}");
+    assert_eq!(attempt["delivery"], "spill", "{attempt}");
+
+    // The retry reconciles the recorded identity before anything is sent: it
+    // cannot deliver the same payload twice.
+    let out = fixture.message(&["--file", file.to_str().unwrap()]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("stays refused"), "{text}");
+    assert!(
+        text.contains(&format!("payloadPath: {}", path.display())),
+        "{text}"
+    );
+    assert_eq!(
+        fixture.server.requests_for("turn/steer").len(),
+        1,
+        "the repeat must not reach the conversation again: {text}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        payload.as_bytes(),
+        "the retry rewrites the same one file with the same bytes"
+    );
+}
+
+#[test]
+fn releasing_a_run_removes_only_its_own_spilled_messages() {
+    let mut fixture = Fixture::new("cleanup", "running", true);
+    let payload = payload_of(300 * 1024);
+    let id = content_id(&payload);
+    let path = spill_path(&fixture.home, &id);
+    let file = fixture.home.join("correction.txt");
+    fs::write(&file, &payload).unwrap();
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "idle",
+                json!([{
+                    "id": TURN,
+                    "status": "completed",
+                    "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+                }]),
+            )),
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "active",
+                turns_with_input_identity(&id, &payload),
+            )),
+        ],
+    );
+    let out = fixture.message(&["--file", file.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", output_text(&out));
+    assert!(path.is_file(), "{path:?}");
+
+    // A neighboring run's message, recorded on its own receipt, is none of this
+    // run's business.
+    let neighbor = spill_path(&fixture.home, "msg-000000000000000000000000");
+    fs::write(&neighbor, b"neighbor payload\n").unwrap();
+    let state_dir =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    let mut neighbor_receipt = fixture.receipt();
+    neighbor_receipt["slot"]["index"] = json!(2);
+    neighbor_receipt["slot"]["owner"] = json!("exec-neighbor");
+    neighbor_receipt["messages"] = json!([{
+        "schema": 1,
+        "id": "msg-000000000000000000000000",
+        "status": "delivered",
+        "delivery": "spill",
+        "payloadPath": neighbor,
+        "payloadBytes": 17,
+    }]);
+    fs::write(
+        state_dir.join("spawn-2.json"),
+        serde_json::to_vec_pretty(&neighbor_receipt).unwrap(),
+    )
+    .unwrap();
+
+    // The release owns the run's records: the host ends, then the run's message
+    // files go with them.
+    fs::write(&fixture.release, b"release").unwrap();
+    wait_for(
+        || {
+            let host = fixture.host.try_wait().unwrap();
+            host.is_some()
+        },
+        "the fixture host ends when its release file appears",
+    );
+    let mut release = lead_command();
+    release
+        .args([
+            "executor",
+            "release",
+            "--source",
+            fixture.source.to_str().unwrap(),
+            "--codex-home",
+            fixture.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--disposition",
+            "discarded",
+            "--reason",
+            "spilled message cleanup",
+        ])
+        .current_dir(&fixture.source);
+    let out = release.output().unwrap();
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("message files: 1 spilled message file(s)"),
+        "{text}"
+    );
+    assert!(!path.exists(), "the released run's spill file is removed");
+    assert!(
+        neighbor.is_file(),
+        "a neighboring run's message survives this run's release"
+    );
+}
+
+#[test]
+fn the_only_live_run_is_addressed_without_any_address_field() {
+    let fixture = Fixture::new("defaults", "running", true);
+    fixture.record_installation();
+    let delivered = "address-free correction\n";
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "idle",
+                json!([{
+                    "id": TURN,
+                    "status": "completed",
+                    "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+                }]),
+            )),
+            Answer::Result(thread_read(
+                &fixture.slot,
+                "active",
+                turns_with_input(delivered),
+            )),
+        ],
+    );
+    // The working directory is a different checkout whose configuration names a
+    // different profile: resolution reads the harness records only, never cwd.
+    let elsewhere = fixture.home.join("unrelated-checkout");
+    fs::create_dir_all(elsewhere.join("global")).unwrap();
+    fs::write(elsewhere.join("global/orchestration.toml"), orchestration()).unwrap();
+    let mut command = fixture.unaddressed_command(&["--text", delivered]);
+    command.current_dir(&elsewhere);
+    let out = command.output().unwrap();
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!(
+            "executor message: slot 1 owner {OWNER} session {THREAD}"
+        )),
+        "the resolved run is named exactly as a typed address would be: {text}"
+    );
+    let started = fixture.server.requests_for("turn/start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["params"]["threadId"], THREAD, "{started:?}");
+    assert_eq!(started[0]["params"]["input"][0]["text"], delivered);
+}
+
+#[test]
+fn several_live_runs_refuse_the_default_and_a_named_slot_still_wins() {
+    let fixture = Fixture::new("ambiguous", "running", true);
+    fixture.record_installation();
+    let mut other = fixture.add_live_run("exec-other", "01a0c719-f4d4-7880-a9d2-1a96ee0f29aa");
+    let out = fixture
+        .unaddressed_command(&["--text", "correction"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("addresses exactly one run and 2 match"),
+        "the refusal must list the live runs: {text}"
+    );
+    assert!(text.contains(&format!("slot 1 owner {OWNER}")), "{text}");
+    assert!(text.contains("slot 2 owner exec-other"), "{text}");
+    assert!(text.contains("pass --slot N"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(
+        fixture.server.requests().is_empty(),
+        "an ambiguous address must send nothing: {text}"
+    );
+
+    // One explicit field is enough to choose: the owner and the session still
+    // come from the recorded binding of that slot, and never from the other run.
+    let delivered = "named slot correction\n";
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(thread_read(
+            &fixture.slot,
+            "active",
+            turns_with_input(delivered),
+        ))],
+    );
+    let out = fixture
+        .unaddressed_command(&["--slot", "1", "--text", delivered])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!("slot 1 owner {OWNER} session {THREAD}")),
+        "{text}"
+    );
+    other.kill().unwrap();
+    let _ = other.wait();
+}
+
+#[test]
+fn an_absent_or_stale_run_reports_its_recorded_state_without_sending() {
+    let mut fixture = Fixture::new("stale", "running", true);
+    fixture.record_installation();
+    // No live lease at all: no live run is recorded, so the address is refused
+    // instead of guessed.
+    fs::remove_file(&fixture.lease).unwrap();
+    let out = fixture
+        .unaddressed_command(&["--text", "correction"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("no live executor run is recorded"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(fixture.server.requests().is_empty(), "{text}");
+
+    // A named slot keeps the existing honest state error: the recorded run's own
+    // host is gone, and that is what is reported.
+    fixture.host.kill().unwrap();
+    let _ = fixture.host.wait();
+    let out = fixture
+        .unaddressed_command(&["--slot", "1", "--text", "correction"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("not delivered (unavailable)"), "{text}");
+    assert!(text.contains("is not running"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(fixture.server.requests().is_empty(), "{text}");
+}
+
+#[test]
+fn two_sources_sharing_a_home_and_two_homes_sharing_a_terminal_never_mix() {
+    let fixture = Fixture::new("cross", "running", true);
+    fixture.record_installation();
+
+    // Two checkouts under one kit home: the explicit source has no live run, and
+    // the other source's run is never substituted for it.
+    let other_source = fixture._root.path().join("proj-other");
+    fs::create_dir_all(&other_source).unwrap();
+    let out = fixture
+        .unaddressed_command(&[
+            "--source",
+            other_source.to_str().unwrap(),
+            "--text",
+            "correction",
+        ])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("no live executor run is recorded"), "{text}");
+    assert!(text.contains("proj-other"), "{text}");
+    assert!(fixture.server.requests().is_empty(), "{text}");
+
+    // Two kit homes in one terminal: the explicit home wins, and the live run
+    // recorded under the other home is not used.
+    let other_home = fixture._root.path().join("other-home");
+    fs::create_dir_all(other_home.join("harness")).unwrap();
+    fs::write(
+        other_home.join("harness/installation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 2,
+            "settings": {"sourceRoot": fixture.source},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut command = fixture.unaddressed_command(&["--text", "correction"]);
+    command.env("CODEX_HOME", &other_home);
+    let out = command.output().unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("no live executor run is recorded"), "{text}");
+    assert!(text.contains("other-home"), "{text}");
+    assert!(
+        fixture.server.requests().is_empty(),
+        "the other home's live run must stay untouched: {text}"
+    );
+}
+
+#[test]
+fn a_reused_slot_refuses_the_resolved_address_with_the_observed_mismatch() {
+    let fixture = Fixture::new("rebound", "running", true);
+    fixture.record_installation();
+    let state_dir =
+        harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.source).unwrap();
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(state_dir.join("slot-1.json")).unwrap()).unwrap();
+    record["owner"] = json!("exec-reused");
+    fs::write(
+        state_dir.join("slot-1.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    // The live lease still names the old owner while the binding names another:
+    // the default address refuses instead of guessing a replacement.
+    let out = fixture
+        .unaddressed_command(&["--text", "correction"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("no live executor run is recorded"), "{text}");
+    assert!(
+        text.contains(&format!("slot 1: not bound to {OWNER}")),
+        "{text}"
+    );
+    assert!(fixture.server.requests().is_empty(), "{text}");
+
+    // A named slot resolves the recorded owner, and the unchanged verification
+    // then reports the mismatch between that binding and the dispatch receipt.
+    let out = fixture
+        .unaddressed_command(&["--slot", "1", "--text", "correction"])
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("belongs to owner {OWNER} instead of exec-reused")),
+        "{text}"
+    );
+    assert!(
+        fixture.server.requests().is_empty(),
+        "the reused slot must receive nothing: {text}"
+    );
+}

@@ -36,6 +36,8 @@ use std::process::{Command, Stdio};
 use crate::executor_assignment::{self, Assignment, AssignmentContext};
 #[path = "executor_control.rs"]
 mod control;
+#[path = "executor_input.rs"]
+mod executor_input;
 #[path = "executor_message.rs"]
 mod executor_message;
 #[path = "executor_stop.rs"]
@@ -52,17 +54,18 @@ use observation::{
 };
 
 const USAGE: &str = concat!(
-    "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\n",
-    "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT | --assignment FILE)\n",
+    "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
+    "codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--profile ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
     "codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session PREVIOUS_SESSION_ID] [--profile ID] [--exec PROMPT | --assignment FILE]\n  Start a NEW conversation in the same occupied worktree, preserving partial work and reusing the recorded assignment by default. The successor records the predecessor session and publishes a new control endpoint; a stale endpoint is not an address of that conversation. Never releases or resets the slot.\n",
-    "codex-harness executor watch (--source CHECKOUT --codex-home DIRECTORY --slot N | --receipt FILE) [--owner ID] [--timeout SECONDS] [--poll MILLISECONDS] [--json]\n",
+    "codex-harness executor watch [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N | --receipt FILE] [--owner ID] [--timeout SECONDS] [--poll MILLISECONDS] [--json]\n",
     "codex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\n",
     "codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\n",
     "codex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\n",
-    "codex-harness executor stop --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] [--timeout SECONDS]\n",
-    "codex-harness executor message --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] (--text TEXT | --file FILE)\n",
-    "codex-harness executor message --reply-to MESSAGE_ID (--text TEXT | --file FILE)\n",
-    "codex-harness lead message (--text TEXT | --file FILE) [--notify]\n",
+    "codex-harness executor stop [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N] [--owner ID] [--session SESSION_ID] [--timeout SECONDS]\n",
+    "codex-harness executor message [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N] [--owner ID] [--session SESSION_ID] [--text TEXT | --file FILE]\n",
+    "codex-harness executor message --reply-to MESSAGE_ID [--text TEXT | --file FILE]\n",
+    "codex-harness lead message [--text TEXT | --file FILE] [--notify]\n",
+    "  Message content is --text TEXT, a UTF-8 --file, or the piped standard input a command without a content flag reads; --text - selects the stream. Piped content is literal and needs no size knowledge: above the 256 KiB inline bound the command writes the complete payload under the harness message state and delivers a pointer envelope naming its exact size and absolute path, recorded as delivery=spill with payloadPath and payloadBytes instead of inline delivery. Every address field above may be omitted: it is resolved from the kit home (--codex-home, else CODEX_HOME, else the recorded installation default), the recorded source checkout and the recorded live pool lease, slot binding and receipt; exactly one live run is used, several are refused with their slots and the --slot disambiguator, and an explicit value always wins and is verified unchanged.\n",
     "codex-harness executor run LAUNCHER [ARG...]\n",
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
@@ -71,10 +74,10 @@ const USAGE: &str = concat!(
     "Explicit --mode exec uses that same observed lifecycle with the native inline TUI (--no-alt-screen), not a second renderer. Historical unmanaged tui and legacy receipts keep the coverage they recorded. `executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues, and 3 when the run is live with an unresolved reply request. Exit 3 is action required: the result names the exact run and the bounded request references with their one-command reply, the run keeps its session, slot, worktree and partial work, and the lead answers and runs watch again - it is never a completion, output defect, unavailable-coverage or release result. ",
     "An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A tab or console host exits 0 after recording that outcome so the tab closes. Resume continues one exact interrupted session on its recorded slot through the managed native TUI: the host starts a control-backed app-server, resumes that exact thread, retires any stale control endpoint, and attaches one native Codex TUI to that session without fetch, reset, clean, a new conversation or a replay of completed work. Without --session it consumes the exact identity the dispatch receipt recorded, keeps it across failed resume attempts, and refuses instead of choosing by recency. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. ",
     "Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. `executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifying each by the recorded identity and terminating survivors so a child command is reported actually terminated. The stopped run's tab closes because that run's own host process ends; no terminal command is ever sent, so the lead's window and sibling tabs are untouched. Nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. ",
-    "Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). `executor message` delivers one literal correction into the addressed run's own live conversation: the text of --text or the verbatim content of a UTF-8 --file (no shell evaluation, line breaks preserved), addressed by --source, --codex-home, --slot, --owner and, when given, the exact --session the dispatch receipt recorded. `--reply-to MESSAGE_ID` is the lead's reply to one request from its own executor and takes only that id plus --text or --file. The id resolves from the lifecycle record written by `lead message`, then this same steer/start owner delivers the unchanged payload to that exact executor run. Another lead, an unknown or retired id, a reused slot or generation, and a contradictory explicit address are refused before anything is sent. It verifies the recorded slot binding, owner, exact session, live lease, host and app-server child, and the live conversation itself before delivering. ",
+    "Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). `executor message` delivers one literal correction into the addressed run's own live conversation: the text of --text, the verbatim content of a UTF-8 --file, or the piped standard input read without a content flag (no shell evaluation, line breaks preserved; content above the inline bound goes through the spill above), addressed by --source, --codex-home, --slot, --owner and, when given, the exact --session the dispatch receipt recorded - and each of those fields may be omitted, resolved from the recorded kit home, installation and live run and then verified exactly as a typed value. `--reply-to MESSAGE_ID` is the lead's reply to one request from its own executor and takes only that id plus --text, --file or piped content. The id resolves from the lifecycle record written by `lead message`, then this same steer/start owner delivers the unchanged payload to that exact executor run. Another lead, an unknown or retired id, a reused slot or generation, and a contradictory explicit address are refused before anything is sent. It verifies the recorded slot binding, owner, exact session, live lease, host and app-server child, and the live conversation itself before delivering. ",
     "Delivery goes to the same thread through the run's kit-local control endpoint (`endpoint-N.json`): a running turn is steered with `turn/steer` at the nearest supported point and is never interrupted, an idle thread gets a new turn on its own thread. The result distinguishes delivered (observed in the conversation's own items), queued (accepted by the recorded turn; not yet visible), error (the endpoint refused; nothing delivered) and indeterminate (unanswered, so whether it was applied is unknown); acceptance is never reported as the executor having applied it. Every attempt is recorded with its content identity: an already delivered or queued text is reported instead of sent again, an indeterminate attempt refuses the repeat, and only a definite error may be sent again. A completed, stopped, interrupted, failed or unavailable run reports its actual state with the exact-session continuation remedy, and a surface that records no control endpoint (a historical unmanaged or legacy receipt) is reported as unsupported instead of pretending delivery. ",
-    "Exit codes: 0 delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. `lead message` is the other direction and the only channel an executor needs: the text of --text or a UTF-8 --file goes to the originating lead recorded for the caller's own live run, so the caller supplies no recipient, slot, session, checkout or endpoint, and --notify marks an exceptional notice that requests no reply where the default requests one. A caller outside that run's recorded relationship, a stale or foreign marker and a caller-supplied address are refused before anything is sent. Routine progress stays on the beads board rather than this channel. Either --exec PROMPT or --assignment FILE carries the assignment; a structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and partial work. ",
-    "`executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified.\n",
+    "Exit codes: 0 delivered or queued, 1 a native error or an indeterminate result with nothing delivered, 2 the addressed run cannot receive the input (ended lifecycle, unverified live run or unsupported surface); invalid options and an address that names another owner, session or run are refused with the kit's error exit before anything is sent. `lead message` is the other direction and the only channel an executor needs: the text of --text, a UTF-8 --file, or the piped standard input read without a content flag goes to the originating lead recorded for the caller's own live run, so the caller supplies no recipient, slot, session, checkout or endpoint, and --notify marks an exceptional notice that requests no reply where the default requests one. A caller outside that run's recorded relationship, a stale or foreign marker and a caller-supplied address are refused before anything is sent. Routine progress stays on the beads board rather than this channel. A structured assignment is strict versioned JSON (schema, objective, inputs, outputs, invariants, acceptance) validated against the allocated slot after synchronization and before any model request, and its brief then names the actual checkout, the committed base and the exact relative paths. A rejected structured assignment stops before the model starts and returns the unused spawn claim to the pool; resume keeps its claim and partial work. ",
+    "`executor assignment` validates and renders that brief without a model, a claim or a write. Assignments live on the beads board; executors set lead_review when done. Succeed replaces one exact session's CLI process through the verified non-interactive `codex exec resume` path at a safe boundary: it writes a durable handover record, stops the predecessor, resumes the exact session under refreshed instructions and reports 'succession not established' when the reload cannot be verified. Either --exec PROMPT, --exec - (the same free-text assignment read from piped standard input) or --assignment FILE carries the assignment; spawn, resume and restart accept all three forms.\n",
 );
 const STARTUP: Duration = Duration::from_secs(20);
 /// Windows Terminal activates the receiving window asynchronously around the
@@ -1156,6 +1159,11 @@ impl HostRoute {
 /// Splits `--exec PROMPT` from `--assignment FILE`: exactly one carries the
 /// assignment, and a structured file is loaded and schema-checked before any
 /// pool slot is touched.
+///
+/// `--exec -` reads the whole free-text assignment from the piped standard
+/// input through the shared bounded reader, so a long assignment never depends
+/// on a process command-line length; a terminal or an empty stream refuses
+/// before a slot is allocated.
 fn parse_prompt(
     prompt: Option<String>,
     assignment_file: Option<PathBuf>,
@@ -1164,7 +1172,15 @@ fn parse_prompt(
         (Some(_), Some(_)) => Err(invalid(
             "--exec and --assignment are mutually exclusive: pass free text or one structured assignment file",
         )),
-        (None, None) => Err(invalid("--exec PROMPT or --assignment FILE is required")),
+        (None, None) => Err(invalid(
+            "--exec PROMPT or --assignment FILE is required; `--exec -` reads the assignment from piped standard input",
+        )),
+        (Some(prompt), None) if prompt == "-" => {
+            Ok(PromptSource::FreeText(executor_input::piped_required(
+                "the executor assignment on standard input",
+                "pipe the assignment on standard input, or pass --exec PROMPT or --assignment FILE; nothing was dispatched",
+            )?))
+        }
         (Some(prompt), None) => Ok(PromptSource::FreeText(prompt)),
         (None, Some(path)) => Ok(PromptSource::Structured(
             executor_assignment::Assignment::load(&path)?,
@@ -1658,6 +1674,10 @@ fn release(args: &[OsString]) -> io::Result<i32> {
     };
     let live = |owner: &str| owner_live(&codex_home, &source, owner);
     let run_note = observed_run_note(&codex_home, &source, index);
+    // The spilled message files of this run are owned by its run records: the
+    // release that cleans those records cleans these with them, and no other
+    // run's messages are touched.
+    let messages = cleanup_run_messages(&codex_home, &source, index);
     match task_worktree::release_slot(
         &codex_home,
         &layout,
@@ -1672,6 +1692,7 @@ fn release(args: &[OsString]) -> io::Result<i32> {
                 "executor slot {index} released as {}: reset to {base} and free for the next dispatch",
                 disposition_name(disposition)
             );
+            report_cleaned_messages(messages.as_ref());
             if let Some(note) = &run_note {
                 println!("{note}");
             }
@@ -1682,6 +1703,7 @@ fn release(args: &[OsString]) -> io::Result<i32> {
                 "executor slot {index} release recorded as {} but the slot is preserved: {limitation}",
                 disposition_name(disposition)
             );
+            report_cleaned_messages(messages.as_ref());
             if let Some(note) = &run_note {
                 println!("{note}");
             }
@@ -1707,6 +1729,28 @@ fn observed_run_note(codex_home: &Path, source: &Path, index: u32) -> Option<Str
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".into())
     ))
+}
+
+/// The spilled message files of one released run, removed together with the run
+/// records that own them. Only the payload paths that run's own receipt records
+/// are touched, so a neighboring run's messages survive.
+fn cleanup_run_messages(codex_home: &Path, source: &Path, index: u32) -> io::Result<usize> {
+    let receipt = receipt_path(codex_home, source, index)?;
+    executor_input::cleanup_recorded_messages(codex_home, &receipt)
+}
+
+/// Reports the message cleanup of one release. A run with nothing spilled adds
+/// no line; a failed removal is named instead of silently dropping the files.
+fn report_cleaned_messages(messages: Result<&usize, &io::Error>) {
+    match messages {
+        Ok(0) => {}
+        Ok(count) => println!(
+            "message files: {count} spilled message file(s) of this run were removed with its records"
+        ),
+        Err(error) => println!(
+            "message files: the slot was released, but this run's spilled message files were not removed: {error}"
+        ),
+    }
 }
 
 fn disposition_name(disposition: SlotDisposition) -> &'static str {
@@ -1997,6 +2041,12 @@ impl WaitingReport {
                 text.push_str(&format!(" lead={thread}"));
             }
             text.push('\n');
+            if let Some(path) = &reference.payload_path {
+                text.push_str(&format!(
+                    "  payloadPath: {path} payloadBytes: {} (delivery: spill; the complete message is in that file)\n",
+                    reference.payload_bytes.unwrap_or(0)
+                ));
+            }
             text.push_str(&format!(
                 "  reply: codex-harness executor message --reply-to {} --text '<answer>'\n",
                 reference.id
@@ -2027,6 +2077,8 @@ impl WaitingReport {
                     "status": reference.status,
                     "leadThreadId": reference.lead_thread,
                     "session": reference.session,
+                    "payloadPath": reference.payload_path,
+                    "payloadBytes": reference.payload_bytes,
                     "reply": format!(
                         "codex-harness executor message --reply-to {} --text '<answer>'",
                         reference.id
@@ -2188,14 +2240,34 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
     let receipt = match receipt {
         Some(path) => path,
         None => {
-            let source = required(source, "--source")?;
-            let codex_home = required(codex_home, "--codex-home")?;
-            let index: u32 = slot
-                .ok_or_else(|| {
-                    invalid("executor watch needs --receipt FILE or --source CHECKOUT --slot N")
-                })?
-                .parse()
-                .map_err(|_| invalid("executor watch --slot must be a pool slot index"))?;
+            // `--source`, `--codex-home` and `--slot` are optional: what is not
+            // given is resolved from the kit home, the installation record and
+            // the recorded live run - never from the working directory or the
+            // most recent session.
+            let explicit_slot = slot
+                .map(|slot| {
+                    slot.parse::<u32>()
+                        .map_err(|_| invalid("executor watch --slot must be a pool slot index"))
+                })
+                .transpose()?;
+            let codex_home = executor_input::codex_home(codex_home)?;
+            let source = executor_input::source(source, &codex_home)?;
+            // A named slot is watched exactly as recorded, including a released
+            // or legacy one; only an omitted slot is resolved from the one live
+            // run.
+            let index = match explicit_slot {
+                Some(index) => index,
+                None => {
+                    executor_input::resolve_run(
+                        &codex_home,
+                        &source,
+                        None,
+                        owner.as_deref(),
+                        "watch",
+                    )?
+                    .slot
+                }
+            };
             receipt_path(&codex_home, &source, index)?
         }
     };
@@ -5797,8 +5869,15 @@ mod tests {
         };
         let text = resolve_prompt(&request, &binding).unwrap();
         assert!(text.starts_with("finish the sample outcome"), "{text}");
+        // The piped assignment `--exec -` produces this same free-text source,
+        // so its rendered brief is exactly this function's own output.
+        assert_eq!(
+            text,
+            executor_assignment::free_text_brief("finish the sample outcome"),
+            "a streamed or typed assignment renders one brief"
+        );
         assert!(
-            text.contains("codex-harness lead message --text '...'"),
+            text.contains("codex-harness lead message: pipe it on standard input"),
             "{text}"
         );
         assert!(
@@ -6479,9 +6558,22 @@ mod tests {
     #[test]
     fn usage_names_the_lead_exchange_and_the_action_required_watch_result() {
         assert!(
-            USAGE.contains("codex-harness lead message (--text TEXT | --file FILE) [--notify]"),
+            USAGE.contains("codex-harness lead message [--text TEXT | --file FILE] [--notify]"),
             "the usage must name the executor's lead message command"
         );
+        // The minimal forms are the documented first choice: piped content with
+        // no size knowledge, the automatic spill that delivers an oversized
+        // payload, and the address fields that may be omitted.
+        for taught in [
+            "the piped standard input a command without a content flag reads",
+            "--text - selects the stream",
+            "above the 256 KiB inline bound the command writes the complete payload",
+            "recorded as delivery=spill with payloadPath and payloadBytes",
+            "Every address field above may be omitted",
+            "exactly one live run is used, several are refused with their slots",
+        ] {
+            assert!(USAGE.contains(taught), "the usage must teach: {taught}");
+        }
         assert!(
             USAGE.contains("executor message --reply-to MESSAGE_ID"),
             "the usage must name the lead's reply form"
@@ -6523,7 +6615,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            USAGE.contains("executor message --source"),
+            USAGE.contains("executor message [--source CHECKOUT]"),
             "the usage must name the addressed message command"
         );
         assert!(

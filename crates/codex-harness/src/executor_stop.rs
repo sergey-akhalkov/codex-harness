@@ -11,6 +11,7 @@
 //! closes because that run's own host process ended.
 
 use super::control;
+use super::executor_input;
 use super::observation::{
     self, HostIdentity, RunObservation, STATE_COMPLETED, STATE_STOPPED, STOP_ALREADY_COMPLETED,
     STOP_ALREADY_STOPPED, STOP_ERROR, STOP_PARTIAL, STOP_SCHEMA, STOP_STOPPED, StopRecord,
@@ -18,7 +19,7 @@ use super::observation::{
 };
 use super::{
     SessionLease, invalid, lease_path, option_text, parse_seconds, read_lease, receipt_binding,
-    receipt_path, required,
+    receipt_path,
 };
 use harness_core::orchestration_config;
 use harness_core::process::{Deadline, ProcessIdentity};
@@ -86,17 +87,25 @@ impl Request {
                 _ => return Err(invalid("invalid native executor options")),
             }
         }
-        let owner = owner
-            .filter(|owner| !owner.trim().is_empty())
-            .ok_or_else(|| invalid("--owner ID is required"))?;
+        let owner = owner.filter(|owner| !owner.trim().is_empty());
+        // The address fields are optional: what is not given is resolved from
+        // the kit home, the installation record and the recorded run binding,
+        // and then verified exactly as an explicitly typed value is.
+        let codex_home = executor_input::codex_home(codex_home)?;
+        let source = executor_input::source(source, &codex_home)?;
+        let slot = slot
+            .map(|slot| {
+                slot.parse::<u32>()
+                    .map_err(|_| invalid("--slot must be a positive pool slot index"))
+            })
+            .transpose()?;
+        let run =
+            executor_input::resolve_run(&codex_home, &source, slot, owner.as_deref(), "stop")?;
         Ok(Self {
-            source: required(source, "--source")?,
-            codex_home: required(codex_home, "--codex-home")?,
-            slot: slot
-                .ok_or_else(|| invalid("--slot is required"))?
-                .parse()
-                .map_err(|_| invalid("--slot must be a positive pool slot index"))?,
-            owner,
+            source,
+            codex_home,
+            slot: run.slot,
+            owner: run.owner,
             session,
             timeout: parse_seconds(timeout.as_deref(), DEFAULT_TIMEOUT.as_secs(), "--timeout")?,
         })

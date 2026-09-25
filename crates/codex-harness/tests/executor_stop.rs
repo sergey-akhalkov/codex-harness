@@ -1166,3 +1166,81 @@ fn stop_racing_natural_completion_reports_the_completed_result() {
     let _ = decoy.wait();
     fixture.drop();
 }
+
+/// The recorded address defaults: a single live pooled run is stopped with no
+/// recipient, slot, owner, session or endpoint supplied, and the values come
+/// only from the kit home, the installation record and the recorded live run.
+#[test]
+fn stop_resolves_the_only_live_run_without_an_address() {
+    let fixture = Fixture::new("defaults");
+    let owner = "exec-ds-stop-defaults";
+    fixture.bind(owner);
+    fixture.seed(owner, "running");
+    let started = fixture.root.join("launcher-identity.json");
+    let mut host = fixture.host(
+        "descendant",
+        &[("HARNESS_EXECUTOR_FIXTURE_STARTED", &started)],
+    );
+    let owned = wait_for_marker(&started);
+    fixture.wait_recorded_host();
+    fs::create_dir_all(fixture.home.join("harness")).unwrap();
+    fs::write(
+        fixture.home.join("harness/installation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 2,
+            "settings": {"sourceRoot": fixture.source},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = lead_command()
+        .args(["executor", "stop"])
+        .env("CODEX_HOME", &fixture.home)
+        .output()
+        .unwrap();
+    let output = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{output}");
+    assert!(output.contains(": stopped in "), "{output}");
+    assert!(
+        output.contains(&format!("owner {owner}")),
+        "the resolved run is named exactly as a typed address would be: {output}"
+    );
+    assert!(
+        output.contains("no reset, clean, release or completion claim"),
+        "{output}"
+    );
+    wait_host(&mut host, "stopped host");
+    wait_gone(identity_of(&owned), &launcher(), "the owned launcher");
+    let recorded = receipt_json(&fixture.receipt());
+    assert_eq!(recorded["observation"]["state"], "stopped", "{recorded}");
+    assert_eq!(recorded["stop"]["outcome"], "stopped", "{recorded}");
+
+    // With no live run recorded and nothing named, the command reports the
+    // recorded state and terminates nothing.
+    let second = Fixture::new("defaults-absent");
+    fs::create_dir_all(second.home.join("harness")).unwrap();
+    fs::write(
+        second.home.join("harness/installation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 2,
+            "settings": {"sourceRoot": second.source},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = lead_command()
+        .args(["executor", "stop"])
+        .env("CODEX_HOME", &second.home)
+        .output()
+        .unwrap();
+    let output = text(&out);
+    assert!(!out.status.success(), "{output}");
+    assert!(
+        output.contains("no live executor run is recorded"),
+        "{output}"
+    );
+    assert!(output.contains("nothing was sent"), "{output}");
+    fixture.drop();
+    second.drop();
+}

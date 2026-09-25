@@ -1112,6 +1112,11 @@ pub(crate) struct ReplyReference {
     pub lead_thread: Option<String>,
     /// Native session of the executor run the request was recorded against.
     pub session: Option<String>,
+    /// When the request's own record names a spill, the absolute harness-owned
+    /// file holding its complete payload and that payload's exact size, so the
+    /// watch surface reports a spilled delivery as one.
+    pub payload_path: Option<String>,
+    pub payload_bytes: Option<u64>,
 }
 
 /// The unresolved reply requests of a receipt in record order, bounded by
@@ -1167,6 +1172,8 @@ fn reply_reference(record: &'static str, entry: &Value) -> ReplyReference {
         status: text("status").unwrap_or_else(|| "unrecorded".into()),
         lead_thread: text("leadThreadId"),
         session: text("session"),
+        payload_path: text("payloadPath"),
+        payload_bytes: entry.get("payloadBytes").and_then(Value::as_u64),
     }
 }
 

@@ -814,6 +814,127 @@ fn spawn_and_resume_take_exactly_one_assignment_source() {
     fixture.drop();
 }
 
+/// Runs one command with this standard input, as a shell pipe delivers it. The
+/// writer is detached, so a command that refuses the stream early cannot block
+/// the check on a full pipe.
+fn piped(command: &mut Command, input: &[u8]) -> std::process::Output {
+    use std::io::Write as _;
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let bytes = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&bytes);
+    });
+    let out = child.wait_with_output().unwrap();
+    let _ = writer.join();
+    out
+}
+
+/// The piped free-text assignment is the assignment: the whole stream, with no
+/// command-line length involved, and the slot is allocated only after it carried
+/// content.
+#[test]
+fn spawn_reads_the_free_text_assignment_from_piped_standard_input() {
+    let fixture = Fixture::new("assignment-stdin", 1);
+    let objective = "implement the piped assignment";
+    let assignment = format!("{objective}\n{}\n", "detail line\n".repeat(4096));
+    let mut command = fixture.spawn_command();
+    command.args(["--exec", "-"]);
+    let out = piped(&mut command, assignment.as_bytes());
+    let text = output_text(&out);
+    // The dispatch stops at the launcher, after the pool work: the streamed
+    // assignment was accepted, the slot was derived and bound, and the brief was
+    // rendered for it.
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    assert!(text.contains("executor slot: index=1 path="), "{text}");
+    assert!(fixture.slot(1).is_dir(), "{text}");
+    assert_eq!(fixture.checkouts(), ["proj", "proj-wt1"], "{text}");
+    let record = fixture.record(1);
+    assert_eq!(record["state"], "occupied", "{record}");
+    assert!(
+        record["owner"].as_str().unwrap().starts_with("exec-ds-"),
+        "{record}"
+    );
+    fixture.drop();
+}
+
+/// An empty or non-text stream, and a caller's own terminal, refuse before any
+/// slot exists.
+#[test]
+fn spawn_refuses_an_empty_or_terminal_assignment_stream_without_allocating() {
+    let fixture = Fixture::new("assignment-stdin-refused", 1);
+    let mut empty = fixture.spawn_command();
+    empty.args(["--exec", "-"]);
+    let out = piped(&mut empty, b"");
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("the executor assignment on standard input is empty"),
+        "{text}"
+    );
+    assert!(text.contains("nothing was dispatched"), "{text}");
+    assert!(
+        !fixture.slot(1).exists(),
+        "no slot may be allocated: {text}"
+    );
+    assert_eq!(fixture.checkouts(), ["proj"], "{text}");
+
+    // Content that is not UTF-8 text is refused by the same reader.
+    let mut invalid = fixture.spawn_command();
+    invalid.args(["--exec", "-"]);
+    let out = piped(&mut invalid, b"assignment \xff\xfe not text");
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("is not UTF-8 text"), "{text}");
+    assert!(!fixture.slot(1).exists(), "{text}");
+
+    // The caller's own standard input, whatever it is: an interactive terminal
+    // or an empty stream, either way the refusal arrives instead of blocking.
+    let mut child = fixture
+        .spawn_command()
+        .args(["--exec", "-"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an assignment stream with no content must not block the dispatch"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let out = child.wait_with_output().unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("the executor assignment on standard input is empty")
+            || text.contains("interactive terminal"),
+        "{text}"
+    );
+    assert!(
+        !fixture.slot(1).exists(),
+        "no slot may be allocated: {text}"
+    );
+    assert_eq!(fixture.checkouts(), ["proj"], "{text}");
+    fixture.drop();
+}
+
 #[test]
 fn resume_rebinds_the_interrupted_slot_without_resetting_partial_work() {
     let fixture = Fixture::new("resume", 1);
