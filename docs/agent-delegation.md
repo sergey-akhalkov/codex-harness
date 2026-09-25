@@ -70,6 +70,9 @@ Dispatch an executor with the installed launcher:
 codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --base REV --exec "assignment"
 ```
 
+Omitting `--mode` selects the native Codex TUI. `--exec` is the assignment
+input, not a presentation selector.
+
 Skills and `orchestration.toml` are live links into the kit checkout, while the
 launcher is an immutable native build changed only by an explicit build and
 install. A checkout updated after the last install can therefore reference an
@@ -113,27 +116,11 @@ a blocked activation), the tab opens in the stable per-checkout window
 `codex-harness-<repository>`, which the terminal creates on first use, and
 `--terminal-window` targets an explicitly named window for setups that prefer
 one. Spawn does not pass `--focus` / maximized / fullscreen and never sends
-synthetic input into a conversation. If the lead is not in a terminal at all,
-it falls back to a visible native TUI (`CREATE_NEW_CONSOLE`) with the same
-restore. The tab host runs the session as `codex exec --json` with
-`--output-last-message <kit-local file>` and renders that stream readably -
-assignment header, actual profile/model/provider/effort, assistant messages,
-tool activity and lifecycle state - so the raw event log is never the visible
-surface. Do not pass
-`--worktree` together with `--remote`; attach with `-C` at the bound pool slot.
-Steering stays `executor message` (`turn/start`), not TUI keystrokes.
-Spawn returns after the tab or window is open so the lead keeps working.
-The default exec mode streams the assignment in that visible tab and exits on
-completion. The tab host then exits 0, including after a recorded failure, so
-Windows Terminal's graceful close-on-exit closes that tab instead of leaving
-it open with "You can now close this terminal". The receipt keeps the real
-state and exit code; inspection is the receipt, detail file and control log,
-not a leftover tab. An owned console still returns the run's own exit code.
-A mid-work stop is detected by the
-lead's watcher and the exact session continues through `codex-harness executor
-resume --slot N --owner ID [--session SESSION_ID]` on its recorded slot, which
-rebinds the slot without resetting partial work; without `--session` it
-consumes the exact identity the dispatch receipt recorded.
+synthetic input into a conversation.
+Without `WT_SESSION`, spawn opens a visible console instead of a tab. Steering
+stays `executor message`, not TUI keystrokes. Spawn returns after the surface
+is open. Presentation, closure, watch and exact-session recovery are the
+[observed lifecycle](#observed-executor-lifecycle).
 While an executor runs, one native watcher process checks the board review
 queue, the assignment's result artifact and executor liveness and emits a
 single event; the lead blocks on that event between other work instead of
@@ -279,10 +266,12 @@ hint. `--base REV` starts the slot from another revision than the upstream
 default branch, and `--owner ID` labels the session binding (default
 `exec-<profile>-<pid>`); a second live owner of one slot is refused instead of
 sharing one checkout. An ordinary interrupted session resumes through
-`codex-harness executor resume --slot N --owner ID [--session SESSION_ID]`:
+`codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] (--exec PROMPT | --assignment FILE)`:
 the recorded slot is rebound for the same owner without fetch, reset or clean,
-so partial work survives, while a fresh spawn resynchronizes and never
-continues a dirty slot. `--session` remains supported and takes precedence;
+and the host attaches the native TUI to that exact session without a new
+conversation or a replay of completed work. Partial work survives. A fresh
+spawn resynchronizes and never continues a dirty slot. `--session` remains
+supported and takes precedence;
 without it, resume consumes the exact session the dispatch receipt recorded,
 keeps that identity across failed resume attempts and refuses when nothing was
 recorded instead of choosing another session by recency. For an automatic cache
@@ -351,33 +340,44 @@ in the repository.
 
 ## Observed executor lifecycle
 
-Exec mode is observable by construction: the hosted session runs
-`codex exec --json --output-last-message <file>`, and the tab host renders that
-stream readably while recording the same stream as an explicit lifecycle in
-the kit-local dispatch receipt
-`$CODEX_HOME/harness/executor-pool/spawn-<N>.json`. The recorded states are
-`dispatch-accepted`, `native-start`, `running`, `completed`, `failed`,
-`defect` and `interrupted`, beside the exact native session from
-`thread.started`, the returned result locator (`message-<N>.txt`), a bounded
-raw stream (`stream-<N>.jsonl`) and the identity of the process that recorded
-it. A created tab is not a native start: only `thread.started` establishes the
-session identity. TUI and legacy receipts record coverage as unavailable
-instead of guessing an identity.
+Ordinary `executor spawn` with no `--mode`, or with explicit `--mode tui`,
+plus `executor resume` and `executor restart`, present the managed
+conversation in the native Codex TUI. Explicit `spawn --mode exec` uses that
+same observed control lifecycle with the native inline TUI (`--no-alt-screen`):
+not a second renderer and not an unobserved `codex exec` launcher. The host
+records the lifecycle in
+`$CODEX_HOME/harness/executor-pool/spawn-<N>.json`: `dispatch-accepted`,
+`native-start`, `running`, `completed`, `failed`, `defect` and `interrupted`,
+beside the exact native session, the final-message locator
+(`message-<N>.txt`) and a bounded detail file (`stream-<N>.jsonl`). A created
+tab is not a native start, and frontend exit is not a finished turn.
+Historical unmanaged tui receipts and legacy receipts keep the coverage they
+recorded; the current native TUI does not make watch coverage unavailable.
 
-The host owns its launcher tree from birth in a Windows Job: an abnormal host
-death (a closed or killed tab) reaps the launcher and every descendant, while
-an ordinary session exit preserves the CLI's own background members, matching
-the launcher's established policy. Host identity, the transient event spool,
-the bounded detail file and the initial recorded state must all succeed before
-any launcher process starts; a later read, render or record failure terminates
-and drains the owned tree and fails the host, so a failing observer never
-reports a successful run and never leaves a conversation running without its
-visible surface. The launcher's stderr is retained in
-`stderr-<N>.log` beside the receipt and its bounded tail is shown when the run
-fails. One writer at a time updates a receipt (a kit-local lock serializes the
+The host owns one `codex app-server` child in a Windows Job. An abnormal host
+death reaps that child tree; an ordinary run end preserves the session's
+remaining background members. Host identity, the bounded detail file and the
+initial record must succeed before the child starts. A later startup, read or
+record failure fails the host with its cause instead of running another
+backend or reporting success. Losing the only frontend suspends further model
+dispatch and contains the owned run. An unfocused or unselected tab is not
+frontend loss, and a retained completion is not overwritten or reported as
+success because the frontend closed. The child's output is retained at a
+kit-local log whose bounded tail is shown when the run fails. One writer at a
+time updates a receipt (a kit-local lock serializes the
 console dispatcher's window record and the host's lifecycle record, and each
 write replaces the document atomically), so concurrent writers cannot lose
 each other's fields.
+
+After the result is persisted, the host ends that owned frontend and backend,
+then the existing terminal-host close policy finishes the tab. The tab host
+exits 0 after recording the outcome, including a recorded failure, so the tab
+closes; watch reads the receipt's exit code, not the tab process code. An
+owned console still returns the run's own code. A cleanup failure names each
+surviving owned resource and its recovery action without changing the recorded
+state or exit code. Closure is not acceptance, merge or slot release. An
+unresolved required reply is not a terminal run and does not close the
+surface. Inspection is the receipt and watch, not a leftover tab.
 
 The lead waits for an executor through that record; no model polling and no
 rollout search is involved:
@@ -387,6 +387,9 @@ codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY --slot N
 codex-harness executor watch --receipt FILE [--json]
 ```
 
+`--receipt` must be an absolute path. Optional `--owner`, `--timeout` and
+`--poll` match `codex-harness executor --help`.
+
 Watch blocks until the run reaches a terminal state and then prints bounded
 review data: state, slot, owner, exact session, checkout, base, changed files,
 the executor's returned message (reported by the executor, not verified
@@ -395,8 +398,9 @@ files are reported in two bounded segments - committed changes compared with
 the recorded base through `git diff <base>..HEAD`, and the current working tree
 including untracked files - so a committed executor result never reads as "no
 changes", and truncation is named. Watch exits 0 for a completed run, 1 for
-failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or
-legacy receipt) or the timeout expired while the run continued. An interrupted
+failed, defect or interrupted runs, and 2 when coverage is unavailable
+(historical unmanaged tui or legacy), the receipt is missing, or the timeout
+expires while the run continues. Timeout does not stop the executor. An interrupted
 host is reported with its reason and an unknown exit code, never as a
 completion. `executor pool` adds `run=<state> session=<id>` per slot, and
 `executor release` prints the last observed run beside the disposition it
@@ -414,13 +418,17 @@ Resume watching ongoing work; elapsed time alone is no reason to steer or stop i
 The shared supervision rule lives in
 [`global/harness.config.toml`](../global/harness.config.toml).
 
-An observed `executor run --file` - the process a tab or console hosts - exits
-0 only for a completed turn with a nonempty final message, otherwise propagates
-the launcher's own exit code, exits 3 when a completed turn wrote an empty or
-missing final message (an output defect, not model, authentication or quota
-unavailability) and exits 1 for failed, defect or interrupted streams. A
-completion record is evidence of execution state, not proof that the
-executor's claimed checks passed.
+An observed `executor run --file` is that tab or console host. It reports the
+same states on its visible surface, propagates the launcher's own exit code,
+exits 0 only for a completed turn with a nonempty final message, exits 3 when
+a completed turn wrote an empty or missing final message (an output defect,
+not model unavailability), and exits 1 for a failed or interrupted stream. An
+empty completion is never reported as success. A Windows Terminal tab host
+exits 0 after recording that outcome so the tab closes. A completion record
+is evidence of execution state, not proof that the executor's claimed checks
+passed. Exact-session recovery is the resume command in
+[executor worktrees](#executor-worktrees). Cache-loss recovery stays the fresh
+restart below, also on the native TUI.
 
 ## Steering and stopping executors
 
@@ -479,7 +487,7 @@ exact recovery command. The lead reviews preserved work and runs that command:
 codex-harness executor restart --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID --session PREVIOUS_SESSION_ID
 ```
 
-Restart starts a fresh conversation in the same worktree, keeping its commits,
+Restart starts a fresh conversation on the native TUI in the same worktree, keeping its commits,
 uncommitted/untracked files and saved test/build evidence. It does not fetch,
 reset, clean or release the slot. The old rollout remains available. The new
 session receives the recorded original assignment plus a bounded checkpoint

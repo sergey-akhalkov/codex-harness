@@ -125,6 +125,10 @@ Brief executors through harness commands, not by automating TUI keystrokes:
 codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY --base REV --exec "assignment"
 ```
 
+Omitting `--mode` selects the native Codex TUI. `--exec` is the assignment
+input, not a presentation selector. Explicit `--mode exec` is the native inline
+TUI on the same observed lifecycle, not an unobserved launcher.
+
 For file-specific work, prefer `--assignment FILE` instead of `--exec`. The
 schema-1 document declares `objective` (include the board id), `inputs` and
 `outputs` as checkout-relative file paths, and the string arrays `invariants`
@@ -182,8 +186,8 @@ the profile or by dispatching raw `codex exec`, TUI automation or in-session
 subagents: that drops the visible conversation, steering, board and recovery
 contract.
 
-Each executor gets a complete outcome, its configured profile, its own visible
-terminal tab or window, and a synchronized pool slot before the first model
+Each executor gets a complete outcome, its configured profile, its own
+native TUI on a terminal tab or owned console, and a synchronized pool slot before the first model
 request; freshness is dispatch's job, not an executor obligation. The brief
 names the exact base revision, and the executor verifies its slot HEAD is that
 revision before substantive edits and stops with a report on mismatch instead
@@ -220,10 +224,9 @@ Assignments require bounded milestone self-reports: after each numbered
 outcome inside the assignment, the executor posts a short board comment on
 its issue (done, next, blockers in at most three lines) instead of waiting
 for the lead to ask.
-The default exec mode streams the assignment in a visible tab and exits on
-completion; the tab's lifetime follows the terminal's close-on-exit policy, so
-a successful exit can close it while a failure stays visible for inspection. A
-mid-work stop is continued on the recorded slot through the recovery paths below.
+The owned surface closes after the result is persisted, including a recorded
+failure; inspect the receipt. Continue a mid-work stop with the exact-session
+resume below.
 Do not prefix prompts with `/goal`: the CLI has no argv goal hook and the
 prefix would be inert text. Accept only against the assignment, not effort
 spent. Spawn returns after the executor window/tab is open so the lead can keep
@@ -267,8 +270,10 @@ CHECKOUT --codex-home DIRECTORY --slot N` blocks on the receipt and returns the
 compact result or the named error with slot, owner, exact session, checkout,
 base, changed files, the returned message and the result/detail locators.
 Exit 0 means the run completed, 1 names a failed, defect or interrupted run
-with its cause, and 2 means unavailable coverage (tui or legacy receipt) or
-the timeout - a reason to inspect, not a result. Watch output is the
+with its cause, and 2 means unavailable coverage (historical unmanaged tui or
+legacy receipt), a missing receipt, or the timeout while the run continues.
+Timeout does not stop the run, and the current native TUI is not that
+unavailable case. Watch output is the
 executor's report, still not verified acceptance.
 Wait in one blocking call, not a polling loop: omit `--timeout` (its default
 1800s covers long acceptance runs) or set it to the expected run duration,
@@ -356,14 +361,16 @@ and legacy-tree semantics live in
 [agent delegation](../../../docs/agent-delegation.md#executor-worktrees).
 Executors set status `lead_review` instead of closing. The lead closes on
 accept or returns the item to `in_progress` with conditions. Executor terminal
-tabs are per-assignment, never pooled: a fresh session must not inherit another
-assignment's context, and the exec tab's lifetime follows the terminal's
-close-on-exit policy rather than a harness-managed close. To return defects or
-continue after an ordinary stop, resume the exact session
-(`codex-harness executor resume --slot N --owner ID [--session SESSION_ID]`
-for a pooled executor - without `--session` it consumes the exact identity the
-dispatch receipt recorded - or `codex resume SESSION_ID` interactively
-otherwise) and state the acceptance conditions there.
+surfaces are per-run, never a pooled conversation: a fresh session must not
+inherit another assignment's context. The host closes the owned surface after
+the result is persisted; the tab then closes under the terminal-host policy,
+including after a recorded failure. To return defects or continue after an
+ordinary stop, resume the exact session
+(`codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] (--exec PROMPT | --assignment FILE)`;
+without `--session` it consumes the exact identity the dispatch receipt
+recorded and attaches the native TUI to that session) and state the acceptance
+conditions there. Do not recover a pooled run with raw `codex resume` or an
+unobserved launcher.
 
 ## Recovery
 
