@@ -69,9 +69,15 @@ fn standing_escalations() -> Vec<String> {
 /// The escalation rule that precedes the boundary list: the single installed
 /// command, its default reply request and its no-reply notice form, when asking
 /// is justified at all, and what stays with the executor and the bd board.
+///
+/// The command's first-choice content form is taught here: the message is piped
+/// on standard input (or given as `--text` short text), the caller never has to
+/// know a size limit, and a large message is delivered automatically through the
+/// harness-owned file that holds it - no temporary file is created or named by
+/// the caller.
 fn lead_channel_heading(consumer: &str) -> String {
     format!(
-        "escalate to {consumer} through {LEAD_CHANNEL_COMMAND} --text '...' (or --file FILE for literal UTF-8), the installed command that addresses the originating lead itself and needs no recipient, slot, session or endpoint supplied; it asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours, and durable blockers, decisions and results stay on the bd issue"
+        "escalate to {consumer} through {LEAD_CHANNEL_COMMAND}: pipe it on standard input (or use --text for short text) - no recipient, slot, session or endpoint supplied and no size limit to know, and large messages are delivered automatically through a harness-owned file. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue"
     )
 }
 
@@ -516,7 +522,7 @@ mod tests {
     /// literal: a wording change has to update it deliberately.
     fn expected_lead_channel(consumer: &str) -> String {
         format!(
-            "escalate to {consumer} through codex-harness lead message --text '...' (or --file FILE for literal UTF-8), the installed command that addresses the originating lead itself and needs no recipient, slot, session or endpoint supplied; it asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours, and durable blockers, decisions and results stay on the bd issue:\n"
+            "escalate to {consumer} through codex-harness lead message: pipe it on standard input (or use --text for short text) - no recipient, slot, session or endpoint supplied and no size limit to know, and large messages are delivered automatically through a harness-owned file. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue:\n"
         )
     }
 
@@ -923,8 +929,10 @@ mod tests {
         assert!(rendered.ends_with(EXPECTED_WAITING_RULE), "{rendered}");
         for required in [
             "codex-harness lead message",
-            "--text '...'",
-            "--file FILE for literal UTF-8",
+            "pipe it on standard input",
+            "--text for short text",
+            "no size limit to know",
+            "large messages are delivered automatically through a harness-owned file",
             "asks for a reply unless --notify marks a notice that needs none",
             "after investigating the available facts",
             "a material ambiguity, or an authority/access boundary",
@@ -938,7 +946,8 @@ mod tests {
         }
         // The rule is the whole workflow: nothing teaches recipient or session
         // discovery, receipt editing, process identity checks, a resume ritual,
-        // recursive delegation or re-enabling the native agent tools.
+        // recursive delegation, re-enabling the native agent tools, a message
+        // size rule, a transport detail or a caller-created message file.
         for forbidden in [
             "--session",
             "CODEX_",
@@ -950,6 +959,10 @@ mod tests {
             "agent tool",
             "receipt",
             "reply-to",
+            "--file",
+            "temporary",
+            "KiB",
+            "MiB",
         ] {
             assert!(!rendered.contains(forbidden), "{forbidden}\n{rendered}");
         }
