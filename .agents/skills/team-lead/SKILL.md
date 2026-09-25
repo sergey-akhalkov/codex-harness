@@ -103,8 +103,8 @@ and material observations stay in the incubator. Promote at `vote_threshold`
 from kit `global/orchestration.toml` by consequence: small improvements to
 backlog tasks, behavior or requirement changes into OpenSpec entries, kit
 demand to the kit backlog with kit-level wording only, and a material
-correctness, integrity or safety concern immediately under your consequence
-override with the reason recorded. Sweep the incubator when you close a stage
+correctness, integrity or safety concern immediately under your consequence override
+with the reason recorded. Sweep the incubator when you close a stage
 or epic during acceptance and when a triage batch finds it above
 `incubator_size_cap`; with no lead session active the sweep waits. Promotion
 confers eligibility for planning, never silent implementation.
