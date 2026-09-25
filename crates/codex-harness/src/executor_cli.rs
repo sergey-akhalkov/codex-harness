@@ -158,7 +158,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 /// endpoint of its own. `lead message` is the other direction and keeps its
 /// own usage beside it.
 const LEAD_START_USAGE: &str = "\
-codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT]
+codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID] [--exec PROMPT] [--exec-file FILE]
   Host the configured lead profile in this terminal via one native app-server/TUI.
   The exact thread records a kit-local endpoint inherited by executors from its shells;
   lead message reaches it. Resume the exact THREAD_ID after its endpoint ends. Native
@@ -273,6 +273,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
     let mut codex_home = None;
     let mut session = None;
     let mut prompt = None;
+    let mut prompt_file = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = arg
@@ -294,6 +295,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
                 }
                 prompt = Some(text);
             }
+            "--exec-file" => prompt_file = Some(PathBuf::from(value)),
             _ => return Err(invalid(&invalid_lead_option(key))),
         }
     }
@@ -311,6 +313,28 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
         None => {
             return Err(invalid(
                 "the kit home is unavailable: CODEX_HOME is not set; pass --codex-home DIRECTORY",
+            ));
+        }
+    };
+    let prompt = match (prompt, prompt_file) {
+        (None, None) => None,
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(path)) => {
+            let prompt = executor_message::read_message_file(&path).map_err(|error| {
+                invalid(&format!(
+                    "lead start --exec-file could not be read: {error}"
+                ))
+            })?;
+            if prompt.trim().is_empty() {
+                return Err(invalid(
+                    "lead start --exec-file needs the first prompt for this conversation",
+                ));
+            }
+            Some(prompt)
+        }
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "lead start accepts only one first prompt: use --exec or --exec-file, not both",
             ));
         }
     };
@@ -335,7 +359,7 @@ fn parse_lead_start(args: &[OsString]) -> io::Result<LeadStart> {
 
 fn invalid_lead_option(key: &str) -> String {
     format!(
-        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID and --exec PROMPT only"
+        "invalid lead start option {key}: `codex-harness lead start` accepts --source CHECKOUT, --codex-home DIRECTORY, --session THREAD_ID, --exec PROMPT and --exec-file FILE only"
     )
 }
 
@@ -5952,6 +5976,33 @@ mod tests {
         assert_eq!(
             lead_title("default", Path::new(r"D:\work\proj")),
             "CLead (default) - proj"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("first-prompt.txt");
+        fs::write(&file, "first line\nsecond line\n").unwrap();
+        let request = parse_lead_start(&[
+            OsString::from("--codex-home"),
+            root.path().as_os_str().to_owned(),
+            OsString::from("--exec-file"),
+            file.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(request.prompt.as_deref(), Some("first line\nsecond line\n"));
+        let conflict = parse_lead_start(&[
+            OsString::from("--codex-home"),
+            root.path().as_os_str().to_owned(),
+            OsString::from("--exec"),
+            OsString::from("text"),
+            OsString::from("--exec-file"),
+            file.as_os_str().to_owned(),
+        ])
+        .err()
+        .expect("conflicting prompt inputs must fail");
+        assert!(
+            conflict
+                .to_string()
+                .contains("use --exec or --exec-file, not both"),
+            "{conflict}"
         );
     }
 

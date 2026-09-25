@@ -58,7 +58,7 @@ For new external tools/dependencies, proportionately assess authentic identity, 
 
 ## Developer experience
 
-Agent/developer surfaces are products: convenience, speed and clarity are required. Commands report what started/changed and where evidence lives; failures name cause and next action. Empty output, automatable manual checks, repeated rituals and re-derived context are owning-tool defects: fix proportionally to recurring cost and record recurring friction in owning feedback. Prefer compact confirmations, stable machine-readable receipts and short feedback loops over options. Seek fewer steps and faster confident decisions without weakening correctness, honesty or acceptance. Replace remembered mechanics with cheap reliable verified automation in their owner; procedural text is interim until coverage exists. Judgment, trade-offs and acceptance remain with the agent.
+Agent/developer surfaces are products: convenience, speed and clarity matter. Follow "don't make me think": the safe path is obvious, outputs say what changed and where evidence lives, and failures name cause and next action. Empty output, automatable checks, repeated rituals and re-derived context are owning-tool defects: fix proportionally to recurring cost and record recurring friction in owning feedback. Prefer compact confirmations, stable machine-readable receipts and short loops. Seek fewer, faster confident decisions without weakening correctness, honesty or acceptance. Replace remembered mechanics with cheap reliable verified automation in their owner; procedural text is interim until coverage exists. Judgment, trade-offs and acceptance remain with the agent.
 
 ## Working environment before implementation
 

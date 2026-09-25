@@ -223,7 +223,7 @@ impl Request {
 /// The literal UTF-8 content of `--file`: whatever the file holds, with its
 /// real line breaks. A file that is not UTF-8 text is refused instead of being
 /// lossily rewritten; a leading byte-order mark is not content.
-fn read_message_file(path: &Path) -> io::Result<String> {
+pub(crate) fn read_message_file(path: &Path) -> io::Result<String> {
     let bytes = observation::read_bounded(path, MAX_TEXT + 1)
         .map_err(|error| invalid(&format!("message file {}: {error}", path.display())))?;
     if bytes.len() as u64 > MAX_TEXT {
