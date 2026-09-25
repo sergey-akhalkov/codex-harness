@@ -450,20 +450,18 @@ session, worktree and assignment metadata with a request reference, so the
 lead answers through the same command owner:
 `codex-harness executor message --reply-to MESSAGE_ID --text TEXT`. That
 reference replaces the address fields and continues the same conversation in
-place, without resume. Asking is exceptional - a material ambiguity, an
-authority or access boundary, or a dependency the executor cannot obtain after
-investigating the available facts. Routine progress, repeated status and
-ordinary implementation errors stay off the channel and on the bd issue, and
-nobody discovers endpoints, receipts, process ids or sessions by hand to reach
-a run: the commands resolve the recorded identity themselves.
+place, without resume. Use `codex-harness lead start --source CHECKOUT` when
+the lead must receive questions; spawn inherits that native thread endpoint.
+An ordinary unmanaged lead may dispatch, but reverse messaging reports no
+registered endpoint. Asking is exceptional: resolve a material ambiguity,
+authority/access boundary, or unobtainable dependency after investigation.
+Routine progress and ordinary errors stay on bd; the commands resolve recorded
+identity, so no manual endpoint, receipt, process or session lookup is needed.
 
-Message a continuing executor for a concrete correction, a relevant fact or a
-requirement change: steering adds facts, resolves a request or corrects an
-established mistake. No status-only nudges, hurry demands or repeats without
-new facts, and no question to a healthy executor about what it is doing -
-waiting is not a reason to steer. A correction continues the same conversation
-in place; a completed, stopped or unavailable run is reported with its actual
-state and the exact-session resume remedy, never revived.
+Message a continuing executor only to add a fact, resolve a request, or correct
+an established mistake. No status-only nudges, hurry demands, repeats without
+new facts, or questions about mere waiting. A correction continues the same
+conversation; an ended run reports its state and exact resume remedy.
 
 Stop only for an explicit cancellation request or a concrete necessity - a
 demonstrated wrong direction, a run that cannot make progress, or a resource

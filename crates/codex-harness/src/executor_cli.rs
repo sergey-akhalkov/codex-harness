@@ -159,17 +159,10 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 /// own usage beside it.
 const LEAD_START_USAGE: &str = "\
 codex-harness lead start [--source CHECKOUT] [--codex-home DIRECTORY] [--session THREAD_ID]
-  Host one managed native lead session in this terminal: resolve the configured lead
-  profile (CHECKOUT/global/orchestration.toml, default: this directory), start one
-  `codex app-server` on loopback, create the thread - or resume the exact THREAD_ID -
-  attach one native Codex TUI to it, and keep this host alive while that frontend runs.
-  The session records its verified endpoint under its exact thread identity in
-  <CODEX_HOME>/harness/lead-endpoints, so an executor dispatched from this session's own
-  shells inherits that address and `codex-harness lead message` reaches this conversation.
-  The lead keeps the native agent capability: no window layout, no second conversation, no
-  daemon and no substitute renderer is started, and profiles, settings, cwd, arguments and
-  effective model/provider/effort stay those of the native CLI. End the previous session
-  before resuming its thread with --session.
+  Host the configured lead profile in this terminal via one native app-server/TUI.
+  The exact thread records a kit-local endpoint inherited by executors from its shells;
+  lead message reaches it. Resume the exact THREAD_ID after its endpoint ends. Native
+  routing and cwd stay unchanged; no daemon or second conversation.
 ";
 
 /// `codex-harness lead`: the lead side of the executor exchange.
