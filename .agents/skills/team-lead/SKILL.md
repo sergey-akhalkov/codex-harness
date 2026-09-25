@@ -121,27 +121,17 @@ Omitting `--mode` selects the native Codex TUI. `--exec` is the assignment
 input, not a presentation selector. Explicit `--mode exec` is the native inline
 TUI on the same observed lifecycle, not an unobserved launcher.
 
-For file-specific work, prefer `--assignment FILE` instead of `--exec`. The
-schema-1 document declares `objective` (include the board id), `inputs` and
-`outputs` as checkout-relative file paths, and the string arrays `invariants`
-and `acceptance`; it cannot decide whether the declared scope is complete. Two
-optional fields carry the rest of the contract: `consumer` names who consumes
-the returned result (default: the dispatching lead) and `escalate` adds
-triggers that return the decision to that consumer. The rendered brief always
-carries the standing boundaries - a change to the agreed outcome or scope, a
-material architecture change, missing authority, an unobtainable dependency -
-together with the installed lead channel, the executor's own work cycle and the
-compact result expected back (done and remaining work, checkout and base,
-files, actual checks, limitations, required decision, detail locator), so do
-not restate those in the objective. `codex-harness lead message --text ...`
-addresses the originating lead itself and holds the run while it waits for the
-answer, so an executor reports its question instead of ending the work.
-Ordinary implementation errors stay with the executor: it investigates,
-corrects and re-runs them itself.
-`executor assignment --source CHECKOUT --slot N --base REV --assignment FILE`
-validates and renders that brief against an existing pool checkout without
-dispatch; the same option works with `resume` while preserving partial work.
-The complete example and limits live in the kit's
+For file-specific work, prefer `--assignment FILE` - or pipe the assignment
+into `--exec -` - instead of a long `--exec` argument; its required fields are
+`objective` (include the board id), `inputs`, `outputs`, `invariants` and
+`acceptance`, and `consumer` and `escalate` are additive. The brief itself
+carries the standing
+boundaries, the executor's work cycle and the compact result expected back, so
+do not restate those in the objective. `codex-harness lead message` (piped
+content or a short `--text`) addresses the originating lead itself and holds
+the run while it waits for the answer, so an executor reports its question
+instead of ending the work; ordinary implementation errors stay with the
+executor. The complete example and limits live in the kit's
 [native commands](../../../docs/rust-native.md#structured-executor-assignments).
 
 `--source` is the repository checkout, and `executor spawn` is the sole
@@ -228,71 +218,64 @@ working. Executors look at the board and do assigned issues.
 
 ## Steer, wait, stop
 
-Steer an active executor with `codex-harness executor message`: it addresses
-the run's checkout, slot, owner and exact recorded session, so input cannot
-reach a later occupant of a reused slot, and it appears in that executor's
-visible conversation. Message only for a concrete correction of continuing
-work: steering adds relevant facts, resolves a request or corrects an
-established mistake, and no status-only nudges, hurry demands or repeats
-without new facts go out. Answer an executor's question with the same command
-addressed by the reference the question carried:
-`codex-harness executor message --reply-to MESSAGE_ID --text ...` needs no
-slot, session or endpoint discovery and continues that same conversation.
-Never hunt for endpoints, receipts, process ids or sessions to reach a run: the
-kit commands resolve the recorded identity themselves. Wait without takeover
+Steer an active executor by piping the correction into `codex-harness executor
+message`, or with a short `--text`: with exactly one live run it resolves and
+verifies the recorded checkout, slot, owner and session itself, so nothing is
+copied by hand, the input appears in that conversation, and it cannot reach a
+later occupant of a reused slot. Long content needs no
+file step: over the inline bound it spills automatically to a harness-owned
+file the recipient reads. Message only for a concrete correction of continuing
+work - a relevant fact, a resolved request or an established mistake; no
+status-only nudges, hurry demands or repeats without new facts. Answer an
+executor's question with the reference the question carried:
+`codex-harness executor message --reply-to MESSAGE_ID` continues that same
+conversation. Address flags (`--source`, `--codex-home`, `--slot`, `--owner`)
+are the disambiguation and scripting form: several live runs refuse with the
+listing that names `--slot`, and resolved and explicit values are verified
+alike. Wait without takeover
 while an executor remains active; improvement observations arrive as board
-feedback tasks, and durable decisions from an answer go on the bd issue.
+feedback tasks, and durable decisions go on the bd issue.
 Stop a run with `codex-harness executor stop` only for an explicit
 cancellation request or a concrete necessity such as a demonstrated wrong
 direction or a run that cannot progress: a brief error, a slow stream, waiting
 or silence alone is not a reason to stop. Use the kit commands before killing
 processes manually; manual killing needs a recorded cause. After a stop,
 preserve the files, slot and partial work. Ordinary interruption continues by
-resuming the exact session. A DeepSeek cache-loss stop instead requires a fresh
+resuming the exact session. A DeepSeek cache-loss stop instead needs a fresh
 conversation: inspect the preserved work and follow the receipt's exact
-`executor restart` command for the same slot/owner/predecessor. It carries the
-original task and bounded visible progress, keeps all saved work and requires
-checking interrupted tests/builds. Do not use spawn, release, reset or resume
-the expensive history as its fallback; investigate recurrence before another
-restart. The policy and limits live in
+`executor restart` command for the same slot/owner/predecessor, which keeps
+saved work, carries the original task and requires checking interrupted
+tests/builds; never fall back to spawn, release, reset or resuming the
+expensive history. The policy and limits live in
 [cache-loss recovery](../../../docs/agent-delegation.md#deepseek-cache-loss-protection-and-recovery).
 Command flags and result classes live in
 [native commands](../../../docs/rust-native.md#structured-executor-assignments),
 lifecycle and steering semantics in
 [agent delegation](../../../docs/agent-delegation.md#steering-and-stopping-executors).
-No hidden model calls and no status polling.
-Do not poll from model turns or executor PIDs. While an executor runs, keep
-one native watcher process for the board review queue, and wait for the run
-itself through its recorded lifecycle: `codex-harness executor watch --source
-CHECKOUT --codex-home DIRECTORY --slot N` blocks on the receipt and returns the
-compact result or the named error with slot, owner, exact session, checkout,
-base, changed files, the returned message and the result/detail locators.
-Exit 0 means the run completed, 1 names a failed, defect or interrupted run
-with its cause, and 2 means unavailable coverage (historical unmanaged tui or
-legacy receipt), a missing receipt, or the timeout while the run continues.
-Exit 3 is action required: the live run holds an unanswered request, and the
-result names the run with the reference whose one-command reply answers it.
-Answer it and run the same watch again; it is not completion, an output defect,
-unavailable coverage or a resume trigger, and the waiting run keeps its
-session, slot, worktree and partial work without any keep-alive loop or
-repeated wait command. Timeout does not stop the run, and the current native
-TUI is not that unavailable case. Watch output is the
-executor's report, still not verified acceptance.
-Wait in one blocking call, not a polling loop: omit `--timeout` (its default
-1800s covers long acceptance runs) or set it to the expected run duration,
-and give the shell call itself enough timeout to cover that wait. Watch
-prints nothing while the run continues, so the wait costs nothing until the
-report. If the shell timeout ends the wait early or watch exits 2 with the run
-still running, rerun the same watch as its continuation; never shrink waiting
-into short fixed-interval polling. `executor pool` is the cheap snapshot
-between other work; a healthy run needs no extra check.
-Track session-file growth in the same loop: a live executor whose rollout is
-silent beyond a bounded threshold (about 15 minutes) is a stuck-suspect -
-then read its recent reasoning and diff, and only for a confirmed anomaly send
-one bounded question with `codex-harness executor message` (blockers, next
-step in at most five lines, then continue). Timed status polling is waste.
-While executors run, the lead analyzes bottlenecks, spend and next cuts, and
-files those as board tasks.
+Do not poll from model turns or executor PIDs. Keep one native watcher process
+for the board review queue and wait through the run's recorded lifecycle:
+`codex-harness executor watch` (optional address fields) blocks on the receipt
+and returns the compact result or the named error - slot, owner, exact session,
+checkout, base, changed files, the returned message and the result/detail
+locators. Exit 0 completed, 1 failed, defect or interrupted with its cause,
+2 unavailable coverage (historical unmanaged tui or legacy receipt), a missing
+receipt or a timeout while the run continues; the current native TUI is never
+that case. Exit 3 is action required: the live run holds an
+unanswered request whose one-command reply reference the result names - answer
+it and run the same watch again. Exit 3 is not completion, an output defect,
+unavailable coverage or a resume trigger; the waiting run keeps its session,
+slot, worktree and partial work, and no timeout or keep-alive loop stops or
+resumes it. Watch output is the executor's report, not verified acceptance.
+Wait in one blocking call: omit `--timeout` (1800s covers long acceptance runs)
+or set the expected duration and give the shell call enough timeout; watch
+stays silent until the report. If the shell timeout ends the wait early or
+watch exits 2 with the run still running, rerun the same watch; never shrink
+waiting into short fixed-interval polling. `executor pool` is the cheap
+snapshot between other work. A rollout silent beyond about 15 minutes is a
+stuck-suspect: read its recent reasoning and diff, and only for a confirmed
+anomaly send one bounded question - blockers and next step, at most five lines;
+timed status polling is waste. While executors run, the lead analyzes
+bottlenecks, spend and next cuts, and files those as board tasks.
 
 ## Pace spend
 

@@ -407,17 +407,16 @@ host is reported with its reason and an unknown exit code, never as a
 completion. `executor pool` adds `run=<state> session=<id>` per slot, and
 `executor release` prints the last observed run beside the disposition it
 records while still refusing to reset a live or unreviewed slot.
-Waiting follows that one-event shape: retain one native watch per run, with
-`--timeout 900` for the 15-minute supervision boundary. Completion or failure
-can return earlier. Short tool yields resume the same pending wait; they do
-not justify another watcher, worktree inspection or status-only update.
-At the boundary, batch one compact state/activity check across active executors;
-`executor pool` supplies the state snapshot. If progress is unclear, inspect
-the latest bounded activity/error evidence once, identify a concrete blocker
-or report what evidence is missing, and choose the next action. A live process,
-growing log or missing patch alone proves neither progress nor a stall.
-Resume watching ongoing work; elapsed time alone is no reason to steer or stop it.
-The shared supervision rule lives in
+Waiting follows that one-event shape: retain one native watch per run
+(`--timeout 900` for the 15-minute supervision boundary); short tool yields
+resume the same pending wait and justify no second watcher, worktree inspection
+or status-only update. At the boundary, batch one compact state/activity check
+across active executors - `executor pool` supplies the state snapshot - and if
+progress is unclear, inspect the latest bounded activity/error evidence once,
+identify a concrete blocker or report what evidence is missing, then choose the
+next action. A live process, growing log or missing patch alone proves neither
+progress nor a stall, and elapsed time alone is no reason to steer or stop a
+run. The shared supervision rule lives in
 [`global/harness.config.toml`](../global/harness.config.toml).
 
 An observed `executor run --file` is that tab or console host. It reports the
@@ -434,29 +433,36 @@ restart below, also on the native TUI.
 
 ## Steering and stopping executors
 
-Steer a continuing run with `codex-harness executor message` and stop one with
-`codex-harness executor stop`; both address the recorded checkout, slot, owner
-and exact session and verify that identity against the live run before
-acting, so input cannot reach a later occupant of a reused slot. The exact
-flag surface and result classes live in
+Steer a continuing run by piping the correction into `codex-harness executor
+message`, or with a short `--text`, and stop one with `codex-harness executor
+stop`. With exactly one live run both resolve and verify the recorded checkout,
+slot, owner and exact session themselves, so no address is copied and input
+cannot reach a later occupant of a reused slot; several live runs refuse with a
+bounded listing naming `--slot`, and the explicit `--source`, `--codex-home`,
+`--slot`, `--owner` and `--session` flags stay the disambiguation and scripting
+form, verified the same way. No size limit or file step is involved: piped
+input, `--text` and explicit UTF-8 `--file` all work, over the inline bound the
+harness spills the payload automatically and reports that class in the receipt
+and watch, and the conversation, model, provider, effort and work are
+preserved. The exact flag surface and result classes live in
 [native commands](rust-native.md#structured-executor-assignments); the rules
 below say when each command is justified.
 
-An executor's own question travels the reverse direction and needs no address:
-`codex-harness lead message --text TEXT` (or a UTF-8 `--file`) sends one
-literal payload to the originating lead recorded for that run, and `--notify`
-marks a notice that requests no reply. The envelope carries the sender, run,
-session, worktree and assignment metadata with a request reference, so the
-lead answers through the same command owner:
-`codex-harness executor message --reply-to MESSAGE_ID --text TEXT`. That
-reference replaces the address fields and continues the same conversation in
-place, without resume. Use `codex-harness lead start --source CHECKOUT` when
-the lead must receive questions; spawn inherits that native thread endpoint.
-An ordinary unmanaged lead may dispatch, but reverse messaging reports no
-registered endpoint. Asking is exceptional: resolve a material ambiguity,
-authority/access boundary, or unobtainable dependency after investigation.
-Routine progress and ordinary errors stay on bd; the commands resolve recorded
-identity, so no manual endpoint, receipt, process or session lookup is needed.
+An executor's own question needs no address:
+`codex-harness lead message` sends one literal payload to the originating lead
+recorded for that run from the same piped, `--text` or `--file` sources, and
+`--notify` marks a notice that requests no reply. The envelope carries the
+sender, run, session, worktree and assignment metadata with a request
+reference, so the lead answers through the same command owner:
+`codex-harness executor message --reply-to MESSAGE_ID`, which replaces the
+address fields and continues the same conversation in place, without resume.
+Use `codex-harness lead start --source CHECKOUT` when the lead must receive
+questions; spawn inherits that native thread endpoint. An ordinary unmanaged
+lead may dispatch, but reverse messaging reports no registered endpoint.
+Asking is exceptional: resolve a material ambiguity, authority/access boundary,
+or unobtainable dependency after investigation. Routine progress and ordinary
+errors stay on bd, and no manual endpoint, receipt, process or session lookup
+is needed.
 
 Message a continuing executor only to add a fact, resolve a request, or correct
 an established mistake. No status-only nudges, hurry demands, repeats without
@@ -466,15 +472,14 @@ conversation; an ended run reports its state and exact resume remedy.
 Stop only for an explicit cancellation request or a concrete necessity - a
 demonstrated wrong direction, a run that cannot make progress, or a resource
 conflict the executor cannot resolve. A brief error, a slow or silent stream,
-waiting or silence alone does not justify stop; inspect the recorded state
-and the current work first. Use the kit's stop command rather than killing
-processes by hand: manual process killing has no identity check, tab closure
-or honest receipt and needs a recorded cause. A stop preserves the files,
-checkout, slot and partial work and claims no completion; continue by
-resuming the exact session (except cache-loss recovery below), and release
-the slot only as its own explicit decision. The same explicit stop ends a run
-that is waiting for an answer: waiting is a live state, and no timeout, silent
-period or unanswered request stops or resumes it by itself.
+waiting or silence alone does not justify stop; inspect the recorded state and
+current work first. Use the kit's stop command rather than manual killing,
+which has no identity check, tab closure or honest receipt and needs a recorded
+cause. A stop preserves the files, checkout, slot and partial work and claims
+no completion; continue by resuming the exact session (except cache-loss
+recovery below), and release the slot only by explicit decision. Waiting is a
+live state: no timeout, silent period or unanswered request stops or resumes it
+by itself.
 
 ### DeepSeek cache-loss protection and recovery
 
