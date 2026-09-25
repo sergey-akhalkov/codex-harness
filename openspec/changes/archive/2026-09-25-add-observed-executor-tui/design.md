@@ -6,7 +6,7 @@ Current source has two different lifetimes. `executor_cli.rs` starts a control-b
 
 The installed CLI inspected during exploration was 0.156.1. Its help exposes `resume --remote` and bearer-token attachment. The official [CLI contract](https://learn.chatgpt.com/docs/developer-commands?surface=cli) documents these options; the [app-server protocol](https://learn.chatgpt.com/docs/app-server) documents thread subscriptions and terminal turn statuses. These are protocol capabilities, not proof of the proposed integrated executor path.
 
-Existing `task_control_contract.rs` checks cover two-client native event delivery and attachment to a named empty thread with canned Responses. [Native verification guidance](../../../docs/rust-native.md#native-task-control-contract) records historical success on 0.154.0, the need to prepare the named empty thread through resume by ID, and rejection of permission overrides on the attaching remote CLI. Those results must be requalified for the target executable; they do not establish current global delivery. The larger ordinary-launcher task controller is unfinished and is not a prerequisite to activate wholesale.
+Existing `task_control_contract.rs` checks cover two-client native event delivery and attachment to a named empty thread with canned Responses. [Native verification guidance](../../../../docs/rust-native.md#native-task-control-contract) records historical success on 0.154.0, the need to prepare the named empty thread through resume by ID, and rejection of permission overrides on the attaching remote CLI. Those results must be requalified for the target executable; they do not establish current global delivery. The larger ordinary-launcher task controller is unfinished and is not a prerequisite to activate wholesale.
 
 ## Goals / Non-Goals
 
@@ -34,7 +34,7 @@ On a terminal outcome, settle accepted work and retain its final message using t
 
 `watch` keeps the current receipt polling implementation, CLI, default timeout and exit meanings: 0 completed, 1 unsuccessful terminal outcome, 2 timeout or unavailable coverage. Timeout does not stop the executor. It can return the persisted outcome independently of frontend shutdown; that preserves synchronous waiting without making the TUI exit itself after an answer. Completion still does not establish lead acceptance or release the slot. When the separate reply workflow is present, its additive waiting observation returns 3 for action required without a terminal outcome; this does not change meanings 0/1/2.
 
-This change alone owns the full modified `Observable executor lifecycle and bounded result` requirement. The messaging change owns its additional waiting/request requirement, so either delta cannot overwrite the other's scenarios. The [simplification design](../simplify-native-harness/design.md) owns later shared-daemon qualification and cross-cutting removal; no wholesale general-controller activation is needed for this TUI path.
+This change alone owns the full modified `Observable executor lifecycle and bounded result` requirement. The messaging change owns its additional waiting/request requirement, so either delta cannot overwrite the other's scenarios. The [simplification design](../../simplify-native-harness/design.md) owns later shared-daemon qualification and cross-cutting removal; no wholesale general-controller activation is needed for this TUI path.
 
 ### Finish the owned surface without affecting neighbors
 
