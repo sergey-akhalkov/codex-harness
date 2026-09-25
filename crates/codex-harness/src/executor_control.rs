@@ -389,17 +389,17 @@ fn dispatcher_is_stale(value: &Value) -> bool {
     let Ok(user) = harness_core::process_service::current_user() else {
         return true;
     };
-    match harness_core::process_service::ServiceProcess::inspect(
-        ProcessIdentity {
-            pid: pid as u32,
-            creation_time: creation,
-        },
-        &program,
-        &user,
-    ) {
-        Ok(Some(_)) => false,
-        _ => true,
-    }
+    !matches!(
+        harness_core::process_service::ServiceProcess::inspect(
+            ProcessIdentity {
+                pid: pid as u32,
+                creation_time: creation,
+            },
+            &program,
+            &user,
+        ),
+        Ok(Some(_))
+    )
 }
 
 fn run_generation() -> io::Result<String> {

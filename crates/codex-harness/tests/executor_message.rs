@@ -2388,9 +2388,9 @@ impl ReplyRoundTrip {
         self.lead_server.answer_sequence(
             "thread/read",
             vec![
-                Answer::Result(lead_thread_read(&LEAD_THREAD, "idle", json!([]))),
+                Answer::Result(lead_thread_read(LEAD_THREAD, "idle", json!([]))),
                 Answer::Result(lead_thread_read(
-                    &LEAD_THREAD,
+                    LEAD_THREAD,
                     "active",
                     json!([{
                         "id": TURN,

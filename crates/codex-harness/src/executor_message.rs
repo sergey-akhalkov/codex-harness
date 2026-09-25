@@ -1587,16 +1587,14 @@ pub(crate) fn lead_message(args: &[OsString]) -> io::Result<i32> {
             "lead message exceeds the {MAX_TEXT}-byte bound; nothing was sent"
         )));
     }
-    deliver_to_recorded_lead(
-        &run,
-        &endpoint,
-        &id,
+    let message = LeadMessage {
+        id: &id,
         kind,
-        &content,
-        &envelope,
-        &payload,
-        previous.as_ref(),
-    )
+        content: &content,
+        envelope: &envelope,
+        payload: &payload,
+    };
+    deliver_to_recorded_lead(&run, &endpoint, &message, previous.as_ref())
 }
 
 fn parse_lead_input(args: &[OsString]) -> io::Result<LeadInput> {
@@ -2074,18 +2072,25 @@ fn update_receipt_document<T>(
     Ok(outcome)
 }
 
+/// One lead message as the delivery path carries it: its published id, its
+/// kind, its content identity without the nonce, the framed envelope that is
+/// submitted and the literal payload it carries.
+struct LeadMessage<'a> {
+    id: &'a str,
+    kind: &'a str,
+    content: &'a str,
+    envelope: &'a str,
+    payload: &'a str,
+}
+
 /// Commits one lead-message attempt, merged by identity so the pending record,
 /// its outcome and an evidence upgrade describe the same one attempt.
 fn record_lead_message(
     run: &SpawnedRun,
-    id: &str,
-    kind: &str,
-    content: &str,
-    method: &str,
-    status: &str,
-    detail: &str,
-    attempts: u64,
+    message: &LeadMessage<'_>,
+    attempt: &LeadAttempt,
 ) -> io::Result<()> {
+    let (id, kind, content) = (message.id, message.kind, message.content);
     update_receipt_document(&run.receipt, |document| {
         let generation = document["originatingLead"]["runGeneration"]
             .as_str()
@@ -2113,16 +2118,21 @@ fn record_lead_message(
                 "requestedMs": now,
             })
         });
-        entry["status"] = Value::String(status.into());
-        entry["method"] = Value::String(method.into());
-        entry["detail"] = Value::String(detail.into());
-        entry["attempts"] = Value::from(entry["attempts"].as_u64().unwrap_or(0).max(attempts));
+        entry["status"] = Value::String(attempt.status.into());
+        entry["method"] = Value::String(attempt.method.clone());
+        entry["detail"] = Value::String(attempt.detail.clone());
+        entry["attempts"] = Value::from(
+            entry["attempts"]
+                .as_u64()
+                .unwrap_or(0)
+                .max(attempt.attempts),
+        );
         entry["leadThreadId"] = Value::String(run.lead_thread.clone());
         entry["runGeneration"] = Value::String(generation.into());
         entry["session"] = Value::String(session.into());
         entry["slot"] = Value::from(slot);
         entry["owner"] = Value::String(owner.into());
-        if status == STATUS_DELIVERED {
+        if attempt.status == STATUS_DELIVERED {
             entry["deliveredMs"] = Value::from(now);
         }
         entry["recordedMs"] = Value::from(now);
@@ -2245,11 +2255,7 @@ fn report_recorded_lead_repeat(
 fn reconcile_recorded_lead(
     run: &SpawnedRun,
     endpoint: &Endpoint,
-    id: &str,
-    kind: &str,
-    content: &str,
-    envelope: &str,
-    payload: &str,
+    message: &LeadMessage<'_>,
     previous: &Value,
 ) -> io::Result<i32> {
     let status = recorded_status(previous).to_owned();
@@ -2257,7 +2263,13 @@ fn reconcile_recorded_lead(
     let attempts = previous["attempts"].as_u64().unwrap_or(0);
     let detail = previous["detail"].as_str().unwrap_or_default().to_owned();
     if status == STATUS_DELIVERED {
-        return report_recorded_lead_repeat(run, id, kind, previous, payload.len());
+        return report_recorded_lead_repeat(
+            run,
+            message.id,
+            message.kind,
+            previous,
+            message.payload.len(),
+        );
     }
     let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
         invalid(&format!(
@@ -2277,37 +2289,27 @@ fn reconcile_recorded_lead(
     }
     let evidence = observe_input(
         &mut conversation,
-        id,
-        envelope,
+        message.id,
+        message.envelope,
         Instant::now() + EVIDENCE_WINDOW,
     );
     if let Some(evidence) = evidence {
-        let detail = format!(
-            "the input is in the lead conversation's own items ({}); the recorded attempt was upgraded from {status} by that evidence, and whether the lead applied it is the lead's own report",
-            evidence.detail()
-        );
-        record_lead_message(
-            run,
-            id,
-            kind,
-            content,
-            &method,
-            STATUS_DELIVERED,
-            &detail,
-            attempts,
-        )?;
         let attempt = LeadAttempt {
             status: STATUS_DELIVERED,
             method,
             attempts,
-            detail,
+            detail: format!(
+                "the input is in the lead conversation's own items ({}); the recorded attempt was upgraded from {status} by that evidence, and whether the lead applied it is the lead's own report",
+                evidence.detail()
+            ),
         };
+        record_lead_message(run, message, &attempt)?;
         return report_lead_message(
             run,
-            id,
-            kind,
+            message.id,
+            message.kind,
             &attempt,
-            payload.len(),
+            message.payload.len(),
             Some(
                 "nothing was sent: the earlier attempt is in the lead conversation, so the same words cannot be delivered twice".to_owned(),
             ),
@@ -2323,10 +2325,10 @@ fn reconcile_recorded_lead(
             };
             report_lead_message(
                 run,
-                id,
-                kind,
+                message.id,
+                message.kind,
                 &attempt,
-                payload.len(),
+                message.payload.len(),
                 Some(
                     "nothing was sent again: the native transport accepted the earlier attempt, which is in the lead conversation, so the same words cannot be delivered twice. The recorded request stands; answer or stop it explicitly".to_owned(),
                 ),
@@ -2340,28 +2342,19 @@ fn reconcile_recorded_lead(
             let detail = format!(
                 "the earlier attempt ({method}) is recorded as {status} and the lead conversation's own items do not show it, so whether it reached the lead is unknown"
             );
-            record_lead_message(
-                run,
-                id,
-                kind,
-                content,
-                &method,
-                STATUS_INDETERMINATE,
-                &detail,
-                attempts,
-            )?;
             let attempt = LeadAttempt {
                 status: STATUS_INDETERMINATE,
                 method,
                 attempts,
                 detail,
             };
+            record_lead_message(run, message, &attempt)?;
             report_lead_message(
                 run,
-                id,
-                kind,
+                message.id,
+                message.kind,
                 &attempt,
-                payload.len(),
+                message.payload.len(),
                 Some(
                     "nothing was sent again: an earlier attempt of this exact text may already be in the lead conversation, so a repeat could deliver it twice. Next action: inspect the lead conversation; if the words are genuinely absent, send them again with a distinguishing first line".to_owned(),
                 ),
@@ -2373,17 +2366,11 @@ fn reconcile_recorded_lead(
 fn deliver_to_recorded_lead(
     run: &SpawnedRun,
     endpoint: &Endpoint,
-    id: &str,
-    kind: &str,
-    content: &str,
-    envelope: &str,
-    payload: &str,
+    message: &LeadMessage<'_>,
     previous: Option<&Value>,
 ) -> io::Result<i32> {
     if let Some(previous) = previous {
-        return reconcile_recorded_lead(
-            run, endpoint, id, kind, content, envelope, payload, previous,
-        );
+        return reconcile_recorded_lead(run, endpoint, message, previous);
     }
     let mut conversation = Conversation::attach(endpoint, CONTROL_BOUND).map_err(|error| {
         invalid(&format!(
@@ -2404,23 +2391,23 @@ fn deliver_to_recorded_lead(
     // The attempt is recorded before the request, so an invocation that is
     // interrupted mid-request leaves its identity behind instead of an
     // invitation to deliver the same words again.
-    record_lead_message(
-        run,
-        id,
-        kind,
-        content,
-        "",
-        STATUS_PENDING,
-        "the input is being submitted to the lead conversation and its own items are being read",
-        0,
-    )?;
+    let pending = LeadAttempt {
+        status: STATUS_PENDING,
+        method: String::new(),
+        attempts: 0,
+        detail:
+            "the input is being submitted to the lead conversation and its own items are being read"
+                .to_owned(),
+    };
+    record_lead_message(run, message, &pending)?;
     let mut sent_method = String::new();
     let mut sent = 0u64;
     let mut refused = String::new();
     let mut outcome: Option<LeadAttempt> = None;
     for _ in 0..DELIVERY_ROUNDS {
         let active = active_turn(&thread);
-        let (method, params) = request_params(&run.lead_thread, id, envelope, &active);
+        let (method, params) =
+            request_params(&run.lead_thread, message.id, message.envelope, &active);
         sent_method = method.to_owned();
         sent += 1;
         match conversation.request(method, params) {
@@ -2428,8 +2415,8 @@ fn deliver_to_recorded_lead(
                 let turn = answer_turn(&result);
                 let evidence = observe_input(
                     &mut conversation,
-                    id,
-                    envelope,
+                    message.id,
+                    message.envelope,
                     Instant::now() + EVIDENCE_WINDOW,
                 );
                 // Transport acceptance is never delivery; only the lead
@@ -2518,17 +2505,15 @@ fn deliver_to_recorded_lead(
             "{sent_method} was refused in every delivery round ({refused}); nothing was delivered"
         ),
     });
-    record_lead_message(
+    record_lead_message(run, message, &attempt)?;
+    report_lead_message(
         run,
-        id,
-        kind,
-        content,
-        &attempt.method,
-        attempt.status,
-        &attempt.detail,
-        attempt.attempts,
-    )?;
-    report_lead_message(run, id, kind, &attempt, payload.len(), None)
+        message.id,
+        message.kind,
+        &attempt,
+        message.payload.len(),
+        None,
+    )
 }
 
 /// Address fields supplied beside `--reply-to`. A present field that does not

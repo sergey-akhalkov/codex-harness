@@ -1522,10 +1522,16 @@ fn accepted_invocation(acceptance: &Value) -> bool {
     }
 }
 
-fn finish_probe(
+/// What one delivery probe exercises: the conversation state it starts from,
+/// the input route it uses and the native method that route names.
+struct ProbeCase {
     state: &'static str,
     route: &'static str,
     method: &'static str,
+}
+
+fn finish_probe(
+    case: ProbeCase,
     thread: &str,
     turn: &str,
     acceptance: &Value,
@@ -1535,11 +1541,11 @@ fn finish_probe(
     let accepted = accepted_invocation(acceptance);
     let delivered = seen.native_item && seen.provider_on_thread;
     let timely = delivered
-        && (state == "idle" || seen.provider_same_turn || seen.provider_before_completion);
+        && (case.state == "idle" || seen.provider_same_turn || seen.provider_before_completion);
     let probe = LeadProbe {
-        state,
-        route,
-        method,
+        state: case.state,
+        route: case.route,
+        method: case.method,
         accepted,
         native_item: seen.native_item,
         marker_event: seen.marker_event,
@@ -1552,9 +1558,9 @@ fn finish_probe(
     fs::write(
         evidence.join("lead-input-probe.json"),
         serde_json::to_vec_pretty(&json!({
-            "state": state,
-            "route": route,
-            "method": method,
+            "state": case.state,
+            "route": case.route,
+            "method": case.method,
             "threadId": thread,
             "turnId": turn,
             "accepted": accepted,
@@ -1672,9 +1678,11 @@ fn probe_generation(route: &'static str) -> LeadProbe {
     );
     seen.provider_before_completion |= during_hold;
     finish_probe(
-        "generation",
-        route,
-        method,
+        ProbeCase {
+            state: "generation",
+            route,
+            method,
+        },
         &thread,
         &turn,
         &acceptance,
@@ -1760,9 +1768,11 @@ fn probe_tool_observation_wait(route: &'static str) -> LeadProbe {
         Instant::now() + Duration::from_secs(25),
     );
     finish_probe(
-        "tool_observation_wait",
-        route,
-        method,
+        ProbeCase {
+            state: "tool_observation_wait",
+            route,
+            method,
+        },
         &thread,
         &turn,
         &acceptance,
@@ -1805,9 +1815,11 @@ fn probe_idle(route: &'static str) -> LeadProbe {
         Instant::now() + Duration::from_secs(20),
     );
     finish_probe(
-        "idle",
-        route,
-        method,
+        ProbeCase {
+            state: "idle",
+            route,
+            method,
+        },
         &thread,
         &turn,
         &acceptance,
