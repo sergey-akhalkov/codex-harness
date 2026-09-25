@@ -2,12 +2,20 @@
 //! conversation.
 //!
 //! The command addresses one run through the accepted checkout, the kit home,
-//! the slot, the owner and, when given, the exact recorded session; verifies the
-//! recorded slot binding, the live lease, the recorded host identity, the
-//! app-server child and the run's own state; and then delivers the literal text,
-//! from `--text` or from a UTF-8 `--file`, with no shell evaluation and its real
-//! line breaks, into that run's recorded conversation through
-//! `endpoint-<index>.json`.
+//! the slot, the owner and, when given, the exact recorded session. A lead
+//! reply instead supplies only `--reply-to MESSAGE_ID` and `--text` or a UTF-8
+//! `--file`. That id is resolved from the compact lifecycle lookup `lead
+//! message` writes; the lookup is a locator, not sender identity. Either form
+//! verifies the recorded slot binding, the live lease, the recorded host
+//! identity, the app-server child and the run's own state, then delivers the
+//! literal text, with no shell evaluation and its real line breaks, into that
+//! run's recorded conversation through `endpoint-<index>.json`.
+//!
+//! Reply resolution fails closed before any send: an unknown or retired id,
+//! another lead, a reused slot or generation, and a contradictory explicit
+//! address are refused. A fully addressed message without `--reply-to` keeps
+//! its current behavior. Reply addressing does not use the lead's working
+//! directory and does not start a listener.
 //!
 //! It never starts a conversation: an active turn is steered with `turn/steer`
 //! at the nearest supported point (the tool call in flight is not interrupted),
@@ -111,6 +119,7 @@ impl Request {
         let mut session = None;
         let mut text = None;
         let mut file = None;
+        let mut reply_to = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let key = arg
@@ -127,12 +136,10 @@ impl Request {
                 "--session" => session = Some(option_text(value)?),
                 "--text" => text = Some(option_text(value)?),
                 "--file" => file = Some(PathBuf::from(value)),
+                "--reply-to" => reply_to = Some(option_text(value)?),
                 _ => return Err(invalid("invalid native executor options")),
             }
         }
-        let owner = owner
-            .filter(|owner| !owner.trim().is_empty())
-            .ok_or_else(|| invalid("--owner ID is required"))?;
         let text = match (text, file) {
             (Some(_), Some(_)) => {
                 return Err(invalid(
@@ -152,14 +159,37 @@ impl Request {
                 "the message is empty; nothing would be delivered to the conversation",
             ));
         }
+        let slot = match slot {
+            Some(value) => Some(
+                value
+                    .parse()
+                    .map_err(|_| invalid("--slot must be a positive pool slot index"))?,
+            ),
+            None => None,
+        };
+        let owner = match owner {
+            Some(owner) if !owner.trim().is_empty() => Some(owner),
+            Some(_) => return Err(invalid("--owner ID is required")),
+            None => None,
+        };
+        if let Some(id) = reply_to {
+            return resolve_reply(
+                &id,
+                &ExplicitAddress {
+                    source,
+                    codex_home,
+                    slot,
+                    owner,
+                    session,
+                },
+                text,
+            );
+        }
         Ok(Self {
             source: required(source, "--source")?,
             codex_home: required(codex_home, "--codex-home")?,
-            slot: slot
-                .ok_or_else(|| invalid("--slot is required"))?
-                .parse()
-                .map_err(|_| invalid("--slot must be a positive pool slot index"))?,
-            owner,
+            slot: slot.ok_or_else(|| invalid("--slot is required"))?,
+            owner: owner.ok_or_else(|| invalid("--owner ID is required"))?,
             session,
             text,
         })
@@ -1961,6 +1991,15 @@ fn record_lead_message(
     status: &str,
     lead_thread: &str,
 ) -> io::Result<()> {
+    let current = read_receipt_value(receipt)?;
+    let generation = current["originatingLead"]["runGeneration"]
+        .as_str()
+        .unwrap_or("unavailable");
+    let session = current["observation"]["session"]
+        .as_str()
+        .unwrap_or("unavailable");
+    let owner = current["slot"]["owner"].as_str().unwrap_or("unavailable");
+    let slot = current["slot"]["index"].as_u64().unwrap_or(0);
     let mut messages = recorded_lead_messages(receipt)?;
     messages.push(json!({
         "id": id,
@@ -1968,8 +2007,298 @@ fn record_lead_message(
         "method": method,
         "status": status,
         "leadThreadId": lead_thread,
+        "runGeneration": generation,
+        "session": session,
+        "slot": slot,
+        "owner": owner,
     }));
-    observation::update_receipt_field(receipt, "leadMessages", Value::Array(messages))
+    observation::update_receipt_field(receipt, "leadMessages", Value::Array(messages))?;
+    if kind == KIND_REQUEST {
+        write_reply_index(receipt, id)?;
+    }
+    Ok(())
+}
+
+/// Address fields supplied beside `--reply-to`. A present field that does not
+/// name the resolved run is a contradiction and is refused before delivery.
+struct ExplicitAddress {
+    source: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    slot: Option<u32>,
+    owner: Option<String>,
+    session: Option<String>,
+}
+
+fn valid_reply_id(id: &str) -> bool {
+    let Some(hex) = id.strip_prefix("lead-") else {
+        return false;
+    };
+    hex.len() == 24
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn unknown_reply(id: &str) -> io::Error {
+    invalid(&format!(
+        "unknown message id {id}; refusing before any send"
+    ))
+}
+
+fn retired_reply(id: &str) -> io::Error {
+    invalid(&format!(
+        "retired message id {id}; refusing before any send"
+    ))
+}
+
+fn reply_index_path(home: &Path, id: &str) -> io::Result<PathBuf> {
+    if !valid_reply_id(id) {
+        return Err(unknown_reply(id));
+    }
+    Ok(home
+        .join("harness")
+        .join("executor-pool")
+        .join("message-index")
+        .join(format!("{id}.json")))
+}
+
+/// Locator only: the receipt path is re-read and is not sender authority.
+fn write_reply_index(receipt: &Path, id: &str) -> io::Result<()> {
+    let home = std::env::var_os("CODEX_HOME").ok_or_else(|| {
+        invalid(
+            "reply reference could not be recorded: CODEX_HOME is not set; refusing to publish an unresolvable id",
+        )
+    })?;
+    let Some(receipt) = receipt.to_str() else {
+        return Err(invalid(
+            "reply reference could not be recorded: the receipt path is not Unicode",
+        ));
+    };
+    if Path::new(receipt).is_relative() {
+        return Err(invalid(
+            "reply reference could not be recorded: the receipt path is not absolute",
+        ));
+    }
+    let path = reply_index_path(Path::new(&home), id)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let body = json!({
+        "schema": 1,
+        "id": id,
+        "receipt": receipt,
+    });
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|error| invalid(&format!("reply reference could not be recorded: {error}")))?;
+    fs::write(&path, bytes)
+        .map_err(|error| invalid(&format!("reply reference could not be recorded: {error}")))
+}
+
+fn reply_home() -> io::Result<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME").ok_or_else(|| {
+        invalid(
+            "reply-to cannot resolve the message record: CODEX_HOME is not set; refusing before any send",
+        )
+    })?;
+    if home.is_empty() {
+        return Err(invalid(
+            "reply-to cannot resolve the message record: CODEX_HOME is blank; refusing before any send",
+        ));
+    }
+    Ok(PathBuf::from(home))
+}
+
+fn receipt_in_pool(home: &Path, receipt: &Path) -> bool {
+    if receipt.is_relative() {
+        return false;
+    }
+    let root = home.join("harness").join("executor-pool");
+    match (fs::canonicalize(&root), fs::canonicalize(receipt)) {
+        (Ok(root), Ok(receipt)) => receipt.starts_with(root),
+        _ => false,
+    }
+}
+
+fn reply_run_ended(state: &str) -> bool {
+    matches!(
+        state,
+        STATE_COMPLETED
+            | STATE_STOPPED
+            | STATE_PARTIAL_STOP
+            | STATE_FAILED
+            | STATE_DEFECT
+            | STATE_INTERRUPTED
+    )
+}
+
+fn verify_calling_lead(lead: &control::OriginatingLead) -> io::Result<()> {
+    let thread = match std::env::var("CODEX_THREAD_ID") {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(invalid(
+                "another lead cannot use this reply reference: CODEX_THREAD_ID is missing; refusing before any send",
+            ));
+        }
+    };
+    if thread.trim() != lead.thread_id {
+        return Err(invalid(
+            "another lead cannot use this reply reference; refusing before any send",
+        ));
+    }
+    require_live(
+        lead.dispatcher.pid,
+        lead.dispatcher.creation_time,
+        &lead.dispatcher.program,
+        "the originating lead is not the live dispatching process",
+    )?;
+    if !caller_in_lineage(lead.dispatcher.pid) {
+        return Err(invalid(
+            "another lead cannot use this reply reference; refusing before any send",
+        ));
+    }
+    Ok(())
+}
+
+fn addresses_differ(given: &Path, recorded: &Path) -> bool {
+    !recorded.as_os_str().is_empty() && !same_directory(given, recorded)
+}
+
+fn reject_contradictory(explicit: &ExplicitAddress, request: &Request) -> io::Result<()> {
+    let source = explicit
+        .source
+        .as_deref()
+        .is_some_and(|path| addresses_differ(path, &request.source));
+    let home = explicit
+        .codex_home
+        .as_deref()
+        .is_some_and(|path| addresses_differ(path, &request.codex_home));
+    let slot = explicit.slot.is_some_and(|slot| slot != request.slot);
+    let owner = explicit
+        .owner
+        .as_deref()
+        .is_some_and(|owner| owner != request.owner);
+    let session = explicit
+        .session
+        .as_deref()
+        .is_some_and(|session| Some(session) != request.session.as_deref());
+    if source || home || slot || owner || session {
+        return Err(invalid(
+            "contradictory explicit address mixed with --reply-to; refusing before any send",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves one lead reply to the executor run that sent it, then returns the
+/// addressed request the existing steer/start path already delivers. Nothing
+/// here connects to an endpoint.
+fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Result<Request> {
+    if !valid_reply_id(id) {
+        return Err(unknown_reply(id));
+    }
+    let home = reply_home()?;
+    let index = reply_index_path(&home, id)?;
+    if !index.is_file() {
+        return Err(unknown_reply(id));
+    }
+    let pointer = fs::read(&index).map_err(|_| retired_reply(id))?;
+    let pointer: Value = serde_json::from_slice(&pointer).map_err(|_| retired_reply(id))?;
+    if pointer["schema"].as_u64() != Some(1)
+        || pointer["id"].as_str() != Some(id)
+        || pointer["retired"].as_bool() == Some(true)
+    {
+        return Err(retired_reply(id));
+    }
+    let Some(receipt_path) = pointer["receipt"].as_str() else {
+        return Err(retired_reply(id));
+    };
+    let receipt_path = PathBuf::from(receipt_path);
+    if !receipt_path.is_file() || !receipt_in_pool(&home, &receipt_path) {
+        return Err(retired_reply(id));
+    }
+    let value = read_receipt_value(&receipt_path).map_err(|_| retired_reply(id))?;
+    let Some(entry) = value["leadMessages"].as_array().and_then(|messages| {
+        messages
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(id))
+    }) else {
+        return Err(retired_reply(id));
+    };
+    if entry["kind"].as_str() != Some(KIND_REQUEST) {
+        return Err(retired_reply(id));
+    }
+    let lead: control::OriginatingLead =
+        serde_json::from_value(value["originatingLead"].clone()).map_err(|_| retired_reply(id))?;
+    if entry["runGeneration"].as_str() != Some(lead.run_generation.as_str())
+        || entry["leadThreadId"].as_str() != Some(lead.thread_id.as_str())
+    {
+        return Err(invalid(&format!(
+            "retired message id {id}: sender generation was reused; refusing before any send"
+        )));
+    }
+    let state = value["observation"]["state"].as_str().unwrap_or("");
+    if reply_run_ended(state) {
+        return Err(retired_reply(id));
+    }
+    verify_calling_lead(&lead)?;
+    let source = PathBuf::from(
+        value["slot"]["source"]
+            .as_str()
+            .ok_or_else(|| retired_reply(id))?,
+    );
+    let worktree = PathBuf::from(value["slot"]["path"].as_str().unwrap_or(""));
+    let slot = u32::try_from(
+        value["slot"]["index"]
+            .as_u64()
+            .ok_or_else(|| retired_reply(id))?,
+    )
+    .map_err(|_| retired_reply(id))?;
+    let owner = value["slot"]["owner"]
+        .as_str()
+        .ok_or_else(|| retired_reply(id))?
+        .to_owned();
+    let session = value["observation"]["session"]
+        .as_str()
+        .ok_or_else(|| retired_reply(id))?
+        .to_owned();
+    if entry["session"].as_str() != Some(session.as_str())
+        || entry["owner"].as_str() != Some(owner.as_str())
+        || entry["slot"].as_u64() != Some(u64::from(slot))
+        || worktree.as_os_str().is_empty()
+    {
+        return Err(invalid(&format!(
+            "reused slot {slot} or generation cannot receive reply {id}; refusing before any send"
+        )));
+    }
+    let record = task_worktree::load_slot_record(&home, &source, slot).map_err(|error| {
+        invalid(&format!(
+            "reused slot {slot} cannot receive reply {id}: {error}; refusing before any send"
+        ))
+    })?;
+    let Some(record) = record else {
+        return Err(invalid(&format!(
+            "reused slot {slot} cannot receive reply {id}; refusing before any send"
+        )));
+    };
+    if record.index != slot
+        || record.owner.as_deref() != Some(owner.as_str())
+        || addresses_differ(&record.source, &source)
+        || addresses_differ(&record.path, &worktree)
+    {
+        return Err(invalid(&format!(
+            "reused slot {slot} cannot receive reply {id}; refusing before any send"
+        )));
+    }
+    let request = Request {
+        source,
+        codex_home: home,
+        slot,
+        owner,
+        session: Some(session),
+        text,
+    };
+    reject_contradictory(explicit, &request)?;
+    Ok(request)
 }
 
 fn report_indeterminate(
