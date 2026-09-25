@@ -1379,10 +1379,33 @@ impl Conversation {
         if self.thread_id.is_empty() {
             return Err(invalid("this control session has no thread identity"));
         }
-        let read = self.call(
+        let read = match self.request(
             "thread/read",
             json!({"threadId": self.thread_id, "includeTurns": true}),
-        )?;
+        )? {
+            Reply::Result(result) => result,
+            // codex-cli 0.156.1 rejects includeTurns on an idle thread with
+            // `list_turns is not supported yet`. A plain read still names the
+            // thread, so an idle conversation can receive turn/start.
+            Reply::Rejected(error) if error.to_string().contains("list_turns") => {
+                self.call("thread/read", json!({"threadId": self.thread_id}))?
+            }
+            Reply::Rejected(error) => {
+                return Err(io::Error::other(format!(
+                    "the native request thread/read was rejected: {}",
+                    excerpt(&error.to_string(), 400)
+                )));
+            }
+            Reply::Unanswered => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the native request thread/read was not answered within {:?}; the conversation state is unknown and must not be reported as progress",
+                        self.bound
+                    ),
+                ));
+            }
+        };
         let thread = &read["thread"];
         if thread["id"].as_str() != Some(self.thread_id.as_str()) {
             return Err(invalid(format!(
