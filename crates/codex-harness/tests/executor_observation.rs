@@ -3526,6 +3526,310 @@ struct StaleEndpoint {
     port: u16,
 }
 
+#[test]
+fn a_pending_request_that_loses_its_surface_is_not_waiting() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    let (host, session) = spawn_managed("waiting-surface-loss");
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "kept partial work").unwrap();
+    // The request becomes unresolved and its turn ends: the live run is
+    // actionable on its visible surface and keeps that surface.
+    write_reply_hold(&host, true);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    let waiting = watch_receipt(&host, "5");
+    let waiting_text = text(&waiting);
+    assert_eq!(
+        waiting.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{waiting_text}"
+    );
+    let held = receipt_json(&host.receipt);
+    assert_ne!(held["observation"]["state"], "completed", "{held}");
+    assert_ne!(held["observation"]["state"], "defect", "{held}");
+    let phases = frontend_phases(&host);
+    assert!(
+        phases.iter().any(|phase| phase["phase"] == "attached"),
+        "{phases:?}"
+    );
+
+    // The visible surface is lost while the request is still unanswered.
+    fs::write(host.home.join("frontend-release"), "release").unwrap();
+    let finished = wait_session(session);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "interrupted", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "the interrupted run lost its exact session: {receipt}"
+    );
+    assert!(
+        receipt["observation"]["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("frontend exited") && cause.contains("resume")),
+        "{receipt}"
+    );
+    // The request identity and the partial work stay for explicit recovery.
+    assert_eq!(receipt["replyRequests"][0]["id"], "req-1", "{receipt}");
+    assert_eq!(
+        receipt["replyRequests"][0]["status"], "unresolved",
+        "{receipt}"
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "kept partial work");
+    let slot: Value =
+        serde_json::from_slice(&fs::read(host.state.join("slot-1.json")).unwrap()).unwrap();
+    assert_eq!(slot["state"], "occupied", "{slot}");
+    assert_eq!(slot["owner"], CONTROL_OWNER, "{slot}");
+    assert_frontend_gone(&host, &double);
+    assert_backend_released(&host);
+
+    // A run whose surface is gone is never the actionable waiting result.
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(watched_text.contains("state=interrupted"), "{watched_text}");
+    assert!(
+        !watched_text.contains("action required"),
+        "a lost surface was reported as waiting: {watched_text}"
+    );
+}
+
+#[test]
+fn a_native_server_failure_while_a_request_is_pending_is_not_waiting() {
+    let (mut host, session) = spawn_managed("waiting-server-loss");
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "kept partial work").unwrap();
+    write_reply_hold(&host, true);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    let waiting = watch_receipt(&host, "5");
+    let waiting_text = text(&waiting);
+    assert_eq!(
+        waiting.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{waiting_text}"
+    );
+
+    // The native server this conversation is bound to fails while the request
+    // is unanswered.
+    host.disconnect();
+    let finished = wait_session(session);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = receipt_json(&host.receipt);
+    assert_ne!(
+        receipt["observation"]["state"], "completed",
+        "a lost native server was reported as success: {receipt}"
+    );
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "the failed run lost its exact session: {receipt}"
+    );
+    assert_eq!(
+        receipt["replyRequests"][0]["status"], "unresolved",
+        "the unanswered request was dropped: {receipt}"
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "kept partial work");
+    let slot: Value =
+        serde_json::from_slice(&fs::read(host.state.join("slot-1.json")).unwrap()).unwrap();
+    assert_eq!(slot["state"], "occupied", "{slot}");
+    assert_eq!(slot["owner"], CONTROL_OWNER, "{slot}");
+
+    // The dead conversation is never offered as a reply-capable wait, and its
+    // request cannot be answered as if it were still live.
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(
+        !watched_text.contains("action required"),
+        "a failed native server was reported as waiting: {watched_text}"
+    );
+    assert!(!watched_text.contains("state=completed"), "{watched_text}");
+}
+
+/// The recorded reply reference of an unresolved request, published the way
+/// `lead message` publishes it, so the reply path itself decides its fate.
+const WAITING_REPLY_ID: &str = "lead-0123456789abcdef01234567";
+
+fn plant_waiting_reply_reference(host: &ControlHost) {
+    let mut receipt = receipt_json(&host.receipt);
+    receipt["leadMessages"] = json!([{
+        "schema": 1,
+        "id": WAITING_REPLY_ID,
+        "kind": "reply-request",
+        "status": "delivered",
+        "requiresReply": true,
+        "leadThreadId": "01a0c719-f4d4-7880-a9d2-1a96ee0f2301",
+        "session": CONTROL_THREAD,
+        "owner": CONTROL_OWNER,
+        "slot": 1
+    }]);
+    fs::write(&host.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let index = host
+        .home
+        .join("harness/executor-pool/message-index")
+        .join(format!("{WAITING_REPLY_ID}.json"));
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    fs::write(
+        &index,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "id": WAITING_REPLY_ID,
+            "receipt": host.receipt.to_str().unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn reply_with_reference(host: &ControlHost, id: &str) -> Output {
+    let mut command = lead_command();
+    command
+        .args([
+            "executor",
+            "message",
+            "--reply-to",
+            id,
+            "--text",
+            "one answer for the waiting run",
+        ])
+        .env("CODEX_HOME", &host.home)
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .current_dir(&host.home);
+    command.output().unwrap()
+}
+
+/// `executor stop` addresses one run through its registered checkout, so the
+/// fixture source carries the same minimal project layout a real dispatch uses.
+fn register_checkout(source: &Path) {
+    fs::create_dir_all(source.join("global")).unwrap();
+    fs::write(
+        source.join("global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 1\n",
+    )
+    .unwrap();
+    git(source, &["init", "-q", "--initial-branch=main"]);
+    git(source, &["add", "."]);
+    git(
+        source,
+        &[
+            "-c",
+            "user.email=stop@example.test",
+            "-c",
+            "user.name=Stop",
+            "commit",
+            "-qm",
+            "seed",
+        ],
+    );
+}
+
+#[test]
+fn stopping_a_waiting_run_invalidates_the_reply_and_preserves_the_slot() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    let (host, session) = spawn_managed("waiting-stop");
+    register_checkout(&host.source);
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "kept partial work").unwrap();
+    plant_waiting_reply_reference(&host);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    let waiting = watch_receipt(&host, "5");
+    let waiting_text = text(&waiting);
+    assert_eq!(
+        waiting.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "the stop check needs a run that is actually waiting: {waiting_text}"
+    );
+    assert!(
+        waiting_text.contains(&format!("--reply-to {WAITING_REPLY_ID}")),
+        "{waiting_text}"
+    );
+
+    // The explicit urgent stop ends that exact waiting run.
+    let stopped = lead_command()
+        .args([
+            "executor",
+            "stop",
+            "--source",
+            host.source.to_str().unwrap(),
+            "--codex-home",
+            host.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            CONTROL_OWNER,
+            "--timeout",
+            "20",
+        ])
+        .output()
+        .unwrap();
+    let stopped_text = text(&stopped);
+    assert_eq!(stopped.status.code(), Some(0), "{stopped_text}");
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
+    assert_eq!(receipt["stop"]["outcome"], "stopped", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "the stop ended another conversation: {receipt}"
+    );
+    let finished = wait_session(session);
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_frontend_gone(&host, &double);
+    assert_backend_released(&host);
+
+    // Files and slot remain for explicit recovery.
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "kept partial work");
+    let slot: Value =
+        serde_json::from_slice(&fs::read(host.state.join("slot-1.json")).unwrap()).unwrap();
+    assert_eq!(slot["state"], "occupied", "{slot}");
+    assert_eq!(slot["owner"], CONTROL_OWNER, "{slot}");
+
+    // The stopped run is not waiting, and the recorded request stays visible
+    // as an unanswered request of a run that ended.
+    let watched = watch_receipt(&host, "10");
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(watched_text.contains("state=stopped"), "{watched_text}");
+    assert!(
+        !watched_text.contains("action required"),
+        "a stopped run was reported as waiting: {watched_text}"
+    );
+
+    // The pending reply is invalidated: the answer reaches neither the ended
+    // run nor a replacement conversation, and nothing is resumed.
+    let steers = host.server().requests_for("turn/steer").len();
+    let turns = host.server().requests_for("turn/start").len();
+    let resumes = host.server().requests_for("thread/resume").len();
+    let reply = reply_with_reference(&host, WAITING_REPLY_ID);
+    let reply_text = text(&reply);
+    assert_eq!(reply.status.code(), Some(2), "{reply_text}");
+    assert!(
+        reply_text.contains(&format!("retired message id {WAITING_REPLY_ID}")),
+        "{reply_text}"
+    );
+    assert_eq!(
+        host.server().requests_for("turn/steer").len(),
+        steers,
+        "a reply reached the stopped run: {reply_text}"
+    );
+    assert_eq!(
+        host.server().requests_for("turn/start").len(),
+        turns,
+        "a reply started a conversation on the stopped run: {reply_text}"
+    );
+    assert!(
+        host.server().requests_for("thread/resume").len() == resumes,
+        "a reply resumed the stopped run: {reply_text}"
+    );
+    let after = receipt_json(&host.receipt);
+    assert_eq!(after["observation"]["state"], "stopped", "{after}");
+    assert_eq!(
+        after["leadMessages"][0]["id"], WAITING_REPLY_ID,
+        "the unanswered request was dropped: {after}"
+    );
+}
+
 fn plant_stale_endpoint(host: &ControlHost, thread_id: &str) -> StaleEndpoint {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -3753,6 +4057,29 @@ fn restart_starts_a_fresh_session_and_ignores_the_stale_endpoint() {
     receipt["control"]["originalAssignment"] = json!(CONTROL_ASSIGNMENT);
     receipt["observation"]["previousSession"] = json!(CONTROL_THREAD);
     receipt["observation"]["session"] = Value::Null;
+    // The continuation of a spawned run keeps its originating lead
+    // relationship; its own new session is not that lead.
+    let lead_thread = "01a0c719-f4d4-7880-a9d2-1a96ee0f2301";
+    let dispatcher_program = std::env::current_exe().unwrap();
+    let dispatcher_user = harness_core::process_service::current_user().unwrap();
+    let dispatcher = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &dispatcher_program,
+        0,
+        &dispatcher_user,
+    )
+    .unwrap()
+    .identity();
+    receipt["originatingLead"] = json!({
+        "schema": 1,
+        "threadId": lead_thread,
+        "runGeneration": "generation-continuation",
+        "dispatcher": {
+            "pid": dispatcher.pid,
+            "creationTime": dispatcher.creation_time,
+            "program": dispatcher_program,
+        }
+    });
     write_receipt(&host, &receipt);
     host.server().answer(
         "thread/start",
@@ -3848,6 +4175,18 @@ fn restart_starts_a_fresh_session_and_ignores_the_stale_endpoint() {
     assert_ne!(
         observed["observation"]["session"],
         observed["observation"]["previousSession"]
+    );
+    assert_eq!(
+        observed["originatingLead"]["threadId"], lead_thread,
+        "the continuation replaced its originating lead: {observed}"
+    );
+    assert_eq!(
+        observed["originatingLead"]["runGeneration"], "generation-continuation",
+        "{observed}"
+    );
+    assert_ne!(
+        observed["observation"]["session"], lead_thread,
+        "the successor run was silently reparented to its lead: {observed}"
     );
     assert_successor_endpoint(&host, FRESH_THREAD, &stale);
     assert_frontend_gone(&host, &double);

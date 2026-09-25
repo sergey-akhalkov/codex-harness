@@ -2563,6 +2563,47 @@ fn retired_reply(id: &str) -> io::Error {
     ))
 }
 
+/// A reply reference whose original run already ended. The reply reaches
+/// nothing, so the refusal names that run's own recorded state and the
+/// supported continuation instead of leaving the lead to guess or address a
+/// replacement conversation.
+fn retired_reply_after_end(
+    id: &str,
+    state: &str,
+    home: &Path,
+    source: Option<&str>,
+    slot: Option<u64>,
+    owner: Option<&str>,
+    session: Option<&str>,
+) -> io::Error {
+    let (run, resume) = match (source, slot, owner) {
+        (Some(source), Some(slot), Some(owner)) => (
+            format!(
+                "its original run {owner} in slot {slot} of {source}{} ",
+                match session {
+                    Some(session) => format!(" (session {session})"),
+                    None => String::new(),
+                }
+            ),
+            format!(
+                "`codex-harness executor resume --source {source} --codex-home {} --slot {slot} --owner {owner}{}` continues that exact recorded session",
+                home.display(),
+                match session {
+                    Some(session) => format!(" --session {session}"),
+                    None => String::new(),
+                }
+            ),
+        ),
+        _ => (
+            "its original run ".to_owned(),
+            "`codex-harness executor resume --source SOURCE --codex-home CODEX_HOME --slot SLOT --owner OWNER` continues that exact recorded session".to_owned(),
+        ),
+    };
+    invalid(&format!(
+        "retired message id {id}; refusing before any send: {run}ended as `{state}`, so this reply was not delivered and no other conversation was started. Next action: {resume}, or inspect the run with `executor watch`"
+    ))
+}
+
 fn reply_index_path(home: &Path, id: &str) -> io::Result<PathBuf> {
     if !valid_reply_id(id) {
         return Err(unknown_reply(id));
@@ -2750,7 +2791,15 @@ fn resolve_reply(id: &str, explicit: &ExplicitAddress, text: String) -> io::Resu
     }
     let state = value["observation"]["state"].as_str().unwrap_or("");
     if reply_run_ended(state) {
-        return Err(retired_reply(id));
+        return Err(retired_reply_after_end(
+            id,
+            state,
+            &home,
+            value["slot"]["source"].as_str(),
+            value["slot"]["index"].as_u64(),
+            value["slot"]["owner"].as_str(),
+            value["observation"]["session"].as_str(),
+        ));
     }
     verify_calling_lead(&lead)?;
     let source = PathBuf::from(

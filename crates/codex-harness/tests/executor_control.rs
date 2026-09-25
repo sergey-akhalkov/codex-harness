@@ -916,6 +916,198 @@ fn one_open_reply_request_holds_until_the_last_one_is_resolved() {
 }
 
 #[test]
+fn a_hold_in_the_terminal_burst_keeps_the_run_live_and_the_exact_thread() {
+    // The question is already unresolved when the whole terminal burst
+    // arrives in one batch: the turn's own status must not finish the run
+    // between acceptance and the reply.
+    let (root, server, mut conversation, job) = start_held(json!([{
+        "id": "lead-0123456789abcdef01234567",
+        "kind": "reply-request",
+        "status": "delivered"
+    }]));
+    let assigned = conversation.assign("which contract applies").unwrap();
+    assert_eq!(assigned.turn_id, TURN);
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "item/completed",
+        "params": {"threadId": THREAD, "item": {
+            "id": "m1", "type": "agentMessage", "text": FINAL}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let events = drain(&mut conversation, 3);
+    assert_ne!(
+        conversation.lifecycle(),
+        Some(Lifecycle::Completed),
+        "a terminal turn finished a run with an unresolved reply hold: {events:?}"
+    );
+    assert_ne!(conversation.lifecycle(), Some(Lifecycle::Defect));
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Running));
+    assert_eq!(conversation.thread_id(), THREAD);
+    assert_eq!(
+        conversation.turn().map(|turn| turn.turn_id.as_str()),
+        Some(TURN)
+    );
+
+    let receipt_path = root.path().join("spawn-1.json");
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_ne!(receipt["inputClosure"], "begun", "{receipt}");
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "the driver rewrote the recorded request: {receipt}"
+    );
+
+    // The exact conversation is retained: the same recorded endpoint still
+    // names the same thread, and no replacement thread was started.
+    let endpoint = Endpoint::read(&root.path().join("endpoint-1.json")).unwrap();
+    assert_eq!(endpoint.thread_id.as_deref(), Some(THREAD));
+    assert_eq!(endpoint.port(), server.port);
+    assert_eq!(server.requests_for("thread/start").len(), 1);
+
+    // Resolving the request continues that same thread, and only then does the
+    // run finish with its own result.
+    let mut resolved: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    resolved["leadMessages"][0]["status"] = json!("resolved");
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&resolved).unwrap()).unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": "reply-turn", "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "item/completed",
+        "params": {"threadId": THREAD, "item": {
+            "id": "m2", "type": "agentMessage", "text": "reply applied"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": "reply-turn", "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 3);
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_eq!(conversation.thread_id(), THREAD);
+    assert!(
+        server.requests_for("thread/resume").is_empty(),
+        "waiting resumed the thread: {:?}",
+        server.requests_for("thread/resume")
+    );
+    assert_eq!(server.requests_for("thread/start").len(), 1);
+    drop(conversation);
+    drop(job);
+}
+
+#[test]
+fn input_after_closure_is_recorded_undelivered_once_and_no_stale_turn_reopens_the_run() {
+    // No request is pending, so the terminal turn finishes the run normally.
+    let (root, server, mut conversation, job) = start_held(json!([]));
+    conversation.assign("finish the assignment").unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "item/completed",
+        "params": {"threadId": THREAD, "item": {
+            "id": "m1", "type": "agentMessage", "text": FINAL}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 3);
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    let receipt_path = root.path().join("spawn-1.json");
+    let closed: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(closed["inputClosure"], "begun", "{closed}");
+
+    // A question registered after closure began, and the input that follows it,
+    // cannot reopen the run or become a second delivery.
+    let late = "late-0123456789abcdef01234567";
+    let mut reopened = closed.clone();
+    reopened["leadMessages"] = json!([{
+        "id": late,
+        "kind": "reply-request",
+        "status": "delivered"
+    }]);
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&reopened).unwrap()).unwrap();
+    server.push(json!({
+        "method": "item/started",
+        "params": {"threadId": THREAD, "item": {
+            "id": "late-1", "type": "userMessage", "text": "late answer",
+            "turnId": "late-turn"}}
+    }));
+    server.push(json!({
+        "method": "item/completed",
+        "params": {"threadId": THREAD, "item": {
+            "id": "late-1", "type": "userMessage", "text": "late answer",
+            "turnId": "late-turn"}}
+    }));
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": "late-turn", "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "item/completed",
+        "params": {"threadId": THREAD, "item": {
+            "id": "late-m", "type": "agentMessage", "text": "late result"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": "late-turn", "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 5);
+    assert_eq!(
+        conversation.lifecycle(),
+        Some(Lifecycle::Completed),
+        "a late turn reopened the closed run"
+    );
+    assert_eq!(conversation.defect(), None);
+    assert_eq!(conversation.thread_id(), THREAD);
+    assert_eq!(
+        conversation.turn().map(|turn| turn.turn_id.as_str()),
+        Some(TURN),
+        "a turn from after closure was adopted as this run's turn"
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    let messages = after["messages"].as_array().cloned().unwrap_or_default();
+    assert_eq!(messages.len(), 1, "{after}");
+    assert_eq!(messages[0]["id"], "late-1", "{after}");
+    assert_eq!(messages[0]["status"], "undelivered", "{after}");
+    assert_eq!(after["inputClosure"], "begun", "{after}");
+
+    // The same records observed again neither duplicate the undelivered input
+    // nor rewrite the retained result.
+    server.push(json!({
+        "method": "item/started",
+        "params": {"threadId": THREAD, "item": {
+            "id": "late-1", "type": "userMessage", "text": "late answer",
+            "turnId": "late-turn"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": "late-turn", "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    let repeated: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        repeated["messages"].as_array().map(Vec::len),
+        Some(1),
+        "{repeated}"
+    );
+    assert_eq!(conversation.lifecycle(), Some(Lifecycle::Completed));
+    assert_eq!(
+        conversation.final_message().unwrap(),
+        FinalMessage::Present(FINAL.to_owned())
+    );
+    drop(conversation);
+    drop(job);
+}
+
+#[test]
 fn failed_and_interrupted_turns_are_distinguished() {
     let recorded = recorded();
     let mut conversation = recorded.attach();
