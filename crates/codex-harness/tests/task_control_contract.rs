@@ -138,13 +138,54 @@ impl Client {
             self.pending.push_back(value);
         }
     }
+
+    /// Drains notifications for one short window without retaining them. A running
+    /// tool can emit more events than the contract pending bound, and this
+    /// comparison only needs to know whether the marker or turn completion was
+    /// among them.
+    fn drain_seen(&mut self, until: Instant, thread: &str, turn: &str, marker: &str) -> (bool, bool) {
+        let mut marker_event = false;
+        let mut turn_completed = false;
+        let note = |value: &Value, marker_event: &mut bool, turn_completed: &mut bool| {
+            if value["params"]["threadId"] == thread && value.to_string().contains(marker) {
+                *marker_event = true;
+            }
+            if !turn.is_empty()
+                && value["method"] == "turn/completed"
+                && value["params"]["threadId"] == thread
+                && value["params"]["turn"]["id"] == turn
+            {
+                *turn_completed = true;
+            }
+        };
+        for value in self.pending.drain(..) {
+            note(&value, &mut marker_event, &mut turn_completed);
+        }
+        while Instant::now() < until {
+            match self.connection.receive(Duration::from_millis(40)) {
+                Ok(Some(value)) => {
+                    writeln!(self.log, "{value}").unwrap();
+                    note(&value, &mut marker_event, &mut turn_completed);
+                }
+                Ok(None) => {}
+                Err(error) => panic!("control receive: {error}"),
+            }
+        }
+        (marker_event, turn_completed)
+    }
 }
 
 fn command(exe: &Path, home: &Path, workspace: &Path) -> CommandSpec {
     let mut command = CommandSpec::new(exe);
     command.current_dir = Some(workspace.into());
     command.env.insert("CODEX_HOME".into(), Some(home.into()));
-    for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+    for key in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+    ] {
         command.env.insert(key.into(), None);
     }
     command.env.insert(
@@ -1120,6 +1161,748 @@ fn native_executor_control_generation_interrupt() {
     release.store(true, Ordering::Relaxed);
     recorder.join().unwrap();
     fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+}
+
+const PROOF_PROMPT: &str = "Perform the owned proof command and return its consumed result.";
+
+struct ProviderHit {
+    file: String,
+    thread: String,
+    turn: String,
+}
+
+struct DeliverySeen {
+    native_item: bool,
+    marker_event: bool,
+    provider_on_thread: bool,
+    provider_same_turn: bool,
+    provider_before_completion: bool,
+    other_thread: bool,
+    turn_completed: bool,
+    hits: Vec<String>,
+}
+
+struct LeadProbe {
+    state: &'static str,
+    route: &'static str,
+    method: &'static str,
+    accepted: bool,
+    native_item: bool,
+    marker_event: bool,
+    provider_on_thread: bool,
+    timely: bool,
+    delivered: bool,
+    other_thread: bool,
+    evidence: PathBuf,
+}
+
+fn provider_hits(root: &Path, marker: &str) -> Vec<ProviderHit> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if name.starts_with("provider-") && name.ends_with(".json") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let mut hits = Vec::new();
+    for name in names {
+        let Ok(body) = fs::read(root.join(&name)) else {
+            continue;
+        };
+        if !String::from_utf8_lossy(&body).contains(marker) {
+            continue;
+        }
+        let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+            continue;
+        };
+        let (thread, turn) =
+            match harness_core::task_request::RequestIdentity::from_request(&request) {
+                Ok(identity) => (identity.thread, identity.turn),
+                Err(_) => (String::new(), String::new()),
+            };
+        hits.push(ProviderHit { file: name, thread, turn });
+    }
+    hits
+}
+
+fn text_bound(text: &str) -> &str {
+    let mut end = text.len().min(1200);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn read_http_message(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    let (start, length) = loop {
+        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&bytes[..end]).into_owned();
+            let length = header.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            });
+            let length = length.unwrap_or_else(|| {
+                panic!("provider exchange has no Content-Length:\n{header}")
+            });
+            assert!(length <= 2 * 1024 * 1024, "provider body limit");
+            break (end + 4, length);
+        }
+        assert!(bytes.len() < 64 * 1024, "provider header limit");
+        let mut chunk = [0; 4096];
+        let count = stream.read(&mut chunk).unwrap();
+        assert!(count != 0, "incomplete provider header");
+        bytes.extend_from_slice(&chunk[..count]);
+    };
+    while bytes.len() < start + length {
+        let mut chunk = [0; 4096];
+        let count = stream.read(&mut chunk).unwrap();
+        assert!(count != 0, "incomplete provider body");
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    bytes.truncate(start + length);
+    bytes
+}
+
+/// Holds the first canned Responses body so the owning turn stays in active
+/// generation. Later requests are forwarded immediately; a replacement request
+/// is itself subsequent provider input.
+struct GenerationGate {
+    port: u16,
+    held: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl GenerationGate {
+    fn start(upstream: u16, evidence: &Path) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let held_flag = held.clone();
+        let release_flag = release.clone();
+        let stop_flag = stop.clone();
+        let hold_first = Arc::new(AtomicBool::new(true));
+        let evidence = evidence.to_path_buf();
+        std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let held_flag = held_flag.clone();
+                        let release_flag = release_flag.clone();
+                        let hold_first = hold_first.clone();
+                        let evidence = evidence.clone();
+                        std::thread::spawn(move || {
+                            forward_held(
+                                stream,
+                                upstream,
+                                evidence,
+                                held_flag,
+                                release_flag,
+                                hold_first,
+                            );
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("generation gate accept: {error}"),
+                }
+            }
+        });
+        Self {
+            port,
+            held,
+            release,
+            stop,
+        }
+    }
+}
+
+impl Drop for GenerationGate {
+    fn drop(&mut self) {
+        self.release.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+fn forward_held(
+    mut client: std::net::TcpStream,
+    upstream: u16,
+    evidence: PathBuf,
+    held: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    hold_first: Arc<AtomicBool>,
+) {
+    client.set_nonblocking(false).unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let request = read_http_message(&mut client);
+    let _ = fs::write(
+        evidence.join("generation-gate-request.txt"),
+        &request[..request.len().min(800)],
+    );
+    let mut server = std::net::TcpStream::connect(("127.0.0.1", upstream)).unwrap();
+    server.set_nonblocking(false).unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    server
+        .set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    server.write_all(&request).unwrap();
+    let response = read_http_message(&mut server);
+    if hold_first.swap(false, Ordering::SeqCst) {
+        held.store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(30);
+        while !release.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = client.write_all(&response);
+}
+
+fn run_queue(fixture: &NativeFixture, thread: &str, message: &str, label: &str) -> Value {
+    let root = fixture.root.path();
+    let mut spec = command(&fixture.exe, &fixture.home, &fixture.workspace);
+    spec.args = vec![
+        "queue".into(),
+        "--thread".into(),
+        thread.into(),
+        "--message".into(),
+        message.into(),
+        "--remote".into(),
+        format!("ws://127.0.0.1:{}", fixture.port).into(),
+        "--remote-auth-token-env".into(),
+        "HARNESS_CONTROL_TOKEN".into(),
+    ];
+    spec.env.insert(
+        "HARNESS_CONTROL_TOKEN".into(),
+        Some(fixture.token.clone().into()),
+    );
+    let stdout_path = root.join(format!("{label}-stdout.txt"));
+    let stderr_path = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout_path).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr_path).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(Duration::from_secs(12)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    json!({
+        "exitCode": outcome.exit_code,
+        "exited": outcome.reason == StopReason::Exited,
+        "reason": format!("{:?}", outcome.reason),
+        "stdout": text_bound(&stdout),
+        "stderr": text_bound(&stderr),
+    })
+}
+
+fn start_owned_thread(client: &mut Client, workspace: &Path, proxy_port: Option<u16>) -> String {
+    let mut params = json!({
+        "cwd": workspace,
+        "model": "gpt-6-astra",
+        "modelProvider": "control_fixture",
+        "allowProviderModelFallback": false,
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access"
+    });
+    if let Some(port) = proxy_port {
+        params["config"] = json!({
+            "model_providers.control_fixture.base_url": format!("http://127.0.0.1:{port}/v1")
+        });
+    }
+    let started = client.request("thread/start", params);
+    assert_eq!(started["modelProvider"], "control_fixture", "{started}");
+    started["thread"]["id"].as_str().unwrap().to_owned()
+}
+
+fn thread_status(client: &mut Client, thread: &str) -> String {
+    client
+        .request("thread/read", json!({"threadId": thread}))["thread"]["status"]["type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn thread_has_marker(client: &mut Client, thread: &str, marker: &str) -> bool {
+    client
+        .request(
+            "thread/read",
+            json!({"threadId": thread, "includeTurns": true}),
+        )
+        .to_string()
+        .contains(marker)
+}
+
+fn watch_delivery(
+    owner: &mut Client,
+    root: &Path,
+    thread: &str,
+    turn: &str,
+    marker: &str,
+    until: Instant,
+) -> DeliverySeen {
+    let mut seen = DeliverySeen {
+        native_item: false,
+        marker_event: false,
+        provider_on_thread: false,
+        provider_same_turn: false,
+        provider_before_completion: false,
+        other_thread: false,
+        turn_completed: false,
+        hits: Vec::new(),
+    };
+    while Instant::now() < until {
+        let hits = provider_hits(root, marker);
+        if hits.iter().any(|hit| hit.thread != thread) {
+            seen.other_thread = true;
+        }
+        if let Some(hit) = hits.iter().find(|hit| hit.thread == thread) {
+            if !seen.provider_on_thread && !seen.turn_completed {
+                seen.provider_before_completion = true;
+            }
+            seen.provider_on_thread = true;
+            seen.provider_same_turn |= !turn.is_empty() && hit.turn == turn;
+            seen.hits = hits
+                .iter()
+                .map(|hit| format!("{}:{}:{}", hit.file, hit.thread, hit.turn))
+                .collect();
+        }
+        let (marker_event, completed) =
+            owner.drain_seen(Instant::now() + Duration::from_millis(80), thread, turn, marker);
+        seen.marker_event |= marker_event;
+        seen.turn_completed |= completed;
+        if !seen.native_item {
+            seen.native_item = thread_has_marker(owner, thread, marker);
+        }
+        if seen.native_item && seen.provider_on_thread && (seen.turn_completed || seen.provider_before_completion)
+        {
+            break;
+        }
+    }
+    seen
+}
+
+fn accepted_invocation(acceptance: &Value) -> bool {
+    if acceptance.get("exitCode").is_some() {
+        acceptance["exited"] == true && acceptance["exitCode"] == 0
+    } else {
+        acceptance.get("error").is_none()
+    }
+}
+
+fn finish_probe(
+    state: &'static str,
+    route: &'static str,
+    method: &'static str,
+    thread: &str,
+    turn: &str,
+    acceptance: &Value,
+    seen: &DeliverySeen,
+    evidence: PathBuf,
+) -> LeadProbe {
+    let accepted = accepted_invocation(acceptance);
+    let delivered = seen.native_item && seen.provider_on_thread;
+    let timely =
+        delivered && (state == "idle" || seen.provider_same_turn || seen.provider_before_completion);
+    let probe = LeadProbe {
+        state,
+        route,
+        method,
+        accepted,
+        native_item: seen.native_item,
+        marker_event: seen.marker_event,
+        provider_on_thread: seen.provider_on_thread,
+        timely,
+        delivered,
+        other_thread: seen.other_thread,
+        evidence: evidence.clone(),
+    };
+    fs::write(
+        evidence.join("lead-input-probe.json"),
+        serde_json::to_vec_pretty(&json!({
+            "state": state,
+            "route": route,
+            "method": method,
+            "threadId": thread,
+            "turnId": turn,
+            "accepted": accepted,
+            "delivered": delivered,
+            "timely": timely,
+            "nativeItem": seen.native_item,
+            "markerEvent": seen.marker_event,
+            "providerOnOwningThread": seen.provider_on_thread,
+            "providerSameTurn": seen.provider_same_turn,
+            "providerBeforeCompletion": seen.provider_before_completion,
+            "otherThread": seen.other_thread,
+            "turnCompleted": seen.turn_completed,
+            "providerHits": seen.hits,
+            "acceptance": acceptance,
+            "deliveryDefinition": "owning-thread item plus subsequent provider input; help, exit 0 and RPC success are not delivery"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    probe
+}
+
+fn inject_input(
+    fixture: &NativeFixture,
+    owner: &mut Client,
+    route: &str,
+    thread: &str,
+    turn: &str,
+    marker: &str,
+    label: &str,
+) -> Value {
+    if route == "queue" {
+        run_queue(fixture, thread, marker, label)
+    } else if turn.is_empty() {
+        owner.raw_request(
+            "turn/start",
+            json!({"threadId": thread, "input": [{"type": "text", "text": marker}]}),
+        )
+    } else {
+        owner.raw_request(
+            "turn/steer",
+            json!({
+                "threadId": thread,
+                "expectedTurnId": turn,
+                "input": [{"type": "text", "text": marker}]
+            }),
+        )
+    }
+}
+
+fn probe_generation(route: &'static str) -> LeadProbe {
+    let fixture = native_fixture(true);
+    let root = fixture.root.path().to_path_buf();
+    let gate = GenerationGate::start(fixture._responses.port, &root);
+    let mut owner = Client::connect(fixture.port, &fixture.token, &root, "generation-owner");
+    let thread = start_owned_thread(&mut owner, &fixture.workspace, Some(gate.port));
+    let turn = owner
+        .request(
+            "turn/start",
+            json!({"threadId": thread, "input": [{"type": "text", "text": PROOF_PROMPT}]}),
+        )["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let until = Instant::now() + WAIT;
+    while !gate.held.load(Ordering::SeqCst) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        gate.held.load(Ordering::SeqCst),
+        "active generation did not reach the canned fixture; {}",
+        root.display()
+    );
+    assert_eq!(
+        thread_status(&mut owner, &thread),
+        "active",
+        "generation input must target the active owning turn"
+    );
+    let marker = if route == "queue" {
+        "LEAD_QUEUE_GENERATION_INPUT"
+    } else {
+        "LEAD_STEER_GENERATION_INPUT"
+    };
+    let method = if route == "queue" {
+        "codex queue --thread <owning-id> --remote <owning-endpoint>"
+    } else {
+        "turn/steer"
+    };
+    // Release even if the native RPC waits on the in-flight provider call.
+    // Three seconds is long enough to send input and short of an unbounded hold.
+    let release = gate.release.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        release.store(true, Ordering::SeqCst);
+    });
+    let acceptance = inject_input(&fixture, &mut owner, route, &thread, &turn, marker, "generation");
+    let during_hold = provider_hits(&root, marker)
+        .iter()
+        .any(|hit| hit.thread == thread);
+    gate.release.store(true, Ordering::SeqCst);
+    let mut seen = watch_delivery(
+        &mut owner,
+        &root,
+        &thread,
+        &turn,
+        marker,
+        Instant::now() + Duration::from_secs(25),
+    );
+    seen.provider_before_completion |= during_hold;
+    finish_probe(
+        "generation",
+        route,
+        method,
+        &thread,
+        &turn,
+        &acceptance,
+        &seen,
+        root,
+    )
+}
+
+fn probe_tool_observation_wait(route: &'static str) -> LeadProbe {
+    let fixture = native_fixture(true);
+    let root = fixture.root.path().to_path_buf();
+    // The canned fixture's close-view gate keeps this tool blocked until the
+    // observation release file appears. It does not emit `executor watch`, and
+    // this comparison does not spawn an executor.
+    fs::write(root.join("close-view"), "hold the owned tool for observation\n").unwrap();
+    let mut owner = Client::connect(fixture.port, &fixture.token, &root, "tool-owner");
+    let thread = start_owned_thread(&mut owner, &fixture.workspace, None);
+    let turn = owner
+        .request(
+            "turn/start",
+            json!({"threadId": thread, "input": [{"type": "text", "text": PROOF_PROMPT}]}),
+        )["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    owner.event(|value| {
+        value["method"] == "item/started"
+            && value["params"]["threadId"] == thread
+            && value["params"]["item"]["type"] == "commandExecution"
+    });
+    let until = Instant::now() + WAIT;
+    while !fixture.workspace.join("proof.txt").is_file() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        fixture.workspace.join("proof.txt").is_file(),
+        "the owned tool did not enter its observation wait; {}",
+        root.display()
+    );
+    assert!(
+        !fixture.workspace.join("finish-tool").exists(),
+        "observation release must not already be present"
+    );
+    assert_eq!(thread_status(&mut owner, &thread), "active");
+    let marker = if route == "queue" {
+        "LEAD_QUEUE_TOOL_WAIT_INPUT"
+    } else {
+        "LEAD_STEER_TOOL_WAIT_INPUT"
+    };
+    let method = if route == "queue" {
+        "codex queue --thread <owning-id> --remote <owning-endpoint>"
+    } else {
+        "turn/steer"
+    };
+    let acceptance = inject_input(&fixture, &mut owner, route, &thread, &turn, marker, "tool-wait");
+    assert_eq!(
+        thread_status(&mut owner, &thread),
+        "active",
+        "input during the observation wait must not require the tool to finish first"
+    );
+    fs::write(
+        fixture.workspace.join("finish-tool"),
+        "release owned observation\n",
+    )
+    .unwrap();
+    let seen = watch_delivery(
+        &mut owner,
+        &root,
+        &thread,
+        &turn,
+        marker,
+        Instant::now() + Duration::from_secs(25),
+    );
+    finish_probe(
+        "tool_observation_wait",
+        route,
+        method,
+        &thread,
+        &turn,
+        &acceptance,
+        &seen,
+        root,
+    )
+}
+
+fn probe_idle(route: &'static str) -> LeadProbe {
+    let fixture = native_fixture(true);
+    let root = fixture.root.path().to_path_buf();
+    let mut owner = Client::connect(fixture.port, &fixture.token, &root, "idle-owner");
+    let thread = start_owned_thread(&mut owner, &fixture.workspace, None);
+    assert_eq!(thread_status(&mut owner, &thread), "idle");
+    assert!(
+        !root.join("provider-1.json").exists(),
+        "an idle loaded thread must not call a model before input"
+    );
+    let marker = if route == "queue" {
+        "LEAD_QUEUE_IDLE_INPUT"
+    } else {
+        "LEAD_START_IDLE_INPUT"
+    };
+    let method = if route == "queue" {
+        "codex queue --thread <owning-id> --remote <owning-endpoint>"
+    } else {
+        "turn/start"
+    };
+    let acceptance = inject_input(&fixture, &mut owner, route, &thread, "", marker, "idle");
+    let turn = acceptance["result"]["turn"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let seen = watch_delivery(
+        &mut owner,
+        &root,
+        &thread,
+        &turn,
+        marker,
+        Instant::now() + Duration::from_secs(20),
+    );
+    finish_probe("idle", route, method, &thread, &turn, &acceptance, &seen, root)
+}
+
+fn probe_json(probe: &LeadProbe) -> Value {
+    json!({
+        "state": probe.state,
+        "route": probe.route,
+        "method": probe.method,
+        "accepted": probe.accepted,
+        "delivered": probe.delivered,
+        "timely": probe.timely,
+        "nativeItem": probe.native_item,
+        "markerEvent": probe.marker_event,
+        "providerOnOwningThread": probe.provider_on_thread,
+        "otherThread": probe.other_thread,
+        "evidence": probe.evidence,
+    })
+}
+
+fn route_probe<'a>(probes: &'a [LeadProbe], state: &str, route: &str) -> &'a LeadProbe {
+    probes
+        .iter()
+        .find(|probe| probe.state == state && probe.route == route)
+        .unwrap()
+}
+
+fn chosen_invocation<'a>(probes: &'a [LeadProbe], state: &str) -> &'a LeadProbe {
+    let native = route_probe(probes, state, "app-server");
+    let queue = route_probe(probes, state, "queue");
+    // One transport owner. Queue is selected only when the app-server
+    // operation is not timely for that state.
+    if native.timely { native } else { queue }
+}
+
+/// Compares installed `codex queue` with native app-server input on the exact
+/// owning thread. Delivery is an owning-thread item plus a later provider
+/// request that carries the marker. Help text, process exit 0 and an RPC
+/// without `error` are recorded separately and are not that evidence.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; owned canned Responses; help and RPC acceptance are not delivery"]
+fn native_lead_queue_and_app_server_input_on_owning_thread() {
+    let probes = vec![
+        probe_generation("queue"),
+        probe_generation("app-server"),
+        probe_tool_observation_wait("queue"),
+        probe_tool_observation_wait("app-server"),
+        probe_idle("queue"),
+        probe_idle("app-server"),
+    ];
+    let summary_root = probes[0].evidence.clone();
+    let version = fs::read_to_string(summary_root.join("version-stdout.txt"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let states = ["generation", "tool_observation_wait", "idle"];
+    let queue_all_timely = states.iter().all(|state| {
+        probes
+            .iter()
+            .any(|probe| probe.state == *state && probe.route == "queue" && probe.timely)
+    });
+    let selected = if queue_all_timely {
+        "codex queue".to_owned()
+    } else {
+        format!(
+            "app-server {}",
+            states
+                .iter()
+                .map(|state| format!("{state}={}", chosen_invocation(&probes, state).method))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+    let summary = summary_root.join("lead-input-comparison.json");
+    fs::write(
+        &summary,
+        serde_json::to_vec_pretty(&json!({
+            "version": version,
+            "selectedRoute": selected,
+            "probes": probes.iter().map(probe_json).collect::<Vec<_>>(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("lead input comparison: {}", summary.display());
+    eprintln!("selected lead input route: {selected}");
+    assert_eq!(
+        version, "codex-cli 0.156.1",
+        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.156.1 binary"
+    );
+    for probe in &probes {
+        assert_eq!(
+            probe.delivered,
+            probe.native_item && probe.provider_on_thread,
+            "acceptance must not define delivery: {} {}",
+            probe.state,
+            probe.route
+        );
+    }
+    let generation_queue = route_probe(&probes, "generation", "queue");
+    let generation_native = route_probe(&probes, "generation", "app-server");
+    let tool_queue = route_probe(&probes, "tool_observation_wait", "queue");
+    let tool_native = route_probe(&probes, "tool_observation_wait", "app-server");
+    let idle_queue = route_probe(&probes, "idle", "queue");
+    let idle_native = route_probe(&probes, "idle", "app-server");
+    assert!(
+        generation_queue.delivered && !generation_queue.timely,
+        "0.156.1 queue must reach the owning thread only after active generation"
+    );
+    assert!(generation_native.timely && generation_native.method == "turn/steer");
+    assert!(
+        tool_queue.delivered && !tool_queue.timely,
+        "0.156.1 queue must reach the owning thread only after a blocked tool"
+    );
+    assert!(tool_native.timely && tool_native.method == "turn/steer");
+    assert!(
+        idle_queue.timely,
+        "0.156.1 queue must still reach an idle owning thread"
+    );
+    assert!(idle_native.timely && idle_native.method == "turn/start");
+    assert_eq!(
+        selected,
+        "app-server generation=turn/steer; tool_observation_wait=turn/steer; idle=turn/start"
+    );
+    for state in states {
+        let chosen = chosen_invocation(&probes, state);
+        assert!(
+            chosen.timely,
+            "no timely owning-thread delivery during {state}; selected {selected}; see {}",
+            summary.display()
+        );
+    }
 }
 
 fn native_fixture_with_arguments(
