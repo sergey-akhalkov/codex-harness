@@ -77,7 +77,7 @@ fn standing_escalations() -> Vec<String> {
 /// the caller.
 fn lead_channel_heading(consumer: &str) -> String {
     format!(
-        "escalate to {consumer} through {LEAD_CHANNEL_COMMAND}: pipe it on standard input (or use --text for short text) - no recipient, slot, session or endpoint supplied and no size limit to know, and large messages are delivered automatically through a harness-owned file. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue"
+        "escalate to {consumer} by piping {LEAD_CHANNEL_COMMAND} (short --text fallback); it addresses the originating lead with no recipient, slot, session or endpoint and spills long content automatically. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue"
     )
 }
 
@@ -522,7 +522,7 @@ mod tests {
     /// literal: a wording change has to update it deliberately.
     fn expected_lead_channel(consumer: &str) -> String {
         format!(
-            "escalate to {consumer} through codex-harness lead message: pipe it on standard input (or use --text for short text) - no recipient, slot, session or endpoint supplied and no size limit to know, and large messages are delivered automatically through a harness-owned file. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue:\n"
+            "escalate to {consumer} by piping codex-harness lead message (short --text fallback); it addresses the originating lead with no recipient, slot, session or endpoint and spills long content automatically. It asks for a reply unless --notify marks a notice that needs none. Ask only after investigating the available facts, and only for a boundary below, a material ambiguity, or an authority/access boundary you cannot cross - everything else, including ordinary implementation errors and routine progress, is yours; durable blockers, decisions and results stay on the bd issue:\n"
         )
     }
 
@@ -875,7 +875,12 @@ mod tests {
             EXPECTED_WAITING_RULE
         );
         println!("CANONICAL_BRIEF_BYTES {}", text.len());
+        println!("CANONICAL_BRIEF_WORDS {}", text.split_whitespace().count());
         println!("CANONICAL_GUIDANCE_BYTES {}", guidance.len());
+        println!(
+            "CANONICAL_GUIDANCE_WORDS {}",
+            guidance.split_whitespace().count()
+        );
         assert!(
             text.len() <= MAX_BRIEF_BYTES,
             "the canonical brief is {} bytes",
@@ -929,10 +934,9 @@ mod tests {
         assert!(rendered.ends_with(EXPECTED_WAITING_RULE), "{rendered}");
         for required in [
             "codex-harness lead message",
-            "pipe it on standard input",
-            "--text for short text",
-            "no size limit to know",
-            "large messages are delivered automatically through a harness-owned file",
+            "by piping codex-harness lead message",
+            "short --text fallback",
+            "spills long content automatically",
             "asks for a reply unless --notify marks a notice that needs none",
             "after investigating the available facts",
             "a material ambiguity, or an authority/access boundary",

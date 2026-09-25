@@ -1590,13 +1590,9 @@ fn recorded_spill(entry: &Value) -> Option<Spill> {
 pub(crate) const LEAD_USAGE: &str = "\
 codex-harness lead message [--text TEXT | --file FILE] [--notify]
   Send one literal payload to the originating lead of this spawned run.
-  Content is TEXT, a UTF-8 FILE, or the piped standard input of a command run
-  without a content flag (--text - selects the stream explicitly); no size
-  limit needs to be known, because a payload too large for one conversation
-  input is delivered as a pointer to the harness-owned file that holds it
-  complete and can be read with ordinary file tools.
-  The caller supplies no recipient, slot, session, checkout, or lead address.
-  The default kind is reply-request. --notify does not request a reply.
+  Pipe content first (or use --text -); short --text and UTF-8 --file are
+  fallbacks, and long content spills automatically. The caller supplies no
+  address. The default asks for a reply; --notify does not.
 ";
 
 const PAYLOAD_MARK: &str = "\n---payload---\n";
