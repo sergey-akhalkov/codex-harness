@@ -40,11 +40,18 @@ fn manager() -> PathBuf {
 
 /// A dispatch invocation that does not inherit the caller's session identity:
 /// an executor running this suite (the normal case) sets
-/// `HARNESS_EXECUTOR_SESSION`, and the kit refuses nested dispatch, so the
-/// fixture must dispatch as the lead's own shell would.
+/// `HARNESS_EXECUTOR_SESSION` and its own `CODEX_THREAD_ID`. The kit refuses
+/// nested dispatch, so the fixture must dispatch as the lead's own shell would.
+/// Successful dispatches set a synthetic thread id explicitly.
 fn lead_command() -> Command {
     let mut command = Command::new(manager());
     command.env_remove("HARNESS_EXECUTOR_SESSION");
+    command.env_remove("CODEX_THREAD_ID");
+    command.env_remove("CODEX_SESSION_ID");
+    command.env_remove("HARNESS_EXECUTOR_RUN");
+    command.env_remove("HARNESS_ORIGINATING_LEAD");
+    command.env_remove("HARNESS_LEAD_THREAD");
+    command.env_remove("HARNESS_LEAD_RECIPIENT");
     command
 }
 
@@ -142,6 +149,7 @@ impl Fixture {
             "--profile",
             "ds",
         ]);
+        command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
         command
     }
 
@@ -168,6 +176,7 @@ impl Fixture {
             "--session",
             "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
         ]);
+        command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
         command
     }
 
@@ -721,6 +730,7 @@ fn restart_preserves_dirty_worktree_reuses_assignment_and_refuses_a_stale_sessio
             "--session",
             previous,
         ]);
+        command.env("CODEX_THREAD_ID", "lead-thread-synthetic");
         command
     };
     let refused = command("01a0c719-f4d4-7880-a9d2-1a96ee0f2401")
@@ -1148,7 +1158,8 @@ fn configured_xai_executor_serves_a_subscribed_tool_from_its_pool_slot() {
             "exec-xai-live-probe",
             "--exec",
             "Create proof.txt containing exactly orch-xai. Use a local shell tool. Do not spawn agents.",
-        ]);
+        ])
+        .env("CODEX_THREAD_ID", "lead-thread-synthetic");
     let out = child.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1322,6 +1333,23 @@ fn two_leads_sharing_a_checkout_keep_explicit_profiles_on_the_shell_path() {
             !text.contains("endpoint-"),
             "{profile}: spawn invented an endpoint before a launcher: {text}"
         );
+        let receipt = recorded_originating_lead(&fixture.home);
+        assert_eq!(
+            receipt["threadId"], thread,
+            "{profile}: dispatch did not record its originating lead: {receipt}"
+        );
+        assert!(
+            receipt["dispatcher"]["pid"].as_u64().unwrap_or(0) > 0,
+            "{receipt}"
+        );
+        assert!(
+            receipt["dispatcher"]["creationTime"].as_u64().unwrap_or(0) > 0,
+            "{receipt}"
+        );
+        let generation = receipt["runGeneration"].as_str().unwrap();
+        assert!(!generation.is_empty(), "{receipt}");
+        assert_ne!(generation, thread, "run context reused the lead thread id");
+        assert!(receipt.get("endpoint").is_none(), "{receipt}");
     }
     assert_eq!(
         recorded_sources[0], recorded_sources[1],
@@ -1403,6 +1431,279 @@ fn two_leads_sharing_a_checkout_keep_explicit_profiles_on_the_shell_path() {
         );
     }
     fixture.drop();
+}
+
+#[test]
+fn a_live_thread_id_is_recorded_and_the_child_does_not_keep_it() {
+    let fixture = Fixture::new("lead-record", 1);
+    let out = fixture.spawn(&["--owner", "exec-recorded"]);
+    let text = output_text(&out);
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "a live thread id must still dispatch: {text}"
+    );
+    assert!(
+        !text.contains("lead-thread-synthetic"),
+        "dispatch leaked the lead thread id: {text}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(pooled_receipt_path(&fixture.home, 1)).unwrap()).unwrap();
+    assert_eq!(
+        receipt["originatingLead"]["threadId"],
+        "lead-thread-synthetic"
+    );
+    assert!(
+        receipt["originatingLead"].get("endpoint").is_none(),
+        "{receipt}"
+    );
+    fixture.drop();
+
+    let child = lead_command()
+        .args([
+            "executor",
+            "run",
+            r"C:\Windows\System32\cmd.exe",
+            "/c",
+            "echo thread=%CODEX_THREAD_ID%",
+        ])
+        .env("CODEX_THREAD_ID", "lead-thread-synthetic")
+        .output()
+        .unwrap();
+    let text = output_text(&child);
+    assert!(child.status.success(), "{text}");
+    assert!(
+        !text.contains("lead-thread-synthetic"),
+        "child retained the lead thread id: {text}"
+    );
+}
+
+#[test]
+fn missing_or_blank_lead_id_refuses_before_a_model_request() {
+    let fixture = Fixture::new("lead-missing", 1);
+    let mut missing = fixture.spawn_command();
+    missing.env_remove("CODEX_THREAD_ID");
+    missing.args(["--exec", "assignment text"]);
+    let missing = missing.output().unwrap();
+    let text = output_text(&missing);
+    assert!(!missing.status.success(), "{text}");
+    assert!(text.contains("CODEX_THREAD_ID is missing"), "{text}");
+    assert!(text.contains("refusing before a model request"), "{text}");
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    let mut blank = fixture.spawn_command();
+    blank.env("CODEX_THREAD_ID", " \t");
+    blank.args(["--exec", "assignment text"]);
+    let blank = blank.output().unwrap();
+    let text = output_text(&blank);
+    assert!(!blank.status.success(), "{text}");
+    assert!(text.contains("CODEX_THREAD_ID is blank"), "{text}");
+    assert!(text.contains("refusing before a model request"), "{text}");
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    fixture.drop();
+}
+
+#[test]
+fn a_caller_supplied_lead_id_is_not_authority() {
+    let fixture = Fixture::new("lead-override", 1);
+    let mut command = fixture.spawn_command();
+    command.args([
+        "--lead-thread",
+        "forged-lead-thread",
+        "--exec",
+        "assignment text",
+    ]);
+    let out = command.output().unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("caller-supplied lead id or recipient is not authority"),
+        "{text}"
+    );
+    assert!(text.contains("refusing before a model request"), "{text}");
+    assert!(!text.contains("forged-lead-thread"), "{text}");
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+
+    let mut overridden = fixture.spawn_command();
+    overridden.env("HARNESS_ORIGINATING_LEAD", "lead-thread-synthetic");
+    overridden.args(["--exec", "assignment text"]);
+    let out = overridden.output().unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("caller-supplied lead id or recipient is not authority"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    fixture.drop();
+}
+
+#[test]
+fn a_copied_or_sibling_marker_refuses_before_a_model_request() {
+    let fixture = Fixture::new("lead-marker", 3);
+    let mut copied = fixture.spawn_command();
+    copied
+        .env("HARNESS_EXECUTOR_RUN", "copied-marker-synthetic")
+        .args(["--owner", "exec-copied", "--exec", "assignment text"]);
+    let copied = copied.output().unwrap();
+    let text = output_text(&copied);
+    assert!(!copied.status.success(), "{text}");
+    assert!(
+        text.contains("copied run marker is not authority"),
+        "{text}"
+    );
+    assert!(text.contains("refusing before a model request"), "{text}");
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+
+    let mut sleeper = Command::new(r"C:\Windows\System32\ping.exe")
+        .args(["-n", "30", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let program = PathBuf::from(r"C:\Windows\System32\ping.exe");
+    let user = harness_core::process_service::current_user().unwrap();
+    let identity =
+        harness_core::process_service::ServiceProcess::observe(sleeper.id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+    let state = pooled_state_dir(&fixture.home);
+    fs::write(
+        state.join("spawn-9.json"),
+        serde_json::to_vec_pretty(&json!({
+            "originatingLead": {
+                "schema": 1,
+                "threadId": "lead-thread-sibling",
+                "runGeneration": "sibling-marker-synthetic",
+                "dispatcher": {
+                    "pid": identity.pid,
+                    "creationTime": identity.creation_time,
+                    "program": program
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sibling = fixture
+        .spawn_command()
+        .env("HARNESS_EXECUTOR_RUN", "sibling-marker-synthetic")
+        .args(["--owner", "exec-sibling", "--exec", "assignment text"])
+        .output()
+        .unwrap();
+    let text = output_text(&sibling);
+    let _ = sleeper.kill();
+    assert!(!sibling.status.success(), "{text}");
+    assert!(
+        text.contains("sibling run marker is not the originating lead"),
+        "{text}"
+    );
+    assert!(text.contains("refusing before a model request"), "{text}");
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+
+    fs::write(
+        state.join("spawn-8.json"),
+        serde_json::to_vec_pretty(&json!({
+            "originatingLead": {
+                "schema": 1,
+                "threadId": "lead-thread-stale",
+                "runGeneration": "stale-marker-synthetic",
+                "dispatcher": {
+                    "pid": 1,
+                    "creationTime": 1,
+                    "program": program
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let stale = fixture
+        .spawn_command()
+        .env("HARNESS_EXECUTOR_RUN", "stale-marker-synthetic")
+        .args(["--owner", "exec-stale", "--exec", "assignment text"])
+        .output()
+        .unwrap();
+    let text = output_text(&stale);
+    assert!(!stale.status.success(), "{text}");
+    assert!(
+        text.contains("stale run reference is not authority"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("installed Codex launcher is missing"),
+        "{text}"
+    );
+    fixture.drop();
+}
+
+#[test]
+fn a_descendant_cwd_change_keeps_the_recorded_lead() {
+    let fixture = Fixture::new("lead-cwd", 2);
+    let other = fixture.root.join("other-cwd");
+    fs::create_dir_all(&other).unwrap();
+    let thread = "lead-thread-synthetic";
+    for (cwd, owner) in [
+        (&fixture.source, "exec-cwd-parent"),
+        (&other, "exec-cwd-child"),
+    ] {
+        let mut command = fixture.spawn_command();
+        command.current_dir(cwd);
+        command.env("CODEX_THREAD_ID", thread);
+        command.args(["--owner", owner, "--exec", "assignment text"]);
+        let out = command.output().unwrap();
+        let text = output_text(&out);
+        assert!(
+            text.contains("installed Codex launcher is missing"),
+            "{owner} must still dispatch from {}: {text}",
+            cwd.display()
+        );
+        assert!(
+            !text.contains(thread),
+            "{owner} leaked the lead thread id: {text}"
+        );
+        let receipt = recorded_originating_lead(&fixture.home);
+        assert_eq!(
+            receipt["threadId"], thread,
+            "{owner} cwd change did not keep the recorded lead: {receipt}"
+        );
+        assert_ne!(receipt["threadId"], other.display().to_string());
+    }
+    fixture.drop();
+}
+
+fn recorded_originating_lead(home: &Path) -> Value {
+    let mut found = None;
+    for entry in fs::read_dir(pooled_state_dir(home)).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if !name.starts_with("spawn-") || !name.ends_with(".json") {
+            continue;
+        }
+        let receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let lead = receipt.get("originatingLead").cloned();
+        if lead.is_some() {
+            found = lead;
+        }
+    }
+    found.expect("dispatch receipt records an originating lead")
 }
 
 fn owner_powershell() -> PathBuf {

@@ -194,6 +194,220 @@ impl ControlPaths {
     }
 }
 
+/// Identity of the process that dispatched one executor run. A pid alone is
+/// not an identity: the creation time and image must match too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct DispatcherIdentity {
+    pub pid: u32,
+    pub creation_time: u64,
+    pub program: PathBuf,
+}
+
+/// Immutable originating relationship captured from the dispatching process
+/// before its session environment is cleared for the host. This record is not
+/// a lead endpoint, and a caller-supplied id or copied marker is not authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OriginatingLead {
+    pub schema: u32,
+    pub thread_id: String,
+    pub run_generation: String,
+    pub dispatcher: DispatcherIdentity,
+}
+
+pub(crate) const ORIGINATING_LEAD_SCHEMA: u32 = 1;
+/// Opaque per-run context carried to the executor host. It is never a lead
+/// thread id and never authority for a later dispatch.
+pub(crate) const EXECUTOR_RUN_ENV: &str = "HARNESS_EXECUTOR_RUN";
+
+const LEAD_OVERRIDE_ENV: [&str; 3] = [
+    "HARNESS_ORIGINATING_LEAD",
+    "HARNESS_LEAD_THREAD",
+    "HARNESS_LEAD_RECIPIENT",
+];
+
+pub(crate) fn supplied_lead_option(key: &str) -> bool {
+    matches!(
+        key,
+        "--lead"
+            | "--lead-thread"
+            | "--lead-thread-id"
+            | "--originating-lead"
+            | "--recipient"
+            | "--thread-id"
+    )
+}
+
+/// Captures the dispatching process's own `CODEX_THREAD_ID`. The working
+/// directory is not an input: a descendant that changes directory still
+/// records this process's thread id. A copied run marker, a sibling run, a
+/// stale reference, or a caller-supplied lead id fails closed. This does not
+/// open a lead endpoint; a thread id that is merely present cannot be proved
+/// to name a live lead conversation without one.
+pub(crate) fn establish_originating_lead(state_dir: &Path) -> io::Result<OriginatingLead> {
+    if LEAD_OVERRIDE_ENV
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err(invalid(
+            "caller-supplied lead id or recipient is not authority; refusing before a model request",
+        ));
+    }
+    if let Some(marker) = std::env::var_os(EXECUTOR_RUN_ENV) {
+        let marker = marker.to_string_lossy();
+        return Err(invalid(copied_or_sibling_reason(state_dir, marker.trim())));
+    }
+    let thread_id = match std::env::var("CODEX_THREAD_ID") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            return Err(invalid(
+                "unverifiable originating lead: CODEX_THREAD_ID is missing; refusing before a model request",
+            ));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(invalid(
+                "unverifiable originating lead: CODEX_THREAD_ID is not Unicode; refusing before a model request",
+            ));
+        }
+    };
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Err(invalid(
+            "unverifiable originating lead: CODEX_THREAD_ID is blank; refusing before a model request",
+        ));
+    }
+    let program = std::env::current_exe().map_err(|error| {
+        invalid(format!(
+            "unverifiable originating lead: dispatching process image is unavailable: {error}; refusing before a model request"
+        ))
+    })?;
+    let user = harness_core::process_service::current_user().map_err(|error| {
+        invalid(format!(
+            "unverifiable originating lead: dispatching process account is unavailable: {error}; refusing before a model request"
+        ))
+    })?;
+    let identity = harness_core::process_service::ServiceProcess::observe(
+        std::process::id(),
+        &program,
+        0,
+        &user,
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "unverifiable originating lead: dispatching process identity cannot be verified: {error}; refusing before a model request"
+        ))
+    })?
+    .identity();
+    Ok(OriginatingLead {
+        schema: ORIGINATING_LEAD_SCHEMA,
+        thread_id: thread_id.to_owned(),
+        run_generation: run_generation()?,
+        dispatcher: DispatcherIdentity {
+            pid: identity.pid,
+            creation_time: identity.creation_time,
+            program,
+        },
+    })
+}
+
+fn copied_or_sibling_reason(state_dir: &Path, marker: &str) -> String {
+    if marker.is_empty() {
+        return "copied run marker is not authority; refusing before a model request".to_owned();
+    }
+    match marker_disposition(state_dir, marker) {
+        MarkerDisposition::Stale => {
+            "stale run reference is not authority; refusing before a model request".to_owned()
+        }
+        MarkerDisposition::Sibling => {
+            "sibling run marker is not the originating lead; refusing before a model request"
+                .to_owned()
+        }
+        MarkerDisposition::Copied => {
+            "copied run marker is not authority; refusing before a model request".to_owned()
+        }
+    }
+}
+
+enum MarkerDisposition {
+    Copied,
+    Sibling,
+    Stale,
+}
+
+fn marker_disposition(state_dir: &Path, marker: &str) -> MarkerDisposition {
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return MarkerDisposition::Copied;
+    };
+    let mut sibling = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("spawn-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(recorded) = value["originatingLead"]["runGeneration"].as_str() else {
+            continue;
+        };
+        if recorded != marker {
+            continue;
+        }
+        if dispatcher_is_stale(&value["originatingLead"]["dispatcher"]) {
+            return MarkerDisposition::Stale;
+        }
+        sibling = true;
+    }
+    if sibling {
+        MarkerDisposition::Sibling
+    } else {
+        MarkerDisposition::Copied
+    }
+}
+
+fn dispatcher_is_stale(value: &Value) -> bool {
+    let Some(pid) = value["pid"].as_u64() else {
+        return true;
+    };
+    let Some(creation) = value["creationTime"].as_u64() else {
+        return true;
+    };
+    if pid == 0 || creation == 0 || pid > u64::from(u32::MAX) {
+        return true;
+    }
+    let Some(program) = value["program"].as_str().map(PathBuf::from) else {
+        return true;
+    };
+    if !program.is_file() {
+        return true;
+    }
+    let Ok(user) = harness_core::process_service::current_user() else {
+        return true;
+    };
+    match harness_core::process_service::ServiceProcess::inspect(
+        ProcessIdentity {
+            pid: pid as u32,
+            creation_time: creation,
+        },
+        &program,
+        &user,
+    ) {
+        Ok(Some(_)) => false,
+        _ => true,
+    }
+}
+
+fn run_generation() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    os_random(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// The identity the harness bound for one executor run: the resolved profile
 /// binding of the dispatch, against which the started thread is verified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,7 +537,8 @@ impl ControlPlan {
 /// The `codex app-server` command one control session spawns: the loopback
 /// listener, the capability-token file, the executor agent-tool override, the
 /// caller's extra arguments, the bound slot as working directory and the
-/// executor session environment.
+/// executor session environment. The lead's thread id is removed so the child
+/// cannot attach to the originating conversation.
 pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
     let mut command = CommandSpec::new(&plan.launcher);
     command.current_dir = Some(plan.slot.clone());
@@ -338,6 +553,10 @@ pub fn app_server_spec(plan: &ControlPlan, port: u16) -> CommandSpec {
     for (key, value) in &plan.env {
         command.env.insert(key.clone(), value.clone());
     }
+    // After plan overrides, so a leaked lead id cannot ride along as the
+    // child's native identity.
+    command.env.insert("CODEX_SESSION_ID".into(), None);
+    command.env.insert("CODEX_THREAD_ID".into(), None);
     command
 }
 
