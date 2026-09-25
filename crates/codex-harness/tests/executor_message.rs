@@ -1991,3 +1991,371 @@ fn lead_message_help_has_no_address_flags() {
         assert!(!text.contains(flag), "{flag} in {text}");
     }
 }
+
+/// One canned executor run plus the lead endpoint `lead message` needs, with
+/// the test process recorded as the originating lead so a child CLI is in that
+/// lead's lineage.
+struct ReplyRoundTrip {
+    fixture: Fixture,
+    generation: String,
+    lead_server: Server,
+    lead_child: Child,
+    lead_release: PathBuf,
+}
+
+impl ReplyRoundTrip {
+    fn new(name: &str) -> Self {
+        let fixture = Fixture::new(name, "running", true);
+        let generation = format!("generation-{name}");
+        let program = std::env::current_exe().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        let mut receipt = fixture.receipt();
+        receipt["originatingLead"] = json!({
+            "schema": 1,
+            "threadId": LEAD_THREAD,
+            "runGeneration": generation,
+            "dispatcher": {
+                "pid": identity.pid,
+                "creationTime": identity.creation_time,
+                "program": program,
+            }
+        });
+        receipt["observation"]["host"] = json!({
+            "pid": identity.pid,
+            "created": identity.creation_time,
+            "program": program,
+        });
+        fs::write(
+            &fixture.receipt,
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        let mut lease: Value = serde_json::from_slice(&fs::read(&fixture.lease).unwrap()).unwrap();
+        lease["pid"] = json!(identity.pid);
+        lease["created"] = json!(identity.creation_time);
+        lease["program"] = json!(program);
+        fs::write(&fixture.lease, serde_json::to_vec_pretty(&lease).unwrap()).unwrap();
+
+        let lead_release = fixture._root.path().join("lead-release");
+        let (lead_child, lead_identity) = fixture_child(
+            &fixture._root.path().join("lead-process.json"),
+            &lead_release,
+        );
+        let lead_server = Server::start(Bearer::Value(TOKEN.to_owned()));
+        lead_server.answer("initialize", Answer::Result(json!({})));
+        lead_server.answer("turn/steer", Answer::Result(json!({"turnId": TURN})));
+        lead_server.answer(
+            "turn/start",
+            Answer::Result(json!({"turn": {"id": NEXT_TURN, "status": "inProgress"}})),
+        );
+        fs::write(
+            fixture
+                .receipt
+                .parent()
+                .unwrap()
+                .join("lead-endpoint-1.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": 1,
+                "port": lead_server.port,
+                "token": TOKEN,
+                "threadId": LEAD_THREAD,
+                "process": {
+                    "pid": lead_identity["pid"],
+                    "creationTime": lead_identity["creation_time"],
+                    "program": launcher(),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            fixture,
+            generation,
+            lead_server,
+            lead_child,
+            lead_release,
+        }
+    }
+
+    /// Sends one real lead message and returns the id the command published.
+    fn issue(&self, payload: &str) -> String {
+        let id = lead_message_id(&self.generation, "reply-request", 1, payload);
+        self.lead_server.answer_sequence(
+            "thread/read",
+            vec![
+                Answer::Result(lead_thread_read(&LEAD_THREAD, "idle", json!([]))),
+                Answer::Result(lead_thread_read(
+                    &LEAD_THREAD,
+                    "active",
+                    json!([{
+                        "id": TURN,
+                        "status": "inProgress",
+                        "items": [{
+                            "id": "u1",
+                            "type": "userMessage",
+                            "clientId": id,
+                            "content": [{"type": "text", "text": payload}]
+                        }]
+                    }]),
+                )),
+            ],
+        );
+        let mut command = Command::new(manager());
+        command.args(["lead", "message", "--text", payload]);
+        command.env("CODEX_HOME", &self.fixture.home);
+        command.env("HARNESS_EXECUTOR_RUN", &self.generation);
+        command.env("HARNESS_EXECUTOR_SESSION", "1");
+        command.env("CODEX_THREAD_ID", "most-recent-session-is-not-authority");
+        command.env_remove("HARNESS_ORIGINATING_LEAD");
+        command.env_remove("HARNESS_LEAD_THREAD");
+        command.env_remove("HARNESS_LEAD_RECIPIENT");
+        command.current_dir(&self.fixture.slot);
+        let out = command.output().unwrap();
+        let text = output_text(&out);
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        assert!(text.contains(&format!("id: {id}")), "{text}");
+        let index = self
+            .fixture
+            .home
+            .join("harness/executor-pool/message-index")
+            .join(format!("{id}.json"));
+        let pointer: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        assert_eq!(pointer["schema"], 1, "{pointer}");
+        assert_eq!(pointer["id"], id, "{pointer}");
+        assert_eq!(
+            pointer["receipt"],
+            self.fixture.receipt.to_str().unwrap(),
+            "{pointer}"
+        );
+        assert!(pointer.get("owner").is_none(), "{pointer}");
+        assert!(
+            !pointer.to_string().contains(payload),
+            "the lookup must not store the payload: {pointer}"
+        );
+        assert!(self.fixture.server.requests().is_empty());
+        id
+    }
+
+    fn reply(&self, lead_thread: &str, args: &[&str]) -> Output {
+        let cwd = self.fixture.home.join("lead-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut command = lead_command();
+        command
+            .args(["executor", "message"])
+            .args(args)
+            .env("CODEX_HOME", &self.fixture.home)
+            .env("CODEX_THREAD_ID", lead_thread)
+            .env_remove("HARNESS_EXECUTOR_RUN")
+            .env_remove("HARNESS_ORIGINATING_LEAD")
+            .env_remove("HARNESS_LEAD_THREAD")
+            .env_remove("HARNESS_LEAD_RECIPIENT")
+            .current_dir(&cwd);
+        command.output().unwrap()
+    }
+
+    fn rewrite_receipt(&self, edit: impl FnOnce(&mut Value)) {
+        let mut receipt = self.fixture.receipt();
+        edit(&mut receipt);
+        fs::write(
+            &self.fixture.receipt,
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+impl Drop for ReplyRoundTrip {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.lead_release, b"release");
+        let _ = self.lead_child.kill();
+        let _ = self.lead_child.wait();
+    }
+}
+
+fn script_executor_reply(fixture: &Fixture, active: bool, text: &str) {
+    let initial = if active {
+        active_turns()
+    } else {
+        json!([{
+            "id": TURN,
+            "status": "completed",
+            "items": [{"id": "m1", "type": "agentMessage", "text": FINAL}]
+        }])
+    };
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![
+            Answer::Result(thread_read(
+                &fixture.slot,
+                if active { "active" } else { "idle" },
+                initial,
+            )),
+            Answer::Result(thread_read(&fixture.slot, "active", turns_with_input(text))),
+        ],
+    );
+}
+
+fn assert_unchanged_payload(requests: &[Value], text: &str) {
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["params"]["threadId"], THREAD, "{requests:?}");
+    assert_eq!(
+        requests[0]["params"]["input"],
+        json!([{"type": "text", "text": text}]),
+        "{requests:?}"
+    );
+}
+
+fn assert_refused_before_send(out: &Output, expected: &str, fixture: &Fixture) {
+    let text = output_text(out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(expected) && text.contains("refusing before any send"),
+        "{text}"
+    );
+    assert!(
+        fixture.server.requests().is_empty(),
+        "refusal reached the executor endpoint: {:?}",
+        fixture.server.requests()
+    );
+}
+
+#[test]
+fn reply_to_steers_the_recorded_executor_thread_with_only_the_message_id() {
+    let run = ReplyRoundTrip::new("reply-steer");
+    let question = "which input contract applies to sample-17?";
+    let id = run.issue(question);
+    let answer = "use the versioned input contract\nsecond line: $(throw), %PATH%, `whoami`";
+    script_executor_reply(&run.fixture, true, answer);
+    let out = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(": delivered in") && text.contains(THREAD),
+        "{text}"
+    );
+    assert!(!text.contains("--source"), "{text}");
+    let steered = run.fixture.server.requests_for("turn/steer");
+    assert_unchanged_payload(&steered, answer);
+    assert_eq!(steered[0]["params"]["expectedTurnId"], TURN, "{steered:?}");
+    assert!(run.fixture.server.requests_for("turn/start").is_empty());
+    assert!(run.fixture.server.requests_for("turn/interrupt").is_empty());
+}
+
+#[test]
+fn reply_to_starts_an_idle_executor_thread_from_a_utf8_file() {
+    let run = ReplyRoundTrip::new("reply-file");
+    let id = run.issue("need the file reply");
+    let answer = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} from the file\nsecond line: $(throw), %PATH%, `whoami`\n";
+    let file = run.fixture.home.join("reply.txt");
+    fs::write(&file, answer).unwrap();
+    script_executor_reply(&run.fixture, false, answer);
+    let out = run.reply(
+        LEAD_THREAD,
+        &["--reply-to", &id, "--file", file.to_str().unwrap()],
+    );
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(": delivered in") && text.contains(THREAD),
+        "{text}"
+    );
+    let started = run.fixture.server.requests_for("turn/start");
+    assert_unchanged_payload(&started, answer);
+    assert!(run.fixture.server.requests_for("turn/steer").is_empty());
+}
+
+#[test]
+fn reply_to_refuses_unknown_retired_reused_and_contradictory_addresses_before_send() {
+    let run = ReplyRoundTrip::new("reply-refuse");
+    let unknown = run.reply(
+        LEAD_THREAD,
+        &[
+            "--reply-to",
+            "lead-0123456789abcdef01234567",
+            "--text",
+            "missing",
+        ],
+    );
+    assert_refused_before_send(&unknown, "unknown message id", &run.fixture);
+
+    let id = run.issue("which contract?");
+    let contradictory = run.reply(
+        LEAD_THREAD,
+        &[
+            "--reply-to",
+            &id,
+            "--owner",
+            "exec-other",
+            "--text",
+            "wrong owner",
+        ],
+    );
+    assert_refused_before_send(
+        &contradictory,
+        "contradictory explicit address",
+        &run.fixture,
+    );
+
+    let other_lead = run.reply(
+        OTHER_LEAD_THREAD,
+        &["--reply-to", &id, "--text", "from another lead"],
+    );
+    assert_refused_before_send(&other_lead, "another lead", &run.fixture);
+
+    let endpoint: Value = serde_json::from_slice(
+        &fs::read(
+            run.fixture
+                .receipt
+                .parent()
+                .unwrap()
+                .join("endpoint-1.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    run.rewrite_receipt(|receipt| {
+        receipt["originatingLead"]["dispatcher"] = endpoint["process"].clone();
+    });
+    let copied = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", "copied thread"]);
+    assert_refused_before_send(&copied, "another lead", &run.fixture);
+    run.rewrite_receipt(|receipt| {
+        let program = std::env::current_exe().unwrap();
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity = ServiceProcess::observe(std::process::id(), &program, 0, &user)
+            .unwrap()
+            .identity();
+        receipt["originatingLead"]["dispatcher"] = json!({
+            "pid": identity.pid,
+            "creationTime": identity.creation_time,
+            "program": program,
+        });
+    });
+
+    run.rewrite_receipt(|receipt| {
+        receipt["originatingLead"]["runGeneration"] = json!("generation-reused");
+    });
+    let reused_generation = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", "late"]);
+    assert_refused_before_send(&reused_generation, "generation", &run.fixture);
+    run.rewrite_receipt(|receipt| {
+        receipt["originatingLead"]["runGeneration"] = json!(run.generation);
+    });
+
+    run.rewrite_receipt(|receipt| {
+        receipt["observation"]["state"] = json!("completed");
+    });
+    let retired = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", "after end"]);
+    assert_refused_before_send(&retired, "retired message id", &run.fixture);
+    run.rewrite_receipt(|receipt| {
+        receipt["observation"]["state"] = json!("running");
+    });
+
+    let slot_record = run.fixture.receipt.parent().unwrap().join("slot-1.json");
+    let mut slot: Value = serde_json::from_slice(&fs::read(&slot_record).unwrap()).unwrap();
+    slot["owner"] = json!("exec-other");
+    fs::write(&slot_record, serde_json::to_vec_pretty(&slot).unwrap()).unwrap();
+    let reused_slot = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", "reused"]);
+    assert_refused_before_send(&reused_slot, "reused slot", &run.fixture);
+}
