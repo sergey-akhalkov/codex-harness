@@ -23,8 +23,9 @@ use executor_control::{
     MAX_EVENTS_PER_PUMP, app_server_spec,
 };
 use harness_core::{
+    console::{ConsoleSession, ConsoleSpec},
     orchestration_config::ProfileBinding,
-    process::{Job, Limits, ProcessIdentity},
+    process::{Cancellation, CommandSpec, Deadline, Job, Limits, ProcessIdentity},
     process_service::{self, ServiceProcess},
 };
 use serde_json::{Value, json};
@@ -1861,43 +1862,64 @@ fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
         serde_json::to_vec_pretty(&receipt).unwrap(),
     )
     .unwrap();
-    let stdout = fs::File::create(evidence.join("host-stdout.txt")).unwrap();
-    let stderr = fs::File::create(evidence.join("host-stderr.txt")).unwrap();
-    let mut host = Command::new(manager())
-        .args(["executor", "run", "--file"])
-        .arg(&pooled.receipt)
-        .env("CODEX_HOME", &pooled.home)
-        .env("HARNESS_CONTROL_FIXTURE_KEY", "synthetic-owned-fixture")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .env_remove("HARNESS_EXECUTOR_SESSION")
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
+    // The host hands the recorded native frontend only a live terminal
+    // surface; a redirected pipe is refused before the assignment, exactly as
+    // `attachment_failure_is_reported_before_the_assignment` asserts. This
+    // run is therefore captured through an owned console, and the launch
+    // registration supplies the upstream executable the attach resolves.
+    let launch = pooled.home.join("harness");
+    fs::create_dir_all(&launch).unwrap();
+    fs::write(
+        launch.join("native-launch.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 2,
+            "upstream": {"executable": exe}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut spec = CommandSpec::new(manager());
+    spec.args = vec![
+        "executor".into(),
+        "run".into(),
+        "--file".into(),
+        pooled.receipt.as_os_str().to_owned(),
+    ];
+    spec.env.insert(
+        "CODEX_HOME".into(),
+        Some(pooled.home.as_os_str().to_owned()),
+    );
+    spec.env.insert(
+        "HARNESS_CONTROL_FIXTURE_KEY".into(),
+        Some("synthetic-owned-fixture".into()),
+    );
+    // No fixture frontend: this check requires the native attach path.
+    spec.env
+        .insert("HARNESS_EXECUTOR_FIXTURE_MODE".into(), None);
+    spec.env.insert("HARNESS_EXECUTOR_SESSION".into(), None);
+    spec.env.insert("WT_SESSION".into(), None);
+    spec.env.insert("OPENAI_API_KEY".into(), None);
+    spec.env.insert("CODEX_API_KEY".into(), None);
+    let session = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(90)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
         .unwrap();
-    let until = Instant::now() + Duration::from_secs(45);
-    loop {
-        if host.try_wait().unwrap().is_some() {
-            break;
-        }
-        if Instant::now() >= until {
-            let _ = host.kill();
-            panic!(
-                "native control cache host timed out; evidence: {}",
-                evidence.display()
-            );
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let status = host.wait().unwrap();
-    let output = fs::read_to_string(evidence.join("host-stdout.txt")).unwrap();
-    let error = fs::read_to_string(evidence.join("host-stderr.txt")).unwrap();
+    let output = finished.transcript;
+    let _ = fs::write(evidence.join("host-console.txt"), &output);
     let receipt = pooled.receipt();
-    assert_eq!(status.code(), Some(1), "{output}\n{error}");
+    assert_eq!(finished.outcome.exit_code, 1, "{output}");
     assert_eq!(
         receipt["observation"]["state"], "stopped",
-        "{receipt}\n{output}\n{error}"
+        "{receipt}\n{output}"
+    );
+    let frontend = fs::read_to_string(pooled.state.join("frontend-1.json")).unwrap_or_default();
+    assert!(
+        frontend.contains("\"phase\":\"attached\""),
+        "the native frontend never attached on the owned console: {frontend}\n{output}"
     );
     assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
     assert!(
