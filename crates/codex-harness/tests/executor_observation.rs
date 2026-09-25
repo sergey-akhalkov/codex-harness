@@ -2475,6 +2475,28 @@ fn watch_receipt(host: &ControlHost, timeout: &str) -> Output {
         .unwrap()
 }
 
+/// The watch exit code for a live run waiting for a reply: action required.
+const WATCH_WAITING_EXIT: i32 = 3;
+
+/// The same watch call a machine consumer reads: compact JSON review data.
+fn watch_json(host: &ControlHost, timeout: &str) -> Output {
+    lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .args(["--json", "--timeout", timeout, "--poll", "50"])
+        .output()
+        .unwrap()
+}
+
+/// The captured output of a watch call this check spawned itself.
+fn child_text(child: &mut Child) -> String {
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        io::Read::read_to_end(&mut pipe, &mut bytes).unwrap();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn wait_session(session: ConsoleSession) -> harness_core::console::ConsoleOutcome {
     session
         .wait(
@@ -2911,13 +2933,28 @@ fn unresolved_reply_hold_keeps_the_tui_open_until_one_reply_continues_the_run() 
         !process_gone(pid, created, &double),
         "frontend closed during the unresolved reply hold"
     );
-    let waiting = watch_receipt(&host, "1");
+    let waiting = watch_receipt(&host, "5");
+    let waiting_text = text(&waiting);
     assert_eq!(
         waiting.status.code(),
-        Some(2),
-        "an unresolved reply is nonterminal: {}",
-        text(&waiting)
+        Some(WATCH_WAITING_EXIT),
+        "an unresolved reply is the actionable waiting result: {waiting_text}"
     );
+    assert!(
+        waiting_text.contains("action required: waiting for reply")
+            && waiting_text.contains("--reply-to req-1"),
+        "{waiting_text}"
+    );
+    let watched_live = receipt_json(&host.receipt);
+    assert_ne!(
+        watched_live["observation"]["state"], "completed",
+        "{watched_live}"
+    );
+    assert_ne!(
+        watched_live["observation"]["state"], "defect",
+        "{watched_live}"
+    );
+    assert_ne!(watched_live["inputClosure"], "begun", "{watched_live}");
 
     write_reply_hold(&host, false);
     answer_thread(&host, json!([agent_turn(REPLY_TURN, REPLY_FINAL)]));
@@ -2950,6 +2987,370 @@ fn unresolved_reply_hold_keeps_the_tui_open_until_one_reply_continues_the_run() 
     assert!(watched_text.contains(REPLY_FINAL), "{watched_text}");
 }
 
+#[test]
+fn watch_reports_action_required_for_a_waiting_run_and_resumes_after_the_reply() {
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    let (host, session) = spawn_managed("watch-waiting");
+    // The executor asks and its turn then ends: the hold keeps the run live.
+    write_reply_hold(&host, true);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    thread::sleep(Duration::from_millis(1600));
+    let waiting = receipt_json(&host.receipt);
+    assert_ne!(waiting["observation"]["state"], "completed", "{waiting}");
+    assert_ne!(waiting["observation"]["state"], "defect", "{waiting}");
+
+    // A newly invoked watch returns the actionable result promptly instead of
+    // blocking to its timeout, and it claims no terminal outcome.
+    let started = Instant::now();
+    let reported = watch_receipt(&host, "30");
+    let elapsed = started.elapsed();
+    let reported_text = text(&reported);
+    assert_eq!(
+        reported.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{reported_text}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "watch waited for its timeout instead of reporting the waiting run: {elapsed:?}"
+    );
+    assert!(
+        reported_text.contains("action required: waiting for reply"),
+        "{reported_text}"
+    );
+    assert!(reported_text.contains("id=req-1"), "{reported_text}");
+    assert!(
+        reported_text.contains("--reply-to req-1"),
+        "{reported_text}"
+    );
+    assert!(
+        reported_text.contains(&format!("session: {CONTROL_THREAD}")),
+        "{reported_text}"
+    );
+    assert!(
+        !reported_text.contains("state=completed"),
+        "{reported_text}"
+    );
+    assert!(!reported_text.contains("state=defect"), "{reported_text}");
+    assert!(!reported_text.contains("timed out"), "{reported_text}");
+    assert!(
+        !reported_text.contains("no native coverage"),
+        "{reported_text}"
+    );
+    assert!(!reported_text.contains("resume"), "{reported_text}");
+    assert!(
+        !reported_text.contains("exit: "),
+        "a waiting result claims no run exit: {reported_text}"
+    );
+
+    // The same result is available to a machine consumer.
+    let json_out = watch_json(&host, "30");
+    let json_text = text(&json_out);
+    assert_eq!(
+        json_out.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{json_text}"
+    );
+    let machine: Value = serde_json::from_str(&json_text).unwrap();
+    assert_eq!(machine["actionRequired"], true, "{machine}");
+    assert_eq!(
+        machine["waiting"]["requests"][0]["id"], "req-1",
+        "{machine}"
+    );
+    assert_eq!(
+        machine["waiting"]["requests"][0]["kind"], "reply-request",
+        "{machine}"
+    );
+    assert_eq!(
+        machine["waiting"]["requests"][0]["status"], "unresolved",
+        "{machine}"
+    );
+    assert_eq!(
+        machine["waiting"]["requests"][0]["record"], "replyRequests",
+        "{machine}"
+    );
+    assert_eq!(
+        machine["waiting"]["requests"][0]["reply"],
+        "codex-harness executor message --reply-to req-1 --text '<answer>'",
+        "{machine}"
+    );
+    assert_eq!(machine["waiting"]["omitted"], 0, "{machine}");
+    assert_eq!(
+        machine["state"], waiting["observation"]["state"],
+        "{machine}"
+    );
+    assert!(machine["returned"].is_null(), "{machine}");
+    assert!(machine["exitCode"].is_null(), "{machine}");
+
+    // Waiting alone changes nothing: the run keeps its session, surface,
+    // lease and partial work, and none of those is a release or a resume.
+    let kept = receipt_json(&host.receipt);
+    assert_eq!(kept["observation"]["session"], CONTROL_THREAD, "{kept}");
+    assert_ne!(kept["inputClosure"], "begun", "{kept}");
+    let lease = receipt_json(&host.state.join("lease-1.json"));
+    let lease_pid = lease["pid"].as_u64().unwrap() as u32;
+    let lease_created = lease["created"].as_u64().unwrap();
+    let lease_program = PathBuf::from(lease["program"].as_str().unwrap());
+    assert!(
+        !process_gone(lease_pid, lease_created, &lease_program),
+        "the host left while the reply was unresolved"
+    );
+    let phases = frontend_phases(&host);
+    assert!(
+        phases.iter().any(|phase| phase["phase"] == "attached"),
+        "{phases:?}"
+    );
+    assert!(
+        !phases.iter().any(|phase| phase["phase"] == "persisted"),
+        "the frontend closed while the reply was unresolved: {phases:?}"
+    );
+
+    // One correlated reply continues the same idle thread. A watch taken while
+    // that work is running observes it instead of claiming an outcome, and the
+    // same watch command later returns the run's own terminal result.
+    write_reply_hold(&host, false);
+    reply_on_same_thread(&host);
+    let started_turns = host.server().requests_for("turn/start");
+    assert_eq!(started_turns.len(), 2, "{started_turns:?}");
+    assert_eq!(
+        started_turns[1]["params"]["threadId"], CONTROL_THREAD,
+        "{started_turns:?}"
+    );
+    let during = watch_receipt(&host, "1");
+    let during_text = text(&during);
+    assert_eq!(during.status.code(), Some(2), "{during_text}");
+    assert!(during_text.contains("timed out"), "{during_text}");
+    assert!(!during_text.contains("action required"), "{during_text}");
+    assert!(!during_text.contains("state=completed"), "{during_text}");
+
+    push_user_input(&host, "reply-1", REPLY_TURN, "one reply");
+    answer_thread(&host, json!([agent_turn(REPLY_TURN, REPLY_FINAL)]));
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "reply-m", "type": "agentMessage", "text": REPLY_FINAL}
+        }
+    }));
+    push_completed(&host, REPLY_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let after = watch_receipt(&host, "10");
+    let after_text = text(&after);
+    assert_eq!(after.status.code(), Some(0), "{after_text}");
+    assert!(after_text.contains("state=completed"), "{after_text}");
+    assert!(after_text.contains(REPLY_FINAL), "{after_text}");
+    assert!(!after_text.contains("action required"), "{after_text}");
+    assert_eq!(
+        receipt_json(&host.receipt)["observation"]["session"],
+        CONTROL_THREAD,
+        "the reply started another session"
+    );
+    assert_eq!(host.server().requests_for("thread/resume").len(), 1);
+    assert_frontend_gone(&host, &double);
+}
+
+#[test]
+fn an_active_watch_returns_action_required_when_the_run_reaches_waiting() {
+    let (host, session) = spawn_managed("watch-active");
+    let mut watch = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .args(["--timeout", "60", "--poll", "50"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1200));
+    assert!(
+        watch.try_wait().unwrap().is_none(),
+        "watch returned before the run was waiting"
+    );
+    // The request becomes unresolved and its turn ends while this watch call
+    // is already blocked on the run.
+    let asked = Instant::now();
+    write_reply_hold(&host, true);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    let status = wait_host(&mut watch, "the watch call blocked on the waiting run");
+    let output = child_text(&mut watch);
+    assert_eq!(status.code(), Some(WATCH_WAITING_EXIT), "{output}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(20),
+        "the active watch waited for its timeout instead of the waiting state: {:?}",
+        asked.elapsed()
+    );
+    assert!(
+        output.contains("action required: waiting for reply") && output.contains("id=req-1"),
+        "{output}"
+    );
+    assert!(!output.contains("state=completed"), "{output}");
+
+    // The same run still finishes with its own result after one reply, and no
+    // resume was needed for it.
+    write_reply_hold(&host, false);
+    push_user_input(&host, "reply-1", REPLY_TURN, "one reply");
+    answer_thread(&host, json!([agent_turn(REPLY_TURN, REPLY_FINAL)]));
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "reply-m", "type": "agentMessage", "text": REPLY_FINAL}
+        }
+    }));
+    push_completed(&host, REPLY_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let after = watch_receipt(&host, "10");
+    let after_text = text(&after);
+    assert_eq!(after.status.code(), Some(0), "{after_text}");
+    assert!(after_text.contains(REPLY_FINAL), "{after_text}");
+    assert_eq!(host.server().requests_for("thread/resume").len(), 1);
+}
+
+#[test]
+fn waiting_at_the_watch_deadline_is_action_required_and_never_a_terminal_claim() {
+    let (host, session) = spawn_managed("watch-deadline");
+    // A due deadline on a running run without a request stays a timeout.
+    let idle = watch_receipt(&host, "0");
+    let idle_text = text(&idle);
+    assert_eq!(idle.status.code(), Some(2), "{idle_text}");
+    assert!(
+        idle_text.contains("watch timed out after 0s while the run was still"),
+        "{idle_text}"
+    );
+    assert!(!idle_text.contains("action required"), "{idle_text}");
+
+    // A notification is not a reply request; it never becomes exit 3.
+    write_lead_message(&host, "notification", "delivered");
+    let notified = watch_receipt(&host, "0");
+    let notified_text = text(&notified);
+    assert_eq!(notified.status.code(), Some(2), "{notified_text}");
+    assert!(
+        !notified_text.contains("action required"),
+        "{notified_text}"
+    );
+
+    // The same due deadline with an established waiting state yields the
+    // actionable result instead of hiding the question behind a timeout, and
+    // the run stays live with its slot bound.
+    write_reply_hold(&host, true);
+    answer_thread(&host, json!([agent_turn(CONTROL_TURN, " ")]));
+    push_completed(&host, CONTROL_TURN, "completed");
+    thread::sleep(Duration::from_millis(1600));
+    let boundary = watch_receipt(&host, "0");
+    let boundary_text = text(&boundary);
+    assert_eq!(
+        boundary.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{boundary_text}"
+    );
+    assert!(
+        boundary_text.contains("action required: waiting for reply"),
+        "{boundary_text}"
+    );
+    assert!(boundary_text.contains("id=req-1"), "{boundary_text}");
+    assert!(!boundary_text.contains("timed out"), "{boundary_text}");
+    let live = receipt_json(&host.receipt);
+    assert_ne!(live["observation"]["state"], "completed", "{live}");
+    assert!(host.state.join("lease-1.json").is_file(), "{live}");
+
+    // The request list is bounded and the references left out are counted
+    // rather than silently dropped.
+    let mut many = receipt_json(&host.receipt);
+    many["replyRequests"] = Value::Array(
+        (1..=6)
+            .map(|index| {
+                json!({
+                    "id": format!("req-{index}"),
+                    "status": "unresolved",
+                    "requiresReply": true
+                })
+            })
+            .collect(),
+    );
+    fs::write(&host.receipt, serde_json::to_vec_pretty(&many).unwrap()).unwrap();
+    let bounded = watch_json(&host, "30");
+    let bounded_text = text(&bounded);
+    assert_eq!(
+        bounded.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{bounded_text}"
+    );
+    let machine: Value = serde_json::from_str(&bounded_text).unwrap();
+    let requests = machine["waiting"]["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 4, "{machine}");
+    assert_eq!(requests[0]["id"], "req-1", "{machine}");
+    assert_eq!(requests[3]["id"], "req-4", "{machine}");
+    assert_eq!(machine["waiting"]["omitted"], 2, "{machine}");
+    let bounded_again = watch_receipt(&host, "30");
+    let bounded_again_text = text(&bounded_again);
+    assert_eq!(
+        bounded_again.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{bounded_again_text}"
+    );
+    assert!(
+        bounded_again_text.contains("2 further unresolved requests stay on the receipt"),
+        "{bounded_again_text}"
+    );
+
+    // A dead run with the same unresolved request keeps its real outcome
+    // instead of appearing reply-capable, and so does a stopped run.
+    let run = SeededRun::new();
+    let mut dead = receipt_json(&run.receipt);
+    dead["observation"]["state"] = json!("running");
+    dead["observation"]["session"] = json!(CONTROL_THREAD);
+    dead["observation"]["host"] = json!({
+        "pid": 4242,
+        "created": 1,
+        "program": run.root.join("absent-host.exe").to_string_lossy()
+    });
+    dead["replyRequests"] = json!([{"id": "req-1", "status": "unresolved", "requiresReply": true}]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&dead).unwrap()).unwrap();
+    let interrupted = run.watch(&["--timeout", "5"]);
+    let interrupted_text = text(&interrupted);
+    assert_eq!(interrupted.status.code(), Some(1), "{interrupted_text}");
+    assert!(
+        interrupted_text.contains("state=interrupted"),
+        "{interrupted_text}"
+    );
+    assert!(
+        !interrupted_text.contains("action required"),
+        "{interrupted_text}"
+    );
+
+    let run = SeededRun::new();
+    let mut stopped = receipt_json(&run.receipt);
+    stopped["observation"]["state"] = json!("stopped");
+    stopped["observation"]["exitCode"] = json!(1);
+    stopped["replyRequests"] =
+        json!([{"id": "req-1", "status": "unresolved", "requiresReply": true}]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&stopped).unwrap()).unwrap();
+    let stopped_out = run.watch(&["--timeout", "5"]);
+    let stopped_text = text(&stopped_out);
+    assert_eq!(stopped_out.status.code(), Some(1), "{stopped_text}");
+    assert!(stopped_text.contains("state=stopped"), "{stopped_text}");
+    assert!(!stopped_text.contains("action required"), "{stopped_text}");
+
+    // The owned run finishes with its own result once the reply resolves the
+    // request, without a resume.
+    write_reply_hold(&host, false);
+    push_user_input(&host, "reply-1", REPLY_TURN, "one reply");
+    answer_thread(&host, json!([agent_turn(REPLY_TURN, REPLY_FINAL)]));
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "reply-m", "type": "agentMessage", "text": REPLY_FINAL}
+        }
+    }));
+    push_completed(&host, REPLY_TURN, "completed");
+    let finished = wait_session(session);
+    assert_eq!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    assert_eq!(host.server().requests_for("thread/resume").len(), 1);
+}
 #[test]
 fn unanswered_lead_message_keeps_the_same_thread_reply_capable_without_a_model_call() {
     let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
@@ -3018,6 +3419,23 @@ fn unanswered_lead_message_keeps_the_same_thread_reply_capable_without_a_model_c
     assert!(
         !process_gone(frontend_pid, frontend_created, &double),
         "frontend closed during the unresolved reply hold"
+    );
+
+    let waiting = watch_receipt(&host, "5");
+    let waiting_text = text(&waiting);
+    assert_eq!(
+        waiting.status.code(),
+        Some(WATCH_WAITING_EXIT),
+        "{waiting_text}"
+    );
+    assert!(
+        waiting_text.contains("id=lead-0123456789abcdef01234567")
+            && waiting_text.contains("--reply-to lead-0123456789abcdef01234567"),
+        "the lead's own message record is the reply reference: {waiting_text}"
+    );
+    assert!(
+        waiting_text.contains("lead=01a0c719-f4d4-7880-a9d2-1a96ee0f2301"),
+        "the addressed lead stays visible in the waiting result: {waiting_text}"
     );
 
     reply_on_same_thread(&host);

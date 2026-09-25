@@ -67,7 +67,7 @@ const USAGE: &str = concat!(
     "codex-harness executor succeed --request PATH\n",
     "The originating lead is the dispatching process CODEX_THREAD_ID, captured before the host environment is cleared. A missing or blank id, a caller-supplied lead or recipient, and a copied, stale, or sibling run marker are refused before any model request. Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (sibling directories named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set: the terminal cannot address that window by id, so dispatch briefly holds it foreground, resolves the tab there through the most-recently-used rule, and restores the user's foreground window and selected tab afterwards. When that window is unavailable (another virtual desktop or a blocked activation) the tab goes to the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use instead of using the user's focused window; --terminal-window targets an explicitly named window. Without WT_SESSION spawn opens a visible console. The Windows Terminal tab host exits 0 after the session ends, including a recorded failure, so the terminal's graceful close-on-exit closes that tab; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace is optional and no longer the isolation mechanism: it must be the source checkout or one of its pool slots, and ad-hoc worktree paths are refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
     "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts the child inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding pinned on it and no model request, attaches one native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The TUI owns terminal input and output; controller diagnostics stay in the bounded detail file and the control log. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt, so `executor message` and `executor stop` address this exact session, and records an explicit lifecycle (dispatch-accepted, native-start, running, completed, failed, defect, interrupted) beside the exact native session identity, the final-message locator and a bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the existing terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. A finished turn is not inferred from frontend exit. An attachment failure is reported before any assignment request and does not substitute a text stream. Losing the only frontend suspends further model dispatch and contains the owned run. An unfocused or unselected tab is not frontend loss, and a completion already retained is not overwritten or reported as success because the frontend closed. An abnormal host death reaps the child tree through the Job while an ordinary run end preserves the session's remaining background members; the child's output is retained at a kit-local log whose bounded tail is shown when the run fails. Host identity, the bounded detail file and the initial record must all succeed before the child starts, a thread that does not report the bound routing refuses the conversation, and a completed turn whose full-thread final-message read exceeds the transport limit records the assistant message already delivered on that turn, or an output defect naming the limit when none was delivered, and does not kill the child tree; any other startup, read or record failure fails the host with its cause instead of running another backend or reporting a successful run. Explicit --mode exec uses that same observed control lifecycle with the native inline TUI (--no-alt-screen), so its text and scrollback contract stays qualified without a second renderer or an unobserved interactive CLI. Historical unmanaged tui receipts and legacy receipts written before observation existed keep the coverage they recorded. ",
-    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, and 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
+    "`executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues, and 3 when the run is live with an unresolved reply request. Exit 3 is action required: the result names the exact run and the bounded request references with their one-command reply, the run keeps its session, slot, worktree and partial work, and the lead answers and runs watch again - it is never a completion, output defect, unavailable-coverage or release result. An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A Windows Terminal tab host exits 0 after recording that outcome so the tab closes; watch reads the receipt's exit code, not the tab process code. ",
     "Resume continues one exact interrupted session on its recorded slot through the managed native TUI: the host starts a control-backed app-server, resumes that exact thread, retires any stale control endpoint, and attaches one native Codex TUI to that session without fetch, reset, clean, a new conversation or a replay of completed work. Without --session it consumes the exact identity the dispatch receipt mechanically recorded, keeps that identity across failed resume attempts, and refuses instead of choosing by recency. It adopts a slot whose owner was cleared after the session ended and refuses a live owner or another owner's claim instead of sharing one checkout. ",
     "Release records the lead's merged or discarded disposition with its reason, reports the last observed run state, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. ",
     "`executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifies each by the recorded identity and boundedly terminates survivors so a child command is reported actually terminated instead of assumed ended with the host. The stopped run's tab closes because that run's own host process ends, and the recorded tab identity is verified closed through the terminal-surface owner; no terminal command is ever sent, so the lead's window, sibling tabs and other conversations are untouched. The receipt gets a stop record with outcome stopped, already-stopped, already-completed, partial or error, honest timestamps, the measured duration, the observed exit code (one that was never observed stays unknown), the pending-message undelivered marking, and the named survivor, cause and next action on partial failure; a repeated stop reports the recorded state and keeps the first stop's outcome, timestamps and measured duration, a stop racing natural completion reports the completed result, and nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. Exit codes: 0 stopped, already-stopped or already-completed, 1 error or refusal with nothing terminated, 2 partial stop; invalid options and an address that names another owner or session are refused with the kit's error exit before anything is acted on. --timeout bounds the whole stop path (default 30 seconds). ",
@@ -1288,6 +1288,10 @@ fn disposition_name(disposition: SlotDisposition) -> &'static str {
 /// as never natively started: dispatch writes its receipt just before the
 /// host opens, so a fresh receipt may legitimately have no host yet.
 const HOST_GRACE: Duration = Duration::from_secs(30);
+/// `executor watch` exit code for a live run waiting for a reply: the lead
+/// must answer the outstanding request. Action required, never completion,
+/// failure, unavailable coverage or permission to release or resume.
+const WATCH_EXIT_WAITING: i32 = 3;
 /// Bound on the changed-file list one review prints.
 const MAX_CHANGED_FILES: usize = 40;
 
@@ -1360,6 +1364,8 @@ struct WatchReport {
     exit_code: Option<i32>,
     events: u64,
     malformed: u64,
+    /// Set only for a live run waiting for a reply: the action-required result.
+    waiting: Option<WaitingReport>,
 }
 
 impl WatchReport {
@@ -1394,7 +1400,25 @@ impl WatchReport {
             exit_code: run.exit_code,
             events: run.events,
             malformed: run.malformed,
+            waiting: None,
         }
+    }
+
+    /// The action-required result of a live run waiting for a reply. The
+    /// shared identity and changed-files review stay; no result, exit code or
+    /// terminal outcome is claimed.
+    fn waiting(
+        receipt: &Path,
+        value: &serde_json::Value,
+        run: &RunObservation,
+        waiting: WaitingHold,
+    ) -> Self {
+        let mut report = Self::build(receipt, value, run, &run.state, None);
+        report.waiting = Some(WaitingReport {
+            references: waiting.references,
+            omitted: waiting.omitted,
+        });
+        report
     }
 
     fn text(&self) -> String {
@@ -1441,6 +1465,15 @@ impl WatchReport {
             }
             None => text.push_str("changed files: unavailable (no recorded checkout)\n"),
         }
+        if let Some(waiting) = &self.waiting {
+            text.push_str(&waiting.text());
+            text.push_str(&format!(
+                "detail: {} receipt: {}\n",
+                self.detail.as_deref().unwrap_or("unavailable"),
+                self.receipt
+            ));
+            return text;
+        }
         if let Some(cause) = &self.cause {
             text.push_str(&format!("cause: {cause}\n"));
         }
@@ -1479,6 +1512,8 @@ impl WatchReport {
         json!({
             "schema": 1,
             "state": self.state,
+            "actionRequired": self.waiting.is_some(),
+            "waiting": self.waiting.as_ref().map(WaitingReport::json),
             "cause": self.cause,
             "slot": self.slot,
             "owner": self.owner,
@@ -1505,6 +1540,71 @@ impl WatchReport {
     }
 }
 
+/// The action-required waiting result: the bounded unresolved request
+/// references with the one-command reply each one expects. Nothing here
+/// claims a lifecycle outcome, and the list never looks complete while more
+/// references stay on the receipt.
+struct WaitingReport {
+    references: Vec<observation::ReplyReference>,
+    omitted: usize,
+}
+
+impl WaitingReport {
+    fn text(&self) -> String {
+        let total = self.references.len() + self.omitted;
+        let mut text = format!(
+            "action required: waiting for reply ({total} unresolved reply request{}); the run stays live with its session, slot, worktree and partial work\n",
+            if total == 1 { "" } else { "s" }
+        );
+        for reference in &self.references {
+            text.push_str(&format!(
+                "  request: id={} kind={} status={}",
+                reference.id, reference.kind, reference.status
+            ));
+            if let Some(thread) = &reference.lead_thread {
+                text.push_str(&format!(" lead={thread}"));
+            }
+            text.push('\n');
+            text.push_str(&format!(
+                "  reply: codex-harness executor message --reply-to {} --text '<answer>'\n",
+                reference.id
+            ));
+        }
+        if self.omitted > 0 {
+            text.push_str(&format!(
+                "  note: {} further unresolved request{} stay on the receipt; this list is bounded\n",
+                self.omitted,
+                if self.omitted == 1 { "" } else { "s" }
+            ));
+        }
+        text.push_str(
+            "  note: action required, not completion, failure, unavailable coverage or release; answer the request, then run the same watch command to observe this run's own result\n",
+        );
+        text
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "requests": self
+                .references
+                .iter()
+                .map(|reference| json!({
+                    "record": reference.record,
+                    "id": reference.id,
+                    "kind": reference.kind,
+                    "status": reference.status,
+                    "leadThreadId": reference.lead_thread,
+                    "session": reference.session,
+                    "reply": format!(
+                        "codex-harness executor message --reply-to {} --text '<answer>'",
+                        reference.id
+                    ),
+                }))
+                .collect::<Vec<_>>(),
+            "omitted": self.omitted,
+        })
+    }
+}
 /// The bounded returned text of one run: presence, size and up to
 /// `MAX_REVIEW_BYTES` of the final message. A larger file is reported as
 /// truncated with its locator instead of being read whole.
@@ -1617,7 +1717,10 @@ fn parse_seconds(value: Option<&str>, fallback: u64, name: &str) -> io::Result<D
 /// `executor watch`: block on the recorded lifecycle of one run and return
 /// compact review data when it reaches a terminal state, without polling a
 /// model or searching rollouts. Exit codes: 0 completed, 1 failed, defect or
-/// interrupted, 2 unavailable coverage or the timeout expired first.
+/// interrupted, and 2 unavailable coverage or the timeout expired first. A
+/// live run with an unresolved reply request returns 3 with the bounded
+/// request references: action required, so the lead answers and watches the
+/// same run again instead of resuming or releasing it.
 fn watch(args: &[OsString]) -> io::Result<i32> {
     let mut source = None;
     let mut codex_home = None;
@@ -1744,15 +1847,7 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             );
             return Ok(2);
         }
-        let terminal = matches!(
-            run.state.as_str(),
-            STATE_COMPLETED
-                | STATE_FAILED
-                | STATE_DEFECT
-                | STATE_INTERRUPTED
-                | observation::STATE_STOPPED
-                | observation::STATE_PARTIAL_STOP
-        );
+        let terminal = watch_terminal_state(run.state.as_str());
         if terminal {
             let report = WatchReport::build(&receipt, &value, &run, &run.state, run.cause.clone());
             print_watch_report(&report, json_output)?;
@@ -1785,7 +1880,22 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
             print_watch_report(&report, json_output)?;
             return Ok(1);
         }
+        if let Some(waiting) = waiting_hold(&run, &value) {
+            let report = WatchReport::waiting(&receipt, &value, &run, waiting);
+            print_watch_report(&report, json_output)?;
+            return Ok(WATCH_EXIT_WAITING);
+        }
         if Instant::now() >= deadline {
+            // The deadline must not hide an established waiting state: read
+            // the newest receipt once, so a request recorded at the boundary
+            // is the actionable result instead of a timeout.
+            if let Some((fresh, fresh_run, waiting)) =
+                waiting_at_deadline(&receipt, owner.as_deref())
+            {
+                let report = WatchReport::waiting(&receipt, &fresh, &fresh_run, waiting);
+                print_watch_report(&report, json_output)?;
+                return Ok(WATCH_EXIT_WAITING);
+            }
             let report = WatchReport::build(
                 &receipt,
                 &value,
@@ -1804,6 +1914,68 @@ fn watch(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
+/// The bounded unresolved request references of one live waiting run: the
+/// question is outstanding and the recorded host can still accept the answer.
+struct WaitingHold {
+    references: Vec<observation::ReplyReference>,
+    omitted: usize,
+}
+
+/// A verified live run waiting for a reply: a running host process, a
+/// non-terminal lifecycle and at least one unresolved request. A terminal,
+/// dead, unrecorded-host or request-free run is not waiting, whatever else
+/// the receipt says; waiting alone changes no lifecycle outcome.
+fn waiting_hold(run: &RunObservation, value: &serde_json::Value) -> Option<WaitingHold> {
+    if watch_terminal_state(run.state.as_str()) {
+        return None;
+    }
+    let host = run.host.as_ref()?;
+    if observation::host_ended(host) {
+        return None;
+    }
+    let (references, omitted) =
+        observation::unresolved_reply_references(value, observation::MAX_WAITING_REFERENCES);
+    (!references.is_empty()).then_some(WaitingHold {
+        references,
+        omitted,
+    })
+}
+
+/// Re-reads the receipt once the watch deadline is due. A waiting state in
+/// that newer record is the actionable result rather than a timeout, and it
+/// keeps every liveness, coverage and owner check.
+fn waiting_at_deadline(
+    receipt: &Path,
+    owner: Option<&str>,
+) -> Option<(serde_json::Value, RunObservation, WaitingHold)> {
+    let bytes = fs::read(receipt).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let run = RunObservation::from_receipt(&value)?;
+    if run.coverage != COVERAGE_NATIVE {
+        return None;
+    }
+    if let (Some(owner), Some(recorded)) = (owner, value["slot"]["owner"].as_str())
+        && recorded != owner
+    {
+        return None;
+    }
+    let waiting = waiting_hold(&run, &value)?;
+    Some((value, run, waiting))
+}
+
+/// Receipt states `executor watch` reports as settled outcomes. A reply hold
+/// changes none of them: waiting is the live state that is not terminal.
+fn watch_terminal_state(state: &str) -> bool {
+    matches!(
+        state,
+        STATE_COMPLETED
+            | STATE_FAILED
+            | STATE_DEFECT
+            | STATE_INTERRUPTED
+            | observation::STATE_STOPPED
+            | observation::STATE_PARTIAL_STOP
+    )
+}
 fn print_watch_report(report: &WatchReport, json_output: bool) -> io::Result<()> {
     if json_output {
         println!(
@@ -5073,6 +5245,59 @@ mod tests {
     }
 
     #[test]
+    fn the_deadline_read_sees_a_waiting_state_recorded_in_the_newest_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = root.path().join("spawn-1.json");
+        let host = observation::host_identity().unwrap();
+        let waiting = json!({
+            "schema": 1,
+            "slot": {"index": 1, "owner": "exec-1"},
+            "observation": {
+                "schema": 1,
+                "coverage": "native",
+                "state": "running",
+                "session": "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4",
+                "host": {"pid": host.pid, "created": host.created, "program": host.program},
+                "updatedMs": observation::now_ms()
+            },
+            "replyRequests": [{"id": "req-1", "status": "unresolved", "requiresReply": true}]
+        });
+        fs::write(&receipt, serde_json::to_vec_pretty(&waiting).unwrap()).unwrap();
+        let (_, run, hold) =
+            waiting_at_deadline(&receipt, None).expect("the newest receipt is a waiting run");
+        assert_eq!(run.state, "running");
+        assert_eq!(hold.omitted, 0);
+        assert_eq!(hold.references.len(), 1);
+        assert_eq!(hold.references[0].id, "req-1");
+
+        let mut resolved = waiting.clone();
+        resolved["replyRequests"][0]["status"] = json!("resolved");
+        fs::write(&receipt, serde_json::to_vec_pretty(&resolved).unwrap()).unwrap();
+        assert!(
+            waiting_at_deadline(&receipt, None).is_none(),
+            "a resolved request is not a waiting state"
+        );
+
+        fs::write(&receipt, serde_json::to_vec_pretty(&waiting).unwrap()).unwrap();
+        assert!(
+            waiting_at_deadline(&receipt, Some("another-owner")).is_none(),
+            "an owner mismatch is not adopted at the deadline"
+        );
+
+        let mut dead = waiting.clone();
+        dead["observation"]["host"] = json!({
+            "pid": 4242,
+            "created": 1,
+            "program": root.path().join("absent-host.exe").to_string_lossy()
+        });
+        fs::write(&receipt, serde_json::to_vec_pretty(&dead).unwrap()).unwrap();
+        assert!(
+            waiting_at_deadline(&receipt, None).is_none(),
+            "a dead run is not waiting"
+        );
+    }
+
+    #[test]
     fn unfocused_or_unselected_tab_is_not_view_loss() {
         assert!(
             !frontend_view_lost(true),
@@ -5653,6 +5878,19 @@ mod tests {
             version: "PowerShell 7.6.6".into(),
             sandbox_mode: "danger-full-access".into(),
         };
+        // The dispatcher's captured originating relationship is part of the
+        // receipt these checks write; it is the same record the waiting and
+        // reply paths read back.
+        let lead = control::OriginatingLead {
+            schema: control::ORIGINATING_LEAD_SCHEMA,
+            thread_id: "01a0c719-f4d4-7880-a9d2-1a96ee0f2301".into(),
+            run_generation: "test-run-generation".into(),
+            dispatcher: control::DispatcherIdentity {
+                pid: std::process::id(),
+                creation_time: 1,
+                program: PathBuf::from(r"C:\home\lead\codex.exe"),
+            },
+        };
         let assignment = "Complete the outcome in ASSIGNMENT.md.";
         let observed =
             RunObservation::accepted(root.join("message-1.txt"), root.join("stream-1.jsonl"));
@@ -5678,9 +5916,14 @@ mod tests {
             None,
             &shell,
             &observed,
+            &lead,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&exec).unwrap()).unwrap();
+        assert_eq!(
+            value["originatingLead"]["threadId"], lead.thread_id,
+            "the dispatch records the originating lead: {value}"
+        );
         assert_eq!(value["mode"], "exec");
         assert_eq!(value["control"]["presentation"], "native-inline");
         assert_eq!(
@@ -5724,6 +5967,7 @@ mod tests {
             None,
             &shell,
             &observed,
+            &lead,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&tui).unwrap()).unwrap();

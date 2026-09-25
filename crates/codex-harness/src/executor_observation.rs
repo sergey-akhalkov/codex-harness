@@ -108,8 +108,14 @@ pub(crate) const MAX_REVIEW_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_RESULT_READ: u64 = 16 * 1024;
 /// Largest accepted event line; longer lines are dropped as oversize.
 const MAX_EVENT_LINE: usize = 512 * 1024;
+/// Bound on one text field of an unresolved request reference.
+const MAX_REFERENCE_TEXT: usize = 120;
 /// Bound on the child's stderr shown on the visible surface after a failure.
 pub(crate) const MAX_STDERR_TAIL: usize = 2 * 1024;
+/// Bound on how many unresolved request references one observation reports.
+/// The reference list an action-required watch result prints stays small even
+/// when a receipt holds more requests; the remainder is counted, not hidden.
+pub(crate) const MAX_WAITING_REFERENCES: usize = 4;
 /// Bound on how long the receipt writer lock waits for another writer.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// Poll interval of the spool tail while the owned child runs.
@@ -1082,40 +1088,86 @@ pub(crate) fn host_ended(host: &HostIdentity) -> bool {
 /// notification (`kind` of `notify`), and `requiresReply` is not false.
 /// `leadMessages` is what `lead message` writes: a `reply-request` that was not
 /// refused and not resolved is the same hold. A notification does not hold.
-/// Watch exit 3 stays with that workflow; this reader only keeps the base
-/// lifecycle from treating the hold as completion. The control driver keeps an
-/// equivalent reader because that file is also compiled alone by its fixture tests.
+/// This reader keeps the base lifecycle from treating the hold as completion,
+/// and it is the one reader behind the watch action-required result. The
+/// control driver keeps an equivalent reader because that file is also
+/// compiled alone by its fixture tests.
 pub(crate) fn unresolved_reply_hold(receipt: &Value) -> bool {
-    reply_request_hold(receipt.get("replyRequests"))
-        || lead_message_hold(receipt.get("leadMessages"))
+    !unresolved_reply_references(receipt, 1).0.is_empty()
 }
 
-/// `replyRequests` is the explicit hold record. A missing field is not a hold.
-fn reply_request_hold(requests: Option<&Value>) -> bool {
-    let Some(requests) = requests.and_then(Value::as_array) else {
-        return false;
-    };
-    requests.iter().any(|request| {
-        request.get("status").and_then(Value::as_str) == Some("unresolved")
-            && request.get("kind").and_then(Value::as_str) != Some("notify")
-            && request.get("requiresReply").and_then(Value::as_bool) != Some(false)
-    })
+/// One unresolved reply request as an observation surface reports it: which
+/// hold record carries it, the opaque reference that `executor message
+/// --reply-to` consumes, and the recorded sender and run it belongs to. Every
+/// text field is bounded, so a hand-edited receipt cannot grow model-visible
+/// output, and a missing field is named as unrecorded instead of invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplyReference {
+    /// `replyRequests` or `leadMessages`: the record holding the request.
+    pub record: &'static str,
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    /// Native thread of the lead being asked, when the record carries one.
+    pub lead_thread: Option<String>,
+    /// Native session of the executor run the request was recorded against.
+    pub session: Option<String>,
 }
 
-/// `lead message` writes `leadMessages`, not `replyRequests`. A reply-request
-/// that was not refused and not resolved is the same hold. A notification is not.
-fn lead_message_hold(messages: Option<&Value>) -> bool {
-    let Some(messages) = messages.and_then(Value::as_array) else {
-        return false;
+/// The unresolved reply requests of a receipt in record order, bounded by
+/// `limit`. The second value counts the references left out of the list, so a
+/// bounded list never looks like the whole record. A notification, a refused
+/// send and a resolved reply are not requests.
+pub(crate) fn unresolved_reply_references(
+    receipt: &Value,
+    limit: usize,
+) -> (Vec<ReplyReference>, usize) {
+    let mut found = Vec::new();
+    if let Some(requests) = receipt.get("replyRequests").and_then(Value::as_array) {
+        for request in requests {
+            let holds = request.get("status").and_then(Value::as_str) == Some("unresolved")
+                && request.get("kind").and_then(Value::as_str) != Some("notify")
+                && request.get("requiresReply").and_then(Value::as_bool) != Some(false);
+            if holds {
+                found.push(reply_reference("replyRequests", request));
+            }
+        }
+    }
+    if let Some(messages) = receipt.get("leadMessages").and_then(Value::as_array) {
+        for message in messages {
+            let holds = message.get("kind").and_then(Value::as_str) == Some("reply-request")
+                && message.get("requiresReply").and_then(Value::as_bool) != Some(false)
+                && !matches!(
+                    message.get("status").and_then(Value::as_str),
+                    Some("resolved" | "error" | "refused")
+                );
+            if holds {
+                found.push(reply_reference("leadMessages", message));
+            }
+        }
+    }
+    let omitted = found.len().saturating_sub(limit);
+    found.truncate(limit);
+    (found, omitted)
+}
+
+/// Bounded view of one holding record: the reply reference and the recorded
+/// identity, with untrustworthy text clipped and nothing invented.
+fn reply_reference(record: &'static str, entry: &Value) -> ReplyReference {
+    let text = |name: &str| {
+        entry
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|value| excerpt(value, MAX_REFERENCE_TEXT))
     };
-    messages.iter().any(|message| {
-        message.get("kind").and_then(Value::as_str) == Some("reply-request")
-            && message.get("requiresReply").and_then(Value::as_bool) != Some(false)
-            && !matches!(
-                message.get("status").and_then(Value::as_str),
-                Some("resolved" | "error" | "refused")
-            )
-    })
+    ReplyReference {
+        record,
+        id: text("id").unwrap_or_else(|| "unknown".into()),
+        kind: text("kind").unwrap_or_else(|| "reply-request".into()),
+        status: text("status").unwrap_or_else(|| "unrecorded".into()),
+        lead_thread: text("leadThreadId"),
+        session: text("session"),
+    }
 }
 
 /// Records one input that arrived after closure began. The same id is recorded
@@ -2124,6 +2176,54 @@ mod tests {
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
         assert_eq!(value["messages"][0]["status"], "undelivered");
         assert_eq!(value["schema"], 1);
+    }
+
+    #[test]
+    fn unresolved_reply_references_are_bounded_and_name_the_reply() {
+        let receipt = json!({
+            "replyRequests": [
+                {"id": "open", "status": "unresolved", "requiresReply": true},
+                {"id": "quiet", "status": "unresolved", "requiresReply": false},
+                {"id": "notice", "status": "unresolved", "kind": "notify"},
+                {"id": "answered", "status": "resolved", "requiresReply": true}
+            ],
+            "leadMessages": [
+                {"id": "lead-1", "kind": "reply-request", "status": "delivered",
+                 "leadThreadId": "01a0-lead", "session": "01a0-session"},
+                {"id": "lead-2", "kind": "reply-request", "status": "resolved"},
+                {"id": "lead-note", "kind": "notification", "status": "delivered"}
+            ]
+        });
+        let (references, omitted) = unresolved_reply_references(&receipt, 4);
+        assert_eq!(omitted, 0);
+        let ids: Vec<&str> = references
+            .iter()
+            .map(|reference| reference.id.as_str())
+            .collect();
+        assert_eq!(ids, ["open", "lead-1"]);
+        assert_eq!(references[0].record, "replyRequests");
+        assert_eq!(references[1].record, "leadMessages");
+        assert_eq!(references[1].lead_thread.as_deref(), Some("01a0-lead"));
+        assert_eq!(references[1].session.as_deref(), Some("01a0-session"));
+        assert!(unresolved_reply_hold(&receipt));
+
+        let (bounded, omitted) = unresolved_reply_references(&receipt, 1);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(omitted, 1);
+        assert!(
+            unresolved_reply_hold(&receipt),
+            "the hold is the request record, not the bounded list"
+        );
+
+        let long = json!({"replyRequests": [{
+            "id": "x".repeat(4096),
+            "status": "unresolved"
+        }]});
+        let (references, _) = unresolved_reply_references(&long, 1);
+        assert!(
+            references[0].id.len() < 512,
+            "a hand-edited receipt must not grow model-visible output"
+        );
     }
 
     #[test]
