@@ -6579,9 +6579,7 @@ mod tests {
             "the usage must name the lead's reply form"
         );
         assert!(
-            USAGE.contains(
-                "with no recipient, slot, session, checkout or endpoint"
-            ),
+            USAGE.contains("with no recipient, slot, session, checkout or endpoint"),
             "the usage must state that the run supplies the lead address"
         );
         assert!(
