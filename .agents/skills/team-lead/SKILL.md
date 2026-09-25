@@ -21,65 +21,58 @@ explicit and preserves partial work.
 
 ## Operating objective
 
-Maximize delivery speed of the accepted result while minimizing the lead's
-own token spend, and never sacrifice quality, correctness or acceptance for
-either. Lead tokens are the most expensive in the loop and the lead is
-normally the strongest model: keep for yourself judgment, decomposition,
-integration and acceptance, work that genuinely exceeds executor capability,
-and work whose delegation overhead - brief, board record, review, merge -
-exceeds the work itself, such as a one-line correction. Delegate every other
-parallelizable implementation slice. In practice: delegate bounded
-parallelizable work to executors, wait on native watcher events instead of
-model-side polling, and stop spending once the agreed outcome is proven
-rather than polishing beyond it.
+Maximize delivery speed of the accepted result while minimizing the lead's own
+token spend, and never sacrifice quality, correctness or acceptance for either.
+Lead tokens are the most expensive in the loop and the lead is normally the
+strongest model: keep judgment, decomposition, integration and acceptance,
+work that genuinely exceeds executor capability, and work whose delegation
+overhead - brief, board record, review, merge - exceeds the work itself.
+Delegate every other parallelizable slice, wait on native watcher events
+instead of model-side polling, and stop spending once the agreed outcome is
+proven rather than polishing beyond it.
 
 ## Keep executors utilized
 
 While this role is active, executor capacity is not left idle by omission.
 Check utilization at session start, at stage and epic planning, after every
-dispatch decision, and after every acceptance or slot release. At each
-checkpoint either dispatch the next worthwhile, capability-sized slice to
-available capacity or record the concrete reason it stays idle: no
-worthwhile slice exists now, remaining slices depend on unresolved work,
-configured pacing holds new assignments, the slot is preserved or blocked
-with its recorded state, or dispatch is unavailable with the reported cause.
-Record the reason as a short board note on the owning stage or feature -
-preserved slots already carry theirs in pool state - and refresh it when its
-circumstance changes, not per task. While capacity idles without a recorded
-reason, do not keep executor-suitable routine implementation work for
-yourself: dispatch it or record why it stays with the lead before doing it.
-Work whose delegation overhead exceeds the work itself - typically a
-one-line correction, a direct answer or a quick read - is not
-executor-suitable: do it directly, with no task, assignment or board note.
-After a slot is released, backfill it with the next dispatchable slice
-before starting unrelated implementation work yourself.
+dispatch decision, and after every acceptance or slot release: either dispatch
+the next worthwhile, capability-sized slice to available capacity or record the
+concrete reason it stays idle - no worthwhile slice exists now, remaining
+slices depend on unresolved work, configured pacing holds new assignments, the
+slot is preserved or blocked with its recorded state, or dispatch is
+unavailable with the reported cause. Record that reason as a short board note
+on the owning stage or feature - preserved slots already carry theirs in pool
+state - and refresh it when its circumstance changes, not per task. While
+capacity idles without a recorded reason, dispatch executor-suitable routine
+work instead of keeping it for yourself, and backfill a released slot before
+starting unrelated implementation work. Work whose delegation overhead exceeds
+the work itself - a one-line correction, a direct answer or a quick read - is
+not executor-suitable: do it directly, with no task, assignment or board note.
 
-Occupancy is observable: every progress report states how many configured
-slots are busy and the recorded reason for each idle executor or free slot,
-derived from board records and `executor pool` - never from window polling
-or status requests to active executors. Utilization creates no manufactured
-filler work and no delegation-count target, never preempts a healthy
-executor, and yields to completion, correctness and configured pacing. This
-duty belongs to the active lead role only: an ordinary session without
-activation reports no utilization and spawns nothing.
+Occupancy is observable: every progress report states how many configured slots
+are busy and the recorded reason for each idle executor or free slot, derived
+from board records and `executor pool` - never from window polling or status
+requests to active executors. Utilization creates no filler work and no
+delegation-count target, never preempts a healthy executor, and yields to
+completion, correctness and configured pacing. This duty belongs to the active
+lead role only: an ordinary session without activation reports no utilization
+and spawns nothing.
 
 ## Discover roles
 
 Read kit `global/orchestration.toml` (lead profile, successor lead, executor
 profiles, max concurrent executors). Installation check already rejects missing
-profiles and non-positive limits. Dispatch uses exactly those profiles.
-Explicit user `codex --profile <id>` keeps native precedence. Do not substitute
-another model. The configured profile is each assignment's complete
-model/effort selection: its native configuration already fixes both,
-`executor spawn` takes no per-assignment model or effort by design, and their
-absence conflicts with no selection rule. With `executor_profiles = ["ds"]`,
-every assignment runs DeepSeek V4.1-Flash at `max`; a single executor profile
-is full configured capacity, never a reason to keep executor-suitable work in
-the lead. Routing wording that seems to demand another model or per-task
-arguments is reported as a discrepancy while dispatch proceeds; only a
-launcher-reported failure blocks dispatch. `max_concurrent_executors` also
-sizes the executor worktree pool, and `executor spawn` - not the lead -
-allocates its slots.
+profiles and non-positive limits. Dispatch uses exactly those profiles; an
+explicit user `codex --profile <id>` keeps native precedence. The configured
+profile is each assignment's complete model/effort selection: its native
+configuration already fixes both, and `executor spawn` takes no per-assignment
+model or effort by design. With `executor_profiles = ["ds"]`, every assignment
+runs DeepSeek V4.1-Flash at `max`; a single executor profile is full configured
+capacity, never a reason to keep executor-suitable work in the lead. Routing
+wording that seems to demand another model or per-task arguments is reported as
+a discrepancy while dispatch proceeds; only a launcher-reported failure blocks
+dispatch. `max_concurrent_executors` also sizes the executor worktree pool, and
+`executor spawn` - not the lead - allocates its slots.
 
 ## Board setup
 
@@ -103,19 +96,18 @@ Listing, merging and voting are board commands: no model calls beyond the
 lead's similarity judgment. Steering remains the live course-correction
 channel; the incubator carries durable demand.
 
-Route each observation by kind before it competes as an incubator vote: a
-verified reusable procedure in owned skill scope is handed to
-`skill-evolution` as a reference (no skill package writes, `SKILL.md`
-untouched), while process, orchestration, requirement, tool, unclear and
-material observations stay in the incubator. Promote at `vote_threshold` from
-kit `global/orchestration.toml` by consequence: small improvements to backlog
-tasks, behavior or requirement changes into OpenSpec entries, kit skill or
-instruction demand to the kit backlog with kit-level wording only. A material
-correctness, integrity or safety concern promotes immediately under your
-consequence override with the reason recorded in history. Sweep the incubator
-when you close a stage or epic during acceptance, and when a triage batch finds
-it above `incubator_size_cap`; with no lead session active the sweep waits.
-Promotion confers eligibility for planning, never silent implementation.
+Route each observation by kind: a verified reusable procedure in owned skill
+scope goes to `skill-evolution` as a reference (no skill package writes,
+`SKILL.md` untouched), while process, orchestration, requirement, tool, unclear
+and material observations stay in the incubator. Promote at `vote_threshold`
+from kit `global/orchestration.toml` by consequence: small improvements to
+backlog tasks, behavior or requirement changes into OpenSpec entries, kit
+demand to the kit backlog with kit-level wording only, and a material
+correctness, integrity or safety concern immediately under your consequence
+override with the reason recorded. Sweep the incubator when you close a stage
+or epic during acceptance and when a triage batch finds it above
+`incubator_size_cap`; with no lead session active the sweep waits. Promotion
+confers eligibility for planning, never silent implementation.
 
 ## Assign and brief
 
@@ -138,11 +130,14 @@ the returned result (default: the dispatching lead) and `escalate` adds
 triggers that return the decision to that consumer. The rendered brief always
 carries the standing boundaries - a change to the agreed outcome or scope, a
 material architecture change, missing authority, an unobtainable dependency -
-together with the executor's own work cycle and the compact result expected
-back (done and remaining work, checkout and base, files, actual checks,
-limitations, required decision, detail locator), so do not restate those in the
-objective. Ordinary implementation errors stay with the executor: it
-investigates, corrects and re-runs them itself.
+together with the installed lead channel, the executor's own work cycle and the
+compact result expected back (done and remaining work, checkout and base,
+files, actual checks, limitations, required decision, detail locator), so do
+not restate those in the objective. `codex-harness lead message --text ...`
+addresses the originating lead itself and holds the run while it waits for the
+answer, so an executor reports its question instead of ending the work.
+Ordinary implementation errors stay with the executor: it investigates,
+corrects and re-runs them itself.
 `executor assignment --source CHECKOUT --slot N --base REV --assignment FILE`
 validates and renders that brief against an existing pool checkout without
 dispatch; the same option works with `resume` while preserving partial work.
@@ -176,15 +171,14 @@ dirty work just to form a base.
 
 Before the first dispatch, probe the installed launcher:
 `codex-harness executor --help` must print the executor usage. An
-`unsupported command` answer is a stale harness build, not proof that
-executors are unavailable: kit skills are live links, while the launcher is an
-immutable build updated only through the kit lifecycle. Report `launcher stale`
-with the remedy - rebuild and update the kit from the source root recorded in
-`CODEX_HOME/harness/installation.json` - and meanwhile continue only work whose
-acceptance does not depend on executors. Do not repair the skew by substituting
-the profile or by dispatching raw `codex exec`, TUI automation or in-session
+`unsupported command` answer is a stale harness build, not proof that executors
+are unavailable: report `launcher stale` with the lifecycle remedy recorded in
+`CODEX_HOME/harness/installation.json`, and meanwhile continue only work that
+does not depend on executors. Do not repair the skew by substituting the
+profile or by dispatching raw `codex exec`, TUI automation or in-session
 subagents: that drops the visible conversation, steering, board and recovery
-contract.
+contract. The staleness distinction and its full remedy live in
+[agent delegation](../../../docs/agent-delegation.md#orchestration-configuration).
 
 Each executor gets a complete outcome, its configured profile, its own
 native TUI on a terminal tab or owned console, and a synchronized pool slot before the first model
@@ -240,10 +234,14 @@ reach a later occupant of a reused slot, and it appears in that executor's
 visible conversation. Message only for a concrete correction of continuing
 work: steering adds relevant facts, resolves a request or corrects an
 established mistake, and no status-only nudges, hurry demands or repeats
-without new facts go out. Wait without takeover while an executor remains
-active; an executor that reaches a declared escalation boundary returns the
-needed decision with its result, and improvement observations arrive as board
-feedback tasks.
+without new facts go out. Answer an executor's question with the same command
+addressed by the reference the question carried:
+`codex-harness executor message --reply-to MESSAGE_ID --text ...` needs no
+slot, session or endpoint discovery and continues that same conversation.
+Never hunt for endpoints, receipts, process ids or sessions to reach a run: the
+kit commands resolve the recorded identity themselves. Wait without takeover
+while an executor remains active; improvement observations arrive as board
+feedback tasks, and durable decisions from an answer go on the bd issue.
 Stop a run with `codex-harness executor stop` only for an explicit
 cancellation request or a concrete necessity such as a demonstrated wrong
 direction or a run that cannot progress: a brief error, a slow stream, waiting
@@ -272,8 +270,13 @@ base, changed files, the returned message and the result/detail locators.
 Exit 0 means the run completed, 1 names a failed, defect or interrupted run
 with its cause, and 2 means unavailable coverage (historical unmanaged tui or
 legacy receipt), a missing receipt, or the timeout while the run continues.
-Timeout does not stop the run, and the current native TUI is not that
-unavailable case. Watch output is the
+Exit 3 is action required: the live run holds an unanswered request, and the
+result names the run with the reference whose one-command reply answers it.
+Answer it and run the same watch again; it is not completion, an output defect,
+unavailable coverage or a resume trigger, and the waiting run keeps its
+session, slot, worktree and partial work without any keep-alive loop or
+repeated wait command. Timeout does not stop the run, and the current native
+TUI is not that unavailable case. Watch output is the
 executor's report, still not verified acceptance.
 Wait in one blocking call, not a polling loop: omit `--timeout` (its default
 1800s covers long acceptance runs) or set it to the expected run duration,
@@ -281,14 +284,13 @@ and give the shell call itself enough timeout to cover that wait. Watch
 prints nothing while the run continues, so the wait costs nothing until the
 report. If the shell timeout ends the wait early or watch exits 2 with the run
 still running, rerun the same watch as its continuation; never shrink waiting
-into short fixed-interval polling such as every 50 seconds. `executor pool`
-is the cheap snapshot between other work; a healthy run needs no extra check.
+into short fixed-interval polling. `executor pool` is the cheap snapshot
+between other work; a healthy run needs no extra check.
 Track session-file growth in the same loop: a live executor whose rollout is
 silent beyond a bounded threshold (about 15 minutes) is a stuck-suspect -
 then read its recent reasoning and diff, and only for a confirmed anomaly send
 one bounded question with `codex-harness executor message` (blockers, next
-step in at most five lines, then continue). Timed status polling of healthy
-executors is waste.
+step in at most five lines, then continue). Timed status polling is waste.
 While executors run, the lead analyzes bottlenecks, spend and next cuts, and
 files those as board tasks.
 

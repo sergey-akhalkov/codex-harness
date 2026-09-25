@@ -75,33 +75,29 @@ input, not a presentation selector.
 
 Skills and `orchestration.toml` are live links into the kit checkout, while the
 launcher is an immutable native build changed only by an explicit build and
-install. A checkout updated after the last install can therefore reference an
-`executor` command the installed launcher does not contain. Probe the launcher
-before the first dispatch with `codex-harness executor --help`; it must print
-the executor usage. `unsupported command` names a stale build, not unavailable
-executors: rebuild and update through the
+install, so a checkout updated after the last install can reference an
+`executor` command the installed launcher lacks. Probe with
+`codex-harness executor --help` before the first dispatch; `unsupported command`
+names a stale build, not unavailable executors: rebuild and update through the
 [installation lifecycle](installation.md#install-and-verify) from the source
-root recorded in `CODEX_HOME/harness/installation.json`. Until the update,
+root recorded in `CODEX_HOME/harness/installation.json`. Until then
 orchestration stays blocked - no profile substitution, no raw `codex exec`, TUI
-automation or in-session helpers, which would drop visibility, steering, board
-and recovery guarantees. `codex-harness --version` prints the installed
+automation or in-session helpers. `codex-harness --version` prints the installed
 build's source identity when its build record is present, so a stale launcher
 is identifiable without guessing.
 
-That command uses `codex --profile xai` from the example above. An unlisted
-`--profile` is an error. Explicit user `codex --profile <id>` keeps native
-precedence over role configuration. The live kit routes every executor
-through `xai` (Grok 4.7, `xhigh`) and accepts no per-assignment model
-or effort override by design: the profile is the selection. If any
-instruction appears to demand per-assignment model/effort for executor
-dispatch, that demand belongs to ordinary in-session agents; dispatch the
-configured profile and report the discrepancy. Only a launcher- or
-installation-check-reported failure - missing profile, stale build, no free
-slot, fetch failure - blocks dispatch, with its exact cause and remedy;
-never a routing-rule interpretation, the single executor profile or unknown
-quota. Quota succession looks up the successor
-profile's model in the native catalog; the verified handoff seed remains a
-configured `zai/glm-5.3` binding, not a hardcoded provider role.
+Dispatch uses the configured executor profile from the example above; an
+unlisted `--profile` is an error, and an explicit user `codex --profile <id>`
+keeps native precedence over role configuration. The profile is the complete
+model/effort selection and `executor spawn` accepts no per-assignment override
+by design. If any instruction appears to demand one for executor dispatch, that
+demand belongs to ordinary in-session agents: dispatch the configured profile
+and report the discrepancy. Only a launcher- or installation-check-reported
+failure - missing profile, stale build, no free slot, fetch failure - blocks
+dispatch, with its exact cause and remedy; never a routing-rule interpretation,
+the single executor profile or unknown quota. Quota succession looks up the
+successor profile's model in the native catalog; the verified handoff seed
+stays a configured binding, not a hardcoded provider role.
 
 Spawn opens the assignment in a new tab of the lead's own Windows Terminal
 window when the lead already runs there (`WT_SESSION`). Windows Terminal has no
@@ -135,7 +131,9 @@ self-correct cycle, and the compact result expected back: done and remaining
 work, the checkout and base worked from, files, actual checks, limitations,
 required decision and detail locator. A declared `consumer` or `escalate`
 trigger extends that contract instead of replacing it, and an executor resolves
-ordinary implementation errors - syntax, API names, failing checks - itself.
+ordinary implementation errors - syntax, API names, failing checks - itself,
+reaching its lead through the installed message channel only when a trigger is
+actually hit.
 The schema, optional fields, defaults and limits live in
 [native commands](rust-native.md#structured-executor-assignments).
 
@@ -221,27 +219,25 @@ Listing, merging, voting and promotion are `bd` commands; only the lead's
 similarity and consequence judgments are model work. The incubator holds unique
 items, a merge or repeated report adds exactly one vote per distinct episode and
 reporter, and `vote_threshold` (kit `global/orchestration.toml`, default 3)
-promotes an item to the backlog in routing order: small improvements to backlog
-tasks, behavior or requirement changes into OpenSpec, and kit instruction or
-tool demand to the kit's own board with kit-level wording only. A material
+promotes an item in routing order with kit-level wording only. A material
 correctness, integrity or safety finding promotes immediately under the lead's
-consequence override with the reason recorded. The lead sweeps the incubator on
-two triggers it already observes - closing a stage or epic during acceptance,
-and a triage batch finding it above `incubator_size_cap` - archiving stale items
-with visible reasons instead of deleting evidence. The `board-workflow` skill
-owns the record formats; the `team-lead` skill owns the workflow.
+consequence override with the reason recorded. The lead sweeps the incubator
+when it closes a stage or epic and when a triage batch finds it above
+`incubator_size_cap`, archiving stale items with visible reasons instead of
+deleting evidence. The `board-workflow` skill owns the record formats; the
+`team-lead` skill owns the workflow.
 
 Pacing uses three scoped sources only: the native Codex/GPT limit snapshot the
 CLI records for itself, actual provider refusals, and bounded dashboard
 snapshots the user supplies. Unknown stays unknown - no probe call and no local
-request-count remainder - and unknown holds the configured limits rather than
-raising them. Below 70% used keeps configured concurrency and cadence, 70% or
-more halves new concurrency and the triage batch (at least 1), and 90% or more,
-or an observed refusal, waits for the reset with concurrency 1 and a `low`
-effort ceiling. Pacing changes new assignments only: a healthy executor keeps
-its slot, model and instructions, and tasks released by one reset are spread by
-a 120-second stagger instead of bursting together. Decisions are recorded on the
-board with reason, basis and expiry, and withdrawn with a revoke record.
+request-count remainder - and unknown holds the configured limits. Below 70%
+used keeps configured concurrency and cadence, 70% or more halves new
+concurrency and the triage batch (at least 1), and 90% or more, or an observed
+refusal, waits for the reset with concurrency 1 and a `low` effort ceiling.
+Pacing changes new assignments only: a healthy executor keeps its slot, model
+and instructions, and tasks released by one reset are spread by a 120-second
+stagger instead of bursting together. Decisions are recorded on the board with
+reason, basis and expiry, and withdrawn with a revoke record.
 
 No improvement becomes a default for assignments, worktrees, concurrency or
 cadence before a matched comparison declares its tolerance in advance and shows
@@ -400,7 +396,13 @@ including untracked files - so a committed executor result never reads as "no
 changes", and truncation is named. Watch exits 0 for a completed run, 1 for
 failed, defect or interrupted runs, and 2 when coverage is unavailable
 (historical unmanaged tui or legacy), the receipt is missing, or the timeout
-expires while the run continues. Timeout does not stop the executor. An interrupted
+expires while the run continues. Exit 3 is action required: the run is live
+with an unanswered reply request, and the result names the run and the request
+references whose one-command reply answers it. The lead answers and runs the
+same watch again; exit 3 is not completion, an output defect, unavailable
+coverage or a resume trigger, and the waiting run keeps its session, slot,
+worktree and partial work instead of being resumed or released. Timeout does
+not stop the executor. An interrupted
 host is reported with its reason and an unknown exit code, never as a
 completion. `executor pool` adds `run=<state> session=<id>` per slot, and
 `executor release` prints the last observed run beside the disposition it
@@ -440,15 +442,28 @@ flag surface and result classes live in
 [native commands](rust-native.md#structured-executor-assignments); the rules
 below say when each command is justified.
 
+An executor's own question travels the reverse direction and needs no address:
+`codex-harness lead message --text TEXT` (or a UTF-8 `--file`) sends one
+literal payload to the originating lead recorded for that run, and `--notify`
+marks a notice that requests no reply. The envelope carries the sender, run,
+session, worktree and assignment metadata with a request reference, so the
+lead answers through the same command owner:
+`codex-harness executor message --reply-to MESSAGE_ID --text TEXT`. That
+reference replaces the address fields and continues the same conversation in
+place, without resume. Asking is exceptional - a material ambiguity, an
+authority or access boundary, or a dependency the executor cannot obtain after
+investigating the available facts. Routine progress, repeated status and
+ordinary implementation errors stay off the channel and on the bd issue, and
+nobody discovers endpoints, receipts, process ids or sessions by hand to reach
+a run: the commands resolve the recorded identity themselves.
+
 Message a continuing executor for a concrete correction, a relevant fact or a
 requirement change: steering adds facts, resolves a request or corrects an
-established mistake. Do not send status-only nudges, hurry demands or repeats
-without new facts, and do not ask a healthy executor what it is doing -
-waiting is not a reason to steer. Delivery preserves the same conversation
-with its context and its model, provider and effort selection, so a
-correction continues in place instead of a new conversation, a stop/resume
-cycle or a re-sent task. A completed, stopped or unavailable run is reported
-with its actual state and the exact-session resume remedy, never revived.
+established mistake. No status-only nudges, hurry demands or repeats without
+new facts, and no question to a healthy executor about what it is doing -
+waiting is not a reason to steer. A correction continues the same conversation
+in place; a completed, stopped or unavailable run is reported with its actual
+state and the exact-session resume remedy, never revived.
 
 Stop only for an explicit cancellation request or a concrete necessity - a
 demonstrated wrong direction, a run that cannot make progress, or a resource
@@ -459,7 +474,9 @@ processes by hand: manual process killing has no identity check, tab closure
 or honest receipt and needs a recorded cause. A stop preserves the files,
 checkout, slot and partial work and claims no completion; continue by
 resuming the exact session (except cache-loss recovery below), and release
-the slot only as its own explicit decision.
+the slot only as its own explicit decision. The same explicit stop ends a run
+that is waiting for an answer: waiting is a live state, and no timeout, silent
+period or unanswered request stops or resumes it by itself.
 
 ### DeepSeek cache-loss protection and recovery
 
@@ -517,26 +534,25 @@ for every available profile stays with the lead, is split further, or uses a
 bounded principal consultation; it is never delegated as-is. Investigation
 inside a delegated slice's boundaries remains executor work.
 
-Combine related routine into one substantial assignment. Splitting a pair of
-short functions between two children increased parent time and spend in the
-first comparison. State material input bounds up front. Routine supervision
-runs once every 15 minutes, as described with `executor watch` above. Check
-earlier only for a delivered result, explicit error, help request, new user
-instruction or concrete risk to correctness or shared resources. Do independent
-work between events; do not repeatedly reread worker source, diffs or logs.
+Combine related routine into one substantial assignment and state material
+input bounds up front. Routine supervision runs once every 15 minutes, as
+described with `executor watch` above. Check earlier only for a delivered
+result, explicit error, help request, new user instruction or concrete risk to
+correctness or shared resources. Do independent work between events; do not
+repeatedly reread worker source, diffs or logs.
 
 That interval is not the assignment deadline. A message to a working agent must
 add facts, correct an established error or change the task. An empty or
 intermediate result requires checking current work; by itself it does not
 establish quota exhaustion or authorize automatic GPT takeover. Reconcile the
-delivery mechanism and partial result before continuation or reassignment; return
-in-scope corrections to the capable original executor.
+delivery mechanism and partial result before reassignment.
 
-After restoring a parent session, `resume_agent` can lose the previous Grok
-binding and inherit Astra. Do not recover a saved Grok through that tool:
-inspect partial work and hand it to a fresh explicitly selected Grok with brief context. An old
-model record does not prove a new binding. A service-state check error on an
-old conversation does not mean the subscription is permanently unavailable.
+After restoring a parent session, `resume_agent` can lose the previous
+subscription binding. Do not recover such a session through that tool: inspect
+partial work and hand it to a fresh explicitly selected agent with brief
+context. An old model record does not prove a new binding, and a service-state
+check error on an old conversation does not mean the route is permanently
+unavailable.
 
 The parent passes the concrete result, inputs, dependencies, change bounds,
 invariants, resource ownership, meaningful check and parent consumer. Usually

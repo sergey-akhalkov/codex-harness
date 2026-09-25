@@ -297,7 +297,10 @@ installed profile. Omitting `--mode` selects the native TUI; explicit
 The observed lifecycle of dispatched sessions is a native command, not a log
 search: `codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY
 --slot N` (or `--receipt FILE`) blocks on the receipt's recorded lifecycle and
-prints bounded review data. `--receipt` must be an absolute path.
+prints bounded review data. Exit 3 means action required: the live run holds an
+unanswered reply request, and the result carries the reference whose
+one-command reply answers it - a state to answer, never a completion, an output
+defect or a resume trigger. `--receipt` must be an absolute path.
 `codex-harness executor run --file RECEIPT` is the tab or console host: it
 attaches the native TUI, inline when spawn selected exec, and records that
 lifecycle rather than launching an unobserved `codex exec`. States, exit codes,
@@ -308,40 +311,49 @@ A live run is then addressed and controlled through its recorded identity:
 
 ```powershell
 codex-harness executor message --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session ID] (--text TEXT | --file FILE)
+codex-harness executor message --reply-to MESSAGE_ID (--text TEXT | --file FILE)
 codex-harness executor stop --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session ID]
+codex-harness lead message (--text TEXT | --file FILE) [--notify]
 ```
 
 `message` delivers one literal UTF-8 text - or a UTF-8 file's content with its
 real line breaks, without shell evaluation - into the addressed run's own
 conversation, at the nearest supported point even while a tool call runs and
-without interrupting it. The conversation, model, provider, reasoning
-effort and completed work are preserved - no new conversation, hidden
-stop/resume or re-sent task - and the input appears on that run's terminal
+without interrupting it. The conversation, model, provider, reasoning effort
+and completed work are preserved, and the input appears on that run's terminal
 surface. The result distinguishes `queued` input, confirmed `delivered` and
-`error`: a local file write is never presented as model delivery, and a retry
-after an indeterminate result cannot silently deliver the same text twice.
-`stop` urgently ends one exact run without waiting for completion, a model
-answer or a child command: native interruption where the run's backend
-provides it, then bounded termination of the recorded host's owned process
-tree - verified by recorded identity, never by process id, program name or
-window title - when that signal is unavailable or insufficient. It closes
-exactly that run's tab, leaving the lead's terminal and neighboring tabs
-usable, and records `stopped`, `already-completed`, `partial` or `error` with
-timestamps, measured duration, an unknown exit code kept unknown and pending
-messages marked undelivered; a partial stop names the surviving process, cause
-and next action instead of reporting success. Stop keeps files, the checkout,
-the slot and partial work (no reset, clean, worktree deletion, release or
-completion claim), a repeated stop safely reports the current state, and a
-stop racing natural completion reports which outcome won.
+`error`: a local write is never presented as model delivery, and a retry after
+an indeterminate result cannot silently deliver the same text twice. `stop`
+urgently ends one exact run: native interruption where the run's backend
+provides it, then bounded termination of the recorded host's process tree -
+verified by recorded identity, never by process id, program name or window
+title - when that signal is unavailable or insufficient. It closes exactly that
+run's tab, leaving the lead's terminal and neighboring tabs usable, and records
+`stopped`, `already-completed`, `partial` or `error` with an unknown exit code
+kept unknown and pending messages marked undelivered; a partial stop names the
+surviving process, cause and next action. Stop keeps files, the checkout, the
+slot and partial work (no reset, clean, release or completion claim), a
+repeated stop safely reports the current state, and a stop racing natural
+completion reports which outcome won.
+
+`lead message` is the executor's direction and the only channel it needs: one
+literal `--text` payload, or a UTF-8 `--file`, goes to the originating lead
+recorded for its own live run, so the caller supplies no recipient, slot,
+session, checkout or endpoint, and `--notify` sends an exceptional notice that
+requests no reply. The default kind requests one, and the lead answers with
+`executor message --reply-to MESSAGE_ID`, which resolves that request instead
+of an address and continues the same conversation in place. An unanswered
+request keeps the run, its session, slot and worktree live - `executor watch`
+returns exit 3 for it - and answering needs no resume. Neither side looks up
+an endpoint, receipt, process id or session by hand: the recorded identity is
+what each command resolves.
 
 Both commands verify the addressed slot, owner and exact session against the
 live run before acting and refuse a mismatch, so input cannot reach a later
 occupant of a reused slot. A completed, stopped or unavailable run gets its
 actual state and the exact-session resume remedy; a run without a recorded
 control endpoint reports `message` as unsupported with the same remedy, while
-`stop` still works through the recorded host identity. Results remain available
-after the run's tab closes. Selection rules - when messaging or stopping is
-justified - live in
+`stop` still works through the recorded host identity. Selection rules live in
 [agent delegation](agent-delegation.md#steering-and-stopping-executors).
 
 ```powershell
