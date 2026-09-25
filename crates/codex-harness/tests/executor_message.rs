@@ -80,6 +80,14 @@ fn orchestration() -> String {
     "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"ds\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 1\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 1\n".to_owned()
 }
 
+/// Rewrites one fixture receipt as an owned test step: the address and identity
+/// fields stay untouched, so the command still verifies the same run.
+fn edit_receipt(path: &Path, edit: impl FnOnce(&mut Value)) {
+    let mut receipt: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    edit(&mut receipt);
+    fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1037,6 +1045,60 @@ fn a_stopped_run_marks_a_queued_message_undelivered() {
     assert_eq!(attempt["id"], content_id(correction), "{attempt}");
 }
 
+#[test]
+fn a_full_receipt_refuses_a_new_message_instead_of_evicting_unresolved_attempts() {
+    let fixture = Fixture::new("capacity", "running", true);
+    let recorded: Vec<Value> = (0..64)
+        .map(|index| {
+            json!({
+                "schema": 1,
+                "id": format!("msg-{index:04}"),
+                "clientMessageId": format!("msg-{index:04}"),
+                "status": "delivered",
+                "attempts": 1,
+            })
+        })
+        .collect();
+    edit_receipt(&fixture.receipt, |receipt| {
+        receipt["messages"] = json!(recorded);
+    });
+    // The receipt is full of records that each prevent a repeat of their
+    // content: none may be silently evicted for one more message.
+    let out = fixture.message(&["--text", "one more correction"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("refusing to evict"), "{text}");
+    assert!(text.contains("nothing was sent"), "{text}");
+    assert!(
+        fixture.server.requests_for("turn/start").is_empty()
+            && fixture.server.requests_for("turn/steer").is_empty(),
+        "the refused attempt must not reach the endpoint: {text}"
+    );
+    assert_eq!(
+        fixture.attempts().len(),
+        64,
+        "no recorded attempt was evicted"
+    );
+
+    // A definite refusal applied nothing, so it is the disposable record: the
+    // same bound then admits the new message instead of blocking it forever.
+    edit_receipt(&fixture.receipt, |receipt| {
+        receipt["messages"][0]["status"] = json!("error");
+        receipt["messages"][0]["id"] = json!("msg-error");
+        receipt["messages"][0]["clientMessageId"] = json!("msg-error");
+    });
+    let out = fixture.message(&["--text", "one more correction"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": queued in"), "{text}");
+    let attempts = fixture.attempts();
+    assert_eq!(attempts.len(), 64, "{attempts:?}");
+    assert!(
+        !attempts.iter().any(|attempt| attempt["id"] == "msg-error"),
+        "the refused attempt is the one that was disposed of: {attempts:?}"
+    );
+}
+
 const BOUNDARY_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24bb";
 const TOOL_TURN: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f24cc";
 const NEIGHBOR_THREAD: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f25aa";
@@ -1992,6 +2054,246 @@ fn lead_message_help_has_no_address_flags() {
     }
 }
 
+#[test]
+fn lead_message_classifies_a_queued_send_and_never_sends_the_same_question_twice() {
+    let fixture = LeadFixture::new("lead-queued", LEAD_THREAD, true);
+    let payload = "queued question: the lead has not applied it yet";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    // The native transport accepts the input, but the conversation's own items
+    // never show it: queued, never delivered.
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(lead_thread_read(
+            &fixture.lead_thread,
+            "idle",
+            json!([]),
+        ))],
+    );
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: queued"), "{text}");
+    assert_metadata(&text, &fixture, "reply-request", &id);
+    assert_eq!(fixture.server.requests_for("turn/start").len(), 1, "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(receipt["leadMessages"][0]["status"], "queued", "{receipt}");
+    assert_eq!(receipt["leadMessages"][0]["id"], id, "{receipt}");
+    assert!(!receipt.to_string().contains(payload), "{receipt}");
+
+    // A repeat of the same words cannot deliver them twice: the recorded
+    // attempt is reconciled with the conversation's own items, and nothing is
+    // sent while its identity is still unresolved.
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: queued"), "{text}");
+    assert!(text.contains(&format!("id: {id}")), "{text}");
+    assert!(text.contains("cannot be delivered twice"), "{text}");
+    assert_eq!(
+        fixture.server.requests_for("turn/start").len(),
+        1,
+        "the repeat must not reach the lead endpoint: {text}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"].as_array().unwrap().len(),
+        1,
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["status"], "queued", "{receipt}");
+}
+
+#[test]
+fn lead_message_records_a_refusal_as_error_without_a_hold_and_allows_a_later_try() {
+    let fixture = LeadFixture::new("lead-refused", LEAD_THREAD, true);
+    let payload = "refused question";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(lead_thread_read(
+            &fixture.lead_thread,
+            "idle",
+            json!([]),
+        ))],
+    );
+    // The native endpoint refuses the request in every delivery round: nothing
+    // was delivered, and the refusal is definite.
+    fixture.server.answer(
+        "turn/start",
+        Answer::Error(json!({"code": -32000, "message": "no active turn"})),
+    );
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("lead message: error"), "{text}");
+    assert!(text.contains("no active turn"), "{text}");
+    assert!(text.contains(&format!("id: {id}")), "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    // `error` is the definite-refusal status the lifecycle hold reader
+    // excludes, so a question that never left cannot keep the run waiting.
+    assert_eq!(receipt["leadMessages"][0]["status"], "error", "{receipt}");
+    assert_eq!(fixture.server.requests_for("turn/start").len(), 3, "{text}");
+
+    // A definite refusal applied nothing and is retryable: the same words may
+    // be sent again as an attempt with its own identity, and the
+    // conversation's own items then show the delivery.
+    let next = lead_message_id(&fixture.generation, "reply-request", 2, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &next);
+    script_delivery(&fixture, false, &envelope, &next);
+    fixture.server.answer(
+        "turn/start",
+        Answer::Result(json!({"turn": {"id": NEXT_TURN, "status": "inProgress"}})),
+    );
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert!(text.contains(&format!("id: {next}")), "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    let messages = receipt["leadMessages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{receipt}");
+    assert_eq!(messages[0]["status"], "error", "{receipt}");
+    assert_eq!(messages[1]["status"], "delivered", "{receipt}");
+    assert_eq!(messages[1]["id"], next, "{receipt}");
+}
+
+#[test]
+fn lead_message_reconciles_an_indeterminate_send_before_any_repeat() {
+    let fixture = LeadFixture::new("lead-uncertain", LEAD_THREAD, true);
+    let payload = "uncertain question";
+    let id = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &id);
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(lead_thread_read(
+            &fixture.lead_thread,
+            "idle",
+            json!([]),
+        ))],
+    );
+    // An acceptance without a turn identity leaves the fate of the input to the
+    // conversation's own items, and they do not show it: indeterminate, never
+    // delivered.
+    fixture.server.answer(
+        "turn/start",
+        Answer::Record(json!({"id": "@request", "result": {}})),
+    );
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("lead message: indeterminate"), "{text}");
+    assert!(text.contains("without a turn identity"), "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "indeterminate",
+        "{receipt}"
+    );
+    assert_eq!(fixture.server.requests_for("turn/start").len(), 1, "{text}");
+
+    // The repeat reconciles the recorded identity with the lead conversation
+    // before anything could be sent: with no evidence the same words stay
+    // refused instead of being delivered twice, under the same id and with the
+    // same unresolved hold.
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("lead message: indeterminate"), "{text}");
+    assert!(text.contains(&format!("id: {id}")), "{text}");
+    assert!(
+        text.contains("could deliver it twice") && text.contains("Next action"),
+        "{text}"
+    );
+    assert_eq!(
+        fixture.server.requests_for("turn/start").len(),
+        1,
+        "the repeat must not reach the lead endpoint: {text}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"].as_array().unwrap().len(),
+        1,
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["id"], id, "{receipt}");
+
+    // The conversation's own record settles it: the input is there, so the
+    // recorded attempt is upgraded to delivered without any second send.
+    fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(lead_thread_read(
+            &fixture.lead_thread,
+            "active",
+            json!([{
+                "id": TURN,
+                "status": "inProgress",
+                "items": [{
+                    "id": "u1",
+                    "type": "userMessage",
+                    "clientId": id,
+                    "content": [{"type": "text", "text": envelope}]
+                }]
+            }]),
+        ))],
+    );
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert!(text.contains("upgraded from indeterminate"), "{text}");
+    assert_eq!(fixture.server.requests_for("turn/start").len(), 1, "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "{receipt}"
+    );
+    assert_eq!(receipt["leadMessages"][0]["id"], id, "{receipt}");
+}
+
+#[test]
+fn lead_message_sends_the_same_words_again_in_a_later_resolved_exchange() {
+    let fixture = LeadFixture::new("lead-resolved", LEAD_THREAD, true);
+    let payload = "same words for another question";
+    let first = lead_message_id(&fixture.generation, "reply-request", 1, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &first);
+    script_delivery(&fixture, false, &envelope, &first);
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(&format!("id: {first}")), "{text}");
+
+    // The lead answered: the exchange is resolved and its content holds nothing.
+    edit_receipt(&fixture.state.join("spawn-1.json"), |receipt| {
+        receipt["leadMessages"][0]["status"] = json!("resolved");
+    });
+
+    // The same words for another question must be a new message with its own
+    // identity, not a suppressed repeat.
+    let second = lead_message_id(&fixture.generation, "reply-request", 2, payload);
+    let envelope = lead_envelope(&fixture, "reply-request", payload, &second);
+    script_delivery(&fixture, false, &envelope, &second);
+    let out = fixture.sender(&["--text", payload], None);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("lead message: delivered"), "{text}");
+    assert!(text.contains(&format!("id: {second}")), "{text}");
+    assert_ne!(first, second, "{text}");
+    assert_eq!(fixture.server.requests_for("turn/start").len(), 2, "{text}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("spawn-1.json")).unwrap()).unwrap();
+    let messages = receipt["leadMessages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{receipt}");
+    assert_eq!(messages[0]["status"], "resolved", "{receipt}");
+    assert_eq!(messages[1]["status"], "delivered", "{receipt}");
+    assert_eq!(messages[1]["id"], second, "{receipt}");
+}
+
 /// One canned executor run plus the lead endpoint `lead message` needs, with
 /// the test process recorded as the originating lead so a child CLI is in that
 /// lead's lineage.
@@ -2385,4 +2687,127 @@ fn reply_to_refuses_unknown_retired_reused_and_contradictory_addresses_before_se
     fs::write(&slot_record, serde_json::to_vec_pretty(&slot).unwrap()).unwrap();
     let reused_slot = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", "reused"]);
     assert_refused_before_send(&reused_slot, "reused slot", &run.fixture);
+}
+
+#[test]
+fn reply_to_the_same_words_answers_two_requests_as_two_inputs() {
+    let run = ReplyRoundTrip::new("reply-two");
+    let first = run.issue("which contract applies to sample-17?");
+    let second = "lead-0123456789abcdef01234567";
+    edit_receipt(&run.fixture.receipt, |receipt| {
+        let mut other = receipt["leadMessages"][0].clone();
+        other["id"] = json!(second);
+        receipt["leadMessages"].as_array_mut().unwrap().push(other);
+    });
+    // The reply lookup has to resolve the second request as well.
+    let index = run
+        .fixture
+        .home
+        .join("harness/executor-pool/message-index")
+        .join(format!("{second}.json"));
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    fs::write(
+        &index,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "id": second,
+            "receipt": run.fixture.receipt.to_str().unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let answer = "use the versioned input contract";
+    script_executor_reply(&run.fixture, true, answer);
+    let out = run.reply(LEAD_THREAD, &["--reply-to", &first, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    // The same words for the other request are a new input with their own
+    // identity, not a repeat of the first answer.
+    script_executor_reply(&run.fixture, true, answer);
+    let out = run.reply(LEAD_THREAD, &["--reply-to", second, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": delivered in"), "{text}");
+    assert_eq!(
+        run.fixture.server.requests_for("turn/steer").len(),
+        2,
+        "{text}"
+    );
+    let receipt = run.fixture.receipt();
+    let messages = receipt["leadMessages"].as_array().unwrap();
+    assert_eq!(messages[0]["id"], first, "{receipt}");
+    assert_eq!(messages[0]["status"], "resolved", "{receipt}");
+    assert_eq!(messages[1]["id"], second, "{receipt}");
+    assert_eq!(messages[1]["status"], "resolved", "{receipt}");
+    let attempts = run.fixture.attempts();
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    for attempt in &attempts {
+        assert_eq!(attempt["status"], "delivered", "{attempt}");
+    }
+    assert_ne!(attempts[0]["id"], attempts[1]["id"], "{attempts:?}");
+
+    // Re-running the same reply is still a repeat of its own one input.
+    let out = run.reply(LEAD_THREAD, &["--reply-to", second, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(": already delivered in"), "{text}");
+    assert_eq!(
+        run.fixture.server.requests_for("turn/steer").len(),
+        2,
+        "the repeat must not reach the executor endpoint: {text}"
+    );
+}
+
+#[test]
+fn an_indeterminate_reply_is_never_sent_twice_and_resolves_nothing() {
+    let run = ReplyRoundTrip::new("reply-uncertain");
+    let id = run.issue("question whose answer never lands");
+    let answer = "an answer that never lands";
+    run.fixture.server.answer_sequence(
+        "thread/read",
+        vec![Answer::Result(thread_read(
+            &run.fixture.slot,
+            "active",
+            active_turns(),
+        ))],
+    );
+    // An acceptance without a turn identity, and no observed item: whether the
+    // input was applied is unknown.
+    run.fixture.server.answer(
+        "turn/steer",
+        Answer::Record(json!({"id": "@request", "result": {}})),
+    );
+    let out = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains(": indeterminate in"), "{text}");
+    let receipt = run.fixture.receipt();
+    // An uncertain answer resolves nothing: the unanswered request keeps its
+    // hold.
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "{receipt}"
+    );
+    assert_eq!(run.fixture.attempts()[0]["status"], "indeterminate");
+
+    // The repeat of the same reply cannot deliver it twice, and it still
+    // resolves nothing.
+    let out = run.reply(LEAD_THREAD, &["--reply-to", &id, "--text", answer]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("stays refused"), "{text}");
+    assert!(text.contains("nothing is reported as delivered"), "{text}");
+    assert_eq!(
+        run.fixture.server.requests_for("turn/steer").len(),
+        1,
+        "the repeat must not reach the executor endpoint: {text}"
+    );
+    let receipt = run.fixture.receipt();
+    assert_eq!(
+        receipt["leadMessages"][0]["status"], "delivered",
+        "{receipt}"
+    );
+    assert_eq!(run.fixture.attempts()[0]["status"], "indeterminate");
 }
