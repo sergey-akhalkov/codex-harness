@@ -94,6 +94,25 @@ fn contains_payload(value: &Value, payload: &str) -> bool {
     }
 }
 
+/// The installed `codex.exe` is the harness launcher. It reads
+/// `harness/native-launch.json` from `CODEX_HOME` before it starts the
+/// registered app-server. The fixture home is empty, so copy that existing
+/// registration in; this does not add a listener or launcher.
+fn seed_launcher_registration(home: &Path) {
+    let source = harness_core::native_launcher::codex_home()
+        .expect("installed launcher home")
+        .join("harness/native-launch.json");
+    assert!(
+        source.is_file(),
+        "installed launcher registration harness/native-launch.json is missing; the 0.156.1 launcher cannot host this fixture"
+    );
+    let destination = home.join("harness");
+    fs::create_dir_all(&destination).unwrap();
+    fs::copy(&source, destination.join("native-launch.json")).unwrap_or_else(|error| {
+        panic!("could not seed harness/native-launch.json into the fixture home: {error}")
+    });
+}
+
 fn fixture() -> Fixture {
     let exe = codex_exe();
     let owned_root = BrokerRoot::prepare().unwrap().keep();
@@ -102,6 +121,7 @@ fn fixture() -> Fixture {
     let workspace = root.join("workspace");
     fs::create_dir(&home).unwrap();
     fs::create_dir(&workspace).unwrap();
+    seed_launcher_registration(&home);
     let version = version_text(&exe);
     assert!(
         version.contains("codex-cli 0.156.1"),
