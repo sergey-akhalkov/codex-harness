@@ -11,6 +11,10 @@
 #![cfg(windows)]
 #[path = "fixtures/cache_usage.rs"]
 mod cache_usage;
+// This standalone fixture compilation includes the whole production control
+// owner, but exercises only its conversation driver: the originating-lead
+// helpers belong to the binary's own dispatch paths and are unused here.
+#[allow(dead_code)]
 #[path = "../src/executor_control.rs"]
 mod executor_control;
 

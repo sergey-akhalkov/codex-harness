@@ -1607,6 +1607,7 @@ fn a_copied_or_sibling_marker_refuses_before_a_model_request() {
         .unwrap();
     let text = output_text(&sibling);
     let _ = sleeper.kill();
+    let _ = sleeper.wait();
     assert!(!sibling.status.success(), "{text}");
     assert!(
         text.contains("sibling run marker is not the originating lead"),
