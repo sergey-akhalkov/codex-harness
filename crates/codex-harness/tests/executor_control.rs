@@ -1837,9 +1837,63 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
     assert!(watched_text.contains(FINAL), "{watched_text}");
 }
 
+/// The non-DeepSeek identity the cache-guard dispatches run with: support is
+/// proven at runtime, so no vendor name may be required to monitor a run or to
+/// stop a losing one.
+const CACHE_MODEL: &str = "glm-5.3";
+const CACHE_PROVIDER: &str = "zai-fixture";
+
+/// The canned `thread/start` answer for the cache-guard identity.
+fn cache_thread_start_answer() -> Value {
+    json!({
+        "thread": {"id": THREAD},
+        "model": CACHE_MODEL,
+        "modelProvider": CACHE_PROVIDER,
+        "reasoningEffort": EFFORT
+    })
+}
+
+/// Rewrites the pooled receipt's resolved identity, exactly as a dispatcher
+/// binding another configured profile records it.
+fn reseed_cache_identity(pooled: &Pooled) {
+    let mut receipt = pooled.receipt();
+    receipt["profile"] = json!("zai-fixture");
+    receipt["model"] = json!(CACHE_MODEL);
+    receipt["modelProvider"] = json!(CACHE_PROVIDER);
+    receipt["control"]["identity"]["profile"] = json!("zai-fixture");
+    receipt["control"]["identity"]["model"] = json!(CACHE_MODEL);
+    receipt["control"]["identity"]["modelProvider"] = json!(CACHE_PROVIDER);
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Bounded wait until the receipt's recorded cache-guard state is ready.
+fn wait_cache_guard(pooled: &Pooled, ready: impl Fn(&Value) -> bool, reason: &str) {
+    let until = Instant::now() + WAIT;
+    loop {
+        let guard = pooled.receipt()["cacheGuard"].clone();
+        if ready(&guard) {
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "cache guard never reached {reason}: {guard}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
-    let pooled = Pooled::new("cache-loss", Answer::Result(thread_start_answer()), true);
+    let pooled = Pooled::new(
+        "cache-loss",
+        Answer::Result(cache_thread_start_answer()),
+        true,
+    );
+    reseed_cache_identity(&pooled);
     pooled
         .server
         .answer("turn/interrupt", Answer::Result(json!({})));
@@ -1865,7 +1919,13 @@ fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
     let output = host.wait_with_output().unwrap();
     let text = output_text(&output);
     assert_eq!(output.status.code(), Some(1), "{text}");
-    assert!(text.contains("DeepSeek cache loss"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "cache loss on provider {CACHE_PROVIDER} model {CACHE_MODEL}"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("DeepSeek"), "{text}");
     assert!(text.contains("no process remained"), "{text}");
     let interrupts = pooled.server.requests_for("turn/interrupt");
     assert!(
@@ -1874,10 +1934,60 @@ fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
     );
     let receipt = pooled.receipt();
     assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
-    assert_eq!(receipt["cacheGuard"]["lastMissTokens"], 394_000);
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(guard["model"], CACHE_MODEL, "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "proven", "{receipt}");
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert_eq!(guard["lastMissTokens"], 394_000, "{receipt}");
     assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
     assert!(rollout.exists());
     assert!(pooled.state.join("slot-1.json").exists());
+}
+
+#[test]
+fn cache_never_warmed_numeric_counters_keep_the_control_run_alive() {
+    let pooled = Pooled::new(
+        "cache-never-warmed",
+        Answer::Result(cache_thread_start_answer()),
+        true,
+    );
+    reseed_cache_identity(&pooled);
+    let preserved = pooled.slot.join("partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "never-warmed assignment started",
+    );
+    let rollout = cache_usage::write_never_warmed(&pooled.home, THREAD);
+    wait_cache_guard(
+        &pooled,
+        |guard| guard["responses"].as_u64() == Some(4),
+        "four never-warmed responses observed",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(!text.contains("cache loss"), "{text}");
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["status"], "warming", "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "unproven", "{receipt}");
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert_eq!(guard["consecutiveMisses"], 0, "{receipt}");
+    assert_eq!(guard["responses"], 4, "{receipt}");
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
+    assert!(rollout.exists());
 }
 
 #[path = "fixtures/succession_responses.rs"]

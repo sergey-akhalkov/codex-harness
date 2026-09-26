@@ -22,6 +22,56 @@ use windows_sys::Win32::{
 
 const LARGE_INPUT: u64 = 100_000;
 const REQUIRED_MISSES: u32 = 3;
+/// Bounded runtime-support states recorded in `cacheGuard.runtimeSupport`.
+/// `proven` is established only by a response meeting the warmup thresholds:
+/// provider branding, a static allowlist and numeric-but-never-warmed counters
+/// never prove that this run's telemetry supports the policy.
+const SUPPORT_PROVEN: &str = "proven";
+const SUPPORT_UNPROVEN: &str = "unproven";
+const SUPPORT_INVALID: &str = "invalid";
+const SUPPORT_UNAVAILABLE: &str = "unavailable";
+/// Bounded diagnostic-delivery state recorded in
+/// `cacheGuard.diagnosticDelivery`: `native-sent`, `undelivered` or
+/// `no-native-consumer`. No native warning transport exists yet, so every
+/// diagnostic records `no-native-consumer`; the warning-transport slice owns
+/// the sent/undelivered states, and a send or delivery failure is never
+/// recorded as a shown warning.
+const DELIVERY_NO_NATIVE_CONSUMER: &str = "no-native-consumer";
+/// Bound on one provider/model field echoed into evidence. Names are the run's
+/// resolved identity only: no credentials, endpoints or filesystem paths.
+const IDENTITY_LIMIT: usize = 64;
+
+/// The monitored run's resolved provider and model, retained from its receipt
+/// so evidence and stop wording name the real route instead of a hard-coded
+/// vendor. Absent, blank or oversized fields are dropped, never echoed.
+#[derive(Clone, Debug, Default)]
+struct Identity {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+impl Identity {
+    fn from_receipt(value: &Value) -> Self {
+        fn bounded(field: &Value) -> Option<String> {
+            let text = field.as_str()?.trim();
+            (!text.is_empty() && text.chars().count() <= IDENTITY_LIMIT).then(|| text.to_owned())
+        }
+        Self {
+            provider: bounded(&value["modelProvider"]),
+            model: bounded(&value["model"]),
+        }
+    }
+
+    /// Provider-neutral evidence label, e.g. `provider zai model glm-5.3`.
+    fn label(&self) -> String {
+        match (&self.provider, &self.model) {
+            (Some(provider), Some(model)) => format!("provider {provider} model {model}"),
+            (Some(provider), None) => format!("provider {provider} model unrecorded"),
+            (None, Some(model)) => format!("unrecorded provider model {model}"),
+            (None, None) => "unrecorded provider and model".to_owned(),
+        }
+    }
+}
 
 /// Kernel change notification, checked by the host's existing event loop.
 /// A sparse metadata reconciliation covers Windows' delayed write notices.
@@ -88,6 +138,7 @@ impl std::error::Error for CacheLoss {}
 
 #[derive(Default)]
 struct Detector {
+    identity: Identity,
     warm: bool,
     consecutive: u32,
     cumulative: u64,
@@ -95,9 +146,19 @@ struct Detector {
     input: u64,
     cached: u64,
     invalid_records: u64,
+    /// The latest processed evidence was a malformed counter rather than a
+    /// usable response; a later valid response clears it.
+    invalid_evidence: bool,
 }
 
 impl Detector {
+    fn with_identity(identity: Identity) -> Self {
+        Self {
+            identity,
+            ..Self::default()
+        }
+    }
+
     fn observe(&mut self, record: &Value, historical: bool) -> Option<CacheLoss> {
         let usage = &record["usage"];
         let values = (
@@ -108,11 +169,13 @@ impl Detector {
         let (Some(input), Some(cached), Some(cumulative)) = values else {
             self.consecutive = 0;
             self.invalid_records += 1;
+            self.invalid_evidence = true;
             return None;
         };
         if cached > input || cumulative < input {
             self.consecutive = 0;
             self.invalid_records += 1;
+            self.invalid_evidence = true;
             return None;
         }
         if cumulative <= self.cumulative {
@@ -120,6 +183,7 @@ impl Detector {
         }
         self.cumulative = cumulative;
         self.responses += 1;
+        self.invalid_evidence = false;
         self.input = input;
         self.cached = cached;
         let miss = input - cached;
@@ -132,12 +196,14 @@ impl Detector {
         }
         self.consecutive += 1;
         (self.consecutive >= REQUIRED_MISSES).then(|| {
+            let identity = self.identity.label();
             CacheLoss(format!(
-                "DeepSeek cache loss: {} consecutive responses after cache warmup each missed at least {LARGE_INPUT} input tokens and 50% of input; last input={input} cached={cached} miss={miss}. Automatic continuation is stopped; files and session are retained",
+                "cache loss on {identity}: {} consecutive responses after cache warmup each missed at least {LARGE_INPUT} input tokens and 50% of input; last input={input} cached={cached} miss={miss}. Automatic continuation is stopped; files and session are retained",
                 self.consecutive
             ), json!({"warm":self.warm,"responses":self.responses,
                 "consecutiveMisses":self.consecutive,"lastInputTokens":input,
-                "lastCachedTokens":cached,"lastMissTokens":miss}))
+                "lastCachedTokens":cached,"lastMissTokens":miss,
+                "provider":self.identity.provider,"model":self.identity.model}))
         })
     }
 }
@@ -159,17 +225,14 @@ pub(crate) struct Monitor {
 }
 
 impl Monitor {
-    /// The receipt's resolved provider selects this policy; other providers
-    /// retain their current behavior. The host supplies its actual CODEX_HOME.
+    /// Every managed executor run is monitored: the policy itself is neutral,
+    /// and only a response that meets the warmup thresholds proves that this
+    /// run's recorded counters support it. The receipt's resolved
+    /// provider/model identity is retained for evidence. The host supplies its
+    /// actual CODEX_HOME. The `Option` stays for the hosts' existing binding;
+    /// no run is filtered out here any more.
     pub(crate) fn new(receipt: &Path, home: &Path) -> io::Result<Option<Self>> {
         let value: Value = serde_json::from_slice(&fs::read(receipt)?)?;
-        if value["modelProvider"] != "deepseek"
-            && !value["model"]
-                .as_str()
-                .is_some_and(|model| model.starts_with("deepseek-"))
-        {
-            return Ok(None);
-        }
         let now = Instant::now();
         let monitor = Self {
             home: home.to_owned(),
@@ -183,14 +246,31 @@ impl Monitor {
             session: None,
             tail: None,
             handoff: VecDeque::new(),
-            detector: Detector::default(),
+            detector: Detector::with_identity(Identity::from_receipt(&value)),
             unavailable: false,
         };
         monitor.record("waiting-for-usage", None)?;
         println!(
-            "cache guard: enabled for DeepSeek; waiting for exact-session per-response usage (not a hard spending cap)"
+            "cache guard: enabled for {}; waiting for exact-session per-response usage (not a hard spending cap)",
+            monitor.detector.identity.label()
         );
         Ok(Some(monitor))
+    }
+
+    /// Bounded runtime-support state of this run's exact-session coverage:
+    /// `proven` after a warmed response, `unproven` while valid counters never
+    /// crossed the warmup thresholds, `invalid` while malformed counters are
+    /// the latest evidence, and `unavailable` before any usable counter.
+    fn runtime_support(&self) -> &'static str {
+        if self.detector.invalid_evidence {
+            SUPPORT_INVALID
+        } else if self.detector.warm {
+            SUPPORT_PROVEN
+        } else if self.detector.responses > 0 {
+            SUPPORT_UNPROVEN
+        } else {
+            SUPPORT_UNAVAILABLE
+        }
     }
 
     fn record(&self, status: &str, reason: Option<&str>) -> io::Result<()> {
@@ -202,6 +282,10 @@ impl Monitor {
                 "lastInputTokens": self.detector.input, "lastCachedTokens": self.detector.cached,
                 "lastMissTokens": self.detector.input - self.detector.cached,
                 "invalidRecords": self.detector.invalid_records,
+                "provider": self.detector.identity.provider,
+                "model": self.detector.identity.model,
+                "runtimeSupport": self.runtime_support(),
+                "diagnosticDelivery": DELIVERY_NO_NATIVE_CONSUMER,
                 "reason": reason}),
         )
     }
@@ -300,6 +384,8 @@ impl Monitor {
                     if let Some(mut loss) = self.detector.observe(&event["payload"], historical) {
                         loss.1["session"] = json!(self.session);
                         loss.1["handoff"] = json!(self.handoff);
+                        loss.1["runtimeSupport"] = json!(SUPPORT_PROVEN);
+                        loss.1["diagnosticDelivery"] = json!(DELIVERY_NO_NATIVE_CONSUMER);
                         // Stop first: receipt locks must not delay containment.
                         return Ok(Some(loss));
                     }
@@ -457,7 +543,11 @@ mod tests {
         use std::io::Write;
         let root = tempfile::tempdir().unwrap();
         let receipt = root.path().join("receipt.json");
-        fs::write(&receipt, r#"{"modelProvider":"deepseek"}"#).unwrap();
+        fs::write(
+            &receipt,
+            r#"{"modelProvider":"openai","model":"gpt-5.2-codex"}"#,
+        )
+        .unwrap();
         let mut monitor = Monitor::new(&receipt, root.path()).unwrap().unwrap();
         let path = root.path().join("sessions/rollout-fixture-session-a.jsonl");
         let mut writer = fs::File::create(path).unwrap();
@@ -523,6 +613,16 @@ mod tests {
         assert!(handoff[0].as_str().unwrap().contains("tests still running"));
         assert!(handoff[1].as_str().unwrap().contains("outcome unknown"));
         assert!(!loss.1.to_string().contains("opaque-secret"));
+        assert!(
+            loss.0
+                .contains("cache loss on provider openai model gpt-5.2-codex"),
+            "{}",
+            loss.0
+        );
+        assert_eq!(loss.1["provider"], "openai");
+        assert_eq!(loss.1["model"], "gpt-5.2-codex");
+        assert_eq!(loss.1["runtimeSupport"], "proven");
+        assert_eq!(loss.1["diagnosticDelivery"], "no-native-consumer");
     }
 
     #[test]
@@ -550,8 +650,122 @@ mod tests {
             "thread_token_usage": {"input_tokens": total}})
     }
 
+    /// Builds a monitor whose receipt records the given resolved identity.
+    fn monitor(root: &Path, recorded: &Value) -> Monitor {
+        let receipt = root.join("receipt.json");
+        fs::write(&receipt, serde_json::to_vec(recorded).unwrap()).unwrap();
+        Monitor::new(&receipt, root).unwrap().unwrap()
+    }
+
+    /// The receipt's recorded cache-guard state.
+    fn cache_guard(receipt: &Path) -> Value {
+        serde_json::from_slice::<Value>(&fs::read(receipt).unwrap()).unwrap()["cacheGuard"].clone()
+    }
+
+    fn stamp() -> String {
+        chrono::DateTime::from_timestamp_millis(now_ms() as i64)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    fn rollout_path(home: &Path, session: &str) -> PathBuf {
+        home.join(format!(
+            "sessions/2026/01/01/rollout-fixture-{session}.jsonl"
+        ))
+    }
+
+    fn record(session: &str, tag: &str, input: u64, cached: u64, total: u64) -> Value {
+        json!({"type":"token_usage_record","timestamp":stamp(),
+            "payload":{"thread_id":session,"response_id":tag,
+            "usage":{"input_tokens":input,"cached_input_tokens":cached},
+            "thread_token_usage":{"input_tokens":total}}})
+    }
+
+    /// Writes one session header plus the given per-response counters,
+    /// timestamped now so none of them counts as historical warmup.
+    fn rollout(home: &Path, session: &str, counters: &[(u64, u64)]) {
+        use std::io::Write;
+        let path = rollout_path(home, session);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":session}})
+        )
+        .unwrap();
+        let mut total = 0;
+        for (index, (input, cached)) in counters.iter().enumerate() {
+            total += input;
+            writeln!(
+                file,
+                "{}",
+                record(
+                    session,
+                    &format!("response-{index}"),
+                    *input,
+                    *cached,
+                    total
+                )
+            )
+            .unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    /// Appends counters to an open rollout, continuing its input total from
+    /// `total_before`.
+    fn append_records(home: &Path, session: &str, counters: &[(u64, u64)], total_before: u64) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(rollout_path(home, session))
+            .unwrap();
+        let mut total = total_before;
+        for (index, (input, cached)) in counters.iter().enumerate() {
+            total += input;
+            writeln!(
+                file,
+                "{}",
+                record(
+                    session,
+                    &format!("appended-{index}"),
+                    *input,
+                    *cached,
+                    total
+                )
+            )
+            .unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    /// Writes one rollout record whose counters cannot be read as numbers.
+    fn malformed_record(home: &Path, session: &str) {
+        use std::io::Write;
+        let path = rollout_path(home, session);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":session}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"token_usage_record","timestamp":stamp(),
+                "payload":{"thread_id":session,"response_id":"malformed",
+                "usage":{"input_tokens":-1,"cached_input_tokens":5},
+                "thread_token_usage":{"input_tokens":-400000}}})
+        )
+        .unwrap();
+        file.flush().unwrap();
+    }
+
     #[test]
-    fn cold_input_and_other_providers_do_not_trip() {
+    fn cold_input_never_trips_and_every_resolved_identity_is_monitored() {
         let mut detector = Detector::default();
         for n in 1..=8 {
             assert!(
@@ -561,10 +775,140 @@ mod tests {
             );
         }
         assert!(!detector.warm);
+        // No configured provider is filtered out any more: monitoring starts
+        // for every managed run and only runtime warmup proves support.
+        for (provider, model) in [
+            ("openai", "gpt-5.2-codex"),
+            ("zai", "glm-5.3"),
+            ("xai", "grok-4.7"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let monitor = monitor(
+                root.path(),
+                &json!({"modelProvider": provider, "model": model}),
+            );
+            let guard = cache_guard(&monitor.receipt);
+            assert_eq!(guard["provider"], provider);
+            assert_eq!(guard["model"], model);
+            assert_eq!(guard["runtimeSupport"], "unavailable");
+            assert_eq!(guard["diagnosticDelivery"], "no-native-consumer");
+        }
+    }
+
+    #[test]
+    fn every_resolved_identity_stops_with_provider_and_model_evidence() {
+        for (provider, model) in [
+            ("openai", "gpt-5.2-codex"),
+            ("zai", "glm-5.3"),
+            ("xai", "grok-4.7"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut monitor = monitor(
+                root.path(),
+                &json!({"modelProvider": provider, "model": model}),
+            );
+            rollout(
+                root.path(),
+                "session-a",
+                &[
+                    (400_000, 399_000),
+                    (400_000, 6_000),
+                    (400_000, 6_000),
+                    (400_000, 6_000),
+                ],
+            );
+            let loss = monitor.poll(Some("session-a"), true).unwrap().unwrap();
+            assert!(
+                loss.0
+                    .contains(&format!("cache loss on provider {provider} model {model}")),
+                "{}",
+                loss.0
+            );
+            assert_eq!(loss.1["provider"], provider);
+            assert_eq!(loss.1["model"], model);
+            assert_eq!(loss.1["consecutiveMisses"], 3);
+            assert_eq!(loss.1["runtimeSupport"], "proven");
+            assert_eq!(loss.1["diagnosticDelivery"], "no-native-consumer");
+            assert!(!loss.0.contains("DeepSeek"), "{}", loss.0);
+        }
+    }
+
+    #[test]
+    fn never_warmed_numeric_counters_stay_unproven_and_never_stop() {
         let root = tempfile::tempdir().unwrap();
-        let receipt = root.path().join("receipt.json");
-        fs::write(&receipt, r#"{"modelProvider":"other"}"#).unwrap();
-        assert!(Monitor::new(&receipt, root.path()).unwrap().is_none());
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "zai", "model": "glm-5.3"}),
+        );
+        let waiting = cache_guard(&monitor.receipt);
+        assert_eq!(waiting["status"], "waiting-for-usage");
+        assert_eq!(waiting["runtimeSupport"], "unavailable");
+        assert_eq!(waiting["diagnosticDelivery"], "no-native-consumer");
+        // Valid counters with no cached input are valid observations that can
+        // never warm: they never arm a stop.
+        rollout(root.path(), "session-a", &[(200_000, 0); 4]);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert_eq!(monitor.detector.responses, 4);
+        assert!(!monitor.detector.warm);
+        let guard = cache_guard(&monitor.receipt);
+        assert_eq!(guard["status"], "warming");
+        assert_eq!(guard["runtimeSupport"], "unproven");
+        assert_eq!(guard["consecutiveMisses"], 0);
+        assert_eq!(guard["lastMissTokens"], 200_000);
+        assert_eq!(guard["diagnosticDelivery"], "no-native-consumer");
+    }
+
+    #[test]
+    fn malformed_counters_record_invalid_support_and_a_valid_response_restores_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "xai", "model": "grok-4.7"}),
+        );
+        malformed_record(root.path(), "session-a");
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        let invalid = cache_guard(&monitor.receipt);
+        assert_eq!(invalid["status"], "unavailable");
+        assert_eq!(invalid["runtimeSupport"], "invalid");
+        assert_eq!(invalid["invalidRecords"], 1);
+        assert_eq!(invalid["consecutiveMisses"], 0);
+        assert_eq!(invalid["diagnosticDelivery"], "no-native-consumer");
+        assert!(!monitor.detector.warm);
+        // A later valid response restores coverage without a stop.
+        append_records(root.path(), "session-a", &[(400_000, 399_000)], 0);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        let recovered = cache_guard(&monitor.receipt);
+        assert_eq!(recovered["status"], "armed");
+        assert_eq!(recovered["runtimeSupport"], "proven");
+        assert_eq!(recovered["provider"], "xai");
+        assert_eq!(recovered["model"], "grok-4.7");
+    }
+
+    #[test]
+    fn oversized_or_blank_identity_fields_are_dropped_from_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "x".repeat(80), "model": "   "}),
+        );
+        rollout(
+            root.path(),
+            "session-a",
+            &[(200_000, 199_000), (200_000, 0), (200_000, 0), (200_000, 0)],
+        );
+        let loss = monitor.poll(Some("session-a"), true).unwrap().unwrap();
+        assert!(
+            loss.0
+                .contains("cache loss on unrecorded provider and model"),
+            "{}",
+            loss.0
+        );
+        assert!(!loss.0.contains(&"x".repeat(80)), "{}", loss.0);
+        assert!(loss.1["provider"].is_null());
+        assert!(loss.1["model"].is_null());
+        let guard = cache_guard(&monitor.receipt);
+        assert!(guard["provider"].is_null());
+        assert!(guard["model"].is_null());
     }
 
     #[test]

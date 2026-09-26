@@ -1126,9 +1126,42 @@ fn observer_failure_terminates_the_owned_tree() {
     assert!(text(&out).contains("state=failed"), "{}", text(&out));
 }
 
+/// The non-DeepSeek identity the cache-guard checks run with: support is
+/// proven at runtime by a warmed response, so no vendor name may gate
+/// monitoring or a stop.
+const CACHE_MODEL: &str = "grok-4.7";
+const CACHE_PROVIDER: &str = "xai-fixture";
+
+/// Rewrites the seeded receipt's resolved identity, exactly as a dispatcher
+/// binding another configured profile records it.
+fn reseed_cache_identity(run: &SeededRun) {
+    let mut receipt = receipt_json(&run.receipt);
+    receipt["profile"] = json!("xai-fixture");
+    receipt["model"] = json!(CACHE_MODEL);
+    receipt["modelProvider"] = json!(CACHE_PROVIDER);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+}
+
+/// Bounded wait until the receipt's recorded cache-guard state is ready.
+fn wait_cache_guard(receipt: &Path, ready: impl Fn(&Value) -> bool, reason: &str) {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let guard = receipt_json(receipt)["cacheGuard"].clone();
+        if ready(&guard) {
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "cache guard never reached {reason}: {guard}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn cache_loss_stops_the_observed_launcher_and_descendant_preserving_work() {
     let run = SeededRun::new();
+    reseed_cache_identity(&run);
     let started = run.root.join("cache-started.json");
     let descendant_marker = run.root.join("cache-descendant.json");
     let preserved = run.root.join("workspace/partial.txt");
@@ -1154,14 +1187,72 @@ fn cache_loss_stops_the_observed_launcher_and_descendant_preserving_work() {
     let receipt = receipt_json(&run.receipt);
     assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
     assert_eq!(receipt["observation"]["session"], session);
-    assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(guard["model"], CACHE_MODEL, "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "proven", "{receipt}");
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert_eq!(guard["consecutiveMisses"], 3, "{receipt}");
     let watch = run.watch(&["--timeout", "1"]);
     assert_eq!(watch.status.code(), Some(1), "{}", text(&watch));
+    let watched = text(&watch);
     assert!(
-        text(&watch).contains("DeepSeek cache loss"),
+        watched.contains(&format!(
+            "cache loss on provider {CACHE_PROVIDER} model {CACHE_MODEL}"
+        )),
         "{}",
-        text(&watch)
+        watched
     );
+    assert!(!watched.contains("DeepSeek"), "{watched}");
+}
+
+/// One never-warmed run: valid per-response counters that never prove cache
+/// support never arm the stop, so the observed run continues to its own
+/// terminal state with its work preserved.
+#[test]
+fn cache_never_warmed_counters_keep_the_observed_run_running_to_completion() {
+    let run = SeededRun::new();
+    reseed_cache_identity(&run);
+    let preserved = run.root.join("workspace/partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let rollout = cache_usage::write_never_warmed(&run.root, session);
+    let mut host = lead_command()
+        .args(["executor", "run", "--file"])
+        .arg(&run.receipt)
+        .env("CODEX_HOME", &run.root)
+        .env("HARNESS_EXECUTOR_FIXTURE_MODE", "slow")
+        .env("HARNESS_EXECUTOR_FIXTURE_DELAY_MS", "4000")
+        .env("HARNESS_EXECUTOR_FIXTURE_SESSION", session)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_cache_guard(
+        &run.receipt,
+        |guard| guard["responses"].as_u64() == Some(4),
+        "four never-warmed responses observed",
+    );
+    let status = wait_host(&mut host, "never-warmed host");
+    assert!(status.success(), "the observed run must continue");
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["status"], "warming", "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "unproven", "{receipt}");
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert_eq!(guard["consecutiveMisses"], 0, "{receipt}");
+    assert_eq!(guard["responses"], 4, "{receipt}");
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
+    assert!(rollout.exists());
 }
 
 #[test]
