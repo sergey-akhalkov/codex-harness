@@ -3,6 +3,9 @@
 //! A fresh anonymous job is assigned before resume. Cleanup never looks up a
 //! process by name or PID. Child stdout and stderr stay in the case root.
 
+#[path = "process_result.rs"]
+mod process_result;
+
 use crate::verification_record;
 use harness_core::analysis_samples;
 use harness_core::inventory;
@@ -258,7 +261,7 @@ fn execute_windows(request: &CaseRequest, root: &Path) -> io::Result<Value> {
                 if is_ready(&root) {
                     ready_flag.store(true, Ordering::Relaxed);
                 }
-                if file_len(&stdout_path) > output_limit || file_len(&stderr_path) > output_limit {
+                if process_result::limit_exceeded(output_limit, [&stdout_path, &stderr_path]) {
                     output_flag.store(true, Ordering::Relaxed);
                     cancellation.cancel();
                     break;
@@ -291,8 +294,7 @@ fn execute_windows(request: &CaseRequest, root: &Path) -> io::Result<Value> {
     let outcome = outcome?;
     let ready = ready_flag.load(Ordering::Relaxed) || is_ready(root);
     let limit_hit = output_flag.load(Ordering::Relaxed)
-        || file_len(&stdout_path) > request.output_limit
-        || file_len(&stderr_path) > request.output_limit;
+        || process_result::limit_exceeded(request.output_limit, [&stdout_path, &stderr_path]);
     let status = classify(
         &outcome,
         ready,
@@ -305,7 +307,7 @@ fn execute_windows(request: &CaseRequest, root: &Path) -> io::Result<Value> {
         "status": status,
         "ready": ready,
         "native": {
-            "Status": job_status(&outcome),
+            "Status": process_result::stop_status(outcome.reason, false),
             "ExitCode": outcome.exit_code,
             "ProcessExitCode": outcome.process_exit_code,
             "ProcessId": identity.pid,
@@ -343,19 +345,7 @@ fn classify(
     }
     match outcome.reason {
         StopReason::Exited if ready_required && !ready => "readiness-failure",
-        StopReason::Exited => "exited",
-        StopReason::Timeout => "timeout",
-        StopReason::Cancelled => "cancelled",
-        StopReason::MemoryLimit => "memory-limit",
-    }
-}
-
-fn job_status(outcome: &Outcome) -> &'static str {
-    match outcome.reason {
-        StopReason::Exited => "exited",
-        StopReason::Timeout => "timeout",
-        StopReason::Cancelled => "cancelled",
-        StopReason::MemoryLimit => "memory-limit",
+        reason => process_result::stop_status(reason, false),
     }
 }
 
@@ -374,7 +364,7 @@ fn finish(result: &mut Value, root: &Path, started: Instant, output_limit: u64) 
         "stdout": {"path": path_string(&stdout), "bytes": file_len_opt(&stdout)},
         "stderr": {"path": path_string(&stderr), "bytes": file_len_opt(&stderr)},
     });
-    let over = file_len(&stdout) > output_limit || file_len(&stderr) > output_limit;
+    let over = process_result::limit_exceeded(output_limit, [&stdout, &stderr]);
     result["output_limit_reached"] = json!(over);
     if over && result.get("status") == Some(&json!("exited")) {
         result["status"] = json!("output-limit");
@@ -487,10 +477,6 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
     let mut file = create_new(path)?;
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.flush()
-}
-
-fn file_len(path: &Path) -> u64 {
-    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 fn file_len_opt(path: &Path) -> Option<u64> {

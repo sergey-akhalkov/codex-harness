@@ -1,6 +1,8 @@
 //! One explicit native outcome attempt. Correctness remains the caller's oracle.
 #[path = "outcome_events.rs"]
 mod events;
+#[path = "process_result.rs"]
+mod process_result;
 
 use harness_core::build_identity::{hash_file, ordinary};
 use serde::Deserialize;
@@ -330,7 +332,7 @@ fn toml_value(value: &Value) -> io::Result<String> {
 
 #[cfg(windows)]
 fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()> {
-    use harness_core::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
+    use harness_core::process::{Cancellation, CommandSpec, Deadline, Job, Limits};
     use std::{
         sync::{
             Arc,
@@ -452,10 +454,7 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
         std::thread::spawn(move || -> io::Result<events::Events> {
             let observed = (|| -> io::Result<()> {
                 loop {
-                    if paths
-                        .iter()
-                        .any(|path| fs::metadata(path).is_ok_and(|m| m.len() > output_limit))
-                    {
+                    if process_result::limit_exceeded(output_limit, &paths) {
                         limit.store(true, Ordering::Relaxed);
                         cancellation.cancel();
                     }
@@ -481,16 +480,7 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     stop.store(true, Ordering::Relaxed);
     let telemetry = watcher.join().map_err(|_| invalid())?;
     let outcome = outcome?;
-    let status = if limit.load(Ordering::Relaxed) {
-        "output-limit"
-    } else {
-        match outcome.reason {
-            StopReason::Exited => "exited",
-            StopReason::Timeout => "timeout",
-            StopReason::Cancelled => "cancelled",
-            StopReason::MemoryLimit => "memory-limit",
-        }
-    };
+    let status = process_result::stop_status(outcome.reason, limit.load(Ordering::Relaxed));
     let receipt = json!({"Status":status,"ExitCode":outcome.exit_code,"ProcessExitCode":outcome.process_exit_code,
         "ProcessId":identity.pid,"AssignedBeforeResume":true,"MemoryLimitBytes":outcome.job.memory_limit_bytes,
         "PeakJobMemoryBytes":outcome.job.peak_job_memory_bytes,"job":outcome.job});

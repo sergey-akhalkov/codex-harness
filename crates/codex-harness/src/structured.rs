@@ -4,12 +4,13 @@
 //! helper records separate final JSON and event JSONL evidence. A caller-selected
 //! Codex command performs the explicitly requested model call.
 
+#[path = "process_result.rs"]
+mod process_result;
+
 use harness_core::analysis_samples;
-use harness_core::process::{
-    Cancellation, CommandSpec, Deadline, Job, Limits, Outcome, StopReason,
-};
+use harness_core::build_identity::{hash_bytes, hash_file};
+use harness_core::process::{Cancellation, CommandSpec, Deadline, Job, Limits, StopReason};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -312,9 +313,7 @@ fn inspect_result(
         evidence.join("stderr.txt"),
     ];
     if evidence.join("output-limit.txt").exists()
-        || paths
-            .iter()
-            .any(|path| path.is_file() && file_len(path).unwrap_or(0) > output_limit)
+        || process_result::limit_exceeded(output_limit, &paths)
     {
         return Ok(Some("output-limit".into()));
     }
@@ -444,11 +443,10 @@ fn observe_command(request: Observe<'_>) -> io::Result<Value> {
         let output_limit = request.output_limit;
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let over = file_len(&stdout).unwrap_or(0) > output_limit
-                    || file_len(&stderr).unwrap_or(0) > output_limit
-                    || watched.as_deref().is_some_and(|path| {
-                        path.is_file() && file_len(path).unwrap_or(0) > output_limit
-                    });
+                let over = process_result::limit_exceeded(output_limit, [&stdout, &stderr])
+                    || watched
+                        .as_deref()
+                        .is_some_and(|path| process_result::limit_exceeded(output_limit, [path]));
                 if over {
                     if let Some(path) = &marker {
                         let _ = fs::write(path, b"final output limit");
@@ -470,13 +468,12 @@ fn observe_command(request: Observe<'_>) -> io::Result<Value> {
     let _ = watcher.join();
     let outcome = outcome?;
     let limit_hit = request.limit_marker.is_some_and(Path::exists)
-        || file_len(request.stdout).unwrap_or(0) > request.output_limit
-        || file_len(request.stderr).unwrap_or(0) > request.output_limit
-        || request.watched_file.is_some_and(|path| {
-            path.is_file() && file_len(path).unwrap_or(0) > request.output_limit
-        });
+        || process_result::limit_exceeded(request.output_limit, [request.stdout, request.stderr])
+        || request
+            .watched_file
+            .is_some_and(|path| process_result::limit_exceeded(request.output_limit, [path]));
     let mut receipt = json!({
-        "status": receipt_status(&outcome, limit_hit),
+        "status": process_result::stop_status(outcome.reason, limit_hit),
         "native": {
             "ExitCode": outcome.exit_code,
             "ProcessExitCode": outcome.process_exit_code,
@@ -495,18 +492,6 @@ fn observe_command(request: Observe<'_>) -> io::Result<Value> {
     });
     receipt["outcome"] = serde_json::to_value(outcome).map_err(io::Error::other)?;
     Ok(receipt)
-}
-
-fn receipt_status(outcome: &Outcome, limit_hit: bool) -> &'static str {
-    if limit_hit {
-        return "output-limit";
-    }
-    match outcome.reason {
-        StopReason::Exited => "exited",
-        StopReason::Timeout => "timeout",
-        StopReason::Cancelled => "cancelled",
-        StopReason::MemoryLimit => "memory-limit",
-    }
 }
 
 fn parse_args(args: &[OsString]) -> io::Result<InspectionRequest> {
@@ -871,19 +856,6 @@ fn file_len(path: &Path) -> io::Result<u64> {
     } else {
         0
     })
-}
-
-fn hash_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest)?;
-    Ok(format!("{:x}", digest.finalize()))
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(bytes);
-    format!("{:x}", digest.finalize())
 }
 
 fn unique_run_id() -> String {
