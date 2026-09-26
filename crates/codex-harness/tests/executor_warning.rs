@@ -773,6 +773,69 @@ fn a_queued_warning_waits_for_the_exact_thread_and_is_presented_once() {
     relay.close();
 }
 
+/// A warning the transport cannot write fails on its own, is recorded as
+/// undelivered while it stays queued, and never ends the healthy session: the
+/// exact thread keeps receiving forwarded traffic and the recorded control
+/// endpoint keeps answering.
+#[test]
+fn a_failed_warning_send_records_undelivered_without_ending_the_session() {
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    server.answer(
+        "thread/resume",
+        Answer::Result(json!({"thread": {"id": THREAD}})),
+    );
+    server.answer(
+        "thread/read",
+        Answer::Result(json!({"thread": {"id": THREAD, "turns": []}})),
+    );
+    let mut relay = Relay::start(server.port, TOKEN, THREAD).unwrap();
+    let warnings = relay.warnings();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+    // The exact thread initializes on this connection first.
+    frontend.request(1, "thread/resume", json!({"threadId": THREAD}));
+    assert_eq!(record_of(frontend.receive(WAIT).text())["id"], 1);
+    // A diagnostic the transport refuses to write fails the delivery attempt
+    // deterministically; nothing outside the captured shape is ever written.
+    let oversized = format!("cache guard degraded: {}", "x".repeat(2 * 1024 * 1024));
+    assert_eq!(warnings.queue(&oversized), QueueOutcome::Queued);
+    wait_for(
+        || warnings.status().state == WarningState::Undelivered,
+        "the failed send was not recorded as undelivered",
+    );
+    assert_eq!(
+        warnings.status().pending,
+        1,
+        "a failed diagnostic stays queued instead of being dropped"
+    );
+    assert_eq!(warnings.queue(&oversized), QueueOutcome::Duplicate);
+    // The session stays healthy: forwarded traffic arrives and the recorded
+    // endpoint still answers a concurrent control request.
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"turn": {"id": "t1", "status": "completed"}}
+    }));
+    let record = record_of(frontend.receive(WAIT).text());
+    assert_eq!(record["method"], "turn/completed", "{record}");
+    let mut control = ControlConnection::connect(server.port, TOKEN, WAIT).unwrap();
+    control
+        .send(
+            &json!({"id": 7, "method": "thread/read", "params": {"threadId": THREAD}}),
+            WAIT,
+        )
+        .unwrap();
+    let mut answer = None;
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline && answer.is_none() {
+        answer = control.receive(Duration::from_millis(200)).unwrap();
+    }
+    let answer = answer.expect("the recorded endpoint answered no control request");
+    assert_eq!(answer["id"], 7, "{answer}");
+    assert_eq!(answer["result"]["thread"]["id"], THREAD, "{answer}");
+
+    frontend.close();
+    relay.close();
+}
+
 #[test]
 fn control_traffic_against_the_recorded_endpoint_survives_the_relay() {
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));

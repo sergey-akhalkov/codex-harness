@@ -1524,7 +1524,7 @@ pub(crate) fn run_observed(
 
     command.stdout = Some(spool_file);
     let mut cache_monitor =
-        cache::Monitor::new(receipt, &harness_core::native_launcher::codex_home()?)?;
+        cache::Monitor::new(receipt, &harness_core::native_launcher::codex_home()?, None)?;
     let mut cache_loss = None;
     let job = Job::new(Limits::default())?;
     let child = job.spawn(&command).map_err(|error| {

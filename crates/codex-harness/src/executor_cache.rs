@@ -1,12 +1,14 @@
 //! Repeated cache-loss protection over the exact executor's recorded usage.
 //! No provider calls, transcript rendering or opaque reasoning inspection.
 
+use super::super::warning::{WarningQueue, WarningState, WarningStatus};
 use super::{Line, SpoolTail, now_ms, update_receipt_field};
 use serde_json::{Value, json};
 use std::os::windows::ffi::OsStrExt;
 use std::{
     collections::VecDeque,
     fs, io,
+    io::Write,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -30,16 +32,80 @@ const SUPPORT_PROVEN: &str = "proven";
 const SUPPORT_UNPROVEN: &str = "unproven";
 const SUPPORT_INVALID: &str = "invalid";
 const SUPPORT_UNAVAILABLE: &str = "unavailable";
-/// Bounded diagnostic-delivery state recorded in
-/// `cacheGuard.diagnosticDelivery`: `native-sent`, `undelivered` or
-/// `no-native-consumer`. No native warning transport exists yet, so every
-/// diagnostic records `no-native-consumer`; the warning-transport slice owns
-/// the sent/undelivered states, and a send or delivery failure is never
-/// recorded as a shown warning.
+/// Routine cache-guard status spellings recorded in `cacheGuard.status` and the
+/// host log. Routine transitions never become user-facing warnings.
+const STATUS_WAITING: &str = "waiting-for-usage";
+const STATUS_WARMING: &str = "warming";
+const STATUS_ARMED: &str = "armed";
+const STATUS_UNAVAILABLE: &str = "unavailable";
+/// Bounded diagnostic-delivery states recorded in
+/// `cacheGuard.diagnosticDelivery`. `native-sent` is the transport's own
+/// send state, never evidence that the user saw a warning; a diagnostic the
+/// native surface still holds or could not take is `undelivered`; a surface
+/// without a native warning consumer records exactly that.
+const DELIVERY_NATIVE_SENT: &str = "native-sent";
+const DELIVERY_UNDELIVERED: &str = "undelivered";
 const DELIVERY_NO_NATIVE_CONSUMER: &str = "no-native-consumer";
 /// Bound on one provider/model field echoed into evidence. Names are the run's
 /// resolved identity only: no credentials, endpoints or filesystem paths.
 const IDENTITY_LIMIT: usize = 64;
+
+/// One degraded cache-guard coverage diagnostic: exact-session telemetry the
+/// run can no longer verify. Routine status transitions are never degraded and
+/// never reach the native warning surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Degraded {
+    /// Counters that cannot be read as numbers, or an impossible relationship.
+    Invalid,
+    /// No usable per-response usage within the coverage window.
+    Unavailable,
+    /// The rollout lost bytes the monitor had already consumed.
+    Truncated,
+    /// The native session identity changed under this run.
+    Identity,
+}
+
+impl Degraded {
+    /// The receipt's `cacheGuard.reason`. It states the lost coverage and
+    /// never claims a spending cap or a user-visible warning.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Invalid => {
+                "invalid per-response cache counters; consecutive loss count reset and protection is unverified until valid usage resumes"
+            }
+            Self::Unavailable => {
+                "no valid exact-session per-response usage observed; cache-loss protection is unverified"
+            }
+            Self::Truncated => {
+                "the exact-session rollout was truncated; usage coverage is lost, the consecutive loss count is reset and protection is unverified until usage resumes"
+            }
+            Self::Identity => {
+                "the native session identity changed; exact-session usage coverage is lost and cache-loss protection is unverified"
+            }
+        }
+    }
+
+    /// The one degraded diagnostic queued for the native warning surface. The
+    /// surface deduplicates a repeated diagnostic, so each reason is offered
+    /// once per run.
+    fn diagnostic(self) -> String {
+        format!("cache guard degraded: {}", self.reason())
+    }
+}
+
+/// The bounded receipt spelling of one warning surface's delivery outcome.
+fn delivery_status(status: WarningStatus) -> &'static str {
+    match status.state {
+        WarningState::Sent => DELIVERY_NATIVE_SENT,
+        // A surface that queued or failed a diagnostic has delivered nothing,
+        // and an attached surface with nothing queued has delivered nothing
+        // either: neither may read as a native send.
+        WarningState::Queued | WarningState::Undelivered | WarningState::Idle => {
+            DELIVERY_UNDELIVERED
+        }
+        WarningState::NoConsumer => DELIVERY_NO_NATIVE_CONSUMER,
+    }
+}
 
 /// The monitored run's resolved provider and model, retained from its receipt
 /// so evidence and stop wording name the real route instead of a hard-coded
@@ -222,6 +288,21 @@ pub(crate) struct Monitor {
     handoff: VecDeque<String>,
     detector: Detector,
     unavailable: bool,
+    /// The exact-session identity changed under this run: coverage is gone and
+    /// no later identity is adopted, so no foreign counters are counted. The
+    /// diagnostic is queued exactly once.
+    identity_lost: bool,
+    /// The native warning surface of the attached frontend, or the honest
+    /// no-consumer surface of a compatibility renderer.
+    warnings: WarningQueue,
+    /// The host log beside the receipt. Routine status and degraded reasons are
+    /// recorded here; an inherited terminal is never written to.
+    log: Option<PathBuf>,
+    /// The last recorded `cacheGuard.status`/`reason`, so attaching a surface
+    /// or persisting the final delivery records the current state instead of
+    /// inventing a transition.
+    status: String,
+    reason: Option<String>,
 }
 
 impl Monitor {
@@ -229,12 +310,14 @@ impl Monitor {
     /// and only a response that meets the warmup thresholds proves that this
     /// run's recorded counters support it. The receipt's resolved
     /// provider/model identity is retained for evidence. The host supplies its
-    /// actual CODEX_HOME. The `Option` stays for the hosts' existing binding;
-    /// no run is filtered out here any more.
-    pub(crate) fn new(receipt: &Path, home: &Path) -> io::Result<Option<Self>> {
+    /// actual CODEX_HOME and this run's own cache-guard log beside the receipt
+    /// (the app-server's control log belongs to that child alone). The `Option`
+    /// stays for the hosts' existing binding; no run is filtered out here any
+    /// more.
+    pub(crate) fn new(receipt: &Path, home: &Path, log: Option<&Path>) -> io::Result<Option<Self>> {
         let value: Value = serde_json::from_slice(&fs::read(receipt)?)?;
         let now = Instant::now();
-        let monitor = Self {
+        let mut monitor = Self {
             home: home.to_owned(),
             receipt: receipt.to_owned(),
             started_ms: now_ms(),
@@ -248,13 +331,37 @@ impl Monitor {
             handoff: VecDeque::new(),
             detector: Detector::with_identity(Identity::from_receipt(&value)),
             unavailable: false,
+            identity_lost: false,
+            warnings: WarningQueue::without_consumer(),
+            log: log.map(Path::to_owned),
+            status: String::new(),
+            reason: None,
         };
-        monitor.record("waiting-for-usage", None)?;
-        println!(
-            "cache guard: enabled for {}; waiting for exact-session per-response usage (not a hard spending cap)",
-            monitor.detector.identity.label()
-        );
+        monitor.transition(
+            STATUS_WAITING,
+            None,
+            Some(format!(
+                "cache guard: enabled for {}; waiting for exact-session per-response usage (not a hard spending cap)",
+                monitor.detector.identity.label()
+            )),
+        )?;
         Ok(Some(monitor))
+    }
+
+    /// Routes this monitor's degraded diagnostics through the native warning
+    /// surface of a frontend attached after the monitor started, and records
+    /// that surface's honest delivery state. Until this is called the surface
+    /// reports that no native consumer exists.
+    pub(crate) fn set_warnings(&mut self, warnings: WarningQueue) -> io::Result<()> {
+        self.warnings = warnings;
+        self.record()
+    }
+
+    /// Re-records the receipt's cache-guard state so a delivery the native
+    /// surface completed after the last transition is recorded honestly before
+    /// the frontend ends. `native-sent` stays the transport's own send state.
+    pub(crate) fn persist(&self) -> io::Result<()> {
+        self.record()
     }
 
     /// Bounded runtime-support state of this run's exact-session coverage:
@@ -273,11 +380,11 @@ impl Monitor {
         }
     }
 
-    fn record(&self, status: &str, reason: Option<&str>) -> io::Result<()> {
+    fn record(&self) -> io::Result<()> {
         update_receipt_field(
             &self.receipt,
             "cacheGuard",
-            json!({"status": status, "session": self.session, "warm": self.detector.warm,
+            json!({"status": self.status, "session": self.session, "warm": self.detector.warm,
                 "responses": self.detector.responses, "consecutiveMisses": self.detector.consecutive,
                 "lastInputTokens": self.detector.input, "lastCachedTokens": self.detector.cached,
                 "lastMissTokens": self.detector.input - self.detector.cached,
@@ -285,9 +392,50 @@ impl Monitor {
                 "provider": self.detector.identity.provider,
                 "model": self.detector.identity.model,
                 "runtimeSupport": self.runtime_support(),
-                "diagnosticDelivery": DELIVERY_NO_NATIVE_CONSUMER,
-                "reason": reason}),
+                "diagnosticDelivery": delivery_status(self.warnings.status()),
+                "reason": self.reason}),
         )
+    }
+
+    /// Records one classified transition. The receipt is authoritative and the
+    /// host log receives the line once per change; nothing here writes to the
+    /// inherited terminal.
+    fn transition(
+        &mut self,
+        status: &str,
+        reason: Option<&str>,
+        log: Option<String>,
+    ) -> io::Result<()> {
+        let changed = self.status != status || self.reason.as_deref() != reason;
+        self.status = status.to_owned();
+        self.reason = reason.map(str::to_owned);
+        if changed && let Some(line) = log {
+            self.note(&line);
+        }
+        self.record()
+    }
+
+    /// Records one degraded coverage diagnostic: the receipt and host log keep
+    /// the full reason, and the native warning surface queues exactly one
+    /// user-facing copy of it. A bounded or absent queue never fails the run.
+    fn degrade(&mut self, degraded: Degraded) -> io::Result<()> {
+        self.transition(
+            STATUS_UNAVAILABLE,
+            Some(degraded.reason()),
+            Some(format!("cache guard: {}", degraded.reason())),
+        )?;
+        let _ = self.warnings.queue(&degraded.diagnostic());
+        Ok(())
+    }
+
+    /// Appends one host-log line. A compatibility renderer without a host log
+    /// records the receipt only.
+    fn note(&self, line: &str) {
+        if let Some(path) = &self.log
+            && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
     }
 
     pub(crate) fn poll(
@@ -299,9 +447,17 @@ impl Monitor {
         if let Some(session) = session {
             match &self.session {
                 Some(bound) if bound != session => {
-                    return Err(io::Error::other(
-                        "cache guard native session identity changed",
-                    ));
+                    // The exact-session guarantee for this run is gone. This
+                    // is a degraded coverage diagnostic, not an observer
+                    // failure: healthy model work continues, no foreign
+                    // session's counters are adopted, and the reason is
+                    // queued once for the native surface.
+                    if !self.identity_lost {
+                        self.identity_lost = true;
+                        self.detector.consecutive = 0;
+                        self.degrade(Degraded::Identity)?;
+                    }
+                    return Ok(None);
                 }
                 None => {
                     self.session = Some(session.to_owned());
@@ -310,21 +466,34 @@ impl Monitor {
                 _ => {}
             }
         }
+        if self.identity_lost {
+            return Ok(None);
+        }
         self.dirty |= self.changes.take()? || native_activity;
         if now >= self.next_reconcile {
             self.next_reconcile = now + Duration::from_secs(1);
-            if let Some(tail) = &self.tail {
+            let length = match &self.tail {
                 // Query the open file, not directory-cached metadata. Cached
                 // writes can be readable long before a notification arrives.
-                let length = tail.file.metadata()?.len();
-                if length < self.observed_bytes {
-                    return Err(io::Error::other(
-                        "cache guard rollout was truncated; usage coverage lost",
-                    ));
+                Some(tail) => Some(tail.file.metadata()?.len()),
+                None => None,
+            };
+            match length {
+                Some(length) if length < self.observed_bytes => {
+                    // The rollout lost bytes this monitor had consumed. That
+                    // is degraded coverage, not an observer failure: the run
+                    // continues, the consecutive loss evidence is reset, and
+                    // the surviving history is rediscovered from the start as
+                    // historical warmup only.
+                    self.detector.consecutive = 0;
+                    self.degrade(Degraded::Truncated)?;
+                    self.tail = None;
+                    self.observed_bytes = 0;
+                    self.dirty = true;
                 }
-                self.dirty |= length > self.observed_bytes;
-            } else if self.session.is_some() {
-                self.dirty = true;
+                Some(length) => self.dirty |= length > self.observed_bytes,
+                None if self.session.is_some() => self.dirty = true,
+                None => {}
             }
         }
         if self.tail.is_none() && self.dirty {
@@ -385,7 +554,8 @@ impl Monitor {
                         loss.1["session"] = json!(self.session);
                         loss.1["handoff"] = json!(self.handoff);
                         loss.1["runtimeSupport"] = json!(SUPPORT_PROVEN);
-                        loss.1["diagnosticDelivery"] = json!(DELIVERY_NO_NATIVE_CONSUMER);
+                        loss.1["diagnosticDelivery"] =
+                            json!(delivery_status(self.warnings.status()));
                         // Stop first: receipt locks must not delay containment.
                         return Ok(Some(loss));
                     }
@@ -394,30 +564,29 @@ impl Monitor {
         }
         if self.detector.invalid_records != previous_invalid {
             self.unavailable = true;
-            let reason = "invalid per-response cache counters; consecutive loss count reset and protection is unverified until valid usage resumes";
-            self.record("unavailable", Some(reason))?;
-            println!("cache guard: {reason}");
+            self.degrade(Degraded::Invalid)?;
         } else if self.detector.responses != previous {
-            self.record(
-                if self.detector.warm {
-                    "armed"
-                } else {
-                    "warming"
-                },
-                None,
-            )?;
-            if previous == 0 || self.unavailable {
-                println!("cache guard: exact-session per-response usage is available");
-                self.unavailable = false;
-            }
+            let status = if self.detector.warm {
+                STATUS_ARMED
+            } else {
+                STATUS_WARMING
+            };
+            let recovered = previous == 0 || self.unavailable;
+            self.unavailable = false;
+            let line = if recovered {
+                Some("cache guard: exact-session per-response usage is available".to_owned())
+            } else if self.status != status {
+                Some(format!("cache guard: status={status}"))
+            } else {
+                None
+            };
+            self.transition(status, None, line)?;
         } else if self.detector.responses == 0
             && !self.unavailable
             && now.duration_since(self.started) >= Duration::from_secs(30)
         {
             self.unavailable = true;
-            let reason = "no valid exact-session per-response usage observed; cache-loss protection is unverified";
-            self.record("unavailable", Some(reason))?;
-            println!("cache guard: {reason}");
+            self.degrade(Degraded::Unavailable)?;
         }
         Ok(None)
     }
@@ -548,7 +717,7 @@ mod tests {
             r#"{"modelProvider":"openai","model":"gpt-5.2-codex"}"#,
         )
         .unwrap();
-        let mut monitor = Monitor::new(&receipt, root.path()).unwrap().unwrap();
+        let mut monitor = Monitor::new(&receipt, root.path(), None).unwrap().unwrap();
         let path = root.path().join("sessions/rollout-fixture-session-a.jsonl");
         let mut writer = fs::File::create(path).unwrap();
         writeln!(
@@ -652,9 +821,14 @@ mod tests {
 
     /// Builds a monitor whose receipt records the given resolved identity.
     fn monitor(root: &Path, recorded: &Value) -> Monitor {
+        monitor_with_log(root, recorded, None)
+    }
+
+    /// Builds a monitor with the given host log, if any.
+    fn monitor_with_log(root: &Path, recorded: &Value, log: Option<&Path>) -> Monitor {
         let receipt = root.join("receipt.json");
         fs::write(&receipt, serde_json::to_vec(recorded).unwrap()).unwrap();
-        Monitor::new(&receipt, root).unwrap().unwrap()
+        Monitor::new(&receipt, root, log).unwrap().unwrap()
     }
 
     /// The receipt's recorded cache-guard state.
@@ -1020,5 +1194,229 @@ mod tests {
         .unwrap();
         assert!(find_usage(root.path(), "session-a").unwrap().is_some());
         assert!(find_usage(root.path(), "../session-a").is_err());
+    }
+
+    /// One record whose counters cannot be read as numbers.
+    fn malformed_line(session: &str) -> String {
+        json!({"type":"token_usage_record","timestamp":stamp(),
+            "payload":{"thread_id":session,"response_id":"malformed",
+            "usage":{"input_tokens":-1,"cached_input_tokens":5},
+            "thread_token_usage":{"input_tokens":-400000}}})
+        .to_string()
+    }
+
+    /// Appends one raw line to an existing rollout.
+    fn append_raw(home: &Path, session: &str, line: &str) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(rollout_path(home, session))
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        file.flush().unwrap();
+    }
+
+    /// Routine status transitions stay in the receipt and host log: an
+    /// attached native warning surface must never carry them.
+    #[test]
+    fn routine_status_never_reaches_the_native_warning_surface() {
+        use super::super::super::warning::Relay;
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("host.log");
+        let mut monitor = monitor_with_log(
+            root.path(),
+            &json!({"modelProvider": "zai", "model": "glm-5.3"}),
+            Some(&log),
+        );
+        let relay = Relay::start(1, &"a".repeat(64), "thread-fixture").unwrap();
+        let warnings = relay.warnings();
+        monitor.set_warnings(warnings.clone()).unwrap();
+        let waiting = cache_guard(&monitor.receipt);
+        assert_eq!(waiting["status"], "waiting-for-usage");
+        assert_eq!(waiting["diagnosticDelivery"], "undelivered");
+        assert_eq!(warnings.status().pending, 0);
+
+        // Warming, then armed: usable counters that never prove warmup and
+        // then a response that does.
+        rollout(root.path(), "session-a", &[(200_000, 0), (200_000, 0)]);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert_eq!(cache_guard(&monitor.receipt)["status"], "warming");
+        assert_eq!(warnings.status().pending, 0, "warming is not a warning");
+        append_records(root.path(), "session-a", &[(200_000, 199_000)], 400_000);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        let armed = cache_guard(&monitor.receipt);
+        assert_eq!(armed["status"], "armed");
+        assert_eq!(armed["runtimeSupport"], "proven");
+        assert_eq!(warnings.status().pending, 0, "arming is not a warning");
+
+        // The host log carries the routine lines; nothing went to a terminal.
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("waiting for exact-session per-response usage"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("exact-session per-response usage is available"),
+            "{logged}"
+        );
+        assert!(logged.contains("status=armed"), "{logged}");
+    }
+
+    /// Degraded coverage is queued exactly once per reason, while every routine
+    /// status transition leaves the native warning surface empty.
+    #[test]
+    fn degraded_diagnostics_are_queued_once_and_routine_status_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "openai", "model": "gpt-5.2-codex"}),
+        );
+        let warnings = WarningQueue::without_consumer();
+        monitor.set_warnings(warnings.clone()).unwrap();
+
+        rollout(root.path(), "session-a", &[(200_000, 0), (200_000, 0)]);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert_eq!(warnings.status().pending, 0);
+
+        // Invalid counters are degraded coverage: receipt plus one queued
+        // diagnostic, and a repeat of the same reason is deduplicated.
+        append_raw(root.path(), "session-a", &malformed_line("session-a"));
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        let invalid = cache_guard(&monitor.receipt);
+        assert_eq!(invalid["status"], "unavailable");
+        assert_eq!(invalid["runtimeSupport"], "invalid");
+        assert!(
+            invalid["reason"].as_str().unwrap().contains("invalid"),
+            "{invalid}"
+        );
+        assert_eq!(warnings.status().pending, 1);
+        append_raw(root.path(), "session-a", &malformed_line("session-a"));
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert_eq!(warnings.status().pending, 1, "one reason is queued once");
+
+        // Valid usage restores coverage without a stop; the queued diagnostic
+        // stays exactly as the surface recorded it.
+        append_records(root.path(), "session-a", &[(400_000, 399_000)], 400_000);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert_eq!(cache_guard(&monitor.receipt)["status"], "armed");
+        assert_eq!(warnings.status().pending, 1);
+    }
+
+    /// No usable usage within the coverage window is a queued diagnostic, not
+    /// a stop and not an observer failure.
+    #[test]
+    fn missing_usage_is_a_queued_diagnostic_and_never_a_run_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "xai", "model": "grok-4.7"}),
+        );
+        let warnings = WarningQueue::without_consumer();
+        monitor.set_warnings(warnings.clone()).unwrap();
+        monitor.started = Instant::now() - Duration::from_secs(31);
+        assert!(monitor.poll(None, false).unwrap().is_none());
+        let guard = cache_guard(&monitor.receipt);
+        assert_eq!(guard["status"], "unavailable");
+        assert!(
+            guard["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no valid exact-session"),
+            "{guard}"
+        );
+        assert_eq!(warnings.status().pending, 1);
+        // The window is closed: the same run queues no second diagnostic.
+        assert!(monitor.poll(None, false).unwrap().is_none());
+        assert_eq!(warnings.status().pending, 1);
+    }
+
+    /// A truncated rollout is degraded coverage: the run continues, nothing is
+    /// replayed as a new miss, and the diagnostic is queued exactly once.
+    #[test]
+    fn truncated_rollout_is_a_queued_diagnostic_not_an_observer_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "zai", "model": "glm-5.3"}),
+        );
+        let warnings = WarningQueue::without_consumer();
+        monitor.set_warnings(warnings.clone()).unwrap();
+        rollout(
+            root.path(),
+            "session-a",
+            &[(200_000, 199_000), (400_000, 0)],
+        );
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert_eq!(monitor.detector.consecutive, 1);
+        // The rollout loses bytes while the monitor holds it open.
+        fs::write(rollout_path(root.path(), "session-a"), "").unwrap();
+        monitor.next_reconcile = Instant::now();
+        assert!(
+            monitor.poll(Some("session-a"), false).unwrap().is_none(),
+            "truncation is a diagnostic, not an observer failure"
+        );
+        let guard = cache_guard(&monitor.receipt);
+        assert_eq!(guard["status"], "unavailable");
+        assert!(
+            guard["reason"].as_str().unwrap().contains("truncated"),
+            "{guard}"
+        );
+        assert_eq!(guard["consecutiveMisses"], 0, "{guard}");
+        assert_eq!(warnings.status().pending, 1);
+        // A repeated reconcile neither fails nor queues the same reason twice.
+        monitor.next_reconcile = Instant::now();
+        assert!(monitor.poll(Some("session-a"), false).unwrap().is_none());
+        assert_eq!(warnings.status().pending, 1);
+    }
+
+    /// A changed native session identity is degraded coverage: no foreign
+    /// counters are adopted and no stop is fabricated.
+    #[test]
+    fn session_identity_change_is_a_queued_diagnostic_not_an_observer_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut monitor = monitor(
+            root.path(),
+            &json!({"modelProvider": "openai", "model": "gpt-5.2-codex"}),
+        );
+        let warnings = WarningQueue::without_consumer();
+        monitor.set_warnings(warnings.clone()).unwrap();
+        // The bound session's own counters never prove warmup, so any warmup
+        // adopted from the foreign session would show up below.
+        rollout(root.path(), "session-a", &[(200_000, 0)]);
+        assert!(monitor.poll(Some("session-a"), true).unwrap().is_none());
+        assert!(monitor.poll(Some("session-b"), true).unwrap().is_none());
+        let guard = cache_guard(&monitor.receipt);
+        assert_eq!(guard["status"], "unavailable");
+        assert!(
+            guard["reason"].as_str().unwrap().contains("identity"),
+            "{guard}"
+        );
+        assert_eq!(guard["session"], "session-a", "{guard}");
+        assert_eq!(warnings.status().pending, 1);
+        // Another session's warmup and losses are never adopted as evidence.
+        rollout(
+            root.path(),
+            "session-b",
+            &[(400_000, 399_000), (400_000, 0), (400_000, 0)],
+        );
+        assert!(monitor.poll(Some("session-b"), true).unwrap().is_none());
+        assert_eq!(
+            monitor.detector.responses, 1,
+            "a foreign session is never adopted"
+        );
+        assert!(!monitor.detector.warm);
+        assert_eq!(warnings.status().pending, 1);
+    }
+
+    /// The receipt's bounded delivery spellings, including a surface that has
+    /// taken nothing: no spelling may claim a warning the user saw.
+    #[test]
+    fn delivery_states_map_to_bounded_receipt_spellings() {
+        let state = |state| delivery_status(WarningStatus { state, pending: 0 });
+        assert_eq!(state(WarningState::Sent), "native-sent");
+        assert_eq!(state(WarningState::Queued), "undelivered");
+        assert_eq!(state(WarningState::Undelivered), "undelivered");
+        assert_eq!(state(WarningState::Idle), "undelivered");
+        assert_eq!(state(WarningState::NoConsumer), "no-native-consumer");
     }
 }

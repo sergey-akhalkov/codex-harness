@@ -310,7 +310,9 @@ binary.
 
 Routine guard status - `waiting-for-usage`, `warming`, `armed` and other
 below-threshold transitions - stays in the receipt and host log; it adds no
-terminal diagnostic line and no user warning. Degraded coverage - invalid or
+terminal diagnostic line and no user warning. The run's own truncated cache-guard
+journal `endpoint-<index>.cache-guard.log` beside the receipt carries those
+status lines; the app-server child owns `endpoint-<index>.log` itself. Degraded coverage - invalid or
 unavailable counters, rollout truncation, a session-identity change - is
 delivered through Codex's native warning presentation when a native executor
 frontend is attached, so it appears in that frontend's warning count and viewer

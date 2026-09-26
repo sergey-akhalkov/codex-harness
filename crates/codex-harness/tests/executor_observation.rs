@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 mod cache_usage;
 use std::{
     fs, io,
+    io::Write,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
@@ -36,6 +37,11 @@ fn fixture() -> PathBuf {
 fn lead_command() -> Command {
     let mut command = Command::new(manager());
     command.env_remove("HARNESS_EXECUTOR_SESSION");
+    // A check may run inside an executor session, whose own run marker is
+    // deliberately not authority for a lead-like resume: a copied marker must
+    // not make this invocation look like the dispatch it is verifying.
+    command.env_remove("HARNESS_EXECUTOR_RUN");
+    command.env_remove("HARNESS_ORIGINATING_LEAD");
     command.env_remove("WT_SESSION");
     command
 }
@@ -1158,6 +1164,37 @@ fn wait_cache_guard(receipt: &Path, ready: impl Fn(&Value) -> bool, reason: &str
     }
 }
 
+/// One exact-session rollout whose counters cannot be read as numbers.
+fn write_invalid_cache_usage(home: &Path, session: &str) -> PathBuf {
+    let directory = home.join("sessions/2026/01/01");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("rollout-fixture-{session}.jsonl"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let timestamp = chrono::DateTime::from_timestamp_millis(now.as_millis() as i64)
+        .unwrap()
+        .to_rfc3339();
+    let mut file = fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":session}})
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"token_usage_record","timestamp":timestamp,
+            "payload":{"thread_id":session,"response_id":"malformed",
+            "usage":{"input_tokens":-1,"cached_input_tokens":5},
+            "thread_token_usage":{"input_tokens":-400000}}})
+    )
+    .unwrap();
+    file.flush().unwrap();
+    path
+}
+
 #[test]
 fn cache_loss_stops_the_observed_launcher_and_descendant_preserving_work() {
     let run = SeededRun::new();
@@ -1252,6 +1289,53 @@ fn cache_never_warmed_counters_keep_the_observed_run_running_to_completion() {
     assert_eq!(guard["responses"], 4, "{receipt}");
     assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
     assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
+    assert!(rollout.exists());
+}
+
+/// Invalid exact-session counters are degraded coverage on the compatibility
+/// renderer: the receipt records them with the honest no-consumer delivery
+/// state, no cache-guard line reaches the visible surface, and the observed
+/// run still completes as its own successful outcome.
+#[test]
+fn cache_guard_degraded_counters_keep_the_observed_run_healthy() {
+    let run = SeededRun::new();
+    reseed_cache_identity(&run);
+    let session = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let rollout = write_invalid_cache_usage(&run.root, session);
+    let out = run.observed_with(
+        "slow",
+        &[
+            ("CODEX_HOME", &run.root),
+            ("HARNESS_EXECUTOR_FIXTURE_SESSION", Path::new(session)),
+            ("HARNESS_EXECUTOR_FIXTURE_DELAY_MS", Path::new("4000")),
+        ],
+    );
+    let output = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "degraded coverage must not fail the observed run: {output}"
+    );
+    assert!(
+        !output.contains("cache guard"),
+        "no cache-guard line may reach the visible surface: {output}"
+    );
+    let receipt = receipt_json(&run.receipt);
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["session"], session, "{receipt}");
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["status"], "unavailable", "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "invalid", "{receipt}");
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert!(
+        guard["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("invalid per-response cache counters")),
+        "{receipt}"
+    );
     assert!(rollout.exists());
 }
 
@@ -4135,6 +4219,193 @@ fn exact_session_resume_attaches_the_native_frontend_without_reset_or_replay() {
     assert_successor_endpoint(&host, CONTROL_THREAD, &stale);
     assert_frontend_gone(&host, &double);
     assert_backend_released(&host);
+}
+
+/// The non-DeepSeek identity the managed cache-guard checks resume with:
+/// protection can only be established at runtime, so no vendor name may gate
+/// monitoring or the stop.
+const CACHE_RESUME_PROFILE: &str = "zai-fixture";
+const CACHE_RESUME_MODEL: &str = "glm-5.3";
+const CACHE_RESUME_PROVIDER: &str = "zai-fixture-provider";
+
+/// Reseeds a managed control receipt onto a non-DeepSeek identity and keeps
+/// the fixture frontend's caption in step with the run's own title.
+fn reseed_native_identity(host: &ControlHost) {
+    let mut receipt = receipt_json(&host.receipt);
+    receipt["profile"] = json!(CACHE_RESUME_PROFILE);
+    receipt["model"] = json!(CACHE_RESUME_MODEL);
+    receipt["modelProvider"] = json!(CACHE_RESUME_PROVIDER);
+    receipt["control"]["identity"] = json!({
+        "profile": CACHE_RESUME_PROFILE,
+        "model": CACHE_RESUME_MODEL,
+        "modelProvider": CACHE_RESUME_PROVIDER,
+        "reasoningEffort": CONTROL_EFFORT
+    });
+    write_receipt(host, &receipt);
+    fs::write(
+        host.home.join("frontend-title.txt"),
+        format!("CEx ({CACHE_RESUME_PROFILE}) - {CONTROL_OWNER}"),
+    )
+    .unwrap();
+}
+
+/// Invalid exact-session counters on a run whose native frontend owns the
+/// terminal: the degraded diagnostic is recorded in the receipt and host log,
+/// the native surface's honest delivery state is recorded without claiming a
+/// warning the user saw, and the healthy model work still completes.
+#[test]
+fn cache_guard_degraded_counters_keep_the_native_frontend_run_healthy() {
+    let host = ControlHost::new("cache-degraded-native");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    let session = spawn_hosted(&host);
+    wait_for_turn(&host);
+    write_invalid_cache_usage(&host.home, CONTROL_THREAD);
+    wait_cache_guard(
+        &host.receipt,
+        |guard| guard["status"] == "unavailable",
+        "degraded coverage recorded",
+    );
+    host.server().push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": CONTROL_THREAD,
+            "item": {"id": "m-new", "type": "agentMessage", "text": CONTROL_FINAL}
+        }
+    }));
+    host.server().push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": CONTROL_THREAD, "turn": {"id": CONTROL_TURN, "status": "completed"}}
+    }));
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(20)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let transcript = finished.transcript;
+    assert_eq!(finished.outcome.exit_code, 0, "{transcript}");
+    assert!(
+        !transcript.contains("cache guard"),
+        "no routine or degraded cache-guard line may reach the terminal the native frontend owns: {transcript}"
+    );
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["status"], "unavailable", "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "invalid", "{receipt}");
+    // The attached native surface never took the diagnostic: the receipt says
+    // undelivered instead of claiming presence in the warning viewer.
+    assert_eq!(guard["diagnosticDelivery"], "undelivered", "{receipt}");
+    // Routine and degraded status stay in this run's cache-guard log beside the
+    // receipt, out of the app-server child's control log and the terminal.
+    let log = fs::read_to_string(host.state.join("endpoint-1.cache-guard.log")).unwrap_or_default();
+    assert!(
+        log.contains("waiting for exact-session per-response usage"),
+        "{log}"
+    );
+    assert!(log.contains("invalid per-response cache counters"), "{log}");
+}
+
+/// An exact-session resume on a non-DeepSeek identity whose warmed cache then
+/// fails repeatedly: the terminal stop keeps its non-success outcome, its
+/// verified stop-first cleanup, the exact session, slot and partial work, and
+/// the explicit fresh-session restart remedy - and it is never reduced to a
+/// warning.
+#[test]
+fn exact_session_resume_cache_loss_stops_the_run_and_keeps_the_session() {
+    let host = ControlHost::new("cache-resume-loss");
+    let double = PathBuf::from(env!("CARGO_BIN_EXE_harness-frontend-double"));
+    host.register_frontend(&double);
+    reseed_native_identity(&host);
+    write_receipt(&host, &resume_receipt(&host, CONTINUATION_PROMPT));
+    host.server().answer(
+        "thread/resume",
+        control_endpoint::Answer::Result(json!({
+            "thread": {"id": CONTROL_THREAD, "cwd": host.slot},
+            "model": CACHE_RESUME_MODEL,
+            "modelProvider": CACHE_RESUME_PROVIDER,
+            "reasoningEffort": CONTROL_EFFORT
+        })),
+    );
+    let partial = host.slot.join("partial-work.txt");
+    fs::write(&partial, "partial work\n").unwrap();
+    let session = spawn_hosted(&host);
+    wait_for_turn(&host);
+    assert!(
+        host.server().requests_for("thread/start").is_empty(),
+        "resume must not start another conversation: {:?}",
+        host.server().requests()
+    );
+    let rollout = cache_usage::write_loss(&host.home, CONTROL_THREAD);
+    let finished = session
+        .wait(
+            Deadline::after(Duration::from_secs(30)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let transcript = finished.transcript;
+    assert_eq!(finished.outcome.exit_code, 1, "{transcript}");
+    assert!(
+        transcript.contains(&format!(
+            "cache loss on provider {CACHE_RESUME_PROVIDER} model {CACHE_RESUME_MODEL}"
+        )),
+        "{transcript}"
+    );
+    assert!(!transcript.contains("DeepSeek"), "{transcript}");
+    assert!(
+        !transcript.contains("cache guard"),
+        "no routine or degraded cache-guard line may reach the terminal: {transcript}"
+    );
+    let receipt = receipt_json(&host.receipt);
+    assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], CONTROL_THREAD,
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt["observation"]["previousSession"], CONTROL_THREAD,
+        "{receipt}"
+    );
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["provider"], CACHE_RESUME_PROVIDER, "{receipt}");
+    assert_eq!(guard["model"], CACHE_RESUME_MODEL, "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "proven", "{receipt}");
+    assert_eq!(guard["consecutiveMisses"], 3, "{receipt}");
+    // The native surface was attached and took nothing: the receipt records
+    // the send that never happened as undelivered, never as user visibility.
+    assert_eq!(guard["diagnosticDelivery"], "undelivered", "{receipt}");
+    assert!(guard["handoff"].is_array(), "{receipt}");
+    assert!(
+        guard["recovery"]
+            .as_str()
+            .is_some_and(|recovery| recovery.contains("executor restart")
+                && recovery.contains(CONTROL_THREAD)),
+        "the recovery names the fresh-session restart for the retained session: {receipt}"
+    );
+    assert_eq!(fs::read_to_string(&partial).unwrap(), "partial work\n");
+    assert!(rollout.exists());
+    assert_eq!(
+        receipt_json(&host.state.join("slot-1.json"))["owner"],
+        CONTROL_OWNER
+    );
+    // The watch result is the recorded non-success terminal outcome.
+    let watched = lead_command()
+        .args(["executor", "watch", "--receipt"])
+        .arg(&host.receipt)
+        .output()
+        .unwrap();
+    let watched_text = text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(watched_text.contains("state=stopped"), "{watched_text}");
+    assert!(
+        watched_text.contains(&format!(
+            "cache loss on provider {CACHE_RESUME_PROVIDER} model {CACHE_RESUME_MODEL}"
+        )),
+        "{watched_text}"
+    );
 }
 
 #[test]

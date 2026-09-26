@@ -31,6 +31,7 @@ use harness_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -1886,6 +1887,46 @@ fn wait_cache_guard(pooled: &Pooled, ready: impl Fn(&Value) -> bool, reason: &st
     }
 }
 
+/// The rollout path the cache monitor discovers for one exact session.
+fn cache_rollout_path(home: &Path, session: &str) -> PathBuf {
+    home.join(format!(
+        "sessions/2026/01/01/rollout-fixture-{session}.jsonl"
+    ))
+}
+
+fn cache_stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    chrono::DateTime::from_timestamp_millis(now.as_millis() as i64)
+        .unwrap()
+        .to_rfc3339()
+}
+
+/// One exact-session rollout whose counters cannot be read as numbers.
+fn write_invalid_cache_usage(home: &Path, session: &str) -> PathBuf {
+    let path = cache_rollout_path(home, session);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":session}})
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"token_usage_record","timestamp":cache_stamp(),
+            "payload":{"thread_id":session,"response_id":"malformed",
+            "usage":{"input_tokens":-1,"cached_input_tokens":5},
+            "thread_token_usage":{"input_tokens":-400000}}})
+    )
+    .unwrap();
+    file.flush().unwrap();
+    path
+}
+
 #[test]
 fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
     let pooled = Pooled::new(
@@ -1927,6 +1968,10 @@ fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
     );
     assert!(!text.contains("DeepSeek"), "{text}");
     assert!(text.contains("no process remained"), "{text}");
+    assert!(
+        !text.contains("cache guard"),
+        "no routine or degraded cache-guard line may reach the terminal: {text}"
+    );
     let interrupts = pooled.server.requests_for("turn/interrupt");
     assert!(
         interrupts.is_empty(),
@@ -1946,6 +1991,14 @@ fn cache_loss_interrupts_the_control_turn_and_preserves_the_slot() {
     assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
     assert!(rollout.exists());
     assert!(pooled.state.join("slot-1.json").exists());
+    // Routine cache-guard status lives in this run's own cache-guard log beside
+    // the receipt; the app-server child owns the control log exclusively.
+    let log =
+        fs::read_to_string(pooled.state.join("endpoint-1.cache-guard.log")).unwrap_or_default();
+    assert!(
+        log.contains("waiting for exact-session per-response usage"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -1988,6 +2041,258 @@ fn cache_never_warmed_numeric_counters_keep_the_control_run_alive() {
     assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
     assert_eq!(fs::read_to_string(preserved).unwrap(), "partial work stays");
     assert!(rollout.exists());
+}
+
+/// One exact-session resume that hits a runtime-proven cache loss: the stop is
+/// terminal and non-success, the recorded session, slot and partial work stay,
+/// and the continuation remedy is the explicit fresh-session restart. The
+/// resolved identity is not DeepSeek, which is the runtime-proven point.
+#[test]
+fn cache_loss_on_exact_session_resume_stops_and_keeps_the_recorded_session() {
+    let pooled = Pooled::new(
+        "cache-resume",
+        Answer::Result(cache_thread_start_answer()),
+        true,
+    );
+    pooled
+        .server
+        .answer("thread/resume", Answer::Result(cache_thread_start_answer()));
+    reseed_cache_identity(&pooled);
+    let mut receipt = pooled.receipt();
+    receipt["mode"] = json!("tui");
+    receipt["control"]["presentation"] = json!("native-tui");
+    receipt["control"]["resumeSession"] = json!(THREAD);
+    receipt["observation"]["previousSession"] = json!(THREAD);
+    receipt["observation"]["session"] = Value::Null;
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let preserved = pooled.slot.join("partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let mut host = pooled.host("complete");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "resumed cache-loss assignment started",
+    );
+    assert_eq!(
+        pooled.server.requests_for("thread/resume").len(),
+        1,
+        "the exact recorded session was resumed"
+    );
+    assert!(
+        pooled.server.requests_for("thread/start").is_empty(),
+        "a resume must not start a new conversation"
+    );
+    let rollout = cache_usage::write_loss(&pooled.home, THREAD);
+    let until = Instant::now() + WAIT;
+    loop {
+        if host.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= until {
+            let _ = host.kill();
+            panic!("cache-loss resume host did not terminate within its test deadline");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "cache loss on provider {CACHE_PROVIDER} model {CACHE_MODEL}"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("DeepSeek"), "{text}");
+    assert!(text.contains("no process remained"), "{text}");
+    assert!(
+        !text.contains("cache guard"),
+        "no routine or degraded cache-guard line may reach the terminal: {text}"
+    );
+    assert!(
+        pooled.server.requests_for("turn/interrupt").is_empty(),
+        "cache loss must terminate before waiting for a control reply"
+    );
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
+    assert_eq!(
+        receipt["observation"]["session"], THREAD,
+        "the exact resumed session is retained: {receipt}"
+    );
+    assert_eq!(
+        receipt["observation"]["previousSession"], THREAD,
+        "{receipt}"
+    );
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(guard["model"], CACHE_MODEL, "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "proven", "{receipt}");
+    assert_eq!(guard["consecutiveMisses"], 3, "{receipt}");
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert!(
+        guard["handoff"].is_array(),
+        "the bounded handoff evidence survives: {receipt}"
+    );
+    assert!(
+        guard["recovery"].as_str().is_some_and(
+            |recovery| recovery.contains("executor restart") && recovery.contains(THREAD)
+        ),
+        "the recovery names the fresh-session restart for the retained session: {receipt}"
+    );
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap(),
+        "partial work stays"
+    );
+    assert!(rollout.exists());
+    assert!(pooled.state.join("slot-1.json").exists());
+    // The watch result is the run's recorded non-success outcome.
+    let watched = Command::new(manager())
+        .args(["executor", "watch", "--receipt"])
+        .arg(&pooled.receipt)
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .output()
+        .unwrap();
+    let watched_text = output_text(&watched);
+    assert_eq!(watched.status.code(), Some(1), "{watched_text}");
+    assert!(watched_text.contains("state=stopped"), "{watched_text}");
+    assert!(
+        watched_text.contains(&format!(
+            "cache loss on provider {CACHE_PROVIDER} model {CACHE_MODEL}"
+        )),
+        "{watched_text}"
+    );
+}
+
+/// Invalid exact-session counters are degraded coverage: the run records them
+/// (receipt plus the compatibility surface's honest no-consumer state) and
+/// continues to its own successful terminal state.
+#[test]
+fn cache_guard_degraded_counters_do_not_fail_the_control_run() {
+    let pooled = Pooled::new(
+        "cache-degraded",
+        Answer::Result(cache_thread_start_answer()),
+        true,
+    );
+    reseed_cache_identity(&pooled);
+    let preserved = pooled.slot.join("partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "degraded-coverage assignment started",
+    );
+    let rollout = write_invalid_cache_usage(&pooled.home, THREAD);
+    wait_cache_guard(
+        &pooled,
+        |guard| guard["status"] == "unavailable",
+        "degraded coverage recorded",
+    );
+    let guard = pooled.receipt()["cacheGuard"].clone();
+    assert_eq!(guard["runtimeSupport"], "invalid", "{guard}");
+    assert_eq!(guard["diagnosticDelivery"], "no-native-consumer", "{guard}");
+    assert!(
+        guard["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("invalid per-response cache counters")),
+        "{guard}"
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "degraded coverage must not fail healthy model work: {text}"
+    );
+    assert!(
+        !text.contains("cache guard"),
+        "no cache-guard line may reach the terminal: {text}"
+    );
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap(),
+        "partial work stays"
+    );
+    assert!(rollout.exists());
+    // The routine and degraded status stay in this run's cache-guard log beside
+    // the receipt, out of the child's control log and the terminal.
+    let log =
+        fs::read_to_string(pooled.state.join("endpoint-1.cache-guard.log")).unwrap_or_default();
+    assert!(
+        log.contains("waiting for exact-session per-response usage"),
+        "{log}"
+    );
+    assert!(log.contains("invalid per-response cache counters"), "{log}");
+}
+
+/// A truncated live rollout is degraded coverage, not an observer failure: the
+/// run records the loss of usage coverage and reaches its own terminal state.
+#[test]
+fn cache_guard_truncated_rollout_does_not_fail_the_control_run() {
+    let pooled = Pooled::new(
+        "cache-truncated",
+        Answer::Result(cache_thread_start_answer()),
+        true,
+    );
+    reseed_cache_identity(&pooled);
+    let preserved = pooled.slot.join("partial.txt");
+    fs::write(&preserved, "partial work stays").unwrap();
+    let host = pooled.host("hang");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "truncated-rollout assignment started",
+    );
+    let rollout = cache_usage::write(&pooled.home, THREAD, &[(200_000, 0); 4]);
+    wait_cache_guard(
+        &pooled,
+        |guard| guard["responses"].as_u64() == Some(4),
+        "four observed responses",
+    );
+    // The live rollout loses the bytes the monitor had already consumed.
+    fs::write(
+        &rollout,
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":THREAD}})
+        ),
+    )
+    .unwrap();
+    wait_cache_guard(
+        &pooled,
+        |guard| {
+            guard["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("truncated"))
+        },
+        "truncated coverage recorded",
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a truncated rollout must not fail healthy model work: {text}"
+    );
+    assert!(!text.contains("cache guard"), "{text}");
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["cacheGuard"]["status"], "unavailable", "{receipt}");
+    assert_eq!(
+        receipt["cacheGuard"]["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap(),
+        "partial work stays"
+    );
 }
 
 #[path = "fixtures/succession_responses.rs"]
