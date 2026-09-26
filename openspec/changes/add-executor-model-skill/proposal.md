@@ -23,17 +23,10 @@ that is lost when the workstation changes.
 - `AGENTS.md`: reusable skills, helpers and configuration are authored only in
   this repository; machine-local skill and config directories may hold only
   lifecycle-produced links, builds and state.
+- The harness-core orchestration tests and current-routing statements are
+  synchronized to the committed `ds` executor profile.
 
 ## Impact
 
 Executors spawned after the switch run DeepSeek V4.1-Flash at `max` through the
 installed `ds` profile. Lead and successor-lead profiles are unchanged.
-
-### Deliberately not reconciled (user-instructed scope: "just switch the configs")
-
-- `crates/harness-core/src/orchestration_config.rs` and
-  `orchestration_lifecycle.rs` unit tests pin the committed executor id as
-  `xai` and fail until synced.
-- `docs/agent-delegation.md` and
-  `openspec/specs/agent-delegation/spec.md` still describe the executor as
-  `xai`/Grok 4.7 in "currently" statements.

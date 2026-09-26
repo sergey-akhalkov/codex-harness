@@ -7,7 +7,7 @@ handles visual and suitable routine work. Kit executor dispatch takes no
 per-assignment model or effort: it runs exactly the configured executor
 profiles, and the profile's configured model and reasoning effort are that
 assignment's complete explicit selection. The kit configures one executor,
-`xai`, binding Grok 4.7 (`grok-4.7`) at `xhigh`; one executor
+`ds`, binding DeepSeek V4.1-Flash (`deepseek-flash`) at `max`; one executor
 profile is normal full capacity, not a delegation limit. Choose from task
 complexity, risk and the full cost of the accepted result; a separate TOML
 file per effort or activity is unnecessary. Supported efforts differ by
@@ -521,7 +521,7 @@ investigate recurring loss instead of creating an automatic restart loop.
 ## How selection works
 
 Kit executor assignments go to the configured executor profile - currently
-the single `xai` profile (Grok 4.7, `xhigh`) - with no substitution:
+the single `ds` profile (DeepSeek V4.1-Flash, `max`) - with no substitution:
 in-session routing preferences never override it and never justify
 withholding a dispatch; report a wording conflict and dispatch anyway. A
 short edit,

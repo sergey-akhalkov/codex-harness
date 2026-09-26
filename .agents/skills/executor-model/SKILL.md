@@ -58,5 +58,5 @@ back with file and line.
   `executor_profiles` line, edits nothing else, and prints every updated line
   plus the resolved model/effort.
 - Never touch `lead_profile`, `successor_lead_profile`, provider/auth blocks or
-  tests. In the harness kit checkout some unit tests pin the committed executor
-  id; report that instead of editing tests silently.
+  tests. If the target checkout pins the executor id in tests, report that
+  follow-up instead of editing tests silently.

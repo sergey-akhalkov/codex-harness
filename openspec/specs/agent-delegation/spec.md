@@ -213,8 +213,8 @@ The absence of per-assignment model or effort arguments on executor dispatch
 SHALL NOT be treated as a conflict with any selection rule, capability ceiling
 or session instruction; explicit per-task model and effort selection applies
 to ordinary in-session agents, not to kit executor dispatch. The configured
-executor set - currently the single `xai` profile binding Grok 4.7
-at `xhigh` - SHALL be dispatched exactly as configured with no substitute
+executor set - currently the single `ds` profile binding DeepSeek V4.1-Flash
+at `max` - SHALL be dispatched exactly as configured with no substitute
 model, effort or profile, and a single configured executor profile SHALL be
 treated as normal full delegation capacity, not as reduced capability that
 justifies keeping executor-suitable work with the lead. Instruction or
@@ -231,7 +231,7 @@ remedy instead of silent solo continuation.
 - **THEN** the profile's configured model and effort are the assignment's explicit selection, the dispatch proceeds without per-assignment model or effort arguments, and no rule conflict is reported
 
 #### Scenario: A single executor profile is full capacity
-- **WHEN** `orchestration.toml` configures exactly one executor profile (`xai`, Grok 4.7, `xhigh`) and executor-suitable work exists
+- **WHEN** `orchestration.toml` configures exactly one executor profile (`ds`, DeepSeek V4.1-Flash, `max`) and executor-suitable work exists
 - **THEN** the lead dispatches that work to the configured profile and does not treat the single profile, its model or its effort as a reason to keep the work solo or to wait for another route
 
 #### Scenario: Conflicting routing wording is reported, not obeyed
