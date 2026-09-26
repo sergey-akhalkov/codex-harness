@@ -34,7 +34,7 @@ The retired script interface and its native equivalent. Selectors, preview
 | Feedback mechanics | `codex-harness feedback record|list|ledger|triage|candidates|promote` |
 | `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
 | Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
-| Skill evolution helpers | `codex-harness skills isolate` / `usage` / `publish` / `identity` |
+| Skill evolution helpers | `codex-harness skills catalogue` / `isolate` / `usage` / `publish` / `identity` |
 
 ## Prerequisites and checks
 

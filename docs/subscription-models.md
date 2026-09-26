@@ -97,8 +97,10 @@ skill owns the record formats, and the shared contract is
 
 ## Compatibility shim
 
-Codex 0.154 and api.x.ai have wire-format mismatches that the shim adapts on
-`127.0.0.1:56122`:
+Codex (requalified against CLI 0.157.0) and api.x.ai still have the
+wire-format mismatches below. The shim adapts them on `127.0.0.1:56122`;
+none is proven obsolete, and provider-side rejection is not re-probed without
+authorization:
 
 1. Codex echoes Responses `reasoning` items with `content: null`, which
    api.x.ai rejects. The shim removes that field.
@@ -113,9 +115,9 @@ Codex 0.154 and api.x.ai have wire-format mismatches that the shim adapts on
    api.x.ai rejects. The shim strips it.
 
 5. Grok often emits whole numbers as JSON floats (`30000.0`) in tool
-   arguments. Codex 0.154 rejects those for integer fields (`u64`, `i32`,
-   `usize`), so the shim rewrites whole floats to integers before the
-   client sees the call.
+   arguments. CLI 0.157 accepts them for its own tools but still rejects a
+   whole float for an integer-typed MCP handle field, so the shim rewrites
+   whole floats to integers before the client sees the call.
 6. Grok often decorates the patch markers (`*** Begin Patch ***`,
    `*** End Patch ***`, `*** End of File ***`). Codex's apply_patch
    validator accepts only the undecorated marker lines and otherwise rejects
