@@ -12,6 +12,11 @@ serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+# The native warning relay is the one place this crate speaks raw WebSocket
+# frames: it must forward app-server bytes unchanged and append one notification
+# shape, which the JSON-only control connection cannot express. Same pinned
+# stack the control transport uses.
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 skill-evolution = { path = "../skill-evolution" }
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 regex = "=1.12.4"

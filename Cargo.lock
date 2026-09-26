@@ -98,6 +98,7 @@ dependencies = [
  "skill-evolution",
  "tempfile",
  "toml",
+ "tungstenite",
  "windows-sys",
 ]
 

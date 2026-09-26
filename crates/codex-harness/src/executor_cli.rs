@@ -44,6 +44,11 @@ mod executor_message;
 mod executor_stop;
 #[path = "executor_observation.rs"]
 mod observation;
+// The native warning relay: the frontend-facing socket the host may append a
+// degraded diagnostic to. It is not a second backend address, and `executor
+// message` and `executor stop` never resolve a run through it.
+#[path = "executor_warning.rs"]
+mod warning;
 
 use control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, FinalMessage, Lifecycle,
@@ -52,6 +57,7 @@ use observation::{
     COVERAGE_NATIVE, ControlOutcome, RunObservation, RunTracker, STATE_ACCEPTED, STATE_COMPLETED,
     STATE_DEFECT, STATE_FAILED, STATE_INTERRUPTED, STATE_STARTED,
 };
+use warning::{Relay, WarningQueue};
 
 const USAGE: &str = concat!(
     "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--mode exec|tui] [--base REV] [--owner ID] [--terminal-profile NAME] [--terminal-window NAME] (--exec PROMPT|- | --assignment FILE)\n",
@@ -3168,6 +3174,10 @@ struct OwnedFrontend {
     job: Option<Job>,
     process: harness_core::process::OwnedProcess,
     program: PathBuf,
+    /// The frontend-facing warning relay this frontend was attached through.
+    /// It is closed with the frontend, so a relay thread never outlives the
+    /// surface it serves.
+    relay: Option<Relay>,
 }
 
 /// How an owned native frontend relates to the conversation it presents. An
@@ -3200,6 +3210,16 @@ impl OwnedFrontend {
         self.process.is_running()
     }
 
+    /// The native warning surface of this frontend: the relay's queue when the
+    /// frontend is fronted by one, and the honest no-consumer surface
+    /// otherwise. A send through it never becomes a terminal outcome here.
+    fn warnings(&self) -> WarningQueue {
+        self.relay
+            .as_ref()
+            .map(Relay::warnings)
+            .unwrap_or_else(WarningQueue::without_consumer)
+    }
+
     /// The frontend's own exit code, when it already exited.
     fn exit_code(&self) -> io::Result<Option<u32>> {
         self.process.exit_code()
@@ -3209,6 +3229,7 @@ impl OwnedFrontend {
         if let Some(job) = self.job.take() {
             job.terminate(0, CONTROL_CLEANUP)?;
         }
+        close_relay(&mut self.relay);
         Ok(())
     }
 
@@ -3253,6 +3274,15 @@ impl Drop for OwnedFrontend {
         if let Some(job) = self.job.take() {
             let _ = job.terminate(0, CONTROL_CLEANUP);
         }
+        close_relay(&mut self.relay);
+    }
+}
+
+/// Ends one frontend-facing relay. The relay serves only this frontend's own
+/// connection, so it never outlives the surface it fronts.
+fn close_relay(relay: &mut Option<Relay>) {
+    if let Some(mut relay) = relay.take() {
+        relay.close();
     }
 }
 
@@ -3362,18 +3392,37 @@ fn attach_owned_frontend(
             role.unfinished()
         )));
     }
+    // Only the native frontend's own connection is relayed: the recorded
+    // endpoint that `executor message` and `executor stop` address, and this
+    // host's control connection, keep addressing the app-server child itself.
+    // A managed lead session runs no cache-guard diagnostics, so its
+    // interactive surface stays on the recorded address.
+    let relay = match role {
+        FrontendRole::Executor => Some(
+            Relay::start(
+                conversation.endpoint().port(),
+                conversation.endpoint().token(),
+                conversation.thread_id(),
+            )
+            .map_err(|error| {
+                invalid(&format!(
+                    "the native warning relay could not front this conversation: {error}. {}",
+                    role.unfinished()
+                ))
+            })?,
+        ),
+        FrontendRole::Lead => None,
+    };
+    let frontend_port = relay
+        .as_ref()
+        .map_or_else(|| conversation.endpoint().port(), Relay::port);
     let mut spec = CommandSpec::new(&upstream);
     spec.inherit_console = true;
     spec.current_dir = Some(plan.slot.clone());
-    spec.args = frontend_args(
-        conversation.endpoint().port(),
-        conversation.thread_id(),
-        presentation,
-        role,
-    )
-    .into_iter()
-    .map(Into::into)
-    .collect();
+    spec.args = frontend_args(frontend_port, conversation.thread_id(), presentation, role)
+        .into_iter()
+        .map(Into::into)
+        .collect();
     spec.env.insert(
         "CODEX_HOME".into(),
         Some(plan.home.as_os_str().to_os_string()),
@@ -3411,6 +3460,7 @@ fn attach_owned_frontend(
         job: Some(job),
         process,
         program: upstream,
+        relay,
     })
 }
 
@@ -3797,6 +3847,23 @@ fn host_control_conversation(
     {
         let _ = write_frontend_record(plan, frontend, conversation.thread_id(), "persisted");
     }
+    // The warning surface of this run, recorded before the surface is ended:
+    // the relay fronting the native frontend, or the honest no-consumer
+    // surface of the compatibility renderer. A native-format send is recorded
+    // as a send, never as a warning a human has seen.
+    let warnings = frontend
+        .as_ref()
+        .map(OwnedFrontend::warnings)
+        .unwrap_or_else(WarningQueue::without_consumer);
+    let delivery = warnings.status();
+    note_log(
+        &plan.paths.log,
+        &format!(
+            "native warning delivery: {} ({} queued)",
+            delivery.state.as_str(),
+            delivery.pending
+        ),
+    );
     // Persist first. Then end only this owned frontend and this run's backend.
     // `run_exec` still applies the terminal-host close policy after this
     // returns: `--close-tab` exits 0, and this exit stays the receipt's code.
