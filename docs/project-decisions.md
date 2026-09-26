@@ -368,10 +368,10 @@ decision with measured everyday demand, not a restore of retired code.
 SuperGrok Heavy is delivered as the native `codex --profile xai` provider with
 a kit-owned compatibility shim on `127.0.0.1:56122`. The OpenCodex proxy, its
 Windows task and its runtime sources are retired. The main model stays GPT-6
-Astra. The shim adapts five wire-format mismatches between Codex 0.154 and
-api.x.ai (reasoning `content: null`, custom tool types, namespace tool
-declarations, `external_web_access`, whole-number JSON floats in tool
-arguments); see
+Astra. The shim adapts six exercised wire-format mismatches between current
+Codex and api.x.ai (reasoning `content: null`, custom tool types, namespace
+declarations, `external_web_access`, whole-number floats, decorated patch
+markers); see
 [subscription models](subscription-models.md#compatibility-shim). Remove the
 shim when Codex or xAI fixes the serialization.
 
@@ -478,8 +478,8 @@ with an unrestricted context);
 portable defaults disable the Apps feature while machine-local values win;
 per-model default effort is max for zai/glm-5.3 and xhigh for
 xai/grok-4.6 and Astra when no explicit effort is selected; the portable
-principles stay at most 24 KiB with every normative rule preserved (measured
-22,928 bytes from 31,442). Removing the locally installed GitHub plugin is a
+principles stay at most 24 KiB with every normative rule preserved (24,320
+bytes after the 2026-09-26 trim). Removing the locally installed GitHub plugin is a
 machine-local action, not a kit requirement. Screenshot policy was already
 fixed separately and stays unchanged.
 
