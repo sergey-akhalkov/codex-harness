@@ -1,14 +1,14 @@
 //! Native-effective scoped catalogue. Overflow blocks growth, not required skills.
 //!
 //! The native consumer's `skills/list` result is authoritative for the effective
-//! set. This module adds only what that response omits: canonical package
-//! identity (revision), config disablement, differing sources for one name,
-//! duplicate links to one source and coverage limits. It never scans discovery
-//! roots itself, so it cannot become a second maintained catalogue.
+//! set. This module adds only what that response omits: package revision
+//! identity, config disablement, differing sources for one name, duplicate links
+//! and coverage limits. It never scans discovery roots itself.
 
 use crate::{delivery, invalid, ownership, package, session};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
 };
@@ -25,13 +25,7 @@ impl Admission {
     }
 
     pub fn allow_growth(&self, name: &str, adding: bool) -> bool {
-        if ownership::protected_name(name) {
-            return true;
-        }
-        if !adding {
-            return true;
-        }
-        self.owned_count < self.limit
+        ownership::protected_name(name) || !adding || self.owned_count < self.limit
     }
 }
 
@@ -65,15 +59,16 @@ pub struct Conflict {
     pub sources: Vec<Source>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Coverage {
+    #[default]
     Complete,
     Incomplete,
     Unavailable,
 }
 
 /// Effective skills plus explicit conflicts, duplicates and coverage limits.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct View {
     pub coverage: Coverage,
     /// Entries within the delivery allowance; `omitted` counts the rest.
@@ -94,31 +89,35 @@ impl View {
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             coverage: Coverage::Unavailable,
-            entries: Vec::new(),
-            conflicts: Vec::new(),
-            duplicates: Vec::new(),
             notes: vec![reason.into()],
-            truncated: false,
-            omitted: 0,
-            measured_bytes: 0,
+            ..Self::default()
         }
     }
 }
 
-/// Bounded retrieval route for entries omitted by the delivery allowance.
-///
-/// It reruns this catalogue at the largest accepted allowance, so it reaches
-/// the omitted entries itself; the usage report holds no catalogue entries.
+/// Bounded retrieval route for entries omitted by the delivery allowance: it
+/// reruns this catalogue at the largest accepted allowance.
 pub fn remainder_route() -> &'static str {
     "codex-harness skills catalogue --limit 1048576"
 }
 
+/// The `skills/list` result fields this view relies on.
+#[derive(Deserialize)]
+struct Listed {
+    data: Vec<ListedRow>,
+}
+
+#[derive(Deserialize)]
+struct ListedRow {
+    cwd: PathBuf,
+    skills: Vec<serde_json::Value>,
+    errors: Vec<serde_json::Value>,
+}
+
 /// Derive the scoped view from one native `skills/list` result for `case`.
-///
 /// `metadata_limit` bounds the delivered entry metadata, not the discovery:
-/// entries beyond it stay explicit through `truncated`, `omitted` and the
-/// remainder route. A malformed or mismatched payload is an error, not an
-/// empty catalogue.
+/// entries beyond it stay explicit through truncation; a malformed or
+/// mismatched payload is an error, not an empty catalogue.
 pub fn derive(
     native: &serde_json::Value,
     case: &Path,
@@ -126,52 +125,28 @@ pub fn derive(
     metadata_limit: usize,
 ) -> io::Result<View> {
     let case = case.canonicalize()?;
-    let data = native
-        .get("data")
-        .and_then(|data| data.as_array())
-        .ok_or_else(|| invalid("native skills/list payload has no data array"))?;
-    if data.len() != 1 {
+    let listed = Listed::deserialize(native).map_err(|error| {
+        io::Error::other(format!("native skills/list result is unusable: {error}"))
+    })?;
+    let [row] = listed.data.as_slice() else {
         return Err(invalid(
             "skills response does not identify one requested project",
         ));
-    }
-    let row = &data[0];
-    let cwd = row
-        .get("cwd")
-        .and_then(|cwd| cwd.as_str())
-        .map(Path::new)
-        .ok_or_else(|| invalid("skills response lacks project identity"))?;
-    if !cwd.is_absolute()
-        || cwd
+    };
+    if !row.cwd.is_absolute()
+        || row
+            .cwd
             .canonicalize()
             .map_err(|_| invalid("skills response project is not readable"))?
             != case
     {
         return Err(invalid("skills response project mismatch"));
     }
-    let mut notes = Vec::new();
-    let errors = row
-        .get("errors")
-        .and_then(|errors| errors.as_array())
-        .ok_or_else(|| invalid("skills response lacks an errors array"))?;
-    for error in errors {
-        let path = error.get("path").and_then(|path| path.as_str());
-        let message = error
-            .get("message")
-            .and_then(|message| message.as_str())
-            .unwrap_or("unreported native discovery error");
-        notes.push(match path {
-            Some(path) => format!("native discovery error at {path}: {message}"),
-            None => format!("native discovery error: {message}"),
-        });
-    }
-    let skills = row
-        .get("skills")
-        .and_then(|skills| skills.as_array())
-        .ok_or_else(|| invalid("skills response lacks a skills array"))?;
+    let mut notes: Vec<String> = row.errors.iter().map(discovery_note).collect();
+    // One entry per canonical source; later links to one source stay explicit.
     let mut unique: Vec<Entry> = Vec::new();
     let mut duplicates = Vec::new();
-    for skill in skills {
+    for skill in &row.skills {
         let Some(entry) = entry(skill, config, &mut notes) else {
             continue;
         };
@@ -191,7 +166,7 @@ pub fn derive(
     let measured_bytes: usize = unique.iter().map(delivery::entry_size).sum();
     let total = unique.len();
     let mut entries = Vec::new();
-    let mut used = 0usize;
+    let mut used = 0;
     for entry in unique {
         let size = delivery::entry_size(&entry);
         if used + size > metadata_limit {
@@ -201,22 +176,30 @@ pub fn derive(
         entries.push(entry);
     }
     let truncated = entries.len() < total;
-    let omitted = total - entries.len();
-    let coverage = if notes.is_empty() && !truncated {
-        Coverage::Complete
-    } else {
-        Coverage::Incomplete
-    };
     Ok(View {
-        coverage,
+        coverage: if notes.is_empty() && !truncated {
+            Coverage::Complete
+        } else {
+            Coverage::Incomplete
+        },
+        omitted: total - entries.len(),
         entries,
         conflicts,
         duplicates,
         notes,
         truncated,
-        omitted,
         measured_bytes,
     })
+}
+
+/// The native skill fields this view consumes.
+#[derive(Deserialize)]
+struct Native {
+    name: String,
+    description: String,
+    path: PathBuf,
+    scope: String,
+    enabled: bool,
 }
 
 fn entry(
@@ -224,39 +207,25 @@ fn entry(
     config: Option<&Path>,
     notes: &mut Vec<String>,
 ) -> Option<Entry> {
-    let name = skill
-        .get("name")
-        .and_then(|name| name.as_str())
-        .filter(|name| !name.is_empty());
-    let applicability = skill
-        .get("description")
-        .and_then(|description| description.as_str());
-    let declared = skill
-        .get("path")
-        .and_then(|path| path.as_str())
-        .filter(|path| Path::new(path).is_absolute());
-    let scope = skill
-        .get("scope")
-        .and_then(|scope| scope.as_str())
-        .filter(|scope| NATIVE_SCOPES.contains(scope));
-    let enabled = skill.get("enabled").and_then(|enabled| enabled.as_bool());
-    let (Some(name), Some(applicability), Some(declared), Some(scope), Some(enabled)) =
-        (name, applicability, declared, scope, enabled)
-    else {
+    let native = serde_json::from_value::<Native>(skill.clone())
+        .ok()
+        .filter(|native| {
+            !native.name.is_empty()
+                && native.path.is_absolute()
+                && NATIVE_SCOPES.contains(&native.scope.as_str())
+        });
+    let Some(native) = native else {
         notes.push(format!("unrecognized native skill entry: {skill}"));
         return None;
     };
-    let declared = PathBuf::from(declared);
-    let declared_root = declared
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| declared.clone());
+    let declared_root = native.path.parent().unwrap_or(&native.path).to_path_buf();
     let (path, revision) = match package::load(&declared_root) {
         Ok(identity) => (identity.root, Some(identity.revision)),
         Err(_) => {
             notes.push(format!(
-                "identity unavailable for native skill '{name}' at {}",
-                declared.display()
+                "identity unavailable for native skill '{}' at {}",
+                native.name,
+                native.path.display()
             ));
             (
                 declared_root
@@ -266,38 +235,45 @@ fn entry(
             )
         }
     };
-    // `canonicalize` returns a verbatim path on Windows; match the declared path
-    // too, because user configuration names the skill the way discovery does.
+    // `canonicalize` returns a verbatim path on Windows; user configuration
+    // names the skill the way discovery does, so check the declared path too.
     let disabled = config.is_some_and(|config| {
         session::config_disables(config, &declared_root) || session::config_disables(config, &path)
     });
-    let enabled = enabled && !disabled;
     Some(Entry {
-        name: name.to_owned(),
-        scope: scope.to_owned(),
-        applicability: applicability.to_owned(),
+        name: native.name,
+        scope: native.scope,
+        applicability: native.description,
         path,
         revision,
-        enabled,
+        enabled: native.enabled && !disabled,
     })
 }
 
+/// One explicit note per native discovery error, with its source path when known.
+fn discovery_note(error: &serde_json::Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .unwrap_or("unreported native discovery error");
+    match error.get("path").and_then(|path| path.as_str()) {
+        Some(path) => format!("native discovery error at {path}: {message}"),
+        None => format!("native discovery error: {message}"),
+    }
+}
+
 fn conflicts(entries: &[Entry]) -> Vec<Conflict> {
-    let mut names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-    names.sort_unstable();
-    names.dedup();
-    names
+    let mut by_name: BTreeMap<&str, Vec<Source>> = BTreeMap::new();
+    for entry in entries {
+        by_name.entry(&entry.name).or_default().push(Source {
+            scope: entry.scope.clone(),
+            path: entry.path.clone(),
+            revision: entry.revision.clone(),
+        });
+    }
+    by_name
         .into_iter()
-        .filter_map(|name| {
-            let sources: Vec<Source> = entries
-                .iter()
-                .filter(|entry| entry.name == name)
-                .map(|entry| Source {
-                    scope: entry.scope.clone(),
-                    path: entry.path.clone(),
-                    revision: entry.revision.clone(),
-                })
-                .collect();
+        .filter_map(|(name, sources)| {
             (sources.len() > 1).then(|| Conflict {
                 name: name.to_owned(),
                 sources,
@@ -316,7 +292,7 @@ mod tests {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: Catalogue fixture.\n---\n{body}\n"),
+            format!("---\nname: {name}\ndescription: fixture.\n---\n{body}\n"),
         )
         .unwrap();
     }
@@ -352,37 +328,30 @@ mod tests {
     fn duplicate_links_to_one_source_keep_one_revision_and_conflicts_stay_distinct() {
         let root = case();
         let case = root.path().join("repo");
-        let local = case.join(".agents/skills/shared");
-        let conflict = case.join(".agents/skills/other");
+        let (local, other) = (
+            case.join(".agents/skills/shared"),
+            case.join(".agents/skills/other"),
+        );
         skill(&local, "shared", "one source");
-        skill(&conflict, "shared", "different source");
-        let view = derive(
-            &payload(
-                &case,
-                vec![
-                    native("shared", &local, "repo"),
-                    native("shared", &local, "user"),
-                    native("shared", &conflict, "repo"),
-                ],
-            ),
-            &case,
-            None,
-            usize::MAX,
-        )
-        .unwrap();
+        skill(&other, "shared", "different source");
+        let links = vec![
+            native("shared", &local, "repo"),
+            native("shared", &local, "user"),
+            native("shared", &other, "repo"),
+        ];
+        let view = derive(&payload(&case, links), &case, None, usize::MAX).unwrap();
         assert_eq!(view.coverage, Coverage::Complete);
         assert_eq!(view.entries.len(), 2, "one entry per canonical source");
         assert_eq!(view.duplicates.len(), 1, "the extra link stays explicit");
         assert!(view.duplicates[0].contains("reach one source"));
         assert_eq!(view.conflicts.len(), 1);
-        let conflict = &view.conflicts[0];
-        assert_eq!(conflict.name, "shared");
-        assert_eq!(conflict.sources.len(), 2);
+        let c = &view.conflicts[0];
+        assert_eq!(c.name, "shared");
+        assert_eq!(c.sources.len(), 2);
         assert!(
-            conflict
-                .sources
+            c.sources
                 .iter()
-                .all(|source| source.revision.as_deref().is_some_and(|r| r.len() > 16))
+                .all(|s| s.revision.as_deref().is_some_and(|r| r.len() > 16))
         );
         assert!(view.entries.iter().all(|entry| entry.revision.is_some()));
     }
@@ -391,35 +360,29 @@ mod tests {
     fn disablement_and_missing_identity_stay_explicit() {
         let root = case();
         let case = root.path().join("repo");
-        let enabled = case.join(".agents/skills/enabled");
-        let disabled = case.join(".agents/skills/disabled");
-        let absent = case.join(".agents/skills/absent");
+        let (enabled, disabled, absent) = (
+            case.join(".agents/skills/enabled"),
+            case.join(".agents/skills/disabled"),
+            case.join(".agents/skills/absent"),
+        );
         skill(&enabled, "enabled", "enabled");
         skill(&disabled, "disabled", "disabled");
         let config = root.path().join("config.toml");
+        let disabled_md = disabled.join("SKILL.md").to_string_lossy().into_owned();
         fs::write(
             &config,
             format!(
                 "[[skills.config]]\npath = {}\nenabled = false\n",
-                serde_json::to_string(&disabled.join("SKILL.md").to_string_lossy().as_ref())
-                    .unwrap()
+                serde_json::to_string(&disabled_md).unwrap()
             ),
         )
         .unwrap();
-        let view = derive(
-            &payload(
-                &case,
-                vec![
-                    native("enabled", &enabled, "repo"),
-                    native("disabled", &disabled, "repo"),
-                    native("absent", &absent, "repo"),
-                ],
-            ),
-            &case,
-            Some(&config),
-            usize::MAX,
-        )
-        .unwrap();
+        let links = vec![
+            native("enabled", &enabled, "repo"),
+            native("disabled", &disabled, "repo"),
+            native("absent", &absent, "repo"),
+        ];
+        let view = derive(&payload(&case, links), &case, Some(&config), usize::MAX).unwrap();
         assert_eq!(view.coverage, Coverage::Incomplete);
         let row = |name: &str| {
             view.entries
@@ -433,7 +396,7 @@ mod tests {
         assert!(
             view.notes
                 .iter()
-                .any(|note| note.contains("identity unavailable") && note.contains("absent"))
+                .any(|n| n.contains("identity unavailable") && n.contains("absent"))
         );
     }
 
@@ -441,8 +404,10 @@ mod tests {
     fn native_errors_are_incomplete_and_truncation_keeps_a_route() {
         let root = case();
         let case = root.path().join("repo");
-        let first = case.join(".agents/skills/first");
-        let second = case.join(".agents/skills/second");
+        let (first, second) = (
+            case.join(".agents/skills/first"),
+            case.join(".agents/skills/second"),
+        );
         skill(&first, "first", "first");
         skill(&second, "second", "second");
         let mut broken = payload(&case, vec![native("first", &first, "repo")]);
@@ -451,7 +416,6 @@ mod tests {
         let view = derive(&broken, &case, None, usize::MAX).unwrap();
         assert_eq!(view.coverage, Coverage::Incomplete);
         assert!(view.notes[0].contains("missing frontmatter"));
-
         let full = payload(
             &case,
             vec![
@@ -477,8 +441,7 @@ mod tests {
         let root = case();
         let case = root.path().join("repo");
         assert!(derive(&json!({}), &case, None, usize::MAX).is_err());
-        let empty = json!({"data":[]});
-        assert!(derive(&empty, &case, None, usize::MAX).is_err());
+        assert!(derive(&json!({"data":[]}), &case, None, usize::MAX).is_err());
         let elsewhere = payload(&root.path().join("elsewhere"), Vec::new());
         assert!(derive(&elsewhere, &case, None, usize::MAX).is_err());
         let unavailable = View::unavailable("native launch registration is missing");

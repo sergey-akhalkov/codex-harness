@@ -1,29 +1,41 @@
-//! Bounded catalogue delivery. Ordinary hooks stay off; a list is not awareness.
-//!
-//! Rendering never claims the complete active set when the native evidence was
-//! unavailable, incomplete or truncated, and never claims current-turn delivery.
+//! Bounded catalogue render. A list is not awareness: rendering never claims
+//! the complete active set when the native evidence was unavailable, incomplete
+//! or truncated, and never claims current-turn delivery.
 
 use crate::{catalogue, invalid};
 use std::{fmt::Write as _, io};
 
 const FIELD_LIMIT: usize = 2048;
-/// Literals of one entry line without the field contents:
-/// `name=;scope=;enabled=;applicability=;path=;revision=\n` plus the boolean.
-const LINE_OVERHEAD: usize = 53;
 
 fn revision(entry: &catalogue::Entry) -> &str {
     entry.revision.as_deref().unwrap_or("unavailable")
 }
 
+fn source(source: &catalogue::Source) -> String {
+    format!(
+        "{}:{}@{}",
+        source.scope,
+        source.path.display(),
+        source.revision.as_deref().unwrap_or("unavailable")
+    )
+}
+
+/// The exact delivered line of one entry, before validation.
+fn line(entry: &catalogue::Entry) -> String {
+    format!(
+        "name={};scope={};enabled={};applicability={};path={};revision={}\n",
+        entry.name,
+        entry.scope,
+        entry.enabled,
+        entry.applicability,
+        entry.path.to_string_lossy(),
+        revision(entry)
+    )
+}
+
 /// Delivered bytes of one entry, measured before any truncation.
 pub fn entry_size(entry: &catalogue::Entry) -> usize {
-    LINE_OVERHEAD
-        + entry.name.len()
-        + entry.scope.len()
-        + entry.applicability.len()
-        + entry.path.to_string_lossy().len()
-        + revision(entry).len()
-        + if entry.enabled { 4 } else { 5 }
+    line(entry).len()
 }
 
 pub fn entry_line(entry: &catalogue::Entry) -> io::Result<String> {
@@ -35,87 +47,57 @@ pub fn entry_line(entry: &catalogue::Entry) -> io::Result<String> {
         path.as_ref(),
         revision(entry),
     ] {
-        if field.len() > FIELD_LIMIT
-            || field.contains('\0')
-            || field.contains('<')
-            || field.contains('>')
-            || field.contains('\n')
-        {
+        if field.len() > FIELD_LIMIT || field.contains(['\0', '<', '>', '\n']) {
             return Err(invalid("malformed or injected catalogue field"));
         }
     }
     if entry.name.is_empty() || path.is_empty() || revision(entry).is_empty() {
         return Err(invalid("incomplete catalogue identity"));
     }
-    Ok(format!(
-        "name={};scope={};enabled={};applicability={};path={};revision={}\n",
-        entry.name,
-        entry.scope,
-        entry.enabled,
-        entry.applicability,
-        path,
-        revision(entry)
-    ))
+    Ok(line(entry))
 }
 
 /// Render the derived view, stating every gap explicitly.
 pub fn render(view: &catalogue::View, limit: usize) -> io::Result<String> {
-    let mut out = String::new();
     if view.coverage == catalogue::Coverage::Unavailable {
-        out.push_str("native_discovery=unavailable\n");
-        for note in &view.notes {
-            let _ = writeln!(out, "reason={note}");
-        }
-        out.push_str("effective_set=unknown\n");
-        out.push_str(
-            "remedy=restore the native read (register harness/native-launch.json or pass --upstream PATH), then rerun codex-harness skills catalogue\n",
-        );
-        out.push_str(
-            "awareness=none: this read cannot establish model awareness or current-turn delivery\n",
-        );
+        let mut out = String::from("native_discovery=unavailable\n");
+        out.extend(view.notes.iter().map(|note| format!("reason={note}\n")));
+        out.push_str("effective_set=unknown\nremedy=restore the native read (register harness/native-launch.json or pass --upstream PATH), then rerun codex-harness skills catalogue\nawareness=none: this read cannot establish model awareness or current-turn delivery\n");
         return Ok(out);
     }
-    let total = view.entries.len() + view.omitted;
-    let _ = writeln!(
-        out,
-        "catalogue: {total} effective; delivered={}; measured_metadata_bytes={}; coverage={}",
+    let mut out = format!(
+        "catalogue: {} effective; delivered={}; measured_metadata_bytes={}; coverage={}\n",
+        view.entries.len() + view.omitted,
         view.entries.len(),
         view.measured_bytes,
-        match view.coverage {
-            catalogue::Coverage::Complete => "complete",
-            catalogue::Coverage::Incomplete => "incomplete",
-            catalogue::Coverage::Unavailable => unreachable!("handled above"),
+        if view.coverage == catalogue::Coverage::Complete {
+            "complete"
+        } else {
+            "incomplete"
         }
     );
     for entry in &view.entries {
         out.push_str(&entry_line(entry)?);
     }
     for conflict in &view.conflicts {
-        let sources = conflict
-            .sources
-            .iter()
-            .map(|source| {
-                format!(
-                    "{}:{}@{}",
-                    source.scope,
-                    source.path.display(),
-                    source.revision.as_deref().unwrap_or("unavailable")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        let sources: Vec<String> = conflict.sources.iter().map(source).collect();
         let _ = writeln!(
             out,
-            "conflict: name={} sources=[{sources}] (native effective selection keeps both)",
-            conflict.name
+            "conflict: name={} sources=[{}] (native effective selection keeps both)",
+            conflict.name,
+            sources.join(" ")
         );
     }
-    for duplicate in &view.duplicates {
-        let _ = writeln!(out, "duplicate_link: {duplicate}");
-    }
-    for note in &view.notes {
-        let _ = writeln!(out, "incomplete: {note}");
-    }
+    out.extend(
+        view.duplicates
+            .iter()
+            .map(|duplicate| format!("duplicate_link: {duplicate}\n")),
+    );
+    out.extend(
+        view.notes
+            .iter()
+            .map(|note| format!("incomplete: {note}\n")),
+    );
     if view.truncated {
         let _ = writeln!(
             out,
@@ -124,9 +106,7 @@ pub fn render(view: &catalogue::View, limit: usize) -> io::Result<String> {
             catalogue::remainder_route()
         );
     }
-    out.push_str(
-        "awareness=discovery-only: revision identity here is not current-turn delivery; read codex-harness skills identity --path DIRECTORY for a live revision\n",
-    );
+    out.push_str("awareness=discovery-only: revision identity here is not current-turn delivery; read codex-harness skills identity --path DIRECTORY for a live revision\n");
     Ok(out)
 }
 
@@ -149,14 +129,8 @@ mod tests {
 
     fn view(entries: Vec<catalogue::Entry>) -> catalogue::View {
         catalogue::View {
-            coverage: Coverage::Complete,
             entries,
-            conflicts: Vec::new(),
-            duplicates: Vec::new(),
-            notes: Vec::new(),
-            truncated: false,
-            omitted: 0,
-            measured_bytes: 0,
+            ..Default::default()
         }
     }
 
@@ -199,19 +173,16 @@ mod tests {
         assert!(text.contains("awareness=discovery-only"));
 
         let mut conflict = view(vec![entry("demo", Some("abc"), true)]);
+        let source = |scope: &str, path: &str, revision: &str| catalogue::Source {
+            scope: scope.into(),
+            path: PathBuf::from(path),
+            revision: Some(revision.into()),
+        };
         conflict.conflicts = vec![catalogue::Conflict {
             name: "demo".into(),
             sources: vec![
-                catalogue::Source {
-                    scope: "repo".into(),
-                    path: PathBuf::from("skills/demo"),
-                    revision: Some("abc".into()),
-                },
-                catalogue::Source {
-                    scope: "user".into(),
-                    path: PathBuf::from("user/skills/demo"),
-                    revision: Some("def".into()),
-                },
+                source("repo", "skills/demo", "abc"),
+                source("user", "user/skills/demo", "def"),
             ],
         }];
         let text = render(&conflict, 4096).unwrap();
