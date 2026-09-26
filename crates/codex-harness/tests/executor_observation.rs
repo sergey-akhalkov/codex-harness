@@ -1135,6 +1135,7 @@ fn observer_failure_terminates_the_owned_tree() {
 /// The non-DeepSeek identity the cache-guard checks run with: support is
 /// proven at runtime by a warmed response, so no vendor name may gate
 /// monitoring or a stop.
+const CACHE_PROFILE: &str = "xai-fixture";
 const CACHE_MODEL: &str = "grok-4.7";
 const CACHE_PROVIDER: &str = "xai-fixture";
 
@@ -1142,7 +1143,7 @@ const CACHE_PROVIDER: &str = "xai-fixture";
 /// binding another configured profile records it.
 fn reseed_cache_identity(run: &SeededRun) {
     let mut receipt = receipt_json(&run.receipt);
-    receipt["profile"] = json!("xai-fixture");
+    receipt["profile"] = json!(CACHE_PROFILE);
     receipt["model"] = json!(CACHE_MODEL);
     receipt["modelProvider"] = json!(CACHE_PROVIDER);
     fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
@@ -1503,11 +1504,12 @@ fn installed_native_cache_loss_stops_before_more_requests() {
     fs::write(evidence.join("cache-loss"), "synthetic counters").unwrap();
     let responses = fixture_responses::Responses::start(evidence.clone());
     fs::write(home.join("config.toml"), format!(
-        "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'low'\nmodel_provider = 'deepseek'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\napproval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n[model_providers.deepseek]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, workspace.to_string_lossy())).unwrap();
+        "model = '{CACHE_MODEL}'\nmodel_reasoning_effort = 'low'\nmodel_provider = '{CACHE_PROVIDER}'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\napproval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n[model_providers.{CACHE_PROVIDER}]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, workspace.to_string_lossy())).unwrap();
     let mut receipt = receipt_json(&run.receipt);
     receipt["launcher"] = json!(exe);
-    receipt["model"] = json!("gpt-6-astra");
-    receipt["modelProvider"] = json!("deepseek");
+    receipt["profile"] = json!(CACHE_PROFILE);
+    receipt["model"] = json!(CACHE_MODEL);
+    receipt["modelProvider"] = json!(CACHE_PROVIDER);
     receipt["reasoningEffort"] = json!("low");
     receipt["args"] = json!([
         "exec",
@@ -1543,8 +1545,19 @@ fn installed_native_cache_loss_stops_before_more_requests() {
         receipt["observation"]["state"], "stopped",
         "{receipt}\n{output}\n{error}"
     );
-    assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
-    assert_eq!(receipt["cacheGuard"]["lastMissTokens"], 196_000);
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["consecutiveMisses"], 3, "{receipt}");
+    assert_eq!(guard["lastMissTokens"], 196_000, "{receipt}");
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(guard["model"], CACHE_MODEL, "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "proven", "{receipt}");
+    // The compatibility renderer has no native warning surface: the receipt
+    // records the honest no-consumer state instead of claiming a delivered
+    // warning.
+    assert_eq!(
+        guard["diagnosticDelivery"], "no-native-consumer",
+        "{receipt}"
+    );
     let requests = fs::read_dir(evidence)
         .unwrap()
         .filter_map(Result::ok)
@@ -1555,7 +1568,7 @@ fn installed_native_cache_loss_stops_before_more_requests() {
         "request count after real-time stop: {requests}"
     );
     println!(
-        "native cache stop: {requests} local requests; per-response counters persisted and the guard stopped the live CLI"
+        "native cache stop: provider {CACHE_PROVIDER} model {CACHE_MODEL}; {requests} local requests; per-response counters persisted and the guard stopped the live CLI"
     );
 }
 

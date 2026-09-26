@@ -1506,6 +1506,71 @@ const OWNER: &str = "exec-deepseek-host";
 /// The assignment one fixture dispatch carries.
 const ASSIGNMENT: &str = "fixture control assignment text";
 
+/// The dispatch fixture's orchestration configuration: the one executor
+/// profile the cache-guard checks bind, sized to the single pool slot the
+/// dispatch-shaped fixture builds.
+fn pool_orchestration(pool_size: u32) -> String {
+    format!(
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"{CACHE_PROFILE}\"\nexecutor_profiles = [\"{CACHE_PROFILE}\"]\nmax_concurrent_executors = {pool_size}\nvote_threshold = 3\nincubator_size_cap = 32\nfeedback_batch_limit = 8\nworktree_limit = 1\n"
+    )
+}
+
+fn file_url(path: &Path) -> String {
+    format!("file:///{}", path.to_str().unwrap().replace('\\', "/"))
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Installs the native CLI at the documented launcher path of an owned home:
+/// the dispatch paths resolve `harness/bin/codex.exe`, and a hard link keeps
+/// the installed binary's identity without copying it where the volume allows.
+fn install_launcher(home: &Path, exe: &Path) {
+    let launcher = home.join("harness/bin/codex.exe");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    if fs::hard_link(exe, &launcher).is_err() {
+        fs::copy(exe, &launcher).unwrap_or_else(|error| {
+            panic!(
+                "the fixture home could not install the native CLI {}: {error}",
+                exe.display()
+            )
+        });
+    }
+}
+
+/// The number of canned provider requests the fixture has served so far.
+fn provider_requests(evidence: &Path) -> usize {
+    fs::read_dir(evidence)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+        .count()
+}
+
 /// One pooled exec dispatch as the dispatcher records it: the launcher, the
 /// resolved profile binding, the slot binding, the prepared shell, the run
 /// observation and the control route, hosted against the canned endpoint this
@@ -1515,6 +1580,7 @@ const ASSIGNMENT: &str = "fixture control assignment text";
 /// app-server fixture binary.
 struct Pooled {
     _root: tempfile::TempDir,
+    source: PathBuf,
     home: PathBuf,
     slot: PathBuf,
     state: PathBuf,
@@ -1529,17 +1595,94 @@ impl Pooled {
     /// reserves a free port and the spawned child must serve that port itself,
     /// which is the ordinary dispatch shape and the startup-failure shape.
     fn new(name: &str, thread_start: Answer, pinned: bool) -> Self {
+        Self::build(name, thread_start, pinned, false)
+    }
+
+    /// The dispatch-shaped fixture: the source is a real Git checkout of an
+    /// owned `file://` upstream and slot 1 is its registered sibling worktree,
+    /// exactly the pool layout the dispatch paths resolve. With the native CLI
+    /// installed at the launcher path, the documented `executor restart` can
+    /// adopt this recorded slot after a run stops.
+    fn dispatched(name: &str, thread_start: Answer) -> Self {
+        Self::build(name, thread_start, false, true)
+    }
+
+    /// One pooled fixture. The bound slot record, the canned endpoint and the
+    /// dispatch receipt are the state `executor run --file` hosts.
+    fn build(name: &str, thread_start: Answer, pinned: bool, dispatch: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join(format!("source-{name}"));
         fs::create_dir_all(&source).unwrap();
         let source = source.canonicalize().unwrap();
         let home = root.path().join("home");
-        let slot = root.path().join("slot");
         fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&slot).unwrap();
+        let (slot, base) = if dispatch {
+            let bare = root.path().join("remote.git");
+            git(
+                root.path(),
+                &[
+                    "init",
+                    "--bare",
+                    "-q",
+                    "--initial-branch=main",
+                    bare.to_str().unwrap(),
+                ],
+            );
+            git(&source, &["init", "-q", "--initial-branch=main"]);
+            git(&source, &["config", "user.email", "executor@example.test"]);
+            git(&source, &["config", "user.name", "Executor"]);
+            fs::write(source.join("README.md"), "seed\n").unwrap();
+            git(&source, &["add", "."]);
+            git(&source, &["commit", "-qm", "seed"]);
+            git(&source, &["remote", "add", "origin", &file_url(&bare)]);
+            git(&source, &["push", "-q", "origin", "main"]);
+            // The orchestration configuration stays untracked in the source,
+            // as a dispatched checkout carries it.
+            fs::create_dir_all(source.join("global")).unwrap();
+            fs::write(
+                source.join("global/orchestration.toml"),
+                pool_orchestration(1),
+            )
+            .unwrap();
+            let base = git_output(&source, &["rev-parse", "HEAD"]);
+            let parent = source.parent().unwrap();
+            let name = source.file_name().unwrap().to_str().unwrap();
+            let text = parent
+                .join(format!("{name}-wt1"))
+                .to_string_lossy()
+                .into_owned();
+            let slot = PathBuf::from(text.strip_prefix("\\\\?\\").unwrap_or(&text));
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    slot.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            (slot, base)
+        } else {
+            let slot = root.path().join("slot");
+            fs::create_dir_all(&slot).unwrap();
+            (slot, "abc123".to_owned())
+        };
         let paths = ControlPaths::for_slot(&home, &source, 1).unwrap();
         let state = paths.endpoint.parent().unwrap().to_path_buf();
         fs::create_dir_all(&state).unwrap();
+        if dispatch {
+            // The profile binding the documented restart resolves; the
+            // installed check replaces this file with the full provider
+            // configuration.
+            fs::write(
+                home.join("config.toml"),
+                format!(
+                    "[profiles.{CACHE_PROFILE}]\nmodel = '{CACHE_MODEL}'\nmodel_provider = '{CACHE_PROVIDER}'\nmodel_reasoning_effort = 'low'\n"
+                ),
+            )
+            .unwrap();
+        }
         // The bound slot record the host's lease reconciliation reads.
         fs::write(
             state.join("slot-1.json"),
@@ -1550,7 +1693,7 @@ impl Pooled {
                 "path": slot,
                 "state": "occupied",
                 "owner": OWNER,
-                "base": "abc123",
+                "base": base,
                 "disposition": null,
                 "reason": null,
             }))
@@ -1595,7 +1738,7 @@ impl Pooled {
                     "path": slot,
                     "source": source,
                     "owner": OWNER,
-                    "base": "abc123",
+                    "base": base,
                     "remote": "origin",
                     "branch": "main",
                 },
@@ -1622,6 +1765,7 @@ impl Pooled {
         .unwrap();
         Self {
             _root: root,
+            source,
             home,
             slot,
             state,
@@ -1666,6 +1810,75 @@ impl Pooled {
 
     fn lease_path(&self) -> PathBuf {
         self.state.join("lease-1.json")
+    }
+}
+
+/// Bounded wait until the restarted run observed its own NEW native session
+/// and published it as the run's address, with the live console transcript as
+/// the failure evidence.
+fn wait_for_fresh_session(pooled: &Pooled, predecessor: &str, restart: &ConsoleSession) -> String {
+    let until = Instant::now() + Duration::from_secs(90);
+    loop {
+        let receipt = pooled.receipt();
+        let state = receipt["observation"]["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if let Some(session) = receipt["observation"]["session"].as_str()
+            && !session.is_empty()
+            && session != predecessor
+            && fs::read_to_string(pooled.endpoint_path())
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .is_some_and(|endpoint| endpoint["threadId"].as_str() == Some(session))
+        {
+            return session.to_owned();
+        }
+        assert!(
+            !matches!(state.as_str(), "failed" | "defect" | "interrupted"),
+            "the restarted run recorded {state} instead of a fresh session: {receipt}\n{}",
+            restart.transcript()
+        );
+        assert!(
+            Instant::now() < until,
+            "the restarted run observed no fresh session: {receipt}\n{}",
+            restart.transcript()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded wait for the fresh conversation's own first handoff request: the
+/// new conversation starts from the bounded handoff that names the predecessor
+/// instead of resuming or replaying it.
+fn wait_for_handoff_request(
+    evidence: &Path,
+    before: usize,
+    predecessor: &str,
+    restart: &ConsoleSession,
+) -> String {
+    let until = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mut index = before + 1;
+        loop {
+            let path = evidence.join(format!("provider-{index}.json"));
+            if !path.is_file() {
+                break;
+            }
+            let body = fs::read_to_string(&path).unwrap_or_default();
+            if body.contains(predecessor)
+                && body.contains("Continue the original assignment in this same preserved worktree")
+            {
+                return body;
+            }
+            index += 1;
+        }
+        assert!(
+            Instant::now() < until,
+            "the fresh conversation submitted no handoff naming predecessor {predecessor}\n{}",
+            restart.transcript()
+        );
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1841,8 +2054,12 @@ fn a_hosted_exec_dispatch_converses_through_the_control_driver_and_records_its_r
 /// The non-DeepSeek identity the cache-guard dispatches run with: support is
 /// proven at runtime, so no vendor name may be required to monitor a run or to
 /// stop a losing one.
+const CACHE_PROFILE: &str = "zai-fixture";
 const CACHE_MODEL: &str = "glm-5.3";
 const CACHE_PROVIDER: &str = "zai-fixture";
+/// The assignment the installed cache-loss dispatch carries; the documented
+/// restart reuses it as the original assignment of its bounded handoff.
+const NATIVE_CACHE_ASSIGNMENT: &str = "Continue the original fixture task in this preserved checkout; keep partial.txt and check previous work before using results.";
 
 /// The canned `thread/start` answer for the cache-guard identity.
 fn cache_thread_start_answer() -> Value {
@@ -1858,10 +2075,10 @@ fn cache_thread_start_answer() -> Value {
 /// binding another configured profile records it.
 fn reseed_cache_identity(pooled: &Pooled) {
     let mut receipt = pooled.receipt();
-    receipt["profile"] = json!("zai-fixture");
+    receipt["profile"] = json!(CACHE_PROFILE);
     receipt["model"] = json!(CACHE_MODEL);
     receipt["modelProvider"] = json!(CACHE_PROVIDER);
-    receipt["control"]["identity"]["profile"] = json!("zai-fixture");
+    receipt["control"]["identity"]["profile"] = json!(CACHE_PROFILE);
     receipt["control"]["identity"]["model"] = json!(CACHE_MODEL);
     receipt["control"]["identity"]["modelProvider"] = json!(CACHE_PROVIDER);
     fs::write(
@@ -2298,6 +2515,11 @@ fn cache_guard_truncated_rollout_does_not_fail_the_control_run() {
 #[path = "fixtures/succession_responses.rs"]
 mod cache_responses;
 
+/// One installed pool-shaped cache-loss run: a real native conversation on the
+/// recorded slot is stopped by a runtime-proven loss with the partial work
+/// preserved, and the documented `executor restart` then continues the same
+/// recorded slot, owner, source and home as a NEW conversation whose bounded
+/// handoff names the stopped predecessor.
 #[test]
 #[ignore = "requires native Codex and owner PowerShell 7; all Responses are local canned events"]
 fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
@@ -2306,19 +2528,24 @@ fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
     let shell = PathBuf::from(
         std::env::var_os("HARNESS_ACCEPTANCE_POWERSHELL").expect("owner PowerShell 7"),
     );
-    let pooled = Pooled::new("native-cache", Answer::Result(thread_start_answer()), false);
+    // The dispatch-shaped fixture: the documented restart resolves this pool
+    // slot, so the check also installs the native CLI at the launcher path a
+    // dispatch resolves.
+    let pooled = Pooled::dispatched("native-cache", Answer::Result(thread_start_answer()));
     let evidence = pooled._root.path().join("evidence");
     fs::create_dir_all(&evidence).unwrap();
     fs::write(evidence.join("cache-loss"), "synthetic counters").unwrap();
     fs::write(pooled.slot.join("partial.txt"), "previous work preserved").unwrap();
     let responses = cache_responses::Responses::start(evidence.clone());
     fs::write(pooled.home.join("config.toml"), format!(
-        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\n[profiles.deepseek]\nmodel = 'gpt-6-astra'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'low'\n[model_providers.deepseek]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, pooled.slot.to_string_lossy())).unwrap();
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\n[profiles.{CACHE_PROFILE}]\nmodel = '{CACHE_MODEL}'\nmodel_provider = '{CACHE_PROVIDER}'\nmodel_reasoning_effort = 'low'\n[model_providers.{CACHE_PROVIDER}]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, pooled.slot.to_string_lossy())).unwrap();
+    install_launcher(&pooled.home, &exe);
     let mut receipt = pooled.receipt();
     receipt["launcher"] = json!(exe);
     for (key, value) in [
-        ("model", "gpt-6-astra"),
-        ("modelProvider", "deepseek"),
+        ("profile", CACHE_PROFILE),
+        ("model", CACHE_MODEL),
+        ("modelProvider", CACHE_PROVIDER),
         ("reasoningEffort", "low"),
     ] {
         receipt[key] = json!(value);
@@ -2327,9 +2554,7 @@ fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
     receipt["shell"]["executable"] = json!(shell);
     receipt["shell"]["version"] = json!("owner PowerShell 7");
     receipt["observation"]["previousSession"] = json!(THREAD);
-    receipt["control"]["assignment"] = json!(
-        "Continue the original fixture task in this preserved checkout; keep partial.txt and check previous work before using results."
-    );
+    receipt["control"]["assignment"] = json!(NATIVE_CACHE_ASSIGNMENT);
     fs::write(
         &pooled.receipt,
         serde_json::to_vec_pretty(&receipt).unwrap(),
@@ -2394,7 +2619,11 @@ fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
         frontend.contains("\"phase\":\"attached\""),
         "the native frontend never attached on the owned console: {frontend}\n{output}"
     );
-    assert_eq!(receipt["cacheGuard"]["consecutiveMisses"], 3);
+    let guard = &receipt["cacheGuard"];
+    assert_eq!(guard["consecutiveMisses"], 3, "{receipt}");
+    assert_eq!(guard["provider"], CACHE_PROVIDER, "{receipt}");
+    assert_eq!(guard["model"], CACHE_MODEL, "{receipt}");
+    assert_eq!(guard["runtimeSupport"], "proven", "{receipt}");
     assert!(
         receipt["observation"]["session"]
             .as_str()
@@ -2404,18 +2633,234 @@ fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
         fs::read_to_string(pooled.slot.join("partial.txt")).unwrap(),
         "previous work preserved"
     );
-    let requests = fs::read_dir(&evidence)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
-        .count();
+    let requests = provider_requests(&evidence);
     assert!(
         (4..=5).contains(&requests),
         "requests after stop: {requests}"
     );
-    println!(
-        "native app-server cache stop: {requests} local requests; fresh session identity and preserved work verified"
+
+    // The stopped run's own session is the predecessor the documented restart
+    // continues from; restart starts a NEW conversation and never resumes or
+    // replays that thread.
+    let predecessor = receipt["observation"]["session"]
+        .as_str()
+        .expect("the stopped run recorded its native session")
+        .to_owned();
+    let mut spec = CommandSpec::new(manager());
+    spec.args = vec![
+        "executor".into(),
+        "restart".into(),
+        "--source".into(),
+        pooled.source.as_os_str().to_owned(),
+        "--codex-home".into(),
+        pooled.home.as_os_str().to_owned(),
+        "--slot".into(),
+        "1".into(),
+        "--owner".into(),
+        OWNER.into(),
+        "--session".into(),
+        predecessor.clone().into(),
+    ];
+    spec.env.insert(
+        "CODEX_HOME".into(),
+        Some(pooled.home.as_os_str().to_owned()),
     );
+    spec.env.insert(
+        "HARNESS_CONTROL_FIXTURE_KEY".into(),
+        Some("synthetic-owned-fixture".into()),
+    );
+    // The restart dispatches like the lead's own shell: it records the
+    // dispatching lead and carries no inherited executor marker, terminal host
+    // or provider credential.
+    spec.env.insert(
+        "CODEX_THREAD_ID".into(),
+        Some("lead-thread-synthetic".into()),
+    );
+    for name in [
+        "HARNESS_EXECUTOR_SESSION",
+        "HARNESS_EXECUTOR_RUN",
+        "HARNESS_ORIGINATING_LEAD",
+        "HARNESS_LEAD_THREAD",
+        "HARNESS_LEAD_RECIPIENT",
+        "HARNESS_EXECUTOR_FIXTURE_MODE",
+        "WT_SESSION",
+        "CODEX_SESSION_ID",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+    ] {
+        spec.env.insert(name.into(), None);
+    }
+    let restart = ConsoleSession::spawn(ConsoleSpec::new(spec)).unwrap();
+    let successor = wait_for_fresh_session(&pooled, &predecessor, &restart);
+    let transcript = restart.transcript();
+    assert!(
+        transcript.contains("fresh conversation, preserved worktree"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains(&format!("previous-session={predecessor}")),
+        "the restart must name the stopped predecessor: {transcript}"
+    );
+    let restarted = pooled.receipt();
+    assert_ne!(successor, predecessor, "{restarted}");
+    assert_eq!(
+        restarted["observation"]["previousSession"],
+        json!(predecessor),
+        "{restarted}"
+    );
+    assert!(
+        restarted["control"]["originalAssignment"]
+            .as_str()
+            .is_some_and(|text| text.contains(NATIVE_CACHE_ASSIGNMENT)),
+        "the restart must retain the recorded original assignment: {restarted}"
+    );
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(pooled.endpoint_path()).unwrap()).unwrap();
+    assert_eq!(
+        endpoint["threadId"],
+        json!(successor),
+        "the fresh conversation is the run's new address: {endpoint}"
+    );
+    assert_eq!(
+        fs::read_to_string(pooled.slot.join("partial.txt")).unwrap(),
+        "previous work preserved"
+    );
+    // The fresh conversation started from the bounded handoff, which names the
+    // predecessor: a resumed old thread or an unnamed restart is not accepted.
+    wait_for_handoff_request(&evidence, requests, &predecessor, &restart);
+
+    // The synthetic run is closed through the documented stop: the recorded
+    // stop and the preserved tree prove restart never reset, cleaned or
+    // released the recorded slot.
+    let stopped = Command::new(manager())
+        .args([
+            "executor",
+            "stop",
+            "--source",
+            pooled.source.to_str().unwrap(),
+            "--codex-home",
+            pooled.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            OWNER,
+            "--session",
+            &successor,
+            "--timeout",
+            "30",
+        ])
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .env_remove("WT_SESSION")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stop_text = output_text(&stopped);
+    assert_eq!(stopped.status.code(), Some(0), "{stop_text}");
+    assert!(stop_text.contains("stopped"), "{stop_text}");
+    let finished = restart
+        .wait(
+            Deadline::after(Duration::from_secs(60)).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_ne!(finished.outcome.exit_code, 0, "{}", finished.transcript);
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "stopped", "{receipt}");
+    assert_eq!(
+        fs::read_to_string(pooled.slot.join("partial.txt")).unwrap(),
+        "previous work preserved"
+    );
+    println!(
+        "native app-server cache stop: {requests} local requests; provider {CACHE_PROVIDER} model {CACHE_MODEL}; the documented restart started fresh session {successor} from predecessor {predecessor} with preserved work and the stop recorded"
+    );
+}
+
+/// The dispatch-shaped fixture the installed check builds is a real dispatch
+/// environment: the documented restart adopts its recorded source, slot, owner
+/// and predecessor session without resynchronizing, names the predecessor and
+/// keeps the preserved tree, stopping only at the installed launcher the
+/// installed check supplies.
+#[test]
+fn restart_adopts_the_dispatch_fixture_slot_and_names_the_predecessor() {
+    let pooled = Pooled::dispatched("restart-adopt", Answer::Result(thread_start_answer()));
+    let predecessor = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
+    let mut receipt = pooled.receipt();
+    receipt["observation"] = json!({
+        "schema": 1,
+        "coverage": "native",
+        "state": "stopped",
+        "session": predecessor,
+        "updatedMs": 1
+    });
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    fs::write(pooled.slot.join("partial.txt"), "previous work preserved").unwrap();
+    let out = Command::new(manager())
+        .args([
+            "executor",
+            "restart",
+            "--source",
+            pooled.source.to_str().unwrap(),
+            "--codex-home",
+            pooled.home.to_str().unwrap(),
+            "--slot",
+            "1",
+            "--owner",
+            OWNER,
+            "--session",
+            predecessor,
+        ])
+        .env("CODEX_THREAD_ID", "lead-thread-synthetic")
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("previous-session={predecessor}")),
+        "the restart must name the recorded predecessor: {text}"
+    );
+    assert!(
+        text.contains("fresh conversation, preserved worktree"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "presentation=native-tui model={CACHE_MODEL} provider={CACHE_PROVIDER}"
+        )),
+        "the restart must resolve the recorded synthetic binding: {text}"
+    );
+    assert!(
+        text.contains("installed Codex launcher is missing"),
+        "the dispatch must stop at the installed launcher this check does not supply: {text}"
+    );
+    let slot_text = pooled.slot.to_string_lossy().to_string();
+    assert!(
+        text.contains(&slot_text),
+        "the restart must adopt the recorded pool slot: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(pooled.slot.join("partial.txt")).unwrap(),
+        "previous work preserved"
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(pooled.state.join("slot-1.json")).unwrap()).unwrap();
+    assert_eq!(record["state"], "occupied", "{record}");
+    assert_eq!(record["owner"], OWNER, "{record}");
+    assert_eq!(record["path"], json!(pooled.slot), "{record}");
 }
 
 /// A turn that did not complete the assignment is never reported as a
