@@ -1,5 +1,5 @@
-//! Executor checkouts: the harness-owned worktree pool plus the legacy native
-//! mapping helpers kept for the installed CLI surface.
+//! Executor checkouts: the harness-owned worktree pool plus the `Mapping`
+//! reader retained for per-thread worktree records written by older builds.
 //!
 //! Executor isolation is a fixed pool of ordinary Git worktrees created as
 //! sibling directories of the source checkout and named `<repo-name>-wt1` ..
@@ -33,19 +33,12 @@ pub struct Mapping {
     pub owner_thread: Option<String>,
     pub archived: bool,
     pub unavailable: bool,
-    pub remote_tui_omits_worktree_flag: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Retirement {
-    Deleted,
-    Preserved { limitation: String },
 }
 
 /// Outcome of returning a lane worktree after an accepted merge. Lanes are
 /// lane-owned: a successfully reset lane stays in place for the next task in
-/// the same lane, keeping its ignored build caches. Lane retirement and
-/// unresettable state remain `retire`'s decision.
+/// the same lane, keeping its ignored build caches; unresettable state and
+/// lane retirement stay the lead's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneDisposition {
     Reused { base: String },
@@ -59,51 +52,6 @@ pub fn limitation(detail: &str) -> io::Error {
     )
 }
 
-pub fn worktrees_enabled(codex_home: &Path) -> io::Result<bool> {
-    let path = codex_home.join("config.toml");
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(text.contains("worktrees") && text.contains("true")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-pub fn enable_worktrees(args: &mut Vec<OsString>) {
-    if !args.iter().any(|arg| arg == "--enable") {
-        args.splice(0..0, ["--enable".into(), "worktrees".into()]);
-    }
-}
-
-pub fn strip_worktree_flag(args: &[OsString]) -> Vec<OsString> {
-    args.iter()
-        .filter(|arg| *arg != "--worktree")
-        .cloned()
-        .collect()
-}
-
-pub fn remote_tui_args(mapping: &Mapping, remote: &[OsString]) -> io::Result<Vec<OsString>> {
-    if remote.iter().any(|arg| arg == "--worktree") && remote.iter().any(|arg| arg == "--remote") {
-        return Err(limitation(
-            "native CLI rejects --worktree with --remote; attach the view to the managed cwd",
-        ));
-    }
-    let mut args = strip_worktree_flag(remote);
-    let cwd = mapping
-        .path
-        .to_str()
-        .ok_or_else(|| limitation("worktree path must be unicode"))?;
-    if !args.iter().any(|arg| arg == "-C" || arg == "--cd") {
-        args.splice(0..0, ["-C".into(), cwd.into()]);
-    }
-    Ok(args)
-}
-
-pub fn record(path: &Path, mapping: &Mapping) -> io::Result<()> {
-    fs::create_dir_all(path.parent().unwrap_or(path))?;
-    fs::write(path, serde_json::to_vec_pretty(mapping)?)?;
-    Ok(())
-}
-
 pub fn load(path: &Path) -> io::Result<Mapping> {
     serde_json::from_slice(&fs::read(path)?).map_err(|error| {
         io::Error::new(
@@ -111,66 +59,6 @@ pub fn load(path: &Path) -> io::Result<Mapping> {
             format!("worktree mapping: {error}"),
         )
     })
-}
-
-pub fn refuse_shared_checkout(shared: &Path, mapping: &Mapping) -> io::Result<()> {
-    let shared = fs::canonicalize(shared).unwrap_or_else(|_| shared.to_path_buf());
-    let tree = fs::canonicalize(&mapping.path).unwrap_or_else(|_| mapping.path.clone());
-    if shared == tree {
-        return Err(limitation(
-            "executor would write to the shared checkout; refusing substitution",
-        ));
-    }
-    Ok(())
-}
-
-pub fn native_delete_eligible(mapping: &Mapping, current: &Path) -> io::Result<Result<(), String>> {
-    let current = fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
-    let tree = fs::canonicalize(&mapping.path).unwrap_or_else(|_| mapping.path.clone());
-    if current == tree {
-        return Ok(Err(
-            "native confirmed deletion refuses the current checkout".into(),
-        ));
-    }
-    if mapping.archived || mapping.unavailable {
-        return Ok(Err(
-            "agents-overview archive or unavailability is not worktree retirement".into(),
-        ));
-    }
-    if !mapping.path.is_dir() {
-        return Ok(Err("managed worktree path is missing".into()));
-    }
-    let inside = git(&mapping.path, &["rev-parse", "--is-inside-work-tree"])?;
-    if inside.trim() != "true" {
-        return Ok(Err("checkout is not a Git worktree".into()));
-    }
-    let porcelain = git(
-        &mapping.path,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
-    if !porcelain.trim().is_empty() {
-        return Ok(Err(
-            "native confirmed deletion refuses local or untracked changes".into(),
-        ));
-    }
-    let ignored = git(
-        &mapping.path,
-        &["ls-files", "--others", "--ignored", "--exclude-standard"],
-    )?;
-    if !ignored.trim().is_empty() {
-        return Ok(Err("native confirmed deletion refuses ignored files".into()));
-    }
-    Ok(Ok(()))
-}
-
-pub fn retire(mapping: &Mapping, current: &Path) -> io::Result<Retirement> {
-    match native_delete_eligible(mapping, current)? {
-        Ok(()) => Ok(Retirement::Preserved {
-            limitation: "native confirmed deletion is TUI-only on CLI 0.155.1; checkout preserved"
-                .into(),
-        }),
-        Err(limitation) => Ok(Retirement::Preserved { limitation }),
-    }
 }
 
 /// Reset a lane worktree to the committed base the lead merged, so the next
@@ -243,26 +131,6 @@ pub fn reset_for_reuse(
         });
     }
     Ok(LaneDisposition::Reused { base: commit })
-}
-
-pub fn exec_isolation_args(codex_home: &Path, workspace: &Path) -> io::Result<Vec<String>> {
-    if !is_shared_git_checkout(workspace)? {
-        return Ok(Vec::new());
-    }
-    if !worktrees_enabled(codex_home)? {
-        return Err(limitation(
-            "experimental feature worktrees is disabled; refusing the shared checkout",
-        ));
-    }
-    Ok(vec![
-        "--enable".into(),
-        "worktrees".into(),
-        "--worktree".into(),
-    ])
-}
-
-pub fn is_shared_git_checkout(path: &Path) -> io::Result<bool> {
-    Ok(path.join(".git").is_dir())
 }
 
 pub fn is_git_checkout(path: &Path) -> io::Result<bool> {
@@ -764,7 +632,6 @@ pub fn release_slot(
         owner_thread: None,
         archived: false,
         unavailable: false,
-        remote_tui_omits_worktree_flag: true,
     };
     match reset_for_reuse(&mapping, &pool.source, &commit)? {
         LaneDisposition::Reused { base } => Ok(LaneDisposition::Reused { base }),
@@ -1645,64 +1512,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_tui_rejects_worktree_flag_and_attaches_cwd() {
-        let mapping = Mapping {
-            schema: 1,
-            path: PathBuf::from(r"D:\wt\exec"),
-            source: PathBuf::from(r"D:\repo"),
-            head: "abc".into(),
-            owner_thread: Some("thread-1".into()),
-            archived: false,
-            unavailable: false,
-            remote_tui_omits_worktree_flag: true,
-        };
-        let error = remote_tui_args(
-            &mapping,
-            &[
-                "--remote".into(),
-                "ws://127.0.0.1:1".into(),
-                "--worktree".into(),
-            ],
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("rejects --worktree with --remote")
-        );
-        let args = remote_tui_args(
-            &mapping,
-            &[
-                "--remote".into(),
-                "ws://127.0.0.1:1".into(),
-                "resume".into(),
-            ],
-        )
-        .unwrap();
-        assert_eq!(args[0], "-C");
-        assert_eq!(args[1], r"D:\wt\exec");
-        assert!(!args.iter().any(|arg| arg == "--worktree"));
-    }
-
-    #[test]
-    fn exec_isolation_uses_native_worktree_flag_not_ordinary_git() {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        let workspace = root.path().join("scratch");
-        fs::create_dir_all(&workspace).unwrap();
-        assert!(exec_isolation_args(&home, &workspace).unwrap().is_empty());
-        let source = repo(root.path());
-        let error = exec_isolation_args(&home, &source).unwrap_err();
-        assert!(error.to_string().contains("refusing the shared checkout"));
-        fs::write(home.join("config.toml"), "features.worktrees = true\n").unwrap();
-        assert_eq!(
-            exec_isolation_args(&home, &source).unwrap(),
-            ["--enable", "worktrees", "--worktree"]
-        );
-    }
-
-    #[test]
     fn pool_slot_names_are_deterministic_siblings_within_the_configured_cap() {
         let root = tempfile::tempdir().unwrap();
         let up = upstream(root.path());
@@ -1812,45 +1621,22 @@ mod tests {
     }
 
     #[test]
-    fn dirty_lane_retirement_is_preserved_and_mapping_round_trips() {
+    fn legacy_mapping_records_load_without_the_retired_remote_tui_flag() {
         let root = tempfile::tempdir().unwrap();
-        let source = repo(root.path());
         let lane = root.path().join("lane");
-        git_ok(
-            &source,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                lane.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-        let mapping = Mapping {
-            schema: 1,
-            path: lane.clone(),
-            source: source.clone(),
-            head: rev(&source),
-            owner_thread: Some("exec-1".into()),
-            archived: false,
-            unavailable: false,
-            remote_tui_omits_worktree_flag: true,
-        };
-        refuse_shared_checkout(&source, &mapping).unwrap();
-        assert!(refuse_shared_checkout(&lane, &mapping).is_err());
-        fs::write(lane.join("scratch.txt"), "dirty\n").unwrap();
-        match retire(&mapping, &source).unwrap() {
-            Retirement::Preserved { limitation } => {
-                assert!(limitation.contains("untracked") || limitation.contains("TUI-only"));
-            }
-            Retirement::Deleted => panic!("dirty tree must not be deleted"),
-        }
-        assert!(lane.exists());
-        record(&source.join("executor-worktree.json"), &mapping).unwrap();
-        assert_eq!(
-            load(&source.join("executor-worktree.json")).unwrap().head,
-            mapping.head
-        );
+        let path = root.path().join("executor-worktree.json");
+        fs::write(
+            &path,
+            format!(
+                "{{\"schema\":1,\"path\":{},\"source\":{},\"head\":\"abc\",\"ownerThread\":\"exec-1\",\"archived\":false,\"unavailable\":false,\"remoteTuiOmitsWorktreeFlag\":true}}",
+                serde_json::to_string(&lane).unwrap(),
+                serde_json::to_string(root.path()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let mapping = load(&path).unwrap();
+        assert_eq!(mapping.path, lane);
+        assert_eq!(mapping.owner_thread.as_deref(), Some("exec-1"));
     }
 
     #[test]
@@ -2119,27 +1905,6 @@ mod tests {
     }
 
     #[test]
-    fn overview_archive_is_not_retirement() {
-        let mapping = Mapping {
-            schema: 1,
-            path: PathBuf::from("."),
-            source: PathBuf::from("."),
-            head: "HEAD".into(),
-            owner_thread: None,
-            archived: true,
-            unavailable: false,
-            remote_tui_omits_worktree_flag: true,
-        };
-        let retired = retire(&mapping, Path::new("..")).unwrap();
-        match retired {
-            Retirement::Preserved { limitation } => {
-                assert!(limitation.contains("archive"));
-            }
-            Retirement::Deleted => panic!("archive must not delete"),
-        }
-    }
-
-    #[test]
     fn audit_of_a_non_git_source_has_no_lanes() {
         let root = tempfile::tempdir().unwrap();
         let exported = root.path().join("packaged-kit");
@@ -2288,7 +2053,6 @@ mod tests {
             owner_thread: Some("exec-1".into()),
             archived: false,
             unavailable: false,
-            remote_tui_omits_worktree_flag: true,
         };
         let disposition = reset_for_reuse(&mapping, &repo, &base).unwrap();
         assert_eq!(disposition, LaneDisposition::Reused { base: base.clone() });
@@ -2338,7 +2102,6 @@ mod tests {
             owner_thread: Some("exec-1".into()),
             archived: false,
             unavailable: false,
-            remote_tui_omits_worktree_flag: true,
         };
         fs::write(lane.join("scratch.txt"), "dirty\n").unwrap();
         match reset_for_reuse(&mapping, &repo, "not-a-commit").unwrap() {

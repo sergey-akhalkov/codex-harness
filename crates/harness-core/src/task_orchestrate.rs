@@ -159,7 +159,6 @@ mod tests {
             owner_thread: Some(thread.into()),
             archived: false,
             unavailable: false,
-            remote_tui_omits_worktree_flag: true,
         }
     }
 
@@ -204,7 +203,6 @@ mod tests {
             owner_thread: Some("exec-xai".into()),
             archived: false,
             unavailable: false,
-            remote_tui_omits_worktree_flag: true,
         };
         let mut record = TaskRecord {
             schema: 1,
