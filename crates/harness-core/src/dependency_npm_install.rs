@@ -23,12 +23,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Audited unmodified official Nuphus native executables by version.
-const AUDITED_NUPHUS_ORIGINALS: &[(&str, &str)] = &[(
-    "0.2.2",
-    "9a07112f17a964d9c0b1a54653af95559d7de33cce1cb3dffd60dfc4c85ccfb0",
-)];
-
 pub struct Request {
     pub manager: PathBuf,
     pub user_home: PathBuf,
@@ -215,10 +209,7 @@ impl Ops for RealOps {
     fn stage(&mut self, request: &Request, id: &str, version: &str) -> io::Result<Staged> {
         match id {
             "nuphus" => {
-                let Some((_, expected)) = AUDITED_NUPHUS_ORIGINALS
-                    .iter()
-                    .find(|(audited, _)| *audited == version)
-                else {
+                let Some(expected) = crate::nuphus_protocol::audited_digest(version) else {
                     return Err(conflict(
                         "This Nuphus version has not passed the source adapter compatibility audit",
                     ));
@@ -251,7 +242,7 @@ impl Ops for RealOps {
                 }
                 fs::rename(&platform_candidate, &destination)?;
                 let executable = destination.join("bin/nuphus-mcp.exe");
-                if !executable.is_file() || build_identity::hash_file(&executable)? != *expected {
+                if !executable.is_file() || build_identity::hash_file(&executable)? != expected {
                     let _ = fs::remove_dir_all(&destination);
                     return Err(conflict(
                         "Nuphus native binary differs from the audited official executable",
@@ -1116,5 +1107,16 @@ mod tests {
             fs::read(foreign.join("foreign.json")).unwrap(),
             br#"{"owner":"foreign-tool","kind":"create-directory","phase":"prepared"}"#
         );
+    }
+
+    #[test]
+    fn unaudited_nuphus_version_is_refused_before_acquisition() {
+        let fixture = Fixture::new();
+        let error = provision(&fixture.request, "nuphus", "1.9.9").unwrap_err();
+        assert!(error.to_string().contains("compatibility audit"), "{error}");
+        assert!(!fixture.modules().exists(), "package tree was created");
+        assert!(!fixture.request.state.join("dependency-staging").exists());
+        assert!(!fixture.request.state.join("transactions").exists());
+        assert!(!fixture.request.state.join("locks").exists());
     }
 }
