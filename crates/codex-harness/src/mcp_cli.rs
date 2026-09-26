@@ -67,7 +67,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
 fn serena(args: &[OsString]) -> io::Result<i32> {
     if args == ["--help"] {
         println!(
-            "codex-harness mcp serena --serena FILE --registry FILE --codex-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. The adopted Serena console entry point runs with a generated harness-owned home that pins every adopted language backend, so a session never provisions or updates a package. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; memory and onboarding tools stay hidden unless HARNESS_SERENA_UNFILTERED=1."
+            "codex-harness mcp serena --serena FILE --registry FILE --codex-home DIRECTORY --source-root DIRECTORY --connection-seconds SECONDS\nServe one Serena stdio connection as a client of the authenticated shared broker for that CODEX_HOME. The adopted Serena console entry point runs with a generated harness-owned home that pins every adopted language backend, so a session never provisions or updates a package. Forwarded native arguments come from the selected catalogue. Requests are serialized per project worker; the generated home carries the managed tool exclusions and connection prompt, so the worker's own catalogue and guidance are forwarded unchanged."
         );
         return Ok(0);
     }

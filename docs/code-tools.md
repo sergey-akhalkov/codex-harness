@@ -26,12 +26,17 @@ matching narrow multi-file text edits. Use explicit project checks for
 validation and Nuphus for authorized UI work. Connected Apps serve their
 matching remote resources when enabled locally; the portable default disables
 the Apps feature. Literal text and narrow line edits retain native tools. The
-Serena proxy hides memory, onboarding and configuration-introspection tools;
-HARNESS_SERENA_UNFILTERED=1 restores the full catalogue for debugging. Initialize
-`instructions` that name those hidden tools are stripped so Codex does not keep
-the model and TUI on Serena while it retries `initial_instructions`.
-`search_for_pattern` is also hidden: scoped native `rg` owns literal text and
-regex search because it is faster, complete and shell-owned.
+managed Serena connection excludes memory, onboarding and
+configuration-introspection tools plus `search_for_pattern` through Serena's
+own `excluded_tools` setting in the generated worker home, and that home
+replaces Serena's stock connection prompt, which named the excluded
+`initial_instructions` tool. The worker therefore advertises exactly the
+accepted selection, and initialize and project-activation guidance name no
+excluded tool. Scoped native `rg` owns literal text and regex search because it
+is faster, complete and shell-owned. Debugging the full catalogue means running
+the adopted console directly with an unrestricted context
+(`serena start-mcp-server --context desktop-app --project <PROJECT>`) instead of
+the managed proxy.
 
 Desktop window identity uses list, title, bounds and state. Screenshots are for
 genuine visual questions about owned non-text UI, not to prove Codex conversation
@@ -121,7 +126,7 @@ introduce a shared Codex app-server.
 | Tool | Reuse and resource contract |
 | --- | --- |
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
-| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers, 300-second idle expiry, a 4 GiB Windows Job and 25% CPU per worker. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. A worker whose language-server manager failed during project initialization is replaced and the same semantic call is retried once. The proxy filters memory, onboarding, introspection and text-search tools from tools/list and drops initialize instructions that name them; native Git records stay authoritative and scoped `rg` owns literal text. |
+| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers, 300-second idle expiry, a 4 GiB Windows Job and 25% CPU per worker. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. A worker whose language-server manager failed during project initialization is replaced and the same semantic call is retried once. The generated worker home excludes memory, onboarding, introspection and text-search tools through Serena's own `excluded_tools` and supplies the managed connection prompt, so the worker's catalogue and guidance are forwarded unchanged; native Git records stay authoritative and scoped `rg` owns literal text. |
 | Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
 
 Windows ownership guards reclaim owned descendant processes on owner exit or

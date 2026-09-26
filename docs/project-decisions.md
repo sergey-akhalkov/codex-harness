@@ -468,8 +468,13 @@ Confirmed with the user after measured rollout evidence (about 1.95 billion
 tokens over three days, marathon threads dominating): Graphify retired from the
 managed MCP selection like Codebase Memory; the CodeGraph MCP surface is
 bounded to search plus detail with deliberate index/sync/status moved to the
-native codegraph-control CLI; the Serena proxy filters memory, onboarding and
-introspection tools with HARNESS_SERENA_UNFILTERED=1 as the escape hatch;
+native codegraph-control CLI; the managed Serena connection hides memory,
+onboarding, introspection and text-search tools through Serena's own
+`excluded_tools` in the generated worker home, which also carries the managed
+connection prompt, so the stdio proxy forwards the worker's catalogue and
+guidance unchanged (2026-09-26; originally a proxy-side catalogue filter with
+`HARNESS_SERENA_UNFILTERED=1`, and the debug route is now the adopted console
+with an unrestricted context);
 portable defaults disable the Apps feature while machine-local values win;
 per-model default effort is max for zai/glm-5.3 and xhigh for
 xai/grok-4.6 and Astra when no explicit effort is selected; the portable

@@ -1,10 +1,12 @@
 //! Native stdio proxy for the shared Serena broker.
 //!
-//! Ports the seam's proxy: one lazily connected client per stdio connection
-//! forwards JSON-RPC requests through the authenticated shared broker, keeps
-//! its own cached route, filters memory/onboarding/configuration tools and
-//! the rg-superseded text search from tools/list (unless explicitly
-//! unfiltered) and reports catalogue changes.
+//! One lazily connected client per stdio connection forwards JSON-RPC
+//! requests through the authenticated shared broker and keeps its own cached
+//! route. The managed tool selection lives in the generated Serena home
+//! (`serena_configuration`), so the worker's own catalogue, guidance and error
+//! paths are forwarded unchanged. The broker can serve a live client from a
+//! different worker after a project activation or a replaced failed worker, so
+//! the proxy still advertises catalogue changes.
 //! Notifications are not forwarded, matching the seam; client EOF disconnects
 //! from the shared worker pool.
 #![cfg(windows)]
@@ -21,74 +23,20 @@ use std::{ffi::OsString, fs::File, io, path::Path, time::Duration};
 const REQUEST: Duration = Duration::from_secs(240);
 const CLEANUP: Duration = Duration::from_secs(5);
 
-/// Native Git records own project memory; onboarding and configuration
-/// introspection are not part of the managed model-facing surface.
-/// `search_for_pattern` is superseded by scoped native `rg`: the managed
-/// route keeps literal text and regex search complete, fast and shell-owned.
-pub const HIDDEN_TOOLS: [&str; 10] = [
-    "onboarding",
-    "initial_instructions",
-    "get_current_config",
-    "list_memories",
-    "read_memory",
-    "write_memory",
-    "edit_memory",
-    "delete_memory",
-    "rename_memory",
-    "search_for_pattern",
-];
-
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-pub fn unfiltered() -> bool {
-    std::env::var_os("HARNESS_SERENA_UNFILTERED").is_some_and(|value| value == "1")
-}
-
-/// Filter the managed tool catalogue for a tools/list result.
-pub fn exposed_tools(tools: &[Value]) -> Vec<Value> {
-    tools
-        .iter()
-        .filter(|tool| {
-            tool["name"]
-                .as_str()
-                .is_none_or(|name| !HIDDEN_TOOLS.contains(&name))
-        })
-        .cloned()
-        .collect()
-}
-
-/// Advertise catalogue changes when the worker exposes a tools capability, so
-/// filtered additions and removals surface without a reconnect.
+/// Advertise catalogue changes when the worker exposes a tools capability: the
+/// shared broker can move a live client to another worker for its route, and
+/// native Serena fixes a connection's catalogue without advertising changes
+/// (the worker's own `tools.listChanged` capability is false).
 pub fn with_list_changed(message: Value) -> Value {
     let mut message = message;
     if message["result"]["capabilities"]["tools"].is_object() {
         message["result"]["capabilities"]["tools"]["listChanged"] = json!(true);
     }
     message
-}
-
-/// Serena's stock initialize `instructions` tell the model to call
-/// `initial_instructions`, which this proxy hides. Codex puts that text in
-/// context and shows `Serena` in the TUI while the model tries the missing
-/// tool, so drop instructions that name a hidden tool.
-pub fn sanitize_initialize(message: Value) -> Value {
-    let mut message = with_list_changed(message);
-    let mentions_hidden = message["result"]["instructions"]
-        .as_str()
-        .is_some_and(|instructions| HIDDEN_TOOLS.iter().any(|name| instructions.contains(name)));
-    if mentions_hidden && let Some(result) = message["result"].as_object_mut() {
-        result.remove("instructions");
-    }
-    message
-}
-
-fn hidden_tool_name(params: &Value) -> Option<&str> {
-    params
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| HIDDEN_TOOLS.contains(name))
 }
 
 /// The broker answers with the shared worker-session envelope, whose id
@@ -102,14 +50,6 @@ fn client_response(mut response: Value, id: &Value) -> Value {
         object.insert("jsonrpc".into(), json!("2.0"));
     }
     response
-}
-
-fn filter_catalogue(message: Value) -> Value {
-    let mut message = message;
-    if let Some(tools) = message["result"]["tools"].as_array() {
-        message["result"]["tools"] = Value::Array(exposed_tools(tools));
-    }
-    message
 }
 
 struct Proxy<'a> {
@@ -178,10 +118,7 @@ impl<'a> Proxy<'a> {
                     cancel,
                 )?;
                 self.route = Some(response["route"].clone());
-                return Ok(sanitize_initialize(response["message"].clone()));
-            }
-            if method == "tools/call" && !unfiltered() && hidden_tool_name(&params).is_some() {
-                return Err(io::Error::other("unknown tool"));
+                return Ok(with_list_changed(response["message"].clone()));
             }
             let Some(initialize) = self.initialize.clone() else {
                 return Err(io::Error::other("Serena client must initialize first"));
@@ -199,11 +136,7 @@ impl<'a> Proxy<'a> {
             if response["tools_changed"] == true {
                 self.pending_change = true;
             }
-            let mut message = response["message"].clone();
-            if method == "tools/list" && !unfiltered() {
-                message = filter_catalogue(message);
-            }
-            Ok(message)
+            Ok(response["message"].clone())
         })();
         match result {
             Ok(response) => Ok(client_response(response, &id)),
@@ -334,33 +267,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn memory_and_onboarding_tools_stay_hidden() {
-        let tools = vec![
-            json!({"name": "find_symbol"}),
-            json!({"name": "onboarding"}),
-            json!({"name": "list_memories"}),
-            json!({"name": "read_memory"}),
-            json!({"name": "search_for_pattern"}),
-            json!({"name": "get_symbols_overview"}),
-        ];
-        let exposed = exposed_tools(&tools);
-        let names: Vec<_> = exposed
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect();
-        assert_eq!(names, ["find_symbol", "get_symbols_overview"]);
-    }
-
-    #[test]
-    fn tools_capability_advertises_catalogue_changes() {
+    fn initialize_envelope_passes_through_with_only_the_capability_change() {
         let message = with_list_changed(json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "result": {"serverInfo": {"name": "Serena"}, "capabilities": {"tools": {}}},
+            "result": {
+                "serverInfo": {"name": "Serena"},
+                "capabilities": {"tools": {}},
+                "instructions": "Worker-authored guidance stays untouched.",
+            },
         }));
         assert_eq!(
             message["result"]["capabilities"]["tools"]["listChanged"],
             true
+        );
+        assert_eq!(
+            message["result"]["instructions"],
+            "Worker-authored guidance stays untouched."
         );
         let without = with_list_changed(json!({
             "jsonrpc": "2.0",
@@ -380,55 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn initialize_drops_instructions_that_name_hidden_tools() {
-        let message = sanitize_initialize(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "serverInfo": {"name": "Serena"},
-                "capabilities": {"tools": {}},
-                "instructions": "CRITICAL: Before starting to work on a coding task, call the `initial_instructions` tool to read the 'Serena Instructions Manual'."
-            },
-        }));
-        assert!(message["result"].get("instructions").is_none());
-        assert_eq!(
-            message["result"]["capabilities"]["tools"]["listChanged"],
-            true
-        );
-        let kept = sanitize_initialize(json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": {
-                "capabilities": {"tools": {}},
-                "instructions": "Use find_symbol for a known file."
-            },
-        }));
-        assert_eq!(
-            kept["result"]["instructions"],
-            "Use find_symbol for a known file."
-        );
-    }
-
-    #[test]
-    fn hidden_tool_calls_are_detected() {
-        assert_eq!(
-            hidden_tool_name(&json!({"name": "initial_instructions"})),
-            Some("initial_instructions")
-        );
-        assert!(hidden_tool_name(&json!({"name": "find_symbol"})).is_none());
-    }
-
-    #[test]
-    fn text_search_stays_native() {
-        let tools = vec![json!({"name": "search_for_pattern"})];
-        assert!(exposed_tools(&tools).is_empty());
-        assert_eq!(
-            hidden_tool_name(&json!({"name": "search_for_pattern"})),
-            Some("search_for_pattern")
-        );
-    }
-
-    #[test]
     fn forwarded_responses_carry_the_client_request_id() {
         let worker_envelope = json!({
             "id": 1,
@@ -444,20 +318,6 @@ mod tests {
             &json!("opaque"),
         );
         assert_eq!(named["id"], "opaque");
-    }
-
-    #[test]
-    fn catalogue_filtering_keeps_other_results_intact() {
-        let message = filter_catalogue(json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "result": {"tools": [
-                {"name": "find_symbol"},
-                {"name": "initial_instructions"},
-            ]},
-        }));
-        assert_eq!(message["result"]["tools"].as_array().unwrap().len(), 1);
-        assert_eq!(message["result"]["tools"][0]["name"], "find_symbol");
     }
 
     #[test]
