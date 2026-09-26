@@ -249,239 +249,38 @@ contract for library mutations.
 
 ## Executor worktrees
 
-`executor spawn` is the sole allocator of executor isolation. It maintains a
-fixed pool of ordinary Git worktrees (`git worktree add --detach`) created as
-sibling directories of the source checkout and named `<repository-name>-wt1`
-through `<repository-name>-wtN`, where `N` is `max_concurrent_executors` from
-[orchestration.toml](../global/orchestration.toml). Positions are fixed, so a
-dispatch that finds every slot held by a live session aborts naming them
-instead of registering another tree. `--workspace` is optional and no longer
-the isolation mechanism: it must be the source checkout or one of its pool
-slots, while an ad-hoc task-named worktree path is refused with a migration
-hint. `--base REV` starts the slot from another revision than the upstream
-default branch, and `--owner ID` labels the session binding (default
-`exec-<profile>-<pid>`); a second live owner of one slot is refused instead of
-sharing one checkout. An ordinary interrupted session resumes through
-`codex-harness executor resume --source CHECKOUT --codex-home DIRECTORY --slot N --owner ID [--session SESSION_ID] (--exec PROMPT | --assignment FILE)`:
-the recorded slot is rebound for the same owner without fetch, reset or clean,
-and the host attaches the native TUI to that exact session without a new
-conversation or a replay of completed work. Partial work survives. A fresh
-spawn resynchronizes and never continues a dirty slot. `--session` remains
-supported and takes precedence;
-without it, resume consumes the exact session the dispatch receipt recorded,
-keeps that identity across failed resume attempts and refuses when nothing was
-recorded instead of choosing another session by recency. For an automatic cache
-stop, use the fresh-conversation recovery below instead. Hand-editing dispatch
-receipts for `executor run` is
-not the resume path. The recorded mapping (index, path,
-owner, synchronized base) and its lease live in kit-local task state under
-`$CODEX_HOME/harness/executor-pool/`, never in tracked files, and a claim whose
-host process is gone is no longer an occupied slot.
+`executor spawn` is the sole allocator of isolation. It selects or creates sibling slots named `<repository-name>-wt1..wtN`, bounded by `max_concurrent_executors`, synchronizes the committed base before the first model request, and binds slot, owner and exact session in the pool record. `--base` names another revision; reusing an owner rebinds the same slot after interruption; `--workspace` may name only the source checkout or one existing pool slot. Ad-hoc worktrees are refused, and a slot holding unreviewed work is preserved rather than reset.
 
-Freshness is a property of dispatch, not an executor obligation. Before the
-first model request, spawn fetches the configured remote (the remote named
-`origin`, or the single configured remote), resolves that remote's default
-branch - or the explicit `--base` override - runs `git reset --hard <base>` and
-`git clean -fd` (ignored build caches stay warm) and verifies a clean HEAD.
-The base is the lead's committed snapshot: before dispatch the lead commits
-assignment-relevant source-checkout changes locally (pushing stays a separate
-authorized step) and names that revision with `--base`, or verifies that
-committed HEAD already contains every input. The upstream default branch is
-the base only for assignments with no dependency on local lead state; if
-commits are not authorized, a slice depending on uncommitted state stays in
-the lead instead of being dispatched from a stale base. Copying files into a
-live slot is not synchronization: changed tracked inputs travel as a new
-commit and a redispatch with the same owner id, which rebinds and
-resynchronizes the same slot. Executor briefs name the exact base; the
-executor verifies its slot HEAD equals that base before substantive edits and
-reports a mismatch instead of repairing it.
-Fail-closed applies throughout: a failed fetch, an unresolvable base, a missing
-slot, an occupied dirty slot or unreviewed changes in a free slot aborts
-dispatch with the concrete cause and leaves the slot untouched, so a stale base
-is never a silent fallback and no extra tree is allocated. A collision - a pool
-position occupied by anything that is not a registered worktree of this
-checkout - is refused instead of adopted or replaced.
+Synchronization fetches the configured remote, resets to the resolved base and removes untracked files while retaining ignored caches. Fetch failure aborts before mutation; a dirty ended run awaits review; a live owner is never reset. The lead merges accepted work, then explicitly records `merged` or `discarded` with `executor release`. Release resets a clean/reviewed slot to the chosen base and removes only that run's recorded message payloads; unrelated messages survive, and a slot that cannot reset safely is preserved with its reason.
 
-Slots move through `free`, `synchronizing`, `occupied`, `awaiting-review` and
-`released`; a slot is occupied only while its bound session is live. A dirty
-slot whose session has ended awaits review: dispatch neither selects nor resets
-it, reports it with its reason, and the lead must merge the work or record an
-explicit discard before it re-enters the pool. Release is explicit, and it
-records the disposition before anything is destroyed:
-
-```powershell
-codex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]
-```
-
-The slot is then reset with `reset_for_reuse` (see
-`crates/harness-core/src/task_worktree.rs`) to the named base or the source
-checkout's committed HEAD, keeping ignored caches, or preserved with its
-limitation and reported as awaiting review again (exit code 2); a live owner is
-never reset beneath. `codex-harness executor pool --source CHECKOUT
---codex-home DIRECTORY` reports the recorded mapping per slot (index, path,
-presence, tree state, state, lease, run, owner, base, disposition, reason) plus
-foreign or legacy worktrees and any worktree beyond the configured pool for
-lead review; `git worktree list` remains the authoritative tree inventory, and
-merged branches are kept.
-
-`worktree_limit` is superseded by the pool size: the field stays accepted in
-`orchestration.toml` for compatibility, but dispatch no longer warns at a
-threshold and cannot exceed `max_concurrent_executors` by construction. Legacy
-task-named and CLI-named executor worktrees in a consuming repository are
-neither adopted nor deleted automatically: the lead reviews them, merges
-accepted work, removes retired trees with authorized `git worktree remove` and
-prunes stale entries. Pool slots are ordinary Git worktrees, so once their work
-is preserved they can be removed manually and leave no harness-specific state
-in the repository.
-
+`executor pool` is the cheap authoritative mapping of index, path, presence, tree/lease/run state, owner, base and disposition. It also reports foreign, legacy and beyond-pool worktrees for lead review. `git worktree list` remains the tree inventory; `worktree_limit` is compatibility only. Legacy task-named worktrees are neither adopted nor deleted automatically: preserve their work, merge or record a discard, then remove them only by an authorized explicit Git operation.
 ## Observed executor lifecycle
 
-Ordinary `executor spawn` with no `--mode`, or with explicit `--mode tui`,
-plus `executor resume` and `executor restart`, present the managed
-conversation in the native Codex TUI. Explicit `spawn --mode exec` uses that
-same observed control lifecycle with the native inline TUI (`--no-alt-screen`):
-not a second renderer and not an unobserved `codex exec` launcher. The host
-records the lifecycle in
-`$CODEX_HOME/harness/executor-pool/spawn-<N>.json`: `dispatch-accepted`,
-`native-start`, `running`, `completed`, `failed`, `defect` and `interrupted`,
-beside the exact native session, the final-message locator
-(`message-<N>.txt`) and a bounded detail file (`stream-<N>.jsonl`). A created
-tab is not a native start, and frontend exit is not a finished turn.
-Historical unmanaged tui receipts and legacy receipts keep the coverage they
-recorded; the current native TUI does not make watch coverage unavailable.
+Spawn, resume and restart present the managed conversation in the native Codex TUI; explicit `--mode exec` uses the same observed lifecycle with the native inline TUI, not an unobserved launcher. The host records `dispatch-accepted`, `native-start`, `running`, `completed`, `failed`, `defect` and `interrupted` in `$CODEX_HOME/harness/executor-pool/spawn-<N>.json`, with the exact native session, final-message locator and bounded detail file. A created tab is not a native start, frontend exit is not a finished turn, and historical receipts keep their recorded coverage.
 
-The host owns one `codex app-server` child in a Windows Job. An abnormal host
-death reaps that child tree; an ordinary run end preserves the session's
-remaining background members. Host identity, the bounded detail file and the
-initial record must succeed before the child starts. A later startup, read or
-record failure fails the host with its cause instead of running another
-backend or reporting success. Losing the only frontend suspends further model
-dispatch and contains the owned run. An unfocused or unselected tab is not
-frontend loss, and a retained completion is not overwritten or reported as
-success because the frontend closed. The child's output is retained at a
-kit-local log whose bounded tail is shown when the run fails. One writer at a
-time updates a receipt (a kit-local lock serializes the
-console dispatcher's window record and the host's lifecycle record, and each
-write replaces the document atomically), so concurrent writers cannot lose
-each other's fields.
+The host owns one app-server child in a Windows Job. Startup, identity, observation and receipt writes fail closed; abnormal host death reaps the owned child tree, while ordinary completion preserves unrelated background work. Losing the only frontend suspends dispatch, but an unfocused tab does not. Receipt writes are locked and atomic. After the result is persisted the owned frontend/backend end and the terminal closes; cleanup failures name survivors without changing the outcome. Closure is not acceptance, merge or release, and an unresolved reply keeps the surface open.
 
-After the result is persisted, the host ends that owned frontend and backend,
-then the existing terminal-host close policy finishes the tab. The tab host
-exits 0 after recording the outcome, including a recorded failure, so the tab
-closes; watch reads the receipt's exit code, not the tab process code. An
-owned console still returns the run's own code. A cleanup failure names each
-surviving owned resource and its recovery action without changing the recorded
-state or exit code. Closure is not acceptance, merge or slot release. An
-unresolved required reply is not a terminal run and does not close the
-surface. Inspection is the receipt and watch, not a leftover tab.
-
-The lead waits for an executor through that record; no model polling and no
-rollout search is involved:
+Wait through the record, never model polling or rollout searches:
 
 ```powershell
 codex-harness executor watch --source CHECKOUT --codex-home DIRECTORY --slot N
 codex-harness executor watch --receipt FILE [--json]
 ```
 
-`--receipt` must be an absolute path. Optional `--owner`, `--timeout` and
-`--poll` match `codex-harness executor --help`.
+`--receipt` is absolute; `--owner`, `--timeout` and `--poll` match executor help. Address fields are optional when recorded state identifies one live run. Watch returns bounded state/identity/checkout/base/changed-file/result locators and the executor report, explicitly separating committed and working changes. Exit 0 completes, 1 names failure/defect/interruption, 2 means missing/unavailable coverage or timeout while the run continues, and 3 means an unanswered reply request: answer its printed reference and watch again. Timeout does not stop or resume the run.
 
-Watch blocks until the run reaches a terminal state and then prints bounded
-review data: state, slot, owner, exact session, checkout, base, changed files,
-the executor's returned message (reported by the executor, not verified
-acceptance), the result, detail and stderr locators and the exit code. Changed
-files are reported in two bounded segments - committed changes compared with
-the recorded base through `git diff <base>..HEAD`, and the current working tree
-including untracked files - so a committed executor result never reads as "no
-changes", and truncation is named. Watch exits 0 for a completed run, 1 for
-failed, defect or interrupted runs, and 2 when coverage is unavailable
-(historical unmanaged tui or legacy), the receipt is missing, or the timeout
-expires while the run continues. Exit 3 is action required: the run is live
-with an unanswered reply request, and the result names the run and the request
-references whose one-command reply answers it. The lead answers and runs the
-same watch again; exit 3 is not completion, an output defect, unavailable
-coverage or a resume trigger, and the waiting run keeps its session, slot,
-worktree and partial work instead of being resumed or released. Timeout does
-not stop the executor. An interrupted
-host is reported with its reason and an unknown exit code, never as a
-completion. `executor pool` adds `run=<state> session=<id>` per slot, and
-`executor release` prints the last observed run beside the disposition it
-records while still refusing to reset a live or unreviewed slot.
-Waiting follows that one-event shape: retain one native watch per run
-(`--timeout 900` for the 15-minute supervision boundary); short tool yields
-resume the same pending wait and justify no second watcher, worktree inspection
-or status-only update. At the boundary, batch one compact state/activity check
-across active executors - `executor pool` supplies the state snapshot - and if
-progress is unclear, inspect the latest bounded activity/error evidence once,
-identify a concrete blocker or report what evidence is missing, then choose the
-next action. A live process, growing log or missing patch alone proves neither
-progress nor a stall, and elapsed time alone is no reason to steer or stop a
-run. The shared supervision rule lives in
-[`global/harness.config.toml`](../global/harness.config.toml).
+Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time and a missing patch prove neither progress nor a stall.
 
-An observed `executor run --file` is that tab or console host. It reports the
-same states on its visible surface, propagates the launcher's own exit code,
-exits 0 only for a completed turn with a nonempty final message, exits 3 when
-a completed turn wrote an empty or missing final message (an output defect,
-not model unavailability), and exits 1 for a failed or interrupted stream. An
-empty completion is never reported as success. A Windows Terminal tab host
-exits 0 after recording that outcome so the tab closes. A completion record
-is evidence of execution state, not proof that the executor's claimed checks
-passed. Exact-session recovery is the resume command in
-[executor worktrees](#executor-worktrees). Cache-loss recovery stays the fresh
-restart below, also on the native TUI.
-
+`executor run --file` is the visible host. It propagates the launcher outcome, treats an empty completion as an output defect, and never presents a completion record as proof that claimed checks passed. Exact-session recovery is the worktree resume command; cache loss uses the fresh restart below.
 ## Steering and stopping executors
 
-Steer a continuing run by piping the correction into `codex-harness executor
-message`, or with a short `--text`, and stop one with `codex-harness executor
-stop`. With exactly one live run both resolve and verify the recorded checkout,
-slot, owner and exact session themselves, so no address is copied and input
-cannot reach a later occupant of a reused slot; several live runs refuse with a
-bounded listing naming `--slot`, and the explicit `--source`, `--codex-home`,
-`--slot`, `--owner` and `--session` flags stay the disambiguation and scripting
-form, verified the same way. No size limit or file step is involved: piped
-input, `--text` and explicit UTF-8 `--file` all work, over the inline bound the
-harness spills the payload automatically and reports that class in the receipt
-and watch, and the conversation, model, provider, effort and work are
-preserved. The exact flag surface and result classes live in
-[native commands](rust-native.md#structured-executor-assignments); the rules
-below say when each command is justified.
+Steer a continuing run by piping content into `codex-harness executor message`; a short `--text` or explicit UTF-8 `--file` remains a fallback. With one live run the command resolves and verifies checkout, home, slot, owner and exact session itself; several runs produce a bounded listing that names `--slot`. Oversized piped input spills automatically and is reported as spill evidence, never confused with model delivery. Message only to add a fact, resolve a request or correct an established mistake—not for status, hurry or repetition without new facts.
 
-An executor's own question needs no address:
-`codex-harness lead message` sends one literal payload to the originating lead
-recorded for that run from the same piped, `--text` or `--file` sources, and
-`--notify` marks a notice that requests no reply. The envelope carries the
-sender, run, session, worktree and assignment metadata with a request
-reference, so the lead answers through the same command owner:
-`codex-harness executor message --reply-to MESSAGE_ID`, which replaces the
-address fields and continues the same conversation in place, without resume.
-Use `codex-harness lead start --source CHECKOUT` when the lead must receive
-questions; spawn inherits that native thread endpoint. An ordinary unmanaged
-lead may dispatch, but reverse messaging reports no registered endpoint.
-Asking is exceptional: resolve a material ambiguity, authority/access boundary,
-or unobtainable dependency after investigation. Routine progress and ordinary
-errors stay on bd, and no manual endpoint, receipt, process or session lookup
-is needed.
+An executor asks through `codex-harness lead message` from piped/text/file input; `--notify` sends a no-reply notice. The request reference lets the lead answer with `codex-harness executor message --reply-to MESSAGE_ID`, continuing the same conversation without reconstructing an address or resuming. `lead start` registers the lead endpoint that spawn inherits; an unmanaged lead can dispatch but reverse messaging honestly reports that no endpoint is registered.
 
-Message a continuing executor only to add a fact, resolve a request, or correct
-an established mistake. No status-only nudges, hurry demands, repeats without
-new facts, or questions about mere waiting. A correction continues the same
-conversation; an ended run reports its state and exact resume remedy.
+Stop only for explicit cancellation or a concrete necessity: demonstrated wrong direction, inability to progress, or a resource conflict the executor cannot resolve. Waiting, silence, slowness and timeout are not causes. The kit stop preserves files, slot and partial work, verifies recorded identity, closes only that run's surface and records the outcome; manual killing has none of those guarantees. Continue an ordinary interruption by exact-session resume, cache loss by restart, and release only by explicit lead decision.
 
-Stop only for an explicit cancellation request or a concrete necessity - a
-demonstrated wrong direction, a run that cannot make progress, or a resource
-conflict the executor cannot resolve. A brief error, a slow or silent stream,
-waiting or silence alone does not justify stop; inspect the recorded state and
-current work first. Use the kit's stop command rather than manual killing,
-which has no identity check, tab closure or honest receipt and needs a recorded
-cause. A stop preserves the files, checkout, slot and partial work and claims
-no completion; continue by resuming the exact session (except cache-loss
-recovery below), and release the slot only by explicit decision. Waiting is a
-live state: no timeout, silent period or unanswered request stops or resumes it
-by itself.
-
-### DeepSeek cache-loss protection and recovery
+## DeepSeek cache-loss protection and recovery
 
 New observed DeepSeek executor hosts monitor their exact session's native
 per-response input/cache counters. After a response with at least 100,000 input
