@@ -324,7 +324,7 @@ fn observe(
             .and_then(|c| c.get(1))
             .map(|m| m.as_str())
             .ok_or_else(invalid)?;
-        if !["0.153.4", "0.154.0"].contains(&observed_version) {
+        if !["0.153.4", "0.154.0", "0.157.0"].contains(&observed_version) {
             return Err(invalid());
         }
         let profile_home = profile_home.canonicalize()?;

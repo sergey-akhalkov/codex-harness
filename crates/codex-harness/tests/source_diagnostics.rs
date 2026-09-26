@@ -95,6 +95,11 @@ impl Fixture {
 
     fn legacy_connect(&self, upstream: &Path) {
         fs::remove_file(self.home.join("harness.config.toml")).unwrap();
+        std::os::windows::fs::symlink_file(
+            self.source.join("global/profile.toml"),
+            self.home.join("harness.config.toml"),
+        )
+        .unwrap();
         let inventory =
             harness_core::inventory::read(&self.source, &self.home, &self.user).unwrap();
         let mut links = Vec::new();
@@ -371,11 +376,17 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
             .unwrap()
             .clone()
     };
-    assert_eq!(
-        setting(&clean, "model_reasoning_effort")["origin"]["profile"],
-        "harness"
-    );
+    let reasoning = setting(&clean, "model_reasoning_effort");
     assert_eq!(setting(&clean, "model_reasoning_effort")["value"], "xhigh");
+    assert!(!reasoning["origin"].is_null(), "{reasoning}");
+    assert!(
+        clean["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|layer| layer["source"]["profile"] == "harness"),
+        "{clean}"
+    );
     for (index, path) in paths.iter().enumerate() {
         assert_eq!(fs::read(fixture.home.join(path)).unwrap(), before[index]);
     }
@@ -405,11 +416,7 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
     std::os::windows::fs::symlink_file(&alternate, &instructions).unwrap();
     let conflicted = observe("conflicts");
     assert_eq!(conflicted["status"], "attention", "{conflicted}");
-    for code in [
-        "setting-overridden",
-        "skill-name-collision",
-        "link-retargeted",
-    ] {
+    for code in ["skill-name-collision", "link-retargeted"] {
         assert!(
             conflicted["findings"]
                 .as_array()
@@ -419,9 +426,26 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
             "missing {code}"
         );
     }
+    assert!(
+        !conflicted["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "setting-overridden"),
+        "the explicit harness profile remains authoritative: {conflicted}"
+    );
     assert_eq!(
         setting(&conflicted, "model_reasoning_effort")["value"],
-        "low"
+        "xhigh"
+    );
+    assert!(
+        setting(&conflicted, "model_reasoning_effort")["declarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|declaration| declaration["source"]["type"] == "project"
+                && declaration["value"] == "low"),
+        "the lower project declaration stays visible: {conflicted}"
     );
     assert_eq!(setting(&conflicted, "features.hooks")["value"], false);
     fs::remove_file(duplicate.join("SKILL.md")).unwrap();
@@ -465,14 +489,24 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
     )
     .unwrap();
     let context = observe("profile-context");
-    assert_eq!(context["status"], "incomplete");
+    assert_eq!(context["status"], "attention");
     assert!(
-        context["settings"]
+        context["findings"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|s| s["origin"].is_null())
+            .any(|finding| finding["code"] == "shared-defaults-missing"),
+        "{context}"
     );
+    for key in [
+        "developer_instructions",
+        "features.context_management.experimental_mode",
+    ] {
+        assert!(
+            setting(&context, key)["origin"].is_null(),
+            "missing shared default remains unasserted: {context}"
+        );
+    }
     fs::write(&profile, profile_before).unwrap();
     fs::write(
         fixture.home.join("config.toml"),
