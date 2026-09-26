@@ -13,7 +13,7 @@ fn positive(value: &str) -> io::Result<u16> {
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.first().is_some_and(|arg| arg == "--help") {
         println!(
-            "codex-harness xai-responses-shim [--port N]\nServe the kit-owned Codex 0.154 <-> api.x.ai compatibility fix on 127.0.0.1. Removes the unsupported `content: null` field from echoed Responses reasoning items and streams everything else unchanged. No credentials are stored; exits when no codex.exe process remains."
+            "codex-harness xai-responses-shim [--port N]\nServe the kit-owned Codex <-> api.x.ai compatibility fix on 127.0.0.1: drop the `content: null` field api.x.ai rejects in echoed reasoning items and translate the `custom`, `namespace` and `external_web_access` shapes Codex sends. No credentials are stored; exits when no codex.exe process remains."
         );
         return Ok(0);
     }

@@ -1,14 +1,28 @@
-//! Minimal kit-owned compatibility shim between Codex 0.154 and api.x.ai.
+//! Kit-owned compatibility shim between the Codex CLI and api.x.ai.
 //!
-//! Codex 0.154 echoes Responses `reasoning` input items with an explicit
+//! Codex echoes Responses `reasoning` input items with an explicit
 //! `content: null` field; api.x.ai rejects exactly that shape on every
 //! follow-up request of a tool turn (see the recorded interop evidence in
-//! the `retire-opencodex-keep-xai-profile` change). The shim removes only
-//! that field from Responses request bodies and forwards everything else
-//! byte-transparently, including streamed responses. It stores no
-//! credentials (Authorization passes through), rewrites no protocol,
-//! registers no scheduled task, and exits once no `codex.exe` process
-//! remains on the host.
+//! the `retire-opencodex-keep-xai-profile` change). The shim removes that
+//! field, translates the tool declarations and echoed call items api.x.ai
+//! does not accept (`custom`, `namespace`, `web_search`'s
+//! `external_web_access`), rewrites the matching streamed calls back into the
+//! forms Codex routes, and repairs whole-number floats and decorated patch
+//! markers. Every other request and response byte passes through. It stores
+//! no credentials (Authorization passes through), registers no scheduled
+//! task, and exits once no `codex.exe` process remains on the host.
+//!
+//! Qualification (2026-09-26, Codex CLI 0.157.0 through a scripted local
+//! upstream, no provider call): the target CLI still echoes `content: null`
+//! reasoning items, still declares `custom` (`apply_patch`, `exec`) and
+//! `namespace` (`multi_agent_v1`) tools alongside `web_search` with
+//! `external_web_access`, still refuses `function_call` items for its `custom`
+//! tools ("incompatible payload") and still rejects decorated patch markers,
+//! so those adaptations are exercised rather than obsolete. Whole-float
+//! coercion is narrowed: 0.157 runs its own tools with whole floats, but an
+//! integer-typed MCP handle argument still failed, so it stays. Re-check each
+//! adaptation on a Codex or api.x.ai upgrade or with an authorized live probe;
+//! none is proven removable today.
 
 use crate::{
     broker_state::BrokerRoot,
@@ -1228,6 +1242,10 @@ fn image_is_codex(path: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe"))
 }
 
+/// Canned upstream and request fixtures reproduce the shapes the target Codex
+/// CLI was measured to send through a scripted local upstream on 2026-09-26
+/// (CLI 0.157.0): `custom`/`namespace`/`web_search` declarations,
+/// `content: null` reasoning echoes, whole floats and decorated patch markers.
 #[cfg(test)]
 mod tests {
     use super::*;
