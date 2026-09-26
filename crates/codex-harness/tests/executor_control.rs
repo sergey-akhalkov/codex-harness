@@ -2537,8 +2537,18 @@ fn native_control_cache_loss_stops_a_fresh_session_and_preserves_work() {
     fs::write(evidence.join("cache-loss"), "synthetic counters").unwrap();
     fs::write(pooled.slot.join("partial.txt"), "previous work preserved").unwrap();
     let responses = cache_responses::Responses::start(evidence.clone());
+    // Installed Codex rejects the legacy `[profiles.<id>]` table when the
+    // profile is selected; the modern per-profile file keeps this installed
+    // check runnable against the current CLI contract.
+    fs::write(
+        pooled.home.join(format!("{CACHE_PROFILE}.config.toml")),
+        format!(
+            "model = '{CACHE_MODEL}'\nmodel_provider = '{CACHE_PROVIDER}'\nmodel_reasoning_effort = 'low'\n"
+        ),
+    )
+    .unwrap();
     fs::write(pooled.home.join("config.toml"), format!(
-        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\n[profiles.{CACHE_PROFILE}]\nmodel = '{CACHE_MODEL}'\nmodel_provider = '{CACHE_PROVIDER}'\nmodel_reasoning_effort = 'low'\n[model_providers.{CACHE_PROVIDER}]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, pooled.slot.to_string_lossy())).unwrap();
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 990000\n[model_providers.{CACHE_PROVIDER}]\nname = 'Owned cache fixture'\nbase_url = 'http://127.0.0.1:{}/v1'\nwire_api = 'responses'\nenv_key = 'HARNESS_CONTROL_FIXTURE_KEY'\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\nsupports_websockets = false\n[analytics]\nenabled = false\n[projects.'{}']\ntrust_level = 'trusted'\n", responses.port, pooled.slot.to_string_lossy())).unwrap();
     install_launcher(&pooled.home, &exe);
     let mut receipt = pooled.receipt();
     receipt["launcher"] = json!(exe);
