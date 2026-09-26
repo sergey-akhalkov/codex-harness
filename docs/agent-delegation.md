@@ -280,26 +280,54 @@ An executor asks through `codex-harness lead message` from piped/text/file input
 
 Stop only for explicit cancellation or a concrete necessity: demonstrated wrong direction, inability to progress, or a resource conflict the executor cannot resolve. Waiting, silence, slowness and timeout are not causes. The kit stop preserves files, slot and partial work, verifies recorded identity, closes only that run's surface and records the outcome; manual killing has none of those guarantees. Continue an ordinary interruption by exact-session resume, cache loss by restart, and release only by explicit lead decision.
 
-## DeepSeek cache-loss protection and recovery
+## Provider-neutral cache-loss protection and recovery
 
-New observed DeepSeek executor hosts monitor their exact session's native
-per-response input/cache counters. After a response with at least 100,000 input
-tokens and 90% cached input, three consecutive responses each missing at least
-100,000 tokens and 50% of input trigger termination of the owned process tree.
-Cold starts, duplicate observations and historical losses on resume do not
-count. The host terminates before waiting on control acknowledgments or writing
-its stop receipt; it does not wait for a model, test or build to finish.
+Every observed managed executor host monitors its exact session's native
+per-response input/cache counters, whatever provider and model its receipt
+resolved - control-backed spawn and observed exact-session resume alike.
+Support is proven at runtime: a recorded response with at least 100,000 input
+tokens and 90% cached input warms that run, and only a warmed run is subject to
+the stop policy. Provider branding, a static allowlist entry or
+numeric-but-never-warmed counters prove nothing. After warmup, three
+consecutive distinct responses each missing at least 100,000 tokens and 50% of
+input trigger termination of the owned process tree. Cold starts, duplicate
+observations, below-threshold responses that reset the consecutive count and
+historical losses on resume do not count; earlier history on an explicit resume
+can establish warmup but never a new miss. The host terminates before waiting
+on control acknowledgments or writing its stop receipt; it does not wait for a
+model, test or build to finish.
 
 Windows file-change notifications and native events trigger bounded reads of
 appended records. A one-second open-file size check covers delayed Windows
-notifications; unchanged content is not periodically reread. No monitoring request is
-sent to the model. Usage arrives after billing, so the three responses and an
-already in-flight request can still cost money. This is a repeated-loss guard,
-not a currency cap or a fix for the upstream cache. Missing/invalid counters
-are reported as unavailable coverage. Already running older hosts do not gain
-protection from installing a new binary.
+notifications; unchanged content is not periodically reread. Only the exact
+session's counters are read, and no monitoring request is sent to the model.
+Usage arrives after billing, so the three responses and an already in-flight
+request can still cost money. This is a repeated-loss guard, not a currency cap
+or a fix for the upstream cache. Missing, invalid or never-proven counters are
+reported as unavailable coverage with the run's resolved provider and model.
+Already running older hosts do not gain protection from installing a new
+binary.
 
-The receipt's `cacheGuard` and failed watch result retain the counters and an
+Routine guard status - `waiting-for-usage`, `warming`, `armed` and other
+below-threshold transitions - stays in the receipt and host log; it adds no
+terminal diagnostic line and no user warning. Degraded coverage - invalid or
+unavailable counters, rollout truncation, a session-identity change - is
+delivered through Codex's native warning presentation when a native executor
+frontend is attached, so it appears in that frontend's warning count and viewer
+instead of the terminal input area.
+A compatibility surface without a native consumer keeps the diagnostic on its
+receipt/log surface and records `no-native-consumer` instead of claiming native
+warning presentation. The receipt records each degraded diagnostic as
+`native-sent`, `undelivered` or `no-native-consumer`: a native-format send is
+not evidence that the user opened the viewer, an undelivered diagnostic is
+never reported as a shown warning, and a delivery failure does not terminate
+otherwise healthy model work. Cache loss stays a terminal non-success outcome,
+not a dismissible warning.
+
+The receipt's `cacheGuard` records the counters, the resolved `provider` and
+`model`, `runtimeSupport` (`proven`, `unproven`, `invalid` or `unavailable`)
+and `diagnosticDelivery` (`native-sent`, `undelivered` or
+`no-native-consumer`). The failed watch result retains the stop cause and an
 exact recovery command. The lead reviews preserved work and runs that command:
 
 ```powershell

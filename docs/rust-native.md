@@ -373,6 +373,7 @@ exit 3) without a resume. Selection rules live in
 ```powershell
 cargo test --locked -p codex-harness --test executor_observation --jobs 1 -- --test-threads=1
 cargo test --locked -p codex-harness --test executor_spawn --jobs 1 -- --test-threads=1
+cargo test --locked -p codex-harness --test executor_warning --jobs 1 -- --test-threads=1
 ```
 
 `executor_observation` drives the owned Rust event fixture
@@ -393,10 +394,34 @@ Cache-loss acceptance also has two opt-in native checks:
 in `executor_observation`. They use local canned Responses with a warmed cache
 followed by three large misses, require `HARNESS_CONTROL_CODEX_EXE` and
 `HARNESS_ACCEPTANCE_POWERSHELL` (the owner's existing PowerShell 7), and verify
-termination with bounded request counts and preserved work. Set
-`HARNESS_OBSERVATION_MANAGER_EXE` to the installed manager to exercise that
-binary; the compiled test targets can run from outside the source checkout.
-No real provider, credentials or subscription is used by these checks.
+termination with bounded request counts and preserved work. The deterministic
+control and observation cache-loss checks run synthetic non-DeepSeek identities
+and a never-warmed identity: support is proven at runtime by a warmed response,
+never by a provider name or an always-zero counter field, and the receipt
+records the resolved `provider` and `model` with `runtimeSupport` (`proven`,
+`unproven`, `invalid` or `unavailable`). Set `HARNESS_OBSERVATION_MANAGER_EXE`
+to the installed manager to exercise that binary; the compiled test targets
+can run from outside the source checkout. No real provider, credentials or
+subscription is used by these checks.
+
+The deterministic `executor_warning` target runs the frontend warning relay
+against a canned app-server endpoint and an owned WebSocket client - no model,
+installed CLI or terminal: the captured notification shape and refusal of
+unsupported shapes and invented client-side requests, handshake authentication,
+byte-preserving bidirectional forwarding, the single notification appended for
+the exact initialized thread, close behavior and honest delivery states. Two
+opt-in checks cover the installed contract:
+`the_installed_frontend_releases_a_queued_diagnostic` needs
+`HARNESS_CONTROL_CODEX_EXE` and releases one queued diagnostic through an owned
+console; `the_installed_app_server_schema_declares_the_implemented_contract`
+needs `HARNESS_CODEX_APP_SERVER_SCHEMA_DIR` naming a `codex app-server
+generate-json-schema --experimental` export. Degraded cache-guard coverage is
+delivered through that native warning surface when an executor frontend is
+attached, never as a line written into the terminal input area, and the
+receipt's `diagnosticDelivery` records `native-sent`, `undelivered` or
+`no-native-consumer` - a native-format send is not evidence that the user
+opened the viewer, and the compatibility fixture renderer records
+`no-native-consumer` instead of claiming native warning presentation.
 
 ## Bounded token reports
 

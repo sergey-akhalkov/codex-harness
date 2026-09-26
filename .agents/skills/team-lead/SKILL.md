@@ -241,13 +241,13 @@ direction or a run that cannot progress: a brief error, a slow stream, waiting
 or silence alone is not a reason to stop. Use the kit commands before killing
 processes manually; manual killing needs a recorded cause. After a stop,
 preserve the files, slot and partial work. Ordinary interruption continues by
-resuming the exact session. A DeepSeek cache-loss stop instead needs a fresh
+resuming the exact session. A runtime-proven cache-loss stop instead needs a fresh
 conversation: inspect the preserved work and follow the receipt's exact
 `executor restart` command for the same slot/owner/predecessor, which keeps
 saved work, carries the original task and requires checking interrupted
 tests/builds; never fall back to spawn, release, reset or resuming the
 expensive history. The policy and limits live in
-[cache-loss recovery](../../../docs/agent-delegation.md#deepseek-cache-loss-protection-and-recovery).
+[cache-loss recovery](../../../docs/agent-delegation.md#provider-neutral-cache-loss-protection-and-recovery).
 Command flags and result classes live in
 [native commands](../../../docs/rust-native.md#structured-executor-assignments),
 lifecycle and steering semantics in
