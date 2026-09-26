@@ -1,122 +1,11 @@
-//! Lead/executor dispatch, steering, merge, recovery and stop.
+//! Lead/executor merge, reassignment, view-loss suspension and recovery rules.
 use crate::{
-    orchestration_config::Orchestration,
     task_failure::FailureCause,
     task_store::{self, Assignment, TaskRecord},
-    task_worktree::{self, LaneDisposition, Mapping},
+    task_worktree::{self, LaneDisposition},
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{io, path::Path, process::Command};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Bounds {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutorView {
-    pub profile: String,
-    pub thread_id: String,
-    pub slot: usize,
-    pub bounds: Bounds,
-    pub mapping: Mapping,
-    pub remote_args: Vec<String>,
-}
-
-pub fn plan_executors(
-    config: &Orchestration,
-    mappings: Vec<(String, Mapping)>,
-) -> io::Result<Vec<ExecutorView>> {
-    if mappings.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "two executors are required for simultaneous dispatch",
-        ));
-    }
-    if mappings.len() as u32 > config.max_concurrent_executors {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executor concurrency exceeds configuration",
-        ));
-    }
-    let layout: Vec<Bounds> = (0..=mappings.len())
-        .map(|slot| Bounds {
-            x: (slot as i32) * 40,
-            y: 0,
-            width: 400,
-            height: 300,
-        })
-        .collect();
-    let mut views = Vec::new();
-    for (slot, (profile, mapping)) in mappings.into_iter().enumerate() {
-        if !config.executor_profiles.iter().any(|name| name == &profile) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("orchestration profile '{profile}' is not an executor"),
-            ));
-        }
-        let thread_id = mapping
-            .owner_thread
-            .clone()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "executor thread missing"))?;
-        let remote = task_worktree::remote_tui_args(
-            &mapping,
-            &[
-                "--remote".into(),
-                "ws://127.0.0.1:1".into(),
-                "resume".into(),
-            ],
-        )?;
-        views.push(ExecutorView {
-            profile,
-            thread_id,
-            slot: slot + 1,
-            bounds: layout.get(slot + 1).copied().unwrap_or(Bounds {
-                x: ((slot as i32) + 1) * 40,
-                y: 0,
-                width: 400,
-                height: 300,
-            }),
-            mapping,
-            remote_args: remote
-                .into_iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
-        });
-    }
-    let paths: Vec<_> = views.iter().map(|view| &view.mapping.path).collect();
-    if paths[0] == paths[1] {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executors must use distinct worktrees",
-        ));
-    }
-    if views[0].thread_id == views[1].thread_id || views[0].profile == views[1].profile {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executors must have distinct live identities",
-        ));
-    }
-    Ok(views)
-}
-
-pub fn steer(thread_id: &str, text: &str, worktree: &Path) -> Value {
-    json!({
-        "schema": 1,
-        "method": "turn/start",
-        "hiddenModelCall": false,
-        "statusPoll": false,
-        "worktree": worktree,
-        "params": {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": text}]
-        }
-    })
-}
 
 pub fn view_loss(closed: &[&str]) -> Value {
     json!({
@@ -272,53 +161,6 @@ mod tests {
             unavailable: false,
             remote_tui_omits_worktree_flag: true,
         }
-    }
-
-    fn config() -> Orchestration {
-        Orchestration {
-            schema: 1,
-            lead_profile: "default".into(),
-            successor_lead_profile: "xai".into(),
-            executor_profiles: vec!["xai".into(), "zai".into()],
-            max_concurrent_executors: 2,
-            vote_threshold: 3,
-            incubator_size_cap: 32,
-            feedback_batch_limit: 8,
-            worktree_limit: 6,
-        }
-    }
-
-    #[test]
-    fn two_executors_get_distinct_windows_worktrees_and_identities() {
-        let views = plan_executors(
-            &config(),
-            vec![
-                ("xai".into(), mapping("exec-xai", r"D:\wt\xai")),
-                ("zai".into(), mapping("exec-zai", r"D:\wt\zai")),
-            ],
-        )
-        .unwrap();
-        assert_eq!(views.len(), 2);
-        assert_ne!(views[0].bounds, views[1].bounds);
-        assert_ne!(views[0].mapping.path, views[1].mapping.path);
-        assert_ne!(views[0].profile, views[1].profile);
-        assert_ne!(views[0].thread_id, views[1].thread_id);
-        assert!(views[0].remote_args.contains(&"-C".into()));
-        assert!(
-            !views
-                .iter()
-                .any(|view| view.remote_args.iter().any(|arg| arg == "--worktree"))
-        );
-    }
-
-    #[test]
-    fn steering_is_visible_turn_start_without_polling() {
-        let payload = steer("exec-xai", "use the fixture path", Path::new(r"D:\wt\xai"));
-        assert_eq!(payload["method"], "turn/start");
-        assert_eq!(payload["hiddenModelCall"], false);
-        assert_eq!(payload["statusPoll"], false);
-        assert_eq!(payload["params"]["threadId"], "exec-xai");
-        assert_eq!(payload["worktree"], r"D:\wt\xai");
     }
 
     #[test]
