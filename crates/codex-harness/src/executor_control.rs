@@ -2452,6 +2452,14 @@ fn free_loopback_port() -> io::Result<u16> {
 /// owned by the host exactly as the launcher tree did. Readiness is a served
 /// endpoint, never a scheduling guess: a child that exits, and a child that
 /// keeps running without serving, both fail closed with the log locator.
+///
+/// The native shared daemon (`codex app-server daemon`) was compared with this
+/// route on codex-cli 0.157.0 and is not an equivalent substitute: it refuses
+/// to start from the elevated Windows sessions this kit runs in, and its
+/// interface exposes no per-run listen address, capability token or Job
+/// membership, so one run could not own its endpoint, exact process identity,
+/// stop authority or CPU admission. The comparison and its receipt live in
+/// `task_control_contract::native_shared_daemon_gap_keeps_the_run_owned_backend`.
 fn spawn_app_server(
     job: &Job,
     plan: &ControlPlan,

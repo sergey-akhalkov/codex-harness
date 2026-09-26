@@ -230,6 +230,46 @@ fn capture(exe: &Path, home: &Path, workspace: &Path, root: &Path, args: &[&str]
     assert_eq!(outcome.exit_code, 0);
 }
 
+/// Runs one native command to completion in its own Job and returns its exit
+/// code with the bounded combined output. Unlike [`capture`], a nonzero exit is
+/// a recorded outcome here: the shared-daemon comparison observes a refusal
+/// instead of asserting success.
+fn capture_outcome(
+    exe: &Path,
+    home: &Path,
+    workspace: &Path,
+    root: &Path,
+    args: &[&str],
+    label: &str,
+) -> (u32, String) {
+    let mut spec = command(exe, home, workspace);
+    spec.args = args.iter().map(Into::into).collect();
+    let stdout = root.join(format!("{label}-stdout.txt"));
+    let stderr = root.join(format!("{label}-stderr.txt"));
+    spec.stdout = Some(fs::File::create(&stdout).unwrap());
+    spec.stderr = Some(fs::File::create(&stderr).unwrap());
+    let job = Job::new(Limits::default()).unwrap();
+    let child = job.spawn(&spec).unwrap();
+    let outcome = job
+        .wait(
+            &child,
+            Deadline::after(WAIT).unwrap(),
+            &Cancellation::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(outcome.reason, StopReason::Exited, "{label}");
+    let text: String = format!(
+        "{}{}",
+        fs::read_to_string(&stdout).unwrap_or_default(),
+        fs::read_to_string(&stderr).unwrap_or_default()
+    )
+    .chars()
+    .take(512)
+    .collect();
+    (outcome.exit_code, text)
+}
+
 /// Provider request files in the owned root whose body carries the marker.
 fn requests_containing(root: &Path, marker: &str) -> Vec<String> {
     let mut found = Vec::new();
@@ -1169,6 +1209,161 @@ fn native_executor_control_generation_interrupt() {
     fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
 }
 
+/// Shared-daemon comparison for the executor backend: why the native
+/// `codex app-server daemon` route cannot carry one run's ownership, and which
+/// run-owned facts are retained instead.
+///
+/// - The daemon interface exposes no per-run attach controls, so a run cannot
+///   pin its own listen address, capability token or process identity through
+///   it; a pre-existing daemon is shared per `CODEX_HOME` and started outside
+///   the run.
+/// - On Windows the daemon refuses to start from the elevated sessions this
+///   kit's sessions run in ("shared clients must not inherit administrator
+///   privileges"), so its pre-request visible attachment, profile binding,
+///   active/idle delivery, reconnect and neighbor-survival behavior cannot be
+///   exercised in the everyday environment at all.
+/// - The run-owned child starts inside the caller's Job, and that kernel
+///   membership is what the stop path and the account CPU allowance rely on.
+///
+/// This check records the comparison receipt and verifies the run-owned
+/// membership; it does not adopt the daemon. If a future executable serves an
+/// elevated session, the check stops that daemon and fails so the comparison
+/// is redone before any adoption.
+#[test]
+#[ignore = "requires HARNESS_CONTROL_CODEX_EXE; records the shared-daemon ownership gap; no model call"]
+fn native_shared_daemon_gap_keeps_the_run_owned_backend() {
+    let fixture = native_fixture(false);
+    let root = fixture.root.path();
+    let version = fs::read_to_string(root.join("version-stdout.txt")).unwrap();
+    let version = version.trim().to_owned();
+    // The run-owned backend is a member of the run's Job: the same kernel
+    // object the host ends the run with, and the membership the executor
+    // session's account CPU allowance covers.
+    assert!(
+        fixture.job.owns(fixture.server).unwrap(),
+        "the run-owned app-server child must be a member of the run's Job"
+    );
+    // The daemon's start surface offers no per-run endpoint, token or Job
+    // membership, so a run cannot own its backend through it.
+    let (help_exit, help_text) = capture_outcome(
+        &fixture.exe,
+        &fixture.home,
+        &fixture.workspace,
+        root,
+        &["app-server", "daemon", "start", "--help"],
+        "daemon-start-help",
+    );
+    assert_eq!(help_exit, 0, "daemon start help: {help_text}");
+    for option in ["--listen", "--ws-auth", "--ws-token-file"] {
+        assert!(
+            !help_text.contains(option),
+            "the daemon interface exposes {option}; redo the ownership comparison: {help_text}"
+        );
+    }
+    // Start the candidate in this owned home and query it afterwards. A start
+    // command that exits zero, or a version query that answers, means the
+    // route became available here and the comparison must be redone.
+    let (start_exit, start_text) = capture_outcome(
+        &fixture.exe,
+        &fixture.home,
+        &fixture.workspace,
+        root,
+        &["app-server", "daemon", "start"],
+        "daemon-start",
+    );
+    let (version_exit, daemon_version_text) = capture_outcome(
+        &fixture.exe,
+        &fixture.home,
+        &fixture.workspace,
+        root,
+        &["app-server", "daemon", "version"],
+        "daemon-version",
+    );
+    let socket = fixture
+        .home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let receipt = json!({
+        "schema": 1,
+        "route": "run-owned isolated app-server (retained)",
+        "candidate": "native shared daemon (codex app-server daemon)",
+        "nativeVersion": version,
+        "runOwned": {
+            "jobOwnsServer": true,
+            "serverPid": fixture.server.pid,
+            "providerRequests": 0,
+        },
+        "daemon": {
+            "startExit": start_exit,
+            "startOutput": start_text,
+            "versionExit": version_exit,
+            "versionOutput": daemon_version_text,
+            "socket": socket.to_string_lossy(),
+            "socketExists": socket.exists(),
+            "perRunEndpointOptions": false,
+        },
+        "dimensions": {
+            "preRequestVisibleAttachment": {
+                "runOwned": "native_named_empty_thread_can_be_attached, native_visible_chats_before_model_dispatch",
+                "sharedDaemon": "not exercisable: the daemon did not start",
+            },
+            "exactProfiles": {
+                "runOwned": "native_provider_address_override_preserves_binding, native_thread_route_override_reaches_only_selected_upstream, native_app_server_binds_the_resolved_profile_and_records_an_addressable_endpoint",
+                "sharedDaemon": "not exercisable: the daemon did not start",
+            },
+            "activeIdleDelivery": {
+                "runOwned": "native_lead_queue_and_app_server_input_on_owning_thread",
+                "sharedDaemon": "not exercisable: the daemon did not start",
+            },
+            "reconnect": {
+                "runOwned": "native_two_clients_reconnect_tool_result_and_tui",
+                "sharedDaemon": "not exercisable: the daemon did not start",
+            },
+            "cpuMembership": {
+                "runOwned": "this check: the run's Job owns the app-server child by kernel membership",
+                "sharedDaemon": "impossible: a pre-existing daemon is started outside the run and is shared by every session of the same CODEX_HOME",
+            },
+            "neighborSurvivalOnStopViewLoss": {
+                "runOwned": "message_steers_an_active_tool_without_touching_the_neighbor_or_partial_files, native_executor_control_active_turn_and_tool_interrupt",
+                "sharedDaemon": "not exercisable: the daemon did not start",
+            },
+        },
+        "gap": "app-server daemon start refuses this kit's elevated Windows sessions (shared clients must not inherit administrator privileges) and the daemon interface has no per-run listen address, capability token or Job membership, so the run cannot own its endpoint, exact process identity, stop authority or CPU admission",
+        "decision": "retain the run-owned isolated backend",
+    });
+    fs::write(
+        root.join("daemon-comparison.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    eprintln!("shared-daemon comparison evidence: {}", root.display());
+    assert!(
+        !root.join("provider-1.json").exists(),
+        "the comparison must not call a model"
+    );
+    if start_exit == 0 || version_exit == 0 {
+        // The candidate served this session; stop it and fail, because
+        // adoption requires the full property comparison this route does not
+        // have and this check must not leave a daemon behind.
+        let (stop_exit, stop_text) = capture_outcome(
+            &fixture.exe,
+            &fixture.home,
+            &fixture.workspace,
+            root,
+            &["app-server", "daemon", "stop"],
+            "daemon-stop",
+        );
+        panic!(
+            "the native shared daemon served this session (start exit {start_exit}: {start_text}; version exit {version_exit}: {daemon_version_text}); stop exit {stop_exit} ({stop_text}); the ownership comparison must be redone before adoption"
+        );
+    }
+    assert_ne!(
+        start_exit, 0,
+        "daemon start neither served nor refused: {start_text}"
+    );
+    fixture.job.terminate(0, Duration::from_secs(2)).unwrap();
+}
+
 const PROOF_PROMPT: &str = "Perform the owned proof command and return its consumed result.";
 
 struct ProviderHit {
@@ -1911,8 +2106,8 @@ fn native_lead_queue_and_app_server_input_on_owning_thread() {
     eprintln!("lead input comparison: {}", summary.display());
     eprintln!("selected lead input route: {selected}");
     assert_eq!(
-        version, "codex-cli 0.156.1",
-        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.156.1 binary"
+        version, "codex-cli 0.157.0",
+        "HARNESS_CONTROL_CODEX_EXE must be the installed Codex 0.157.0 binary"
     );
     for probe in &probes {
         assert_eq!(
@@ -1931,17 +2126,17 @@ fn native_lead_queue_and_app_server_input_on_owning_thread() {
     let idle_native = route_probe(&probes, "idle", "app-server");
     assert!(
         generation_queue.delivered && !generation_queue.timely,
-        "0.156.1 queue must reach the owning thread only after active generation"
+        "0.157.0 queue must reach the owning thread only after active generation"
     );
     assert!(generation_native.timely && generation_native.method == "turn/steer");
     assert!(
         tool_queue.delivered && !tool_queue.timely,
-        "0.156.1 queue must reach the owning thread only after a blocked tool"
+        "0.157.0 queue must reach the owning thread only after a blocked tool"
     );
     assert!(tool_native.timely && tool_native.method == "turn/steer");
     assert!(
         idle_queue.timely,
-        "0.156.1 queue must still reach an idle owning thread"
+        "0.157.0 queue must still reach an idle owning thread"
     );
     assert!(idle_native.timely && idle_native.method == "turn/start");
     assert_eq!(

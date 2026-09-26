@@ -920,6 +920,8 @@ pub fn serve(mut guard: ServiceGuard, expected: &str) -> io::Result<()> {
     // The native server performs this session's work, so it is admitted to the
     // account allowance (outer) and to this service's lifecycle Job (inner) at
     // creation instead of relying on inheritance alone.
+    // A pre-existing shared daemon is started outside both objects, so it is
+    // not an accepted substitute for this service's server.
     let server = spawn_admitted(
         guard.shared_cpu(),
         guard.job(),
