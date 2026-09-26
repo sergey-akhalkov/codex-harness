@@ -86,6 +86,8 @@ fn effort_config(arg: &OsStr) -> bool {
         .is_some_and(|s| s.trim_start().starts_with('='))
 }
 
+/// Translate the supported `--harness-effort routine|standard|demanding`
+/// compatibility selector into native `model_reasoning_effort` configuration.
 pub fn task_arguments(args: &[OsString]) -> io::Result<Vec<OsString>> {
     let Some(first) = args.first().and_then(|s| s.to_str()) else {
         return Ok(args.to_vec());
@@ -109,37 +111,8 @@ pub fn task_arguments(args: &[OsString]) -> io::Result<Vec<OsString>> {
         }
     };
     let rest = &args[offset..];
-    let mut i = 0;
-    while i < rest.len() {
-        let arg = rest[i].to_str().unwrap_or("");
-        if arg == "--" {
-            break;
-        }
-        if option(arg, "--profile") || arg.starts_with("-p") || option(arg, "--remote") {
-            return Ok(rest.to_vec());
-        }
-        if matches!(arg, "-c" | "--config") {
-            if rest.get(i + 1).is_some_and(|s| effort_config(s)) {
-                return Ok(rest.to_vec());
-            }
-            i += 2;
-            continue;
-        }
-        if arg
-            .strip_prefix("--config=")
-            .or_else(|| arg.strip_prefix("-c"))
-            .is_some_and(|s| effort_config(OsStr::new(s)))
-        {
-            return Ok(rest.to_vec());
-        }
-        if VALUES.contains(&arg) {
-            i += 2;
-            continue;
-        }
-        if image(arg) {
-            skip_images(rest, &mut i);
-        }
-        i += 1;
+    if effort_selection(rest).0 {
+        return Ok(rest.to_vec());
     }
     let mut result = vec![
         "-c".into(),
@@ -164,6 +137,65 @@ fn config_model_value(arg: &str) -> Option<String> {
         .and_then(|inner| inner.strip_suffix('"'))
         .unwrap_or(trimmed);
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Classify the arguments before the first `--` once for both effort
+/// functions: an explicit native effort/profile/remote route, and the model.
+fn effort_selection(args: &[OsString]) -> (bool, Option<String>) {
+    let mut explicit = false;
+    let mut model = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if option(arg, "--profile") || arg.starts_with("-p") || option(arg, "--remote") {
+            explicit = true;
+            break;
+        }
+        let (config, step) = if matches!(arg, "-c" | "--config") {
+            (args.get(i + 1).and_then(|s| s.to_str()), 2)
+        } else {
+            (
+                arg.strip_prefix("--config=")
+                    .or_else(|| arg.strip_prefix("-c")),
+                1,
+            )
+        };
+        if let Some(config) = config {
+            if effort_config(OsStr::new(config)) {
+                explicit = true;
+                break;
+            }
+            if model_config(config) {
+                model = config_model_value(config);
+            }
+            i += step;
+            continue;
+        }
+        if matches!(arg, "-m" | "--model") {
+            if let Some(value) = args.get(i + 1).and_then(|s| s.to_str()) {
+                model = Some(value.to_string());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--model=") {
+            model = Some(value.to_string());
+            i += 1;
+            continue;
+        }
+        if VALUES.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if image(arg) {
+            skip_images(args, &mut i);
+        }
+        i += 1;
+    }
+    (explicit, model)
 }
 
 fn default_effort(model: &str) -> Option<&'static str> {
@@ -212,7 +244,7 @@ fn session_command(args: &[OsString]) -> bool {
 
 /// Apply the per-model default effort to a session start without an explicit
 /// effort selection. Explicit arguments, profiles, remote routes and the
-/// harness effort selector always keep precedence.
+/// compatibility effort selector always keep precedence.
 pub fn per_model_effort(args: &[OsString], configured_model: Option<&str>) -> Vec<OsString> {
     if args
         .first()
@@ -222,64 +254,11 @@ pub fn per_model_effort(args: &[OsString], configured_model: Option<&str>) -> Ve
     {
         return args.to_vec();
     }
-    let mut model = None;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].to_str().unwrap_or("");
-        if arg == "--" {
-            break;
-        }
-        if option(arg, "--profile") || arg.starts_with("-p") || option(arg, "--remote") {
-            return args.to_vec();
-        }
-        if matches!(arg, "-c" | "--config") {
-            let Some(value) = args.get(i + 1).and_then(|s| s.to_str()) else {
-                break;
-            };
-            if effort_config(OsStr::new(value)) {
-                return args.to_vec();
-            }
-            if model_config(value) {
-                model = config_model_value(value);
-            }
-            i += 2;
-            continue;
-        }
-        if let Some(rest) = arg
-            .strip_prefix("--config=")
-            .or_else(|| arg.strip_prefix("-c"))
-        {
-            if effort_config(OsStr::new(rest)) {
-                return args.to_vec();
-            }
-            if model_config(rest) {
-                model = config_model_value(rest);
-            }
-            i += 1;
-            continue;
-        }
-        if matches!(arg, "-m" | "--model") {
-            if let Some(value) = args.get(i + 1).and_then(|s| s.to_str()) {
-                model = Some(value.to_string());
-            }
-            i += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--model=") {
-            model = Some(value.to_string());
-            i += 1;
-            continue;
-        }
-        if VALUES.contains(&arg) {
-            i += 2;
-            continue;
-        }
-        if image(arg) {
-            skip_images(args, &mut i);
-        }
-        i += 1;
+    let (explicit, model) = effort_selection(args);
+    if explicit {
+        return args.to_vec();
     }
-    let model = model.or_else(|| configured_model.map(|value| value.to_string()));
+    let model = model.or_else(|| configured_model.map(str::to_owned));
     let Some(effort) = model.as_deref().and_then(default_effort) else {
         return args.to_vec();
     };

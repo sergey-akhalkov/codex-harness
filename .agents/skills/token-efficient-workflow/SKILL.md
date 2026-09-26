@@ -29,14 +29,14 @@ When setup, repeated work or waits dominate, including during a running task, re
 
 The installed CLI cannot change the effort of an already running model turn through an agent tool. Brevity instructions do not change that effort. Preserve current task continuity; do not restart a task just to chase a cheaper setting.
 
-For a new local CLI task, the linked launcher accepts a first-position selector:
+Select effort for a new CLI task with native configuration:
 
 ```powershell
-codex --harness-effort routine exec 'A bounded task with a deterministic check'
-codex --harness-effort standard 'A task needing substantive reasoning'
-codex --harness-effort demanding 'A complex or high-risk task'
+codex -c model_reasoning_effort=low exec 'A bounded task with a deterministic check'
+codex -c model_reasoning_effort=high 'A task needing substantive reasoning'
+codex -c model_reasoning_effort=xhigh 'A complex or high-risk task'
 ```
 
-These select native `low`, `high`, and `xhigh` respectively. The default remains conservative `xhigh`. Explicit native effort/profile settings take precedence. Select routine only with clear inputs, low risk and a reliable check; use more effort when uncertainty or failures warrant it. For a supported external app-server client, `turn/start.effort` is a turn-boundary setting, not an in-turn model tool.
+The default remains conservative `xhigh`, and explicit native effort/profile settings take precedence. Select `low` only with clear inputs, low risk and a reliable check; use more effort when uncertainty or failures warrant it. For a supported external app-server client, `turn/start.effort` is a turn-boundary setting, not an in-turn model tool.
 
 Follow the user's current model, provider and conversation-visibility policy; keep selection in its existing owner instead of maintaining another preset list here. This selector does not authorize recursive model calls or a billing change. A small task is often cheapest to finish directly. Validate effective effort from native turn/config evidence when measuring it; do not claim quota savings from effort names.

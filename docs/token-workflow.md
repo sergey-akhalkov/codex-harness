@@ -61,17 +61,18 @@ own the detailed limits and traps. The archived [CodeGraph calibration](../opens
 records the historical comparisons that supported the later full retirement;
 the managed graph registration no longer exists.
 
-For a new task the launcher accepts `--harness-effort routine|standard|demanding`
-as the first argument, mapping to native `low|high|xhigh`. An explicit native
-effort or profile wins. Without an explicit selection the launcher applies
-per-model defaults: `zai/glm-5.3` runs at `max`, while `xai/grok-4.6` and
-the Astra family run at `xhigh`; unmapped models keep the native
-configuration. Changing effort inside an
-already running turn of the current CLI is unsupported. An external app-server
-client may set `turn/start.effort` for the next turn. Effort names do not prove
-a savings percentage. Apply the current
+For a new task select effort with native configuration, for example
+`-c model_reasoning_effort=high`, or an in-session subagent's
+`reasoning_effort` parameter. A first-position
+`--harness-effort routine|standard|demanding` stays a compatibility alias for
+`low|high|xhigh`; explicit native effort or profile wins. Without an explicit
+selection the launcher applies per-model defaults: `zai/glm-5.3` at `max`,
+`xai/grok-4.6` and Astra at `xhigh`; unmapped models keep native
+configuration. The installed CLI cannot change effort in a running turn; an
+app-server client may set `turn/start.effort` for the next turn. Effort names
+do not prove a savings percentage. Apply the
 [model selection and recovery rules](agent-delegation.md#how-selection-works);
-former named levels are migration context, not required dispatch presets.
+former levels are migration context, not dispatch presets.
 
 Treat sessions as consumable context, guided by measured usage: a few marathon
 threads repay their whole history every turn (single sessions measured at

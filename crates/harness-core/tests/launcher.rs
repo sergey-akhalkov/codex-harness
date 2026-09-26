@@ -248,6 +248,95 @@ fn per_model_effort_respects_explicit_selections() {
 }
 
 #[test]
+fn canonical_native_effort_needs_no_legacy_selector() {
+    // The native configuration is the canonical interface: both functions
+    // leave it untouched, including beside a model with a per-model default.
+    let native = argv(&[
+        "-c",
+        "model_reasoning_effort=low",
+        "-m",
+        "zai/glm-5.3",
+        "exec",
+        "hello",
+    ]);
+    assert_eq!(task_arguments(&native).unwrap(), native);
+    assert_eq!(per_model_effort(&native, None), native);
+
+    // A translated compatibility selector is already explicit native
+    // configuration, so no per-model default stacks on top of it.
+    let translated = task_arguments(&argv(&[
+        "--harness-effort=routine",
+        "-m",
+        "zai/glm-5.3",
+        "exec",
+    ]))
+    .unwrap();
+    assert_eq!(
+        translated,
+        argv(&[
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "-m",
+            "zai/glm-5.3",
+            "exec"
+        ])
+    );
+    assert_eq!(per_model_effort(&translated, None), translated);
+
+    // The `--model=` spelling reaches the same per-model default.
+    let selected = argv(&["--model=zai/glm-5.3", "exec"]);
+    let mut expected = argv(&["-c", "model_reasoning_effort=\"max\""]);
+    expected.extend(selected.clone());
+    assert_eq!(per_model_effort(&selected, None), expected);
+}
+
+#[test]
+fn executor_launches_keep_the_translated_or_profiled_effort() {
+    // The executor route composes the same translation, per-model default and
+    // capability switch: the selector wins over the mapped model's default.
+    let translated = per_model_effort(
+        &task_arguments(&argv(&[
+            "--harness-effort=standard",
+            "-m",
+            "zai/glm-5.3",
+            "exec",
+            "work",
+        ]))
+        .unwrap(),
+        None,
+    );
+    assert_eq!(
+        executor_limited(translated, true),
+        argv(&[
+            "-c",
+            "agents.enabled=false",
+            "-c",
+            "model_reasoning_effort=\"high\"",
+            "-m",
+            "zai/glm-5.3",
+            "exec",
+            "work"
+        ])
+    );
+    // A configured profile route stays authoritative: the selector yields and
+    // no per-model default is injected.
+    let routed = per_model_effort(
+        &task_arguments(&argv(&[
+            "--harness-effort=routine",
+            "--profile",
+            "ds",
+            "exec",
+        ]))
+        .unwrap(),
+        Some("zai/glm-5.3"),
+    );
+    assert_eq!(
+        executor_limited(routed, true),
+        argv(&["-c", "agents.enabled=false", "--profile", "ds", "exec"])
+    );
+}
+
+#[test]
 fn explicit_roots_use_effective_cwd_without_prompt_or_remote_expansion() {
     let temp = tempfile::tempdir().unwrap();
     let primary = temp.path().join("primary");
