@@ -34,7 +34,7 @@ On a terminal outcome, settle accepted work and retain its final message using t
 
 `watch` keeps the current receipt polling implementation, CLI, default timeout and exit meanings: 0 completed, 1 unsuccessful terminal outcome, 2 timeout or unavailable coverage. Timeout does not stop the executor. It can return the persisted outcome independently of frontend shutdown; that preserves synchronous waiting without making the TUI exit itself after an answer. Completion still does not establish lead acceptance or release the slot. When the separate reply workflow is present, its additive waiting observation returns 3 for action required without a terminal outcome; this does not change meanings 0/1/2.
 
-This change alone owns the full modified `Observable executor lifecycle and bounded result` requirement. The messaging change owns its additional waiting/request requirement, so either delta cannot overwrite the other's scenarios. The [simplification design](../../simplify-native-harness/design.md) owns later shared-daemon qualification and cross-cutting removal; no wholesale general-controller activation is needed for this TUI path.
+This change alone owns the full modified `Observable executor lifecycle and bounded result` requirement. The messaging change owns its additional waiting/request requirement, so either delta cannot overwrite the other's scenarios. The [simplification design](../2026-09-26-simplify-native-harness/design.md) owns later shared-daemon qualification and cross-cutting removal; no wholesale general-controller activation is needed for this TUI path.
 
 ### Finish the owned surface without affecting neighbors
 
