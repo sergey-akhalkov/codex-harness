@@ -48,8 +48,30 @@ fn kit_json_inventory_lists_evolution_and_analysis_without_copying_bodies() {
         .collect();
     assert!(skills.contains(&"skill-evolution"));
     assert!(skills.contains(&"skills-usage-analysis"));
+    let mut sources = std::collections::BTreeSet::new();
     for link in inventory.links.iter().filter(|link| link.kind == "skill") {
         assert!(link.source.is_dir());
         assert!(!link.destination.starts_with(&source));
+        // Native discovery resolves these sources; the kit-owned identity the
+        // derived catalogue adds stays readable and names the linked skill.
+        let descriptor = link.source.join("SKILL.md");
+        let text = fs::read_to_string(&descriptor).unwrap_or_else(|error| {
+            panic!(
+                "kit skill identity is unreadable at {} ({error})",
+                descriptor.display()
+            )
+        });
+        assert!(
+            text.contains(&format!("name: {}", link.name)),
+            "{} does not declare name {}",
+            descriptor.display(),
+            link.name
+        );
+        sources.insert(link.source.clone());
     }
+    assert_eq!(
+        sources.len(),
+        2,
+        "kit skills keep distinct canonical sources"
+    );
 }

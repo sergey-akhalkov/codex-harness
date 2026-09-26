@@ -2407,6 +2407,167 @@ trust_level = "trusted"
     );
 }
 
+#[test]
+fn catalogue_without_native_discovery_is_explicit_and_never_scans() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-unavailable-")
+        .tempdir()
+        .unwrap();
+    let case = root.path().join("case");
+    let home = root.path().join("codex");
+    fs::create_dir_all(case.join(".agents/skills/local_probe")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    write_skill(
+        &case.join(".agents/skills/local_probe"),
+        "local_probe",
+        "LOCAL_PROBE_MARKER",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unavailable native discovery must not report success"
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("native_discovery=unavailable"), "{text}");
+    assert!(text.contains("route=codex-harness skills usage"), "{text}");
+    assert!(
+        text.contains("native launch registration is unreadable"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("local_probe"),
+        "unavailable native discovery must not fall back to a local scan: {text}"
+    );
+}
+
+#[test]
+#[ignore = "explicit installed native CLI app-server skills/list; no model"]
+fn catalogue_reports_the_native_effective_set_with_kit_identity() {
+    let root = tempfile::Builder::new()
+        .prefix("skill-catalogue-native-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    println!("skill catalogue native evidence: {}", root.display());
+    let case = root.join("case");
+    let home = root.join("codex");
+    let skills = case.join(".agents/skills");
+    fs::create_dir_all(&skills).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    write_skill(
+        &skills.join("catalogue_shared_one"),
+        "catalogue_shared_probe",
+        "SHARED_ONE",
+    );
+    write_skill(
+        &skills.join("catalogue_shared_two"),
+        "catalogue_shared_probe",
+        "SHARED_TWO",
+    );
+    write_skill(
+        &skills.join("catalogue_disabled"),
+        "catalogue_disabled_probe",
+        "DISABLED",
+    );
+    let broken = skills.join("catalogue_broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("SKILL.md"), "no frontmatter here").unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "[[skills.config]]\npath = {}\nenabled = false\n",
+            serde_json::to_string(
+                &skills
+                    .join("catalogue_disabled/SKILL.md")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+            .unwrap()
+        ),
+    )
+    .unwrap();
+    let upstream = registered_upstream(&live_codex_home());
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .arg("--upstream")
+        .arg(&upstream)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    fs::write(root.join("catalogue.txt"), text.as_bytes()).unwrap();
+    let repo_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("name=") && line.contains(";scope=repo;"))
+        .collect();
+    let shared: Vec<&&str> = repo_lines
+        .iter()
+        .filter(|line| line.contains("name=catalogue_shared_probe;"))
+        .collect();
+    assert_eq!(
+        shared.len(),
+        2,
+        "both distinct sources stay visible: {text}"
+    );
+    assert_ne!(
+        shared[0].split("revision=").nth(1),
+        shared[1].split("revision=").nth(1),
+        "distinct sources keep distinct revisions: {text}"
+    );
+    assert!(
+        text.contains("conflict: name=catalogue_shared_probe"),
+        "{text}"
+    );
+    assert!(
+        repo_lines.iter().any(|line| {
+            line.contains("name=catalogue_disabled_probe;") && line.contains(";enabled=false;")
+        }),
+        "config disablement is retained: {text}"
+    );
+    assert!(
+        text.contains("incomplete: native discovery error at"),
+        "the broken package stays explicit: {text}"
+    );
+    assert!(text.contains("coverage=incomplete"), "{text}");
+    assert!(text.contains("awareness=discovery-only"), "{text}");
+}
+
+fn live_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(".codex"))
+}
+
+fn registered_upstream(home: &Path) -> PathBuf {
+    let registration = home.join("harness/native-launch.json");
+    let bytes = fs::read(&registration).unwrap_or_else(|error| {
+        panic!(
+            "installed launcher registration {} is missing ({error}); the installed native CLI is required for this probe",
+            registration.display()
+        )
+    });
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    PathBuf::from(
+        value["upstream"]["executable"]
+            .as_str()
+            .expect("registration records the upstream executable"),
+    )
+}
+
 fn persist_partial(
     evidence: &Path,
     home: &Path,

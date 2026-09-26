@@ -2,6 +2,8 @@
 //!
 //! Model execution stays on the existing `outcome-*` runner. This crate does not
 //! launch Codex, mutate the user library or write Git.
+//! `catalogue` derives its view from the native consumer's effective discovery
+//! and never scans discovery roots itself; `delivery` renders that view bounded.
 
 pub mod budget;
 pub mod catalogue;

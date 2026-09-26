@@ -2,7 +2,9 @@
 
 use serde_json::json;
 use skill_evolution::isolation::{self, Request};
-use skill_evolution::{identity, ledger, session, usage};
+use skill_evolution::{catalogue, delivery, identity, ledger, session, usage};
+#[cfg(windows)]
+use std::time::Duration;
 use std::{
     env,
     ffi::OsString,
@@ -16,8 +18,14 @@ fn invalid() -> io::Error {
     io::Error::other("invalid skills command")
 }
 
+const CATALOGUE_TIMEOUT: u64 = 30;
+const CATALOGUE_LIMIT: u64 = 16 * 1024;
+
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+        println!(
+            "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--timeout SECONDS] [--limit BYTES]"
+        );
         println!("codex-harness skills isolate --request PATH");
         println!("codex-harness skills usage [--user-home DIRECTORY] [--codex-home DIRECTORY]");
         println!("codex-harness skills publish --request PATH");
@@ -25,6 +33,9 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
             "codex-harness skills identity --path DIRECTORY [--operation NAME] [--journal PATH] [--codex-home DIRECTORY]"
         );
         return Ok(0);
+    }
+    if args[0] == "catalogue" {
+        return catalogue_cmd(&args[1..]);
     }
     if args[0] == "isolate" {
         return isolate(&args[1..]);
@@ -39,6 +50,173 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         return identity_cmd(&args[1..]);
     }
     Err(invalid())
+}
+
+fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps. Raw native evidence stays in a private temporary root. A missing native read is reported as unavailable; it never falls back to a complete-looking local scan."
+        );
+        return Ok(0);
+    }
+    let mut case = None;
+    let mut codex_home = None;
+    let mut upstream = None;
+    let mut timeout = CATALOGUE_TIMEOUT;
+    let mut limit = CATALOGUE_LIMIT;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("--case") if case.is_none() => {
+                case = Some(PathBuf::from(iter.next().ok_or_else(invalid)?));
+            }
+            Some("--codex-home") if codex_home.is_none() => {
+                codex_home = Some(PathBuf::from(iter.next().ok_or_else(invalid)?));
+            }
+            Some("--upstream") if upstream.is_none() => {
+                upstream = Some(PathBuf::from(iter.next().ok_or_else(invalid)?));
+            }
+            Some("--timeout") => timeout = number(iter.next())?,
+            Some("--limit") => limit = number(iter.next())?,
+            _ => return Err(invalid()),
+        }
+    }
+    if !(1..=300).contains(&timeout) || !(1024..=1024 * 1024).contains(&limit) {
+        return Err(invalid());
+    }
+    let case = case.unwrap_or(env::current_dir()?).canonicalize()?;
+    let home = codex_home.unwrap_or(default_codex_home()?).canonicalize()?;
+    let private = tempfile::Builder::new()
+        .prefix("codex-skills-catalogue-")
+        .tempdir()?;
+    let root = private.path().canonicalize()?;
+    if root.starts_with(repository()) {
+        return Err(invalid());
+    }
+    match native_catalogue(
+        &case,
+        &home,
+        upstream.as_deref(),
+        timeout,
+        limit as usize,
+        &root,
+    ) {
+        Ok(view) => {
+            print!("{}", delivery::render(&view, limit as usize)?);
+            Ok(0)
+        }
+        Err(error) => {
+            let evidence = private.keep().canonicalize()?;
+            let view = catalogue::View::unavailable(error.to_string());
+            print!("{}", delivery::render(&view, limit as usize)?);
+            eprintln!(
+                "native skill discovery failed; private evidence: {}",
+                evidence.display()
+            );
+            Ok(1)
+        }
+    }
+}
+
+fn number(value: Option<&OsString>) -> io::Result<u64> {
+    value
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(invalid)
+}
+
+fn default_codex_home() -> io::Result<PathBuf> {
+    if let Some(home) = env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    let profile = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .ok_or_else(invalid)?;
+    Ok(PathBuf::from(profile).join(".codex"))
+}
+
+fn registered_upstream(home: &Path) -> io::Result<PathBuf> {
+    let path = home.join("harness/native-launch.json");
+    let bytes = std::fs::read(&path).map_err(|error| {
+        io::Error::other(format!(
+            "native launch registration is unreadable at {} ({error})",
+            path.display()
+        ))
+    })?;
+    let registration: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::other(format!(
+            "native launch registration at {} is not JSON ({error})",
+            path.display()
+        ))
+    })?;
+    registration["upstream"]["executable"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "native launch registration at {} records no upstream executable",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(windows)]
+fn native_catalogue(
+    case: &Path,
+    home: &Path,
+    upstream: Option<&Path>,
+    timeout: u64,
+    limit: usize,
+    root: &Path,
+) -> io::Result<catalogue::View> {
+    let upstream = match upstream {
+        Some(path) => path.to_path_buf(),
+        None => registered_upstream(home)?,
+    };
+    if !upstream.is_absolute()
+        || !upstream
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err(io::Error::other(
+            "native upstream must be an absolute executable path",
+        ));
+    }
+    let mut report = json!({"status":"incomplete","model_calls":0,"evidence_root":root});
+    let response = crate::native_read_rpc::exchange(
+        crate::native_read_rpc::Request {
+            upstream: &upstream,
+            case,
+            working_directory: case,
+            home,
+            extra: &[],
+            root,
+            timeout: Duration::from_secs(timeout),
+            output_limit: 16 * 1024 * 1024,
+            protocol: crate::native_read_rpc::Protocol::Outcome,
+        },
+        &mut report,
+    )?;
+    catalogue::derive(
+        &response["listed"],
+        case,
+        Some(&home.join("config.toml")),
+        limit,
+    )
+}
+
+#[cfg(not(windows))]
+fn native_catalogue(
+    _: &Path,
+    _: &Path,
+    _: Option<&Path>,
+    _: u64,
+    _: usize,
+    _: &Path,
+) -> io::Result<catalogue::View> {
+    Err(io::Error::other(
+        "native skills/list requires the Windows app-server job",
+    ))
 }
 
 fn isolate(args: &[OsString]) -> io::Result<i32> {
