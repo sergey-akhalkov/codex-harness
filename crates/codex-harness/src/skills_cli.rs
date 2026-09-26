@@ -55,7 +55,7 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
 fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps. Raw native evidence stays in a private temporary root. A missing native read is reported as unavailable; it never falls back to a complete-looking local scan."
+            "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps. Raw native evidence stays in a private temporary root. A missing native read is reported as unavailable; it never falls back to a complete-looking local scan. --limit accepts 1024-1048576 bytes (default 16384); entries beyond it stay explicit and are retrieved by rerunning with a larger --limit."
         );
         return Ok(0);
     }

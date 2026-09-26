@@ -105,8 +105,12 @@ impl View {
     }
 }
 
+/// Bounded retrieval route for entries omitted by the delivery allowance.
+///
+/// It reruns this catalogue at the largest accepted allowance, so it reaches
+/// the omitted entries itself; the usage report holds no catalogue entries.
 pub fn remainder_route() -> &'static str {
-    "codex-harness skills usage"
+    "codex-harness skills catalogue --limit 1048576"
 }
 
 /// Derive the scoped view from one native `skills/list` result for `case`.
@@ -462,7 +466,10 @@ mod tests {
         assert_eq!(bounded.coverage, Coverage::Incomplete);
         assert_eq!(bounded.omitted, 1);
         assert_eq!(bounded.measured_bytes, sized.measured_bytes);
-        assert_eq!(remainder_route(), "codex-harness skills usage");
+        assert_eq!(
+            remainder_route(),
+            "codex-harness skills catalogue --limit 1048576"
+        );
     }
 
     #[test]

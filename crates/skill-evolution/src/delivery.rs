@@ -66,10 +66,9 @@ pub fn render(view: &catalogue::View, limit: usize) -> io::Result<String> {
         for note in &view.notes {
             let _ = writeln!(out, "reason={note}");
         }
-        let _ = writeln!(
-            out,
-            "effective_set=unknown route={}",
-            catalogue::remainder_route()
+        out.push_str("effective_set=unknown\n");
+        out.push_str(
+            "remedy=restore the native read (register harness/native-launch.json or pass --upstream PATH), then rerun codex-harness skills catalogue\n",
         );
         out.push_str(
             "awareness=none: this read cannot establish model awareness or current-turn delivery\n",
@@ -192,7 +191,10 @@ mod tests {
         let text = render(&bounded, 512).unwrap();
         assert!(text.contains("coverage=incomplete"));
         assert!(text.contains("omitted=4 beyond the 512-byte catalogue allowance"));
-        assert!(text.contains("codex-harness skills usage"));
+        assert!(
+            text.contains("route=codex-harness skills catalogue --limit 1048576"),
+            "{text}"
+        );
         assert!(text.contains("incomplete: native discovery error"));
         assert!(text.contains("awareness=discovery-only"));
 
@@ -224,7 +226,7 @@ mod tests {
         assert!(text.contains("native_discovery=unavailable"));
         assert!(text.contains("reason=native launch registration is missing"));
         assert!(text.contains("effective_set=unknown"));
-        assert!(text.contains("route=codex-harness skills usage"));
+        assert!(text.contains("remedy=restore the native read"));
         assert!(!text.contains("name="), "no complete-looking scan: {text}");
     }
 }

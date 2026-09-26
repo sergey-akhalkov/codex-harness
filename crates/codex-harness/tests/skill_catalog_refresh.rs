@@ -2427,6 +2427,8 @@ fn catalogue_without_native_discovery_is_explicit_and_never_scans() {
         .arg(&case)
         .arg("--codex-home")
         .arg(&home)
+        // The remainder route passes this exact value; the command must accept it.
+        .args(["--limit", "1048576"])
         .output()
         .unwrap();
     assert_eq!(
@@ -2436,7 +2438,7 @@ fn catalogue_without_native_discovery_is_explicit_and_never_scans() {
     );
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("native_discovery=unavailable"), "{text}");
-    assert!(text.contains("route=codex-harness skills usage"), "{text}");
+    assert!(text.contains("remedy=restore the native read"), "{text}");
     assert!(
         text.contains("native launch registration is unreadable"),
         "{text}"
@@ -2544,6 +2546,26 @@ fn catalogue_reports_the_native_effective_set_with_kit_identity() {
     );
     assert!(text.contains("coverage=incomplete"), "{text}");
     assert!(text.contains("awareness=discovery-only"), "{text}");
+
+    // The correction: the omitted-entry route must retrieve the catalogue
+    // itself, not the local usage report.
+    let bounded = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["skills", "catalogue", "--case"])
+        .arg(&case)
+        .arg("--codex-home")
+        .arg(&home)
+        .arg("--upstream")
+        .arg(&upstream)
+        .args(["--limit", "1024"])
+        .output()
+        .unwrap();
+    assert!(bounded.status.success());
+    let bounded = String::from_utf8_lossy(&bounded.stdout);
+    assert!(bounded.contains("omitted="), "{bounded}");
+    assert!(
+        bounded.contains("route=codex-harness skills catalogue --limit 1048576"),
+        "{bounded}"
+    );
 }
 
 fn live_codex_home() -> PathBuf {
