@@ -426,6 +426,8 @@ for ordinary use and interpretation.
 
 `codex-harness feedback` uses the consumer's existing `bd` board. `record`
 creates a bounded observation; `list`, `ledger` and `candidates` inspect it.
+`ledger` also reports the item's pacing observations, applicable pacing
+decisions and benefit-gate default from the same native bd comments.
 `triage --decisions FILE` applies caller-selected grouping/kinds, counts distinct
 reporter/episode votes, excludes diagnostic votes and enforces the configured
 batch limit. Every command identifies its limits; an explicit `--source KIT`

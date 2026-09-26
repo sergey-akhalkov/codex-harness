@@ -1798,7 +1798,10 @@ fn issue_labels(issue: &Value) -> Vec<String> {
     }
 }
 
-fn list_comments(bd: &Path, project: &Path, item_id: &str) -> io::Result<Vec<String>> {
+/// The comment texts of one board item, in board order. The feedback CLI
+/// parses the same native `bd comments` records the ledger readers use, so
+/// pacing and benefit-gate lookups need no second board mirror.
+pub fn list_comments(bd: &Path, project: &Path, item_id: &str) -> io::Result<Vec<String>> {
     let value = json_ok(bd, project, &["comments", item_id, "--json"])?;
     Ok(comment_values(&value)
         .iter()

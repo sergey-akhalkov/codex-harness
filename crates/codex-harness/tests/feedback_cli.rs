@@ -923,3 +923,195 @@ fn consequence_override_promotes_without_votes_and_kit_route_needs_its_wording()
     );
     board.drop();
 }
+
+/// One native board comment, in the exact form the board-workflow skill
+/// records pacing and benefit-gate lines.
+fn comment(board: &Board, item: &str, text: &str) {
+    let out = bd_run(
+        &board.bd,
+        &board.project,
+        &["comment", item, "--json", text],
+    );
+    assert!(out.status.success(), "{}", bd_failed("comment", &out));
+}
+
+#[test]
+fn ledger_reports_fresh_pacing_records_and_the_gate_default() {
+    let board = Board::new("ledger-pacing");
+    let item = board.record("pacing for the stage", "lead-1", "e5", "lead");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    comment(
+        &board,
+        &item,
+        &format!(
+            "pacing-observation v1 scope=gpt source=dashboard-snapshot used=93 resets_at={} window_minutes=10080 refusals=1 observed_at={now} max_age=3600",
+            now + 1800
+        ),
+    );
+    comment(
+        &board,
+        &item,
+        "pacing-decision v1 id=gpt:concurrency scope=gpt knob=concurrency from=4 to=1 expires_at=none reason=pressure basis=dashboard",
+    );
+    comment(
+        &board,
+        &item,
+        "pacing-decision v1 id=gpt:effort scope=gpt knob=effort from=xhigh to=high expires_at=none reason=pressure basis=dashboard",
+    );
+    comment(
+        &board,
+        &item,
+        "pacing-revoke v1 id=gpt:effort reason=superseded",
+    );
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=lane-reuse outcome=reject quality=regressed matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=140.0 regression_percent=40.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=regressed"
+        ),
+    );
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=lane-reuse outcome=adopt quality=unchanged matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=99.0 regression_percent=-1.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=adopted"
+        ),
+    );
+
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("pacing observation gpt: 93% used resets_at="),
+        "{text}"
+    );
+    assert!(text.contains("refusals=1"), "{text}");
+    assert!(
+        text.contains("pacing decisions: 1 applicable of 2 recorded; 1 revoked"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pacing decision pacing-decision v1 id=gpt:concurrency"),
+        "{text}"
+    );
+    assert!(!text.contains("id=gpt:effort"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: adopted across 2 recorded comparison(s)"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=reject quality=regressed"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=adopt quality=unchanged"
+        )),
+        "{text}"
+    );
+    board.drop();
+}
+
+#[test]
+fn ledger_keeps_unknown_and_stale_pacing_evidence_honest() {
+    let board = Board::new("ledger-unknown");
+    let item = board.record("unknown telemetry", "lead-1", "e6", "lead");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    comment(
+        &board,
+        &item,
+        &format!(
+            "pacing-observation v1 scope=gpt source=dashboard-snapshot used=unknown resets_at=unknown window_minutes=10080 refusals=0 observed_at={now} max_age=3600"
+        ),
+    );
+    comment(
+        &board,
+        &item,
+        &format!(
+            "pacing-observation v1 scope=gpt source=dashboard-snapshot used=50 resets_at=unknown window_minutes=10080 refusals=0 observed_at={} max_age=3600",
+            now - 7200
+        ),
+    );
+
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("pacing observation gpt: used unknown"),
+        "{text}"
+    );
+    assert!(!text.contains("50% used"), "{text}");
+    assert!(text.contains("stale_ignored=1"), "{text}");
+    assert!(
+        text.contains("pacing decisions: 0 applicable of 0 recorded; 0 revoked"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: no comparison recorded; unadopted"
+        )),
+        "{text}"
+    );
+    board.drop();
+}
+
+#[test]
+fn ledger_reports_gate_records_and_the_latest_outcome() {
+    let board = Board::new("ledger-gate");
+    let item = board.record("promoted improvement", "lead-1", "e7", "lead");
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=shorten-help outcome=adopt quality=unchanged matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=99.0 regression_percent=-1.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=adopted"
+        ),
+    );
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=shorten-help outcome=inconclusive quality=unmeasurable matched=1 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=100.0 regression_percent=0.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=retest_unresolved"
+        ),
+    );
+
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: unadopted across 2 recorded comparison(s)"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=adopt quality=unchanged"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=inconclusive quality=unmeasurable"
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&format!("benefit gate {item}: adopted")),
+        "{text}"
+    );
+    assert!(
+        text.contains("pacing observations: none recorded; telemetry unknown"),
+        "{text}"
+    );
+    board.drop();
+}

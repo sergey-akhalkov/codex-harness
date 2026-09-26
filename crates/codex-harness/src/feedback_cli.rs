@@ -4,8 +4,11 @@
 //! Six verbs, each an explicit operation: `record` writes one bounded
 //! observation, `list`, `ledger` and `candidates` only read, `triage` applies
 //! caller-selected semantic decisions in one configured batch, and `promote`
-//! performs one explicit recorded promotion. Similarity, merging and
-//! consequence stay caller decisions. Thresholds and batch size come from the
+//! performs one explicit recorded promotion. `ledger` also parses the item's
+//! `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate`
+//! board comments and reports the scoped account view, the applicable pacing
+//! decisions and the benefit-gate default. Similarity, merging and consequence
+//! stay caller decisions. Thresholds and batch size come from the
 //! owning orchestration configuration: the installed kit checkout recorded by
 //! the normal CODEX_HOME installation, else the project's own checkout, else
 //! the kit defaults; `--source` names an explicit override and every verb
@@ -17,6 +20,7 @@ use harness_core::board_feedback::{
     PartialRoutedReport, PromotionEvidence, PromotionOutcome, PromotionRoute, ReporterKind,
     RouteTarget, RoutedAction, VoteDecision, VoteLedger,
 };
+use harness_core::{benefit_gate, pacing, scoped_observations};
 use serde::Deserialize;
 use std::{
     collections::BTreeSet,
@@ -25,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion: a completed promotion retry confirms the recorded outcome, while a different route or OpenSpec target is refused.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's benefit-gate default. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion: a completed promotion retry confirms the recorded outcome, while a different route or OpenSpec target is refused.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
@@ -352,6 +356,59 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
             },
             promotion.counted,
             promotion.target.as_deref().unwrap_or("none")
+        );
+    }
+    // The same native comments carry the pacing and benefit-gate records; the
+    // ledger reports them instead of leaving a second tracker to be invented.
+    let comments = board_feedback::list_comments(&board.bd, &board.project, item)?;
+    let now = epoch_seconds();
+    let observations = scoped_observations::parse_observation_comments(&comments);
+    if observations.is_empty() {
+        println!("pacing observations: none recorded; telemetry unknown");
+    } else {
+        let mut scopes: Vec<&str> = observations
+            .iter()
+            .map(|observation| observation.scope.as_str())
+            .collect();
+        scopes.sort_unstable();
+        scopes.dedup();
+        for scope in scopes {
+            let view = scoped_observations::account_view(&observations, scope, now);
+            println!("pacing observation {}", view.describe());
+        }
+    }
+    let pacing_records = pacing::parse_pacing_comments(&comments);
+    let applicable = pacing::applicable(&pacing_records, now);
+    println!(
+        "pacing decisions: {} applicable of {} recorded; {} revoked",
+        applicable.len(),
+        pacing_records.decisions.len(),
+        pacing_records.revoked.len()
+    );
+    for decision in applicable {
+        println!("pacing decision {}", decision.to_comment());
+    }
+    let gates = benefit_gate::parse_gate_comments(&comments);
+    let recorded_here = gates.iter().filter(|record| record.item == item).count();
+    if recorded_here == 0 {
+        println!("benefit gate {item}: no comparison recorded; unadopted");
+    } else {
+        println!(
+            "benefit gate {item}: {} across {} recorded comparison(s)",
+            if benefit_gate::default_allowed(&gates, item) {
+                "adopted"
+            } else {
+                "unadopted"
+            },
+            recorded_here
+        );
+    }
+    for record in &gates {
+        println!(
+            "benefit-gate record item={} outcome={} quality={}",
+            record.item,
+            record.outcome,
+            record.quality.as_str()
         );
     }
     Ok(0)
@@ -739,6 +796,15 @@ fn display_text(value: &str) -> String {
     }
     let truncated: String = value.chars().take(LIMIT).collect();
     format!("{truncated}... [truncated: {total} chars total]")
+}
+
+/// Seconds since the Unix epoch: pacing freshness and expiry are evaluated at
+/// the moment the ledger reads them.
+fn epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// `--name value` options, each name at most once.
