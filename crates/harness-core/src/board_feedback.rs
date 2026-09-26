@@ -3758,18 +3758,9 @@ mod tests {
 
     #[test]
     fn pacing_observations_decisions_and_gate_records_round_trip_on_the_board() {
-        use crate::benefit_gate::{
-            ArmTiming, ComparisonRecord, GateOutcome, MatchedTask, default_allowed, evaluate,
-            format_gate_comment, parse_gate_comments,
-        };
-        use crate::pacing::{
-            NewAssignment, PacingLimits, applicable, format_revoke_comment, parse_pacing_comments,
-            plan,
-        };
-        use crate::scoped_observations::{
-            DEFAULT_MAX_AGE_SECONDS, DashboardSnapshotDraft, account_view, dashboard_snapshot,
-            list_observations, provider_refusal, record_observation,
-        };
+        use crate::benefit_gate::{default_allowed, parse_gate_comments};
+        use crate::pacing::{applicable, parse_pacing_comments};
+        use crate::scoped_observations::{account_view, parse_observation_comments};
 
         let Some(bd) = bd_executable() else {
             panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
@@ -3794,86 +3785,61 @@ mod tests {
         let item_id = string_field(&item, "id").unwrap();
         let now = 1_789_853_000;
         let reset = now + 1800;
-        let snapshot = dashboard_snapshot(DashboardSnapshotDraft {
-            scope: "gpt".into(),
-            used_percent: Some(93),
-            resets_at: Some(reset),
-            window_minutes: Some(10_080),
-            observed_at: now - 30,
-            max_age_seconds: DEFAULT_MAX_AGE_SECONDS,
-        })
-        .unwrap();
-        let refusal = provider_refusal("xai", 1, now - 60, DEFAULT_MAX_AGE_SECONDS).unwrap();
-        record_observation(&bd, &project, &item_id, &snapshot).unwrap();
-        record_observation(&bd, &project, &item_id, &refusal).unwrap();
-        let read = list_observations(&bd, &project, &item_id).unwrap();
-        assert_eq!(read, vec![snapshot.clone(), refusal.clone()]);
-        let view = account_view(&read, "gpt", now);
-        assert_eq!(view.used_percent, Some(93));
-        assert_eq!(view.resets_at, Some(reset));
-        assert_eq!(account_view(&read, "xai", now).used_percent, None);
-        assert_eq!(account_view(&read, "xai", now).refusals, 1);
-
-        let limits = PacingLimits::configured(2, 8).unwrap();
-        let assignments = [NewAssignment {
-            id: "next-lane-task".into(),
-            scope: "gpt".into(),
-            requested_effort: Some("xhigh".into()),
-        }];
-        let paced = plan(&limits, &read, &[], &assignments, now);
-        assert_eq!(paced.scopes[0].concurrency_limit, 1);
-        assert!(!paced.decisions.is_empty());
-        for decision in &paced.decisions {
-            json_ok(
-                &bd,
-                &project,
-                &["comment", &item_id, "--json", &decision.to_comment()],
-            )
-            .unwrap();
-        }
-        let comments = list_comments(&bd, &project, &item_id).unwrap();
-        let records = parse_pacing_comments(&comments);
-        assert_eq!(records.decisions, paced.decisions);
-        assert_eq!(applicable(&records, now).len(), paced.decisions.len());
-
-        let withdrawal =
-            format_revoke_comment("gpt", paced.decisions[0].knob, "observation superseded");
-        json_ok(&bd, &project, &["comment", &item_id, "--json", &withdrawal]).unwrap();
-        let comments = list_comments(&bd, &project, &item_id).unwrap();
-        let records = parse_pacing_comments(&comments);
-        assert_eq!(records.revoked, vec![paced.decisions[0].id()]);
-        assert_eq!(applicable(&records, now).len(), paced.decisions.len() - 1);
-
-        let comparison = ComparisonRecord {
-            item: "codex-harness-pvr.5".into(),
-            improvement: "lane-reuse".into(),
-            baseline_label: "fresh-worktree".into(),
-            candidate_label: "lane-reuse".into(),
-            tolerance_percent: 10.0,
-            matched: vec![MatchedTask {
-                task: "verify-crate-tests".into(),
-                baseline_passed: true,
-                candidate_passed: true,
-                baseline: ArmTiming::new(212.0, 1.0, 0.0).unwrap(),
-                candidate: ArmTiming::new(3.0, 0.5, 0.0).unwrap(),
-            }],
+        let comment = |text: &str| {
+            json_ok(&bd, &project, &["comment", &item_id, "--json", text]).unwrap();
         };
-        let outcome = evaluate(&comparison);
-        assert!(matches!(outcome, GateOutcome::Adopt { .. }));
-        json_ok(
-            &bd,
-            &project,
-            &[
-                "comment",
-                &item_id,
-                "--json",
-                &format_gate_comment(&comparison, &outcome),
-            ],
-        )
-        .unwrap();
-        let comments = list_comments(&bd, &project, &item_id).unwrap();
-        let gate = parse_gate_comments(&comments);
-        assert!(default_allowed(&gate, "codex-harness-pvr.5"));
+
+        // The documented board-comment format, as the board-workflow skill
+        // records it, is the only input the ledger reads back.
+        comment(&format!(
+            "pacing-observation v1 scope=gpt source=dashboard-snapshot used=93 resets_at={reset} window_minutes=10080 refusals=0 observed_at={} max_age=3600",
+            now - 30
+        ));
+        comment(&format!(
+            "pacing-observation v1 scope=xai source=provider-refusal used=unknown resets_at=unknown window_minutes=unknown refusals=1 observed_at={} max_age=3600",
+            now - 60
+        ));
+        let observations =
+            parse_observation_comments(&list_comments(&bd, &project, &item_id).unwrap());
+        assert_eq!(observations.len(), 2);
+        let gpt = account_view(&observations, "gpt", now);
+        assert_eq!(gpt.used_percent, Some(93));
+        assert_eq!(gpt.resets_at, Some(reset));
+        let xai = account_view(&observations, "xai", now);
+        assert_eq!(xai.used_percent, None);
+        assert_eq!(xai.refusals, 1);
+
+        comment(
+            "pacing-decision v1 id=gpt:concurrency scope=gpt knob=concurrency from=4 to=1 expires_at=none reason=pressure basis=dashboard",
+        );
+        comment(
+            "pacing-decision v1 id=gpt:effort scope=gpt knob=effort from=xhigh to=high expires_at=none reason=pressure basis=dashboard",
+        );
+        comment(&format!(
+            "pacing-decision v1 id=gpt:new-assignments scope=gpt knob=new-assignments from=admit to=defer:2 expires_at={} reason=critical basis=dashboard",
+            now - 1
+        ));
+        comment("pacing-revoke v1 id=gpt:effort reason=observation superseded");
+        let records = parse_pacing_comments(&list_comments(&bd, &project, &item_id).unwrap());
+        assert_eq!(records.decisions.len(), 3);
+        assert_eq!(records.revoked, vec!["gpt:effort".to_owned()]);
+        let usable = applicable(&records, now);
+        assert_eq!(
+            usable.len(),
+            1,
+            "withdrawn and expired decisions stop applying"
+        );
+        assert_eq!(usable[0].id(), "gpt:concurrency");
+        assert!(usable[0].to_comment().contains("from=4 to=1"));
+
+        for (outcome, quality) in [("reject", "regressed"), ("adopt", "unchanged")] {
+            comment(&format!(
+                "benefit-gate v1 item={item_id} improvement=lane-reuse outcome={outcome} quality={quality} matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=99.0 regression_percent=-1.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=measured over two matched tasks"
+            ));
+        }
+        let gate = parse_gate_comments(&list_comments(&bd, &project, &item_id).unwrap());
+        assert_eq!(gate.len(), 2);
+        assert!(default_allowed(&gate, &item_id), "the latest adoption wins");
         assert!(!default_allowed(&gate, "codex-harness-qr6.1"));
     }
 }
