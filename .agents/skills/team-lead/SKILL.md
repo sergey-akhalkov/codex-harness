@@ -27,36 +27,34 @@ Lead tokens are the most expensive in the loop and the lead is normally the
 strongest model: keep judgment, decomposition, integration and acceptance,
 work that genuinely exceeds executor capability, and work whose delegation
 overhead - brief, board record, review, merge - exceeds the work itself.
-Delegate every other parallelizable slice, wait on native watcher events
-instead of model-side polling, and stop spending once the agreed outcome is
-proven rather than polishing beyond it.
+Delegate every other substantial eligible slice before starting it; when no
+useful independent lead work remains, wait quietly on native events instead of
+polling; stop once the agreed outcome is proven rather than polishing beyond it.
 
-## Keep executors utilized
+## Delegation first
 
-While this role is active, executor capacity is not left idle by omission.
-Check utilization at session start, at stage and epic planning, after every
-dispatch decision, and after every acceptance or slot release: either dispatch
-the next worthwhile, capability-sized slice to available capacity or record the
-concrete reason it stays idle - no worthwhile slice exists now, remaining
-slices depend on unresolved work, configured pacing holds new assignments, the
-slot is preserved or blocked with its recorded state, or dispatch is
-unavailable with the reported cause. Record that reason as a short board note
-on the owning stage or feature - preserved slots already carry theirs in pool
-state - and refresh it when its circumstance changes, not per task. While
-capacity idles without a recorded reason, dispatch executor-suitable routine
-work instead of keeping it for yourself, and backfill a released slot before
-starting unrelated implementation work. Work whose delegation overhead exceeds
-the work itself - a one-line correction, a direct answer or a quick read - is
-not executor-suitable: do it directly, with no task, assignment or board note.
+While this role is active, executor capacity is not left idle by omission:
+before the lead starts substantial implementable work that fits an executor
+profile, it dispatches that work to available capacity, and a slot released
+after acceptance or explicit discard is backfilled with the next worthwhile
+slice before unrelated lead implementation starts. An idle capacity has a
+nameable cause - no worthwhile slice now, remaining slices depend on unresolved
+work, configured pacing holds new assignments, the slot is preserved or blocked
+with its recorded state, or dispatch is unavailable with its reported cause -
+and board and `executor pool` state already show it: there is no checkpoint
+ritual, per-report occupancy statement or reason note to keep current. When a
+stage or result summary would otherwise mislead about capacity that sat unused,
+name its cause in a clause.
 
-Occupancy is observable: every progress report states how many configured slots
-are busy and the recorded reason for each idle executor or free slot, derived
-from board records and `executor pool` - never from window polling or status
-requests to active executors. Utilization creates no filler work and no
-delegation-count target, never preempts a healthy executor, and yields to
-completion, correctness and configured pacing. This duty belongs to the active
-lead role only: an ordinary session without activation reports no utilization
-and spawns nothing.
+Utilization creates no filler work and no delegation-count target, never
+preempts a healthy executor, and yields to completion, correctness and
+configured pacing; occupancy is read from board and `executor pool` records,
+never from window polling or status requests to active executors. Work whose
+delegation overhead - brief, board record, review, merge - exceeds the work
+itself stays with the lead: a one-line correction, a direct answer, a quick
+read or a small, tightly coupled slice needs no task, assignment or note. This
+duty belongs to the active lead role only: an ordinary session without
+activation reports no utilization and spawns nothing.
 
 ## Discover roles
 
@@ -203,11 +201,8 @@ complete outcomes each. Sequence only genuinely dependent slices; respect
 `max_concurrent_executors` and shared accounts or machines; the lead owns
 integration and acceptance conflicts.
 The free-text prompt or structured objective points at board ids; the beads
-issue remains the durable assignment.
-Assignments require bounded milestone self-reports: after each numbered
-outcome inside the assignment, the executor posts a short board comment on
-its issue (done, next, blockers in at most three lines) instead of waiting
-for the lead to ask.
+issue remains the durable assignment, where executors post durable blockers,
+decisions and results - not routine progress.
 The owned surface closes after the result is persisted, including a recorded
 failure; inspect the receipt. Continue a mid-work stop with the exact-session
 resume below.
@@ -271,11 +266,19 @@ or set the expected duration and give the shell call enough timeout; watch
 stays silent until the report. If the shell timeout ends the wait early or
 watch exits 2 with the run still running, rerun the same watch; never shrink
 waiting into short fixed-interval polling. `executor pool` is the cheap
-snapshot between other work. A rollout silent beyond about 15 minutes is a
-stuck-suspect: read its recent reasoning and diff, and only for a confirmed
-anomaly send one bounded question - blockers and next step, at most five lines;
-timed status polling is waste. While executors run, the lead analyzes
-bottlenecks, spend and next cuts, and files those as board tasks.
+snapshot between other work. Routine supervision is at most one compact check
+every 15 minutes of wall-clock time, batched across active runs; the interval
+is not a deadline and nothing needs doing when it passes. Check earlier only
+for a delivered result, an explicit error, a help request, a new user
+instruction or other new fact that changes the work, or a concrete risk to
+correctness or shared resources. A check reads bounded state and activity -
+the watch result, `executor pool`, the issue's durable records - not the
+executor's reasoning, diffs or logs, and it ends in a decision: answer, steer,
+stop or keep waiting. Silence, elapsed time, log growth and a missing patch
+prove neither progress nor a stall and never justify an interruption, stop,
+resume, steering message or status question. When the lead's useful
+independent work ends, it waits quietly at the recorded lifecycle instead of
+manufacturing work to fill the gap.
 
 ## Pace spend
 

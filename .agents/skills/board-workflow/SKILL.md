@@ -199,7 +199,7 @@ Custom status `lead_review` (wip): configure with
 | --- | --- |
 | Lead | Creates epics/features/tasks, assigns executor work, records its own follow-ups as tasks assigned to `lead` so a later lead session does not repeat them |
 | Executor | Claims assigned work, implements the outcome, sets `lead_review` when done. Does not `bd close` its own assignment |
-| Lead | Periodically lists `lead_review` and `assignee=lead`, reviews, merges, closes or returns to `in_progress` with feedback |
+| Lead | Reviews `lead_review` and `assignee=lead` as results arrive (the native wait event) and at stage boundaries, then merges, closes or returns to `in_progress` with feedback |
 
 On a new lead session: read the board first (`lead_review`, assignee `lead`,
 ready work). Create new tasks for new situation; do not re-open completed

@@ -23,7 +23,7 @@ Prefer native `apply_patch` for bounded text edits. Use semantic edits or determ
 
 ## Repeated preparation and sessions
 
-When setup, repeated work or waits dominate, including during a running task, read [prepared-session reuse](references/session-reuse.md). Compare valid reuse, reset and restart by remaining completion cost, and use targeted delegation only when its result advances the parent. The project-verification skill owns check selection and failure attribution; complete parent acceptance without adding a general helper merely because a task has several steps.
+When setup, repeated work or waits dominate, including during a running task, read [prepared-session reuse](references/session-reuse.md). Compare valid reuse, reset and restart by remaining completion cost. When delegation is available, authorized and useful, a substantial eligible slice belongs with a worker through the `team-lead` skill, and a bounded assignment is worth its handoff only when its result advances the parent; delegation is never periodic filler or a reason to delay a cheaper direct task. The project-verification skill owns check selection and failure attribution; complete parent acceptance without adding a general helper merely because a task has several steps.
 
 ## Reasoning at task boundaries
 
