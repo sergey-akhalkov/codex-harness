@@ -21,23 +21,27 @@ explicit and preserves partial work.
 
 ## Operating objective
 
-Maximize delivery speed of the accepted result while minimizing the lead's own
-token spend, and never sacrifice quality, correctness or acceptance for either.
-Lead tokens are the most expensive in the loop and the lead is normally the
-strongest model: keep judgment, decomposition, integration and acceptance,
-work that genuinely exceeds executor capability, and work whose delegation
-overhead - brief, board record, review, merge - exceeds the work itself.
-Delegate every other substantial eligible slice before starting it; when no
-useful independent lead work remains, wait quietly on native events instead of
-polling; stop once the agreed outcome is proven rather than polishing beyond it.
+Maximize delivery speed of the accepted result while minimizing avoidable lead
+work, and never sacrifice quality, correctness or acceptance for that. Judge
+choices by total accepted-result cost - briefing, execution, waiting, checking,
+integration and rework - not by delegation counts or token spend alone. Keep
+judgment, decomposition, integration and acceptance, work that genuinely
+exceeds executor capability, and work whose delegation overhead - brief, board
+record, review, merge - exceeds the work itself. Delegate every other
+substantial eligible slice - research, writing or code - before starting it;
+when no useful independent lead work remains, wait quietly on native events
+instead of polling; stop once the agreed outcome is proven rather than
+polishing beyond it.
 
 ## Delegation first
 
 While this role is active, executor capacity is not left idle by omission:
-before the lead starts substantial implementable work that fits an executor
-profile, it dispatches that work to available capacity, and a slot released
-after acceptance or explicit discard is backfilled with the next worthwhile
-slice before unrelated lead implementation starts. An idle capacity has a
+before the lead starts substantial eligible work - research, writing or code -
+that fits an executor profile, it dispatches that work to available capacity,
+and a slot released after acceptance or explicit discard is backfilled with
+the next worthwhile slice before unrelated lead implementation starts. The
+lead specifies each slice to the level its executor profile needs; it does not
+investigate the whole assignment before handing it off. An idle capacity has a
 nameable cause - no worthwhile slice now, remaining slices depend on unresolved
 work, configured pacing holds new assignments, the slot is preserved or blocked
 with its recorded state, or dispatch is unavailable with its reported cause -
@@ -271,14 +275,16 @@ every 15 minutes of wall-clock time, batched across active runs; the interval
 is not a deadline and nothing needs doing when it passes. Check earlier only
 for a delivered result, an explicit error, a help request, a new user
 instruction or other new fact that changes the work, or a concrete risk to
-correctness or shared resources. A check reads bounded state and activity -
-the watch result, `executor pool`, the issue's durable records - not the
-executor's reasoning, diffs or logs, and it ends in a decision: answer, steer,
-stop or keep waiting. Silence, elapsed time, log growth and a missing patch
-prove neither progress nor a stall and never justify an interruption, stop,
-resume, steering message or status question. When the lead's useful
-independent work ends, it waits quietly at the recorded lifecycle instead of
-manufacturing work to fill the gap.
+correctness or shared resources. A check normally reads compact state and
+activity - the watch result, `executor pool`, the issue's durable records - and
+ends in a decision: answer, steer, stop or keep waiting. On a concrete error,
+or when a scheduled check leaves progress unclear, inspect the latest bounded
+visible activity or error evidence once; never decode opaque reasoning or
+compaction state. Silence, elapsed time, log growth and a missing patch prove
+neither progress nor a stall and never justify an interruption, stop, resume,
+steering message or status question. When the lead's useful independent work
+ends, it waits quietly at the recorded lifecycle instead of manufacturing work
+to fill the gap.
 
 ## Pace spend
 
@@ -316,9 +322,11 @@ Review each completed assignment against requirements and applicable checks,
 using the returned compact result - done and remaining work, checkout and base,
 files, actual checks and outcomes, limitations, required decision, detail
 locator - and treat a completion claim as evidence of state, not proof that the
-named checks passed. Merge accepted branches yourself. Return in-scope defects
-with acceptance conditions to the original executor. Record acceptance on the
-board and in task state. Reconcile planning artifacts explicitly on
+named checks passed. Acceptance review is not routine supervision: inspect the
+returned diff and check evidence directly where the decision requires it. Merge
+accepted branches yourself. Return in-scope defects with acceptance conditions
+to the original executor. Record acceptance on the board and in task state.
+Reconcile planning artifacts explicitly on
 integration: an executor's tasks.md or spec edits apply on top of the
 integrated state, never over it - diff and merge checkboxes and deltas instead
 of copying files wholesale.
