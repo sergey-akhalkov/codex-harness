@@ -190,11 +190,19 @@ The requirement that every active model conversation appear on its own visible t
 
 ### Requirement: Patient ownership of delegated outcomes
 
-Elapsed time, an expired observation wait, an intermediate answer or missing final prose SHALL NOT alone authorize takeover, duplicate execution, cancellation or reassignment. The lead SHALL wait without repeated model status calls when no independent useful work remains. Steering SHALL add relevant facts, resolve a request or correct an established mistake. Incomplete output SHALL first be reconciled with visible work and the owning result-delivery mechanism. A stopped or failed attempt SHALL be recovered or reassigned with its partial result and a concrete cause; it SHALL NOT silently become work for GPT. A verified reasoning limitation can justify bounded assistance, and user stop or redirection SHALL still take effect.
+Elapsed time, an expired observation wait, an intermediate answer or missing final prose SHALL NOT alone authorize takeover, duplicate execution, cancellation or reassignment. The lead SHALL wait without repeated model status calls when no independent useful work remains, keeping one watcher on the run's recorded outcome and blocking on it rather than polling, duplicating the delegated investigation or manufacturing status work. Routine supervision SHALL occur at most once per 15 minutes of wall-clock time, batched across active executors, and SHALL read one compact state/activity summary rather than worker source, diffs or full logs; an earlier check SHALL require a delivered result, explicit error, help request, new or corrected user instruction or concrete risk to correctness or shared resources. Silence, elapsed time and missing intermediate evidence SHALL NOT establish a stall, and the interval SHALL NOT act as a task deadline. Steering SHALL add relevant facts, resolve a request or correct an established mistake. Incomplete output SHALL first be reconciled with visible work and the owning result-delivery mechanism. A stopped or failed attempt SHALL be recovered or reassigned with its partial result and a concrete cause; it SHALL NOT silently become work for GPT. A verified reasoning limitation can justify bounded assistance, and user stop or redirection SHALL still take effect.
 
 #### Scenario: A correct worker takes longer than an observation interval
-- **WHEN** an executor remains active beyond several observation waits without a demonstrated failure
-- **THEN** its ownership is preserved, no competing solution starts, and waiting generates no repeated model status requests
+- **WHEN** an executor remains active beyond several observation waits, or a quiet rollout reaches the 15-minute supervision boundary, without a demonstrated failure
+- **THEN** its ownership is preserved, no competing solution starts, waiting generates no repeated model status requests, and a routine check reads one compact state/activity summary at most
+
+#### Scenario: The lead has no independent work left
+- **WHEN** the lead's useful independent work is exhausted while executors run and no event has been delivered
+- **THEN** the lead keeps blocking on a watcher event without polling, duplicating the delegated investigation or manufacturing status work
+
+#### Scenario: An event justifies checking earlier
+- **WHEN** a delivered result, explicit error, help request, new or corrected user instruction or concrete risk to correctness or shared resources occurs before the routine boundary
+- **THEN** the lead checks then and acts on that concrete cause instead of waiting for the interval
 
 #### Scenario: A child returns only a progress message
 - **WHEN** a child ends with an intermediate response and partial artifacts but no provider rejection

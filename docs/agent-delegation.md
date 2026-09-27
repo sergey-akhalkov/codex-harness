@@ -119,8 +119,10 @@ is open. Presentation, closure, watch and exact-session recovery are the
 [observed lifecycle](#observed-executor-lifecycle).
 While an executor runs, one native watcher process checks the board review
 queue, the assignment's result artifact and executor liveness and emits a
-single event; the lead blocks on that event between other work instead of
-polling executor process ids from model turns or reading window pixels.
+single event; the lead blocks on that event between other work and keeps
+blocking when no useful independent work remains, instead of polling executor
+process ids from model turns, duplicating the assignment's investigation or
+reading window pixels.
 Assignments live on the beads board; executors set `lead_review` when done
 instead of closing. The lead reviews that inbox and its own `assignee=lead`
 tasks.
@@ -269,7 +271,7 @@ codex-harness executor watch --receipt FILE [--json]
 
 `--receipt` is absolute; `--owner`, `--timeout` and `--poll` match executor help. Address fields are optional when recorded state identifies one live run. Watch returns bounded state/identity/checkout/base/changed-file/result locators and the executor report, explicitly separating committed and working changes. Exit 0 completes, 1 names failure/defect/interruption, 2 means missing/unavailable coverage or timeout while the run continues, and 3 means an unanswered reply request: answer its printed reference and watch again. Timeout does not stop or resume the run.
 
-Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time and a missing patch prove neither progress nor a stall.
+Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time, silence and a missing patch prove neither progress nor a stall.
 
 `executor run --file` is the visible host. It propagates the launcher outcome, treats an empty completion as an output defect, and never presents a completion record as proof that claimed checks passed. Exact-session recovery is the worktree resume command; cache loss uses the fresh restart below.
 ## Steering and stopping executors
@@ -367,11 +369,14 @@ bounded principal consultation; it is never delegated as-is. Investigation
 inside a delegated slice's boundaries remains executor work.
 
 Combine related routine into one substantial assignment and state material
-input bounds up front. Routine supervision runs once every 15 minutes, as
-described with `executor watch` above. Check earlier only for a delivered
-result, explicit error, help request, new user instruction or concrete risk to
-correctness or shared resources. Do independent work between events; do not
-repeatedly reread worker source, diffs or logs.
+input bounds up front. Routine supervision runs at most once per 15 minutes of
+wall-clock time, batched across active executors, as described with
+`executor watch` above. Check earlier only for a delivered result, explicit
+error, help request, new or corrected user instruction or concrete risk to
+correctness or shared resources. Do independent work between events; when none
+remains, keep blocking on the watcher instead of polling, rereading worker
+source, diffs or logs, duplicating the investigation or manufacturing status
+work. The interval is not a task deadline, and silence is not a stall.
 
 That interval is not the assignment deadline. A message to a working agent must
 add facts, correct an established error or change the task. An empty or

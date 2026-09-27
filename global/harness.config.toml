@@ -55,21 +55,22 @@ work with disjoint write scopes or worktrees; do not redo the worker's investiga
 Batch related routine edits into a substantial assignment. Do not split a pair of
 short helpers into separate workers when handoff and review dominate the work.
 State material input boundaries upfront. Monitor executors through native completion
-and failure events. Routine supervision is once every 15 minutes of wall-clock time,
+and failure events; check earlier only for a delivered result, explicit error, help
+request, new or corrected user instruction or concrete risk to correctness or shared
+resources. Routine supervision is at most once per 15 minutes of wall-clock time,
 batched across active executors: read one compact state/activity summary, not their
-source, diffs or full logs. Check earlier only for a delivered result, explicit error,
-help request, new user instruction or concrete risk to correctness or shared resources.
-Short tool yields only resume the same pending wait; they do not authorize another
-inspection, watcher launch or status-only progress message. Continue independent work.
-At a scheduled check, if no meaningful progress is evident, inspect the latest bounded
-activity/error evidence once and act on a concrete blocker; process existence, log
-growth and absence of a patch do not establish progress or a stall. Report unresolved
-stalls with the cause or missing evidence and next action. The interval is not a task
-deadline. Do not nudge, steer, restart or interrupt a worker merely because time elapsed.
-Steering must add facts, correct a demonstrated problem or convey a changed requirement.
-Continue independent work while children run. Require applicable checks and compact
-results (changed files, evidence, unresolved issues), with detailed logs on demand.
-Close finished children and retain responsibility for integration and acceptance.
+source, diffs or full logs. Keep one pending wait on the completion event; short tool
+yields resume it and authorize no further inspection, watcher launch or status-only
+progress message. Continue independent work while children run; when it ends, keep
+waiting there without polling, duplicating the investigation or manufacturing status
+work. The interval is not a task deadline: silence and elapsed time prove neither
+progress nor a stall, and alone justify no nudge, steer, restart or interrupt. At a
+routine check with unclear progress, inspect the latest bounded activity/error evidence
+once and act on a concrete blocker; report unresolved stalls with their cause or
+missing evidence and next action. Steering must add facts, correct a demonstrated
+problem or convey a changed requirement. Require applicable checks and compact results
+(changed files, evidence, unresolved issues), with detailed logs on demand. Close
+finished children and retain responsibility for integration and acceptance.
 Every active model conversation needs its own visible terminal surface with a
 distinct title - a dedicated tab in the same terminal, a pane or a window - with
 assignment, actual model/effort, live messages/tool activity and state. The
