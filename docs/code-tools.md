@@ -126,8 +126,19 @@ introduce a shared Codex app-server.
 | Tool | Reuse and resource contract |
 | --- | --- |
 | harness-lsp | Retired; no managed registration or backend. Cached hook callbacks are silent compatibility guards. |
-| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers, 300-second idle expiry, a 4 GiB Windows Job and 25% CPU per worker. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access. Clients retain their own project selection and conversation state. A worker whose language-server manager failed during project initialization is replaced and the same semantic call is retried once. The generated worker home excludes memory, onboarding, introspection and text-search tools through Serena's own `excluded_tools` and supplies the managed connection prompt, so the worker's catalogue and guidance are forwarded unchanged; native Git records stay authoritative and scoped `rg` owns literal text. |
+| Serena | One authenticated local broker per `CODEX_HOME`, with at most three project workers, 300-second idle expiry, a 4 GiB Windows Job and 25% CPU per worker. Each worker retains a fixed project; matching project/mode/configuration requests share serialized access, while independent workers start, serve and retire concurrently instead of serializing on one pool lock. Capacity counts active, starting and retiring generations until their ownership is released; compatible concurrent cold requests share one startup, only idle generations are replaced, and waiting respects the request deadline and cancellation, so an expired request never executes later. Clients retain their own project selection, route order and conversation state, and every response preserves its originating client. A worker whose language-server manager failed during project initialization is replaced and the same semantic call is retried once; other failures, including uncertain mutations, are returned without retry. The generated worker home excludes memory, onboarding, introspection and text-search tools through Serena's own `excluded_tools` and supplies the managed connection prompt, so the worker's catalogue and guidance are forwarded unchanged; native Git records stay authoritative and scoped `rg` owns literal text. |
 | Nuphus | Native tools and the session's owned browser start lazily. Browser operations use a private browser profile and verified endpoint; session/snapshot references expire after navigation or browser retirement. Foreign or expired references require a fresh snapshot. Desktop operations share account-wide admission. Desktop or window screenshots without a destination path return a native image content block; a caller-supplied owned path remains path-only. Image bytes, base64 and nested JSON text are not model-visible. Conversation visibility is not a Nuphus screenshot task. |
+
+The broker's authenticated local `status` operation is the capacity-decision
+evidence surface for that pool. It reports bounded per-instance counters
+(hit, cold-start, eviction, startup-failure), active/reserved/idle worker
+counts plus starting and retiring generations against the configured limit,
+queue/startup/request duration totals, and a reset identity with the
+observation start, so a restarted broker presents its own interval instead of
+lifetime totals. Memory stays explicitly unavailable with the configured
+4 GiB per-worker Job limit; no telemetry service or per-call metric report is
+added, worker and executor limits are unchanged, and no status value implies
+token savings.
 
 Windows ownership guards reclaim owned descendant processes on owner exit or
 crash, including language servers and private browsers. Pool eviction closes the

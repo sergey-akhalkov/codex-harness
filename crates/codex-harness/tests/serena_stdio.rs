@@ -13,7 +13,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
 };
@@ -92,6 +92,7 @@ fn python_project(root: &Path, name: &str, marker: i32) -> PathBuf {
 struct Proxy {
     child: Child,
     responses: mpsc::Receiver<String>,
+    stderr: Arc<Mutex<Vec<String>>>,
 }
 
 impl Proxy {
@@ -122,6 +123,19 @@ impl Proxy {
             .spawn()
             .expect("proxy spawn");
         let stdout = child.stdout.take().unwrap();
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let error_lines = Arc::clone(&stderr);
+        let error_stream = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            let reader = BufReader::new(error_stream);
+            for line in reader.lines().map_while(Result::ok) {
+                let mut lines = error_lines.lock().unwrap();
+                lines.push(line);
+                if lines.len() > 40 {
+                    lines.remove(0);
+                }
+            }
+        });
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -139,19 +153,24 @@ impl Proxy {
         Self {
             child,
             responses: receiver,
+            stderr,
         }
     }
 
     fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
         {
             let stdin = self.child.stdin.as_mut().expect("proxy stdin");
-            writeln!(
+            let written = writeln!(
                 stdin,
                 "{}",
                 json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
-            )
-            .unwrap();
-            stdin.flush().unwrap();
+            );
+            if let Err(error) = written.and_then(|_| stdin.flush()) {
+                panic!(
+                    "proxy write for request {id} ({method}) failed: {error}; proxy stderr: {:?}",
+                    self.stderr.lock().unwrap()
+                );
+            }
         }
         self.response(id)
     }
@@ -167,7 +186,10 @@ impl Proxy {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("proxy closed before answering request {id}");
+                    panic!(
+                        "proxy closed before answering request {id}; proxy stderr: {:?}",
+                        self.stderr.lock().unwrap()
+                    );
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
             }
@@ -185,7 +207,11 @@ impl Proxy {
                 None => thread::sleep(Duration::from_millis(50)),
             }
         };
-        assert!(status.success(), "proxy exit: {status:?}");
+        assert!(
+            status.success(),
+            "proxy exit: {status:?}; proxy stderr: {:?}",
+            self.stderr.lock().unwrap()
+        );
     }
 }
 
@@ -208,6 +234,39 @@ fn broker_status(codex_home: &Path) -> Value {
         &Cancellation::default(),
     )
     .unwrap()
+}
+
+/// The pool status entry serving one canonical project root.
+fn worker_pid(status: &Value, project: &Path) -> Option<u64> {
+    let expected = fs::canonicalize(project).unwrap();
+    status["backend"]["workers"]
+        .as_array()?
+        .iter()
+        .find_map(|worker| {
+            let path = PathBuf::from(worker["project"].as_str()?);
+            (fs::canonicalize(path).ok()? == expected).then(|| worker["pid"].as_u64())?
+        })
+}
+
+fn symbol_text(proxy: &mut Proxy, id: u64) -> String {
+    let response = proxy.request(
+        id,
+        "tools/call",
+        json!({
+            "name": "find_symbol",
+            "arguments": {
+                "relative_path": "src/lib.rs",
+                "name_path_pattern": "shared",
+                "include_body": true
+            }
+        }),
+    );
+    response["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect()
 }
 
 #[test]
@@ -503,4 +562,147 @@ fn grown_location_record_still_completes_handshake_after_deliveries() {
     for location in locations {
         let _ = fs::remove_dir_all(location);
     }
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn shared_broker_keeps_independent_roots_and_replaces_changed_configuration() {
+    let console = adopted_console();
+    let registry = PathBuf::from(
+        std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit adopted registry"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("Serena broker independence root: {}", root.path().display());
+    let codex_home = root.path().join("codex-home");
+    let alpha_project = crate_project(root.path(), "broker alpha", 501);
+    let beta_project = crate_project(root.path(), "broker beta", 502);
+    let initialize = json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "broker-independence", "version": "0.1.0"}
+    });
+
+    // Two clients of one root share a worker; an independent root gets its own.
+    // Each proxy prepares the shared generated home before the next starts;
+    // concurrent first materialization of one CODEX_HOME is not part of this
+    // acceptance.
+    let mut first = Proxy::start(
+        root.path(),
+        &codex_home,
+        &registry,
+        &alpha_project,
+        &console,
+    );
+    let reply = first.request(1, "initialize", initialize.clone());
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let mut second = Proxy::start(
+        root.path(),
+        &codex_home,
+        &registry,
+        &alpha_project,
+        &console,
+    );
+    let reply = second.request(1, "initialize", initialize.clone());
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let mut third = Proxy::start(root.path(), &codex_home, &registry, &beta_project, &console);
+    let reply = third.request(1, "initialize", initialize.clone());
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    let alpha_text = symbol_text(&mut first, 2);
+    assert!(alpha_text.contains("501"), "{alpha_text}");
+    let shared_text = symbol_text(&mut second, 2);
+    assert!(shared_text.contains("501"), "{shared_text}");
+    let beta_text = symbol_text(&mut third, 2);
+    assert!(beta_text.contains("502"), "{beta_text}");
+    let status = broker_status(&codex_home);
+    assert_eq!(status["backend"]["workers"].as_array().unwrap().len(), 2);
+    let alpha_worker = worker_pid(&status, &alpha_project).expect("alpha worker");
+    let beta_worker = worker_pid(&status, &beta_project).expect("beta worker");
+    assert_ne!(alpha_worker, beta_worker);
+    assert!(status["backend"]["counters"]["hits"].as_u64().unwrap() >= 1);
+    assert_eq!(status["backend"]["counts"]["limit"], 3);
+    assert_eq!(status["backend"]["memory"]["observation"], "unavailable");
+    assert_eq!(
+        status["backend"]["memory"]["configured_limit_bytes"],
+        json!(4096u64 * 1024 * 1024)
+    );
+    assert_eq!(
+        status["backend"]["interval"]["identity"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64,
+        "{status}"
+    );
+    assert!(
+        status["backend"]["durations"]["request"]["count"]
+            .as_u64()
+            .unwrap()
+            >= 3
+    );
+
+    // One client's ordered activation resolves the canonical root of another
+    // project and moves only that client; shared clients keep their results.
+    let activated = third.request(
+        3,
+        "tools/call",
+        json!({
+            "name": "activate_project",
+            "arguments": {"project": alpha_project.to_string_lossy()}
+        }),
+    );
+    assert!(activated.get("error").is_none(), "{activated}");
+    assert_ne!(activated["result"]["isError"], json!(true), "{activated}");
+    let moved = symbol_text(&mut third, 4);
+    assert!(moved.contains("501"), "{moved}");
+    let held = symbol_text(&mut first, 3);
+    assert!(held.contains("501"), "{held}");
+    let status = broker_status(&codex_home);
+    assert_eq!(status["backend"]["workers"].as_array().unwrap().len(), 2);
+    assert_eq!(worker_pid(&status, &alpha_project), Some(alpha_worker));
+    assert_eq!(worker_pid(&status, &beta_project), Some(beta_worker));
+
+    // A changed project configuration identity replaces that root's worker
+    // without moving the other root's client.
+    fs::write(
+        alpha_project.join(".serena/project.yml"),
+        "project_name: 'broker alpha'\nlanguage_servers:\n- rust\nencoding: utf-8\n# configuration revision 2\n",
+    )
+    .unwrap();
+    let replaced = symbol_text(&mut first, 4);
+    assert!(replaced.contains("501"), "{replaced}");
+    let status = broker_status(&codex_home);
+    let replacement = worker_pid(&status, &alpha_project).expect("replacement worker");
+    assert_ne!(replacement, alpha_worker, "{status}");
+    assert_eq!(worker_pid(&status, &beta_project), Some(beta_worker));
+    assert!(
+        status["backend"]["counters"]["cold_starts"]
+            .as_u64()
+            .unwrap()
+            >= 3
+    );
+    let followed = symbol_text(&mut second, 5);
+    assert!(followed.contains("501"), "{followed}");
+    let final_status = broker_status(&codex_home);
+    assert_eq!(
+        worker_pid(&final_status, &alpha_project),
+        Some(replacement),
+        "{final_status}"
+    );
+
+    first.finish();
+    second.finish();
+    third.finish();
+    let anchor = codex_home.join("harness/runtime/serena-broker.json");
+    let record: Value = serde_json::from_slice(&fs::read(&anchor).unwrap()).unwrap();
+    let broker = BrokerRoot::open(Path::new(record["root"].as_str().unwrap())).unwrap();
+    let retirement = broker_launch::retire(
+        &broker,
+        Deadline::after(Duration::from_secs(60)).unwrap(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    assert!(!matches!(
+        retirement,
+        broker_launch::Retirement::Pending { .. }
+    ));
 }

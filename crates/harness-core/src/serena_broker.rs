@@ -408,7 +408,7 @@ impl Client {
 }
 
 struct Backend {
-    pool: Arc<Mutex<Pool>>,
+    pool: Arc<Pool>,
     stop: Arc<AtomicBool>,
 }
 
@@ -426,7 +426,7 @@ impl Backend {
             home: configuration.codex_home.clone(),
         };
         let factory = serena_shared::session_factory(launch, cancel)?;
-        let pool = Arc::new(Mutex::new(Pool::new(policy, serena_home, factory)?));
+        let pool = Arc::new(Pool::new(policy, serena_home, factory)?);
         let stop = Arc::new(AtomicBool::new(false));
         {
             let pool = Arc::clone(&pool);
@@ -436,9 +436,7 @@ impl Backend {
                 .spawn(move || {
                     while !stop.load(Ordering::SeqCst) {
                         thread::sleep(Duration::from_secs(1));
-                        if let Ok(mut pool) = pool.lock() {
-                            pool.reap();
-                        }
+                        pool.reap();
                     }
                 })?;
         }
@@ -452,16 +450,13 @@ impl broker_service::Backend for Backend {
         operation: &str,
         payload: &Value,
         deadline: Deadline,
-        _cancel: &Cancellation,
+        cancel: &Cancellation,
     ) -> io::Result<Value> {
-        // Lock poisoning is the only fatal condition; per-request failures
-        // answer as broker error envelopes and keep the service serving,
-        // matching the seam's dispatch contract.
+        // Per-request failures answer as broker error envelopes and keep the
+        // service serving, matching the seam's dispatch contract. The pool
+        // itself owns short table coordination; startup, requests and
+        // retirement stay outside it so independent workers overlap.
         let result = (|| -> io::Result<Value> {
-            let mut pool = self
-                .pool
-                .lock()
-                .map_err(|_| io::Error::other("Serena pool lock poisoned"))?;
             let client = payload["client"]
                 .as_str()
                 .ok_or_else(|| invalid("Serena broker request lacks a client identity"))?;
@@ -478,12 +473,13 @@ impl broker_service::Backend for Backend {
                             .as_str()
                             .ok_or_else(|| invalid("Serena connect lacks a working directory"))?,
                     );
-                    pool.connect(
+                    self.pool.connect(
                         client,
                         &arguments,
                         &cwd,
                         payload["initialize"].clone(),
                         deadline,
+                        cancel,
                     )
                 }
                 "rpc" => {
@@ -491,16 +487,17 @@ impl broker_service::Backend for Backend {
                         .as_str()
                         .ok_or_else(|| invalid("Serena rpc lacks a method"))?;
                     let route = serena_route::Route::from_json(&payload["route"])?;
-                    pool.rpc(
+                    self.pool.rpc(
                         client,
                         method,
                         payload["params"].clone(),
                         route,
                         payload["initialize"].clone(),
                         deadline,
+                        cancel,
                     )
                 }
-                "disconnect" => Ok(json!(pool.disconnect(client))),
+                "disconnect" => Ok(json!(self.pool.disconnect(client))),
                 _ => Err(invalid("Unknown Serena broker operation")),
             }
         })();
@@ -514,23 +511,23 @@ impl broker_service::Backend for Backend {
     }
 
     fn is_idle(&self) -> bool {
-        self.pool.lock().map(|pool| pool.is_idle()).unwrap_or(false)
+        self.pool.is_idle()
     }
 
     fn status(&self) -> Value {
-        self.pool
-            .lock()
-            .map(|pool| pool.status())
-            .unwrap_or_else(|_| json!({"poisoned": true}))
+        self.pool.status()
     }
 
-    fn shutdown(&self, _deadline: Deadline, _cancel: &Cancellation) -> io::Result<()> {
+    fn shutdown(&self, deadline: Deadline, cancel: &Cancellation) -> io::Result<()> {
         self.stop.store(true, Ordering::SeqCst);
-        let mut pool = self
-            .pool
-            .lock()
-            .map_err(|_| io::Error::other("Serena pool lock poisoned"))?;
-        pool.close()
+        self.pool.close(deadline)?;
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Serena broker shutdown cancelled",
+            ));
+        }
+        Ok(())
     }
 }
 
