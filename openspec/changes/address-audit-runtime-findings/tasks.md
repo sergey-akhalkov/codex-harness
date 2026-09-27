@@ -20,6 +20,6 @@
 
 ## 4. Integration and global delivery
 
-- [ ] 4.1 Run applicable native checks from `docs/rust-native.md`: formatting, affected Rust checks/clippy and the RTK, Serena and ledger test targets, expanding for concrete integration failures. Record commands, source/build identity, exercised properties and remaining limits; passing fixtures alone must not be described as installed-consumer acceptance.
+- [x] 4.1 Run applicable native checks from `docs/rust-native.md`: formatting, affected Rust checks/clippy and the RTK, Serena and ledger test targets, expanding for concrete integration failures. Record commands, source/build identity, exercised properties and remaining limits; passing fixtures alone must not be described as installed-consumer acceptance.
 - [ ] 4.2 Deliver through the supported kit update lifecycle and verify from owned consumer roots outside this checkout: the real compact Cargo route, two actual Serena projects with distinct same-named symbols, bounded capacity and truthful ledger output. Verify scoped update/recovery and preservation of unrelated consumers; do not complete this task on repository-only tests or an unavailable live path.
 - [ ] 4.3 Review compact-output byte evidence, deterministic concurrency evidence and record correctness against every delta scenario. Use existing local evidence owners, report unmeasured daily/token/quota effects explicitly, and run strict OpenSpec validation plus source/link hygiene. Close implementation tasks only on their actual checks; leave excluded research ideas out of the completion claim.
