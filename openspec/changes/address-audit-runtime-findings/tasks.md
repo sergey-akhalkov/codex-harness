@@ -14,9 +14,9 @@
 
 ## 3. Honest benefit records
 
-- [ ] 3.1 Extend the existing reader in `crates/harness-core/src/benefit_gate.rs` to retain comparison completeness/consistency and newer attributable invalid decisions. Verify regressed/unmeasurable quality, missing fields, zero/invalid counts, non-finite values, inconsistent arithmetic and malformed-latest records without silently reviving an earlier adoption.
-- [ ] 3.2 Update `crates/codex-harness/src/feedback_cli.rs` to separate recorded outcome, supported consistency and evidence limitations. Verify consistent adoption, unsupported legacy records and later withdrawal through `crates/codex-harness/tests/feedback_cli.rs` and existing board fixtures; confirm it makes no model calls or acceptance/deployment decisions.
-- [ ] 3.3 Reconcile `.agents/skills/board-workflow/SKILL.md` and the existing benefit-record section of `docs/agent-delegation.md` with the reader. Verify documented examples through the real parser/CLI and keep current record/detail ownership without introducing another evaluator or database.
+- [x] 3.1 Extend the existing reader in `crates/harness-core/src/benefit_gate.rs` to retain comparison completeness/consistency and newer attributable invalid decisions. Verify regressed/unmeasurable quality, missing fields, zero/invalid counts, non-finite values, inconsistent arithmetic and malformed-latest records without silently reviving an earlier adoption.
+- [x] 3.2 Update `crates/codex-harness/src/feedback_cli.rs` to separate recorded outcome, supported consistency and evidence limitations. Verify consistent adoption, unsupported legacy records and later withdrawal through `crates/codex-harness/tests/feedback_cli.rs` and existing board fixtures; confirm it makes no model calls or acceptance/deployment decisions.
+- [x] 3.3 Reconcile `.agents/skills/board-workflow/SKILL.md` and the existing benefit-record section of `docs/agent-delegation.md` with the reader. Verify documented examples through the real parser/CLI and keep current record/detail ownership without introducing another evaluator or database.
 
 ## 4. Integration and global delivery
 

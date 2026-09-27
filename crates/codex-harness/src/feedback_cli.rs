@@ -7,7 +7,9 @@
 //! performs one explicit recorded promotion. `ledger` also parses the item's
 //! `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate`
 //! board comments and reports the scoped account view, the applicable pacing
-//! decisions and the benefit-gate default. Similarity, merging and consequence
+//! decisions and the recorded benefit-gate decision separated from its
+//! comparison consistency and evidence limitations (recorded evidence only;
+//! never an independent rerun). Similarity, merging and consequence
 //! stay caller decisions. Thresholds and batch size come from the
 //! owning orchestration configuration: the installed kit checkout recorded by
 //! the normal CODEX_HOME installation, else the project's own checkout, else
@@ -29,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's benefit-gate default. Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion: a completed promotion retry confirms the recorded outcome, while a different route or OpenSpec target is refused.";
+const USAGE: &str = "codex-harness feedback record --project DIRECTORY --observation TEXT --scope TEXT --reporter ID --episode ID --kind lead|executor|diagnostic --parent ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback list --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback ledger --project DIRECTORY --item ID [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback triage --project DIRECTORY --decisions FILE [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback candidates --project DIRECTORY [--bd FILE] [--source DIRECTORY]\ncodex-harness feedback promote --project DIRECTORY --item ID [--route backlog-task|openspec-change|kit-backlog|default] [--openspec-change NAME] [--kit-project DIRECTORY --summary TEXT --scope TEXT] [--override-consequence TEXT --override-reason TEXT] [--bd FILE] [--source DIRECTORY]\nRecords, triages, inspects and promotes board feedback through the consuming project's bd board. Thresholds and the triage batch size come from --source/global/orchestration.toml when --source is given, else from the installed kit checkout recorded by CODEX_HOME/harness/installation.json, else from the project's own global/orchestration.toml, else from the kit defaults; every verb prints the configuration source it used. The triage decisions file is strict versioned JSON: {\"schema\": 1, \"decisions\": [{\"feedback\": \"ID\", \"kind\": \"process\", \"merge_into\": \"ID or null\"}]}. `ledger` also parses the item's `pacing-observation`, `pacing-decision`, `pacing-revoke` and `benefit-gate` records from the same native bd comments and reports the scoped account view (missing or unknown telemetry stays unknown), the applicable pacing decisions and the item's recorded benefit-gate decision with its comparison consistency and limitations (the record is read back; it is not rerun or independently certified here). Semantic grouping and consequence are caller decisions: this command adds no similarity, no model, no tracker and no implementation authority. An openspec-change promotion validates the intended change directory the OpenSpec workflow created (`openspec new change NAME`) and records its reference as the promotion target; the harness never writes into openspec/ and rerunning preserves an existing draft while it reconciles the board. A partial batch reports the applied prefix and the failing operation with a nonzero exit, and rerunning the same decisions never adds a duplicate counted vote, merge or promotion: a completed promotion retry confirms the recorded outcome, while a different route or OpenSpec target is refused.";
 
 /// Bound on the caller-supplied triage decision document.
 const MAX_DECISIONS_BYTES: u64 = 256 * 1024;
@@ -389,26 +391,60 @@ fn ledger(args: &[OsString]) -> io::Result<i32> {
         println!("pacing decision {}", decision.to_comment());
     }
     let gates = benefit_gate::parse_gate_comments(&comments);
-    let recorded_here = gates.iter().filter(|record| record.item == item).count();
-    if recorded_here == 0 {
-        println!("benefit gate {item}: no comparison recorded; unadopted");
-    } else {
-        println!(
-            "benefit gate {item}: {} across {} recorded comparison(s)",
-            if benefit_gate::default_allowed(&gates, item) {
-                "adopted"
+    match benefit_gate::assess(&gates, item) {
+        None => println!("benefit gate {item}: no comparison recorded; unadopted"),
+        Some(assessment) => {
+            let latest = assessment.latest;
+            println!(
+                "benefit gate {item}: recorded outcome={} quality={} across {} attributable record(s)",
+                latest.outcome.as_deref().unwrap_or("absent"),
+                latest.quality.as_deref().unwrap_or("absent"),
+                assessment.recorded
+            );
+            let (supported, phrase, status) = match assessment.verdict {
+                benefit_gate::Verdict::Consistent => (
+                    "yes",
+                    "recorded comparison consistent within its declared tolerance",
+                    "adopted",
+                ),
+                benefit_gate::Verdict::Unsupported => (
+                    "no",
+                    "recorded comparison cannot support an adoption",
+                    "unadopted",
+                ),
+                benefit_gate::Verdict::NonAdoption => (
+                    "no",
+                    "the latest record is not an adoption decision",
+                    "unadopted",
+                ),
+                benefit_gate::Verdict::Unreadable => (
+                    "no",
+                    "the latest attributable record states no readable decision",
+                    "unadopted",
+                ),
+            };
+            println!("benefit gate {item}: supported={supported} ({phrase}) default={status}");
+            if assessment.limitations.is_empty() {
+                println!("benefit gate {item}: limitations: none");
             } else {
-                "unadopted"
-            },
-            recorded_here
-        );
+                let reasons: Vec<&str> = assessment
+                    .limitations
+                    .iter()
+                    .map(|limitation| limitation.as_str())
+                    .collect();
+                println!("benefit gate {item}: limitations: {}", reasons.join("; "));
+            }
+            println!(
+                "benefit gate {item}: evidence: the recorded board comment only; the comparison has not been rerun or independently certified here"
+            );
+        }
     }
     for record in &gates {
         println!(
             "benefit-gate record item={} outcome={} quality={}",
             record.item,
-            record.outcome,
-            record.quality.as_str()
+            record.outcome.as_deref().unwrap_or("absent"),
+            record.quality.as_deref().unwrap_or("absent")
         );
     }
     Ok(0)

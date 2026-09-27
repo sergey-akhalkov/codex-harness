@@ -1000,8 +1000,22 @@ fn ledger_reports_fresh_pacing_records_and_the_gate_default() {
     assert!(!text.contains("id=gpt:effort"), "{text}");
     assert!(
         text.contains(&format!(
-            "benefit gate {item}: adopted across 2 recorded comparison(s)"
+            "benefit gate {item}: recorded outcome=adopt quality=unchanged across 2 attributable record(s)"
         )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=yes (recorded comparison consistent within its declared tolerance) default=adopted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("benefit gate {item}: limitations: none")),
+        "{text}"
+    );
+    assert!(
+        text.contains("evidence: the recorded board comment only; the comparison has not been rerun or independently certified here"),
         "{text}"
     );
     assert!(
@@ -1089,8 +1103,18 @@ fn ledger_reports_gate_records_and_the_latest_outcome() {
     assert!(out.status.success(), "{text}");
     assert!(
         text.contains(&format!(
-            "benefit gate {item}: unadopted across 2 recorded comparison(s)"
+            "benefit gate {item}: recorded outcome=inconclusive quality=unmeasurable across 2 attributable record(s)"
         )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=no (the latest record is not an adoption decision) default=unadopted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("benefit gate {item}: limitations: none")),
         "{text}"
     );
     assert!(
@@ -1106,11 +1130,190 @@ fn ledger_reports_gate_records_and_the_latest_outcome() {
         "{text}"
     );
     assert!(
-        !text.contains(&format!("benefit gate {item}: adopted")),
+        !text.contains(&format!("benefit gate {item}: supported=yes")),
         "{text}"
     );
     assert!(
         text.contains("pacing observations: none recorded; telemetry unknown"),
+        "{text}"
+    );
+    board.drop();
+}
+
+/// An adoption that predates the comparison fields, and a newer adoption that
+/// contradicts its own measured quality, stay visible with their limitations:
+/// the reader never fabricates missing values and never revives an earlier
+/// adoption that a newer attributable record has superseded.
+#[test]
+fn ledger_keeps_incomplete_and_contradictory_adoptions_unproven() {
+    let board = Board::new("ledger-unsupported");
+    let item = board.record("legacy adoption", "lead-1", "e8", "lead");
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=legacy outcome=adopt quality=unchanged matched=2"
+        ),
+    );
+
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: recorded outcome=adopt quality=unchanged across 1 attributable record(s)"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=no (recorded comparison cannot support an adoption) default=unadopted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("tolerance_percent missing or not a finite non-negative number"),
+        "{text}"
+    );
+    assert!(text.contains("accounting basis missing"), "{text}");
+    assert!(!text.contains("default=adopted"), "{text}");
+
+    // A newer complete record that adopts despite regressed quality must not
+    // be presented as supported either.
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=legacy outcome=adopt quality=regressed matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=140.0 regression_percent=40.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=regressed"
+        ),
+    );
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: recorded outcome=adopt quality=regressed across 2 attributable record(s)"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=no (recorded comparison cannot support an adoption) default=unadopted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("limitations: quality regressed; regression beyond the declared tolerance"),
+        "{text}"
+    );
+    assert!(!text.contains("default=adopted"), "{text}");
+
+    // A newer malformed record stays exposed: it supersedes the earlier
+    // adoption without silently restoring it, and the history remains.
+    comment(
+        &board,
+        &item,
+        &format!("benefit-gate v1 item={item} outcome=adopt"),
+    );
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: recorded outcome=adopt quality=absent across 3 attributable record(s)"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=no (recorded comparison cannot support an adoption) default=unadopted"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("limitations: no quality recorded;"), "{text}");
+    assert!(!text.contains("default=adopted"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=adopt quality=absent"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=adopt quality=regressed"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=adopt quality=unchanged"
+        )),
+        "{text}"
+    );
+    board.drop();
+}
+
+/// A later rejection supersedes a supported adoption: the item is no longer
+/// reported as adopted, and the recorded history stays available.
+#[test]
+fn ledger_reports_a_withdrawal_after_a_supported_adoption() {
+    let board = Board::new("ledger-withdraw");
+    let item = board.record("withdrawn improvement", "lead-1", "e9", "lead");
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=lane-reuse outcome=adopt quality=improved matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=95.0 regression_percent=-5.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=adopted"
+        ),
+    );
+
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=yes (recorded comparison consistent within its declared tolerance) default=adopted"
+        )),
+        "{text}"
+    );
+
+    comment(
+        &board,
+        &item,
+        &format!(
+            "benefit-gate v1 item={item} improvement=lane-reuse outcome=reject quality=regressed matched=2 tolerance_percent=10.0 baseline_seconds=100.0 candidate_seconds=120.0 regression_percent=20.0 baseline=direct candidate=lane accounting=check+coordination+rework detail=rejected"
+        ),
+    );
+    let out = board.feedback(&["ledger", "--item", &item]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: recorded outcome=reject quality=regressed across 2 attributable record(s)"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit gate {item}: supported=no (the latest record is not an adoption decision) default=unadopted"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("benefit gate {item}: limitations: none")),
+        "{text}"
+    );
+    assert!(!text.contains("default=adopted"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=adopt quality=improved"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "benefit-gate record item={item} outcome=reject quality=regressed"
+        )),
         "{text}"
     );
     board.drop();

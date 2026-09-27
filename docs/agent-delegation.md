@@ -244,10 +244,19 @@ reason, basis and expiry, and withdrawn with a revoke record.
 No improvement becomes a default for assignments, worktrees, concurrency or
 cadence before a matched comparison declares its tolerance in advance and shows
 unchanged-or-better quality inside that tolerance, with check time, coordination
-and rework counted in both arms. An adopted record is required: an inconclusive
-or rejected comparison, or no record at all, leaves the improvement unadopted.
-The gate evaluates orchestration defaults; it is not the skill-evaluation
-contract for library mutations.
+and rework counted in both arms. The `codex-harness feedback ledger` view keeps
+the recorded decision and the comparison it supports separate: an adoption is
+supported only when the recorded comment names both arms, a positive matched
+count, finite tolerance and timing values, regression arithmetic consistent with
+the recorded arm seconds and delivery inside the declared tolerance. Missing,
+contradictory or malformed records stay visible with their limitations, and the
+newest record naming the item controls the status - a newer unreadable record
+never silently restores an older adoption. These checks read the recorded board
+comment; they do not rerun the comparison or certify it independently. An
+inconclusive or rejected comparison, or no record at all, leaves the improvement
+unadopted, and a user-accepted trade-off remains a recorded decision rather than
+demonstrated improvement. The gate evaluates orchestration defaults; it is not
+the skill-evaluation contract for library mutations.
 
 ## Executor worktrees
 

@@ -182,10 +182,21 @@ only with an adopted gate record. Record the comparison on the promoted item:
 | Step | Command |
 | --- | --- |
 | Record | `bd comment <item> --json "benefit-gate v1 item=<item> improvement=<name> outcome=<adopt\|reject\|inconclusive> quality=<unchanged\|improved\|regressed\|unmeasurable> matched=<n> tolerance_percent=<n> baseline_seconds=<n> candidate_seconds=<n> regression_percent=<n> baseline=<arm> candidate=<arm> accounting=check+coordination+rework detail=<why>"` |
+| Inspect | `codex-harness feedback ledger --project <project> --item <id>` |
 
 Declare the tolerance before the run and include feedback-triage, coordination
 and rework in each arm's seconds. An inconclusive or rejected record leaves the
-improvement unadopted.
+improvement unadopted. The ledger reads the recorded comment back and keeps the
+recorded decision separate from what it supports: an adoption is supported only
+when the record names both arms, a positive matched count, finite tolerance and
+timing values, regression arithmetic consistent with the recorded arm seconds
+and delivery inside the declared tolerance. Missing or contradictory fields are
+reported as limitations of the record; they are never filled in, and the
+consistency of a recorded comment is not treated as an independent rerun or
+proof of the comparison. Every record naming the item is retained, and the
+newest one controls the status: a newer incomplete, contradictory or malformed
+record leaves the improvement unadopted instead of silently restoring an older
+adoption.
 
 ## Pipeline
 
