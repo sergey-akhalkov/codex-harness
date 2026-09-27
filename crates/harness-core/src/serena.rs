@@ -25,7 +25,9 @@ const CLEANUP: Duration = Duration::from_secs(5);
 /// notifier share one Windows Job. 2 GiB caused `MemoryError` during baseline
 /// polling, after which every semantic call failed with an uninitialized
 /// language-server manager.
-const WORKER_JOB_MEMORY_BYTES: usize = 4096 * 1024 * 1024;
+/// The configured per-worker Job memory limit, also reported by the shared
+/// pool status as a limit rather than an observed measurement.
+pub(crate) const WORKER_JOB_MEMORY_BYTES: usize = 4096 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Launch {

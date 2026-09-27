@@ -379,7 +379,8 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
     let serena_home =
         harness_core::serena_configuration::prepare(&registry, &root.path().join("codex-home"))
             .unwrap();
-    let mut pool = Pool::new(policy, serena_home, factory).unwrap();
+    let pool = Pool::new(policy, serena_home, factory).unwrap();
+    let no_cancel = Cancellation::default();
     let initialize = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {},
@@ -417,6 +418,7 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
             &alpha_project,
             initialize.clone(),
             deadline(),
+            &no_cancel,
         )
         .unwrap();
     assert_eq!(
@@ -430,6 +432,7 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
             &alpha_project,
             initialize.clone(),
             deadline(),
+            &no_cancel,
         )
         .unwrap();
     // Two clients of one project share a single native worker.
@@ -446,12 +449,13 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
             &beta_project,
             initialize.clone(),
             deadline(),
+            &no_cancel,
         )
         .unwrap();
     assert_eq!(pool.worker_count(), 2);
     assert_eq!(pool.status()["workers"].as_array().unwrap().len(), 2);
 
-    let call = |pool: &mut Pool, client: &str, project: &Path| {
+    let call = |pool: &Pool, client: &str, project: &Path| {
         let route = serena_route::Route {
             project: Some(project.to_path_buf()),
             cwd: project.to_path_buf(),
@@ -478,6 +482,7 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
                 route,
                 initialize.clone(),
                 deadline(),
+                &no_cancel,
             )
             .unwrap();
         result["message"]["result"]["content"]
@@ -487,9 +492,9 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
             .filter_map(|item| item["text"].as_str())
             .collect::<String>()
     };
-    let alpha_a = call(&mut pool, &client_a, &alpha_project);
-    let alpha_b = call(&mut pool, &client_b, &alpha_project);
-    let beta_c = call(&mut pool, &client_c, &beta_project);
+    let alpha_a = call(&pool, &client_a, &alpha_project);
+    let alpha_b = call(&pool, &client_b, &alpha_project);
+    let beta_c = call(&pool, &client_c, &beta_project);
     assert!(alpha_a.contains("301"), "{alpha_a}");
     assert!(alpha_b.contains("301"), "{alpha_b}");
     assert!(beta_c.contains("302"), "{beta_c}");
@@ -497,7 +502,7 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
     assert_eq!(pool.status()["workers"].as_array().unwrap().len(), 2);
     // Disconnecting one client of a project keeps the shared worker.
     assert!(pool.disconnect(&client_a));
-    let alpha_b2 = call(&mut pool, &client_b, &alpha_project);
+    let alpha_b2 = call(&pool, &client_b, &alpha_project);
     assert!(alpha_b2.contains("301"), "{alpha_b2}");
     let alpha_still_shared = pool.status()["workers"]
         .as_array()
@@ -505,5 +510,6 @@ fn shared_pool_reuses_one_worker_and_isolates_projects() {
         .iter()
         .any(|worker| worker["pid"] == shared_identity);
     assert!(alpha_still_shared);
-    pool.close().unwrap();
+    pool.close(Deadline::after(Duration::from_secs(60)).unwrap())
+        .unwrap();
 }
