@@ -10,10 +10,11 @@ use harness_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
+    time::Instant,
 };
 
 fn adapter() -> PathBuf {
@@ -97,7 +98,7 @@ fn rtk_fixture() -> PathBuf {
 }
 
 /// Owned adapter copy whose `rtk.exe` dependency and whose allowlisted source
-/// command are the inert fixture double: no RTK download and no network.
+/// commands are the inert fixture double: no RTK download and no network.
 fn staged(root: &Path) -> (PathBuf, PathBuf) {
     let directory = root.join("bin");
     fs::create_dir_all(&directory).unwrap();
@@ -105,7 +106,163 @@ fn staged(root: &Path) -> (PathBuf, PathBuf) {
     fs::copy(rtk_fixture(), directory.join("rtk.exe")).unwrap();
     let command = directory.join("git.exe");
     fs::copy(rtk_fixture(), &command).unwrap();
+    fs::copy(rtk_fixture(), directory.join("cargo.exe")).unwrap();
     (directory.join("harness-rtk.exe"), command)
+}
+
+fn cargo_double(binary: &Path) -> PathBuf {
+    binary.with_file_name("cargo.exe")
+}
+
+/// Invoke the adapter with a hard wall-clock bound, so a pipe deadlock fails
+/// the test instead of hanging the suite.
+fn invoke_bounded(
+    adapter: &Path,
+    args: &[&str],
+    cwd: &Path,
+    home: &Path,
+    extra: &[(&str, &str)],
+    timeout: Duration,
+) -> std::process::Output {
+    let mut command = Command::new(adapter);
+    command.args(args).current_dir(cwd).env("CODEX_HOME", home);
+    command.env_remove("HARNESS_RTK_DISABLE");
+    command.env("PROCESS_CASE_ROOT", cwd);
+    for (key, value) in extra {
+        command.env(*key, *value);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes).unwrap()
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes).unwrap()
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("adapter invocation exceeded {timeout:?}: {args:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::process::Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
+    }
+}
+
+/// The bounded local decision records as the adapter's own reader reports them.
+fn diagnostics(binary: &Path, workspace: &Path, home: &Path) -> Vec<Value> {
+    let output = invoke(
+        binary,
+        &["diagnostics", "--json", "--last", "32"],
+        workspace,
+        home,
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["records"].as_array().cloned().unwrap_or_default()
+}
+
+fn record_for<'a>(records: &'a [Value], command: &str) -> &'a Value {
+    records
+        .iter()
+        .rev()
+        .find(|record| record["command"] == command)
+        .unwrap_or_else(|| panic!("no decision record for `{command}`: {records:#?}"))
+}
+
+fn fixture_ledger(root: &Path) -> PathBuf {
+    root.join("ledger.txt")
+}
+
+fn ledger_runs(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+/// A compiler-shaped stream well above the retention floor: two Cargo status
+/// lines plus warning blocks whose text must survive verbatim.
+fn warning_stream() -> String {
+    let mut text = String::from("    Checking synthetic-demo v0.1.0 (/fixture/demo)\n");
+    text.push_str("warning: unused variable: `unused_factor`\n");
+    text.push_str(" --> src/lib.rs:7:9\n");
+    text.push_str("  |\n");
+    text.push_str("7 |     let unused_factor = 3;\n");
+    text.push_str("  |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused_factor`\n");
+    text.push_str("  |\n");
+    text.push_str(
+        "  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default\n",
+    );
+    text.push_str("  = note: this synthetic block is long enough that retention repays its cost\n");
+    text.push_str("warning: unused import: `std::fmt`\n");
+    text.push_str(" --> src/lib.rs:1:5\n");
+    text.push_str("  |\n");
+    text.push_str("1 | use std::fmt;\n");
+    text.push_str("  |     ^^^^^^^^^\n");
+    text.push_str("  |\n");
+    text.push_str(
+        "  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default\n",
+    );
+    text.push_str("warning: `synthetic-demo` (lib) generated 2 warnings (run `cargo fix --lib -p synthetic-demo` to apply 2 suggestions)\n");
+    text.push_str("    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s\n");
+    text
+}
+
+/// A failing stream: one Cargo status line plus a rustc error block that must
+/// survive verbatim with no test summary anywhere.
+fn compile_failure_stream() -> String {
+    let mut text = String::from("    Checking synthetic-broken v0.1.0 (/fixture/broken)\n");
+    text.push_str("error[E0308]: mismatched types\n");
+    text.push_str(" --> broken/src/lib.rs:2:5\n");
+    text.push_str("  |\n");
+    text.push_str("1 | pub fn broken() -> u32 {\n");
+    text.push_str("  |                    --- expected `u32` because of return type\n");
+    text.push_str("2 |     \"not a number\"\n");
+    text.push_str("  |     ^^^^^^^^^^^^^^ expected `u32`, found `&str`\n");
+    text.push_str("  |\n");
+    text.push_str(
+        "  = note: the synthetic failure block is long enough that retaining it repays its cost\n",
+    );
+    text.push_str(
+        "  = note: and it must survive the presentation byte-verbatim on the failing path\n",
+    );
+    text.push_str("For more information about this error, try `rustc --explain E0308`.\n");
+    text.push_str("error: could not compile `synthetic-broken` (lib) due to 1 previous error\n");
+    text
+}
+
+/// A block the adapter must not recognize: it is kept byte-verbatim.
+fn unknown_block() -> String {
+    let mut text = String::from("== synthetic tool block ==\n");
+    for index in 1..=8 {
+        text.push_str(&format!(
+            "unrecognized diagnostic detail line {index} that no cargo status word starts\n"
+        ));
+    }
+    text.push_str("== end synthetic tool block ==\n");
+    text
 }
 
 fn packed_handle(stdout: &str) -> String {
@@ -1004,9 +1161,19 @@ fn terminal_stdout_bypasses_compression_and_retention() {
     assert!(!transcript.contains("[rtk pack:"), "{transcript}");
     assert!(!transcript.contains("[rtk raw:"), "{transcript}");
     assert!(
-        !home.join("harness/rtk").exists(),
+        !home.join("harness/rtk/raw").exists() && !home.join("harness/rtk/pack").exists(),
         "a terminal stdout retains neither raw archives nor observations"
     );
+    // The bypass itself stays inspectable: the record names why nothing was
+    // compressed, which is what a hook rewrite can never establish on its own.
+    let records = diagnostics(&binary, &workspace, &home);
+    assert_eq!(
+        records.len(),
+        1,
+        "the interactive invocation is recorded: {records:#?}"
+    );
+    assert_eq!(records[0]["reason"], "interactive");
+    assert_eq!(records[0]["presentation_bytes"], Value::Null);
     // Control: the same run with a piped stdout compresses and packs, so the
     // difference is the terminal rather than the fixture setup.
     let piped = invoke(
@@ -1200,4 +1367,956 @@ fn byte_accounting_for_bounded_recall_and_footer_overhead() {
          recall windows {first_window} B and {second_window} B for 200 lines each, served with \
          the source command double removed (0 reruns)"
     );
+}
+
+/// Task 1.1: every documented verification form reaches compression, and the
+/// child still runs exactly once per invocation.
+#[test]
+fn cargo_corpus_forms_enter_the_documented_compression_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let stderr = warning_stream();
+    let ledger = fixture_ledger(root.path());
+    let forms: [(&str, &[&str]); 6] = [
+        (
+            "cargo-test",
+            &[
+                "test",
+                "-p",
+                "synthetic-demo",
+                "--locked",
+                "--jobs",
+                "1",
+                "--",
+                "--test-threads=1",
+            ],
+        ),
+        (
+            "cargo-test",
+            &[
+                "test",
+                "--workspace",
+                "--locked",
+                "--jobs",
+                "1",
+                "--",
+                "--test-threads=1",
+                "sign_check",
+            ],
+        ),
+        (
+            "cargo-check",
+            &["check", "--workspace", "--locked", "--jobs", "1"],
+        ),
+        (
+            "cargo-build",
+            &[
+                "build",
+                "-p",
+                "synthetic-demo",
+                "--release",
+                "-j",
+                "2",
+                "--locked",
+            ],
+        ),
+        (
+            "cargo-clippy",
+            &[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--locked",
+                "--jobs",
+                "1",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        (
+            "cargo-check",
+            &["check", "-j4", "--target-dir", "target/owned", "--locked"],
+        ),
+    ];
+    for (index, (selection, args)) in forms.iter().enumerate() {
+        let mut full: Vec<&str> = vec!["compact", cargo.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let output = invoke_bounded(
+            &binary,
+            &full,
+            &workspace,
+            &home,
+            &[
+                ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+                ("HARNESS_RTK_FIXTURE_CARGO_STDERR", stderr.as_str()),
+                ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+            ],
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let out = String::from_utf8_lossy(&output.stdout).into_owned();
+        let err = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            out.contains("[rtk raw: ") && out.contains("[rtk pack: "),
+            "{args:?} must compress stdout through its recorded path: {out}"
+        );
+        assert!(
+            out.contains("[rtk raw[stderr]: ") && out.contains("[rtk pack[stderr]: "),
+            "{args:?} must compress stderr and name that stream: {out}"
+        );
+        assert!(
+            err.contains("warning: unused variable: `unused_factor`")
+                && !err.contains("    Checking synthetic-demo"),
+            "{args:?}: recognized progress lines leave, diagnostics stay verbatim: {err}"
+        );
+        assert_eq!(
+            ledger_runs(&ledger),
+            index + 1,
+            "{args:?}: the native command must run exactly once"
+        );
+        let records = diagnostics(&binary, &workspace, &home);
+        let command = format!("{} {}", cargo.display(), args.join(" "));
+        let record = record_for(&records, &command);
+        assert_eq!(record["selection"], *selection, "{args:?}: {record}");
+        assert_eq!(record["decision"], "applied", "{args:?}: {record}");
+    }
+}
+
+/// Task 1.1: unsupported commands, flags and machine formats are bypassed with
+/// a recorded reason instead of a guessed summary.
+#[test]
+fn cargo_machine_formats_and_unsupported_forms_stay_raw() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let stderr = warning_stream();
+    let ledger = fixture_ledger(root.path());
+    // The inert double has no role for `fmt` or `run`, so those two forms exit
+    // with the double's own code and no output; the adapter must pass both the
+    // code and the empty streams through unchanged.
+    let forms: [(&[&str], &str, i32, bool); 10] = [
+        (
+            &["test", "--message-format=json", "--locked"],
+            "machine-format",
+            0,
+            true,
+        ),
+        (&["check", "--json"], "machine-format", 0, true),
+        (&["fmt", "--all"], "unsupported-command", 2, false),
+        (&["run", "--release"], "unsupported-command", 2, false),
+        (&["test", "-v"], "unsupported-flags", 0, true),
+        (
+            &["check", "an-extra-positional"],
+            "unsupported-flags",
+            0,
+            true,
+        ),
+        (&["test", "-p"], "unsupported-flags", 0, true),
+        (
+            &["build", "--", "-Zunstable-options"],
+            "unsupported-flags",
+            0,
+            true,
+        ),
+        (&["clippy", "--", "--fix"], "unsupported-flags", 0, true),
+        (&["test", "--", "--nocapture"], "unsupported-flags", 0, true),
+    ];
+    for (index, (args, reason, code, passthrough)) in forms.iter().enumerate() {
+        let mut full: Vec<&str> = vec!["compact", cargo.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let output = invoke_bounded(
+            &binary,
+            &full,
+            &workspace,
+            &home,
+            &[
+                ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+                ("HARNESS_RTK_FIXTURE_CARGO_STDERR", stderr.as_str()),
+                ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+            ],
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(*code),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = if *passthrough {
+            stdout.clone()
+        } else {
+            String::new()
+        };
+        assert_eq!(
+            String::from_utf8(output.stdout.clone()).unwrap(),
+            expected,
+            "{args:?}: a bypassed stream stays byte-raw"
+        );
+        let expected = if *passthrough {
+            stderr.clone()
+        } else {
+            // The inert double reports its own missing role on stderr; that is
+            // the child's output and the adapter must pass it through as-is.
+            format!("rtk fixture: unsupported fixture role {}\n", args[0])
+        };
+        assert_eq!(
+            String::from_utf8(output.stderr.clone()).unwrap(),
+            expected,
+            "{args:?}: a bypassed stream carries no footer or telemetry"
+        );
+        assert_eq!(
+            ledger_runs(&ledger),
+            index + 1,
+            "{args:?}: the native command must still run exactly once"
+        );
+        let records = diagnostics(&binary, &workspace, &home);
+        let command = format!("{} {}", cargo.display(), args.join(" "));
+        let record = record_for(&records, &command);
+        assert_eq!(record["decision"], "bypassed", "{args:?}: {record}");
+        assert_eq!(record["reason"], *reason, "{args:?}: {record}");
+    }
+}
+
+/// Task 1.2: a compile failure that appears only on stderr keeps its text, its
+/// stream identity and its nonzero child result, and stays recallable.
+#[test]
+fn cargo_stderr_only_compile_failure_keeps_stream_and_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let failure = compile_failure_stream();
+    let ledger = fixture_ledger(root.path());
+    let output = invoke_bounded(
+        &binary,
+        &[
+            "compact",
+            cargo.to_str().unwrap(),
+            "check",
+            "-p",
+            "synthetic-broken",
+            "--locked",
+        ],
+        &workspace,
+        &home,
+        &[
+            // No test summary and no stdout at all: a compile error on stderr.
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", failure.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_EXIT", "101"),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(101),
+        "the child's own exit status is preserved: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(err.contains("error[E0308]: mismatched types"), "{err}");
+    assert!(
+        err.contains("error: could not compile `synthetic-broken` (lib) due to 1 previous error"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("    Checking synthetic-broken"),
+        "recognized progress lines are elided: {err}"
+    );
+    assert!(
+        !err.contains("test result"),
+        "no test counts may be invented: {err}"
+    );
+    assert!(
+        out.contains("[rtk raw[stderr]: ") && out.contains("[rtk pack[stderr]: "),
+        "the stderr archive and handle are named: {out}"
+    );
+    assert!(
+        !out.contains("[rtk raw: "),
+        "an empty stdout mints no stdout locator: {out}"
+    );
+    assert!(
+        out.contains("[rtk cargo exit: 101]"),
+        "a compacted failure never looks successful: {out}"
+    );
+    let record = {
+        let records = diagnostics(&binary, &workspace, &home);
+        record_for(
+            &records,
+            &format!("{} check -p synthetic-broken --locked", cargo.display()),
+        )
+        .clone()
+    };
+    assert_eq!(record["decision"], "applied", "{record}");
+    assert_eq!(record["exit_code"], 101, "{record}");
+    assert_eq!(record["streams"][0]["stream"], "stdout", "{record}");
+    assert_eq!(record["streams"][0]["reason"], "empty-output", "{record}");
+    assert_eq!(record["streams"][1]["stream"], "stderr", "{record}");
+    assert_eq!(record["streams"][1]["decision"], "applied", "{record}");
+
+    // Detail comes back with its stream identity while the command is gone.
+    let handle = out
+        .lines()
+        .find(|line| line.starts_with("[rtk pack[stderr]: "))
+        .map(|line| {
+            line["[rtk pack[stderr]: ".len()..]
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .expect("the stderr footer carries its handle");
+    fs::remove_file(&cargo).unwrap();
+    let recalled = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    let recalled = String::from_utf8(recalled.stdout).unwrap();
+    assert!(recalled.contains("digest: sha256 "), "{recalled}");
+    assert!(recalled.contains("[stderr]"), "{recalled}");
+    for line in failure.lines().take(6) {
+        assert!(recalled.contains(line), "{recalled}");
+    }
+    assert_eq!(ledger_runs(&ledger), 1, "recall never reruns the command");
+}
+
+/// Task 1.2: both pipes are drained concurrently, so a command that fills its
+/// stderr pipe before writing stdout neither deadlocks nor loses a stream.
+#[test]
+fn cargo_large_simultaneous_streams_are_drained() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let ledger = fixture_ledger(root.path());
+    let output = invoke_bounded(
+        &binary,
+        &[
+            "compact",
+            cargo.to_str().unwrap(),
+            "test",
+            "--locked",
+            "--jobs",
+            "1",
+        ],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT_BYTES", "200000"),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR_BYTES", "300000"),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        (299_900..300_100).contains(&output.stderr.len()),
+        "the whole stderr stream arrives: {} bytes",
+        output.stderr.len()
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(out.contains("[rtk pack: "), "{out}");
+    assert_eq!(ledger_runs(&ledger), 1);
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(
+        &records,
+        &format!("{} test --locked --jobs 1", cargo.display()),
+    );
+    assert_eq!(record["streams"][0]["decision"], "applied", "{record}");
+    assert!(
+        record["streams"][0]["raw_bytes"].as_u64().unwrap() >= 200_000,
+        "{record}"
+    );
+    assert_eq!(record["streams"][1]["decision"], "bypassed", "{record}");
+    assert_eq!(record["streams"][1]["reason"], "non-shrinking", "{record}");
+    let stderr_bytes = record["streams"][1]["raw_bytes"].as_u64().unwrap();
+    assert!(
+        (300_000..300_100).contains(&stderr_bytes),
+        "both streams are measured where they were captured: {record}"
+    );
+}
+
+/// Task 1.2: exceeding the capture bound keeps the raw output usable and live,
+/// names the limit and retains nothing it cannot deliver.
+#[test]
+fn cargo_oversized_stream_passes_raw_with_an_explicit_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let output = invoke_bounded(
+        &binary,
+        &[
+            "compact",
+            cargo.to_str().unwrap(),
+            "build",
+            "--locked",
+            "--jobs",
+            "1",
+        ],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT_BYTES", "4200000"),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR_BYTES", "120000"),
+        ],
+        Duration::from_secs(120),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.len() >= 4_200_000,
+        "oversized stdout still arrives whole: {} bytes",
+        output.stdout.len()
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("[rtk raw"),
+        "an oversized stream mints no locator"
+    );
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        err.contains("stdout exceeds 4 MiB; raw passthrough without retention"),
+        "{err}"
+    );
+    assert!(
+        err.len() >= 120_000,
+        "stderr still arrives: {} bytes",
+        err.len()
+    );
+    assert!(
+        !home.join("harness/rtk/pack/index.json").exists(),
+        "an oversized run packs nothing"
+    );
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(
+        &records,
+        &format!("{} build --locked --jobs 1", cargo.display()),
+    );
+    assert_eq!(record["decision"], "bypassed", "{record}");
+    assert_eq!(record["reason"], "oversize", "{record}");
+    assert_eq!(record["streams"][0]["raw_bytes"], Value::Null, "{record}");
+    assert_eq!(record["presentation_bytes"], Value::Null, "{record}");
+}
+
+/// Task 1.2: blocks the adapter does not recognize stay byte-verbatim, and a
+/// short stream stays raw rather than paying for retention.
+#[test]
+fn cargo_unknown_blocks_and_short_streams_stay_raw() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let unknown = format!("   Compiling synthetic-demo v0.1.0\n{}", unknown_block());
+    let output = invoke_bounded(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", unknown.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", "   Compiling demo\n"),
+        ],
+        Duration::from_secs(30),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        out.contains(&unknown_block()),
+        "an unrecognized block is kept verbatim: {out}"
+    );
+    assert!(
+        !out.contains("Compiling"),
+        "the recognized progress line is elided: {out}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "   Compiling demo\n",
+        "a short stream stays raw"
+    );
+    let short = "   Compiling demo\n".len() as u64;
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display()));
+    assert_eq!(record["streams"][0]["decision"], "applied", "{record}");
+    assert_eq!(record["streams"][1]["reason"], "short-output", "{record}");
+    assert_eq!(record["streams"][1]["raw_bytes"], short, "{record}");
+    assert_eq!(record["streams"][1]["presented_bytes"], short, "{record}");
+}
+
+/// Task 1.2: a failing or timing-out formatter keeps the original output
+/// usable, names the presentation problem and never reruns the command.
+#[test]
+fn cargo_filter_failure_and_timeout_keep_raw_output() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let ledger = fixture_ledger(root.path());
+    let cases: [((&str, &str), &str, &str); 2] = [
+        (
+            ("HARNESS_RTK_FIXTURE_STDERR", "filter diagnostics"),
+            "filter-failed",
+            "filter failed or returned diagnostics; raw passthrough",
+        ),
+        (
+            ("HARNESS_RTK_FIXTURE_PIPE_DELAY_MS", "2600"),
+            "filter-timeout",
+            "filter timed out; raw passthrough",
+        ),
+    ];
+    for (extra, reason, needle) in cases {
+        let output = invoke_bounded(
+            &binary,
+            &["compact", cargo.to_str().unwrap(), "test", "--locked"],
+            &workspace,
+            &home,
+            &[
+                ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+                ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+                extra,
+            ],
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{reason}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout.clone()).unwrap(),
+            stdout,
+            "{reason}: the original output stays usable"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(needle),
+            "{reason}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = diagnostics(&binary, &workspace, &home);
+        let record = record_for(&records, &format!("{} test --locked", cargo.display()));
+        assert_eq!(record["streams"][0]["reason"], reason, "{record}");
+    }
+    assert_eq!(
+        ledger_runs(&ledger),
+        2,
+        "each invocation runs the native command exactly once"
+    );
+}
+
+/// Task 1.2: unavailable retention storage keeps the run raw and usable.
+#[test]
+fn cargo_unavailable_retention_keeps_raw_output() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let stderr = warning_stream();
+    // A file where the raw capture directory belongs makes every save_raw fail.
+    fs::create_dir_all(home.join("harness/rtk")).unwrap();
+    fs::write(home.join("harness/rtk/raw"), b"not a directory").unwrap();
+    let output = invoke_bounded(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", stderr.as_str()),
+        ],
+        Duration::from_secs(30),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout.clone()).unwrap(), stdout);
+    let err = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(
+        err.ends_with(&stderr),
+        "the raw stream still arrives after its diagnostic: {err}"
+    );
+    assert!(
+        err.matches("raw capture unavailable; raw passthrough")
+            .count()
+            == 2,
+        "each stream reports the retention problem: {err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("[rtk raw"),
+        "no locator may name storage that does not exist"
+    );
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display()));
+    assert_eq!(
+        record["streams"][0]["reason"], "retention-unavailable",
+        "{record}"
+    );
+    assert_eq!(
+        record["streams"][1]["reason"], "retention-unavailable",
+        "{record}"
+    );
+    assert_eq!(record["decision"], "bypassed", "{record}");
+}
+
+/// Task 1.2: a long run keeps bounded progress visibility while its output is
+/// held back for presentation.
+#[test]
+fn cargo_long_run_reports_bounded_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let output = invoke_bounded(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_DELAY_MS", "1200"),
+            ("HARNESS_RTK_PROGRESS_SECONDS", "1"),
+        ],
+        Duration::from_secs(30),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        err.contains("compact capture still running") && err.contains("bytes captured so far"),
+        "{err}"
+    );
+    assert!(
+        err.matches("progress notice").count() <= 20,
+        "the notice count stays bounded: {err}"
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(out.contains("[rtk pack: "), "the run still compacts: {out}");
+    // Zero disables the notice instead of printing one per tick.
+    let quiet = invoke_bounded(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_DELAY_MS", "1200"),
+            ("HARNESS_RTK_PROGRESS_SECONDS", "0"),
+        ],
+        Duration::from_secs(30),
+    );
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("compact capture still running"),
+        "HARNESS_RTK_PROGRESS_SECONDS=0 disables the notice"
+    );
+}
+
+/// Task 1.3: the decision, the concrete reason, the measured stream bytes and
+/// the complete presentation size are recorded, while tokens stay unavailable.
+#[test]
+fn compression_decisions_and_byte_evidence_are_recorded() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let plain = format!(
+        "{}fixture stderr without a cargo status word\n",
+        "x".repeat(600)
+    );
+    let applied = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", plain.as_str()),
+        ],
+    );
+    assert_eq!(applied.status.code(), Some(0));
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display())).clone();
+    assert_eq!(record["decision"], "applied", "{record}");
+    assert_eq!(record["streams"][0]["decision"], "applied", "{record}");
+    assert_eq!(record["streams"][1]["decision"], "bypassed", "{record}");
+    assert_eq!(record["streams"][1]["reason"], "non-shrinking", "{record}");
+    assert_eq!(record["streams"][1]["raw_bytes"], plain.len(), "{record}");
+    assert_eq!(
+        record["streams"][1]["presented_bytes"],
+        plain.len(),
+        "{record}"
+    );
+    assert_eq!(
+        record["presentation_bytes"].as_u64().unwrap(),
+        (applied.stdout.len() + applied.stderr.len()) as u64,
+        "the record accounts for every emitted byte: {record}"
+    );
+    assert_eq!(
+        record["presentation_bytes"].as_u64().unwrap(),
+        record["streams"][0]["presented_bytes"].as_u64().unwrap()
+            + record["streams"][1]["presented_bytes"].as_u64().unwrap()
+            + record["footer_bytes"].as_u64().unwrap(),
+        "{record}"
+    );
+    assert_eq!(record["tokens"], Value::Null, "{record}");
+    assert_eq!(record["token_measurement"], "unavailable", "{record}");
+    assert!(
+        record["streams"][1]["raw_bytes"].as_u64().unwrap() > 0,
+        "raw bytes are measured where the stream was captured: {record}"
+    );
+
+    // The inspected-invocation line is opt-in and never touches the payload.
+    let announced = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", plain.as_str()),
+            ("HARNESS_RTK_DIAGNOSTIC", "1"),
+        ],
+    );
+    let announced_err = String::from_utf8_lossy(&announced.stderr).into_owned();
+    assert!(
+        announced_err.contains("B -> ") && announced_err.contains("tokens unavailable"),
+        "{announced_err}"
+    );
+    assert!(
+        !announced_err.contains("[rtk raw") && !announced_err.contains("[rtk pack"),
+        "the notice stays out of the payload channels: {announced_err}"
+    );
+
+    // A bypassed invocation carries the reason and no invented measurement.
+    let bypassed = invoke(
+        &binary,
+        &[
+            "compact",
+            cargo.to_str().unwrap(),
+            "test",
+            "--message-format=json",
+        ],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(bypassed.status.code(), Some(0));
+    assert!(
+        !String::from_utf8_lossy(&bypassed.stdout).contains("[rtk"),
+        "a machine-format bypass receives no footer"
+    );
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(
+        &records,
+        &format!("{} test --message-format=json", cargo.display()),
+    );
+    assert_eq!(record["reason"], "machine-format", "{record}");
+    assert_eq!(record["presentation_bytes"], Value::Null, "{record}");
+    assert_eq!(record["streams"].as_array().unwrap().len(), 0, "{record}");
+
+    // The human rendering names the byte evidence and the unavailable tokens.
+    let rendered = invoke(&binary, &["diagnostics"], &workspace, &home, None);
+    let rendered = String::from_utf8(rendered.stdout).unwrap();
+    assert!(rendered.contains("[rtk diagnostics: "), "{rendered}");
+    assert!(rendered.contains("tokens unavailable"), "{rendered}");
+    assert!(
+        rendered.contains("presentation unavailable"),
+        "an uncaptured invocation reports no measurement instead of zero: {rendered}"
+    );
+}
+
+/// Task 1.2/1.3: both retained streams are recallable with their identity
+/// after the command is gone.
+#[test]
+fn recall_serves_both_cargo_streams_without_rerunning() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let stdout = warning_stream();
+    let stderr = compile_failure_stream();
+    let ledger = fixture_ledger(root.path());
+    let output = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", stderr.as_str()),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8(output.stdout).unwrap();
+    let handles: Vec<String> = out
+        .lines()
+        .filter(|line| line.starts_with("[rtk pack"))
+        .map(|line| {
+            let rest = line.split_once(": ").unwrap().1;
+            rest.split(' ').next().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(handles.len(), 2, "one handle per retained stream: {out}");
+    fs::remove_file(&cargo).unwrap();
+    let first = invoke(&binary, &["recall", &handles[0]], &workspace, &home, None);
+    assert_eq!(first.status.code(), Some(0));
+    let first = String::from_utf8(first.stdout).unwrap();
+    assert!(first.contains("source: "), "{first}");
+    assert!(
+        !first.contains("[stderr]"),
+        "stdout keeps its own identity: {first}"
+    );
+    for line in stdout.lines().take(3) {
+        assert!(first.contains(line), "{first}");
+    }
+    let second = invoke(&binary, &["recall", &handles[1]], &workspace, &home, None);
+    assert_eq!(second.status.code(), Some(0));
+    let second = String::from_utf8(second.stdout).unwrap();
+    assert!(second.contains("[stderr]"), "{second}");
+    for line in stderr.lines().take(3) {
+        assert!(second.contains(line), "{second}");
+    }
+    assert_eq!(ledger_runs(&ledger), 1, "recall never reruns the command");
+}
+
+/// Task 1.3: the local record stays bounded and survives damaged or missing
+/// storage without inventing an outcome.
+#[test]
+fn diagnostics_records_stay_bounded_and_readable() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    // An unsupported command still records why compression did not apply.
+    for _ in 0..33 {
+        let output = invoke(
+            &binary,
+            &[
+                "compact",
+                cargo_double(&binary).to_str().unwrap(),
+                "test",
+                "-v",
+            ],
+            &workspace,
+            &home,
+            None,
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+    let records = diagnostics(&binary, &workspace, &home);
+    assert_eq!(records.len(), 32, "the local record stays bounded");
+    assert_eq!(records[0]["reason"], "unsupported-flags");
+    let clamped = invoke(
+        &binary,
+        &["diagnostics", "--json", "--last", "100"],
+        &workspace,
+        &home,
+        None,
+    );
+    let value: Value = serde_json::from_slice(&clamped.stdout).unwrap();
+    assert_eq!(value["records"].as_array().unwrap().len(), 32);
+    let last = invoke(
+        &binary,
+        &["diagnostics", "--json", "--last", "2"],
+        &workspace,
+        &home,
+        None,
+    );
+    let value: Value = serde_json::from_slice(&last.stdout).unwrap();
+    assert_eq!(value["records"].as_array().unwrap().len(), 2);
+    for (args, code, needle) in [
+        (vec!["diagnostics", "--last", "0"], 1, "positive integer"),
+        (vec!["diagnostics", "--depth", "1"], 1, "unknown option"),
+    ] {
+        let output = invoke(&binary, &args, &workspace, &home, None);
+        assert_eq!(output.status.code(), Some(code), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(needle),
+            "{args:?}"
+        );
+    }
+    // A damaged record is reported instead of being guessed.
+    fs::write(
+        home.join("harness/rtk/diagnostics/records.json"),
+        b"not json",
+    )
+    .unwrap();
+    let damaged = invoke(&binary, &["diagnostics"], &workspace, &home, None);
+    assert_eq!(damaged.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&damaged.stderr).contains("unreadable"));
+    // Nothing recorded yet stays a clean, explicit answer.
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_home = fresh.path().join("codex");
+    fs::create_dir(&fresh_home).unwrap();
+    let empty = invoke(&binary, &["diagnostics"], &workspace, &fresh_home, None);
+    assert_eq!(empty.status.code(), Some(0));
+    assert!(empty.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("no compact-run decision records yet"));
 }

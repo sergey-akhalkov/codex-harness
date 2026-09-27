@@ -52,6 +52,67 @@ codex-harness heavy -- cargo test --workspace --locked --jobs 1 -- --test-thread
 cargo run -p codex-harness --bin harness-source-check -- --root .
 ```
 
+### Compact verification output
+
+The same verification forms also run through the installed native compression
+boundary, which keeps the heavy-command resource ownership and the native Cargo
+argument vector:
+
+```powershell
+codex-harness heavy -- harness-rtk.exe compact cargo build --workspace --locked --jobs 1
+codex-harness heavy -- harness-rtk.exe compact cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
+codex-harness heavy -- harness-rtk.exe compact cargo test --workspace --locked --jobs 1 -- --test-threads=1
+```
+
+`harness-rtk.exe compact` forwards the whole argument tail to `cargo` unchanged
+and preserves cwd, environment, stdin, both output streams and the child exit
+status. Cargo therefore runs exactly once; the adapter presents what it already
+captured and never repeats the command. Package/workspace selection, `--locked`,
+job limits, `--target-dir` and arguments after the Cargo separator keep their
+native meaning. For the allowlisted one-stream commands (`git status`, `git log`,
+`rg -n`, `pytest`) nothing changes: stdout is filtered and stderr stays
+inherited.
+
+Human-output `cargo test|check|build|clippy` is handled as two independent
+streams, because Cargo writes its progress and its rustc diagnostics to stderr
+while the test harness writes results to stdout. Each stream is decided on its
+own: `cargo test` keeps the pinned RTK `cargo-test` filter, every other Cargo
+stream uses the adapter's own presentation, which removes only recognized Cargo
+status lines and keeps every other line — including unknown diagnostic blocks —
+byte-verbatim. A compacted stream carries its own locator and recall handle, so
+the raw original stays reachable without rerunning Cargo:
+
+```text
+[rtk raw: C:\...\rtk-<stamp>-<pid>.log]
+[rtk pack: ob-... sha256:... | harness-rtk.exe recall ob-... --offset 1 --limit 200]
+[rtk raw[stderr]: C:\...\rtk-<stamp>-<pid>.err.log]
+[rtk pack[stderr]: ob-... sha256:... | harness-rtk.exe recall ob-... --offset 1 --limit 200]
+[rtk cargo exit: 101]
+```
+
+The last line appears only when the child failed, so a compacted failure never
+looks successful. Explicit limits, all verified by
+`cargo test --locked -p codex-harness --test rtk_adapter --jobs 1`:
+
+- Machine formats (`--message-format json`, `--json`), verbose output, unknown
+  flags and any command other than those four verbs stay byte-raw.
+- A stream below 500 bytes, non-UTF-8 or NUL-carrying input, a filter failure or
+  timeout, an output that would not shrink, and unavailable retention storage
+  all keep the raw stream usable with a diagnostic.
+- Captures are bounded to 4 MiB per stream. Beyond that the run passes raw and
+  the remainder streams live without retention; the limit is printed.
+- Recognized progress lines are the only content removed, so a failed compile
+  with no test summary stays a failure with its error text intact.
+- While a long run's output is held back for presentation, one bounded progress
+  notice per `HARNESS_RTK_PROGRESS_SECONDS` (default 10, `0` disables) reports
+  captured bytes, capped at 20 notices.
+
+`harness-rtk.exe diagnostics [--last N] [--json]` reads the bounded local
+decision records (newest 32) behind an explicitly inspected invocation: the
+decision, the concrete bypass reason, measured raw and delivered bytes per
+stream, and the complete presentation size. Bytes stay bytes; token,
+subscription and quota effects remain unavailable and are never inferred.
+
 The executable ownership check compares the working tree against
 [executable-ownership.json](evidence/executable-ownership.json). Unclassified
 foreign-language executables (tracked or untracked), embedded or generated
@@ -1138,5 +1199,8 @@ resource selection anymore.
 The original RTK script lifecycle now reads the root workspace manifest/lock
 and builds only `harness-rtk`. Native RTK lifecycle and Rust acceptance-helper
 exist. `cargo test --locked -p codex-harness --test rtk_adapter --jobs 1 -- --test-threads=1`
-covers exec-once, hook rewrite, malformed/Stop silence, disable/missing
-bypass and oversized raw passthrough after `cargo build --locked -p harness-rtk --jobs 1`.
+covers exec-once, hook rewrite, malformed/Stop silence, disable/missing and
+machine-format bypass, the Cargo corpus's two-stream decisions, bounded
+capture and live raw overflow, retention and filter failures, dual-stream
+recall after the command is gone, and the bounded local decision records,
+after `cargo build --locked -p harness-rtk --jobs 1`.
