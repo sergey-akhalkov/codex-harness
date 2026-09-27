@@ -577,7 +577,7 @@ host, so unbounded records add no remote attack surface, and every time bound
 stays. The delivered-message fallback for an oversized final-message read and
 its output-defect scenario are removed with the limit; a read now completes or
 fails for its own reason and fails the host. Change:
-[fix executor transport size limit](../openspec/changes/fix-executor-transport-size-limit/proposal.md).
+[fix executor transport size limit](../openspec/changes/archive/2026-09-27-fix-executor-transport-size-limit/proposal.md).
 
 **2026-09-25, confirmed (supersedes the 2026-09-20 text-default choice):** pooled `executor spawn`, `resume` and `restart` present the native Codex TUI by default. Explicit `spawn --mode exec` is the native inline TUI on that same observed lifecycle, not an unobserved launcher. Watch, automatic closure and exact-session `executor resume` stay the current path, and the 2026-09-24 tab-close policy still applies. Operating detail: [observed executor lifecycle](agent-delegation.md#observed-executor-lifecycle). Change: [add observed executor TUI](../openspec/changes/archive/2026-09-25-add-observed-executor-tui/proposal.md).
 

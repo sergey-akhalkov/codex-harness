@@ -540,22 +540,6 @@ When dispatch opens an executor conversation as a Windows Terminal tab, that tab
 - **WHEN** the same failed run is hosted in an owned console instead of a terminal tab
 - **THEN** the console process returns the run's own non-zero exit code and the receipt records the failure
 
-### Requirement: An oversized final-message read does not fail a completed turn
-
-After a turn has completed, the host SHALL read the final assistant message without treating a transport size limit on a full-thread read as a failed run. When that read exceeds the transport limit and the turn already delivered a nonempty assistant message, the host SHALL record that message and complete the run. When no such message was delivered, the host SHALL record an output defect that names the size limit, and SHALL NOT report success. In either case the host SHALL NOT terminate the owned child tree as a crash and SHALL NOT leave the failure unrecorded. A final-message read that fails for a reason other than the transport size limit SHALL still fail the host and terminate the owned child tree.
-
-#### Scenario: The full thread exceeds the transport limit
-- **WHEN** a turn completes, its assistant message was already delivered, and reading the whole thread exceeds the transport limit
-- **THEN** the run is recorded completed with that message, the child tree is not terminated as a crash, and the receipt does not say the final message could not be read
-
-#### Scenario: No delivered message and the thread read is too large
-- **WHEN** a turn completes without a delivered nonempty assistant message and the full-thread read exceeds the transport limit
-- **THEN** the receipt records an output defect that names the size limit, and the run is not reported as a successful completion
-
-#### Scenario: Another final-message read failure still fails the host
-- **WHEN** a completed turn's final-message read fails for a reason other than the transport size limit
-- **THEN** the host records the failure, terminates the owned child tree, and does not report a successful run
-
 ### Requirement: Native TUI for managed executor runs
 
 Ordinary pooled `executor spawn`, `executor resume` and `executor restart` SHALL present each managed conversation in the native Codex TUI on its dedicated titled terminal surface without requiring an additional caller option. The explicit TUI mode SHALL provide the same managed observation and control. The frontend SHALL display the exact bound conversation, assignment, actual model and supported effective effort, live messages, tool activity and state. It SHALL retain the recorded slot cwd, configured provider/model/effort and single-agent restrictions. Controller output SHALL NOT interleave with or corrupt the native TUI. Before the first model request, dispatch SHALL establish the frontend's attachment to that conversation and its live terminal surface; a process or tab existing alone SHALL NOT establish readiness. A failed or unsupported attachment SHALL report its cause and recovery action instead of silently substituting a text stream or an invisible conversation. Existing command spellings, including the assignment input named `--exec`, SHALL remain accepted; explicitly selected exec presentation SHALL retain its supported observation behavior.
@@ -844,3 +828,27 @@ meaning.
 #### Scenario: Empty stdin assignment is refused
 - **WHEN** spawn runs with `--exec -` and standard input is an interactive terminal or an empty stream
 - **THEN** spawn refuses with the supported assignment sources and allocates no slot
+
+### Requirement: Managed executor transports impose no harness-side record size cap
+
+The host's control connection to its owned app-server child and the
+frontend-facing relay SHALL NOT impose a harness-side WebSocket message, frame
+or write-buffer size limit on managed conversation records. Time bounds -
+connect, read poll, socket write and relay shutdown - SHALL remain bounded. An
+exact-session resume or a full-thread final-message read whose records exceed
+any fixed small bound SHALL complete through the same transport. A final
+message SHALL come from the thread's own items; a full-thread read that fails
+for its own reason SHALL fail the run, with no delivered-message fallback for
+an oversized read.
+
+#### Scenario: An exact-session resume exceeds one mebibyte
+- **WHEN** a managed executor resumes an exact session whose resume state record is larger than one mebibyte
+- **THEN** the resume completes on the managed backend, the assignment is submitted on that exact thread, and no new conversation is started
+
+#### Scenario: A full-thread read exceeds one mebibyte
+- **WHEN** a completed turn's full-thread read is larger than one mebibyte and its thread items carry a final assistant message
+- **THEN** the run completes and records that message
+
+#### Scenario: Another final-message read failure still fails the host
+- **WHEN** a completed turn's final-message read fails for a reason other than record size
+- **THEN** the host records the failure, terminates the owned child tree, and does not report a successful run

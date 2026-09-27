@@ -148,6 +148,7 @@ represented as the current project's state.
 #### Scenario: A worktree or nested project changes the applicable root
 - **WHEN** a session operates in that root
 - **THEN** the selected project, configuration, cache identity and reported file paths agree with that root
+
 ### Requirement: Complete global acceptance evidence
 
 Acceptance SHALL exercise the selected configuration through actual installed Codex consumers outside this checkout. It SHALL cover retained operations, intentional absence of retired hooks/LSP, applicable entry points, concurrent-root isolation and selected install/update/recovery paths. Component versions, source identities, inputs, outputs and substitute-environment limits SHALL be recorded. Automatic diagnostic evidence SHALL be required only for capabilities passing the benefit gate, including every strict no-trigger scenario. Unrelated OpenCode configuration SHALL be preserved; additional runs of the original source-kit consumer SHALL NOT be required. Rejected capabilities SHALL NOT be misrepresented as verified support or force unbounded further evaluation.
@@ -250,3 +251,20 @@ The connected consumer SHALL expose the accepted tool set through supported nati
 #### Scenario: Two projects share the managed service
 - **WHEN** clients from different projects perform retained semantic operations after the selection change
 - **THEN** each operation uses its client's project, one client's exit leaves the other's service usable, and the existing resource and recovery guarantees still hold
+
+### Requirement: Cold Serena broker startup stays within the request budget
+
+The Serena stdio client SHALL bound broker startup, relocation and recovery by
+the same budget class as a forwarded request rather than by a shorter fixed
+control cap, so a cold broker start followed by the first worker's
+language-server activation completes the waiting request instead of surfacing a
+client-side broker HTTP deadline. Explicit broker retirement SHALL observe a
+cold or busy owned broker for at least sixty seconds before reporting failure.
+
+#### Scenario: First call after the shared broker exits
+- **WHEN** no Serena broker is running and a session's first Serena request must start the broker and activate a worker
+- **THEN** the request completes within the forwarded request budget with the worker's answer, instead of failing with `broker HTTP deadline expired`
+
+#### Scenario: Explicit retirement during cold start
+- **WHEN** `codex-harness mcp broker-retire` targets a broker that is still publishing its endpoint or activating its first worker
+- **THEN** the command observes the owned service for up to sixty seconds instead of expiring while it starts
