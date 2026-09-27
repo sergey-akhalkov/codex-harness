@@ -263,10 +263,12 @@ fn prepared_command(
     let roots = launcher::additional_roots(&task_args, &env::current_dir()?);
     let mut command = Command::new(target);
     let classified = launcher::profile_arguments(&task_args);
+    let mut shared_overrides = false;
     if shared && classified.len() != task_args.len() {
         match shared_config_args(&selected, home) {
             Ok(overrides) => {
                 command.args(overrides);
+                shared_overrides = true;
             }
             Err(_) => {
                 notice_degraded_session(&task_args);
@@ -275,6 +277,7 @@ fn prepared_command(
     } else if !shared {
         notice_degraded_session(&task_args);
     }
+    command.args(launcher::daemon_opt_out(&task_args, shared_overrides));
     command.args(&task_args);
     if roots.is_empty() {
         command.env_remove("HARNESS_LSP_WORKSPACE_ROOTS");

@@ -176,9 +176,9 @@ fn config() -> WebSocketConfig {
     WebSocketConfig::default()
         .read_buffer_size(4096)
         .write_buffer_size(0)
-        .max_write_buffer_size(1024 * 1024 + 4096)
-        .max_message_size(Some(1024 * 1024))
-        .max_frame_size(Some(1024 * 1024))
+        .max_write_buffer_size(usize::MAX)
+        .max_message_size(None)
+        .max_frame_size(None)
 }
 
 /// The frontend double: one authenticated WebSocket client of the relay.
@@ -643,6 +643,12 @@ fn forwarding_preserves_bytes_in_both_directions() {
             r#"{{"method":"fixture/large","id":3,"params":{{"blob":"{}"}}}}"#,
             "x".repeat(70_000)
         ),
+        // A real exact-session resume state exceeds one mebibyte; the relay
+        // must forward it unchanged in both directions.
+        &format!(
+            r#"{{"method":"fixture/resume","id":4,"params":{{"state":"{}"}}}}"#,
+            "r".repeat(1024 * 1024 + 8192)
+        ),
     ] {
         frontend.send_text(text);
         match frontend.receive(WAIT) {
@@ -773,12 +779,14 @@ fn a_queued_warning_waits_for_the_exact_thread_and_is_presented_once() {
     relay.close();
 }
 
-/// A warning the transport cannot write fails on its own, is recorded as
-/// undelivered while it stays queued, and never ends the healthy session: the
-/// exact thread keeps receiving forwarded traffic and the recorded control
-/// endpoint keeps answering.
+/// A diagnostic larger than the removed one-mebibyte transport bound is
+/// delivered natively without ending the healthy session: the exact thread
+/// keeps receiving forwarded traffic and the recorded control endpoint keeps
+/// answering. (A genuine socket-write failure still records `undelivered` in
+/// `deliver`; no deterministic write-failure double remains now that the size
+/// cap is gone.)
 #[test]
-fn a_failed_warning_send_records_undelivered_without_ending_the_session() {
+fn a_large_degraded_diagnostic_is_delivered_without_ending_the_session() {
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
     server.answer(
         "thread/resume",
@@ -794,20 +802,27 @@ fn a_failed_warning_send_records_undelivered_without_ending_the_session() {
     // The exact thread initializes on this connection first.
     frontend.request(1, "thread/resume", json!({"threadId": THREAD}));
     assert_eq!(record_of(frontend.receive(WAIT).text())["id"], 1);
-    // A diagnostic the transport refuses to write fails the delivery attempt
-    // deterministically; nothing outside the captured shape is ever written.
+    // A diagnostic far above the removed one-mebibyte transport bound: the
+    // relay must deliver it natively instead of dropping it.
     let oversized = format!("cache guard degraded: {}", "x".repeat(2 * 1024 * 1024));
     assert_eq!(warnings.queue(&oversized), QueueOutcome::Queued);
     wait_for(
-        || warnings.status().state == WarningState::Undelivered,
-        "the failed send was not recorded as undelivered",
+        || warnings.status().state == WarningState::Sent,
+        "the large diagnostic was not delivered",
     );
     assert_eq!(
         warnings.status().pending,
-        1,
-        "a failed diagnostic stays queued instead of being dropped"
+        0,
+        "a delivered diagnostic leaves the queue"
     );
     assert_eq!(warnings.queue(&oversized), QueueOutcome::Duplicate);
+    let delivered = match frontend.receive(WAIT) {
+        Wait::Text(text) => record_of(text),
+        other => panic!("no delivered diagnostic: {}", matches!(other, Wait::Closed)),
+    };
+    assert_eq!(delivered["method"], "warning", "{delivered}");
+    assert_eq!(delivered["params"]["message"], oversized, "{delivered}");
+    assert_eq!(delivered["params"]["threadId"], THREAD, "{delivered}");
     // The session stays healthy: forwarded traffic arrives and the recorded
     // endpoint still answers a concurrent control request.
     server.push(json!({

@@ -460,6 +460,58 @@ fn explicit_native_precedence_and_package_manager_metadata() {
 }
 
 #[test]
+fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
+    let f = Fixture::new();
+    let out = f.command().args(["--profile", "user"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "features.daemon_auto_start=false",
+            "--profile",
+            "user"
+        ])
+    );
+
+    let out = f.command().arg("hello").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.daemon_auto_start=false",
+            "hello"
+        ])
+    );
+
+    // Non-TUI commands keep codex-cli's own startup path and arguments.
+    let out = f.command().args(["exec", "hello"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!(["-c", "approval_policy=\"never\"", "exec", "hello"])
+    );
+}
+
+#[test]
 fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() {
     for mode in ["registration", "journal", "recursion"] {
         let f = Fixture::new();

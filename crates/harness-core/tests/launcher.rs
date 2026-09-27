@@ -1,7 +1,7 @@
 //! Accepted script-launcher dispatch cases, ported as argument-vector oracles.
 use harness_core::launcher::{
-    additional_roots, executor_limited, per_model_effort, profile_arguments, task_arguments,
-    xai_shim_requested,
+    additional_roots, daemon_opt_out, executor_limited, per_model_effort, profile_arguments,
+    task_arguments, xai_shim_requested,
 };
 use std::ffi::OsString;
 
@@ -334,6 +334,45 @@ fn executor_launches_keep_the_translated_or_profiled_effort() {
         executor_limited(routed, true),
         argv(&["-c", "agents.enabled=false", "--profile", "ds", "exec"])
     );
+}
+
+#[test]
+fn embedded_tui_sessions_opt_out_of_daemon_auto_start() {
+    // Live shared defaults and explicit profiles always run codex-cli's
+    // app-server embedded; the config-level opt-out keeps that session while
+    // suppressing the unused shared-daemon fallback warning.
+    let opt_out = argv(&["-c", "features.daemon_auto_start=false"]);
+    for (args, shared) in [
+        (argv(&["--profile", "zai"]), false),
+        (argv(&["--profile=zai"]), false),
+        (argv(&["-p", "zai"]), false),
+        (argv(&[]), true),
+        (argv(&["hello there"]), true),
+        (argv(&["resume", "--last"]), true),
+        (argv(&["fork", "--last"]), true),
+    ] {
+        assert_eq!(daemon_opt_out(&args, shared), opt_out, "{args:?}");
+    }
+    for (args, shared) in [
+        // Without kit layers the session keeps codex-cli's daemon discovery.
+        (argv(&[]), false),
+        (argv(&["--remote", "ws://127.0.0.1:1"]), false),
+        (argv(&["--remote", "ws://127.0.0.1:1"]), true),
+        (argv(&["--no-daemon"]), true),
+        (argv(&["--no-daemon", "--profile", "zai"]), false),
+        // Non-TUI commands neither run the daemon startup path nor accept
+        // broad opt-outs everywhere.
+        (argv(&["exec", "hello"]), true),
+        (argv(&["e", "hello"]), true),
+        (argv(&["review", "--uncommitted"]), true),
+        (argv(&["debug", "prompt-input", "hello"]), true),
+        (argv(&["mcp", "list"]), true),
+        (argv(&["agents"]), true),
+        (argv(&["--help"]), true),
+        (argv(&["-V"]), false),
+    ] {
+        assert!(daemon_opt_out(&args, shared).is_empty(), "{args:?}");
+    }
 }
 
 #[test]

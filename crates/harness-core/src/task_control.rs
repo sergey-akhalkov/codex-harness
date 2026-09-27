@@ -14,8 +14,6 @@ use windows_sys::Win32::System::Console::{
     GetConsoleProcessList, GetConsoleTitleW, GetConsoleWindow, SetConsoleTitleW,
 };
 
-const RECORD_LIMIT: usize = 1024 * 1024;
-
 /// One authenticated connection to an explicitly owned local server. It does
 /// not enumerate sessions, infer task state, retry requests, or select models.
 pub struct ControlConnection {
@@ -48,12 +46,6 @@ impl ControlConnection {
 
     pub fn send(&mut self, value: &Value, timeout: Duration) -> io::Result<()> {
         let text = serde_json::to_string(value)?;
-        if text.len() > RECORD_LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "control record limit exceeded",
-            ));
-        }
         self.socket.get_mut().set_write_timeout(Some(timeout))?;
         self.socket
             .send(Message::Text(text.into()))
@@ -99,12 +91,16 @@ impl ControlConnection {
 }
 
 fn config() -> WebSocketConfig {
+    // No harness-side message, frame or write-buffer size cap: a managed
+    // conversation's real records - full-thread reads and exact-session
+    // resume state - legitimately exceed any small bound, and both peers are
+    // owned localhost processes of this host.
     WebSocketConfig::default()
         .read_buffer_size(4096)
         .write_buffer_size(0)
-        .max_write_buffer_size(RECORD_LIMIT + 4096)
-        .max_message_size(Some(RECORD_LIMIT))
-        .max_frame_size(Some(RECORD_LIMIT))
+        .max_write_buffer_size(usize::MAX)
+        .max_message_size(None)
+        .max_frame_size(None)
 }
 
 fn protocol_error(error: impl std::fmt::Display) -> io::Error {

@@ -76,7 +76,7 @@ const USAGE: &str = concat!(
     "codex-harness executor run --file RECEIPT\n",
     "codex-harness executor succeed --request PATH\n",
     "The originating lead is the dispatching process CODEX_THREAD_ID, captured before the host environment is cleared. A missing or blank id, a caller-supplied lead or recipient, and a copied, stale or sibling run marker are refused before any model request. Spawn selects, synchronizes and binds one slot of the harness-owned worktree pool of --source (siblings named <repository>-wt1..N, sized to max_concurrent_executors) before the first model request, then opens a tab in the lead's own Windows Terminal window when WT_SESSION is set, restoring the user's foreground window and selected tab afterwards; --terminal-window targets an explicitly named window, and a window that cannot be addressed (another virtual desktop or a blocked activation) gets the stable per-checkout window codex-harness-<repository>, which the terminal creates on first use. Without WT_SESSION spawn opens a visible console. The tab host exits 0 after the session ends, including a recorded failure; the receipt keeps the run's state and exit code, and an owned console still returns the run's own code. --workspace must be the source checkout or one of its pool slots; an ad-hoc worktree path is refused. --base overrides the synchronized base (the upstream default branch by default); --owner labels the session binding (default exec-<profile>-<pid>) and reusing it keeps the same slot across an interruption. ",
-    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts it inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding and no model request, attaches the native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt - the address `executor message`, `executor stop` and the lead's reply use - and records the run's lifecycle state with the exact native session identity, the final-message locator and the bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. An attachment failure is reported before any assignment request. A thread that does not report the bound routing refuses the conversation, and a turn whose full-thread final-message read exceeds the transport limit records the delivered assistant message, or an output defect naming the limit, without killing the child tree. Every managed executor run also monitors its exact session's recorded per-response usage for repeated cache loss, regardless of provider or model: routine status stays in the receipt and host log, degraded coverage goes through the attached native frontend's own warning view when one exists (recorded in `cacheGuard.diagnosticDelivery` as a native-format send or as undelivered, never as a warning a person confirmed seeing), no cache-guard line is written into the terminal that frontend owns, and a runtime-proven sustained loss stops the owned tree as a non-success outcome with an explicit fresh-session recovery command. ",
+    "The default and explicit tui mode host one `codex app-server` child behind the tab host: the host starts it inside its own Windows Job with the executor session environment, prepares the bound thread with the resolved profile binding and no model request, attaches the native Codex TUI to that exact thread in the existing tab, and submits the assignment once through `turn/start`. The host records the conversation's endpoint (port, capability token, thread id and the child's exact process identity) in `endpoint-<index>.json` beside the dispatch receipt - the address `executor message`, `executor stop` and the lead's reply use - and records the run's lifecycle state with the exact native session identity, the final-message locator and the bounded detail file. After the result is persisted the host ends that owned frontend and its backend, then the terminal-host close policy finishes the tab; a cleanup failure names each surviving owned resource and its recovery action in the receipt without changing the recorded state or exit code. An attachment failure is reported before any assignment request. A thread that does not report the bound routing refuses the conversation. Every managed executor run also monitors its exact session's recorded per-response usage for repeated cache loss, regardless of provider or model: routine status stays in the receipt and host log, degraded coverage goes through the attached native frontend's own warning view when one exists (recorded in `cacheGuard.diagnosticDelivery` as a native-format send or as undelivered, never as a warning a person confirmed seeing), no cache-guard line is written into the terminal that frontend owns, and a runtime-proven sustained loss stops the owned tree as a non-success outcome with an explicit fresh-session recovery command. ",
     "Explicit --mode exec uses that same observed lifecycle with the native inline TUI (--no-alt-screen), not a second renderer. Historical unmanaged tui and legacy receipts keep the coverage they recorded. `executor watch` blocks on that recorded lifecycle and returns bounded review data without model polling or rollout searches: state, slot, owner, exact session, checkout, base, changed files (committed changes since the recorded base plus the current working tree including untracked files, both bounded), the executor's returned message (reported, not verified acceptance), result, detail and stderr locators, and the exit code. Watch exits 0 for a completed run, 1 for failed, defect or interrupted runs, 2 when coverage is unavailable (tui or legacy), the receipt is missing or the timeout expires while the run continues, and 3 when the run is live with an unresolved reply request. Exit 3 is action required: the result names the exact run and the bounded request references with their one-command reply, the run keeps its session, slot, worktree and partial work, and the lead answers and runs watch again - it is never a completion, output defect, unavailable-coverage or release result. ",
     "An observed `executor run --file` reports the same states on its visible surface, propagates the launcher's own exit code, exits 0 only for a completed turn with a nonempty final message, exits 3 when a completed turn wrote an empty or missing final message (an output defect, not model unavailability), and exits 1 for a failed or interrupted stream; an empty completion is never reported as success. A tab or console host exits 0 after recording that outcome so the tab closes. Resume continues one exact interrupted session on its recorded slot through the managed native TUI: the host starts a control-backed app-server, resumes that exact thread, retires any stale control endpoint, and attaches one native Codex TUI to that session without fetch, reset, clean, a new conversation or a replay of completed work. Without --session it consumes the exact identity the dispatch receipt recorded, keeps it across failed resume attempts, and refuses instead of choosing by recency. Release records the lead's merged or discarded disposition with its reason, resets the slot with ignored build caches kept, and preserves it with its limitation when it cannot be safely reset; a live session or an unreviewed tree is never reset beneath the lead, and no release is automatic. ",
     "Pool reports the recorded slot mapping (index, path, state, owner, base, run), the tree and lease state, and the foreign or legacy worktrees that only the lead retires; worktree_limit is superseded by the pool size. `executor stop` urgently stops one exact pooled run addressed by --source, --slot and --owner; an optional --session must equal the session the dispatch receipt recorded. It verifies the recorded host process by its full identity (pid, creation time and image, never a bare pid, program name or window title), requests native `turn/interrupt` through the run's kit-local control endpoint (`endpoint-N.json`) only when the run recorded one, then boundedly terminates the recorded host and the recorded processes of its tree, verifying each by the recorded identity and terminating survivors so a child command is reported actually terminated. The stopped run's tab closes because that run's own host process ends; no terminal command is ever sent, so the lead's window and sibling tabs are untouched. Nothing is reset, cleaned, released or completed - continuation stays an explicit `executor resume`. ",
@@ -3804,7 +3804,7 @@ fn host_control_conversation(
             );
         }
     };
-    let (state, streamed_message) = state;
+    let (state, _streamed_message) = state;
     // The turn's own status is terminal. The final message comes from the
     // thread's items, never from a transport acknowledgement.
     let (final_message, cause) = match state {
@@ -3827,31 +3827,6 @@ fn host_control_conversation(
             }
             Ok(FinalMessage::Empty) => (Some(observation::FinalMessage::Empty), None),
             Ok(FinalMessage::Missing) => (Some(observation::FinalMessage::Missing), None),
-            Err(error) if transport_limit_exceeded(&error) => {
-                if let Some(text) = streamed_message {
-                    if let Err(write_error) = observation::write_final_message(&result, &text) {
-                        return fail_with_frontend(
-                            &mut frontend,
-                            receipt,
-                            &mut tracker,
-                            format!(
-                                "the final message could not be recorded at {}: {write_error}",
-                                result.display()
-                            ),
-                            plan,
-                            Some(job),
-                        );
-                    }
-                    (Some(observation::FinalMessage::Present), None)
-                } else {
-                    (
-                        Some(observation::FinalMessage::Missing),
-                        Some(format!(
-                            "the full-thread final-message read exceeded the transport limit and the turn delivered no assistant message: {error}"
-                        )),
-                    )
-                }
-            }
             Err(error) => {
                 return fail_with_frontend(
                     &mut frontend,
@@ -4221,13 +4196,6 @@ fn completed_agent_message(event: &control::ControlEvent) -> Option<String> {
         return None;
     }
     Some(text.to_owned())
-}
-
-/// True when the control transport rejected one record for exceeding its size
-/// limit. Other read failures are not this condition.
-fn transport_limit_exceeded(error: &io::Error) -> bool {
-    let text = error.to_string();
-    text.contains("Space limit exceeded") || text.contains("Message too long")
 }
 
 /// Fails one control-backed run honestly: the receipt records a failed state

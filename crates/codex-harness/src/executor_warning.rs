@@ -53,9 +53,6 @@ const WARNING_MESSAGE: &str = "message";
 /// applies to, `null` when it applies to no single thread.
 const WARNING_THREAD: &str = "threadId";
 
-/// Message bound shared with the control transport, so both sides of the relay
-/// refuse the same oversized records.
-const RECORD_LIMIT: usize = 1024 * 1024;
 /// Bound on the relay's upstream connect and on one socket write.
 const WRITE: Duration = Duration::from_secs(5);
 /// Read timeout of one relay step. It bounds both how long an idle step waits
@@ -881,12 +878,16 @@ fn deliver(
 }
 
 fn config() -> WebSocketConfig {
+    // No harness-side message, frame or write-buffer size cap: the frontend's
+    // own exact-thread resume state legitimately exceeds any small bound, and
+    // both peers - the native frontend and the owned app-server - are local
+    // processes of this host.
     WebSocketConfig::default()
         .read_buffer_size(4096)
         .write_buffer_size(0)
-        .max_write_buffer_size(RECORD_LIMIT + 4096)
-        .max_message_size(Some(RECORD_LIMIT))
-        .max_frame_size(Some(RECORD_LIMIT))
+        .max_write_buffer_size(usize::MAX)
+        .max_message_size(None)
+        .max_frame_size(None)
 }
 
 fn would_block(error: &WsError) -> bool {

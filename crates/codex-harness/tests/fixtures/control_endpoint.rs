@@ -262,7 +262,9 @@ impl Wire {
                         }
                         Err(error) => return Err(error),
                     }
-                    if self.buffer.len() > 1024 * 1024 + 16 {
+                    // The double's own sanity bound, not a product contract:
+                    // real conversation records exceed one mebibyte.
+                    if self.buffer.len() > 16 * 1024 * 1024 + 16 {
                         return Err(io::Error::other("canned frame exceeds its bound"));
                     }
                 }
@@ -293,7 +295,9 @@ impl Wire {
                 let mut size = [0u8; 8];
                 size.copy_from_slice(&self.buffer[2..10]);
                 let size = u64::from_be_bytes(size);
-                if size > 1024 * 1024 {
+                // The double's own sanity bound, not a product contract:
+                // real conversation records exceed one mebibyte.
+                if size > 16 * 1024 * 1024 {
                     return Err(io::Error::other("canned frame exceeds its bound"));
                 }
                 (10, size as usize)

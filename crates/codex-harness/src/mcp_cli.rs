@@ -37,9 +37,12 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         }
         let path = local_path(Path::new(&args[2]))?;
         let root = harness_core::broker_state::BrokerRoot::open(&path)?;
+        // A cold broker can still be publishing its endpoint or finishing the
+        // first worker activation; observe that state instead of expiring an
+        // explicit retirement while the owned service is starting.
         let result = harness_core::broker_launch::retire(
             &root,
-            Deadline::after(Duration::from_secs(8))?,
+            Deadline::after(Duration::from_secs(60))?,
             &Cancellation::default(),
         )?;
         println!("{}", serde_json::to_string(&result)?);

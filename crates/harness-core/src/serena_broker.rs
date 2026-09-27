@@ -93,6 +93,12 @@ struct Record {
 
 const OWNER: &str = "codex-harness-serena-broker";
 
+/// Startup, relocation and recovery share the request budget. Publishing a
+/// cold broker endpoint plus the first worker's language-server activation
+/// regularly exceeds a shorter fixed cap, which surfaced as a client-side
+/// `broker HTTP deadline expired` before the worker ever answered.
+const CONTROL: Duration = Duration::from_secs(240);
+
 struct Admission(std::os::windows::io::OwnedHandle);
 
 impl Admission {
@@ -246,7 +252,7 @@ impl Client {
             self.source.clone(),
             serde_json::to_string(&self.configuration)?,
         ];
-        let startup = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+        let startup = Deadline::after(deadline.remaining().min(CONTROL))?;
         let mut location = self.location()?;
         let mut endpoint = match broker_launch::ensure(
             &BrokerRoot::open(&location)?,
@@ -261,7 +267,7 @@ impl Client {
             // Another build generation took the location between resolution
             // and startup; resolve this generation's own location once.
             Err(error) if broker_launch::source_conflict(&error) => {
-                let retry = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+                let retry = Deadline::after(deadline.remaining().min(CONTROL))?;
                 location = root(&self.configuration.codex_home, &self.source, retry, cancel)?;
                 self.relocate(&location)?;
                 broker_launch::ensure(
@@ -279,7 +285,7 @@ impl Client {
         match Self::rpc_once(&endpoint, operation, payload, deadline, cancel) {
             Ok(value) => Ok(value),
             Err(error) if serena_rpc_recoverable(&error) => {
-                let retry = Deadline::after(deadline.remaining().min(Duration::from_secs(30)))?;
+                let retry = Deadline::after(deadline.remaining().min(CONTROL))?;
                 match broker_launch::retire(&BrokerRoot::open(&location)?, retry, cancel)? {
                     broker_launch::Retirement::Pending { pid } => Err(io::Error::other(format!(
                         "Serena broker retirement still pending (pid {pid:?})"

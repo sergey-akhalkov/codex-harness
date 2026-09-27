@@ -358,6 +358,64 @@ pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {
     result
 }
 
+pub fn daemon_opt_out(args: &[OsString], shared_overrides: bool) -> Vec<OsString> {
+    let mut command = None;
+    let mut positional = false;
+    let mut profile = false;
+    let mut remote = false;
+    let mut help = false;
+    let mut opted_out = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg, "-h" | "--help" | "-V" | "--version")
+            || arg
+                .strip_prefix('-')
+                .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c == 'h' || c == 'V'))
+        {
+            help = true;
+        }
+        if option(arg, "--profile") || arg.starts_with("-p") {
+            profile = true;
+        }
+        if option(arg, "--remote") {
+            remote = true;
+        }
+        if arg == "--no-daemon" {
+            opted_out = true;
+        }
+        if VALUES.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if image(arg) {
+            skip_images(args, &mut i);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            i += 1;
+            continue;
+        }
+        if !positional {
+            positional = true;
+            if COMMANDS.contains(&arg) {
+                command = Some(arg);
+            }
+        }
+        i += 1;
+    }
+    let tui = matches!(command, None | Some("resume" | "fork"));
+    if tui && !help && !remote && !opted_out && (shared_overrides || profile) {
+        vec!["-c".into(), "features.daemon_auto_start=false".into()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Executor sessions are single-agent workers. Any launch that inherits the
 /// executor marker receives Codex CLI's built-in agent-capability switch, so a
 /// raw nested `codex` invocation stays a single-agent session as well. The

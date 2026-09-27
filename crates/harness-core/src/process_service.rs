@@ -45,7 +45,11 @@ mod wmi;
 pub const CREATE_ARGUMENT: &str = "--harness-service-create";
 pub const RUN_ARGUMENT: &str = "--harness-service-run";
 const MAX_REQUEST: usize = 1024 * 1024;
-const MAX_STARTUP_MS: u64 = 120_000;
+/// Service startup may use the shared 240-second control budget: a cold
+/// Serena broker publishes its endpoint and activates its first worker's
+/// language server inside one forwarded request, which exceeds the old
+/// 120-second cap before the worker ever answers.
+const MAX_STARTUP_MS: u64 = 240_000;
 const CLEANUP: Duration = Duration::from_secs(5);
 /// Job-object access rights (winnt.h). The enabled windows-sys features do not
 /// export the SystemServices constants, so the documented values are spelled
@@ -829,7 +833,7 @@ pub fn spawn(
     let remaining = deadline.remaining();
     if remaining.is_zero() || remaining > Duration::from_millis(MAX_STARTUP_MS) {
         return Err(invalid(
-            "service startup requires a deadline within 120 seconds",
+            "service startup requires a deadline within 240 seconds",
         ));
     }
     if !program.is_absolute() {

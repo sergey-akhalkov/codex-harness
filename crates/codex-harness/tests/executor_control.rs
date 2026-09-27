@@ -2981,14 +2981,15 @@ fn a_hosted_empty_final_message_is_an_output_defect() {
 }
 
 #[test]
-fn a_hosted_oversized_thread_read_keeps_the_delivered_message() {
+fn a_hosted_full_thread_read_above_one_mebibyte_records_its_message() {
     let pooled = Pooled::new(
         "host-oversized",
         Answer::Result(thread_start_answer()),
         true,
     );
     let mut read = thread_read_answer();
-    read["thread"]["turns"][0]["items"][1]["text"] = json!("x".repeat(1024 * 1024 + 8192));
+    let oversized = "x".repeat(1024 * 1024 + 8192);
+    read["thread"]["turns"][0]["items"][1]["text"] = json!(oversized);
     pooled.server.answer("thread/read", Answer::Result(read));
     let host = pooled.host("hang");
     wait_for(
@@ -3000,16 +3001,22 @@ fn a_hosted_oversized_thread_read_keeps_the_delivered_message() {
     let text = output_text(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("result: completed"), "{text}");
-    assert!(!text.contains("owned child tree was terminated"), "{text}");
-    assert!(!text.contains("final message could not be read"), "{text}");
-    assert_eq!(fs::read_to_string(pooled.result_path()).unwrap(), FINAL);
+    assert!(
+        !text.contains("transport limit"),
+        "no transport size limit may appear: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(pooled.result_path()).unwrap(),
+        oversized,
+        "the full-thread read above one mebibyte is the recorded final message"
+    );
     let receipt = pooled.receipt();
     assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
     assert_eq!(receipt["observation"]["exitCode"], 0, "{receipt}");
 }
 
 #[test]
-fn a_hosted_oversized_thread_read_without_a_message_is_a_defect() {
+fn a_hosted_full_thread_read_above_one_mebibyte_without_a_message_is_an_empty_defect() {
     let pooled = Pooled::new(
         "host-oversized-empty",
         Answer::Result(thread_start_answer()),
@@ -3033,12 +3040,79 @@ fn a_hosted_oversized_thread_read_without_a_message_is_a_defect() {
     let text = output_text(&output);
     assert_eq!(output.status.code(), Some(3), "{text}");
     assert!(text.contains("result: defect:"), "{text}");
-    assert!(text.contains("transport limit"), "{text}");
+    assert!(
+        text.contains("no final assistant message in the thread items"),
+        "the oversized read succeeds, so the defect is the missing message: {text}"
+    );
+    assert!(
+        !text.contains("transport limit"),
+        "no transport size limit may appear: {text}"
+    );
     assert!(!text.contains("owned child tree was terminated"), "{text}");
     assert!(!pooled.result_path().exists(), "{text}");
     let receipt = pooled.receipt();
     assert_eq!(receipt["observation"]["state"], "defect", "{receipt}");
     assert_eq!(receipt["observation"]["exitCode"], 3, "{receipt}");
+}
+
+#[test]
+fn an_exact_session_resume_above_one_mebibyte_starts_and_completes() {
+    let pooled = Pooled::new(
+        "resume-oversized",
+        Answer::Result(thread_start_answer()),
+        true,
+    );
+    // The real failing shape: an exact-session resume whose thread state
+    // record is larger than the old one-mebibyte transport bound. The host
+    // must resume it, submit the assignment and complete the turn.
+    let mut resume = thread_start_answer();
+    resume["thread"]["resumed"] = json!({"payload": "r".repeat(1024 * 1024 + 8192)});
+    pooled
+        .server
+        .answer("thread/resume", Answer::Result(resume));
+    let mut receipt = pooled.receipt();
+    receipt["mode"] = json!("tui");
+    receipt["control"]["presentation"] = json!("native-tui");
+    receipt["control"]["resumeSession"] = json!(THREAD);
+    receipt["observation"]["previousSession"] = json!(THREAD);
+    receipt["observation"]["session"] = Value::Null;
+    fs::write(
+        &pooled.receipt,
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+    let host = pooled.host("complete");
+    wait_for(
+        || !pooled.server.requests_for("turn/start").is_empty(),
+        "the oversized resumed assignment was submitted",
+    );
+    assert_eq!(
+        pooled.server.requests_for("thread/resume").len(),
+        1,
+        "the exact recorded session was resumed"
+    );
+    assert!(
+        pooled.server.requests_for("thread/start").is_empty(),
+        "a resume must not start a new conversation"
+    );
+    completion_burst(&pooled.server);
+    let output = host.wait_with_output().unwrap();
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("result: completed"), "{text}");
+    assert!(
+        !text.contains("was not resumed on the managed backend"),
+        "{text}"
+    );
+    assert!(!text.contains("Message too long"), "{text}");
+    assert_eq!(fs::read_to_string(pooled.result_path()).unwrap(), FINAL);
+    let receipt = pooled.receipt();
+    assert_eq!(receipt["observation"]["state"], "completed", "{receipt}");
+    assert_eq!(receipt["observation"]["session"], THREAD, "{receipt}");
+    assert_eq!(
+        receipt["observation"]["previousSession"], THREAD,
+        "{receipt}"
+    );
 }
 
 #[test]

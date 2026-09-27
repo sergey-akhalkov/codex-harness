@@ -565,6 +565,20 @@ no argv goal hook, so such a prefix is inert text; crash recovery is owned by
 the lead's watcher plus exact-session resume. Interactive `--mode tui` remains
 available for human-attended executors.
 
+**2026-09-27, confirmed (user decision):** the managed executor transports -
+the host's control connection to its owned app-server child and the
+frontend-facing warning relay - impose no harness-side WebSocket message,
+frame or write-buffer size cap. The earlier one-mebibyte record bound rejected
+real conversation state: an exact-session resume of 1,149,210 bytes failed
+before the assignment was submitted and the frontend surfaced the dead backend
+as a connection-lost reconnect loop, so executors with real session histories
+could not start. Both peers of each hop are owned localhost processes of the
+host, so unbounded records add no remote attack surface, and every time bound
+stays. The delivered-message fallback for an oversized final-message read and
+its output-defect scenario are removed with the limit; a read now completes or
+fails for its own reason and fails the host. Change:
+[fix executor transport size limit](../openspec/changes/fix-executor-transport-size-limit/proposal.md).
+
 **2026-09-25, confirmed (supersedes the 2026-09-20 text-default choice):** pooled `executor spawn`, `resume` and `restart` present the native Codex TUI by default. Explicit `spawn --mode exec` is the native inline TUI on that same observed lifecycle, not an unobserved launcher. Watch, automatic closure and exact-session `executor resume` stay the current path, and the 2026-09-24 tab-close policy still applies. Operating detail: [observed executor lifecycle](agent-delegation.md#observed-executor-lifecycle). Change: [add observed executor TUI](../openspec/changes/archive/2026-09-25-add-observed-executor-tui/proposal.md).
 
 **2026-09-24, confirmed:** a failed executor tab closes too. Windows Terminal's
