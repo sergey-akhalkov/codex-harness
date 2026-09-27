@@ -162,16 +162,16 @@ further delegation need to the lead instead of widening orchestration.
 
 ## Executor utilization
 
-While the lead role is active, configured executor capacity is not left idle
-by omission: at each utilization checkpoint the lead dispatches the next
-worthwhile, capability-sized slice or records the concrete reason the capacity
-stays idle, and released capacity is backfilled before unrelated lead work
-starts. Idle capacity without such a reason, or a report that hides it, is a
-lead workflow defect. Requirements live in the
+While the lead role is active, substantial eligible investigation, writing or
+code is dispatched to available executor capacity before the lead starts it,
+and released capacity is backfilled before unrelated lead work starts. An idle
+capacity's cause stays identifiable from board and `executor pool` state: no
+checkpoint ritual, reason note or occupancy narration is required, and a
+summary that would otherwise mislead about capacity that sat unused names the
+cause in a clause. Requirements live in the
 [delegation](../openspec/specs/agent-delegation/spec.md) and
 [orchestration](../openspec/specs/lead-agent-orchestration/spec.md)
-specifications, and the live checkpoints, recorded reasons, occupancy
-reporting and priority rules are owned by the
+specifications, and the priority rules are owned by the
 [`team-lead` skill](../.agents/skills/team-lead/SKILL.md) rather than restated
 here.
 

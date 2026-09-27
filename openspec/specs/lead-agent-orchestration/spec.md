@@ -228,21 +228,21 @@ Pooled executor dispatch SHALL run its managed conversations, including the defa
 - **WHEN** the lead stops one of two active managed TUI runs
 - **THEN** the existing urgent-stop contract interrupts and contains only that run, closes its owned surface, preserves its files and continuation identity, and leaves the other executor and lead running
 
-### Requirement: Utilization checkpoints and observable occupancy
+### Requirement: Delegation-first utilization without reporting ritual
 
-The lead workflow SHALL check executor utilization at session start, at stage or epic planning, after each dispatch decision, and after each acceptance or slot release. At each checkpoint the lead SHALL either dispatch the next worthwhile, capability-sized slice to available executor capacity or record the concrete reason the capacity stays idle. Lead progress reporting SHALL state executor occupancy against the configured concurrency limit and the recorded reason for every idle executor or free slot, derived from board and executor-pool records without window polling or model status requests to active executors. When a slot is released after acceptance or explicit discard and a worthwhile dispatchable slice exists, the lead SHALL backfill that capacity before starting unrelated implementation work itself. Sessions without lead activation SHALL remain unchanged.
+The lead workflow SHALL dispatch substantial eligible investigation, writing or code to available configured executor capacity before starting that work itself, and SHALL backfill a slot released after acceptance or explicit discard with the next worthwhile dispatchable slice before starting unrelated implementation work itself. Capacity that stays idle SHALL have a nameable cause - no worthwhile slice now, remaining slices dependent on unresolved work, configured pacing, a preserved or blocked slot, or unavailable dispatch with its reported cause - which board and executor-pool state already show: no utilization checkpoint, per-report occupancy statement or kept-current reason note SHALL be required, and occupancy SHALL be read from those records without window polling or model status requests to active executors. A stage or result summary that would otherwise mislead about capacity that sat unused SHALL name the cause in a clause. Sessions without lead activation SHALL remain unchanged.
 
-#### Scenario: Progress reports occupancy
-- **WHEN** the lead reports progress while orchestration is active
-- **THEN** the report states how many configured executor slots are busy and the recorded reason for every idle executor or free slot, derived from board and pool records
+#### Scenario: Substantial eligible work is dispatched, not solved by the lead
+- **WHEN** the lead identifies substantial implementable investigation, writing or code within a configured executor profile's capability while capacity is available
+- **THEN** the lead dispatches that work instead of starting it itself, retaining decomposition, integration and acceptance
 
 #### Scenario: A released slot is backfilled
 - **WHEN** the lead merges accepted work and releases a slot while a worthwhile, dispatchable slice exists within a configured executor profile's capability
 - **THEN** the lead dispatches that slice into the freed capacity before starting unrelated implementation work itself
 
-#### Scenario: An idle reason is refreshed
-- **WHEN** the circumstance behind a recorded idle reason changes, such as a dependency resolving, a quota window resetting, or a preserved slot returning to the pool
-- **THEN** the next utilization checkpoint re-evaluates the capacity and either dispatches a worthwhile slice or records the updated reason
+#### Scenario: Idle capacity needs no note or checkpoint
+- **WHEN** configured capacity stays idle, whether the cause is an absent worthwhile slice, an unresolved dependency, configured pacing or a preserved slot
+- **THEN** board and executor-pool state already show that cause, no checkpoint, reason note or occupancy statement is required to keep it current, and a summary that would otherwise mislead names the cause in a clause
 
 #### Scenario: An ordinary session is unchanged
 - **WHEN** a session without lead activation works a small direct task

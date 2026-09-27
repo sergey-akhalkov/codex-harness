@@ -62,23 +62,23 @@ The lead SHALL assign worthwhile complete workstreams to configured executors ac
 
 ### Requirement: Executor utilization with justified idleness
 
-While the lead role is active and orchestration is not blocked, the lead SHALL keep configured executor capacity supplied with worthwhile, capability-sized work under the economical-delegation requirement, and SHALL NOT leave executor capacity idle without a recorded reason. The recorded reason SHALL name a concrete cause: no worthwhile slice exists now, remaining slices depend on unresolved work, configured quota pacing holds new assignments, the slot is preserved or blocked with its recorded state, or dispatch is unavailable with the reported cause. While configured capacity idles without such a reason, the lead SHALL NOT retain executor-suitable routine implementation work for itself; the reason is recorded for the idle period at a checkpoint and refreshed when its circumstance changes, not per task. Utilization discipline SHALL NOT create manufactured filler work, a delegation-count target, or preemption of a healthy executor, and completion, correctness and configured quota pacing SHALL retain precedence over occupancy.
+While the lead role is active and orchestration is not blocked, the lead SHALL dispatch substantial eligible investigation, writing or code to available configured executor capacity before starting that work itself, and SHALL backfill capacity released after acceptance or explicit discard with the next worthwhile slice before unrelated lead implementation starts. Capacity that stays idle SHALL have a nameable cause - no worthwhile slice now, remaining slices dependent on unresolved work, configured quota pacing, a preserved or blocked slot, or unavailable dispatch with its reported cause - which board and executor-pool state already show; a checkpoint ritual, per-report occupancy statement or kept-current reason note SHALL NOT be required. A stage or result summary that would otherwise mislead about capacity that sat unused SHALL name the cause in a clause. Utilization discipline SHALL NOT create manufactured filler work, a delegation-count target, or preemption of a healthy executor, and completion, correctness and configured quota pacing SHALL retain precedence over occupancy.
 
 #### Scenario: Freed capacity receives the next slice
 - **WHEN** an assignment is accepted and its executor capacity becomes available while a worthwhile, sufficiently specified slice within a configured executor profile's capability exists and quota and pool state allow dispatch
 - **THEN** the lead dispatches that slice to the available capacity before starting unrelated implementation work itself, without preempting any healthy executor
 
-#### Scenario: The lead begins routine work while capacity idles
-- **WHEN** configured executor capacity is idle without a recorded reason and the lead identifies executor-suitable routine implementation work
-- **THEN** the lead dispatches that work to the idle capacity or records the concrete reason it stays with the lead before continuing the work directly
+#### Scenario: The lead starts eligible work while capacity idles
+- **WHEN** configured executor capacity is idle and the lead identifies substantial executor-eligible investigation, writing or code within a configured profile's capability
+- **THEN** the lead dispatches that work to the idle capacity; work whose briefing and review cost more than doing it directly stays with the lead without a note
 
 #### Scenario: No worthwhile slice exists
 - **WHEN** every remaining slice depends on unresolved work, exceeds every configured executor profile, or would cost more to brief and verify than to complete directly
-- **THEN** the lead records that cause for the idle capacity, keeps over-capability and tightly coupled work with itself, and manufactures no filler assignment or artificial split
+- **THEN** that condition justifies the idle capacity without a note or checkpoint, over-capability and tightly coupled work stays with the lead, and no filler assignment or artificial split is created
 
 #### Scenario: Quota pacing holds new assignments
 - **WHEN** configured pacing suspends or reduces new assignments in an observed provider window
-- **THEN** executor capacity may remain idle with the pacing reason recorded, and a healthy executor keeps its slot, model and instructions
+- **THEN** executor capacity may remain idle under that pacing condition without a recorded note, and a healthy executor keeps its slot, model and instructions
 
 ### Requirement: Autonomous recovery and escalation
 
