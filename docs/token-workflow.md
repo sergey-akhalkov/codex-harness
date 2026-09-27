@@ -8,8 +8,9 @@ start to discover the changed configuration.
 RTK is the explicit exception to ordinary hooks-off. For bulky output the agent
 calls, for example, `harness-rtk.exe exec git log -n 80`; the selected
 `PreToolUse` changes only the adapter mode to `compact`. The native program
-runs once with actual arguments, cwd and environment; only stdout is filtered.
-Stderr and exit code are preserved. CLI 0.153.4 does not pass the selected shell
+runs once with actual arguments, cwd and environment. For the allowlisted
+one-stream commands (`git status`, `git log`, `rg -n`, `pytest`) only stdout is
+filtered; stderr and the exit code pass through unchanged. CLI 0.153.4 does not pass the selected shell
 to the hook, so ordinary commands are not rewritten. Details remain available
 without a rerun: a compressed run also prints an observation handle beside the
 unchanged `[rtk raw: <path>]` locator, and
@@ -27,6 +28,48 @@ or dependency). Ambiguous shell syntax, unsupported or machine formats and
 `HARNESS_RTK_DISABLE=1` bypass compression.
 `global/hooks.json` and the former diagnostic handler stay inactive; the RTK
 definition lives separately in `global/rtk-hooks.json`.
+
+Human-output `cargo test|check|build|clippy` is the documented verification
+corpus of the accepted compression boundary, and it is a two-stream path:
+Cargo writes progress and rustc diagnostics to stderr while the test harness
+writes results to stdout. The adapter drains both pipes concurrently, decides
+each stream separately and keeps each retained original reachable: `cargo test`
+stdout keeps the pinned RTK `cargo-test` filter, every other Cargo stream uses
+the adapter's own presentation, which removes only recognized Cargo status
+lines (`Compiling`, `Checking`, `Finished`, `Running` and the like inside
+Cargo's 12-column status field) and keeps every other line verbatim, including
+unknown diagnostic blocks. A failed compile with no test summary stays a
+failure: no count is invented from a missing line, and a compacted run whose
+child failed also prints `[rtk cargo exit: <code>]`. The documented route is
+`codex-harness heavy -- harness-rtk.exe compact cargo test --workspace --locked
+--jobs 1 -- --test-threads=1`; package/workspace selection, `--locked`, job
+limits and arguments after the separator reach Cargo unchanged, and Cargo runs
+exactly once.
+
+Explicit limits of that path: machine formats (`--message-format json`,
+`--json`), verbose output, unknown flags, other Cargo verbs and `--nocapture`
+stay byte-raw; so do streams below 500 bytes, non-UTF-8 or NUL-carrying output,
+non-shrinking results, filter failures and timeouts, and runs where retention
+storage is unavailable. Capture is bounded to 4 MiB per stream; beyond that the
+run passes raw, reports the limit and streams the remainder live with no
+retention. While a long run is held back for presentation, a bounded progress
+notice reports captured bytes every `HARNESS_RTK_PROGRESS_SECONDS` (default 10,
+`0` disables, at most 20 notices). Compressed streams carry their own locator
+and handle (`[rtk raw[stderr]: <path>]`, `[rtk pack[stderr]: <handle> ...]`), so
+both streams are recallable with their stream identity after the command is
+gone.
+
+`harness-rtk.exe diagnostics [--last N] [--json]` reads the bounded local
+decision records (newest 32) for an explicitly inspected invocation: applied
+versus bypassed, the concrete reason (unsupported command or flags,
+machine-format, disabled, interactive, empty, short, binary, non-shrinking,
+filter failure or timeout, retention unavailable, oversize), measured raw and
+delivered bytes per stream, and the complete presentation size. Setting
+`HARNESS_RTK_DIAGNOSTIC=1` prints the same evidence for the current invocation
+on stderr, so a hook rewrite that changed nothing is visible without a second
+command. Routine raw and machine-output payloads never receive that footer, and
+byte counts are not token, subscription or quota measurements; the token field
+stays explicitly unavailable.
 
 Detailed use is in the portable
 [token-efficient-workflow skill](../.agents/skills/token-efficient-workflow/SKILL.md).
