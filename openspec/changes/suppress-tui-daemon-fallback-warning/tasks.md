@@ -14,5 +14,5 @@
       feature override flips `daemon_auto_start` off and the argument
       combination parses for the TUI path; record the pinned-source analysis
       in the design note.
-- [ ] 2.2 Deploy the built manager through the kit installation lifecycle
+- [x] 2.2 Deploy the built manager through the kit installation lifecycle
       and confirm the ordinary start path through the installed launcher.

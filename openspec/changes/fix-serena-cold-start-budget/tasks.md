@@ -13,4 +13,4 @@
 ## 3. Delivery
 
 - [x] 3.1 `openspec validate fix-serena-cold-start-budget --strict --no-interactive` and `git diff --check`.
-- [ ] 3.2 Deliver the fixed launcher through the immutable deploy lifecycle from a source snapshot that does not include unrelated in-flight edits, and re-verify the cold-start probe outside this checkout.
+- [x] 3.2 Deliver the fixed launcher through the immutable deploy lifecycle from a source snapshot that does not include unrelated in-flight edits, and re-verify the cold-start probe outside this checkout.

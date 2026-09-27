@@ -15,4 +15,4 @@
 
 - [x] 3.1 Record the user-confirmed decision in `docs/project-decisions.md`, superseding the one-mebibyte transport bound.
 - [x] 3.2 Validate with `openspec validate --strict --no-interactive` and `git diff --check`.
-- [ ] 3.3 Exercise the installed launcher outside this checkout through the immutable lifecycle: one fresh managed spawn and one real exact-session resume whose state exceeds one mebibyte, with rollback to the prior build retained.
+- [x] 3.3 Exercise the installed launcher outside this checkout through the immutable lifecycle: one fresh managed spawn and one real exact-session resume whose state exceeds one mebibyte, with rollback to the prior build retained.
