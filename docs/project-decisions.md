@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-24**.
+Last updated: **2026-09-27**.
 
 ## Public pack
 
@@ -652,18 +652,27 @@ forbade committing stay in the lead, and unrelated dirty work is never
 committed just to form a base. Change:
 [committed dispatch snapshot](../openspec/changes/archive/2026-09-23-committed-dispatch-snapshot/proposal.md).
 
-**2026-09-23, confirmed:** only the main session may decide to use the
+**2026-09-27, confirmed (refines the 2026-09-23 decision):** only the main session may decide to use the
 `team-lead` skill autonomously, and it does so when the user's task
 decomposes into parallel, independently verifiable slices that repay
 orchestration; the main session states that activation and its basis before
 spawning anything. Explicit user requests for executors or orchestrated
 development remain direct triggers. Executors and ephemeral helper agents
 never activate the role or originate further agents or executors and report
-such needs to the lead. While the role is active, the lead minimizes its own
-token spend and the time to the accepted result, keeps judgment,
-decomposition, integration, acceptance and capability-exceeding work, and
-does work whose delegation overhead exceeds the work itself - typically a
-one-line correction - directly, with no task or board note. Change:
+such needs to the lead. While the role is active, the lead focuses on ideas,
+judgment, useful task decomposition, integration and acceptance. Delegate
+substantial suitable investigation, writing and implementation before solving
+the assignment in the lead. Tiny or inseparable work whose handoff costs more
+stays direct, without a task or board note. When no useful independent lead
+work remains, wait for native completion or help events; do not invent work,
+repeat the investigation or request progress to fill the wait. Routine
+supervision is one compact check across active workers at most once per
+15 minutes, with earlier inspection only for a result, error, help request,
+new user instruction or concrete correctness/resource risk. Elapsed time
+alone warrants neither intervention nor takeover. Preserve full acceptance
+and judge total coordination and rework as well as lead effort; instruction
+changes alone establish no measured token or subscription savings. Operational
+owners are the portable principles and the `team-lead` skill. Original change:
 [autonomous lead activation](../openspec/changes/archive/2026-09-23-autonomous-lead-activation/proposal.md).
 
 **2026-09-23, confirmed:** the shared kit tracks the current stable Rust
