@@ -11,7 +11,8 @@ use tungstenite::{
     protocol::WebSocketConfig,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleProcessList, GetConsoleTitleW, GetConsoleWindow, SetConsoleTitleW,
+    COORD, GetConsoleProcessList, GetConsoleScreenBufferInfo, GetConsoleTitleW, GetConsoleWindow,
+    GetStdHandle, ReadConsoleOutputCharacterW, STD_OUTPUT_HANDLE, SetConsoleTitleW,
 };
 
 /// One authenticated connection to an explicitly owned local server. It does
@@ -161,6 +162,55 @@ pub fn frontend_loaded(pid: u32, title: &str) -> io::Result<bool> {
         return Ok(false);
     }
     Ok(caption_loaded(&caption, title))
+}
+
+/// Bounded text from this console, only while the named child belongs to it.
+/// Used after a failed frontend attachment, never as readiness evidence. This
+/// reads characters, not pixels, and neither sends input nor changes the UI.
+pub fn frontend_console_text(pid: u32) -> io::Result<Option<String>> {
+    if !console_contains(pid)? {
+        return Ok(None);
+    }
+    let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let mut info = unsafe { std::mem::zeroed() };
+    if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let left = info.srWindow.Left;
+    let bottom = info.srWindow.Bottom;
+    let top = info.srWindow.Top.max(bottom.saturating_sub(63));
+    let width = (i32::from(info.srWindow.Right) - i32::from(left) + 1).clamp(1, 1024);
+    let mut line = vec![0_u16; width as usize];
+    let mut text = String::new();
+    for y in top..=bottom {
+        let mut read = 0;
+        if unsafe {
+            ReadConsoleOutputCharacterW(
+                output,
+                line.as_mut_ptr(),
+                line.len() as u32,
+                COORD { X: left, Y: y },
+                &mut read,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let decoded = String::from_utf16_lossy(&line[..read as usize]);
+        let trimmed = decoded.trim_end();
+        if !trimmed.is_empty() {
+            text.push_str(trimmed);
+            text.push('\n');
+        }
+        if text.len() > 4096 {
+            let mut start = text.len() - 4096;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text.drain(..start);
+        }
+    }
+    Ok(Some(text.trim_end().to_owned()))
 }
 
 /// Sets this process's console caption. Used by an owned frontend double; the

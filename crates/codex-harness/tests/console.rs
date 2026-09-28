@@ -184,6 +184,34 @@ mod native {
     }
 
     #[test]
+    fn frontend_startup_text_is_owned_bounded_and_unicode_safe() {
+        let root = root("startup-text");
+        let marker = root.join("result.json");
+        let mut command = spec("startup-text");
+        command.args.push(marker.clone().into());
+        let session = ConsoleSession::spawn(ConsoleSpec::new(command)).unwrap();
+        let result = session
+            .wait(
+                Deadline::after(Duration::from_secs(15)).unwrap(),
+                &Cancellation::default(),
+                CLEANUP,
+            )
+            .unwrap();
+        assert_eq!(result.outcome.exit_code, 0);
+        let data = receipt(&marker);
+        let text = data["text"].as_str().unwrap();
+        assert!(text.len() <= 4096, "{}", text.len());
+        assert!(
+            text.contains("native startup condition: synthetic refusal"),
+            "{text}"
+        );
+        assert!(text.contains('λ'));
+        assert!(!text.contains("line 000"));
+        assert!(!text.contains('\u{fffd}'));
+        assert!(data["foreign"].is_null());
+    }
+
+    #[test]
     fn unicode_quoting_cwd_env_stdin_and_streams() {
         let root = root("streams");
         let marker = root.join("result.json");

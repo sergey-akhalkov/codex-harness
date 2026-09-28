@@ -3520,8 +3520,13 @@ fn wait_for_frontend(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "unavailable".into());
+            let console = match harness_core::task_control::frontend_console_text(pid) {
+                Ok(Some(text)) => format!("bounded console text: {text:?}"),
+                Ok(None) => "console text unavailable: child is not on this console".into(),
+                Err(error) => format!("console text unavailable: {error}"),
+            };
             return Err(invalid(&format!(
-                "the native frontend did not attach to thread {} within {FRONTEND_ATTACH:?}; console caption is {caption:?}. The assignment was not submitted. Remedy: confirm the installed Codex TUI can resume --remote this thread and that this host owns the terminal tab",
+                "the native frontend did not attach to thread {} within {FRONTEND_ATTACH:?}; console caption is {caption:?}; {console}. The assignment was not submitted. Remedy: resolve the reported frontend startup condition, then retry through the owning dispatcher",
                 conversation.thread_id()
             )));
         }

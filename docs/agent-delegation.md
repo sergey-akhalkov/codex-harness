@@ -283,6 +283,13 @@ codex-harness executor watch --receipt FILE [--json]
 Keep one watcher per run. Short tool yields continue that watcher; at the supervision boundary use one compact `executor pool` snapshot and, only if progress is unclear, inspect the latest bounded evidence once. Process existence, log growth, elapsed time, silence and a missing patch prove neither progress nor a stall.
 
 `executor run --file` is the visible host. It propagates the launcher outcome, treats an empty completion as an output defect, and never presents a completion record as proof that claimed checks passed. Exact-session recovery is the worktree resume command; cache loss uses the fresh restart below.
+
+An attachment timeout includes at most 4096 UTF-8 bytes of visible console text,
+read only while the exact frontend belongs to that console. This diagnostic
+neither captures pixels nor sends input and never substitutes for attachment.
+Keep the failure in the owning local receipt: a resumed console can contain
+private conversation text. Unavailable text is reported without hiding the
+original timeout or changing its cleanup.
 ## Steering and stopping executors
 
 Steer a continuing run by piping content into `codex-harness executor message`; a short `--text` or explicit UTF-8 `--file` remains a fallback. With one live run the command resolves and verifies checkout, home, slot, owner and exact session itself; several runs produce a bounded listing that names `--slot`. Oversized piped input spills automatically and is reported as spill evidence, never confused with model delivery. Message only to add a fact, resolve a request or correct an established mistake—not for status, hurry or repetition without new facts.

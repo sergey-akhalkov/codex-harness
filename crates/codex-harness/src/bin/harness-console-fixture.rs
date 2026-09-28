@@ -114,6 +114,23 @@ mod fixture {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let role = args.first().and_then(|v| v.to_str()).unwrap_or("");
         match role {
+            "startup-text" => {
+                let artifact = Path::new(
+                    args.get(1)
+                        .ok_or_else(|| io::Error::other("startup-text ARTIFACT required"))?,
+                );
+                for index in 0..90 {
+                    write_line(&mut output, &format!("line {index:03} {}", "λ".repeat(100)))?;
+                }
+                write_line(&mut output, "native startup condition: synthetic refusal")?;
+                record(
+                    artifact,
+                    json!({
+                        "text": harness_core::task_control::frontend_console_text(std::process::id())?,
+                        "foreign": harness_core::task_control::frontend_console_text(0)?,
+                    }),
+                )
+            }
             "report" => {
                 let artifact = Path::new(
                     args.get(1)
