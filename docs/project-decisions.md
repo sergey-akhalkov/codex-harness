@@ -145,6 +145,23 @@ Result, quality and speed are all required:
   complete task, including checks and needed corrections. Completeness of
   infrastructure built in advance is not the goal.
 
+**2026-09-28, confirmed (user decision):** the portable principles gate
+substantial optional effort by its effect on the earliest verified MVP -
+accelerating, acceptance-required or deferrable, with deferrable work recorded
+in its existing owner - and define the main-session posture: coordination,
+judgment, ideation, deep analysis, decomposition, integration and acceptance
+stay in the main session, whose context and tokens are the scarce resource,
+while substantial transferable execution is delegated under the existing
+activation rules. Cross-session decisions, priorities, agreements and deferred
+work are recorded in the owning memory record when decided, and explicit
+remember or roadmap requests write immediately; the `project-memory` skill and
+the `git-project-memory` specification own that contract. To carry these
+additions without weakening accepted guidance, the enforced
+portable-principles limit rose by 512 bytes to 25,088 after 201 bytes of
+lossless compression (content 25,038 bytes); a silent or larger raise stays
+rejected. Change:
+[sharpen MVP focus and session memory](../openspec/changes/archive/2026-09-29-sharpen-mvp-focus-and-session-memory/proposal.md).
+
 ## Engineering judgment and simplicity
 
 The agent is an independent engineering partner: understand the intended result,
@@ -362,6 +379,14 @@ literal text and regex search belong to scoped `rg` (`search_for_pattern` is
 hidden from the Serena catalogue). Exact-reference and refactoring claims use
 Serena or current source. Any future graph re-adoption is a deliberate new
 decision with measured everyday demand, not a restore of retired code.
+
+**Serena symbol diagnostics (2026-09-29):** the managed selection
+additionally includes Serena's optional `get_diagnostics_for_symbol`
+(changed symbol plus optional direct referencers, explicit and bounded)
+while memory, onboarding, introspection, text-search,
+`restart_language_server` and line-surgery tools stay excluded;
+`restart_language_server` is revisited only on recorded recurring
+LSP-stall evidence. Core delivery follows the normal deploy lifecycle.
 
 ## Subscriptions
 

@@ -22,7 +22,12 @@ explicit and preserves partial work.
 ## Operating objective
 
 Maximize delivery speed of the accepted result while minimizing avoidable lead
-work, and never sacrifice quality, correctness or acceptance for that. Judge
+work, and never sacrifice quality, correctness or acceptance for that. Classify
+substantial optional effort by its effect on the earliest verified MVP -
+accelerating, acceptance-required or deferrable - recording deferrable work
+with its trigger in its owner instead of doing or losing it; spend the lead's
+scarce context on judgment, ideation, decomposition, integration and
+acceptance, not on retrievable execution. Judge
 choices by total accepted-result cost - briefing, execution, waiting, checking,
 integration and rework - not by delegation counts or token spend alone. Keep
 judgment, decomposition, integration and acceptance, work that genuinely
