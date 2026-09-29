@@ -5,7 +5,7 @@ members = [
     "crates/windows-disk-reclaim",
     "crates/skill-evolution",
     "crates/token-audit",
-    "tools/rtk-adapter",
+    "crates/harness-rtk",
 ]
 resolver = "3"
 

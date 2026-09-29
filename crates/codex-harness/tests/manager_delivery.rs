@@ -33,7 +33,7 @@ impl Fixture {
         let source = root.path().join("source");
         for directory in [
             source.join("crates/one/src"),
-            source.join("tools/rtk-adapter/src"),
+            source.join("crates/harness-rtk/src"),
             source.join(INSPECTION_SCHEMA).parent().unwrap().to_owned(),
         ] {
             fs::create_dir_all(directory).unwrap();

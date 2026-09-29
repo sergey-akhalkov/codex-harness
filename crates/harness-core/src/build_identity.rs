@@ -124,7 +124,7 @@ fn collect(root: &Path, path: &Path, files: &mut BTreeMap<String, String>) -> io
 pub fn source_identity(source: &Path) -> io::Result<SourceIdentity> {
     let root = source.canonicalize()?;
     let mut files = BTreeMap::new();
-    for required in ["Cargo.toml", "Cargo.lock", "crates", "tools/rtk-adapter"] {
+    for required in ["Cargo.toml", "Cargo.lock", "crates"] {
         collect(&root, &root.join(required), &mut files)?;
     }
     for optional in [".cargo", "rust-toolchain", "rust-toolchain.toml"] {
@@ -342,13 +342,13 @@ mod tests {
         fs::create_dir_all(root.join(INSPECTION_SCHEMA).parent().unwrap()).unwrap();
         fs::write(root.join(INSPECTION_SCHEMA), "{}").unwrap();
         fs::create_dir_all(root.join("crates/test/src")).unwrap();
-        fs::create_dir_all(root.join("tools/rtk-adapter/src")).unwrap();
+        fs::create_dir_all(root.join("crates/harness-rtk/src")).unwrap();
         for path in [
             "Cargo.toml",
             "Cargo.lock",
             "crates/test/Cargo.toml",
             "crates/test/src/lib.rs",
-            "tools/rtk-adapter/src/main.rs",
+            "crates/harness-rtk/src/main.rs",
         ] {
             fs::write(root.join(path), path).unwrap();
         }

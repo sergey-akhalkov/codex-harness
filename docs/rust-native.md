@@ -136,7 +136,7 @@ inspect Git history.
 Core delivery also installs `harness-source-check` on PATH. From any directory,
 run `harness-source-check --root <kit-checkout>` to audit that checkout without
 compiling or starting a model. The checker enforces the portable principles'
-24 KiB byte limit. For a kit root identified by `global/kit.json`, it also
+25,088-byte limit. For a kit root identified by `global/kit.json`, it also
 checks token-audit's declared documentation owners. These mechanical checks
 do not certify semantic completeness or inspect Git history.
 

@@ -1983,7 +1983,7 @@ mod tests {
                 source.join("global/agents"),
                 source.join("skills/one"),
                 source.join("crates/one/src"),
-                source.join("tools/rtk-adapter/src"),
+                source.join("crates/harness-rtk/src"),
                 source
                     .join(build_identity::INSPECTION_SCHEMA)
                     .parent()

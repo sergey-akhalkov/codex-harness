@@ -154,7 +154,7 @@ side, and the `board-workflow` skill the record formats.
 
 Installation uses RTK 0.48.0 for Windows x64 with pinned archive and exe
 SHA-256. Building the small adapter needs Cargo/Rust; sources are in
-`tools/rtk-adapter`, build-identity artifacts stay outside Git under
+`crates/harness-rtk`, build-identity artifacts stay outside Git under
 `CODEX_HOME/harness/rtk`. Native `--token-workflow-only` Install reuses or
 acquires that pinned archive and a bounded adapter build, then links only
 `harness/bin/rtk.exe` and `harness/bin/harness-rtk.exe`. When the recorded

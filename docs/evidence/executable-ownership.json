@@ -36,8 +36,7 @@
     }
   ],
   "rust_source_roots": [
-    "crates",
-    "tools/rtk-adapter"
+    "crates"
   ],
   "embedded_program_markers": [
     {

@@ -417,7 +417,7 @@ fn native_entry(case: EntryCase) {
         build.clone(),
         source.join("global"),
         source.join("crates/fixture/src"),
-        source.join("tools/rtk-adapter/src"),
+        source.join("crates/harness-rtk/src"),
         source
             .join(build_identity::INSPECTION_SCHEMA)
             .parent()

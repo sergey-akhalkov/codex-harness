@@ -283,7 +283,7 @@ mod shared_cpu_policy {
             source.join("global/agents"),
             source.join("skills/one"),
             source.join("crates/one/src"),
-            source.join("tools/rtk-adapter/src"),
+            source.join("crates/harness-rtk/src"),
             build.clone(),
         ] {
             fs::create_dir_all(dir).unwrap();
@@ -291,7 +291,7 @@ mod shared_cpu_policy {
         for file in ["Cargo.toml", "Cargo.lock", "crates/one/src/lib.rs"] {
             fs::write(source.join(file), b"fixture\n").unwrap();
         }
-        fs::write(source.join("tools/rtk-adapter/src/lib.rs"), b"fixture\n").unwrap();
+        fs::write(source.join("crates/harness-rtk/src/lib.rs"), b"fixture\n").unwrap();
         fs::write(
             source.join("global/profile.toml"),
             "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel = 'gpt-6-astra'\n",

@@ -24,7 +24,7 @@ fn document(entries: Vec<Entry>) -> OwnershipDocument {
             path: ".venv".into(),
             reason: "external dependency environment".into(),
         }],
-        rust_source_roots: vec!["crates".into(), "tools/rtk-adapter".into()],
+        rust_source_roots: vec!["crates".into()],
         embedded_program_markers: vec![
             EmbeddedMarker {
                 name: "python-shebang".into(),
@@ -89,10 +89,6 @@ fn kinds(report: &executable_ownership::Report) -> Vec<String> {
 
 fn clean_fixture(root: &Path) -> OwnershipDocument {
     write(&root.join("crates/demo/src/main.rs"), "fn main() {}\n");
-    write(
-        &root.join("tools/rtk-adapter/src/main.rs"),
-        "fn main() {}\n",
-    );
     write(
         &root.join("crates/demo/src/consumer.rs"),
         "pub const SAMPLE: &str = \"tests/fixtures/lsp/sample.py\";\n",
@@ -169,7 +165,7 @@ fn embedded_or_generated_foreign_program_fails() {
     let doc = clean_fixture(&source);
     let powershell_marker = doc.embedded_program_markers[1].needle.clone();
     write(
-        &source.join("tools/rtk-adapter/src/generated.rs"),
+        &source.join("crates/demo/src/generated.rs"),
         &format!("const SCRIPT: &str = \"{} 7.4\";\n", powershell_marker),
     );
     let report = executable_ownership::check(&source, &doc).unwrap();

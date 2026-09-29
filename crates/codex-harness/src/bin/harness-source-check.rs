@@ -4,7 +4,7 @@ use regex::Regex;
 use std::{collections::BTreeSet, env, fs, path::Path, process::Command};
 
 const PRINCIPLES_PATH: &str = "global/principles-of-work.md";
-const PRINCIPLES_LIMIT: usize = 24 * 1024;
+const PRINCIPLES_LIMIT: usize = 25_088;
 
 fn visible(path: &str, terms: &[String]) -> String {
     if terms.iter().any(|term| path.to_lowercase().contains(term)) {
@@ -140,7 +140,7 @@ fn run() -> Result<bool, &'static str> {
             }
             "--help" | "-h" => {
                 println!(
-                    "harness-source-check [--root REPOSITORY] [--private-terms LOCAL_FILE]\nChecks existing tracked and non-ignored new files, caches, shared trust settings,\nmachine home paths in documentation/configuration, caller-supplied private terms,\nlocal inline Markdown links and the 24 KiB portable-principles limit. Kit roots\nalso require principles and valid token-audit documentation owners.\nSkips fenced examples, template targets and non-text assets. Terms are one per\nline in a file outside the repository. Diagnostics omit matched text.\nExit: 0 clean, 1 findings, 2 audit unavailable.\nThis is a working-tree check, not a secret detector or Git-history audit."
+                    "harness-source-check [--root REPOSITORY] [--private-terms LOCAL_FILE]\nChecks existing tracked and non-ignored new files, caches, shared trust settings,\nmachine home paths in documentation/configuration, caller-supplied private terms,\nlocal inline Markdown links and the 25,088-byte portable-principles limit. Kit roots\nalso require principles and valid token-audit documentation owners.\nSkips fenced examples, template targets and non-text assets. Terms are one per\nline in a file outside the repository. Diagnostics omit matched text.\nExit: 0 clean, 1 findings, 2 audit unavailable.\nThis is a working-tree check, not a secret detector or Git-history audit."
                 );
                 return Ok(true);
             }

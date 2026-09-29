@@ -365,7 +365,7 @@ fn native_launch_case() -> Value {
         home.join("harness"),
         source.join("global"),
         source.join("crates/one/src"),
-        source.join("tools/rtk-adapter/src"),
+        source.join("crates/harness-rtk/src"),
         source
             .join(harness_core::build_identity::INSPECTION_SCHEMA)
             .parent()

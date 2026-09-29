@@ -379,7 +379,7 @@ mod tests {
         fs::create_dir_all(schema.parent().unwrap()).unwrap();
         fs::write(schema, "{}").unwrap();
         fs::create_dir_all(source.join("crates/one/src")).unwrap();
-        fs::create_dir_all(source.join("tools/rtk-adapter/src")).unwrap();
+        fs::create_dir_all(source.join("crates/harness-rtk/src")).unwrap();
         for name in ["Cargo.toml", "Cargo.lock", "crates/one/src/lib.rs"] {
             fs::write(source.join(name), "fixture").unwrap();
         }

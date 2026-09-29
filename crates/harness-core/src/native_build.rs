@@ -850,14 +850,14 @@ mod tests {
 
     fn source_fixture(root: &Path, name: &str) -> PathBuf {
         let source = root.join(name);
-        for directory in ["crates/one/src", "tools/rtk-adapter/src"] {
+        for directory in ["crates/one/src", "crates/harness-rtk/src"] {
             fs::create_dir_all(source.join(directory)).unwrap();
         }
         for file in [
             "Cargo.toml",
             "Cargo.lock",
             "crates/one/src/lib.rs",
-            "tools/rtk-adapter/src/lib.rs",
+            "crates/harness-rtk/src/lib.rs",
         ] {
             fs::write(source.join(file), "fixture").unwrap();
         }

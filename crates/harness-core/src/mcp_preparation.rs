@@ -214,13 +214,13 @@ mod tests {
         let source = root.join("source");
         let build = root.join("state/builds/aaaa0000aaaa0000-1500-1");
         std::fs::create_dir_all(source.join("crates/one/src")).unwrap();
-        std::fs::create_dir_all(source.join("tools/rtk-adapter/src")).unwrap();
+        std::fs::create_dir_all(source.join("crates/harness-rtk/src")).unwrap();
         std::fs::create_dir_all(&build).unwrap();
         for file in [
             "Cargo.toml",
             "Cargo.lock",
             "crates/one/src/lib.rs",
-            "tools/rtk-adapter/src/lib.rs",
+            "crates/harness-rtk/src/lib.rs",
         ] {
             std::fs::write(source.join(file), "fixture").unwrap();
         }

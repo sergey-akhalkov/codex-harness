@@ -654,8 +654,8 @@ fn rtk_url(definition: &Value) -> io::Result<&str> {
 const SOURCE_FILES: [&str; 5] = [
     "Cargo.toml",
     "Cargo.lock",
-    "tools/rtk-adapter/Cargo.toml",
-    "tools/rtk-adapter/src/main.rs",
+    "crates/harness-rtk/Cargo.toml",
+    "crates/harness-rtk/src/main.rs",
     "global/rtk.json",
 ];
 

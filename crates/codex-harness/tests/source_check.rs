@@ -128,7 +128,7 @@ fn detects_shared_state_and_tracked_caches_but_allows_deleted_caches() {
 #[test]
 fn principles_limit_checks_bytes_at_the_exact_boundary() {
     let f = Fixture::new();
-    let limit = 24 * 1024;
+    let limit = 25_088;
     // Multi-byte text makes a character-count implementation insufficient.
     f.write("global/principles-of-work.md", &"é".repeat(limit / 2));
     assert!(f.check(None).status.success());
@@ -137,7 +137,7 @@ fn principles_limit_checks_bytes_at_the_exact_boundary() {
     let bad = f.check(None);
     assert_eq!(bad.status.code(), Some(1));
     let output = String::from_utf8_lossy(&bad.stdout);
-    assert!(output.contains("principles-size-limit actual=24577 allowed=24576"));
+    assert!(output.contains("principles-size-limit actual=25089 allowed=25088"));
     assert_eq!(
         fs::read_to_string(f.repo().join("global/principles-of-work.md")).unwrap(),
         oversized

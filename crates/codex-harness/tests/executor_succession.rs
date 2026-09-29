@@ -347,7 +347,7 @@ fn owned_session(hold_seed: bool) -> OwnedSession {
         build.clone(),
         source.join("global"),
         source.join("crates/fixture/src"),
-        source.join("tools/rtk-adapter/src"),
+        source.join("crates/harness-rtk/src"),
         evidence.clone(),
         source
             .join(build_identity::INSPECTION_SCHEMA)

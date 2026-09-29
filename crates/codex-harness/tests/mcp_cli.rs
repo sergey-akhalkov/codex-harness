@@ -84,7 +84,7 @@ fn source_stale_manager_keeps_serving_and_management_available() {
     let build = root.path().join("build");
     for directory in [
         source.join("crates/one/src"),
-        source.join("tools/rtk-adapter/src"),
+        source.join("crates/harness-rtk/src"),
         source.join(INSPECTION_SCHEMA).parent().unwrap().into(),
         build.clone(),
     ] {
@@ -220,7 +220,7 @@ fn source_stale_manager_still_emits_shared_config_overrides() {
     let home = root.path().join("home");
     for directory in [
         source.join("crates/one/src"),
-        source.join("tools/rtk-adapter/src"),
+        source.join("crates/harness-rtk/src"),
         source.join("global"),
         source.join(INSPECTION_SCHEMA).parent().unwrap().into(),
         build.clone(),

@@ -1654,7 +1654,7 @@ fn fixture(source: &Path) {
     fs::create_dir_all(schema.parent().unwrap()).unwrap();
     fs::write(schema, "{}").unwrap();
     fs::create_dir_all(source.join("crates/manager/src")).unwrap();
-    fs::create_dir_all(source.join("tools/rtk-adapter/src")).unwrap();
+    fs::create_dir_all(source.join("crates/harness-rtk/src")).unwrap();
     fs::write(
         source.join("Cargo.toml"),
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
@@ -1686,7 +1686,7 @@ fn fixture(source: &Path) {
     .unwrap();
     for (directory, name) in [
         ("crates/manager", "codex-harness"),
-        ("tools/rtk-adapter", "harness-rtk"),
+        ("crates/harness-rtk", "harness-rtk"),
         ("crates/token-audit", "token-audit"),
     ] {
         fs::create_dir_all(source.join(directory).join("src")).unwrap();
