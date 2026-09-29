@@ -16,7 +16,7 @@ The ordinary scenarios are already established by the kit: an agent runs Cargo c
 
 ### 1. RTK coverage: accept, with a smaller integration than a new runner
 
-In [the adapter](../../../../tools/rtk-adapter/src/main.rs), `filter_for()` accepts only a small Cargo-test allowlist. `--locked`, `--jobs`, `-p`, the test-argument separator and `--test-threads=1` fail selection; `check`, `build` and `clippy` are not selected. `run()` inherits stdout when no filter is selected and always inherits stderr. Consequently the native recipes in [rust-native.md](../../../../docs/rust-native.md) and the package-scoped checks in [cargo-fast](../../../../.agents/skills/cargo-fast/SKILL.md) bypass this compression. This is a source-level conclusion; the daily fraction of affected output is unmeasured.
+In [the adapter](../../../../crates/harness-rtk/src/main.rs), `filter_for()` accepts only a small Cargo-test allowlist. `--locked`, `--jobs`, `-p`, the test-argument separator and `--test-threads=1` fail selection; `check`, `build` and `clippy` are not selected. `run()` inherits stdout when no filter is selected and always inherits stderr. Consequently the native recipes in [rust-native.md](../../../../docs/rust-native.md) and the package-scoped checks in [cargo-fast](../../../../.agents/skills/cargo-fast/SKILL.md) bypass this compression. This is a source-level conclusion; the daily fraction of affected output is unmeasured.
 
 The audit correctly rejects arbitrary PowerShell interception. A hook rewrite alone also does not prove compression: `hook()` rewrites the explicit adapter entry while `run()` makes the later argv-based selection. Preserve those separate decisions.
 
