@@ -49,8 +49,10 @@ Each retained integration SHALL preserve its accepted explicit source
 operations through a bounded model-facing surface: suitable Serena
 navigation, references, semantic edits and explicit diagnostics; Nuphus
 authorized desktop/browser inspection and interaction. The Serena
-model-facing tool list SHALL exclude memory, onboarding,
-configuration-introspection tools and `search_for_pattern`; native Git
+model-facing tool list SHALL include Serena's symbol-scoped diagnostics
+tool alongside file diagnostics while a supported backend delivers it, and
+SHALL exclude memory, onboarding, configuration-introspection tools,
+`restart_language_server` and `search_for_pattern`; native Git
 records remain the authoritative memory route, an explicit escape hatch
 SHALL keep an unfiltered debugging view possible, and literal text, regex,
 configuration and document search SHALL route to scoped native search
@@ -65,6 +67,10 @@ refactoring claims SHALL be checked with current Serena or source evidence.
 #### Scenario: Each MCP is exercised by its consumer
 - **WHEN** acceptance performs a meaningful read and applicable bounded mutation through each retained MCP
 - **THEN** the actual result or owned-target effect and server identity are recorded, with diagnostic uncertainty preserved
+
+#### Scenario: Symbol-scoped diagnostics are delivered
+- **WHEN** a fresh managed session edits a symbol and requests diagnostics for that changed symbol, optionally with its direct referencers
+- **THEN** the managed Serena catalogue serves the symbol-scoped result with the same freshness uncertainty as file diagnostics, bounded answer limits and no automatic diagnostic activation
 
 #### Scenario: Maintenance moves outside the model session
 - **WHEN** any retired integration's host residue needs maintenance or deletion

@@ -226,6 +226,12 @@ pub const EXCLUDED_TOOLS: [&str; 10] = [
     "search_for_pattern",
 ];
 
+/// Optional Serena tools the managed selection advertises. Symbol-scoped
+/// diagnostics keep explicit verification bounded to a changed symbol and
+/// its direct referencers; every other optional tool stays unadvertised
+/// because no evidenced everyday demand or owning lifecycle exists.
+pub const INCLUDED_OPTIONAL_TOOLS: [&str; 1] = ["get_diagnostics_for_symbol"];
+
 /// Managed prompt-template file inside the owned home.
 pub const PROMPT_TEMPLATE_NAME: &str = "harness.yml";
 
@@ -279,6 +285,10 @@ fn render(settings: &BTreeMap<String, Value>) -> String {
     }
     text.push_str("excluded_tools:\n");
     for name in EXCLUDED_TOOLS {
+        text.push_str(&format!("  - {name}\n"));
+    }
+    text.push_str("included_optional_tools:\n");
+    for name in INCLUDED_OPTIONAL_TOOLS {
         text.push_str(&format!("  - {name}\n"));
     }
     text
@@ -405,6 +415,36 @@ mod tests {
         ] {
             assert!(!EXCLUDED_TOOLS.contains(&retained), "{retained}");
         }
+        // The optional semantic tool is included next to the exclusions.
+        assert!(
+            rendered.contains("included_optional_tools:\n"),
+            "{rendered}"
+        );
+        for name in INCLUDED_OPTIONAL_TOOLS {
+            assert!(rendered.contains(&format!("  - {name}\n")), "{name}");
+            assert!(!EXCLUDED_TOOLS.contains(&name), "{name}");
+        }
+        // The rendered YAML stays readable by the routing subset parser, so a
+        // broken literal cannot pass the text assertions above.
+        let parsed = tempfile::tempdir().unwrap();
+        let file = parsed.path().join(CONFIG_NAME);
+        fs::write(&file, &rendered).unwrap();
+        let mapping = crate::serena_route::read_yaml_mapping(&file).unwrap();
+        assert_eq!(mapping.scalar("web_dashboard"), Some("false"));
+        let excluded: Vec<&str> = mapping
+            .sequence("excluded_tools")
+            .unwrap()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(excluded, EXCLUDED_TOOLS.to_vec());
+        let included: Vec<&str> = mapping
+            .sequence("included_optional_tools")
+            .unwrap()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(included, INCLUDED_OPTIONAL_TOOLS.to_vec());
         // A backend recorded as missing is not pinned.
         let mut incomplete = registry;
         incomplete["languages"][1] = json!({
@@ -445,12 +485,21 @@ mod tests {
     }
 
     #[test]
-    fn managed_selection_lists_the_accepted_exclusions_once() {
+    fn managed_selection_lists_the_accepted_tool_lists_once() {
         let mut sorted = EXCLUDED_TOOLS;
         sorted.sort_unstable();
         let mut unique = sorted.to_vec();
         unique.dedup();
         assert_eq!(sorted.to_vec(), unique);
+        let mut included = INCLUDED_OPTIONAL_TOOLS;
+        included.sort_unstable();
+        let mut included_unique = included.to_vec();
+        included_unique.dedup();
+        assert_eq!(included.to_vec(), included_unique);
+        // A tool is either excluded or explicitly included, never both.
+        for name in INCLUDED_OPTIONAL_TOOLS {
+            assert!(!EXCLUDED_TOOLS.contains(&name), "{name}");
+        }
         assert!(PROMPT_TEMPLATE_NAME.ends_with(".yml"));
         let rendered = render_prompt_template();
         assert!(rendered.contains(CONNECTION_PROMPT), "{rendered}");

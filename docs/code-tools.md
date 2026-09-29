@@ -22,7 +22,10 @@ bodies through `find_symbol`, exact relationships through
 changes through symbol operations (`replace_symbol_body`,
 `insert_before_symbol`/`insert_after_symbol`, `rename_symbol`,
 `safe_delete_symbol`) instead of line surgery; `replace_in_files` serves
-matching narrow multi-file text edits. Use explicit project checks for
+matching narrow multi-file text edits. Symbol-scoped diagnostics through
+`get_diagnostics_for_symbol` extend the explicit diagnostic route: the
+changed symbol and optional direct referencers, bounded, with the same
+freshness caveat as file diagnostics. Use explicit project checks for
 validation and Nuphus for authorized UI work. Connected Apps serve their
 matching remote resources when enabled locally; the portable default disables
 the Apps feature. Literal text and narrow line edits retain native tools. The
@@ -233,6 +236,9 @@ applied; they are not missing language support.
 The standalone native MCP health check reports `protocol-ready` after handshake
 and tools/list. That status establishes protocol availability, not representative
 operations or completed language acceptance.
+The handshake's `serverInfo.version` (currently 1.28.1) is the vendored MCP
+SDK version reported by FastMCP; the Serena distribution itself is 1.7.0
+(`serena --version`). Do not read the SDK string as a Serena upgrade.
 
 Native MCP/hook contract notes that remain current:
 

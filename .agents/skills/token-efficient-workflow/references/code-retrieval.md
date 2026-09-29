@@ -11,14 +11,20 @@ the managed Serena catalogue.
 | File structure | Serena `get_symbols_overview` | One file, `depth: 0`, `max_answer_chars: 4000` |
 | Exact symbol in a known file | Serena `find_symbol` | `relative_path`, exact name, `depth: 0`, `max_matches: 1`, `include_body: false`, `max_answer_chars: 4000` |
 | Read one function | Serena `find_symbol` | Same scope, `include_body: true`; expand the answer limit only if that body is needed |
+| Signature or docstring only | Serena `find_symbol` | Same scope, `include_info: true`, `include_body: false`; a smaller answer than a full body |
+| Name variants in known scope | Serena `find_symbol` | `substring_matching: true` with `max_matches` and `max_answer_chars`; expand only on a stated missing fact |
 | Exact references / edit safety | Serena `find_referencing_symbols`, `find_implementations`, `find_declaration` | One symbol/file, `max_answer_chars: 4000`; a too-long answer requires narrowing or deliberate bounded expansion |
+| Post-edit symbol diagnostics | Serena `get_diagnostics_for_symbol` | Changed symbol, optional `check_symbol_references` for direct referencers, explicit `min_severity`, `max_answer_chars: 4000`; the same freshness caveat as file diagnostics |
 | Unknown location | Scoped `rg` for distinctive identifiers, then Serena overview of the hit file | File or directory glob plus bounded matches; derive candidate names from required behavior instead of inventing semantic search |
 | Replace one symbol | Serena `replace_symbol_body` | Retrieve the current body first; write the complete replacement; keep project-native checks |
 | Insert a sibling symbol | Serena `insert_before_symbol` / `insert_after_symbol` | One unambiguous anchor symbol |
 | Rename across references | Serena `rename_symbol` | One unambiguous symbol; verify callers after |
 | Remove a symbol safely | Serena `safe_delete_symbol` | One unambiguous symbol; check the reported reference set |
-| Matching narrow multi-file text edit | Serena `replace_in_files` | Explicit paths, literal pattern, bounded occurrences; prefer symbol edits when names are known |
+| Matching narrow multi-file text edit | Serena `replace_in_files` | Explicit paths, literal pattern; run `dry_run` first (or set an `expected_count` guard), then apply with the selected `occurrence_ids`; prefer symbol edits when names are known |
 | Literal text, config, documents, unsupported source | Scoped `rg` / native read | File or directory and bounded matches/lines |
+
+Batch independent Serena reads into one tool block when they share no
+ordering dependency; activation remains once per project session.
 
 For diff impact, establish the exact base and whether the input includes
 staged, unstaged or untracked work. Map changed code to unambiguous symbols
@@ -39,7 +45,9 @@ Serena's `initial_instructions` can advise trusting a refactor without
 checks. Keep the consuming project's applicable behavioral checks: tool
 success proves the operation's reported execution, not correct caller
 behavior. Empty diagnostics remain unverified unless their current complete
-analysis is independently known. Likewise, a mode called `planning` is not an
+analysis is independently known, and the first answer after an external file
+edit can be a stale snapshot; retry briefly instead of treating one repeated
+or empty result as fresh. Likewise, a mode called `planning` is not an
 enforced read-only boundary. Qualify the effective catalogue and rejected
 owned writes of the chosen MCP restriction; native tools still retain the
 user's separately authorized capabilities. Existing clients may keep an older

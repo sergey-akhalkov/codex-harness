@@ -289,6 +289,7 @@ fn mcp_serena_proxy_serves_the_native_tool_selection_to_isolated_projects() {
         "find_referencing_symbols",
         "find_symbol",
         "get_diagnostics_for_file",
+        "get_diagnostics_for_symbol",
         "get_symbols_overview",
         "insert_after_symbol",
         "insert_before_symbol",
@@ -385,6 +386,78 @@ fn mcp_serena_proxy_serves_the_native_tool_selection_to_isolated_projects() {
         .collect();
     assert!(text.contains("401"), "{text}");
 
+    // Symbol-scoped diagnostics follow the explicit route: a known Rust
+    // error is reported for the changed symbol and clears after the fix.
+    fs::write(
+        alpha.join("src/lib.rs"),
+        "pub fn shared() -> i32 { 401 }\npub fn broken() -> i32 { \"not an i32\" }\n",
+    )
+    .unwrap();
+    let broken = first.request(
+        5,
+        "tools/call",
+        json!({
+            "name": "get_diagnostics_for_symbol",
+            "arguments": {
+                "name_path": "broken",
+                "reference_file": "src/lib.rs"
+            }
+        }),
+    );
+    let text: String = broken["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect();
+    assert!(text.contains("broken") && text.contains("E0308"), "{text}");
+    fs::write(
+        alpha.join("src/lib.rs"),
+        "pub fn shared() -> i32 { 401 }\npub fn broken() -> i32 { 7 }\n",
+    )
+    .unwrap();
+    // Diagnostics publish asynchronously after an external file change, so
+    // the explicit route retries briefly instead of trusting a stale
+    // snapshot.
+    let mut text = String::new();
+    for attempt in 0..20 {
+        let cleared = first.request(
+            6 + attempt,
+            "tools/call",
+            json!({
+                "name": "get_diagnostics_for_symbol",
+                "arguments": {
+                    "name_path": "broken",
+                    "reference_file": "src/lib.rs"
+                }
+            }),
+        );
+        text = cleared["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect();
+        if !text.contains("broken") || text == "{}" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        !text.contains("broken") || text == "{}",
+        "the known Rust diagnostic did not clear: {text}"
+    );
+    // The excluded text-search tool stays refused by the worker itself.
+    let refused_search = first.request(
+        30,
+        "tools/call",
+        json!({"name": "search_for_pattern", "arguments": {"pattern": "shared"}}),
+    );
+    assert_eq!(
+        refused_search["result"]["isError"], true,
+        "{refused_search}"
+    );
+
     // A second stdio client of the same project shares the broker worker.
     let mut second = Proxy::start(root.path(), &codex_home, &registry, &alpha, &console);
     let reply = second.request(1, "initialize", initialize.clone());
@@ -455,6 +528,61 @@ fn mcp_serena_proxy_serves_the_native_tool_selection_to_isolated_projects() {
         .filter_map(|item| item["text"].as_str())
         .collect();
     assert!(text.contains("reportReturnType"), "{text}");
+    // The same known diagnostic stays bounded when it is requested for the
+    // symbol, and it clears through the managed symbol route after a fix.
+    let symbol = fourth.request(
+        4,
+        "tools/call",
+        json!({
+            "name": "get_diagnostics_for_symbol",
+            "arguments": {
+                "name_path": "broken",
+                "reference_file": "src/mod.py"
+            }
+        }),
+    );
+    let text: String = symbol["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect();
+    assert!(text.contains("reportReturnType"), "{text}");
+    fs::write(
+        python.join("src/mod.py"),
+        "def shared() -> int:\n    return 411\n\n\ndef broken() -> int:\n    return 12\n",
+    )
+    .unwrap();
+    // The Python backend publishes asynchronously too; the bounded retry
+    // keeps the clearance claim tied to a fresh answer.
+    let mut text = String::new();
+    for attempt in 0..20 {
+        let cleared = fourth.request(
+            5 + attempt,
+            "tools/call",
+            json!({
+                "name": "get_diagnostics_for_symbol",
+                "arguments": {
+                    "name_path": "broken",
+                    "reference_file": "src/mod.py"
+                }
+            }),
+        );
+        text = cleared["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect();
+        if !text.contains("reportReturnType") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        !text.contains("reportReturnType"),
+        "the known Python diagnostic did not clear: {text}"
+    );
     let status = broker_status(&codex_home);
     assert_eq!(status["backend"]["workers"].as_array().unwrap().len(), 3);
 
