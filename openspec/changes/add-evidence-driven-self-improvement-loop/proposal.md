@@ -2,10 +2,14 @@
 
 The harness can account for attempts and retain feedback, but it does not yet turn observed losses into a continuous sequence of independently evaluated improvements. Real improvement work can provide useful comparison tasks: evaluate candidate A by implementing B with and without A, retain B, then evaluate B on C instead of maintaining a separate synthetic coding benchmark.
 
+Improvement also includes subtraction: accumulated features, instructions and machinery can consume context, operations and maintenance without a corresponding benefit. Occam's razor favors the simplest sufficient solution with supported usefulness; neither low usage nor fewer files alone proves that a capability should disappear.
+
 ## What Changes
 
 - Deliver a `self-improvement-loop` skill and resumable Rust controller for an explicitly started, continuously operating A -> B -> C loop. The change includes installed operation outside this checkout, not only repository scaffolding.
 - Admit hypotheses from attributable execution evidence, reproducible defects and verified tool constraints. Require a causal explanation, predicted benefit, counterexample and prior-result search; do not generate changes solely to keep the loop occupied.
+- Consider retaining, simplifying, consolidating, loading on demand, disabling or removing existing capability alongside additions. Review attributable overhead in skills, code/features, instructions, documentation, tools/dependencies, configuration, checks, orchestration and retained outputs without creating a separate recurring audit system.
+- Require explicit, informed user approval before implementing a proposed removal of code, features or skills, including experimental removals and disabling that withdraws capability. Present exact scope, evidence, expected benefit, lost scenarios, alternatives and recovery first; a favorable experiment or general permission to run the loop is not removal authority.
 - Use Beads `task` items labeled `hypothesis` as the sole durable owner of hypothesis identity, queue, lifecycle and decisions. Reuse existing feedback/benefit bookkeeping and local evidence storage rather than introduce a parallel journal.
 - Require a linked OpenSpec change with proposal, requirements, design, implementation tasks and experiment acceptance before implementing **every** hypothesis, including instruction, skill, MCP, plugin and configuration changes.
 - Compare frozen baseline and candidate runtimes on the same frozen real task with fresh executors, independent acceptance and complete accounting. Retain useful target implementations without confusing their correctness with evidence of their own benefit.
@@ -18,12 +22,12 @@ The harness can account for attempts and retain feedback, but it does not yet tu
 
 ### New Capabilities
 
-- `self-improvement-loop`: Evidence-driven hypothesis selection, mandatory per-hypothesis planning, sequential real-task evaluation, continuous execution, recovery and global skill/CLI delivery.
+- `self-improvement-loop`: Evidence-driven hypothesis selection including simplification, informed removal approval, mandatory per-hypothesis planning, sequential real-task evaluation, continuous execution, recovery and global skill/CLI delivery.
 
 ### Modified Capabilities
 
-- `orchestration-feedback-loop`: Beads ownership of hypothesis cards, planning prerequisites, nonblocking evaluation relationships and durable, evidence-linked decisions.
-- `harness-outcome-evaluation`: Frozen task/runtime comparisons, exact candidate lineage, local-runner repeatability qualification and accounting for rolling real-work experiments.
+- `orchestration-feedback-loop`: Beads ownership of hypothesis cards, planning prerequisites, nonblocking evaluation relationships and durable, evidence-linked benefit and removal-authorization decisions.
+- `harness-outcome-evaluation`: Frozen task/runtime comparisons, exact candidate lineage, local-runner repeatability qualification, simplification benefit/retained-behavior checks and accounting for rolling real-work experiments.
 
 ## Impact
 

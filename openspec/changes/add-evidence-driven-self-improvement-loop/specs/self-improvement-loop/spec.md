@@ -28,6 +28,56 @@ The installed skill SHALL start or resume an explicitly selected loop against an
 - **WHEN** an otherwise promising experiment requires access outside the authorized scope
 - **THEN** dependent work waits for that decision while independent authorized work and evidence are preserved
 
+### Requirement: Simplification is a first-class improvement hypothesis
+
+For an observed cost, the loop SHALL consider whether existing capability, no change, simplification or subtraction can satisfy the intended outcome before proposing additional machinery. Applicable treatments SHALL include consolidation, narrower default exposure, on-demand loading, disabling and removal of skills, code/features, instructions, documentation, tools/dependencies, configuration, workflow stages, checks and generated outputs. A hypothesis SHALL identify the burden it removes, the outcomes that remain required, possible lost uses and a falsifiable expected effect on accepted-task time, steps or resources. The loop SHALL NOT require a new audit service, exhaustive inventory or fixed deletion quota; review SHALL reuse relevant evidence and existing owners proportionately.
+
+Low or absent observed use SHALL be a lead for investigation, not a finding of uselessness. Usage claims SHALL identify the observation interval, task/environment coverage and telemetry gaps. Review SHALL include applicable rare recovery, compatibility, explicit invocation and indirect consumers; unresolved supported use SHALL remain explicit. Correctness, integrity, recovery and required quality SHALL remain binding even when a capability gives no everyday speed or token saving. Fewer lines, files, skills or exposed names alone SHALL NOT establish net benefit.
+
+#### Scenario: A skill has no recorded invocations
+- **WHEN** bounded usage evidence finds no invocation of an installed skill
+- **THEN** the loop checks observation coverage, supported uses and actual context exposure, and can propose retention, changed exposure, consolidation or removal with a reason rather than automatically deleting it
+
+#### Scenario: A rarely used recovery path adds no normal-task saving
+- **WHEN** a simplification candidate would remove recovery behavior still required by the product
+- **THEN** ordinary-task nonuse cannot justify retirement, and the candidate must preserve that behavior or await an explicitly revised product requirement
+
+#### Scenario: An addition duplicates an existing route
+- **WHEN** an existing capability can satisfy the evidenced need with less total work and equivalent required behavior
+- **THEN** the loop proposes reuse or simplification with its acceptance and cost basis instead of assuming that improvement requires another feature
+
+### Requirement: Removal requires informed and scoped user approval
+
+Before implementing a removal of existing code, features or skills, the loop SHALL present a reviewable proposal and obtain an explicit user decision recorded through `orchestration-feedback-loop`. The proposal SHALL identify target paths/capabilities and source basis, evidence and its gaps, observed versus predicted benefit, what users lose and in which scenarios, affected callers/configuration/installations, retained requirements and checks, alternatives including no change, and a recovery route. Unverified dependencies or consumer access SHALL be disclosed rather than treated as absent. The approval SHALL identify the authorized targets, behavior loss and action scope: isolated experiment, accepted-source integration and/or installed publication.
+
+Read-only investigation, planning and an unapplied diff preview SHALL be allowed before approval. Applying the removal SHALL wait even in a candidate worktree or evaluation workload. Disabling, de-registration or consolidation that withdraws an existing capability SHALL use the same gate; renaming the action SHALL NOT bypass it. Ordinary additions and edits preserving capability remain under existing run authority, but deleting existing code or skill definitions as a simplification treatment SHALL use this gate. General loop-start authority, low usage, an agent-authored decision or a favorable benefit result SHALL NOT substitute for approval. Silence SHALL leave dependent work pending while independent authorized work can continue.
+
+One approval SHALL suffice for all stages expressly covered by its unchanged scope. Before a later stage or resume, the loop SHALL confirm that the actual target, behavior loss, dependency findings and action remain covered and the approval has not been withdrawn. Material changes or uncovered publication SHALL require a new decision; routine continuation of the approved scope SHALL NOT create another approval ritual. Benefit and required checks SHALL still gate adoption, and approval SHALL NOT waive unrelated acceptance, authorize evidence destruction or allow a candidate to remove its own control safeguards.
+
+#### Scenario: A removal has a plausible benefit but no approval
+- **WHEN** a skill or code-removal hypothesis has a complete plan and an unapplied preview but no explicit user approval
+- **THEN** no executor applies the removal, the loop reports the lost capability and required decision, and independent eligible hypotheses can proceed
+
+#### Scenario: A removal is used as workload B
+- **WHEN** A is to be measured by implementing a removal task B in both arms
+- **THEN** B's approval must cover those isolated implementations before either arm can apply the removal; workload status does not exempt it
+
+#### Scenario: Only the isolated experiment was approved
+- **WHEN** the experiment supports benefit but the user authorized only experimental removal
+- **THEN** the evidence is retained while integration, baseline advancement and live publication remain pending their applicable authority
+
+#### Scenario: An approved removal resumes with unchanged scope
+- **WHEN** approval covers experiment and integration, required evidence passes and the scoped targets and consequences remain unchanged
+- **THEN** the loop can complete those covered stages without another question, preserving the approval reference and actual effects
+
+#### Scenario: New evidence reveals another supported consumer
+- **WHEN** preparation or recovery finds a consumer whose capability loss was absent from the approved proposal
+- **THEN** dependent removal or activation stops for an updated informed decision without discarding evidence or treating the previous approval as blanket permission
+
+#### Scenario: The user declines a removal
+- **WHEN** the user refuses the presented proposal
+- **THEN** the loop retains the capability and decision, and does not repeat the same request without a new evidential basis or user instruction
+
 ### Requirement: Every implemented hypothesis has a complete planning contract
 
 Before changing any candidate implementation, the loop SHALL satisfy the per-hypothesis OpenSpec prerequisite owned by `orchestration-feedback-loop`. This includes the hypothesis serving as the evaluation task. Both arms SHALL consume the same frozen task contract, including its applicable planning artifacts and independent acceptance. A change to that contract during a comparison SHALL invalidate comparability rather than silently update one arm.
@@ -42,10 +92,10 @@ Before changing any candidate implementation, the loop SHALL satisfy the per-hyp
 
 ### Requirement: Real improvement tasks rotate through candidate and workload roles
 
-The loop SHALL support the sequence A evaluated on B, then B evaluated on C, without requiring reciprocal A/B comparisons or a separate synthetic coding suite. It SHALL prepare a frozen candidate A, solve the frozen real task B with baseline H and candidate H+A, independently accept each solution, decide A, and retain exact useful implementations of B. The next baseline SHALL be H+A only after a supported adoption of A; otherwise it SHALL remain H. Before B becomes the next candidate, its exact selected implementation SHALL be integrated and checked against that current baseline, with any changed revision recorded. Implementing B successfully SHALL NOT establish B's own benefit or close its hypothesis prematurely.
+The loop SHALL support the sequence A evaluated on B, then B evaluated on C, without requiring reciprocal A/B comparisons or a separate synthetic coding suite. It SHALL prepare a frozen candidate A, solve the frozen real task B with baseline H and candidate H+A, independently accept each solution, decide A, and retain exact useful implementations of B. The next baseline SHALL be H+A only after a supported adoption of A and any required removal approval for that transition; otherwise it SHALL remain H. Before B becomes the next candidate, its exact selected implementation SHALL be integrated and checked on its candidate branch against that current baseline, with any changed revision recorded. Implementing B successfully SHALL NOT establish B's own benefit or close its hypothesis prematurely.
 
 #### Scenario: A is adopted and B is next
-- **WHEN** A's declared acceptance passes and both attempts at B are retained
+- **WHEN** A's declared acceptance passes, applicable removal approval covers advancement and both attempts at B are retained
 - **THEN** the loop advances the experimental baseline to the evaluated A revision, selects and checks an exact B revision against it, and evaluates B on a new specified real task C
 
 #### Scenario: A is rejected
@@ -73,7 +123,7 @@ Each hypothesis implementation SHALL have a dedicated branch from an explicit ac
 - **THEN** its code remains outside the accepted mainline, with its branch and useful evidence preserved; rejecting it does not require reverting the mainline
 
 #### Scenario: An accepted candidate is integrated
-- **WHEN** an independently supported benefit decision authorizes integration within the run's scope
+- **WHEN** an independently supported benefit decision and applicable authority, including any required removal approval, permit integration within the run's scope
 - **THEN** only the evaluated candidate changes enter the mainline after combined-tree checks, with any changed base or conflict resolution requiring revalidation of affected benefit evidence before adoption
 
 ### Requirement: Correctness and benefit remain independent decisions
@@ -94,7 +144,7 @@ An explicitly started loop SHALL remain available across successive experiments 
 
 #### Scenario: Interruption follows a recorded adoption
 - **WHEN** the process exits after publishing an adoption decision but before confirming baseline activation
-- **THEN** resume verifies the exact decision and installed experimental identity, completes or repairs that transition without a new trial or duplicate decision, and reports the recovered phase
+- **THEN** resume verifies the exact decision, applicable removal approval and installed experimental identity, completes or repairs only the authorized transition without a new trial or duplicate decision, and reports the recovered phase
 
 #### Scenario: A provider becomes unavailable
 - **WHEN** the configured endpoint returns a persistent availability failure

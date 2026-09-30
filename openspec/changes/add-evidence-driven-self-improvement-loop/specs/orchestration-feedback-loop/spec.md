@@ -40,6 +40,24 @@ A hypothesis card SHALL identify the other hypothesis used as its evaluation wor
 - **WHEN** both relationships are recorded
 - **THEN** the queue can decide A from completed B trials without waiting for B's benefit decision or creating a blocking chain through C
 
+### Requirement: Removal authorization is distinct from benefit outcome
+
+The existing hypothesis card SHALL own the removal proposal reference and explicit user approval, refusal or withdrawal separately from `adopt`, `reject` or `inconclusive`. The authorization reference SHALL identify the user's decision, reviewed proposal/source basis, target and behavior scope, covered experiment/integration/publication actions and superseding decisions. An agent or evaluator SHALL NOT manufacture user consent from a benefit verdict or general run authority. The referenced proposal SHALL carry the informed-removal contract from `self-improvement-loop`; neither a new approval tracker nor duplicated private transcripts SHALL be required.
+
+Status SHALL distinguish pending approval, user-declined removal, unsupported benefit and completed authorized application through the existing work statuses and decision details. A favorable benefit result without the authority for the next stage SHALL remain pending that stage and SHALL NOT imply activation, publication, main-spec synchronization or full completion. Before applying a covered action, including after recovery, the loop SHALL resolve the current decision and compare the actual scope with its authorization. An unchanged authorized action SHALL reuse its approval; a refusal SHALL be respected without repeated prompts absent new evidence or user instruction.
+
+#### Scenario: Benefit passes while publication approval is absent
+- **WHEN** an approved isolated removal experiment succeeds but installed publication was not covered
+- **THEN** its card retains the favorable evidence and identifies the pending authority without reporting the feature retired from the live installation
+
+#### Scenario: A decision changes while the loop is stopped
+- **WHEN** the user withdraws approval after an experiment but before its integration and the controller resumes
+- **THEN** the current withdrawal prevents new removal effects and baseline advancement, preserving completed evidence and identifying any already applied effects needing recovery
+
+#### Scenario: Refusal is not an experimental failure
+- **WHEN** the user declines a removal with otherwise promising evidence
+- **THEN** the card records that decision separately from measured benefit and prior-result search prevents the same proposal from being repeatedly presented
+
 ### Requirement: Benefit decisions reuse the board evidence owner
 
 Hypothesis decisions SHALL reuse and, where needed, extend the existing benefit-gate/ledger contract with links to independently accepted experiment evidence. Each decision SHALL identify the hypothesis, experiment, evaluated revisions, scope, quality result, measured effects, coverage and reason. Retried publication of the same decision SHALL be idempotent; contradictory or incomplete newer evidence SHALL not silently restore an older adoption. An `inconclusive` result SHALL identify the missing observation and next action or deferral condition rather than immediately requeue identical work. Closed and deferred hypotheses SHALL participate in prior-result search, and reconsideration SHALL preserve the earlier result and record a new evidential basis before another implementation attempt.
