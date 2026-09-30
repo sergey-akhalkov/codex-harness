@@ -503,3 +503,33 @@ versioned output; the USN append fast path is not required for closure
 (changed files conservatively full-parse, the permitted fallback) and remains
 a future candidate behind its own evidence gate; interval text presentation
 stays a bounded follow-up in render.rs with JSON carrying the full contract.
+
+## Group 8: development feedback and publication candidates (tasks 8.1-8.4)
+
+Implemented in worktree slot 3 (`exec-ds-devroute`, base `bfff088`) as commit
+`56eddc9` and merged as `9c52963` after review. The measured development
+route (fmt, focused lib filter ~1 s fresh/~42 s rebuilt, real build fixture
+tests, full harness-core lib suite) is documented in `docs/rust-native.md`
+without requiring a cold release first. The identity comparison at the frozen
+revision: the published-record inventory (349 files, independently walked)
+contains every one of the 208 compiled inputs of the seven published
+binaries; fixture `include_str!` targets appear in the top-level dep-info and
+are tracked by the finalize gate, uncovered includes are refused, and the
+remaining inventory is the wider test/manifest set — so **build-key narrowing
+is not adopted** (category exclusion would be unsafe and no safe benefit was
+measured). **Persistent compiler target: rejected** — the executor
+demonstrated Cargo's mtime freshness trap (a content change with a restored
+timestamp reports "Finished" in 0.01 s with a stale binary), while unchanged
+identity is already reused via verified content in 114-138 ms without Cargo.
+**thin-LTO/16-CGU profile: rejected** — 531.6 s vs 447.5 s publication build
+and +5.4% artifacts with equal runtime within noise (outputs byte-identical);
+the accepted route stays fat LTO with cgu=1 (cold 447.5 s, peak 1.88 GiB,
+25,215,488 B). No candidate reached the installed path; killed/queued
+commands leave no state and failed candidates publish nothing. Executor
+verification: fmt/clippy clean, harness-core lib 745/0/38, `native_build`
+compile suite 3/3 including both new resource-gate tests (659 s). Lead
+verification: workspace clippy on `codex-harness --all-targets` passes on the
+merged tree. The executor also caught a pre-existing `clippy::bool_comparison`
+in the group-12 `ci_workflow.rs` test (a semantics-preserving one-line fix,
+applied as `3c5677e`) — a lead verification gap, since that file had only
+been cargo-tested, not clippy-checked, when added.
