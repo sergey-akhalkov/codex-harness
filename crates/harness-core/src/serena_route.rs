@@ -190,6 +190,11 @@ fn strip_bom(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 pub struct Policy {
     pub max_projects: usize,
     pub idle_seconds: u64,
+    /// Cold starts of different configurations that may run at once. One
+    /// fresh worker commits a full language-server tree (measured ~1.1 GiB
+    /// on this kit's largest checkout), so a burst of concurrent startups
+    /// can exhaust a host before any per-worker limit is reached.
+    pub max_concurrent_startups: usize,
 }
 
 pub fn policy(source: &Path) -> io::Result<Policy> {
@@ -200,12 +205,17 @@ pub fn policy(source: &Path) -> io::Result<Policy> {
     let serena = &value["serena"];
     let max_projects = serena["max_projects"].as_u64().unwrap_or(0) as usize;
     let idle_seconds = serena["idle_seconds"].as_u64().unwrap_or(0);
-    if !(1..=16).contains(&max_projects) || !(1..=3600).contains(&idle_seconds) {
+    let max_concurrent_startups = serena["max_concurrent_startups"].as_u64().unwrap_or(1) as usize;
+    if !(1..=16).contains(&max_projects)
+        || !(1..=3600).contains(&idle_seconds)
+        || !(1..=4).contains(&max_concurrent_startups)
+    {
         return Err(invalid("invalid Serena resource policy"));
     }
     Ok(Policy {
         max_projects,
         idle_seconds,
+        max_concurrent_startups,
     })
 }
 

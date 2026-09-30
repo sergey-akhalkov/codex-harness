@@ -234,6 +234,43 @@ now would sabotage them. No correction has been selected yet — the existing
 single bounded retry is not duplicated, and no language or resource policy
 has been weakened.
 
+Measured cold start (2026-09-30 04:55, task 11.1): with 7 GB free and no live
+language servers, a fresh managed worker for this checkout was cold-started
+through the ordinary semantic route (the same configuration as both failing
+incidents) while a detached sampler recorded every worker-tree process. The
+operation succeeded in 27.5 s. Tree commit peak: **~1 112 MB** (rust-analyzer
+756 MB, BasedPyright-under-Node 320 MB, Serena agent 166 MB, proc-macro
+server 3 MB), settling to ~343 MB after warm-up. The sampler did not include
+flycheck cargo/rustc children; with the warm target directory they were not
+observed. Conclusion: a single cold start stays far below the 4 GiB per-worker
+job cap, so cause (a) alone cannot explain the incidents unless a cold
+flycheck adds multi-GB rustc children. Cause (b) — machine-wide commit
+exhaustion (five concurrent cold trees ≈ 5.5 GB of language servers plus four
+executor cargo suites with 8 GiB caps on a 15.8 GB machine, matching the
+22:10 burst) — is the strongest supported cause, with a cold-flycheck
+transient as a possible per-tree amplifier. The smallest cause-supported
+correction is therefore a machine-wide bound on concurrent cold starts in the
+shared pool, not another retry, a larger cap or a weaker language policy.
+
+Group 11.2 correction (2026-09-30): the shared pool now bounds cold starts
+across configurations. `serena_route::Policy` gains
+`max_concurrent_startups` (read from `global/tool-resources.json`, default 1,
+validated 1..=4; this checkout sets 1), and the pool's reservation step waits
+while another configuration's startup is in flight, instead of starting
+beside it. Same-configuration callers keep sharing one startup, the existing
+single bounded retry is untouched, no language or worker limit changed, and
+the pool status now reports `concurrent_startup_limit` and a
+`serialized_startups` counter so the bound is observable. Verified:
+`different_projects_cold_start_serially_under_the_startup_bound` (held first
+startup, deterministic counter-based wait, second factory provably not
+invoked until release, both complete, `cold_starts == 2`), plus the
+same-config sharing, independent-overlap and policy tests; 40 sibling
+`serena_shared`/`serena_route` tests passed with the production change in the
+same session; `cargo clippy -p harness-core --all-targets --locked --
+-D warnings` clean. Task 11.3 remains open: the installed-consumer exercise
+outside the checkout waits for the corrected build to reach the global
+lifecycle (group 13 delivery).
+
 ## Groups 9 and 3: accepted executor slices (2026-09-30)
 
 **Group 9 (tasks 9.1-9.6), merged as `7d32067`.** Executor `exec-ds-benefit`

@@ -89,8 +89,8 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 11. Restore and truthfully report semantic readiness
 
-- [ ] 11.1 Preserve local bounded failure evidence and reproduce the affected managed operation for `crates/harness-core/src/serena.rs`, `serena_shared.rs` and configuration ownership; verify project coverage, relevant backend inputs and actual resource evidence distinguish the observed OOM from its still-unproven cause. Covers N06.
-- [ ] 11.2 Apply the smallest cause-supported correction in its existing owner and make readiness/failure states useful; verify the existing bounded retry is not duplicated, unresolved initialization cannot be reported as working semantics and required languages/resource policies are not silently weakened. Covers N06.
+- [x] 11.1 Preserve local bounded failure evidence and reproduce the affected managed operation for `crates/harness-core/src/serena.rs`, `serena_shared.rs` and configuration ownership; verify project coverage, relevant backend inputs and actual resource evidence distinguish the observed OOM from its still-unproven cause. Covers N06.
+- [x] 11.2 Apply the smallest cause-supported correction in its existing owner and make readiness/failure states useful; verify the existing bounded retry is not duplicated, unresolved initialization cannot be reported as working semantics and required languages/resource policies are not silently weakened. Covers N06.
 - [ ] 11.3 Exercise representative retained Rust and affected multi-language navigation through the actual managed installed consumer outside the checkout; verify current coverage, useful failures, unaffected operations and separately qualified diagnostic freshness. Covers N06.
 
 ## 12. Deliver reproducible Windows verification

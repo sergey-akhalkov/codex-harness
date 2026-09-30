@@ -203,6 +203,7 @@ struct Table {
     cold_starts: u64,
     evictions: u64,
     startup_failures: u64,
+    serialized_startups: u64,
     queue: Durations,
     start: Durations,
     request: Durations,
@@ -297,6 +298,7 @@ impl Pool {
                 cold_starts: 0,
                 evictions: 0,
                 startup_failures: 0,
+                serialized_startups: 0,
                 queue: Durations::default(),
                 start: Durations::default(),
                 request: Durations::default(),
@@ -368,12 +370,14 @@ impl Pool {
                 "starting": table.starting.len(),
                 "retiring": table.retiring,
                 "limit": self.policy.max_projects,
+                "concurrent_startup_limit": self.policy.max_concurrent_startups,
             },
             "counters": {
                 "hits": table.hits,
                 "cold_starts": table.cold_starts,
                 "evictions": table.evictions,
                 "startup_failures": table.startup_failures,
+                "serialized_startups": table.serialized_startups,
             },
             "durations": {
                 "queue": table.queue.to_json(),
@@ -498,6 +502,15 @@ impl Pool {
                 table.retiring += 1;
             }
             return Ok(Step::Retire(obsolete));
+        }
+        // Cold starts are bounded across configurations: one fresh worker
+        // commits a whole language-server tree to the host, and a burst of
+        // concurrent startups can exhaust the machine before any per-worker
+        // job limit is reached. Callers of the same configuration keep
+        // sharing one startup above; this only serializes distinct starts.
+        if table.starting.len() >= self.policy.max_concurrent_startups {
+            table.serialized_startups += 1;
+            return Ok(Step::Wait);
         }
         if table.generations() < self.policy.max_projects {
             table.serial += 1;
@@ -1493,6 +1506,15 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, max_projects: usize, idle_seconds: u64) -> (Self, Pool) {
+            Self::with_startup_bound(tag, max_projects, idle_seconds, 4)
+        }
+
+        fn with_startup_bound(
+            tag: &str,
+            max_projects: usize,
+            idle_seconds: u64,
+            max_concurrent_startups: usize,
+        ) -> (Self, Pool) {
             let root = tempfile::Builder::new()
                 .prefix(&format!("harness-serena-pool-{tag}-"))
                 .tempdir()
@@ -1538,6 +1560,7 @@ mod tests {
                 serena_route::Policy {
                     max_projects,
                     idle_seconds,
+                    max_concurrent_startups,
                 },
                 home.clone(),
                 factory,
@@ -1594,6 +1617,10 @@ mod tests {
 
         fn requests(&self, index: usize) -> Vec<(String, Value)> {
             self.state(index).lock().unwrap().requests.clone()
+        }
+
+        fn starts(&self) -> u64 {
+            self.starts.load(Ordering::SeqCst)
         }
 
         fn wait_requests(&self, index: usize, count: usize) -> bool {
@@ -1955,6 +1982,55 @@ mod tests {
         .unwrap();
         assert_eq!(content(&current)["fixture"], 1);
         assert_eq!(fixture.requests(0).len(), 1);
+        assert_eq!(pool.status()["counters"]["cold_starts"], 2);
+        pool.close(Fixture::deadline()).unwrap();
+    }
+
+    #[test]
+    fn different_projects_cold_start_serially_under_the_startup_bound() {
+        // A burst of concurrent sessions must not stack fresh language-server
+        // trees on one host: with one concurrent cold start, a second
+        // project's startup waits for the first to finish instead of running
+        // beside it. The bound addresses machine-wide startup exhaustion; it
+        // never weakens a language, a worker limit or the single retry.
+        let (fixture, pool) = Fixture::with_startup_bound("serial-start", 3, 300, 1);
+        let alpha = fixture.project("alpha-serial");
+        let beta = fixture.project("beta-serial");
+        let hold = Signal::new();
+        fixture.plan(
+            &alpha,
+            Plan {
+                start_hold: Some(Arc::clone(&hold)),
+                ..Plan::default()
+            },
+        );
+        let pool = Arc::new(pool);
+        let first = spawn_rpc(&pool, &Fixture::client(1), &alpha, "tools/list", json!({}));
+        assert!(
+            wait_until(WAIT, || fixture.starts() == 1),
+            "the first startup is in flight"
+        );
+        let second = spawn_rpc(&pool, &Fixture::client(2), &beta, "tools/list", json!({}));
+        assert!(
+            wait_until(WAIT, || {
+                pool.status()["counters"]["serialized_startups"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    >= 1
+            }),
+            "the second startup reached the bound"
+        );
+        assert_eq!(
+            fixture.starts(),
+            1,
+            "the second factory cannot start while the first is in flight"
+        );
+        hold.set();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(content(&first)["fixture"], 0);
+        assert_eq!(content(&second)["fixture"], 1);
+        assert_eq!(fixture.starts(), 2);
         assert_eq!(pool.status()["counters"]["cold_starts"], 2);
         pool.close(Fixture::deadline()).unwrap();
     }

@@ -2,7 +2,8 @@
   "schema_version": 1,
   "serena": {
     "max_projects": 3,
-    "idle_seconds": 300
+    "idle_seconds": 300,
+    "max_concurrent_startups": 1
   },
   "nuphus": {
     "idle_seconds": 300
