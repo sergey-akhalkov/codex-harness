@@ -39,6 +39,11 @@ pub const MAX_OWNER_BYTES: usize = 64;
 /// How long a mutating command waits for the exclusive run-mutation guard
 /// before reporting the busy controller instead of acting on stale state.
 pub const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// Bounds for the private terminal-evidence retention: a receipt snapshot and
+/// a bounded result snapshot, copied before ephemeral pool records can be
+/// overwritten by a later dispatch into the same slot.
+pub const MAX_RETAINED_RECEIPT_BYTES: u64 = 1024 * 1024;
+pub const MAX_RETAINED_RESULT_BYTES: u64 = 256 * 1024;
 
 const MAX_TOKEN: usize = 200;
 const MAX_REASON: usize = 1024;
@@ -87,6 +92,10 @@ pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, limit: u64) -> io::R
     let bytes = bounded_read(path, limit)?;
     serde_json::from_slice(&bytes)
         .map_err(|error| invalid(format!("{} is not valid JSON: {error}", path.display())))
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn token(name: &str, value: &str, max: usize) -> io::Result<String> {
@@ -533,11 +542,156 @@ pub enum ObservedOutcome {
     Unknown,
 }
 
+/// The host process identity observed for one accepted dispatch generation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostBinding {
+    pub pid: u32,
+    /// Windows FILETIME creation time: a bare pid is never an identity.
+    pub created: u64,
+    pub program: PathBuf,
+}
+
+/// The frozen identity of the native dispatch an attempt accepted.
+///
+/// A receipt path alone is not identity: the pool reuses `spawn-<slot>.json`
+/// and the result/detail files for later dispatches. The generation recorded
+/// by the dispatcher is per dispatch, so later observations and cleanup can
+/// refuse a receipt that now belongs to another run. The session and host are
+/// frozen as soon as they are observed for the verified generation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchBinding {
+    pub slot: u32,
+    pub owner: String,
+    pub generation: String,
+    /// Retained as a locator only; identity is the slot/owner/generation.
+    pub receipt: PathBuf,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub host: Option<HostBinding>,
+}
+
+/// A freshly read native receipt identity, as the dispatcher's own receipt
+/// records it now. Every field is optional because a reused or foreign receipt
+/// may no longer carry the accepted facts at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedIdentity {
+    pub slot: Option<u32>,
+    pub owner: Option<String>,
+    pub generation: Option<String>,
+    pub session: Option<String>,
+    pub host: Option<HostBinding>,
+}
+
+/// The result of validating one observed receipt identity against the frozen
+/// accepted binding. Missing and mismatched facts stay distinct so callers can
+/// report what changed; neither ever settles or stops the attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityCheck {
+    Verified,
+    Mismatch(String),
+    Missing(String),
+}
+
+pub fn verify_dispatch_identity(
+    binding: &DispatchBinding,
+    observed: &ObservedIdentity,
+) -> IdentityCheck {
+    match (observed.slot, observed.owner.as_deref()) {
+        (Some(slot), Some(owner)) if slot == binding.slot && owner == binding.owner => {}
+        (Some(slot), Some(owner)) => {
+            return IdentityCheck::Mismatch(format!(
+                "the receipt names slot {slot} owner {owner} instead of the accepted slot {} owner {}",
+                binding.slot, binding.owner
+            ));
+        }
+        _ => {
+            return IdentityCheck::Missing(
+                "the receipt no longer records the accepted slot and owner".to_owned(),
+            );
+        }
+    }
+    match observed.generation.as_deref() {
+        Some(generation) if generation == binding.generation => {}
+        Some(generation) => {
+            return IdentityCheck::Mismatch(format!(
+                "the receipt names dispatch generation {generation} instead of the accepted generation {}; a later run reuses this slot",
+                binding.generation
+            ));
+        }
+        None => {
+            return IdentityCheck::Missing(
+                "the receipt no longer records the accepted dispatch generation".to_owned(),
+            );
+        }
+    }
+    if let (Some(frozen), Some(observed)) = (&binding.session, &observed.session)
+        && frozen != observed
+    {
+        return IdentityCheck::Mismatch(format!(
+            "the receipt names session {observed} instead of the accepted session {frozen}"
+        ));
+    }
+    if let (Some(frozen), Some(observed)) = (&binding.host, &observed.host)
+        && frozen != observed
+    {
+        return IdentityCheck::Mismatch(format!(
+            "the receipt names host pid {} ({}) instead of the accepted host pid {} ({})",
+            observed.pid,
+            observed.program.display(),
+            frozen.pid,
+            frozen.program.display()
+        ));
+    }
+    IdentityCheck::Verified
+}
+
+impl Attempt {
+    /// Records session/host facts observed for an already-verified generation,
+    /// so later checks compare against the same run rather than the file.
+    pub fn freeze_observed(&mut self, observed: &ObservedIdentity) {
+        if let Some(binding) = &mut self.binding {
+            if binding.session.is_none() {
+                binding.session = observed.session.clone();
+            }
+            if binding.host.is_none() {
+                binding.host = observed.host.clone();
+            }
+        }
+    }
+}
+
+/// The private snapshot of one verified terminal attempt: the receipt and the
+/// bounded terminal result, retained before the ephemeral pool files can be
+/// overwritten. Locators point inside the run store, not the pool.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedEvidence {
+    pub receipt: PathBuf,
+    pub receipt_sha256: String,
+    pub result: Option<PathBuf>,
+    pub result_sha256: Option<String>,
+    /// Why a bounded result snapshot could not be retained, when it could not.
+    pub note: Option<String>,
+    pub retained_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Attempt {
     pub id: String,
     pub role: AttemptRole,
+    /// The frozen native dispatch identity this attempt accepted. `None` means
+    /// no verifiable dispatch identity was recorded (a legacy cursor or an
+    /// acceptance without a generation): observations and cleanup then refuse
+    /// instead of binding the attempt to whatever the receipt holds now.
+    #[serde(default)]
+    pub binding: Option<DispatchBinding>,
+    /// The retained terminal evidence, copied at settle time.
+    #[serde(default)]
+    pub retained: Option<RetainedEvidence>,
     /// The `executor` owner label; bounded so the titled surface stays
     /// verifiable by the frontend attach guard.
     pub owner: String,
@@ -1109,6 +1263,61 @@ impl RunStore {
             previous,
             previous_live,
         })
+    }
+
+    /// Copies one verified terminal attempt's evidence into the private run
+    /// store: the receipt snapshot and, when bounded, the terminal result.
+    /// The pool reuses its `spawn-<slot>.json` and result files for later
+    /// dispatches, so controller consumption reads these retained locators
+    /// instead of the mutable pool files once an attempt has settled.
+    pub fn retain_evidence(
+        &self,
+        attempt_id: &str,
+        receipt: &Path,
+        result: Option<&Path>,
+    ) -> io::Result<RetainedEvidence> {
+        let safe: String = attempt_id
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+            .collect();
+        if safe.is_empty() || safe.len() > MAX_OWNER_BYTES {
+            return Err(invalid("invalid attempt identity for evidence retention"));
+        }
+        let dir = self.root.join("evidence").join(&safe);
+        fs::create_dir_all(&dir)?;
+        let receipt_bytes = bounded_read(receipt, MAX_RETAINED_RECEIPT_BYTES)?;
+        let receipt_path = dir.join("receipt.json");
+        fs::write(&receipt_path, &receipt_bytes)?;
+        let mut retained = RetainedEvidence {
+            receipt: receipt_path,
+            receipt_sha256: digest_bytes(&receipt_bytes),
+            result: None,
+            result_sha256: None,
+            note: None,
+            retained_ms: now_ms(),
+        };
+        if let Some(result) = result {
+            match bounded_read(result, MAX_RETAINED_RESULT_BYTES) {
+                Ok(bytes) => {
+                    let path = dir.join("result.txt");
+                    fs::write(&path, &bytes)?;
+                    retained.result = Some(path);
+                    retained.result_sha256 = Some(digest_bytes(&bytes));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    retained.note = Some(
+                        "the terminal result file was already gone when the attempt settled"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    retained.note = Some(format!(
+                        "the terminal result was not retained within its bound: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(retained)
     }
 }
 

@@ -326,6 +326,8 @@ fn attempt(id: &str, role: AttemptRole, state: AttemptState) -> Attempt {
     Attempt {
         id: id.to_owned(),
         role,
+        binding: None,
+        retained: None,
         owner: dispatch_owner("loop-fixture", role, 1),
         title: format!("CEx (ds) - {id}"),
         profile: "ds".to_owned(),
@@ -725,4 +727,191 @@ fn variant_sets_name_prepared_runtimes_without_consuming_them() {
     assert_eq!(loaded.baseline.build, set.baseline.build);
     assert!(loaded.named("candidate").is_some());
     assert!(loaded.named("other").is_none());
+}
+
+fn binding_fixture() -> DispatchBinding {
+    DispatchBinding {
+        slot: 1,
+        owner: "loop-fixture-implementer-1".to_owned(),
+        generation: "gen-accepted".to_owned(),
+        receipt: PathBuf::from(r"C:\pool\spawn-1.json"),
+        session: None,
+        host: None,
+    }
+}
+
+#[test]
+fn dispatch_identity_requires_the_accepted_generation_and_host() {
+    let binding = binding_fixture();
+    let accepted = ObservedIdentity {
+        slot: Some(1),
+        owner: Some("loop-fixture-implementer-1".to_owned()),
+        generation: Some("gen-accepted".to_owned()),
+        session: None,
+        host: None,
+    };
+    assert_eq!(
+        verify_dispatch_identity(&binding, &accepted),
+        IdentityCheck::Verified
+    );
+
+    let replaced = ObservedIdentity {
+        generation: Some("gen-newer".to_owned()),
+        ..accepted.clone()
+    };
+    match verify_dispatch_identity(&binding, &replaced) {
+        IdentityCheck::Mismatch(reason) => assert!(reason.contains("generation"), "{reason}"),
+        other => panic!("expected a generation mismatch, got {other:?}"),
+    }
+    let unrecorded = ObservedIdentity {
+        generation: None,
+        ..accepted.clone()
+    };
+    assert!(matches!(
+        verify_dispatch_identity(&binding, &unrecorded),
+        IdentityCheck::Missing(_)
+    ));
+    let other_slot = ObservedIdentity {
+        slot: Some(2),
+        ..accepted.clone()
+    };
+    assert!(matches!(
+        verify_dispatch_identity(&binding, &other_slot),
+        IdentityCheck::Mismatch(_)
+    ));
+
+    // Once a session/host has been observed for the verified generation, a
+    // different one is refused instead of being read as this attempt's run.
+    let mut frozen = binding.clone();
+    frozen.session = Some("session-a".to_owned());
+    frozen.host = Some(HostBinding {
+        pid: 7,
+        created: 9,
+        program: PathBuf::from(r"C:\fixture\codex.exe"),
+    });
+    let matched = ObservedIdentity {
+        session: Some("session-a".to_owned()),
+        host: Some(HostBinding {
+            pid: 7,
+            created: 9,
+            program: PathBuf::from(r"C:\fixture\codex.exe"),
+        }),
+        ..accepted.clone()
+    };
+    assert_eq!(
+        verify_dispatch_identity(&frozen, &matched),
+        IdentityCheck::Verified
+    );
+    let drifted = ObservedIdentity {
+        session: Some("session-b".to_owned()),
+        ..matched.clone()
+    };
+    assert!(matches!(
+        verify_dispatch_identity(&frozen, &drifted),
+        IdentityCheck::Mismatch(_)
+    ));
+    let other_host = ObservedIdentity {
+        host: Some(HostBinding {
+            pid: 8,
+            created: 9,
+            program: PathBuf::from(r"C:\fixture\codex.exe"),
+        }),
+        ..matched
+    };
+    assert!(matches!(
+        verify_dispatch_identity(&frozen, &other_host),
+        IdentityCheck::Mismatch(_)
+    ));
+}
+
+#[test]
+fn freeze_observed_records_the_first_verified_session_and_host_only() {
+    let mut attempt = attempt("a1", AttemptRole::Implementer, AttemptState::Started);
+    attempt.binding = Some(binding_fixture());
+    let first = ObservedIdentity {
+        slot: Some(1),
+        owner: Some("loop-fixture-implementer-1".to_owned()),
+        generation: Some("gen-accepted".to_owned()),
+        session: Some("session-a".to_owned()),
+        host: Some(HostBinding {
+            pid: 7,
+            created: 9,
+            program: PathBuf::from(r"C:\fixture\codex.exe"),
+        }),
+    };
+    attempt.freeze_observed(&first);
+    let binding = attempt.binding.as_ref().unwrap();
+    assert_eq!(binding.session.as_deref(), Some("session-a"));
+    assert_eq!(binding.host.as_ref().map(|host| host.pid), Some(7));
+    let later = ObservedIdentity {
+        session: Some("session-b".to_owned()),
+        ..first
+    };
+    attempt.freeze_observed(&later);
+    let binding = attempt.binding.as_ref().unwrap();
+    assert_eq!(
+        binding.session.as_deref(),
+        Some("session-a"),
+        "the first verified identity is not overwritten by later observations"
+    );
+}
+
+#[test]
+fn terminal_evidence_is_retained_bounded_with_digests() {
+    let root = fixture_root("retained");
+    let spec = spec_fixture(root.path(), "retained");
+    let run_dir = root.path().join("run");
+    let change_root = root.path().join("openspec/changes/add-synthetic");
+    let store = RunStore::create(&run_dir, &spec, &spec.digest().unwrap(), &change_root).unwrap();
+    let receipt = root.path().join("spawn-1.json");
+    let receipt_bytes = b"{\"observation\":{\"state\":\"completed\"}}\n";
+    fs::write(&receipt, receipt_bytes).unwrap();
+    let result = root.path().join("message-1.txt");
+    fs::write(&result, "final answer\n").unwrap();
+
+    let retained = store
+        .retain_evidence("implementer-1", &receipt, Some(&result))
+        .unwrap();
+    assert_eq!(retained.receipt_sha256, digest_bytes(receipt_bytes));
+    assert_eq!(fs::read(&retained.receipt).unwrap(), receipt_bytes);
+    let retained_result = retained.result.as_ref().unwrap();
+    assert_eq!(
+        retained.result_sha256.as_deref(),
+        Some(digest_bytes(b"final answer\n").as_str())
+    );
+    assert_eq!(fs::read(retained_result).unwrap(), b"final answer\n");
+    assert!(retained.note.is_none());
+
+    // An oversized result is not silently truncated: the locator stays
+    // explicit and the note names why the snapshot is absent.
+    let oversized = root.path().join("oversized.txt");
+    fs::write(
+        &oversized,
+        vec![b'x'; (MAX_RETAINED_RESULT_BYTES + 1) as usize],
+    )
+    .unwrap();
+    let retained = store
+        .retain_evidence("implementer-2", &receipt, Some(&oversized))
+        .unwrap();
+    assert!(retained.result.is_none());
+    assert!(
+        retained.note.as_deref().unwrap().contains("not retained"),
+        "{retained:?}"
+    );
+
+    // A missing result or receipt is reported, never fabricated.
+    let retained = store
+        .retain_evidence(
+            "implementer-3",
+            &receipt,
+            Some(&root.path().join("gone.txt")),
+        )
+        .unwrap();
+    assert!(retained.result.is_none());
+    assert!(retained.note.as_deref().unwrap().contains("already gone"));
+    assert!(
+        store
+            .retain_evidence("implementer-4", &root.path().join("absent.json"), None)
+            .is_err()
+    );
 }

@@ -12,18 +12,19 @@
 #![cfg(windows)]
 
 use crate::executor_cli::{
-    ConversationState, VisibleAccepted, VisibleConversation, conversation_state,
-    dispatch_visible_conversation, executor_title, stop_owned_run,
+    ConversationState, VisibleAccepted, VisibleConversation, dispatch_visible_conversation,
+    executor_title, receipt_view, stop_owned_run,
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;
 use harness_core::build_identity;
 use harness_core::build_selection;
 use harness_core::improvement_loop::{
-    Attempt, AttemptRole, AttemptState, Cursor, DispatchFacts, DispatchGate, EffectKind,
-    ObservedOutcome, Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE,
-    VariantSet, declared_removal_gate, dispatch_gate, dispatch_owner, frozen_removal_digest,
-    now_ms, read_json, selection_gate, settle_completed_reuse, write_json_atomic,
+    Attempt, AttemptRole, AttemptState, Cursor, DispatchBinding, DispatchFacts, DispatchGate,
+    EffectKind, HostBinding, IdentityCheck, ObservedIdentity, ObservedOutcome, Phase, RemovalGate,
+    ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE, VariantSet, declared_removal_gate,
+    dispatch_gate, dispatch_owner, frozen_removal_digest, now_ms, read_json, selection_gate,
+    settle_completed_reuse, verify_dispatch_identity, write_json_atomic,
 };
 use harness_core::improvement_spec::{OpenSpec, PlanningReceipt};
 use harness_core::orchestration_config;
@@ -458,11 +459,16 @@ fn print_attempts(cursor: &Cursor) -> String {
         .iter()
         .map(|attempt| {
             let mut line = format!(
-                "  - id={} role={} state={} observed={} owner={} title=\"{}\" profile={}",
+                "  - id={} role={} state={} observed={} generation={} owner={} title=\"{}\" profile={}",
                 attempt.id,
                 attempt.role.as_str(),
                 attempt.state.as_str(),
                 observed_state(attempt),
+                attempt
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.generation.as_str())
+                    .unwrap_or("unbound"),
                 attempt.owner,
                 attempt.title,
                 attempt.profile
@@ -476,28 +482,102 @@ fn print_attempts(cursor: &Cursor) -> String {
             if let Some(reuse) = &attempt.reuse_refused {
                 line.push_str(&format!(" reuse-refused=\"{reuse}\""));
             }
+            if let Some(retained) = &attempt.retained {
+                line.push_str(&format!(
+                    " retained={} sha256={}",
+                    retained.receipt.display(),
+                    &retained.receipt_sha256[..16.min(retained.receipt_sha256.len())]
+                ));
+            }
             line
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// The read-only receipt observation of one attempt. Status reports the
-/// durable state and this authoritative observation side by side, so a
-/// retained live conversation is never conflated with a truly unknown effect.
-fn observed_state(attempt: &Attempt) -> String {
-    let Some(receipt) = &attempt.receipt else {
-        return "no receipt".to_owned();
+/// The identity-checked evidence of one attempt. The frozen accepted dispatch
+/// generation decides whether the receipt now on disk belongs to this attempt
+/// at all: a reused slot, a replaced generation or a receipt without the
+/// accepted facts is refused instead of being read as this attempt's outcome.
+enum AttemptEvidence {
+    Verified {
+        state: ConversationState,
+        observed: ObservedIdentity,
+    },
+    Refused(String),
+}
+
+fn attempt_evidence(attempt: &Attempt) -> AttemptEvidence {
+    let Some(binding) = &attempt.binding else {
+        return AttemptEvidence::Refused(
+            "no frozen native dispatch identity is recorded, so no receipt can be attributed to this attempt"
+                .to_owned(),
+        );
     };
-    match conversation_state(receipt) {
-        Ok(ConversationState::Completed) => "completed".to_owned(),
-        Ok(ConversationState::Failed(cause)) => named_observation("failed", &cause),
-        Ok(ConversationState::Interrupted(cause)) => named_observation("interrupted", &cause),
-        Ok(ConversationState::Stopped(cause)) => named_observation("stopped", &cause),
-        Ok(ConversationState::Active) => "active(host live)".to_owned(),
-        Ok(ConversationState::Unknown(reason)) => format!("unknown({reason})"),
-        Ok(ConversationState::Missing) => "missing".to_owned(),
-        Err(error) => format!("unreadable({error})"),
+    let Some(receipt) = &attempt.receipt else {
+        return AttemptEvidence::Refused(
+            "the attempt records no dispatch receipt locator".to_owned(),
+        );
+    };
+    let view = match receipt_view(receipt) {
+        Ok(view) => view,
+        Err(error) => {
+            return AttemptEvidence::Refused(format!(
+                "the dispatch receipt is unreadable: {error}"
+            ));
+        }
+    };
+    let observed = ObservedIdentity {
+        slot: view.identity.slot,
+        owner: view.identity.owner.clone(),
+        generation: view.identity.generation.clone(),
+        session: view.identity.session.clone(),
+        host: view
+            .identity
+            .host
+            .clone()
+            .map(|(pid, created, program)| HostBinding {
+                pid,
+                created,
+                program,
+            }),
+    };
+    match verify_dispatch_identity(binding, &observed) {
+        IdentityCheck::Verified => AttemptEvidence::Verified {
+            state: view.state,
+            observed,
+        },
+        IdentityCheck::Mismatch(reason) | IdentityCheck::Missing(reason) => {
+            AttemptEvidence::Refused(reason)
+        }
+    }
+}
+
+/// The read-only identity-checked observation of one attempt. Status reports
+/// the durable state and this authoritative observation side by side, so a
+/// retained live conversation, a verified terminal outcome and a receipt that
+/// no longer belongs to this attempt stay distinguishable.
+fn observed_state(attempt: &Attempt) -> String {
+    match attempt_evidence(attempt) {
+        AttemptEvidence::Refused(reason) => {
+            if attempt.retained.is_some() {
+                // The attempt settled from verified evidence that was retained
+                // before the ephemeral pool file moved on; its evidence is the
+                // retained snapshot, not the current receipt.
+                "settled(retained evidence)".to_owned()
+            } else {
+                format!("unverified({reason})")
+            }
+        }
+        AttemptEvidence::Verified { state, .. } => match state {
+            ConversationState::Completed => "completed".to_owned(),
+            ConversationState::Failed(cause) => named_observation("failed", &cause),
+            ConversationState::Interrupted(cause) => named_observation("interrupted", &cause),
+            ConversationState::Stopped(cause) => named_observation("stopped", &cause),
+            ConversationState::Active => "active(host live)".to_owned(),
+            ConversationState::Unknown(reason) => format!("unknown({reason})"),
+            ConversationState::Missing => "missing".to_owned(),
+        },
     }
 }
 
@@ -563,6 +643,11 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             "role": attempt.role.as_str(),
             "state": attempt.state.as_str(),
             "observed": observed_state(attempt),
+            "generation": attempt.binding.as_ref().map(|binding| binding.generation.clone()),
+            "bound_slot": attempt.binding.as_ref().map(|binding| binding.slot),
+            "bound_session": attempt.binding.as_ref().and_then(|binding| binding.session.clone()),
+            "retained_receipt": attempt.retained.as_ref().map(|retained| retained.receipt.display().to_string()),
+            "retained_receipt_sha256": attempt.retained.as_ref().map(|retained| retained.receipt_sha256.clone()),
             "owner": attempt.owner,
             "title": attempt.title,
             "receipt": attempt.receipt.as_ref().map(|path| path.display().to_string()),
@@ -842,6 +927,8 @@ fn dispatch_investigator(run: &Run, receipt: &PlanningReceipt) -> io::Result<boo
     let attempt = Attempt {
         id: attempt_id.clone(),
         role: AttemptRole::Investigator,
+        binding: None,
+        retained: None,
         owner: owner.clone(),
         title: title.clone(),
         profile: binding.profile.clone(),
@@ -909,12 +996,70 @@ fn dispatch_investigator(run: &Run, receipt: &PlanningReceipt) -> io::Result<boo
 }
 
 fn record_accepted(cursor: &mut Cursor, attempt_id: &str, accepted: &VisibleAccepted) {
+    // Freeze the accepted native dispatch identity from the dispatcher's own
+    // receipt, at the moment of acceptance. The receipt path alone is not
+    // identity: the pool reuses it for later dispatches.
+    let mut binding = None;
+    let mut binding_note = None;
+    match receipt_view(&accepted.receipt) {
+        Ok(view) => {
+            let identity = view.identity;
+            let slot_matches = identity.slot == Some(accepted.slot);
+            let owner_matches = identity.owner.as_deref() == Some(accepted.owner.as_str());
+            match (slot_matches, owner_matches, identity.generation.clone()) {
+                (true, true, Some(generation)) => {
+                    binding = Some(DispatchBinding {
+                        slot: accepted.slot,
+                        owner: accepted.owner.clone(),
+                        generation,
+                        receipt: accepted.receipt.clone(),
+                        session: identity.session.clone(),
+                        host: identity
+                            .host
+                            .clone()
+                            .map(|(pid, created, program)| HostBinding {
+                                pid,
+                                created,
+                                program,
+                            }),
+                    });
+                }
+                (_, _, None) => {
+                    binding_note = Some(
+                        "the accepted dispatch recorded no native generation; observations and cleanup will refuse this attempt instead of binding it to a mutable receipt"
+                            .to_owned(),
+                    );
+                }
+                _ => {
+                    binding_note = Some(format!(
+                        "the accepted receipt names slot {} owner {} instead of the accepted slot {} owner {}; the attempt is retained as unknown and never settled from it",
+                        identity
+                            .slot
+                            .map_or("none".to_owned(), |slot| slot.to_string()),
+                        identity.owner.as_deref().unwrap_or("none"),
+                        accepted.slot,
+                        accepted.owner
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            binding_note = Some(format!(
+                "the accepted receipt {} could not be read for identity: {error}; the attempt is retained as unknown and never settled from it",
+                accepted.receipt.display()
+            ));
+        }
+    }
     if let Some(attempt) = cursor
         .attempts
         .iter_mut()
         .find(|attempt| attempt.id == attempt_id)
     {
         attempt.state = AttemptState::Started;
+        attempt.binding = binding;
+        if let Some(note) = binding_note {
+            attempt.reason = Some(note);
+        }
         attempt.title = accepted.title.clone();
         attempt.checkout = Some(accepted.checkout.clone());
         attempt.receipt = Some(accepted.receipt.clone());
@@ -928,9 +1073,15 @@ fn record_accepted(cursor: &mut Cursor, attempt_id: &str, accepted: &VisibleAcce
     cursor.effect(
         EffectKind::DispatchAccepted,
         format!(
-            "attempt={attempt_id} owner={} title=\"{}\" receipt={} coverage=native",
+            "attempt={attempt_id} owner={} title=\"{}\" slot={} generation={} receipt={} coverage=native",
             accepted.owner,
             accepted.title,
+            accepted.slot,
+            cursor
+                .attempt(attempt_id)
+                .and_then(|attempt| attempt.binding.as_ref())
+                .map(|binding| binding.generation.as_str())
+                .unwrap_or("unrecorded"),
             accepted.receipt.display()
         ),
     );
@@ -1041,17 +1192,6 @@ fn timeout_option(value: Option<&str>) -> io::Result<Duration> {
     }
 }
 
-/// The pooled slot an attempt's dispatch receipt records for the exact owner.
-/// `None` means this attempt's effect cannot be located as one owned pooled
-/// run, so no process may be terminated on this evidence.
-fn pooled_slot(receipt: &Path, owner: &str) -> Option<u32> {
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt).ok()?).ok()?;
-    let slot = value.get("slot")?;
-    let index = slot.get("index")?.as_u64()?;
-    let recorded_owner = slot.get("owner").and_then(|value| value.as_str())?;
-    (recorded_owner == owner && index > 0 && index <= u32::MAX as u64).then_some(index as u32)
-}
-
 fn terminal_outcome(state: &ConversationState) -> Option<ObservedOutcome> {
     match state {
         ConversationState::Completed => Some(ObservedOutcome::Completed),
@@ -1088,14 +1228,46 @@ fn state_reason(state: &ConversationState) -> Option<String> {
     }
 }
 
+/// Settles one attempt from verified evidence and retains its terminal
+/// evidence before the pool files can be overwritten. Returns the recorded
+/// note, including an explicit retention failure.
+fn settle_verified(
+    store: &RunStore,
+    attempt: &mut Attempt,
+    outcome: ObservedOutcome,
+    observed: &ObservedIdentity,
+    at: u64,
+    note: String,
+) -> String {
+    let receipt = attempt.receipt.clone();
+    let result = attempt.result.clone();
+    let retained = receipt
+        .as_deref()
+        .map(|receipt| store.retain_evidence(&attempt.id, receipt, result.as_deref()));
+    attempt.settle(outcome, at);
+    attempt.freeze_observed(observed);
+    let note = match retained {
+        Some(Ok(retained)) => {
+            attempt.retained = Some(retained);
+            note
+        }
+        Some(Err(error)) => {
+            attempt.retained = None;
+            format!("{note}; the terminal evidence could not be retained: {error}")
+        }
+        None => note,
+    };
+    attempt.reason = Some(note.clone());
+    note
+}
+
 /// Verified owned cleanup of every attempt whose effect may still exist. Each
-/// known owned attempt is stopped through the exact-identity executor stop
-/// owner, which verifies the slot binding and the recorded host identity and
-/// terminates only that run's recorded process tree. Where cleanup cannot be
-/// established - no receipt, no pooled address, a refused or partial stop, or
-/// a receipt that records no terminal state - the effect stays explicitly
-/// retained as unknown and is never replayed. Attempts that are already
-/// terminal are left untouched.
+/// attempt is first attributed to its frozen accepted dispatch generation; a
+/// receipt that now belongs to another run is refused without any process
+/// action. Only an attributed attempt is stopped through the exact-identity
+/// executor stop owner - with the frozen session when one is known, so a newer
+/// dispatch into the same slot is refused there as well. Anything that cannot
+/// be established stays explicitly retained as unknown and is never replayed.
 fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, String)> {
     let ids: Vec<String> = run
         .cursor
@@ -1115,114 +1287,154 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
         else {
             continue;
         };
-        let (receipt, owner) = {
-            let attempt = &run.cursor.attempts[index];
-            (attempt.receipt.clone(), attempt.owner.clone())
+        let evidence = attempt_evidence(&run.cursor.attempts[index]);
+        let (slot, owner, session, state, observed) = match evidence {
+            AttemptEvidence::Refused(reason) => {
+                let note = format!(
+                    "cleanup refused: {reason}; the effect stays retained as unknown and is never bound to the current receipt contents"
+                );
+                let attempt = &mut run.cursor.attempts[index];
+                if attempt.state != AttemptState::Unknown {
+                    attempt.settle(ObservedOutcome::Unknown, at);
+                }
+                attempt.reason = Some(note.clone());
+                run.cursor
+                    .effect(EffectKind::OwnedCleanup, format!("attempt={id}: {note}"));
+                notes.push((id, note));
+                continue;
+            }
+            AttemptEvidence::Verified { state, observed } => {
+                let binding = run.cursor.attempts[index]
+                    .binding
+                    .as_ref()
+                    .expect("verified evidence requires a frozen binding");
+                (
+                    binding.slot,
+                    binding.owner.clone(),
+                    binding.session.clone().or_else(|| observed.session.clone()),
+                    state,
+                    observed,
+                )
+            }
         };
-        let Some(receipt) = receipt else {
-            notes.push((
-                id.clone(),
-                "no dispatch receipt is recorded, so no owned effect can be located; the effect stays retained as unknown and is never replayed"
-                    .to_owned(),
-            ));
-            run.cursor.effect(
-                EffectKind::OwnedCleanup,
-                format!("attempt={id}: no dispatch receipt; retained unknown"),
+        if let Some(outcome) = terminal_outcome(&state) {
+            let note = format!(
+                "already terminal on its verified receipt: {}",
+                state_reason(&state).unwrap_or_else(|| "settled from the receipt".to_owned())
             );
-            continue;
-        };
-        if !receipt.is_file() {
-            notes.push((
-                id.clone(),
-                "the recorded dispatch receipt is missing, so no owned effect can be located; the effect stays retained as unknown and is never replayed"
-                    .to_owned(),
-            ));
-            run.cursor.effect(
-                EffectKind::OwnedCleanup,
-                format!("attempt={id}: dispatch receipt missing; retained unknown"),
-            );
+            let attempt = &mut run.cursor.attempts[index];
+            let note = settle_verified(&run.store, attempt, outcome, &observed, at, note);
+            run.cursor
+                .effect(EffectKind::OwnedCleanup, format!("attempt={id}: {note}"));
+            notes.push((id, note));
             continue;
         }
-        let Some(slot) = pooled_slot(&receipt, &owner) else {
-            notes.push((
-                id.clone(),
-                "the dispatch receipt does not name this attempt's pooled slot and owner, so cleanup could not be established; the effect stays retained as unknown"
-                    .to_owned(),
-            ));
-            run.cursor.effect(
-                EffectKind::OwnedCleanup,
-                format!("attempt={id}: no pooled address; retained unknown"),
-            );
-            continue;
-        };
-        let exit = stop_owned_run(
-            &run.spec.project,
-            &run.spec.codex_home,
-            slot,
-            &owner,
-            timeout,
-        );
-        let observed = conversation_state(&receipt);
-        let (outcome, note) = match (&exit, &observed) {
-            (Err(error), _) => (
-                None,
-                format!(
-                    "cleanup could not be established: {error}; the effect stays retained as unknown"
-                ),
-            ),
-            (Ok(code), Ok(state)) => match terminal_outcome(state) {
-                Some(outcome) => (
-                    Some(outcome),
-                    format!(
-                        "owned stop of slot {slot} (exit {code}) verified: {}",
-                        state_reason(state)
-                            .unwrap_or_else(|| "settled from the receipt".to_owned())
+        match state {
+            ConversationState::Active => {
+                let exit = stop_owned_run(
+                    &run.spec.project,
+                    &run.spec.codex_home,
+                    slot,
+                    &owner,
+                    session.as_deref(),
+                    timeout,
+                );
+                // Re-attribute after the stop: the pool may have moved on, and
+                // only the frozen generation may settle this attempt.
+                let post = attempt_evidence(&run.cursor.attempts[index]);
+                let note = match (exit, post) {
+                    (Err(error), _) => format!(
+                        "cleanup could not be established: {error}; the effect stays retained as unknown"
                     ),
-                ),
-                None => {
-                    let detail = match state {
-                        ConversationState::Active => {
-                            "the receipt still reports a live host".to_owned()
-                        }
-                        ConversationState::Unknown(reason) => reason.clone(),
-                        ConversationState::Missing => "the receipt disappeared".to_owned(),
-                        _ => "the receipt records no terminal state".to_owned(),
-                    };
                     (
-                        None,
-                        format!(
-                            "the owned stop of slot {slot} exited {code} but {detail}; the effect stays retained as unknown"
-                        ),
-                    )
-                }
-            },
-            (Ok(code), Err(error)) => (
-                None,
-                format!(
-                    "the owned stop of slot {slot} exited {code} and the receipt is unreadable: {error}; the effect stays retained as unknown"
-                ),
-            ),
-        };
-        {
-            let attempt = &mut run.cursor.attempts[index];
-            match outcome {
-                Some(outcome) => {
-                    attempt.settle(outcome, at);
-                    attempt.reason = Some(note.clone());
-                }
-                None => {
-                    if attempt.state != AttemptState::Unknown {
+                        Ok(code),
+                        AttemptEvidence::Verified {
+                            state: post_state,
+                            observed: post_observed,
+                        },
+                    ) => match terminal_outcome(&post_state) {
+                        Some(outcome) => {
+                            let prefix = format!(
+                                "owned stop of slot {slot} (exit {code}) verified: {}",
+                                state_reason(&post_state)
+                                    .unwrap_or_else(|| "settled from the receipt".to_owned())
+                            );
+                            let attempt = &mut run.cursor.attempts[index];
+                            settle_verified(
+                                &run.store,
+                                attempt,
+                                outcome,
+                                &post_observed,
+                                at,
+                                prefix,
+                            )
+                        }
+                        None => {
+                            run.cursor.attempts[index].freeze_observed(&post_observed);
+                            let detail = match post_state {
+                                ConversationState::Active => {
+                                    "the receipt still reports a live host".to_owned()
+                                }
+                                ConversationState::Unknown(reason) => reason,
+                                ConversationState::Missing => "the receipt disappeared".to_owned(),
+                                _ => "the receipt records no terminal state".to_owned(),
+                            };
+                            format!(
+                                "the owned stop of slot {slot} exited {code} but {detail}; the effect stays retained as unknown"
+                            )
+                        }
+                    },
+                    (Ok(code), AttemptEvidence::Refused(reason)) => format!(
+                        "the owned stop of slot {slot} exited {code} but the receipt no longer verifies ({reason}); the effect stays retained as unknown"
+                    ),
+                };
+                {
+                    let attempt = &mut run.cursor.attempts[index];
+                    // A verified terminal outcome already settled the attempt;
+                    // anything still in flight stays explicitly unknown.
+                    if attempt.state.is_in_flight() {
                         attempt.settle(ObservedOutcome::Unknown, at);
                     }
                     attempt.reason = Some(note.clone());
                 }
+                run.cursor.effect(
+                    EffectKind::OwnedCleanup,
+                    format!("attempt={id} owner={owner} slot={slot}: {note}"),
+                );
+                notes.push((id, note));
             }
+            ConversationState::Unknown(reason) => {
+                let note = format!(
+                    "the verified receipt reports an unknown outcome: {reason}; the effect stays retained as unknown"
+                );
+                let attempt = &mut run.cursor.attempts[index];
+                attempt.freeze_observed(&observed);
+                if attempt.state != AttemptState::Unknown {
+                    attempt.settle(ObservedOutcome::Unknown, at);
+                }
+                attempt.reason = Some(note.clone());
+                run.cursor
+                    .effect(EffectKind::OwnedCleanup, format!("attempt={id}: {note}"));
+                notes.push((id, note));
+            }
+            ConversationState::Missing => {
+                let note = "the verified receipt disappeared before cleanup; the effect stays retained as unknown"
+                    .to_owned();
+                let attempt = &mut run.cursor.attempts[index];
+                attempt.freeze_observed(&observed);
+                if attempt.state != AttemptState::Unknown {
+                    attempt.settle(ObservedOutcome::Unknown, at);
+                }
+                attempt.reason = Some(note.clone());
+                run.cursor
+                    .effect(EffectKind::OwnedCleanup, format!("attempt={id}: {note}"));
+                notes.push((id, note));
+            }
+            ConversationState::Completed
+            | ConversationState::Failed(_)
+            | ConversationState::Interrupted(_)
+            | ConversationState::Stopped(_) => unreachable!("terminal states settled above"),
         }
-        run.cursor.effect(
-            EffectKind::OwnedCleanup,
-            format!("attempt={id} owner={owner} slot={slot}: {note}"),
-        );
-        notes.push((id, note));
     }
     notes
 }
@@ -1288,9 +1500,10 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
     let stale_planning = || "planning inputs changed since the attempt".to_owned();
     let at = now_ms();
     // In-flight attempts and attempts retained as unknown both reconcile from
-    // their exact receipts: an authoritative terminal outcome settles them
-    // once, a live host stays retained live, and a truly unobserved effect
-    // stays unknown without ever being replayed.
+    // the receipts of their frozen accepted dispatch generation: an
+    // authoritative terminal outcome settles them once, a live host stays
+    // retained live, and a receipt that now belongs to another run - or a
+    // truly unobserved effect - stays unknown without ever being replayed.
     let reconcile_ids: Vec<String> = cursor
         .attempts_requiring_reconciliation()
         .iter()
@@ -1300,70 +1513,78 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
         let Some(index) = cursor.attempts.iter().position(|attempt| attempt.id == id) else {
             continue;
         };
-        let attempt = &mut cursor.attempts[index];
-        let previous = attempt.state;
-        let Some(receipt) = attempt.receipt.clone() else {
-            if previous != AttemptState::Unknown {
-                attempt.settle(ObservedOutcome::Unknown, at);
-                attempt.reason = Some(
-                    "no dispatch receipt was recorded; the outcome is unknown and the attempt is never resubmitted"
-                        .to_owned(),
-                );
-            }
-            report.unknown.push(attempt.id.clone());
-            continue;
-        };
-        let state = conversation_state(&receipt)?;
-        if let Some(outcome) = terminal_outcome(&state) {
-            attempt.settle(outcome, at);
-            attempt.reason = state_reason(&state);
-            if outcome == ObservedOutcome::Completed
-                && !settle_completed_reuse(
-                    attempt,
-                    planning_ok.clone().map_err(|_| stale_planning()),
-                )
-            {
-                report.remeasure.push((
-                    attempt.id.clone(),
-                    attempt.reuse_refused.clone().unwrap_or_default(),
+        let previous = cursor.attempts[index].state;
+        let evidence = attempt_evidence(&cursor.attempts[index]);
+        match evidence {
+            AttemptEvidence::Refused(reason) => {
+                let attempt = &mut cursor.attempts[index];
+                if previous != AttemptState::Unknown {
+                    attempt.settle(ObservedOutcome::Unknown, at);
+                }
+                attempt.reason = Some(format!(
+                    "{reason}; the attempt is never settled from unverifiable evidence and never replayed"
                 ));
-            }
-            report.settled.push(attempt.id.clone());
-            continue;
-        }
-        match state {
-            ConversationState::Active => {
-                if previous == AttemptState::Unknown {
-                    attempt.reason = Some(
-                        "retained live: the recorded host still runs; the outcome stays unknown until its receipt is terminal"
-                            .to_owned(),
-                    );
-                    report.retained_live.push(attempt.id.clone());
-                } else {
-                    report.active.push(attempt.id.clone());
-                }
-            }
-            ConversationState::Unknown(reason) => {
-                if previous != AttemptState::Unknown {
-                    attempt.settle(ObservedOutcome::Unknown, at);
-                }
-                attempt.reason = Some(reason);
                 report.unknown.push(attempt.id.clone());
             }
-            ConversationState::Missing => {
-                if previous != AttemptState::Unknown {
-                    attempt.settle(ObservedOutcome::Unknown, at);
+            AttemptEvidence::Verified { state, observed } => {
+                if let Some(outcome) = terminal_outcome(&state) {
+                    let prefix = state_reason(&state)
+                        .unwrap_or_else(|| "settled from the verified receipt".to_owned());
+                    let attempt = &mut cursor.attempts[index];
+                    settle_verified(&run.store, attempt, outcome, &observed, at, prefix);
+                    if outcome == ObservedOutcome::Completed
+                        && !settle_completed_reuse(
+                            attempt,
+                            planning_ok.clone().map_err(|_| stale_planning()),
+                        )
+                    {
+                        report.remeasure.push((
+                            attempt.id.clone(),
+                            attempt.reuse_refused.clone().unwrap_or_default(),
+                        ));
+                    }
+                    report.settled.push(attempt.id.clone());
+                    continue;
                 }
-                attempt.reason = Some(
-                    "the recorded dispatch receipt is missing; the outcome is unknown and the attempt is never resubmitted"
-                        .to_owned(),
-                );
-                report.unknown.push(attempt.id.clone());
+                let attempt = &mut cursor.attempts[index];
+                attempt.freeze_observed(&observed);
+                match state {
+                    ConversationState::Active => {
+                        if previous == AttemptState::Unknown {
+                            attempt.reason = Some(
+                                "retained live: the recorded host still runs; the outcome stays unknown until its receipt is terminal"
+                                    .to_owned(),
+                            );
+                            report.retained_live.push(attempt.id.clone());
+                        } else {
+                            report.active.push(attempt.id.clone());
+                        }
+                    }
+                    ConversationState::Unknown(reason) => {
+                        if previous != AttemptState::Unknown {
+                            attempt.settle(ObservedOutcome::Unknown, at);
+                        }
+                        attempt.reason = Some(reason);
+                        report.unknown.push(attempt.id.clone());
+                    }
+                    ConversationState::Missing => {
+                        if previous != AttemptState::Unknown {
+                            attempt.settle(ObservedOutcome::Unknown, at);
+                        }
+                        attempt.reason = Some(
+                            "the accepted dispatch receipt is missing; the outcome is unknown and the attempt is never resubmitted"
+                                .to_owned(),
+                        );
+                        report.unknown.push(attempt.id.clone());
+                    }
+                    ConversationState::Completed
+                    | ConversationState::Failed(_)
+                    | ConversationState::Interrupted(_)
+                    | ConversationState::Stopped(_) => {
+                        unreachable!("terminal states settled above")
+                    }
+                }
             }
-            ConversationState::Completed
-            | ConversationState::Failed(_)
-            | ConversationState::Interrupted(_)
-            | ConversationState::Stopped(_) => unreachable!("terminal states settled above"),
         }
     }
     // Completed attempts settle reuse against the current planning inputs.

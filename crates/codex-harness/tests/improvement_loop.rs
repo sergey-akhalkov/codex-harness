@@ -373,10 +373,23 @@ fn write_change(proj: &Path, proposal: &str, design: &str, tasks: &str) {
 }
 
 fn attempt_json(id: &str, role: &str, state: &str, receipt: Option<&Path>) -> Value {
+    let owner = format!("loop-fixture-{id}");
+    let binding = receipt.map(|path| {
+        json!({
+            "slot": 1,
+            "owner": owner,
+            "generation": "gen-1",
+            "receipt": path.display().to_string(),
+            "session": Value::Null,
+            "host": Value::Null,
+        })
+    });
     json!({
         "id": id,
         "role": role,
-        "owner": format!("loop-fixture-{role}-1"),
+        "owner": owner,
+        "binding": binding,
+        "retained": Value::Null,
         "title": format!("CEx (ds) - {id}"),
         "profile": "ds",
         "model": Value::Null,
@@ -403,6 +416,38 @@ fn seed_attempt(fixture: &Fixture, attempt: Value, phase: &str) {
 }
 
 fn seed_receipt(path: &Path, state: &str, exit_code: Option<i32>) {
+    seed_bound_receipt(
+        path,
+        "loop-fixture-implementer-1",
+        "gen-1",
+        state,
+        exit_code,
+        None,
+        None,
+    );
+}
+
+/// One dispatch receipt shaped exactly as the native dispatcher writes it:
+/// the pooled slot binding, the per-dispatch generation and the observed
+/// lifecycle, with an optional recorded session/host.
+#[allow(clippy::too_many_arguments)]
+fn seed_bound_receipt(
+    path: &Path,
+    owner: &str,
+    generation: &str,
+    state: &str,
+    exit_code: Option<i32>,
+    session: Option<&str>,
+    host: Option<(&Path, u32)>,
+) {
+    let host = host.map(|(program, pid)| {
+        let user = harness_core::process_service::current_user().unwrap();
+        let identity =
+            harness_core::process_service::ServiceProcess::observe(pid, program, 0, &user)
+                .expect("the recorded host is identifiable by its exact identity")
+                .identity();
+        json!({"pid": identity.pid, "created": identity.creation_time, "program": program})
+    });
     fs::write(
         path,
         serde_json::to_vec_pretty(&json!({
@@ -412,12 +457,27 @@ fn seed_receipt(path: &Path, state: &str, exit_code: Option<i32>) {
             "mode": "tui",
             "visible": true,
             "host": "windows-terminal-tab",
+            "slot": {
+                "index": 1,
+                "path": "C:\\fixture\\slot-1",
+                "source": "C:\\fixture\\source",
+                "owner": owner,
+                "base": "base",
+                "remote": "origin",
+                "branch": Value::Null,
+            },
+            "originatingLead": {
+                "schema": 1,
+                "threadId": "fixture-thread",
+                "runGeneration": generation,
+                "dispatcher": {"pid": 1, "creationTime": 1, "program": "C:\\fixture\\dispatcher.exe"},
+            },
             "observation": {
                 "schema": 1,
                 "coverage": "native",
                 "reason": Value::Null,
                 "state": state,
-                "session": Value::Null,
+                "session": session,
                 "previousSession": Value::Null,
                 "exitCode": exit_code,
                 "events": 0,
@@ -425,7 +485,7 @@ fn seed_receipt(path: &Path, state: &str, exit_code: Option<i32>) {
                 "toolCalls": 0,
                 "malformed": 0,
                 "cause": Value::Null,
-                "host": {"pid": 4294967294u32, "created": 1, "program": "C:\\missing\\host.exe"},
+                "host": host.unwrap_or_else(|| json!({"pid": 4294967294u32, "created": 1, "program": "C:\\missing\\host.exe"})),
                 "result": Value::Null,
                 "detail": Value::Null,
                 "updatedMs": 1,
@@ -932,7 +992,15 @@ fn stop_and_resume_recover_boundaries_and_never_replay_unknown_attempts() {
     // A completed arm whose receipt is terminal is settled and reused while
     // the planning inputs still validate.
     let completed = fixture.run.join("completed-receipt.json");
-    seed_receipt(&completed, "completed", Some(0));
+    seed_bound_receipt(
+        &completed,
+        "loop-fixture-baseline-1",
+        "gen-1",
+        "completed",
+        Some(0),
+        None,
+        None,
+    );
     let mut cursor = fixture.cursor();
     cursor["attempts"]
         .as_array_mut()
@@ -1228,7 +1296,15 @@ fn resume_settles_retained_unknown_attempts_from_late_receipts_once() {
     );
     let stop = fixture.improve(&["stop", "--run", &run_arg, "--reason", "pause"]);
     assert!(stop.status.success(), "{}", text(&stop));
-    seed_receipt(&failed, "failed", Some(1));
+    seed_bound_receipt(
+        &failed,
+        "loop-fixture-implementer-2",
+        "gen-1",
+        "failed",
+        Some(1),
+        None,
+        None,
+    );
     let resume = fixture.improve(&["resume", "--run", &run_arg]);
     assert!(
         text(&resume).contains("settled attempt(s) implementer-2"),
@@ -1287,6 +1363,21 @@ fn status_distinguishes_a_retained_live_attempt_from_unknown() {
             "mode": "tui",
             "visible": true,
             "host": "windows-terminal-tab",
+            "slot": {
+                "index": 1,
+                "path": "C:\\fixture\\slot-1",
+                "source": "C:\\fixture\\source",
+                "owner": "loop-fixture-implementer-1",
+                "base": "base",
+                "remote": "origin",
+                "branch": Value::Null,
+            },
+            "originatingLead": {
+                "schema": 1,
+                "threadId": "fixture-thread",
+                "runGeneration": "gen-1",
+                "dispatcher": {"pid": 1, "creationTime": 1, "program": "C:\\fixture\\dispatcher.exe"},
+            },
             "observation": {
                 "schema": 1,
                 "coverage": "native",
@@ -1407,12 +1498,18 @@ fn stop_cleans_up_owned_attempts_and_preserves_foreign_processes() {
                 "remote": "origin",
                 "branch": Value::Null,
             },
+            "originatingLead": {
+                "schema": 1,
+                "threadId": "fixture-thread",
+                "runGeneration": "gen-1",
+                "dispatcher": {"pid": 1, "creationTime": 1, "program": "C:\\fixture\\dispatcher.exe"},
+            },
             "observation": {
                 "schema": 1,
                 "coverage": "native",
                 "reason": Value::Null,
                 "state": "running",
-                "session": Value::Null,
+                "session": "session-0001",
                 "previousSession": Value::Null,
                 "exitCode": Value::Null,
                 "events": 0,
@@ -1460,4 +1557,205 @@ fn stop_cleans_up_owned_attempts_and_preserves_foreign_processes() {
     assert_eq!(receipt_json["stop"]["outcome"], "stopped", "{receipt_json}");
     let _ = foreign.kill();
     let _ = foreign.wait();
+}
+
+#[test]
+fn resume_refuses_a_receipt_replaced_by_a_foreign_generation() {
+    let fixture = Fixture::new("foreign-generation");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // The attempt accepted generation gen-1; the pool file now holds a
+    // completed run of a later generation for the same slot and owner.
+    let receipt = fixture.run.join("replaced-receipt.json");
+    seed_bound_receipt(
+        &receipt,
+        "loop-fixture-implementer-1",
+        "gen-newer",
+        "completed",
+        Some(0),
+        None,
+        None,
+    );
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-1", "implementer", "unknown", Some(&receipt)),
+        "candidate-attempt",
+    );
+
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(resume.status.success(), "{}", text(&resume));
+    let resume_text = text(&resume);
+    assert!(resume_text.contains("generation"), "{resume_text}");
+    assert!(
+        resume_text.contains("never settled from unverifiable evidence"),
+        "{resume_text}"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][0]["state"], "unknown");
+    assert_eq!(cursor["attempts"][0]["retained"], Value::Null);
+    assert_eq!(cursor["attempts"][0]["reuse_refused"], Value::Null);
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1);
+
+    let report: Value = serde_json::from_str(&text(
+        &fixture.improve(&["status", "--run", &run_arg, "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(report["attempts"][0]["state"], "unknown");
+    let observed = report["attempts"][0]["observed"].as_str().unwrap();
+    assert!(observed.contains("unverified"), "{report}");
+    assert!(observed.contains("generation"), "{report}");
+    let dispatch = report["dispatch"]["reason"].as_str().unwrap();
+    assert!(dispatch.contains("unknown outcome"), "{report}");
+}
+
+#[test]
+fn stop_refuses_a_replaced_generation_and_preserves_the_newer_child() {
+    let fixture = Fixture::new("replaced-generation");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // A newer same-owner dispatch occupies the slot with a live child; the
+    // retained attempt still froze the earlier generation.
+    let mut newer = start_sleeper();
+    let pwsh = powershell();
+    let receipt = fixture.run.join("replaced-live.json");
+    seed_bound_receipt(
+        &receipt,
+        "loop-fixture-implementer-1",
+        "gen-newer",
+        "running",
+        None,
+        Some("session-0002"),
+        Some((&pwsh, newer.id())),
+    );
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-1", "implementer", "unknown", Some(&receipt)),
+        "candidate-attempt",
+    );
+
+    let stop = fixture.improve(&[
+        "stop",
+        "--run",
+        &run_arg,
+        "--reason",
+        "pause",
+        "--timeout",
+        "10",
+    ]);
+    assert!(stop.status.success(), "{}", text(&stop));
+    let stop_text = text(&stop);
+    assert!(stop_text.contains("cleanup refused"), "{stop_text}");
+    assert!(stop_text.contains("generation"), "{stop_text}");
+    assert!(
+        child_running(&mut newer),
+        "the newer generation's child survives a refused cleanup"
+    );
+    assert_eq!(fixture.cursor()["attempts"][0]["state"], "unknown");
+    let _ = newer.kill();
+    let _ = newer.wait();
+}
+
+#[test]
+fn resume_settles_and_retains_evidence_for_the_unchanged_generation() {
+    let fixture = Fixture::new("retained-evidence");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // The accepted generation is live but has no terminal record yet.
+    let receipt = fixture.run.join("late-completed.json");
+    seed_bound_receipt(
+        &receipt,
+        "loop-fixture-implementer-1",
+        "gen-1",
+        "running",
+        None,
+        None,
+        None,
+    );
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-1", "implementer", "started", Some(&receipt)),
+        "candidate-attempt",
+    );
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert_eq!(fixture.cursor()["attempts"][0]["state"], "unknown");
+    let stop = fixture.improve(&["stop", "--run", &run_arg, "--reason", "pause"]);
+    assert!(stop.status.success(), "{}", text(&stop));
+
+    // The owning dispatcher later records the authoritative completion of the
+    // same generation; resume settles it once and retains the evidence.
+    seed_bound_receipt(
+        &receipt,
+        "loop-fixture-implementer-1",
+        "gen-1",
+        "completed",
+        Some(0),
+        Some("session-0001"),
+        None,
+    );
+    let original = fs::read(&receipt).unwrap();
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("settled attempt(s) implementer-1"),
+        "{}",
+        text(&resume)
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][0]["state"], "completed");
+    assert_eq!(cursor["attempts"][0]["reuse_refused"], Value::Null);
+    let retained_path = PathBuf::from(
+        cursor["attempts"][0]["retained"]["receipt"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(retained_path.is_file(), "{cursor}");
+    assert_eq!(
+        cursor["attempts"][0]["retained"]["receipt_sha256"],
+        harness_core::build_identity::hash_bytes(&original)
+    );
+
+    // The pool file is later overwritten by a foreign run: the settled
+    // attempt keeps its retained evidence, is not re-settled and is not
+    // rebound to the new file's contents.
+    seed_bound_receipt(
+        &receipt,
+        "loop-fixture-implementer-1",
+        "gen-newer",
+        "completed",
+        Some(0),
+        None,
+        None,
+    );
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        !text(&resume).contains("settled attempt(s)"),
+        "{}",
+        text(&resume)
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][0]["state"], "completed");
+    assert_eq!(
+        cursor["attempts"][0]["retained"]["receipt_sha256"],
+        harness_core::build_identity::hash_bytes(&original)
+    );
+    let report: Value = serde_json::from_str(&text(
+        &fixture.improve(&["status", "--run", &run_arg, "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(report["attempts"][0]["state"], "completed");
+    assert_eq!(
+        report["attempts"][0]["observed"],
+        "settled(retained evidence)"
+    );
 }

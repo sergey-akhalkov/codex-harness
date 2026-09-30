@@ -1290,6 +1290,8 @@ pub(crate) struct VisibleConversation {
 pub(crate) struct VisibleAccepted {
     pub owner: String,
     pub title: String,
+    /// The pooled slot index the accepted dispatch bound.
+    pub slot: u32,
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -1329,6 +1331,7 @@ pub(crate) fn dispatch_visible_conversation(
     let accepted = VisibleAccepted {
         owner: prepared.binding.owner.clone(),
         title: executor_title(&profile, &prepared.binding.owner),
+        slot: prepared.binding.index,
         model: prepared.bound.model.clone(),
         model_provider: prepared.bound.model_provider.clone(),
         reasoning_effort: prepared.bound.reasoning_effort.clone(),
@@ -1370,43 +1373,96 @@ pub(crate) enum ConversationState {
     Missing,
 }
 
-/// Reads one dispatch receipt without mutating it. Anything the receipt
-/// cannot establish stays explicitly unknown instead of being guessed.
-pub(crate) fn conversation_state(receipt: &Path) -> io::Result<ConversationState> {
+/// The native identity facts a dispatch receipt records now. A controller
+/// freezes these at acceptance and re-reads them before every observation and
+/// cleanup, because the pool reuses `spawn-<slot>.json` for later dispatches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiptIdentity {
+    pub slot: Option<u32>,
+    pub owner: Option<String>,
+    /// The per-dispatch generation the dispatcher recorded.
+    pub generation: Option<String>,
+    pub session: Option<String>,
+    pub host: Option<(u32, u64, PathBuf)>,
+}
+
+/// One bounded read of a dispatch receipt: its current identity facts and the
+/// lifecycle state observed from the same bytes, so nothing is compared
+/// across two different file revisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiptView {
+    pub identity: ReceiptIdentity,
+    pub state: ConversationState,
+}
+
+pub(crate) fn receipt_view(receipt: &Path) -> io::Result<ReceiptView> {
     let bytes = match fs::read(receipt) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ConversationState::Missing);
+            return Ok(ReceiptView {
+                identity: ReceiptIdentity {
+                    slot: None,
+                    owner: None,
+                    generation: None,
+                    session: None,
+                    host: None,
+                },
+                state: ConversationState::Missing,
+            });
         }
         Err(error) => return Err(error),
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::other(format!("receipt is not JSON: {error}")))?;
-    let Some(run) = RunObservation::from_receipt(&value) else {
-        return Ok(ConversationState::Unknown(
-            "the receipt carries no observation record".to_owned(),
-        ));
+    let identity = ReceiptIdentity {
+        slot: value["slot"]["index"]
+            .as_u64()
+            .and_then(|index| u32::try_from(index).ok()),
+        owner: value["slot"]["owner"].as_str().map(str::to_owned),
+        generation: value["originatingLead"]["runGeneration"]
+            .as_str()
+            .map(str::to_owned),
+        session: value["observation"]["session"].as_str().map(str::to_owned),
+        host: (|| {
+            let host = value.get("observation")?.get("host")?;
+            if host.is_null() {
+                return None;
+            }
+            Some((
+                u32::try_from(host["pid"].as_u64()?).ok()?,
+                host["created"].as_u64()?,
+                PathBuf::from(host["program"].as_str()?),
+            ))
+        })(),
+    };
+    let state = conversation_state_of(&value);
+    Ok(ReceiptView { identity, state })
+}
+
+fn conversation_state_of(value: &serde_json::Value) -> ConversationState {
+    let Some(run) = RunObservation::from_receipt(value) else {
+        return ConversationState::Unknown("the receipt carries no observation record".to_owned());
     };
     if run.coverage != COVERAGE_NATIVE {
-        return Ok(ConversationState::Unknown(format!(
+        return ConversationState::Unknown(format!(
             "the recorded run has no native coverage: {}",
             run.reason
                 .as_deref()
                 .unwrap_or("this mode records no event stream")
-        )));
+        ));
     }
     let cause = run.cause.clone().unwrap_or_default();
     match run.state.as_str() {
-        STATE_COMPLETED if run.exit_code == Some(0) => Ok(ConversationState::Completed),
-        STATE_COMPLETED => Ok(ConversationState::Failed(if cause.is_empty() {
+        STATE_COMPLETED if run.exit_code == Some(0) => ConversationState::Completed,
+        STATE_COMPLETED => ConversationState::Failed(if cause.is_empty() {
             "the run completed without a zero exit code".to_owned()
         } else {
             cause
-        })),
-        STATE_FAILED | STATE_DEFECT => Ok(ConversationState::Failed(cause)),
-        STATE_INTERRUPTED => Ok(ConversationState::Interrupted(cause)),
+        }),
+        STATE_FAILED | STATE_DEFECT => ConversationState::Failed(cause),
+        STATE_INTERRUPTED => ConversationState::Interrupted(cause),
         observation::STATE_STOPPED | observation::STATE_PARTIAL_STOP => {
-            Ok(ConversationState::Stopped(cause))
+            ConversationState::Stopped(cause)
         }
         STATE_ACCEPTED | STATE_STARTED | observation::STATE_RUNNING => {
             let ended = match &run.host {
@@ -1414,17 +1470,15 @@ pub(crate) fn conversation_state(receipt: &Path) -> io::Result<ConversationState
                 None => observation::now_ms() > run.updated_ms + HOST_GRACE.as_millis() as u64,
             };
             if ended {
-                Ok(ConversationState::Unknown(
+                ConversationState::Unknown(
                     "the recorded session host is gone and no terminal event was recorded"
                         .to_owned(),
-                ))
+                )
             } else {
-                Ok(ConversationState::Active)
+                ConversationState::Active
             }
         }
-        other => Ok(ConversationState::Unknown(format!(
-            "unrecognized recorded state {other}"
-        ))),
+        other => ConversationState::Unknown(format!("unrecognized recorded state {other}")),
     }
 }
 
@@ -1440,9 +1494,10 @@ pub(crate) fn stop_owned_run(
     codex_home: &Path,
     slot: u32,
     owner: &str,
+    session: Option<&str>,
     timeout: Duration,
 ) -> io::Result<i32> {
-    executor_stop::run(&[
+    let mut args = vec![
         OsString::from("--source"),
         source.as_os_str().to_owned(),
         OsString::from("--codex-home"),
@@ -1453,7 +1508,14 @@ pub(crate) fn stop_owned_run(
         OsString::from(owner),
         OsString::from("--timeout"),
         OsString::from(timeout.as_secs().to_string()),
-    ])
+    ];
+    if let Some(session) = session {
+        // The stop owner then verifies the exact recorded session, so a newer
+        // dispatch into the same slot is refused instead of terminated.
+        args.push(OsString::from("--session"));
+        args.push(OsString::from(session));
+    }
+    executor_stop::run(&args)
 }
 
 /// The dispatch text for the bound slot: free text keeps the caller's own words
