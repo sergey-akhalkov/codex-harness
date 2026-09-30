@@ -13,7 +13,7 @@ use harness_core::board_hypothesis::{
 use harness_core::improvement_intake::{
     ClaimKind, EvidenceIndex, EvidenceItem, EvidenceOwner, EvidenceRef, IntakeOutcome,
     InvestigatorReport, Proposal, ReadIdentity, RemovalBasis, RemovalClaim, RepeatedReadClaim,
-    Treatment, WorkloadLink, WorkloadRef, intake,
+    RetainedRead, Treatment, WorkloadLink, WorkloadRef, intake,
 };
 use serde_json::json;
 use std::{
@@ -494,7 +494,7 @@ fn native_reader_evidence_retains_attribution_coverage_and_partial_limits() {
         corrupt.errors
     );
 
-    let index = EvidenceIndex::new(vec![clean, corrupt]).unwrap();
+    let index = EvidenceIndex::new(vec![clean.clone(), corrupt.clone()]).unwrap();
     let mut candidate = base_proposal("rollout:clean#1");
     candidate.observation = "rollout:corrupt#1".to_owned();
     candidate.evidence = vec![EvidenceRef {
@@ -517,25 +517,107 @@ fn native_reader_evidence_retains_attribution_coverage_and_partial_limits() {
         "a deferred candidate performs no board mutation"
     );
 
-    // Unknown repeated-read identity defers to structured identity capture;
-    // changed identity refuses outright.
-    let identity = |content: &str| ReadIdentity {
-        file: "file:src/lib.rs".to_owned(),
-        content: content.to_owned(),
-        context: "context:task-1".to_owned(),
+    // The read-fact owner captures actual identities through the existing
+    // owners: two unchanged reads share one identity, a content change
+    // between reads does not.
+    let stable_path = temp.path().join("stable.txt");
+    fs::write(&stable_path, "stable contents\n").unwrap();
+    let stable_first = RetainedRead::capture(&stable_path, "context:task-1").unwrap();
+    let stable_second = RetainedRead::capture(&stable_path, "context:task-1").unwrap();
+    assert_eq!(stable_first, stable_second);
+    let stable_item = EvidenceItem::new(
+        "source:stable#reads",
+        EvidenceOwner::Source,
+        ClaimKind::Observed,
+        "retained_reads=2",
+        &[],
+        &[],
+    )
+    .unwrap()
+    .with_reads(vec![stable_first.clone(), stable_second])
+    .unwrap();
+
+    let changed_path = temp.path().join("changed.txt");
+    fs::write(&changed_path, "first contents\n").unwrap();
+    let changed_first = RetainedRead::capture(&changed_path, "context:task-1").unwrap();
+    fs::write(&changed_path, "second, different contents\n").unwrap();
+    let changed_second = RetainedRead::capture(&changed_path, "context:task-1").unwrap();
+    assert_ne!(changed_first, changed_second);
+    let changed_item = EvidenceItem::new(
+        "source:changed#reads",
+        EvidenceOwner::Source,
+        ClaimKind::Observed,
+        "retained_reads=2",
+        &[],
+        &[],
+    )
+    .unwrap()
+    .with_reads(vec![changed_first.clone(), changed_second])
+    .unwrap();
+
+    let index = EvidenceIndex::new(vec![
+        clean.clone(),
+        corrupt.clone(),
+        stable_item,
+        changed_item,
+    ])
+    .unwrap();
+    let claim = |evidence: &str, first: &RetainedRead, second_content: &str| RepeatedReadClaim {
+        operation: "read:observed.txt".to_owned(),
+        evidence: evidence.to_owned(),
+        first: ReadIdentity {
+            file: first.file.clone(),
+            content: first.content.clone(),
+            context: first.context.clone(),
+        },
+        second: ReadIdentity {
+            file: first.file.clone(),
+            content: second_content.to_owned(),
+            context: first.context.clone(),
+        },
     };
-    let mut unknown = base_proposal("rollout:clean#1");
-    unknown.observation = "rollout:clean#1".to_owned();
-    unknown.evidence = vec![EvidenceRef {
-        locator: "rollout:clean#1".to_owned(),
-        kind: ClaimKind::Observed,
-    }];
-    unknown.repeated_read = Some(RepeatedReadClaim {
+    let with_rollout_observation = |candidate: &mut Proposal| {
+        candidate.observation = "rollout:clean#1".to_owned();
+        candidate.evidence = vec![EvidenceRef {
+            locator: "rollout:clean#1".to_owned(),
+            kind: ClaimKind::Observed,
+        }];
+    };
+
+    // Counterexample: a complete generic rollout item carries no retained read
+    // facts, so equal claimed tokens still cannot establish the repetition.
+    let mut generic = base_proposal("rollout:clean#1");
+    with_rollout_observation(&mut generic);
+    generic.repeated_read = Some(RepeatedReadClaim {
         operation: "read:src/lib.rs".to_owned(),
         evidence: "rollout:clean#1".to_owned(),
-        first: identity("digest-aaa"),
-        second: identity("unknown"),
+        first: ReadIdentity {
+            file: "file:src/lib.rs".to_owned(),
+            content: "sha256.aaaaaaaa".to_owned(),
+            context: "context:task-1".to_owned(),
+        },
+        second: ReadIdentity {
+            file: "file:src/lib.rs".to_owned(),
+            content: "sha256.aaaaaaaa".to_owned(),
+            context: "context:task-1".to_owned(),
+        },
     });
+    let outcomes = intake(&bd, &project, &report(generic), &index).unwrap();
+    match &outcomes.outcomes[0] {
+        IntakeOutcome::Deferred { reason, next } => {
+            assert!(
+                reason.contains("no two retained structured read facts"),
+                "{reason}"
+            );
+            assert!(next.contains("capture both reads"), "{next}");
+        }
+        other => panic!("expected a deferral without retained read facts, got {other:?}"),
+    }
+
+    // Unknown claimed identity still defers to structured identity capture.
+    let mut unknown = base_proposal("rollout:clean#1");
+    with_rollout_observation(&mut unknown);
+    unknown.repeated_read = Some(claim("source:stable#reads", &stable_first, "unknown"));
     let outcomes = intake(&bd, &project, &report(unknown), &index).unwrap();
     assert!(
         matches!(&outcomes.outcomes[0], IntakeOutcome::Deferred { reason, .. } if reason.contains("identity is unknown")),
@@ -543,24 +625,62 @@ fn native_reader_evidence_retains_attribution_coverage_and_partial_limits() {
         outcomes.outcomes[0]
     );
 
-    let mut changed = base_proposal("rollout:clean#1");
-    changed.observation = "rollout:clean#1".to_owned();
-    changed.evidence = vec![EvidenceRef {
-        locator: "rollout:clean#1".to_owned(),
-        kind: ClaimKind::Observed,
-    }];
-    changed.repeated_read = Some(RepeatedReadClaim {
-        operation: "read:src/lib.rs".to_owned(),
-        evidence: "rollout:clean#1".to_owned(),
-        first: identity("digest-aaa"),
-        second: identity("digest-bbb"),
-    });
-    let outcomes = intake(&bd, &project, &report(changed), &index).unwrap();
+    // Retained reads differ in content while the claimed reads are fabricated
+    // equal: the avoidable-repeat claim is refused.
+    let mut fabricated = base_proposal("rollout:clean#1");
+    with_rollout_observation(&mut fabricated);
+    fabricated.repeated_read = Some(claim(
+        "source:changed#reads",
+        &changed_first,
+        &changed_first.content,
+    ));
+    let outcomes = intake(&bd, &project, &report(fabricated), &index).unwrap();
     assert!(
-        matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("changed content identity"))),
+        matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("record no two reads with the same"))),
         "{:?}",
         outcomes.outcomes[0]
     );
+
+    // A claim whose tokens do not match the retained facts is a mismatch, not
+    // observed support.
+    let mut mismatch = base_proposal("rollout:clean#1");
+    with_rollout_observation(&mut mismatch);
+    mismatch.repeated_read = Some(claim(
+        "source:stable#reads",
+        &changed_first,
+        &changed_first.content,
+    ));
+    let outcomes = intake(&bd, &project, &report(mismatch), &index).unwrap();
+    assert!(
+        matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("do not match the retained read facts"))),
+        "{:?}",
+        outcomes.outcomes[0]
+    );
+    assert!(
+        board_hypothesis::list_hypothesis_cards(&bd, &project)
+            .unwrap()
+            .is_empty(),
+        "deferred and refused repeated-read candidates perform no board mutation"
+    );
+
+    // Two retained reads with one identity and a matching claim continue
+    // through the actual owned board intake.
+    let mut supported = base_proposal("rollout:clean#1");
+    with_rollout_observation(&mut supported);
+    supported.repeated_read = Some(claim(
+        "source:stable#reads",
+        &stable_first,
+        &stable_first.content,
+    ));
+    let outcomes = intake(&bd, &project, &report(supported), &index).unwrap();
+    let IntakeOutcome::Admitted { id, .. } = &outcomes.outcomes[0] else {
+        panic!(
+            "expected the matching retained reads to be admitted, got {:?}",
+            outcomes.outcomes[0]
+        );
+    };
+    let card = board_hypothesis::load_card(&bd, &project, id).unwrap();
+    assert!(card.labels.iter().any(|label| label == "hypothesis"));
 }
 
 #[test]

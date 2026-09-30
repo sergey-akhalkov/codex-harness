@@ -23,10 +23,13 @@
 //! - observations, inferences and predictions stay distinguishable: evidence
 //!   items and references carry [`ClaimKind`], the expected effect stays
 //!   `predicted`, and a prediction can never be cited as retained evidence;
-//! - a repeated-read claim needs equal file, content and context identity from
-//!   structured evidence; changed identity is refused and unknown identity is
-//!   deferred, because identical names alone do not establish avoidable
-//!   rereading when content or available context changed;
+//! - a repeated-read claim must match retained structured read facts captured
+//!   by an existing owner ([`RetainedRead::capture`] over the native file
+//!   change identity and the content identities of
+//!   [`crate::build_identity`]); investigator-supplied tokens alone never
+//!   establish the repetition. Missing retained facts defer, changed or
+//!   non-matching retained facts refuse, and only two retained reads with the
+//!   same file, content and context identity admit the claim;
 //! - retention, not use counts, grounds a hypothesis: a subtraction or
 //!   simplification proposal is only admitted with a bounded
 //!   coverage/lost-use/restoration basis, usage volume alone defers to further
@@ -75,8 +78,7 @@
 //! # }
 //! ```
 
-use crate::board_hypothesis;
-use crate::rollout_reader;
+use crate::{board_hypothesis, build_identity, rollout_reader};
 use serde::{Deserialize, Serialize};
 use std::{io, path::Path};
 
@@ -98,6 +100,8 @@ pub const MAX_STATEMENT: usize = 256;
 pub const MAX_COVERAGE: usize = 192;
 /// Bound on the error and warning notes of one evidence item.
 pub const MAX_NOTES: usize = 16;
+/// Bound on the retained read facts of one evidence item.
+pub const MAX_READS: usize = 16;
 /// Bound on refusal reasons reported for one candidate.
 pub const MAX_REASONS: usize = 8;
 /// Bound on one serialized investigator report.
@@ -144,6 +148,9 @@ pub enum EvidenceOwner {
     Outcome,
     /// A board record, decision or card.
     Board,
+    /// The retained source/file identity owner (native file change identity
+    /// and the content identities of [`crate::build_identity`]).
+    Source,
     /// An observation of authorized real work outside this checkout.
     AuthorizedWork,
 }
@@ -154,6 +161,7 @@ impl EvidenceOwner {
             Self::Rollout => "rollout",
             Self::Outcome => "outcome",
             Self::Board => "board",
+            Self::Source => "source",
             Self::AuthorizedWork => "authorized-work",
         }
     }
@@ -163,9 +171,77 @@ impl EvidenceOwner {
             "rollout" => Some(Self::Rollout),
             "outcome" => Some(Self::Outcome),
             "board" => Some(Self::Board),
+            "source" => Some(Self::Source),
             "authorized-work" => Some(Self::AuthorizedWork),
             _ => None,
         }
+    }
+}
+
+/// One retained read observation of a file, captured for one actual read by
+/// an existing owner: the native file change identity, the content identity
+/// and the task/attempt context identity the read happened under.
+///
+/// This is the only accepted identity source for a repeated-read claim.
+/// Investigator-supplied tokens are assertions; they are matched against
+/// these retained facts, never trusted on their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedRead {
+    pub file: String,
+    pub content: String,
+    pub context: String,
+}
+
+impl RetainedRead {
+    /// Captures one read observation from an actual file, reusing the
+    /// existing owners: [`crate::build_identity::ordinary`] and
+    /// [`crate::build_identity::hash_file`] for the owned-input check and the
+    /// content identity, and [`rollout_reader::FileIdentity`] for the native
+    /// file change identity. `context` names the existing task, attempt or
+    /// run identity under which the read happened. The file is verified
+    /// unchanged across the capture so the two identities describe the same
+    /// bytes.
+    pub fn capture(path: &Path, context: &str) -> io::Result<Self> {
+        build_identity::ordinary(path)?;
+        let before = rollout_reader::FileIdentity::of_path(path)?;
+        let content = build_identity::hash_file(path)?;
+        let after = rollout_reader::FileIdentity::of_path(path)?;
+        if before != after {
+            return Err(board_hypothesis::invalid(
+                "the file changed while its read identity was captured; capture again under stable content",
+            ));
+        }
+        let id_hex: String = before
+            .file_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            file: format!(
+                "file:v{:x}.i{}.c{:x}.s{:x}",
+                before.volume_serial, id_hex, before.change_time, before.size
+            ),
+            content: format!("sha256.{content}"),
+            context: context.to_owned(),
+        }
+        .bounded()
+    }
+
+    fn bounded(self) -> io::Result<Self> {
+        Ok(Self {
+            file: board_hypothesis::require_token("read file identity", &self.file, MAX_LOCATOR)?,
+            content: board_hypothesis::require_token(
+                "read content identity",
+                &self.content,
+                MAX_LOCATOR,
+            )?,
+            context: board_hypothesis::require_token(
+                "read context identity",
+                &self.context,
+                MAX_LOCATOR,
+            )?,
+        })
     }
 }
 
@@ -176,7 +252,9 @@ impl EvidenceOwner {
 /// lines, conflicting or identity-less usage records); an item with any error
 /// is partial and cannot ground an observed claim. `warnings` carry the
 /// reader's own notes, including missing counters - they stay visible instead
-/// of being turned into zero values.
+/// of being turned into zero values. `reads` carry the structured read
+/// observations captured by an existing owner; merely labelling an item
+/// observed supplies no identities it does not carry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceItem {
@@ -194,11 +272,16 @@ pub struct EvidenceItem {
     /// The reader's own notes (stale or missing counters stay explicit).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Retained structured read observations for this evidence.
+    #[serde(default)]
+    pub reads: Vec<RetainedRead>,
 }
 
 impl EvidenceItem {
-    /// Builds one bounded evidence item. A prediction is not retained
-    /// evidence and is refused here; keep it in the predicted effect.
+    /// Builds one bounded evidence item without retained read facts. A
+    /// prediction is not retained evidence and is refused here; keep it in
+    /// the predicted effect. Attach captured read observations through
+    /// [`EvidenceItem::with_reads`] or [`EvidenceItem::read_source`].
     pub fn new(
         locator: &str,
         owner: EvidenceOwner,
@@ -206,6 +289,18 @@ impl EvidenceItem {
         coverage: &str,
         errors: &[String],
         warnings: &[String],
+    ) -> io::Result<Self> {
+        Self::validated(locator, owner, kind, coverage, errors, warnings, &[])
+    }
+
+    fn validated(
+        locator: &str,
+        owner: EvidenceOwner,
+        kind: ClaimKind,
+        coverage: &str,
+        errors: &[String],
+        warnings: &[String],
+        reads: &[RetainedRead],
     ) -> io::Result<Self> {
         if kind == ClaimKind::Predicted {
             return Err(board_hypothesis::invalid(
@@ -216,6 +311,17 @@ impl EvidenceItem {
         let coverage = board_hypothesis::require_line("coverage", coverage, MAX_COVERAGE)?;
         let errors = bounded_notes("evidence error", errors)?;
         let warnings = bounded_notes("evidence warning", warnings)?;
+        if reads.len() > MAX_READS {
+            return Err(board_hypothesis::invalid(format!(
+                "the evidence item carries {} read facts; at most {MAX_READS} are accepted",
+                reads.len()
+            )));
+        }
+        let reads = reads
+            .iter()
+            .cloned()
+            .map(RetainedRead::bounded)
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(Self {
             locator,
             owner,
@@ -223,7 +329,32 @@ impl EvidenceItem {
             coverage,
             errors,
             warnings,
+            reads,
         })
+    }
+
+    /// Attaches retained structured read observations to this item and
+    /// re-validates the bounds.
+    pub fn with_reads(mut self, reads: Vec<RetainedRead>) -> io::Result<Self> {
+        self.reads = reads;
+        self.bounded()
+    }
+
+    /// Captures one retained read observation from an actual file through the
+    /// existing owners and builds the evidence item for it. A repeated-read
+    /// claim needs two such observations on one item, each captured for its
+    /// own read.
+    pub fn read_source(locator: &str, context: &str, path: &Path) -> io::Result<Self> {
+        let read = RetainedRead::capture(path, context)?;
+        Self::validated(
+            locator,
+            EvidenceOwner::Source,
+            ClaimKind::Observed,
+            "retained_reads=1 native-file-identity content=sha256",
+            &[],
+            &[],
+            std::slice::from_ref(&read),
+        )
     }
 
     /// Reads one retained rollout file through the existing reader and retains
@@ -293,13 +424,14 @@ impl EvidenceItem {
     }
 
     fn bounded(self) -> io::Result<Self> {
-        Self::new(
+        Self::validated(
             &self.locator,
             self.owner,
             self.kind,
             &self.coverage,
             &self.errors,
             &self.warnings,
+            &self.reads,
         )
     }
 }
@@ -371,7 +503,9 @@ pub struct EvidenceRef {
     pub kind: ClaimKind,
 }
 
-/// The declared identity of one read of a file within a task context.
+/// An asserted identity of one read of a file within a task context. It is
+/// matched against retained read facts ([`RetainedRead`]); the assertion alone
+/// never establishes the repetition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadIdentity {
@@ -383,10 +517,11 @@ pub struct ReadIdentity {
     pub context: String,
 }
 
-/// A claim that one repeated read was avoidable. The two reads must carry
-/// matching file, content and context identity from structured evidence;
-/// unchanged identity is necessary, and the mechanism must still explain why
-/// the repetition was unnecessary.
+/// A claim that one repeated read was avoidable. Both asserted identities must
+/// equal two retained structured read observations ([`RetainedRead`]) with one
+/// file, content and context identity; unchanged retained identity is
+/// necessary, and the mechanism must still explain why the repetition was
+/// unnecessary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepeatedReadClaim {
@@ -1114,23 +1249,57 @@ fn validate_repeated_read(
     }
     let first = read_identity("first", &claim.first, issues);
     let second = read_identity("second", &claim.second, issues);
-    if let (Some(first), Some(second)) = (&first, &second) {
-        let mut changed = Vec::new();
-        if first.0 != second.0 {
-            changed.push("file");
-        }
-        if first.1 != second.1 {
-            changed.push("content");
-        }
-        if first.2 != second.2 {
-            changed.push("context");
-        }
-        if !changed.is_empty() {
-            issues.push(Issue::unsupported(format!(
-                "the repeated-read claim records changed {} identity; identical names alone do not establish avoidable rereading when content or available context changed",
-                changed.join(", ")
-            )));
-        }
+    let (Some(first), Some(second)) = (&first, &second) else {
+        return;
+    };
+    let Some(item) = index.resolve(locator) else {
+        return;
+    };
+    // The claim's tokens are assertions; the conclusion must come from the
+    // retained structured read facts the cited evidence owner captured.
+    if item.reads.len() < 2 {
+        issues.push(Issue::missing(
+            format!(
+                "no two retained structured read facts for {} are recorded on {locator}",
+                claim.operation.trim()
+            ),
+            "have the read owner capture both reads (native file identity, content digest and context) and retain them on the evidence item, then resubmit",
+        ));
+        return;
+    }
+    let matching = |read: &RetainedRead, identity: &(String, String, String)| {
+        read.file == identity.0 && read.content == identity.1 && read.context == identity.2
+    };
+    let supported = item.reads.iter().enumerate().any(|(left_index, left)| {
+        item.reads
+            .iter()
+            .skip(left_index + 1)
+            .any(|right| left == right && matching(left, first) && matching(right, second))
+    });
+    if supported {
+        return;
+    }
+    let retained_pair = item.reads.iter().enumerate().any(|(left_index, left)| {
+        item.reads
+            .iter()
+            .skip(left_index + 1)
+            .any(|right| left == right)
+    });
+    let first_retained = item.reads.iter().any(|read| matching(read, first));
+    let second_retained = item.reads.iter().any(|read| matching(read, second));
+    let operation = claim.operation.trim();
+    if !retained_pair {
+        issues.push(Issue::unsupported(format!(
+            "the retained read facts for {operation} record no two reads with the same file, content and context identity on {locator}; a repetition across changed identity is not avoidable rereading"
+        )));
+    } else if !(first_retained && second_retained) {
+        issues.push(Issue::unsupported(format!(
+            "the claimed read identities do not match the retained read facts for {operation} on {locator}; investigator-supplied tokens alone do not establish the repetition"
+        )));
+    } else {
+        issues.push(Issue::unsupported(format!(
+            "the retained read facts for {operation} do not record two distinct matching reads on {locator}; the claimed repetition is not supported"
+        )));
     }
 }
 
@@ -1429,44 +1598,188 @@ mod tests {
         );
     }
 
-    #[test]
-    fn changed_repeated_read_identity_refuses_and_unknown_defers() {
-        let (bd, project) = unowned_board();
-        let claim = |first: &str, second: &str| RepeatedReadClaim {
+    fn read(file: &str, content: &str, context: &str) -> RetainedRead {
+        RetainedRead {
+            file: file.to_owned(),
+            content: content.to_owned(),
+            context: context.to_owned(),
+        }
+    }
+
+    fn reads_item(locator: &str, reads: Vec<RetainedRead>) -> EvidenceItem {
+        EvidenceItem::new(
+            locator,
+            EvidenceOwner::Source,
+            ClaimKind::Observed,
+            "retained_reads",
+            &[],
+            &[],
+        )
+        .unwrap()
+        .with_reads(reads)
+        .unwrap()
+    }
+
+    fn read_claim(evidence: &str, first: &str, second: &str) -> RepeatedReadClaim {
+        RepeatedReadClaim {
             operation: "read:src/lib.rs".to_owned(),
-            evidence: "outcome:cycle-1#task".to_owned(),
+            evidence: evidence.to_owned(),
             first: ReadIdentity {
-                file: "file:src/lib.rs".to_owned(),
+                file: "file:a".to_owned(),
                 content: first.to_owned(),
                 context: "context:task-1".to_owned(),
             },
             second: ReadIdentity {
-                file: "file:src/lib.rs".to_owned(),
+                file: "file:a".to_owned(),
                 content: second.to_owned(),
                 context: "context:task-1".to_owned(),
             },
+        }
+    }
+
+    #[test]
+    fn repeated_read_claims_require_matching_retained_facts() {
+        let (bd, project) = unowned_board();
+
+        // A complete generic item carries no read facts: equal claimed tokens
+        // still cannot establish the repetition.
+        let mut generic = addition("avoid-repeated-read");
+        generic.repeated_read = Some(read_claim(
+            "outcome:cycle-1#task",
+            "digest-aaa",
+            "digest-aaa",
+        ));
+        let outcomes = intake(bd, project, &report(generic), &index()).unwrap();
+        let IntakeOutcome::Deferred { reason, next } = &outcomes.outcomes[0] else {
+            panic!("expected deferral, got {:?}", outcomes.outcomes[0]);
         };
-        let mut changed = addition("avoid-repeated-read");
-        changed.repeated_read = Some(claim("digest-aaa", "digest-bbb"));
-        let outcomes = intake(bd, project, &report(changed), &index()).unwrap();
+        assert!(
+            reason.contains("no two retained structured read facts"),
+            "{reason}"
+        );
+        assert!(next.contains("capture both reads"), "{next}");
+
+        // Retained facts that differ in content refuse even when the claim
+        // repeats fabricated equal tokens.
+        let changed = EvidenceIndex::new(vec![
+            evidence(
+                "outcome:cycle-1#task",
+                ClaimKind::Observed,
+                "rounds=2 attempts=1",
+            ),
+            reads_item(
+                "source:lib#reads",
+                vec![
+                    read("file:a", "digest-aaa", "context:task-1"),
+                    read("file:a", "digest-bbb", "context:task-1"),
+                ],
+            ),
+        ])
+        .unwrap();
+        let mut fabricated = addition("avoid-repeated-read");
+        fabricated.repeated_read = Some(read_claim("source:lib#reads", "digest-aaa", "digest-aaa"));
+        let outcomes = intake(bd, project, &report(fabricated), &changed).unwrap();
         let IntakeOutcome::Refused { reasons } = &outcomes.outcomes[0] else {
             panic!("expected refusal, got {:?}", outcomes.outcomes[0]);
         };
         assert!(
             reasons
                 .iter()
-                .any(|reason| reason.contains("changed content identity")),
+                .any(|reason| reason.contains("record no two reads with the same")),
             "{reasons:?}"
         );
 
+        // A claim that does not match the retained facts is a mismatch, not
+        // observed support.
+        let matching = EvidenceIndex::new(vec![
+            evidence(
+                "outcome:cycle-1#task",
+                ClaimKind::Observed,
+                "rounds=2 attempts=1",
+            ),
+            reads_item(
+                "source:lib#reads",
+                vec![
+                    read("file:a", "digest-aaa", "context:task-1"),
+                    read("file:a", "digest-aaa", "context:task-1"),
+                ],
+            ),
+        ])
+        .unwrap();
+        let mut mismatch = addition("avoid-repeated-read");
+        mismatch.repeated_read = Some(read_claim("source:lib#reads", "digest-ccc", "digest-ccc"));
+        let outcomes = intake(bd, project, &report(mismatch), &matching).unwrap();
+        let IntakeOutcome::Refused { reasons } = &outcomes.outcomes[0] else {
+            panic!("expected refusal, got {:?}", outcomes.outcomes[0]);
+        };
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("do not match the retained read facts")),
+            "{reasons:?}"
+        );
+
+        // Two retained reads with the same identity and a matching claim pass
+        // grounding; the owned-board admission is covered by the integration
+        // test.
+        let mut supported = addition("avoid-repeated-read");
+        supported.repeated_read = Some(read_claim("source:lib#reads", "digest-aaa", "digest-aaa"));
+        assert!(matches!(
+            prepare(&supported, &matching),
+            Ok(Prepared::Hypothesis { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_repeated_read_identity_defers() {
+        let (bd, project) = unowned_board();
+        let index = EvidenceIndex::new(vec![
+            evidence(
+                "outcome:cycle-1#task",
+                ClaimKind::Observed,
+                "rounds=2 attempts=1",
+            ),
+            reads_item(
+                "source:lib#reads",
+                vec![
+                    read("file:a", "digest-aaa", "context:task-1"),
+                    read("file:a", "digest-aaa", "context:task-1"),
+                ],
+            ),
+        ])
+        .unwrap();
         let mut unknown = addition("avoid-repeated-read");
-        unknown.repeated_read = Some(claim("digest-aaa", "unknown"));
-        let outcomes = intake(bd, project, &report(unknown), &index()).unwrap();
+        unknown.repeated_read = Some(read_claim("source:lib#reads", "digest-aaa", "unknown"));
+        let outcomes = intake(bd, project, &report(unknown), &index).unwrap();
         let IntakeOutcome::Deferred { reason, next } = &outcomes.outcomes[0] else {
             panic!("expected deferral, got {:?}", outcomes.outcomes[0]);
         };
         assert!(reason.contains("identity is unknown"), "{reason}");
         assert!(next.contains("structured"), "{next}");
+    }
+
+    #[test]
+    fn read_source_captures_native_identity_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.txt");
+        std::fs::write(&path, "observed contents\n").unwrap();
+        let item = EvidenceItem::read_source("source:observed#1", "context:task-1", &path).unwrap();
+        assert_eq!(item.owner, EvidenceOwner::Source);
+        assert_eq!(item.kind, ClaimKind::Observed);
+        assert_eq!(item.reads.len(), 1);
+        assert!(item.reads[0].content.starts_with("sha256."));
+        assert!(item.reads[0].file.starts_with("file:v"));
+        assert_eq!(item.reads[0].context, "context:task-1");
+        let repeat =
+            EvidenceItem::read_source("source:observed#2", "context:task-1", &path).unwrap();
+        assert_eq!(
+            item.reads[0], repeat.reads[0],
+            "an unchanged file captures the same read identity"
+        );
+        std::fs::write(&path, "different contents\n").unwrap();
+        let changed =
+            EvidenceItem::read_source("source:observed#3", "context:task-1", &path).unwrap();
+        assert_ne!(item.reads[0].content, changed.reads[0].content);
     }
 
     #[test]
