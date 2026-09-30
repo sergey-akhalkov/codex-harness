@@ -179,8 +179,8 @@ fn every_required_deterministic_check_is_present() {
     for required in [
         "cargo fmt --all -- --check",
         "cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings",
-        "cargo test --workspace --exclude codex-harness --locked --jobs 1 -- --test-threads=1",
-        "cargo test -p codex-harness --lib --bins --locked --jobs 1 -- --test-threads=1",
+        "cargo test --workspace --exclude codex-harness --locked --jobs 1 --no-fail-fast -- --test-threads=1",
+        "cargo test -p codex-harness --lib --bins --locked --jobs 1 --no-fail-fast -- --test-threads=1",
         "cargo run -p codex-harness --locked --bin codex-harness -- ownership-check --source .",
         "cargo run -p codex-harness --locked --bin harness-source-check -- --root .",
         "rustup toolchain install 1.98.1",
