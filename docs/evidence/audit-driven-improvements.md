@@ -185,3 +185,51 @@ record-last removal, reparse refusal, foreign-root preservation); the 12
 and pass. Lead decisions: the three-partition workspace evidence is accepted
 for this slice; the short `chx` root name and the bounded empty-directory
 crash window (identity not yet published) are accepted as designed.
+
+## Group 11: semantic readiness evidence so far (task 11.1, unfinished)
+
+Observed incidents, preserved in local logs (not tracked; private paths):
+
+- `serena-home\workers\99fc5a20a9ad7890\logs\2026-09-29\mcp_20260929-145914_6244.txt`
+  (planning session) and `...\mcp_20260929-220952_3712.txt` (dispatch burst).
+  Both show the same sequence: the Node-based BasedPyright language server
+  dies with `JavaScript heap out of memory`, its GC trace reporting only
+  ~180 MB heap at the failed allocation; in the 22:10 incident rust-analyzer's
+  flycheck `cargo check --workspace --all-targets` failed simultaneously
+  (rustc exit `0xC0000409`) inside the same worker tree; Serena then reports
+  `The language server manager is not initialized`, and the pool's single
+  bounded retry also fails under the same pressure.
+
+Verified backend inputs and coverage: Serena agent 1.7.0 (uv tool) with
+rust-analyzer (rustup stable) and BasedPyright under Node 24 (Winget); the
+managed configuration selects Python and Rust, and the checkout contains
+Python files (2, the migration-owned classified paths), so the Python layer
+is a deliberate selection, not a discovery accident. Each worker tree runs
+under one Windows Job with a 4 GiB memory limit and 25% CPU
+(`serena::WORKER_JOB_MEMORY_BYTES`; a 2 GiB limit previously caused a
+`MemoryError` and the same uninitialized-manager failure, after which the
+limit was raised). Workers are shared per route/configuration; warm steady
+state is small (~200 MB active: serena agent, one rust-analyzer, no Node).
+The pool shares one cold start among concurrent callers of the *same*
+configuration and reports the configured limit (not a measurement) in its
+status.
+
+Resource evidence that constrains the cause: Node's own heap limit was not
+reached (180 MB at refusal), so the allocation was refused externally. Two
+candidate external causes remain, both consistent with all evidence: (a) the
+per-worker 4 GiB Job exhausted by the combined startup transient
+(rust-analyzer full-workspace analysis plus its flycheck cargo/rustc children
+plus BasedPyright indexing in one tree), or (b) machine-wide exhaustion: the
+host has 15.8 GB RAM, and the 22:10 burst started five fresh worker trees on
+five workspace copies (four executor worktrees plus the main checkout) while
+other lead sessions' executors were also active. Both incidents coincided
+with concurrent heavy activity; four later staggered fresh workers
+(2026-09-30 00:30, 02:02, 03:04 and one at 22:55) initialized cleanly with no
+OOM, uninitialized-manager or startup failure in their logs.
+
+Still open for 11.1: a measured fresh-startup peak (one cold worker with job
+memory sampling) to separate cause (a) from (b). It is deliberately deferred
+while four executor suites occupy the machine; reproducing the memory burst
+now would sabotage them. No correction has been selected yet — the existing
+single bounded retry is not duplicated, and no language or resource policy
+has been weakened.
