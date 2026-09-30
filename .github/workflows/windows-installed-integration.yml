@@ -24,7 +24,7 @@ jobs:
 
       - name: Install the pinned Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --no-self-update
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
           rustup default 1.98.1
           rustc --version
           cargo --version
