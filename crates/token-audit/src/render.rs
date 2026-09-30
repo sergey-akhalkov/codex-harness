@@ -4,6 +4,9 @@
 //! are the bounded interactive presentation: they keep totals, coverage and
 //! warnings complete, rank records by recorded total tokens, state how many
 //! records the presentation omitted and name the retained complete JSON.
+use crate::baseline::{
+    BaselineDiff, BucketMovement, CoverageMovement, SessionMovement, SnapshotCoverage,
+};
 use crate::findings::FindingsReport;
 use crate::model::{Bucket, CoverageReport, Report, SessionContext, SessionRow, TokenTotals};
 use crate::retention::{Detail, Kind};
@@ -304,4 +307,237 @@ fn counts_text<K: ToString + Ord>(counts: &BTreeMap<K, usize>) -> String {
         .map(|(key, count)| format!("{}={count}", key.to_string()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+impl BaselineDiff {
+    /// Sessions or groups presented per section in the bounded text diff.
+    pub const TEXT_ROWS: usize = 20;
+
+    /// Byte bound of the bounded text diff. Row sections are trimmed so the
+    /// complete presentation stays inside it; the header, totals, coverage,
+    /// locator and limitation stay complete.
+    pub const TEXT_BYTES: usize = 32_768;
+
+    /// Bounded line-oriented comparison for interactive reading. `detail`
+    /// names the retained complete comparison that `token-audit detail` reads
+    /// without rescanning sessions. Sections are ranked by absolute recorded
+    /// token movement, largest first, with the record identity as the
+    /// deterministic tie-break; every presented section states how many
+    /// movements it omitted.
+    pub fn render_text(&self, detail: &Detail) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "token-audit baseline diff  generated={}  baseline={}\n",
+            self.generated_at, self.baseline
+        ));
+        out.push_str(&format!(
+            "snapshot status={} schema={} current_schema={} version_changed={} compatible={} comparable={}\n",
+            self.snapshot_status,
+            self.snapshot_schema_version
+                .map_or_else(|| "unknown".to_owned(), |version| version.to_string()),
+            self.current_schema_version,
+            self.version_changed,
+            self.compatible,
+            self.comparable
+        ));
+        if let Some(reason) = &self.snapshot_reason {
+            out.push_str(&format!("snapshot note: {reason}\n"));
+        }
+        for reason in &self.comparability {
+            out.push_str(&format!("not comparable: {reason}\n"));
+        }
+        out.push_str(&coverage_movement_text(&self.coverage));
+        out.push_str(&bucket_movement_text(&self.totals));
+        let mut ranked: Vec<&SessionMovement> = self.sessions.iter().collect();
+        ranked.sort_by(|left, right| {
+            right
+                .significance()
+                .cmp(&left.significance())
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        let rows: Vec<String> = ranked
+            .iter()
+            .map(|movement| session_movement_text(movement))
+            .collect();
+        push_ranked_movements(&mut out, "sessions", &rows);
+        for (label, movements) in [
+            ("project", &self.by_project),
+            ("model", &self.by_model),
+            ("effort", &self.by_effort),
+            ("day", &self.by_day),
+        ] {
+            let mut ranked: Vec<&BucketMovement> = movements.iter().collect();
+            ranked.sort_by(|left, right| {
+                right
+                    .significance()
+                    .cmp(&left.significance())
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+            let rows: Vec<String> = ranked
+                .iter()
+                .map(|movement| bucket_movement_text(movement))
+                .collect();
+            push_ranked_movements(&mut out, label, &rows);
+        }
+        out.push_str(&format!("{}\n", baseline_detail_note(detail)));
+        out.push_str(&format!("limitation {}\n", self.limitation));
+        out
+    }
+}
+
+/// Bytes reserved below the row budget for the locator, the limitation and
+/// the section headers of the remaining sections.
+const TEXT_TAIL_RESERVE: usize = 512;
+
+/// Appends one bounded, ranked movement section: a header with the exact
+/// presented and omitted counts, then the highest-significance rows that fit
+/// the remaining byte bound. The selection is deterministic because both the
+/// order and the fit test depend only on the recorded data.
+fn push_ranked_movements(out: &mut String, label: &str, rows: &[String]) {
+    let total = rows.len();
+    if total == 0 {
+        out.push_str(&format!(
+            "{label} ranked by absolute recorded token movement, none recorded\n"
+        ));
+        return;
+    }
+    let budget = BaselineDiff::TEXT_BYTES.saturating_sub(TEXT_TAIL_RESERVE);
+    let mut shown = total.min(BaselineDiff::TEXT_ROWS);
+    while shown > 0 {
+        let header = ranked_movement_header(label, shown, total);
+        let body: usize = rows.iter().take(shown).map(String::len).sum();
+        if out.len() + header.len() + body <= budget {
+            break;
+        }
+        shown -= 1;
+    }
+    out.push_str(&ranked_movement_header(label, shown, total));
+    for row in rows.iter().take(shown) {
+        out.push_str(row);
+    }
+}
+
+fn ranked_movement_header(label: &str, shown: usize, total: usize) -> String {
+    if shown < total {
+        format!(
+            "{label} ranked by absolute recorded token movement, showing {shown} of {total}; {} omitted from this presentation\n",
+            total - shown
+        )
+    } else {
+        format!("{label} ranked by absolute recorded token movement, all {total} presented\n")
+    }
+}
+
+fn coverage_movement_text(coverage: &CoverageMovement) -> String {
+    let mut out = String::new();
+    match &coverage.baseline {
+        Some(baseline) => out.push_str(&format!(
+            "coverage baseline {}\n",
+            coverage_snapshot_text(baseline)
+        )),
+        None => out.push_str("coverage baseline not recorded\n"),
+    }
+    out.push_str(&format!(
+        "coverage current {}\n",
+        coverage_snapshot_text(&coverage.current)
+    ));
+    if coverage.degraded {
+        out.push_str(&format!(
+            "coverage degraded: {}; a lower recorded subtotal is not a saving\n",
+            coverage.reasons.join("; ")
+        ));
+    }
+    out
+}
+
+fn coverage_snapshot_text(coverage: &SnapshotCoverage) -> String {
+    format!(
+        "sessions={} without_usage={} corrupt_lines={} oversized_lines={} unrecognized_events={} partial={} usage_basis={} warnings={}",
+        coverage.sessions,
+        coverage.sessions_without_usage,
+        coverage.corrupt_lines,
+        coverage.oversized_lines,
+        coverage.unrecognized_events,
+        coverage.partial,
+        counts_text(&coverage.usage_basis),
+        counts_text(&coverage.warnings)
+    )
+}
+
+fn session_movement_text(movement: &SessionMovement) -> String {
+    format!(
+        "session {} status={} total {} -> {} delta {} basis {} -> {} partial {} -> {} warnings {} -> {}\n",
+        movement.session_id,
+        movement.status,
+        number(movement.baseline_total_tokens),
+        number(movement.current_total_tokens),
+        optional_delta(movement.delta_total_tokens),
+        movement
+            .baseline_usage_basis
+            .as_deref()
+            .unwrap_or("unavailable"),
+        movement
+            .current_usage_basis
+            .as_deref()
+            .unwrap_or("unavailable"),
+        optional_bool(movement.baseline_partial),
+        movement.current_partial,
+        warnings_text(&movement.baseline_warnings),
+        warnings_text(&movement.current_warnings)
+    )
+}
+
+fn bucket_movement_text(movement: &BucketMovement) -> String {
+    format!(
+        "{} sessions {} -> {} total {} -> {} delta {} basis {} -> {} missing_usage {} -> {} partial {} -> {}\n",
+        movement.key,
+        optional_count(movement.baseline_sessions),
+        movement.current_sessions,
+        number(movement.baseline_total_tokens),
+        number(movement.current_total_tokens),
+        optional_delta(movement.delta_total_tokens),
+        counts_text(&movement.baseline_usage_basis),
+        counts_text(&movement.current_usage_basis),
+        optional_count(movement.baseline_missing_usage_sessions),
+        movement.current_missing_usage_sessions,
+        optional_bool(movement.baseline_partial),
+        movement.current_partial
+    )
+}
+
+fn warnings_text(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        "-".to_owned()
+    } else {
+        warnings.join(",")
+    }
+}
+
+fn optional_count(value: Option<usize>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn optional_delta(value: Option<i64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:+}"))
+}
+
+fn optional_bool(value: Option<bool>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn baseline_detail_note(detail: &Detail) -> String {
+    match detail {
+        Detail::Retained { path, warning } => {
+            let mut note = format!(
+                "retained {}  (complete comparison; read one movement: token-audit detail --diff {} --session ID, --group project:KEY, --sessions or --groups day, with optional --offset/--limit)",
+                path.display(),
+                path.display()
+            );
+            if let Some(warning) = warning {
+                note.push_str(&format!("\nretention warning: {warning}"));
+            }
+            note
+        }
+        Detail::Unavailable(reason) => format!("retained unavailable: {reason}"),
+    }
 }

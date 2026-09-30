@@ -37,6 +37,28 @@ impl Fixture {
             .unwrap()
     }
 
+    /// A child without CODEX_HOME must resolve the native user-profile home.
+    fn run_without_codex_home(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_token-audit"))
+            .args(args)
+            .env_remove("CODEX_HOME")
+            .env("USERPROFILE", self.root().join("user-profile"))
+            .output()
+            .unwrap()
+    }
+
+    fn baseline(&self, subcommand: &str, extra: &[&str]) -> Output {
+        let sessions = self.sessions();
+        let mut args = vec![
+            "baseline",
+            subcommand,
+            "--sessions",
+            sessions.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+
     fn report(&self, extra: &[&str]) -> Output {
         let sessions = self.sessions();
         let mut args = vec!["report", "--sessions", sessions.to_str().unwrap()];
@@ -218,4 +240,141 @@ fn private_sources_destination_is_protected() {
     let output = fixture.report(&["--private-sources", fixture.root().to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(2));
     assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn baseline_save_name_works_unchanged_and_as_a_basename() {
+    let fixture = Fixture::new();
+    fixture.rollout(
+        "2026/09/20/rollout-alpha.jsonl",
+        &simple_session("session_alpha"),
+    );
+    let sessions = fixture.sessions();
+    let saved = fixture.baseline("save", &[]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    let name = receipt["baseline"].as_str().unwrap().to_owned();
+    assert!(
+        name.starts_with("baseline-") && name.ends_with(".json"),
+        "{name}"
+    );
+    let basename = name.strip_suffix(".json").unwrap();
+    for requested in [name.as_str(), basename, "latest"] {
+        let output = fixture.baseline("diff", &["--baseline", requested]);
+        assert!(
+            output.status.success(),
+            "{requested}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let diff: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(diff["snapshot_status"], "valid", "{requested}");
+        assert_eq!(diff["compatible"], true, "{requested}");
+        assert_eq!(diff["comparable"], true, "{requested}");
+        assert_eq!(diff["baseline"], name.as_str(), "{requested}");
+        assert_eq!(diff["sessions"][0]["session_id"], "session_alpha");
+    }
+    assert!(sessions.is_dir());
+}
+
+#[test]
+fn baseline_defaults_use_the_native_codex_home_under_the_user_profile() {
+    let fixture = Fixture::new();
+    fixture.rollout(
+        "2026/09/20/rollout-alpha.jsonl",
+        &simple_session("session_alpha"),
+    );
+    let sessions = fixture.sessions();
+    let saved = fixture.run_without_codex_home(&[
+        "baseline",
+        "save",
+        "--sessions",
+        sessions.to_str().unwrap(),
+    ]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    let directory = PathBuf::from(receipt["directory"].as_str().unwrap());
+    let expected = fixture
+        .root()
+        .join("user-profile")
+        .join(".codex")
+        .join("harness")
+        .join("token-audit")
+        .join("baselines");
+    assert_eq!(
+        directory, expected,
+        "baseline state must resolve the native Codex home under the profile"
+    );
+    let output = fixture.run_without_codex_home(&[
+        "baseline",
+        "diff",
+        "--sessions",
+        sessions.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let diff: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(diff["sessions"][0]["session_id"], "session_alpha");
+    assert_eq!(diff["compatible"], true);
+}
+
+#[test]
+fn escaping_baseline_names_and_pointers_are_rejected() {
+    let fixture = Fixture::new();
+    fixture.rollout(
+        "2026/09/20/rollout-alpha.jsonl",
+        &simple_session("session_alpha"),
+    );
+    let saved = fixture.baseline("save", &[]);
+    assert!(saved.status.success());
+    let directory = fixture
+        .root()
+        .join("codex-home")
+        .join("harness")
+        .join("token-audit")
+        .join("baselines");
+    // An unrelated local file outside the baseline directory stays unread.
+    fs::write(fixture.root().join("outside.json"), "{}").unwrap();
+    for requested in [
+        "../outside",
+        "..\\outside",
+        "C:/outside",
+        "D:\\outside",
+        "sub/outside",
+        "",
+    ] {
+        let output = fixture.baseline("diff", &["--baseline", requested]);
+        assert_eq!(output.status.code(), Some(2), "{requested:?}");
+        assert!(output.stdout.is_empty(), "{requested:?}");
+        assert!(!output.stderr.is_empty(), "{requested:?}");
+    }
+    // Pointer contents are validated the same way, before any file is
+    // interpreted as an owned baseline.
+    for pointer in ["../outside.json", "..\\outside.json", "C:/Windows/win.ini"] {
+        fs::write(directory.join("latest"), pointer).unwrap();
+        let output = fixture.baseline("diff", &[]);
+        assert_eq!(output.status.code(), Some(2), "{pointer:?}");
+        assert!(output.stdout.is_empty(), "{pointer:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("does not name an owned baseline"),
+            "{pointer:?}: {error}"
+        );
+    }
+    // A missing pointer is an explicit error as well.
+    fs::remove_file(directory.join("latest")).unwrap();
+    let output = fixture.baseline("diff", &[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
 }
