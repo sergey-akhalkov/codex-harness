@@ -632,3 +632,36 @@ project root (a full workspace copy outside the main checkout):
   and a stdio-less invocation is refused with an explicit pipe-endpoint
   error. Diagnostic freshness was qualified separately through the diagnose
   surface (group 2).
+
+## Task 13.3: audit matrix reconciliation
+
+Mechanical reconciliation 2026-09-30 of all 49 design-matrix rows (A01-A39,
+N01-N10) against task checkboxes and the recorded evidence: **45 rows fully
+closed** on executed evidence — every mandatory correction closed on real
+tests, measurements or installed runs recorded per group above (RTK
+transaction 38/38 including pre-fix failure demonstrations; native
+model/effort precedence with the real-CLI config acceptance; validated
+baselines 45 tests plus the outside-checkout user path; interval accounting
+and incremental equivalence with measured 0-byte warm reuse; launch
+integrity with measured reads and the real build-reuse-repair path; owned
+scratch leases with a real killed build; authenticated xAI generations with
+a stream outliving the former grace; honest benefit accounting; consumed
+skill identity with frozen acceptance; CI contract tests plus the corrected
+outside-checkout acceptance; serialized Serena cold starts from measured
+resource evidence). No optional candidate is mislabeled an improvement:
+group 8's three candidates are recorded rejected/not-adopted with
+measurements, group 10's integration decisions are inconclusive-pending, and
+A33 (deferred discovery) is recorded unsupported against the installed CLI.
+Citation placeholders are gone and no universal benefit/coverage claim
+exists (sweeps clean; the only "100%" text is the change's own rejection of
+such claims). `openspec validate` passes and `harness-source-check` reports
+0 findings over 896 files, covering local links. Owning documentation was
+corrected during implementation (rust-native sections, token-workflow,
+token-audit memory and skill, ownership-check note); the subscription record
+already describes the shim generically and needed no change.
+
+Open rows after this reconciliation: **A22** (task 12.4) — an authorized
+actual CI run tied to the candidate revision, blocked only on remote
+publication/Actions authority that no one has granted in this session; and
+**A38/A39/N10**, which close with this very reconciliation and the delivery
+evidence (13.1, 13.2, 13.4).
