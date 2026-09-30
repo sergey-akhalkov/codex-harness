@@ -57,11 +57,11 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 7. Protect xAI transport ownership and generation continuity
 
-- [ ] 7.1 Define and implement owned endpoint/control identity using existing process/build/generation owners in `crates/harness-core/src/native_launcher.rs` and `xai_responses_shim.rs`; verify a self-reported valid-looking executable path alone does not authenticate a listener and stale control authority cannot retire another generation. Covers A20, N05.
-- [ ] 7.2 Reject unknown/spoofed listeners and distinguish free, occupied and probe-unavailable states; verify synthetic secret-bearing requests never reach an unverified endpoint, foreign processes survive and failure preserves the requested provider/billing route. Covers A20, N05.
-- [ ] 7.3 Bind new and existing sessions to verified compatible generations and retire by live ownership/work release; verify an ordinary update selects a new endpoint without invalidating an existing session's next request. Covers A21.
-- [ ] 7.4 Exercise real owned loopback processes with a stream continuing beyond the former grace, a concurrent new session and a later request from the old session; verify original request deadlines, correct generation selection and no production model call. Covers A21.
-- [ ] 7.5 Exercise concurrent launch/update, unclean owner exit, explicit forced recovery and rollback; verify only abandoned owned generations are reclaimed and unrelated live requests/processes remain intact. Covers A21.
+- [x] 7.1 Define and implement owned endpoint/control identity using existing process/build/generation owners in `crates/harness-core/src/native_launcher.rs` and `xai_responses_shim.rs`; verify a self-reported valid-looking executable path alone does not authenticate a listener and stale control authority cannot retire another generation. Covers A20, N05.
+- [x] 7.2 Reject unknown/spoofed listeners and distinguish free, occupied and probe-unavailable states; verify synthetic secret-bearing requests never reach an unverified endpoint, foreign processes survive and failure preserves the requested provider/billing route. Covers A20, N05.
+- [x] 7.3 Bind new and existing sessions to verified compatible generations and retire by live ownership/work release; verify an ordinary update selects a new endpoint without invalidating an existing session's next request. Covers A21.
+- [x] 7.4 Exercise real owned loopback processes with a stream continuing beyond the former grace, a concurrent new session and a later request from the old session; verify original request deadlines, correct generation selection and no production model call. Covers A21.
+- [x] 7.5 Exercise concurrent launch/update, unclean owner exit, explicit forced recovery and rollback; verify only abandoned owned generations are reclaimed and unrelated live requests/processes remain intact. Covers A21.
 
 ## 8. Improve development feedback and evaluate publication candidates
 
