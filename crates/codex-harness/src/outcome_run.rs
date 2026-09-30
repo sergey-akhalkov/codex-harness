@@ -1,4 +1,6 @@
-//! One explicit native outcome attempt. Correctness remains the caller's oracle.
+//! One explicit native outcome attempt. Correctness remains the caller's
+//! oracle. The launcher runs hidden with captured streams: this route creates
+//! no visible terminal or conversation, which only the dispatch path provides.
 #[path = "outcome_events.rs"]
 mod events;
 #[path = "process_result.rs"]
@@ -65,7 +67,7 @@ fn default_output_limit() -> u64 {
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher in an isolated temporary case/home. An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. Private evidence is retained; correctness requires a separate oracle."
+            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher hidden with captured streams in an isolated temporary case/home (no visible terminal; visible dispatch is a separate path). An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. Private evidence is retained; correctness requires a separate oracle."
         );
         return Ok(0);
     }

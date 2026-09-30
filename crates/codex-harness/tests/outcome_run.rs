@@ -850,3 +850,117 @@ fn smoke_observes_real_tool_round_trip_while_strict_qualification_stays_open() {
     assert!(strict.tool_exchange_missing.is_empty());
     assert!(strict.divergent_outputs.is_empty());
 }
+
+#[test]
+fn failed_and_timed_out_attempts_cannot_qualify_even_with_matching_outputs() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let run = |mode: &str, code: i32, content: &str| -> (Value, String) {
+        let out = f
+            .command(mode)
+            .env("HARNESS_OUTCOME_SOLUTION", content)
+            .output()
+            .unwrap();
+        let row = f.check(out, code);
+        let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+        (row, digest)
+    };
+    let (success, success_digest) = run("success", 0, "same controlled output\n");
+    let (failed, failed_digest) = run("nonzero", 1, "same controlled output\n");
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed_digest, success_digest);
+    assert!(failed["tool_operations"].as_u64().unwrap() > 0);
+    let mut a = observation(&success, &success_digest);
+    let mut b = observation(&failed, &failed_digest);
+    a.attempt_id.push_str("#1");
+    b.attempt_id.push_str("#2");
+    assert!(a.completed);
+    assert!(!b.completed);
+    let result = qualify(&recorded_runner(&success), &policy(), &[a, b]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.unfinished_attempts.len(), 1);
+    assert!(result.unfinished_attempts[0].ends_with("#2"));
+    assert!(result.divergent_outputs.is_empty());
+    assert!(result.runner_mismatch.is_empty());
+
+    // Timed-out work retains its artifacts and counters but is still
+    // unfinished and cannot qualify.
+    f.edit("timeout", json!(1));
+    let (timeout, timeout_digest) = run("timeout", 1, "same controlled output\n");
+    assert_eq!(timeout["status"], "timeout");
+    assert_eq!(timeout_digest, success_digest);
+    let mut c = observation(&timeout, &timeout_digest);
+    c.attempt_id.push_str("#3");
+    let mut a2 = observation(&success, &success_digest);
+    a2.attempt_id.push_str("#4");
+    let result = qualify(&recorded_runner(&success), &policy(), &[a2, c]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.unfinished_attempts.len(), 1);
+}
+
+#[test]
+fn smoke_requires_one_completed_verified_tool_attempt() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    // Verified metadata without tools plus an unverified attempt with tools
+    // never proves basic execution: no single attempt did both.
+    let text_only = f.run("text-only", 0);
+    let wrong_model = f.run("wrong-model", 0);
+    assert_eq!(text_only["observed_model_metadata_verified"], true);
+    assert_eq!(text_only["tool_operations"], 0);
+    assert_eq!(wrong_model["observed_model_metadata_verified"], false);
+    assert_eq!(wrong_model["tool_operations"], 3);
+    let mut a = observation(&text_only, "digest-a");
+    let mut b = observation(&wrong_model, "digest-a");
+    a.attempt_id.push_str("#1");
+    b.attempt_id.push_str("#2");
+    let result = smoke(&recorded_runner(&text_only), &[a.clone(), b.clone()]);
+    assert_eq!(result.verified_attempts, 1);
+    assert_eq!(result.tool_attempts, 1);
+    assert_eq!(result.executing_verified_attempts, 0);
+    assert!(!result.basic_execution_observed());
+    // One completed attempt with its own verified tool execution does.
+    let success = f.run("success", 0);
+    let mut c = observation(&success, "digest-a");
+    c.attempt_id.push_str("#3");
+    let result = smoke(&recorded_runner(&success), &[a, b, c]);
+    assert_eq!(result.executing_verified_attempts, 1);
+    assert_eq!(result.executing_attempt_ids.len(), 1);
+    assert!(result.executing_attempt_ids[0].ends_with("#3"));
+    assert!(result.basic_execution_observed());
+}
+
+#[test]
+fn attempt_runner_identity_drift_blocks_qualification() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let first = f.run("success", 0);
+    let mut changed = local_runner();
+    changed["identity"]["quantization"] = json!("Q5_K_M");
+    f.edit("runner", changed);
+    let second = f.run("success", 0);
+    let mut a = observation(&first, "digest-a");
+    let mut b = observation(&second, "digest-a");
+    a.attempt_id.push_str("#1");
+    b.attempt_id.push_str("#2");
+    let result = qualify(&recorded_runner(&first), &policy(), &[a.clone(), b.clone()]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.runner_mismatch.len(), 1);
+    assert_eq!(result.runner_mismatch[0].attempt_id, b.attempt_id);
+    assert_eq!(
+        result.runner_mismatch[0].changed,
+        vec!["identity.quantization"]
+    );
+    assert!(result.divergent_outputs.is_empty());
+    // An attempt that recorded no runner identity cannot prove the expected
+    // configuration either.
+    let mut unrecorded = a.clone();
+    unrecorded.runner = None;
+    unrecorded.attempt_id.push_str("-bare");
+    let mut a2 = a;
+    a2.attempt_id = "attempt-a2".into();
+    let result = qualify(&recorded_runner(&first), &policy(), &[a2, unrecorded]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.runner_mismatch.len(), 1);
+    assert!(result.runner_mismatch[0].changed.is_empty());
+}

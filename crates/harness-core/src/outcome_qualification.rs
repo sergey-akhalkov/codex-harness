@@ -222,10 +222,17 @@ fn name_is_bounded(name: &str) -> bool {
 pub struct QualificationAttempt {
     /// Stable attempt locator (thread identity or local attempt identity).
     pub attempt_id: String,
+    /// The attempt completed successfully through the real entry point. Failed,
+    /// cancelled, timed-out or unknown outcomes stay recorded but block strict
+    /// comparisons even when their required outputs match.
+    pub completed: bool,
     /// The attempt's evidence verified the observed model/effort metadata.
     pub model_metadata_verified: bool,
     /// Completed tool round-trips observed in this attempt.
     pub tool_operations: u64,
+    /// Runner identity recorded in this attempt's own evidence; `None` when the
+    /// attempt recorded no runner identity.
+    pub runner: Option<RunnerRecord>,
     /// Content digests of the compared outputs, keyed by required path.
     pub outputs: BTreeMap<String, String>,
 }
@@ -246,10 +253,14 @@ pub struct Qualification {
     pub policy: RepeatabilityPolicy,
     /// Declared material identity facts that are absent.
     pub missing_identity: Vec<String>,
+    /// Attempts that did not complete successfully through the real entry point.
+    pub unfinished_attempts: Vec<String>,
     /// Attempts whose observed model metadata was not verified.
     pub unverified_attempts: Vec<String>,
     /// Attempts with no observed tool round-trip.
     pub tool_exchange_missing: Vec<String>,
+    /// Attempts whose recorded runner identity was absent or drifted.
+    pub runner_mismatch: Vec<AttemptDrift>,
     /// Required outputs absent from at least one repeat.
     pub missing_outputs: Vec<String>,
     /// Required outputs that differed across repeats.
@@ -269,6 +280,17 @@ impl Qualification {
     }
 }
 
+/// One attempt whose recorded runner identity is absent or differs from the
+/// expected configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptDrift {
+    pub attempt_id: String,
+    /// Changed configuration field names; empty when the attempt recorded no
+    /// runner identity at all.
+    pub changed: Vec<String>,
+}
+
 /// Basic execution evidence from controlled attempts through the real
 /// agent/tool path.
 ///
@@ -285,21 +307,35 @@ pub struct ExecutionSmoke {
     pub verified_attempts: usize,
     /// Attempts with at least one completed tool round-trip.
     pub tool_attempts: usize,
+    /// Attempts that completed, verified their own observed model metadata and
+    /// executed at least one tool round-trip in the same attempt.
+    pub executing_verified_attempts: usize,
+    /// Attempt ids of those attempts, in observation order.
+    pub executing_attempt_ids: Vec<String>,
     pub tool_operations: u64,
     /// Material identity facts still unknown; strict comparisons stay blocked.
     pub missing_identity: Vec<String>,
 }
 
 impl ExecutionSmoke {
-    /// The route executed through the agent and tools at least once.
+    /// The route executed through the agent and tools at least once: one
+    /// attempt must, by itself, have completed, verified its observed model
+    /// metadata and exercised a tool round-trip. Facts from different attempts
+    /// are never combined.
     pub fn basic_execution_observed(&self) -> bool {
-        self.verified_attempts > 0 && self.tool_attempts > 0
+        self.executing_verified_attempts > 0
     }
 }
 
 /// Summarizes basic execution evidence. Strict comparisons remain gated by
 /// [`qualify`]; this function reports only what the route observably executed.
 pub fn smoke(runner: &LocalRunner, attempts: &[QualificationAttempt]) -> ExecutionSmoke {
+    let executing: Vec<&QualificationAttempt> = attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.completed && attempt.model_metadata_verified && attempt.tool_operations > 0
+        })
+        .collect();
     ExecutionSmoke {
         observed_attempts: attempts.len(),
         verified_attempts: attempts
@@ -310,6 +346,11 @@ pub fn smoke(runner: &LocalRunner, attempts: &[QualificationAttempt]) -> Executi
             .iter()
             .filter(|attempt| attempt.tool_operations > 0)
             .count(),
+        executing_verified_attempts: executing.len(),
+        executing_attempt_ids: executing
+            .iter()
+            .map(|attempt| attempt.attempt_id.clone())
+            .collect(),
         tool_operations: attempts
             .iter()
             .map(|attempt| attempt.tool_operations)
@@ -321,8 +362,11 @@ pub fn smoke(runner: &LocalRunner, attempts: &[QualificationAttempt]) -> Executi
 /// Evaluates the declared repeatability rule over controlled attempts.
 ///
 /// Output equality uses only the declared required outputs; extra attempt
-/// outputs and timing are not compared. Divergence, absent material identity,
-/// unverified model metadata, an absent tool round-trip in any repeat, a
+/// outputs and timing are not compared. Qualification requires every attempt
+/// to have completed successfully, verified its own observed model metadata,
+/// executed its own tool round-trip and recorded the exact expected runner
+/// identity. Divergence, absent material identity, an unfinished attempt, an
+/// absent or drifted attempt runner record, an absent tool round-trip, a
 /// missing required output or a repeat-count mismatch all block qualification.
 pub fn qualify(
     runner: &LocalRunner,
@@ -362,6 +406,11 @@ pub fn qualify(
         }
     }
     let missing_identity = runner.missing_identity();
+    let unfinished_attempts: Vec<String> = attempts
+        .iter()
+        .filter(|attempt| !attempt.completed)
+        .map(|attempt| attempt.attempt_id.clone())
+        .collect();
     let unverified_attempts: Vec<String> = attempts
         .iter()
         .filter(|attempt| !attempt.model_metadata_verified)
@@ -372,9 +421,28 @@ pub fn qualify(
         .filter(|attempt| attempt.tool_operations == 0)
         .map(|attempt| attempt.attempt_id.clone())
         .collect();
+    let expected = RunnerRecord::new(runner);
+    let runner_mismatch: Vec<AttemptDrift> = attempts
+        .iter()
+        .filter_map(|attempt| match &attempt.runner {
+            None => Some(AttemptDrift {
+                attempt_id: attempt.attempt_id.clone(),
+                changed: Vec::new(),
+            }),
+            Some(record) => {
+                let observed = record_drift(&expected, record);
+                observed.drifted.then_some(AttemptDrift {
+                    attempt_id: attempt.attempt_id.clone(),
+                    changed: observed.changed,
+                })
+            }
+        })
+        .collect();
     let blocked = !missing_identity.is_empty()
+        || !unfinished_attempts.is_empty()
         || !unverified_attempts.is_empty()
         || !tool_exchange_missing.is_empty()
+        || !runner_mismatch.is_empty()
         || !missing_outputs.is_empty()
         || !divergent_outputs.is_empty()
         || attempts.len() != policy.repeats;
@@ -386,8 +454,10 @@ pub fn qualify(
         },
         policy: policy.clone(),
         missing_identity,
+        unfinished_attempts,
         unverified_attempts,
         tool_exchange_missing,
+        runner_mismatch,
         missing_outputs: missing_outputs.into_iter().collect(),
         divergent_outputs: divergent_outputs.into_iter().collect(),
         observed_repeats: attempts.len(),
@@ -407,15 +477,27 @@ pub struct Drift {
 /// newly unknown material fact is drift: the recorded identity no longer
 /// describes the same serving configuration.
 pub fn drift(before: &LocalRunner, after: &LocalRunner) -> Drift {
+    record_drift(&RunnerRecord::new(before), &RunnerRecord::new(after))
+}
+
+/// Compares an expected configuration against a runner identity recorded in
+/// one attempt's evidence. Kind, endpoint, model, wire protocol and every
+/// material identity fact must match for the attempt to belong to the same
+/// serving configuration.
+pub fn record_drift(expected: &RunnerRecord, observed: &RunnerRecord) -> Drift {
     let mut changed = Vec::new();
-    if before.endpoint != after.endpoint {
-        changed.push("endpoint".to_owned());
-    }
-    if before.model != after.model {
-        changed.push("model".to_owned());
+    for (name, left, right) in [
+        ("kind", &expected.kind, &observed.kind),
+        ("endpoint", &expected.endpoint, &observed.endpoint),
+        ("model", &expected.model, &observed.model),
+        ("wire_api", &expected.wire_api, &observed.wire_api),
+    ] {
+        if left != right {
+            changed.push(name.to_owned());
+        }
     }
     for name in MATERIAL_FIELDS {
-        if identity_field(&before.identity, name) != identity_field(&after.identity, name) {
+        if identity_field(&expected.identity, name) != identity_field(&observed.identity, name) {
             changed.push(format!("identity.{name}"));
         }
     }
@@ -446,8 +528,9 @@ fn identity_field<'a>(identity: &'a MaterialIdentity, name: &str) -> &'a Option<
 /// the required output digests collected from its controlled case.
 ///
 /// Missing observation evidence stays conservative: an absent model-metadata
-/// verification is unverified, and an absent tool-operation counter counts as
-/// no observed tool round-trip instead of being assumed.
+/// verification is unverified, an absent tool-operation counter counts as no
+/// observed tool round-trip, a status other than `completed` is unfinished and
+/// an absent runner record cannot prove the expected configuration.
 pub fn qualification_attempt(
     result: &Value,
     outputs: BTreeMap<String, String>,
@@ -456,10 +539,18 @@ pub fn qualification_attempt(
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid("attempt result has no thread identity"))?;
+    let runner = result
+        .get("runner")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<RunnerRecord>(value.clone()))
+        .transpose()
+        .map_err(|_| invalid("attempt runner record is invalid"))?;
     Ok(QualificationAttempt {
         attempt_id: attempt_id.to_owned(),
+        completed: result["status"] == "completed",
         model_metadata_verified: result["observed_model_metadata_verified"] == Value::Bool(true),
         tool_operations: result["tool_operations"].as_u64().unwrap_or(0),
+        runner,
         outputs,
     })
 }
@@ -504,8 +595,10 @@ mod tests {
     fn attempt(id: &str, tools: u64, digest: &str) -> QualificationAttempt {
         QualificationAttempt {
             attempt_id: id.into(),
+            completed: true,
             model_metadata_verified: true,
             tool_operations: tools,
+            runner: Some(RunnerRecord::new(&runner())),
             outputs: BTreeMap::from([("solution.txt".to_owned(), digest.to_owned())]),
         }
     }
@@ -584,6 +677,79 @@ mod tests {
         let result = qualify(&runner(), &policy(), &[attempt("a", 2, "d1"), second]).unwrap();
         assert!(result.blocks_comparisons());
         assert_eq!(result.unverified_attempts, vec!["b"]);
+    }
+
+    #[test]
+    fn unfinished_attempts_cannot_qualify_even_with_matching_outputs() {
+        // A failed, cancelled, timed-out or unknown outcome never qualifies,
+        // even when the required output matches the completed repeat.
+        let mut unfinished = attempt("b", 3, "d1");
+        unfinished.completed = false;
+        let result = qualify(&runner(), &policy(), &[attempt("a", 3, "d1"), unfinished]).unwrap();
+        assert!(result.blocks_comparisons());
+        assert_eq!(result.unfinished_attempts, vec!["b"]);
+        assert!(result.divergent_outputs.is_empty());
+        assert!(result.runner_mismatch.is_empty());
+    }
+
+    #[test]
+    fn attempt_runner_identity_mismatch_blocks_qualification() {
+        let mut drifted = attempt("b", 3, "d1");
+        drifted.runner.as_mut().unwrap().identity.quantization = Some("Q5_K_M".into());
+        let result = qualify(&runner(), &policy(), &[attempt("a", 3, "d1"), drifted]).unwrap();
+        assert!(result.blocks_comparisons());
+        assert_eq!(
+            result.runner_mismatch,
+            vec![AttemptDrift {
+                attempt_id: "b".into(),
+                changed: vec!["identity.quantization".into()],
+            }]
+        );
+        assert!(result.divergent_outputs.is_empty());
+
+        // An attempt that recorded no runner identity cannot prove the expected
+        // configuration.
+        let mut unrecorded = attempt("c", 3, "d1");
+        unrecorded.runner = None;
+        let result = qualify(&runner(), &policy(), &[attempt("a", 3, "d1"), unrecorded]).unwrap();
+        assert!(result.blocks_comparisons());
+        assert_eq!(
+            result.runner_mismatch,
+            vec![AttemptDrift {
+                attempt_id: "c".into(),
+                changed: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn smoke_requires_one_attempt_with_its_own_verified_tool_execution() {
+        // Verified metadata without tools plus an unverified attempt with tools
+        // never proves basic execution: no single attempt did both.
+        let mut text_only = attempt("a", 0, "d1");
+        text_only.model_metadata_verified = true;
+        let mut unverified_tools = attempt("b", 3, "d1");
+        unverified_tools.model_metadata_verified = false;
+        let result = smoke(&runner(), &[text_only.clone(), unverified_tools.clone()]);
+        assert_eq!(result.verified_attempts, 1);
+        assert_eq!(result.tool_attempts, 1);
+        assert_eq!(result.executing_verified_attempts, 0);
+        assert!(!result.basic_execution_observed());
+
+        // An unfinished attempt does not prove basic execution either.
+        let mut unfinished = attempt("c", 3, "d1");
+        unfinished.completed = false;
+        assert!(!smoke(&runner(), &[unfinished]).basic_execution_observed());
+
+        // One attempt with its own completion, verified metadata and tool
+        // round-trip does.
+        let result = smoke(
+            &runner(),
+            &[text_only, unverified_tools, attempt("d", 2, "d1")],
+        );
+        assert_eq!(result.executing_verified_attempts, 1);
+        assert_eq!(result.executing_attempt_ids, vec!["d"]);
+        assert!(result.basic_execution_observed());
     }
 
     #[test]
@@ -725,17 +891,26 @@ mod tests {
         assert!(record.identity_missing.is_empty());
         assert_eq!(record.runner(), runner());
 
-        let full =
-            json!({"thread_id":"t-1","observed_model_metadata_verified":true,"tool_operations":3});
+        let full = json!({"thread_id":"t-1","status":"completed",
+            "observed_model_metadata_verified":true,"tool_operations":3,
+            "runner":serde_json::to_value(&record).unwrap()});
         let attempt = qualification_attempt(&full, BTreeMap::new()).unwrap();
         assert_eq!(attempt.attempt_id, "t-1");
+        assert!(attempt.completed);
         assert!(attempt.model_metadata_verified);
         assert_eq!(attempt.tool_operations, 3);
+        assert_eq!(attempt.runner.as_ref(), Some(&record));
 
         let bare = json!({"thread_id":"t-2"});
         let attempt = qualification_attempt(&bare, BTreeMap::new()).unwrap();
+        assert!(!attempt.completed);
         assert!(!attempt.model_metadata_verified);
         assert_eq!(attempt.tool_operations, 0);
+        assert!(attempt.runner.is_none());
         assert!(qualification_attempt(&json!({}), BTreeMap::new()).is_err());
+        assert!(
+            qualification_attempt(&json!({"thread_id":"t-3","runner":42}), BTreeMap::new())
+                .is_err()
+        );
     }
 }
