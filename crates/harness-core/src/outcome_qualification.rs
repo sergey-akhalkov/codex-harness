@@ -61,12 +61,17 @@ pub struct MaterialIdentity {
 
 impl MaterialIdentity {
     /// Names of the absent material facts, in declaration order.
+    ///
+    /// A blank or literal `unknown` placeholder counts as absent, matching the
+    /// accounting rule for stale identity: it cannot authorize a comparison.
     pub fn missing(&self) -> Vec<String> {
         MATERIAL_FIELDS
             .iter()
             .filter(|name| {
-                self.declared(name)
-                    .is_none_or(|value| value.trim().is_empty())
+                self.declared(name).is_none_or(|value| {
+                    let value = value.trim();
+                    value.is_empty() || value.eq_ignore_ascii_case("unknown")
+                })
             })
             .map(|name| (*name).to_owned())
             .collect()
@@ -566,6 +571,10 @@ mod tests {
             ..runner()
         };
         assert_eq!(empty.missing_identity(), MATERIAL_FIELDS.to_vec());
+        // A literal `unknown` placeholder is not a declared material fact.
+        let mut placeholder = runner();
+        placeholder.identity.weights = Some(" unknown ".into());
+        assert_eq!(placeholder.missing_identity(), vec!["weights"]);
     }
 
     #[test]
