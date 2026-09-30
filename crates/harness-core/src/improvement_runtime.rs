@@ -25,7 +25,11 @@
 //!    client is explicit (never a PATH or provider fallback), and `protected`
 //!    names every allocation the installation must stay disjoint from (frozen
 //!    workloads, the other arm, prepared runtimes, the candidate checkout, the
-//!    immutable supervisor/oracle).
+//!    immutable supervisor/oracle). The declared client route and its explicit
+//!    overlay are written into the arm configuration, and every declared
+//!    setting is reconciled against the launch-time overrides the arm's own kit
+//!    profile would apply, so an overridden declaration refuses instead of
+//!    being recorded as consumed.
 //! 4. `ExperimentBindings::validate` / `verify_pre_attempt` before the first
 //!    measured attempt; [`verify_consumption`] additionally proves this arm's
 //!    home still consumes exactly the prepared runtime and content.
@@ -58,13 +62,13 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
 
-pub const RUNTIME_SCHEMA: u32 = 1;
+pub const RUNTIME_SCHEMA: u32 = 2;
 
 /// Provider id of the explicit local route written into every prepared arm.
 /// It matches the existing explicit local outcome route; no other provider is
@@ -258,9 +262,17 @@ fn ambient_user_home() -> Option<PathBuf> {
 /// (endpoint, served model and declared material identity) plus the declared
 /// reasoning effort. The catalogue is an external local file referenced from
 /// the arm configuration (`model_catalog_json`), never copied, generated or
-/// edited; it must stay resolvable and unchanged. The module writes no
-/// credentials, never falls back to another provider and records exactly what
-/// was declared (including missing identity facts) without inventing values.
+/// edited; it must stay resolvable and unchanged. The optional overlay is one
+/// explicit TOML file carrying the qualified local client settings that the
+/// route fields do not express (`features.code_mode = false`,
+/// `model_context_window`, web/sandbox/approval settings, ...); it is merged
+/// into the arm's base configuration, never into ambient state, and its file
+/// must stay resolvable and unchanged. Settings the arm's own kit profile
+/// would override at launch are refused instead of being silently rewritten,
+/// and every declared setting is re-verified through the same native
+/// precedence the launcher applies. The module writes no credentials, never
+/// falls back to another provider and records exactly what was declared
+/// (including missing identity facts) without inventing values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClientInputs {
@@ -269,6 +281,8 @@ pub struct ClientInputs {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogue: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<PathBuf>,
 }
 
 /// One explicit private runner file copied into the owned fresh home. The
@@ -344,9 +358,19 @@ pub struct InstalledLink {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogueRecord {
+pub struct FileIdentity {
     pub path: PathBuf,
     pub sha256: String,
+}
+
+/// One declared client setting exactly as it was written into the arm
+/// configuration, for drift checks and native-precedence reconciliation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeclaredSetting {
+    /// Dotted TOML path, for example `features.code_mode`.
+    pub key: String,
+    pub value: toml::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,16 +389,26 @@ pub struct ClientRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalogue: Option<CatalogueRecord>,
+    pub catalogue: Option<FileIdentity>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The effective arm configuration: the written base configuration, every
+/// declared client setting, the explicit overlay and the arm kit profile
+/// whose launch overrides were reconciled against those settings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConfigurationRecord {
     pub path: PathBuf,
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientRecord>,
+    pub settings: Vec<DeclaredSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<FileIdentity>,
+    /// The arm kit profile whose launch overrides were reconciled against the
+    /// declared settings; present whenever client inputs were declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit_profile: Option<FileIdentity>,
 }
 
 /// Compact facts reported by the real installation owner.
@@ -392,7 +426,7 @@ pub struct InstallationFacts {
 }
 
 /// Retained preparation and consumption identity of one ready arm.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArmRuntime {
     pub schema: u32,
@@ -463,6 +497,9 @@ pub struct Retirement {
 struct ValidatedClient {
     record: ClientRecord,
     config_bytes: Vec<u8>,
+    settings: Vec<DeclaredSetting>,
+    overlay: Option<FileIdentity>,
+    kit_profile: FileIdentity,
 }
 
 struct ValidatedPrivate {
@@ -690,15 +727,66 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
         ));
     }
 
-    let client = request.client.as_ref().map(validate_client).transpose()?;
+    let client = request
+        .client
+        .as_ref()
+        .map(validate_client)
+        .transpose()?
+        .map(|draft| -> io::Result<ValidatedClient> {
+            let settings = declared_settings(&draft.table)?;
+            let bytes = toml::to_string(&draft.table)
+                .map_err(io::Error::other)?
+                .into_bytes();
+            if bytes.len() > CONFIG_LIMIT {
+                return Err(invalid("the generated arm configuration exceeds its bound"));
+            }
+            let manifest = kit_manifest(&source)?;
+            let kit_profile_path = plain(&source.join(&manifest.profile))?;
+            let kit_profile = FileIdentity {
+                sha256: hash_file(
+                    "the arm kit profile",
+                    &kit_profile_path,
+                    CONFIG_LIMIT as u64,
+                )
+                .map_err(|error| invalid(format!("the arm kit profile is unresolved ({error})")))?,
+                path: kit_profile_path,
+            };
+            // Refuse declared settings the arm's own kit profile would override
+            // at launch: preparation never claims an unreachable value.
+            let scratch = tempfile::Builder::new()
+                .prefix("improvement-runtime-client-")
+                .tempdir()?;
+            fs::write(scratch.path().join("config.toml"), &bytes)?;
+            reconcile_effective(&kit_profile.path, scratch.path(), &settings)?;
+            Ok(ValidatedClient {
+                record: draft.record,
+                config_bytes: bytes,
+                settings,
+                overlay: draft.overlay,
+                kit_profile,
+            })
+        })
+        .transpose()?;
     let config_path = home.join("config.toml");
     match (&client, fs::symlink_metadata(&config_path)) {
         (Some(validated), Ok(_)) => {
-            verify_client_values(&config_path, &validated.record).map_err(|error| {
+            let bytes = fs::read(&config_path)?;
+            let table = parse_config_bytes(&bytes, "the existing arm configuration")?;
+            declared_settings_present(&table, &validated.settings).map_err(|error| {
                 invalid(format!(
                     "an existing config.toml does not match the declared client inputs ({error}); a fresh arm home is never merged"
                 ))
             })?;
+            verify_client_values(&table, &validated.record)?;
+            verify_file_identity(
+                "the arm kit profile",
+                &validated.kit_profile,
+                CONFIG_LIMIT as u64,
+            )?;
+            if let Some(overlay) = &validated.overlay {
+                verify_file_identity("the explicit client overlay", overlay, CONFIG_LIMIT as u64)?;
+            }
+            reconcile_effective(&validated.kit_profile.path, &home, &validated.settings)?;
         }
         (Some(_), Err(error)) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
@@ -721,7 +809,13 @@ fn prepare_plan(request: &ArmRequest) -> io::Result<Plan> {
     })
 }
 
-fn validate_client(client: &ClientInputs) -> io::Result<ValidatedClient> {
+struct ClientDraft {
+    record: ClientRecord,
+    table: toml::Table,
+    overlay: Option<FileIdentity>,
+}
+
+fn validate_client(client: &ClientInputs) -> io::Result<ClientDraft> {
     let runner = &client.runner;
     let endpoint = runner.endpoint.as_str();
     let authority = endpoint
@@ -772,35 +866,372 @@ fn validate_client(client: &ClientInputs) -> io::Result<ValidatedClient> {
     if let Some(effort) = &effort {
         bounded_token("the declared reasoning effort", effort, 64)?;
     }
-    let catalogue_sha256 = client
-        .catalogue
-        .as_ref()
-        .map(|path| {
+
+    // Explicit overlay file: bounded ordinary TOML carrying the qualified
+    // client settings beyond the route fields. Never ambient state.
+    let (overlay_table, overlay) = match &client.overlay {
+        Some(path) => {
             if !path.is_absolute() {
                 return Err(invalid(
-                    "the external catalogue must be an explicit absolute path",
+                    "the client overlay must be an explicit absolute TOML file",
                 ));
             }
-            hash_file("the external catalogue", path, FILE_LIMIT)
-                .map_err(|error| invalid(format!("the external catalogue is unresolved ({error})")))
-        })
-        .transpose()?;
-    let record = ClientRecord {
-        runner: RunnerRecord::new(&client.runner),
-        reasoning_effort: effort.clone(),
-        catalogue: match (&client.catalogue, catalogue_sha256) {
-            (Some(path), Some(sha256)) => Some(CatalogueRecord {
+            let sha256 = hash_file("the client overlay", path, CONFIG_LIMIT as u64)
+                .map_err(|error| invalid(format!("the client overlay is unresolved ({error})")))?;
+            let bytes = fs::read(path)?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| invalid("the client overlay is not UTF-8"))?;
+            let table: toml::Table = toml::from_str(text.trim_start_matches('\u{feff}'))
+                .map_err(|_| invalid("the client overlay is not a valid TOML table"))?;
+            (
+                Some(table),
+                Some(FileIdentity {
+                    path: plain(path)?,
+                    sha256,
+                }),
+            )
+        }
+        None => (None, None),
+    };
+
+    // Effective catalogue: declared by the client inputs and/or referenced by
+    // the overlay; both must agree and the file stays external and hashed.
+    let overlay_catalogue = overlay_table
+        .as_ref()
+        .and_then(|table| table.get("model_catalog_json"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from);
+    let catalogue = match (client.catalogue.clone(), overlay_catalogue) {
+        (Some(declared), Some(referenced)) => {
+            if !same_place(&declared, &referenced)? {
+                return Err(invalid(
+                    "the client overlay names a different catalogue than the accepted client inputs",
+                ));
+            }
+            Some(declared)
+        }
+        (Some(declared), None) => Some(declared),
+        (None, Some(referenced)) => {
+            if !referenced.is_absolute() {
+                return Err(invalid(
+                    "the catalogue reference must be an explicit absolute path",
+                ));
+            }
+            Some(referenced)
+        }
+        (None, None) => None,
+    };
+    let catalogue = catalogue
+        .as_ref()
+        .map(|path| {
+            let sha256 =
+                hash_file("the external catalogue", path, FILE_LIMIT).map_err(|error| {
+                    invalid(format!("the external catalogue is unresolved ({error})"))
+                })?;
+            Ok::<_, io::Error>(FileIdentity {
                 path: plain(path)?,
                 sha256,
-            }),
-            _ => None,
-        },
+            })
+        })
+        .transpose()?;
+
+    // The accepted route is preserved exactly: overlay declarations that
+    // contradict it are refused, never silently rewritten.
+    if let Some(table) = &overlay_table {
+        route_setting(table, "model", Some(runner.model.as_str()))?;
+        route_setting(table, "model_provider", Some(LOCAL_PROVIDER))?;
+        route_setting(table, "model_reasoning_effort", effort.as_deref())?;
+        if let Some(value) = table.get("model_catalog_json") {
+            let Some(accepted) = &catalogue else {
+                return Err(invalid(
+                    "the client overlay declares a catalogue but the accepted client inputs do not",
+                ));
+            };
+            let referenced = value.as_str().ok_or_else(|| {
+                invalid("the client overlay catalogue reference must be a string path")
+            })?;
+            if !same_place(Path::new(referenced), &accepted.path)? {
+                return Err(invalid(
+                    "the client overlay must not replace the accepted catalogue reference",
+                ));
+            }
+        }
+        for reserved in ["profile", "profiles", "projects"] {
+            if table.contains_key(reserved) {
+                return Err(invalid(format!(
+                    "the client overlay must not carry the {reserved} layer; keep it an explicit dispatch input"
+                )));
+            }
+        }
+        if let Some(providers) = table.get("model_providers") {
+            let providers = providers
+                .as_table()
+                .ok_or_else(|| invalid("the client overlay model_providers must be a table"))?;
+            for (id, value) in providers {
+                if id != LOCAL_PROVIDER {
+                    return Err(invalid(
+                        "the client overlay must not add alternate provider routes",
+                    ));
+                }
+                let provider = value
+                    .as_table()
+                    .ok_or_else(|| invalid("the client overlay provider must be a table"))?;
+                if let Some(base_url) = provider.get("base_url").and_then(toml::Value::as_str)
+                    && base_url != endpoint
+                {
+                    return Err(invalid(
+                        "the client overlay must not replace the accepted local endpoint",
+                    ));
+                }
+                if let Some(wire) = provider.get("wire_api").and_then(toml::Value::as_str)
+                    && wire != crate::outcome_qualification::WIRE_API
+                {
+                    return Err(invalid(
+                        "the client overlay must not replace the supported wire API",
+                    ));
+                }
+            }
+        }
+        if let Some(hooks) = table.get("features").and_then(|value| value.get("hooks"))
+            && hooks.as_bool() != Some(false)
+        {
+            return Err(invalid(
+                "a fresh arm home installs with hooks disabled; the client overlay must not request hooks",
+            ));
+        }
+    }
+
+    let mut table = route_table(&client.runner, effort.as_deref(), catalogue.as_ref())?;
+    if let Some(overlay_table) = overlay_table {
+        deep_merge(&mut table, overlay_table);
+    }
+    if toml::to_string(&table).map_err(io::Error::other)?.len() > CONFIG_LIMIT {
+        return Err(invalid("the generated arm configuration exceeds its bound"));
+    }
+    let record = ClientRecord {
+        runner: RunnerRecord::new(&client.runner),
+        reasoning_effort: effort,
+        catalogue,
     };
-    let config_bytes = client_configuration(client, effort.as_deref())?;
-    Ok(ValidatedClient {
+    Ok(ClientDraft {
         record,
-        config_bytes,
+        table,
+        overlay,
     })
+}
+
+/// One overlay declaration of an accepted route key must agree with the
+/// accepted inputs; an absent accepted value refuses a declared one instead of
+/// letting the overlay choose it.
+fn route_setting(table: &toml::Table, key: &str, accepted: Option<&str>) -> io::Result<()> {
+    let Some(value) = table.get(key) else {
+        return Ok(());
+    };
+    let Some(accepted) = accepted else {
+        return Err(invalid(format!(
+            "the client overlay declares {key} but the accepted client inputs do not; declare the accepted value instead"
+        )));
+    };
+    if value.as_str() != Some(accepted) {
+        return Err(invalid(format!(
+            "the client overlay must not replace the accepted {key}"
+        )));
+    }
+    Ok(())
+}
+
+/// The accepted route as a TOML table: model, provider, effort, catalogue
+/// reference and the explicit local provider entry.
+fn route_table(
+    runner: &LocalRunner,
+    effort: Option<&str>,
+    catalogue: Option<&FileIdentity>,
+) -> io::Result<toml::Table> {
+    let mut table = toml::Table::new();
+    table.insert("model".into(), toml::Value::String(runner.model.clone()));
+    table.insert(
+        "model_provider".into(),
+        toml::Value::String(LOCAL_PROVIDER.into()),
+    );
+    if let Some(effort) = effort {
+        table.insert(
+            "model_reasoning_effort".into(),
+            toml::Value::String(effort.to_owned()),
+        );
+    }
+    if let Some(catalogue) = catalogue {
+        table.insert(
+            "model_catalog_json".into(),
+            toml::Value::String(plain(&catalogue.path)?.to_string_lossy().into_owned()),
+        );
+    }
+    let mut provider = toml::Table::new();
+    provider.insert("name".into(), toml::Value::String("Local".into()));
+    provider.insert(
+        "base_url".into(),
+        toml::Value::String(runner.endpoint.clone()),
+    );
+    provider.insert(
+        "wire_api".into(),
+        toml::Value::String(crate::outcome_qualification::WIRE_API.into()),
+    );
+    let mut providers = toml::Table::new();
+    providers.insert(LOCAL_PROVIDER.into(), toml::Value::Table(provider));
+    table.insert("model_providers".into(), toml::Value::Table(providers));
+    Ok(table)
+}
+
+fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        let nested = matches!(
+            (base.get(&key), &value),
+            (Some(toml::Value::Table(_)), toml::Value::Table(_))
+        );
+        if nested {
+            if let (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) =
+                (base.get_mut(&key), value)
+            {
+                deep_merge(existing, incoming);
+            }
+            continue;
+        }
+        base.insert(key, value);
+    }
+}
+
+/// Every declared client setting as a bounded dotted path with its exact
+/// value, sorted for stable receipts.
+fn declared_settings(table: &toml::Table) -> io::Result<Vec<DeclaredSetting>> {
+    const MAX_SETTINGS: usize = 256;
+    let mut settings = Vec::new();
+    flatten_settings("", table, &mut settings)?;
+    settings.sort_by(|left, right| left.key.cmp(&right.key));
+    if settings.len() > MAX_SETTINGS {
+        return Err(invalid(
+            "the declared client configuration exceeds its bound",
+        ));
+    }
+    Ok(settings)
+}
+
+fn flatten_settings(
+    prefix: &str,
+    table: &toml::Table,
+    settings: &mut Vec<DeclaredSetting>,
+) -> io::Result<()> {
+    for (key, value) in table {
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(invalid(
+                "declared client setting keys must be plain dotted components",
+            ));
+        }
+        let dotted = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            toml::Value::Table(inner) => flatten_settings(&dotted, inner, settings)?,
+            leaf => settings.push(DeclaredSetting {
+                key: dotted,
+                value: leaf.clone(),
+            }),
+        }
+    }
+    Ok(())
+}
+
+fn lookup<'a>(table: &'a toml::Table, key: &str) -> Option<&'a toml::Value> {
+    let mut parts = key.split('.');
+    let mut current = table.get(parts.next()?)?;
+    for part in parts {
+        current = current.as_table()?.get(part)?;
+    }
+    Some(current)
+}
+
+fn parse_config_bytes(bytes: &[u8], name: &str) -> io::Result<toml::Table> {
+    if bytes.len() > CONFIG_LIMIT {
+        return Err(invalid(format!("{name} exceeds its bound")));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid(format!("{name} is not UTF-8")))?;
+    toml::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|_| invalid(format!("{name} is not valid TOML")))
+}
+
+fn declared_settings_present(table: &toml::Table, settings: &[DeclaredSetting]) -> io::Result<()> {
+    for setting in settings {
+        match lookup(table, &setting.key) {
+            Some(value) if *value == setting.value => {}
+            _ => {
+                return Err(invalid(format!(
+                    "the declared client setting {} changed since preparation",
+                    setting.key
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_file_identity(name: &str, identity: &FileIdentity, limit: u64) -> io::Result<()> {
+    let sha256 = hash_file(name, &identity.path, limit)
+        .map_err(|error| invalid(format!("{name} is unresolved ({error})")))?;
+    if sha256 != identity.sha256 {
+        return Err(invalid(format!("{name} changed since preparation")));
+    }
+    Ok(())
+}
+
+/// Reconcile the declared client settings against the launch-time overrides
+/// the installed launcher actually computes from the arm's own kit profile.
+/// A declared setting the kit profile would override at launch is refused
+/// instead of being counted as consumed.
+fn reconcile_effective(
+    kit_profile: &Path,
+    home: &Path,
+    settings: &[DeclaredSetting],
+) -> io::Result<()> {
+    let args = crate::portable_config::overrides(kit_profile, home, home)?;
+    let mut overridden: BTreeMap<String, toml::Value> = BTreeMap::new();
+    let (pairs, remainder) = args.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(invalid("native overrides are unbalanced"));
+    }
+    for pair in pairs {
+        if pair[0] != "-c" {
+            return Err(invalid("unexpected native override form"));
+        }
+        let encoded = pair[1]
+            .to_str()
+            .ok_or_else(|| invalid("a native override is not Unicode"))?;
+        let (key, value) = encoded
+            .split_once('=')
+            .ok_or_else(|| invalid("a native override is malformed"))?;
+        let parsed: toml::Table = toml::from_str(&format!("value={value}"))
+            .map_err(|_| invalid("a native override value is not TOML"))?;
+        overridden.insert(key.to_owned(), parsed["value"].clone());
+    }
+    for setting in settings {
+        if let Some(value) = overridden.get(&setting.key)
+            && *value != setting.value
+        {
+            return Err(invalid(format!(
+                "the arm kit profile would override the declared client setting {} at launch",
+                setting.key
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn kit_manifest(source: &Path) -> io::Result<inventory::Manifest> {
+    let bytes = fs::read(source.join("global/kit.json"))
+        .map_err(|error| invalid(format!("the arm kit manifest is unavailable ({error})")))?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid("the arm kit manifest is invalid"))
 }
 
 fn validate_private_inputs(
@@ -870,31 +1301,6 @@ fn validate_private_inputs(
         });
     }
     Ok(validated)
-}
-
-fn quote(value: &str) -> io::Result<String> {
-    serde_json::to_string(value).map_err(io::Error::other)
-}
-
-fn client_configuration(client: &ClientInputs, effort: Option<&str>) -> io::Result<Vec<u8>> {
-    let mut text = String::new();
-    text.push_str(&format!("model = {}\n", quote(&client.runner.model)?));
-    text.push_str(&format!("model_provider = {}\n", quote(LOCAL_PROVIDER)?));
-    if let Some(effort) = effort {
-        text.push_str(&format!("model_reasoning_effort = {}\n", quote(effort)?));
-    }
-    if let Some(catalogue) = &client.catalogue {
-        let path = plain(catalogue)?.to_string_lossy().into_owned();
-        text.push_str(&format!("model_catalog_json = {}\n", quote(&path)?));
-    }
-    text.push_str(&format!(
-        "\n[model_providers.{LOCAL_PROVIDER}]\nname = \"Local\"\nbase_url = {}\nwire_api = \"responses\"\n",
-        quote(&client.runner.endpoint)?
-    ));
-    if text.len() > CONFIG_LIMIT {
-        return Err(invalid("the generated arm configuration exceeds its bound"));
-    }
-    Ok(text.into_bytes())
 }
 
 /// Install one arm into its fresh owned homes through the real installation
@@ -1114,6 +1520,19 @@ fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
                 path: plain(&config_path)?,
                 sha256,
                 client: plan.client.as_ref().map(|client| client.record.clone()),
+                settings: plan
+                    .client
+                    .as_ref()
+                    .map(|client| client.settings.clone())
+                    .unwrap_or_default(),
+                overlay: plan
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.overlay.clone()),
+                kit_profile: plan
+                    .client
+                    .as_ref()
+                    .map(|client| client.kit_profile.clone()),
             })
         }
     };
@@ -1359,8 +1778,21 @@ pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
         if build_identity::hash_bytes(&bytes) != configuration.sha256 {
             return Err(invalid("the arm configuration changed since preparation"));
         }
+        let document = parse_config_bytes(&bytes, "the arm configuration")?;
+        declared_settings_present(&document, &configuration.settings)?;
         if let Some(client) = &configuration.client {
-            verify_client_values(&configuration.path, client)?;
+            verify_client_values(&document, client)?;
+            let kit_profile = configuration.kit_profile.as_ref().ok_or_else(|| {
+                invalid("the arm configuration record lost its kit profile identity")
+            })?;
+            if !inside(&kit_profile.path, &runtime.source) {
+                return Err(invalid("the recorded arm kit profile escapes its source"));
+            }
+            verify_file_identity("the arm kit profile", kit_profile, CONFIG_LIMIT as u64)?;
+            reconcile_effective(&kit_profile.path, &runtime.home, &configuration.settings)?;
+        }
+        if let Some(overlay) = &configuration.overlay {
+            verify_file_identity("the explicit client overlay", overlay, CONFIG_LIMIT as u64)?;
         }
     } else if runtime.client_configured() {
         return Err(invalid(
@@ -1416,15 +1848,7 @@ fn directory_link_unchanged(link: &InstalledLink) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_client_values(path: &Path, client: &ClientRecord) -> io::Result<()> {
-    let bytes = fs::read(path)?;
-    if bytes.len() > CONFIG_LIMIT {
-        return Err(invalid("the arm configuration exceeds its bound"));
-    }
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| invalid("the arm configuration is not UTF-8"))?;
-    let document: toml::Table = toml::from_str(text.trim_start_matches('\u{feff}'))
-        .map_err(|_| invalid("the arm configuration is not valid TOML"))?;
+fn verify_client_values(document: &toml::Table, client: &ClientRecord) -> io::Result<()> {
     let string = |name: &str| -> Option<String> {
         document
             .get(name)
@@ -1474,10 +1898,7 @@ fn verify_client_values(path: &Path, client: &ClientRecord) -> io::Result<()> {
                     "the arm configuration catalogue reference changed since preparation",
                 ));
             }
-            let sha256 = hash_file("the external catalogue", &catalogue.path, FILE_LIMIT)?;
-            if sha256 != catalogue.sha256 {
-                return Err(invalid("the external catalogue changed since preparation"));
-            }
+            verify_file_identity("the external catalogue", catalogue, FILE_LIMIT)?;
         }
         None => {
             if string("model_catalog_json").is_some() {

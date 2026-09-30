@@ -91,21 +91,38 @@ fn home() -> PathBuf {
 
 fn set_hooks(text: &mut String, enabled: bool) {
     let mut replaced = String::new();
-    let mut found = false;
+    let mut in_features = false;
+    let mut seen_features = false;
+    let mut done = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("hooks") && line.contains('=') {
-            replaced.push_str(&format!("hooks = {enabled}\n"));
-            found = true;
-        } else {
-            replaced.push_str(line);
-            replaced.push('\n');
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            if in_features && !done {
+                replaced.push_str(&format!("hooks = {enabled}\n"));
+                done = true;
+            }
+            in_features = trimmed == "[features]";
+            seen_features |= in_features;
         }
+        if in_features && !done && trimmed.starts_with("hooks") && line.contains('=') {
+            replaced.push_str(&format!("hooks = {enabled}\n"));
+            done = true;
+            continue;
+        }
+        replaced.push_str(line);
+        replaced.push('\n');
     }
-    if found {
-        *text = replaced;
+    if in_features && !done {
+        replaced.push_str(&format!("hooks = {enabled}\n"));
+        done = true;
+    }
+    *text = if done {
+        replaced
+    } else if seen_features {
+        format!("{replaced}hooks = {enabled}\n")
     } else {
-        text.push_str(&format!("\n[features]\nhooks = {enabled}\n"));
-    }
+        format!("{replaced}\n[features]\nhooks = {enabled}\n")
+    };
 }
 
 fn hooks_state(text: &str) -> bool {
@@ -248,7 +265,7 @@ fn kit_source(root: &Path, name: &str, marker: &str) -> PathBuf {
     .unwrap();
     fs::write(
         source.join("global/harness.config.toml"),
-        "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+        "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[features]\ncode_mode = true\napps = false\n",
     )
     .unwrap();
     fs::write(
@@ -352,7 +369,7 @@ fn arm_fixture(
     }
 }
 
-fn local_client(catalogue: &Path) -> ClientInputs {
+fn local_client(catalogue: &Path, overlay: Option<&Path>) -> ClientInputs {
     ClientInputs {
         runner: LocalRunner {
             endpoint: "http://127.0.0.1:45999/v1".into(),
@@ -365,6 +382,7 @@ fn local_client(catalogue: &Path) -> ClientInputs {
         },
         reasoning_effort: Some("low".into()),
         catalogue: Some(catalogue.to_path_buf()),
+        overlay: overlay.map(Path::to_path_buf),
     }
 }
 
@@ -416,11 +434,20 @@ fn arms_install_consume_their_own_runtime_and_retire_restores() {
     // ambient account is never read for these.
     let catalogue = root.join("model-catalogue.json");
     fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    // The qualified local client settings the route fields cannot express,
+    // including false-valued features. The guard below is real: this false
+    // declaration must shield the arm kit profile's `code_mode = true`.
+    let overlay = root.join("qualified-client.config.toml");
+    fs::write(
+        &overlay,
+        "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\ncode_mode_only = false\n",
+    )
+    .unwrap();
     let secret = "private-runner-input-sentinel";
     let private_source = root.join("runner.private");
     fs::write(&private_source, secret).unwrap();
     for arm in [&mut baseline, &mut candidate] {
-        arm.request.client = Some(local_client(&catalogue));
+        arm.request.client = Some(local_client(&catalogue, Some(&overlay)));
         arm.request.private_inputs = vec![PrivateInput {
             source: private_source.clone(),
             destination: "runner.private".into(),
@@ -542,11 +569,58 @@ fn arms_install_consume_their_own_runtime_and_retire_restores() {
         "model_provider = \"local\"",
         "model_reasoning_effort = \"low\"",
         "base_url = \"http://127.0.0.1:45999/v1\"",
+        "model_context_window = 65536",
+        "web_search = \"disabled\"",
+        "code_mode = false",
+        "code_mode_only = false",
         "hooks = false",
     ] {
         assert!(config_text.contains(expected), "{config_text}");
     }
     assert!(config_text.contains("model_catalog_json"));
+    let baseline_kit_profile = baseline_config
+        .kit_profile
+        .as_ref()
+        .expect("the declared client records its kit profile");
+    assert!(
+        baseline_config.overlay.is_some(),
+        "the explicit client overlay is retained"
+    );
+    assert!(
+        baseline_config
+            .settings
+            .iter()
+            .any(|setting| setting.key == "features.code_mode"
+                && setting.value == toml::Value::Boolean(false)),
+        "the false feature value is a declared setting"
+    );
+    // Native precedence: the launcher computes the arm kit profile's launch
+    // overrides; the false-valued feature shields the kit's `code_mode = true`
+    // while the kit's other defaults still reach the launch.
+    let launch_args = harness_core::portable_config::overrides(
+        &baseline_kit_profile.path,
+        &baseline_runtime.home,
+        &baseline_runtime.home,
+    )
+    .unwrap()
+    .iter()
+    .map(|value| value.to_string_lossy().into_owned())
+    .collect::<Vec<_>>();
+    assert!(
+        launch_args.iter().any(|arg| arg == "features.apps=false"),
+        "{launch_args:?}"
+    );
+    assert!(
+        !launch_args
+            .iter()
+            .any(|arg| arg.starts_with("features.code_mode=")),
+        "the declared false value must shield the kit profile's code_mode: {launch_args:?}"
+    );
+    assert!(
+        launch_args
+            .iter()
+            .any(|arg| arg == "web_search=\"disabled\"")
+    );
     assert!(
         baseline_runtime
             .commands
@@ -659,6 +733,58 @@ fn arms_install_consume_their_own_runtime_and_retire_restores() {
         .to_string();
     assert!(error.contains("configuration"), "{error}");
     fs::write(&candidate_config.path, &candidate_config_bytes).unwrap();
+    verify_consumption(&candidate_runtime).unwrap();
+
+    // A changed declared setting refuses even when the file is otherwise the
+    // prepared one: the effective client identity is the declared value, not
+    // merely the file's presence.
+    let falsified = candidate_config_bytes
+        .windows(b"code_mode = false".len())
+        .position(|window| window == b"code_mode = false")
+        .expect("the prepared configuration declares the false feature");
+    let mut changed = candidate_config_bytes.clone();
+    changed[falsified..falsified + b"code_mode = false".len()]
+        .copy_from_slice(b"code_mode = true ");
+    fs::write(&candidate_config.path, &changed).unwrap();
+    let error = verify_consumption(&candidate_runtime)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("configuration") || error.contains("code_mode"),
+        "{error}"
+    );
+    fs::write(&candidate_config.path, &candidate_config_bytes).unwrap();
+    verify_consumption(&candidate_runtime).unwrap();
+
+    // The explicit overlay is an external, drift-checked input.
+    let overlay_bytes = fs::read(&overlay).unwrap();
+    fs::write(
+        &overlay,
+        "model_context_window = 1\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\ncode_mode_only = false\n",
+    )
+    .unwrap();
+    let error = verify_consumption(&candidate_runtime)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("overlay"), "{error}");
+    fs::write(&overlay, &overlay_bytes).unwrap();
+    verify_consumption(&candidate_runtime).unwrap();
+
+    // The arm kit profile feeds the launcher's precedence: changing it refuses
+    // that arm while the other arm stays consumed.
+    let kit_profile = candidate.source.join("global/harness.config.toml");
+    let kit_profile_bytes = fs::read(&kit_profile).unwrap();
+    fs::write(
+        &kit_profile,
+        [kit_profile_bytes.as_slice(), b"web_search = \"enabled\"\n"].concat(),
+    )
+    .unwrap();
+    let error = verify_consumption(&candidate_runtime)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("kit profile"), "{error}");
+    verify_consumption(&baseline_runtime).unwrap();
+    fs::write(&kit_profile, &kit_profile_bytes).unwrap();
     verify_consumption(&candidate_runtime).unwrap();
 
     // Retirement restores the prepared homes: owned links and the
@@ -806,10 +932,112 @@ fn refusals_guard_overlap_missing_inputs_and_partial_state() {
     drop(codex_home);
 
     // Missing or mismatched client and runner inputs.
+    let present_catalogue = root.join("present-catalogue.json");
+    fs::write(&present_catalogue, br#"{"models":[]}"#).unwrap();
     let mut request = fixture.request.clone();
-    request.client = Some(local_client(&root.join("missing-catalogue.json")));
+    request.client = Some(local_client(&root.join("missing-catalogue.json"), None));
     let error = refused(&request);
     assert!(error.contains("catalogue"), "{error}");
+
+    // Explicit client overlay refusals: unresolved, contradictory or route
+    // replacing declarations never become an apparently ready arm.
+    let mut request = fixture.request.clone();
+    request.client = Some(local_client(
+        &present_catalogue,
+        Some(&root.join("missing-overlay.toml")),
+    ));
+    let error = refused(&request);
+    assert!(error.contains("overlay"), "{error}");
+    assert!(not_installed(&fixture.request.home));
+
+    let overlay = |name: &str, body: &str| -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, body).unwrap();
+        path
+    };
+    let cases: [(&str, &str, &str); 7] = [
+        (
+            "overlay-model.config.toml",
+            "model = \"other-model\"\n",
+            "must not replace the accepted model",
+        ),
+        (
+            "overlay-provider.config.toml",
+            "model_provider = \"xai\"\n",
+            "must not replace the accepted model_provider",
+        ),
+        (
+            "overlay-effort.config.toml",
+            "model_reasoning_effort = \"high\"\n",
+            "must not replace the accepted model_reasoning_effort",
+        ),
+        (
+            "overlay-endpoint.config.toml",
+            "[model_providers.local]\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+            "must not replace the accepted local endpoint",
+        ),
+        (
+            "overlay-route.config.toml",
+            "[model_providers.xai]\nname = \"xAI\"\nbase_url = \"http://127.0.0.1:2/v1\"\nwire_api = \"responses\"\n",
+            "alternate provider routes",
+        ),
+        (
+            "overlay-hooks.config.toml",
+            "[features]\nhooks = true\n",
+            "hooks",
+        ),
+        (
+            "overlay-trust.config.toml",
+            "[projects.'C:\\synthetic']\ntrust_level = \"trusted\"\n",
+            "projects",
+        ),
+    ];
+    for (name, body, expected) in cases {
+        let mut request = fixture.request.clone();
+        request.client = Some(local_client(&present_catalogue, Some(&overlay(name, body))));
+        let error = refused(&request);
+        assert!(error.contains(expected), "{name}: {error}");
+        assert!(not_installed(&fixture.request.home), "{name}");
+    }
+    let mut request = fixture.request.clone();
+    request.client = Some(local_client(
+        &present_catalogue,
+        Some(&overlay("overlay-invalid.config.toml", "model = [\n")),
+    ));
+    let error = refused(&request);
+    assert!(error.contains("overlay"), "{error}");
+
+    // A declared setting the arm's own kit profile would override at launch is
+    // refused instead of being recorded as consumed.
+    let mut request = fixture.request.clone();
+    request.client = Some(local_client(
+        &present_catalogue,
+        Some(&overlay(
+            "overlay-approval.config.toml",
+            "approval_policy = \"on-request\"\n",
+        )),
+    ));
+    let error = refused(&request);
+    assert!(error.contains("would override"), "{error}");
+    assert!(not_installed(&fixture.request.home));
+
+    // A reused home whose configuration no longer carries the declared client
+    // settings refuses instead of being merged.
+    let reused_home = prepare_home(&root.join("reused-home")).unwrap();
+    fs::write(
+        reused_home.join("config.toml"),
+        "model = \"other-model\"\nmodel_provider = \"local\"\n",
+    )
+    .unwrap();
+    let mut request = fixture.request.clone();
+    request.home = reused_home.clone();
+    request.client = Some(local_client(&present_catalogue, None));
+    let error = refused(&request);
+    assert!(
+        error.contains("does not match the declared client inputs"),
+        "{error}"
+    );
+    assert!(not_installed(&reused_home));
 
     let mut request = fixture.request.clone();
     request.upstream = root.join("missing-upstream.exe");
