@@ -1,25 +1,29 @@
 //! Thin binary over the `token-audit` library.
+use chrono::{DateTime, NaiveDate, Utc};
 use std::{env, io, io::Write, path::PathBuf, process::ExitCode};
 use token_audit::{
     BaselineDiff, Detail, Format, RETENTION_LIMIT, RetainedKind, SCHEMA_VERSION, ScanOptions,
-    analyze, baseline_diff, default_baseline_directory, default_retention_directory,
-    default_sessions_root, now, render_findings_json, render_findings_text, render_json,
-    render_text, resolve_baseline, retain_detail, save_baseline, scan, select_finding,
-    select_session, write_private_sources,
+    analyze, baseline_diff, default_baseline_directory, default_checkpoint_directory,
+    default_retention_directory, default_sessions_root, now, render_findings_json,
+    render_findings_text, render_json, render_text, resolve_baseline, retain_detail, save_baseline,
+    scan, select_finding, select_session, write_private_sources,
 };
 
 fn usage() -> String {
     format!(
         "token-audit report [--sessions DIR] [--days N] [--format json|text] [--private-sources PATH]
-token-audit findings [--sessions DIR] [--days N] [--format json|text] [--all-bases]
-token-audit baseline save [--sessions DIR] [--days N] [--format json|text]
-token-audit baseline diff [--sessions DIR] [--days N] [--format json|text] [--baseline NAME|latest]
+                    [--interval START..END] [--incremental]
+token-audit findings [--sessions DIR] [--days N] [--format json|text] [--all-bases] [--incremental]
+token-audit baseline save [--sessions DIR] [--days N] [--format json|text] [--incremental]
+token-audit baseline diff [--sessions DIR] [--days N] [--format json|text] [--baseline NAME|latest] [--incremental]
 token-audit detail --report PATH --session ID
 token-audit detail --findings PATH --finding ID
 token-audit detail --diff PATH --session ID | --group KIND:KEY | --sessions | --groups KIND [--offset N] [--limit N]
 Measured token-usage reports over local Codex rollout sessions: recorded counters, instruction bytes and coverage. No currency, quota or transcript content.
 Project identities are hashed; --private-sources PATH records local source digests and raw project names there instead, outside tracked sources.
 --days N bounds the scan to sessions with recorded activity within N days.
+--interval START..END selects interval accounting: recorded usage attributable to the half-open UTC window [START, END), where START and END are RFC3339 instants or YYYY-MM-DD dates. Lifetime session totals stay labeled as such; unknown allocations stay explicit. Interval output requires --format json because the bounded text presentation does not render it yet.
+--incremental reuses disposable local parser checkpoints under CODEX_HOME/harness/token-audit/checkpoints. Only files whose change identity proves the parsed prefix unchanged are not re-read; every unproven input is fully parsed. The report's incremental counters state bytes read, reused inputs and invalidation reasons.
 --format json prints the complete machine contract. --format text prints a bounded ranked summary and retains its complete same-scan JSON under CODEX_HOME/harness/token-audit/reports (newest 20 per kind); the summary names that path.
 baseline save publishes an immutable uniquely named snapshot under CODEX_HOME/harness/token-audit/baselines and updates its latest pointer; diff accepts the returned name, its basename or latest.
 baseline diff --format text is bounded: {} most significant movements per section inside {} bytes, with exact omitted counts; it retains the complete comparison and names its locator. --format json stays the complete machine contract.
@@ -62,6 +66,11 @@ fn report(args: &[String]) -> io::Result<ExitCode> {
     if options.all_bases {
         return Err(invalid("--all-bases applies to findings only"));
     }
+    if options.interval.is_some() && options.format() == Format::Text {
+        return Err(invalid(
+            "--format text does not present interval accounting; use --format json or omit --interval",
+        ));
+    }
     let root = match &options.sessions {
         Some(root) => root.clone(),
         None => default_sessions_root().ok_or_else(|| {
@@ -74,11 +83,7 @@ fn report(args: &[String]) -> io::Result<ExitCode> {
             root.display()
         )));
     }
-    let scanned = scan(&ScanOptions {
-        sessions_root: root,
-        days: options.days,
-        generated_at: now(),
-    })?;
+    let scanned = scan(&scan_options(&options, root, options.interval)?)?;
     if let Some(path) = &options.private_sources {
         write_private_sources(path, &scanned)?;
     }
@@ -117,6 +122,9 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
     if options.baseline.is_some() {
         return Err(invalid("--baseline applies to baseline diff only"));
     }
+    if options.interval.is_some() {
+        return Err(invalid("--interval applies to report only"));
+    }
     let root = match &options.sessions {
         Some(root) => root.clone(),
         None => default_sessions_root().ok_or_else(|| {
@@ -129,11 +137,7 @@ fn findings(args: &[String]) -> io::Result<ExitCode> {
             root.display()
         )));
     }
-    let scanned = scan(&ScanOptions {
-        sessions_root: root,
-        days: options.days,
-        generated_at: now(),
-    })?;
+    let scanned = scan(&scan_options(&options, root, None)?)?;
     if let Some(path) = &options.private_sources {
         write_private_sources(path, &scanned)?;
     }
@@ -334,6 +338,9 @@ fn baseline_run(args: &[String], diff_mode: bool) -> io::Result<ExitCode> {
     if options.all_bases {
         return Err(invalid("--all-bases applies to findings only"));
     }
+    if options.interval.is_some() {
+        return Err(invalid("--interval applies to report only"));
+    }
     let requested = options.take_baseline();
     let root = match &options.sessions {
         Some(root) => root.clone(),
@@ -350,11 +357,7 @@ fn baseline_run(args: &[String], diff_mode: bool) -> io::Result<ExitCode> {
     let directory = default_baseline_directory().ok_or_else(|| {
         invalid("CODEX_HOME or USERPROFILE is required for the baseline directory")
     })?;
-    let scanned = scan(&ScanOptions {
-        sessions_root: root,
-        days: options.days,
-        generated_at: now(),
-    })?;
+    let scanned = scan(&scan_options(&options, root, None)?)?;
     if !diff_mode {
         let name = save_baseline(&directory, &scanned)?;
         let rendered = match options.format() {
@@ -408,6 +411,62 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+/// One scan request from the shared options, resolving the checkpoint
+/// directory when incremental reuse is enabled.
+fn scan_options(
+    options: &Options,
+    root: PathBuf,
+    interval: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> io::Result<ScanOptions> {
+    let checkpoints = if options.incremental {
+        Some(default_checkpoint_directory().ok_or_else(|| {
+            invalid("CODEX_HOME or USERPROFILE is required for checkpoints; drop --incremental")
+        })?)
+    } else {
+        None
+    };
+    Ok(ScanOptions {
+        sessions_root: root,
+        days: options.days,
+        generated_at: now(),
+        interval,
+        checkpoints,
+    })
+}
+
+/// One interval boundary: an RFC3339 instant or a date meaning its UTC
+/// midnight.
+fn parse_window_boundary(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(instant) = DateTime::parse_from_rfc3339(raw) {
+        return Some(instant.with_timezone(&Utc));
+    }
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| naive.and_utc())
+}
+
+/// Parses `START..END` into the half-open UTC window.
+fn parse_interval(raw: &str) -> io::Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let (start, end) = raw.split_once("..").ok_or_else(|| {
+        invalid(
+            "--interval needs START..END, for example 2026-09-20..2026-09-21 or 2026-09-20T00:00:00Z..2026-09-21T00:00:00Z",
+        )
+    })?;
+    let start = parse_window_boundary(start.trim()).ok_or_else(|| {
+        invalid("--interval start must be an RFC3339 UTC instant or a YYYY-MM-DD date")
+    })?;
+    let end = parse_window_boundary(end.trim()).ok_or_else(|| {
+        invalid("--interval end must be an RFC3339 UTC instant or a YYYY-MM-DD date")
+    })?;
+    if start >= end {
+        return Err(invalid(
+            "--interval start must be before its end; the window is half-open [start, end)",
+        ));
+    }
+    Ok((start, end))
+}
+
 #[derive(Default)]
 struct Options {
     sessions: Option<PathBuf>,
@@ -416,6 +475,8 @@ struct Options {
     private_sources: Option<PathBuf>,
     all_bases: bool,
     baseline: Option<String>,
+    interval: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    incremental: bool,
 }
 
 impl Options {
@@ -444,6 +505,11 @@ impl Options {
                 "--private-sources" => options.private_sources = Some(PathBuf::from(value()?)),
                 "--all-bases" => options.all_bases = true,
                 "--baseline" => options.baseline = Some(value()?),
+                "--incremental" => options.incremental = true,
+                "--interval" => {
+                    let raw = value()?;
+                    options.interval = Some(parse_interval(&raw)?);
+                }
                 "--days" => {
                     let raw = value()?;
                     options.days = Some(

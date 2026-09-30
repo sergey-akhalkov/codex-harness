@@ -13,11 +13,12 @@
 //! receive byte counts, identities and counters, not instruction or transcript
 //! content.
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -41,8 +42,18 @@ const EVENT_TYPES: [&str; 6] = [
     "compacted",
 ];
 
+/// Version of the checkpoint envelope written by [`ParserCheckpoint`].
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+/// Semantics version of the parser and of the state a checkpoint carries.
+///
+/// Any change to recognised events, aggregation or the checkpointed state
+/// shape must bump this value: stored checkpoints that do not match are
+/// discarded and the file is fully parsed again.
+pub const PARSER_VERSION: u32 = 1;
+
 /// Per-file counters for malformed, unknown or skipped records.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
     /// Non-blank lines read from the file.
     pub lines: u64,
@@ -59,7 +70,7 @@ pub struct Coverage {
 }
 
 /// Recorded instruction sizes; texts are measured and never retained.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionBytes {
     /// Bytes of recorded `session_meta` base instructions.
     pub base_bytes: u64,
@@ -68,7 +79,7 @@ pub struct InstructionBytes {
 }
 
 /// One deduplicated model response with its recorded turn association.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnUsage {
     /// Recorded turn identity; `None` when the record carries none.
     pub turn_id: Option<String>,
@@ -80,6 +91,169 @@ pub struct TurnUsage {
     pub turn_usage: Option<Usage>,
     /// Cumulative thread usage when the record carries it.
     pub thread_usage: Option<Usage>,
+    /// Recorded event timestamp of the usage record; `None` when it carried
+    /// none. This is when the record was written, not when the provider
+    /// generated tokens.
+    #[serde(with = "optional_timestamp")]
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Model in effect from the recorded turn context, when identifiable.
+    pub model: Option<String>,
+    /// Reasoning effort in effect from the recorded turn context, when
+    /// identifiable.
+    pub effort: Option<String>,
+}
+
+/// One recorded usage amount with the recorded event timestamp beside it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    #[serde(with = "optional_timestamp")]
+    pub timestamp: Option<DateTime<Utc>>,
+    pub usage: Usage,
+}
+
+/// Strong change-generation identity of one rollout file, read from its open
+/// handle: volume and file identity, NTFS change time and size.
+///
+/// Equality of all three proves that no data was written between the two
+/// observations. Size and modification time alone are not proof: an in-place
+/// edit can preserve both, while NTFS updates the change time for every data
+/// or metadata modification and `SetFileTime` resets it to the current time
+/// instead of restoring an arbitrary value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub volume_serial: u64,
+    pub file_id: [u8; 16],
+    pub change_time: i64,
+    pub size: u64,
+}
+
+impl FileIdentity {
+    /// Identity of an open handle. Unavailable when the platform or the
+    /// filesystem does not expose it, which forces full parsing.
+    #[cfg(windows)]
+    pub fn of_file(file: &File) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FILE_ID_INFO, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let handle = file.as_raw_handle();
+        let mut basic = FILE_BASIC_INFO::default();
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                std::ptr::from_mut(&mut basic).cast(),
+                u32::try_from(size_of::<FILE_BASIC_INFO>()).unwrap_or_default(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut id = FILE_ID_INFO::default();
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                std::ptr::from_mut(&mut id).cast(),
+                u32::try_from(size_of::<FILE_ID_INFO>()).unwrap_or_default(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            volume_serial: id.VolumeSerialNumber,
+            file_id: id.FileId.Identifier,
+            change_time: basic.ChangeTime,
+            size: file.metadata()?.len(),
+        })
+    }
+
+    /// Identity is unavailable on platforms without the query; callers fall
+    /// back to full parsing.
+    #[cfg(not(windows))]
+    pub fn of_file(_file: &File) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file change identity is unavailable on this platform",
+        ))
+    }
+
+    /// Identity of a path, for diagnostics and tests.
+    pub fn of_path(path: &Path) -> std::io::Result<Self> {
+        Self::of_file(&File::open(path)?)
+    }
+
+    /// `Ok(())` when `current` still identifies the same unchanged bytes.
+    ///
+    /// The returned reason is the most informative difference, and every
+    /// difference forces full parsing.
+    pub fn verify_unchanged(&self, current: &Self) -> Result<(), &'static str> {
+        if self.volume_serial != current.volume_serial || self.file_id != current.file_id {
+            return Err("file_replaced");
+        }
+        if current.size < self.size {
+            return Err("file_truncated");
+        }
+        if current.size > self.size {
+            return Err("file_grew");
+        }
+        if self.change_time != current.change_time {
+            return Err("file_modified");
+        }
+        Ok(())
+    }
+}
+
+/// Why a stored checkpoint could not be interpreted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointError {
+    /// The stored bytes are not a checkpoint of this shape.
+    Corrupt,
+    /// The stored envelope or parser version differs from the current one.
+    VersionMismatch,
+}
+
+/// Parser state at the end of the last complete line of one rollout file,
+/// together with the change identity of the bytes it covers.
+///
+/// A checkpoint is a disposable local cache. It never replaces reading the
+/// file: reuse additionally requires the stored identity to still describe
+/// the bytes before [`ParserCheckpoint::boundary`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ParserCheckpoint {
+    format: u32,
+    parser: u32,
+    boundary: u64,
+    identity: FileIdentity,
+    state: Reader,
+}
+
+impl ParserCheckpoint {
+    /// Offset after the last complete line covered by this checkpoint.
+    pub fn boundary(&self) -> u64 {
+        self.boundary
+    }
+
+    /// Change identity of the bytes covered by this checkpoint.
+    pub fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Serializes the checkpoint for local storage.
+    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(std::io::Error::other)
+    }
+
+    /// Parses stored bytes, rejecting foreign formats and parser versions.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CheckpointError> {
+        let checkpoint: Self =
+            serde_json::from_slice(bytes).map_err(|_| CheckpointError::Corrupt)?;
+        if checkpoint.format != CHECKPOINT_FORMAT_VERSION || checkpoint.parser != PARSER_VERSION {
+            return Err(CheckpointError::VersionMismatch);
+        }
+        Ok(checkpoint)
+    }
 }
 
 /// One parsed rollout session file.
@@ -99,8 +273,69 @@ pub struct SessionSummary {
     pub tool_output_bytes: BTreeMap<String, u64>,
     /// Deduplicated responses in recorded order with turn association.
     pub turns: Vec<TurnUsage>,
+    /// Recorded cumulative counter snapshots in event order, with their
+    /// recorded timestamps. Increments between them are the interval evidence
+    /// of sessions that recorded no per-response usage.
+    pub cumulative: Vec<UsageSnapshot>,
+    /// Recorded usage of response records that carried no stable identity, so
+    /// duplicates cannot be detected and interval allocation stays unknown.
+    pub unidentified: Vec<UsageSnapshot>,
+    /// Response identities whose repeated records disagreed; their usage
+    /// stays unknown.
+    pub conflicts: BTreeSet<String>,
     /// Open source handle retained for caller-side identity checks.
     pub source: Option<File>,
+}
+
+/// One reader pass over one rollout file.
+#[derive(Debug)]
+pub struct IncrementalRead {
+    pub summary: SessionSummary,
+    /// Source bytes read by this pass.
+    pub bytes_read: u64,
+    /// JSON events parsed by this pass; a reused prefix is not re-parsed.
+    pub events_parsed: u64,
+    /// The supplied checkpoint's proven prefix was reused.
+    pub reused: bool,
+    /// Why a supplied checkpoint was not reused.
+    pub invalidation: Option<&'static str>,
+    /// Fresh checkpoint for the parsed prefix; absent when the file changed
+    /// while it was read or when nothing new needed storing.
+    pub checkpoint: Option<ParserCheckpoint>,
+}
+
+/// RFC3339 round-trip for recorded instants.
+///
+/// The workspace chrono build does not enable serde support, and the
+/// checkpoint format stores instants as RFC3339 text with nanosecond
+/// precision so a resumed read observes exactly the parsed instant.
+mod optional_timestamp {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<DateTime<Utc>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(instant) => {
+                serializer.serialize_some(&instant.to_rfc3339_opts(SecondsFormat::Nanos, true))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<DateTime<Utc>>, D::Error> {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        raw.map(|text| {
+            DateTime::parse_from_rfc3339(&text)
+                .map(|instant| instant.with_timezone(&Utc))
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+    }
 }
 
 /// Byte size of one recorded tool output: the string length when the record
@@ -253,7 +488,7 @@ fn only(values: &BTreeSet<String>) -> Option<String> {
     (values.len() == 1).then(|| values.first().unwrap().clone())
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Reader {
     thread_ids: Vec<String>,
     parents: BTreeSet<String>,
@@ -264,7 +499,7 @@ struct Reader {
     versions: BTreeSet<String>,
     projects: BTreeSet<String>,
     warnings: BTreeSet<String>,
-    counts: BTreeMap<&'static str, u64>,
+    counts: BTreeMap<String, u64>,
     responses: BTreeMap<String, Usage>,
     conflicts: BTreeSet<String>,
     children: BTreeSet<String>,
@@ -281,11 +516,19 @@ struct Reader {
     coverage: Coverage,
     instructions: InstructionBytes,
     turn_usages: Vec<TurnUsage>,
+    /// Recorded model/effort per turn identity from `turn_context` events.
+    contexts: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// Most recent recorded model/effort, in event order.
+    context: Option<(Option<String>, Option<String>)>,
+    /// Recorded cumulative snapshots in event order.
+    cumulative: Vec<UsageSnapshot>,
+    /// Recorded amounts of response records without a stable identity.
+    unidentified: Vec<UsageSnapshot>,
 }
 
 impl Reader {
     fn bump(&mut self, key: &'static str) {
-        *self.counts.entry(key).or_default() += 1;
+        *self.counts.entry(key.to_owned()).or_default() += 1;
     }
     fn warn(&mut self, code: &str) {
         self.warnings.insert(code.to_owned());
@@ -370,19 +613,28 @@ impl Reader {
                 }
             }
         } else if kind == "turn_context" {
-            if let Some(model) = identifier(&p["model"]) {
-                self.models.insert(model);
+            let model = identifier(&p["model"]);
+            if let Some(model) = &model {
+                self.models.insert(model.clone());
             } else {
                 self.warn("missing_model_context");
             }
             let effort = p.get("effort").unwrap_or(&p["reasoning_effort"]);
-            if let Some(e) = effort.as_str().filter(|v| {
-                ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(v)
-            }) {
-                self.efforts.insert(e.to_owned());
+            let effort = effort
+                .as_str()
+                .filter(|v| {
+                    ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(v)
+                })
+                .map(str::to_owned);
+            if let Some(e) = &effort {
+                self.efforts.insert(e.clone());
             } else {
                 self.warn("missing_reasoning_context");
             }
+            if let Some(turn) = identifier(&p["turn_id"]) {
+                self.contexts.insert(turn, (model.clone(), effort.clone()));
+            }
+            self.context = Some((model, effort));
             for value in std::iter::once(&p["cwd"]).chain(list(&p["workspace_roots"])) {
                 if let Some(label) = value.as_str().and_then(project_label) {
                     self.projects.insert(label);
@@ -402,7 +654,11 @@ impl Reader {
                 self.warn("cumulative_usage_decreased");
             }
             self.previous = Some(next.clone());
-            self.usage = next;
+            self.usage = next.clone();
+            self.cumulative.push(UsageSnapshot {
+                timestamp: timestamp(&event["timestamp"]),
+                usage: next,
+            });
         } else if kind == "event_msg" && p["type"] == "task_started" {
             self.bump("task_started");
             Self::stamp(&mut self.turns, &event);
@@ -415,6 +671,7 @@ impl Reader {
             self.bump("turn_aborted");
         } else if kind == "token_usage_record" {
             let next = usage(&p["usage"]);
+            let recorded_at = timestamp(&event["timestamp"]);
             if let Some(id) = identifier(&p["response_id"]) {
                 if let Some(previous) = self.responses.get(&id) {
                     if previous != &next {
@@ -423,18 +680,31 @@ impl Reader {
                         self.warn("conflicting_response_id");
                     }
                 } else {
+                    let turn_id = identifier(&p["turn_id"]);
+                    let context = turn_id
+                        .as_ref()
+                        .and_then(|turn| self.contexts.get(turn).cloned())
+                        .or_else(|| self.context.clone());
+                    let (model, effort) = context.unwrap_or((None, None));
                     self.responses.insert(id.clone(), next.clone());
                     Self::stamp(&mut self.turns, &event);
                     self.turn_usages.push(TurnUsage {
-                        turn_id: identifier(&p["turn_id"]),
+                        turn_id,
                         response_id: Some(id),
                         usage: next.clone(),
                         turn_usage: usage_snapshot(&p["turn_token_usage"]),
                         thread_usage: usage_snapshot(&p["thread_token_usage"]),
+                        timestamp: recorded_at,
+                        model,
+                        effort,
                     });
                 }
             } else {
                 self.warn("missing_response_id");
+                self.unidentified.push(UsageSnapshot {
+                    timestamp: recorded_at,
+                    usage: next.clone(),
+                });
             }
             self.check_usage(&next);
             if next["reasoning_output_tokens"]
@@ -478,7 +748,7 @@ impl Reader {
                     .any(|m| head.starts_with(m))
                     {
                         self.bump("hook_messages");
-                        *self.counts.entry("hook_chars").or_default() +=
+                        *self.counts.entry("hook_chars".to_owned()).or_default() +=
                             text.chars().count() as u64;
                     } else if head.starts_with("<turn_aborted")
                         || head.starts_with("the user interrupted")
@@ -542,6 +812,9 @@ impl Reader {
             self.responses.clear();
             self.children.clear();
             self.turn_usages.clear();
+            self.cumulative.clear();
+            self.unidentified.clear();
+            self.conflicts.clear();
         }
         if self.parents.len() > 1 {
             self.warn("conflicting_parent_ids");
@@ -637,6 +910,9 @@ impl Reader {
             instructions: self.instructions,
             tool_output_bytes: self.tool_output_bytes,
             turns: self.turn_usages,
+            cumulative: self.cumulative,
+            unidentified: self.unidentified,
+            conflicts: self.conflicts,
             source: None,
         }
     }
@@ -644,15 +920,68 @@ impl Reader {
 
 /// Reads one rollout session file tolerantly; unreadable input yields warnings.
 pub fn read(path: &Path) -> SessionSummary {
-    let mut reader = Reader {
+    read_incremental(path, None).summary
+}
+
+/// Reads one rollout file, reusing a supplied checkpoint only when its stored
+/// identity still proves the bytes before its boundary unchanged.
+///
+/// Every uncertainty falls back to parsing from the start of the file: an
+/// unavailable or changed identity, a boundary past the current size and an
+/// unreadable checkpoint never suppress parsing. The trailing line is
+/// consumed for the returned summary but stays outside the returned
+/// checkpoint, so a later pass re-reads it until it is complete.
+pub fn read_incremental(path: &Path, checkpoint: Option<ParserCheckpoint>) -> IncrementalRead {
+    let fresh = || Reader {
         usage: unknown_usage(),
         ..Reader::default()
     };
+    let mut reader = fresh();
     let mut held = None;
-    match File::open(path) {
-        Ok(file) => {
+    let mut bytes_read = 0u64;
+    let mut events_parsed = 0u64;
+    let mut reused = false;
+    let mut invalidation = None;
+    let mut identity_before = None;
+    let mut identity_after = None;
+    let mut start = 0u64;
+    let mut boundary = 0u64;
+    let mut boundary_state = None;
+    if let Ok(mut file) = File::open(path) {
+        identity_before = FileIdentity::of_file(&file).ok();
+        if let Some(stored) = checkpoint {
+            match identity_before {
+                Some(current) => match stored.identity.verify_unchanged(&current) {
+                    Ok(()) if stored.boundary <= current.size => {
+                        start = stored.boundary;
+                        boundary = stored.boundary;
+                        reader = stored.state;
+                        reused = true;
+                    }
+                    Ok(()) => invalidation = Some("file_boundary_unreachable"),
+                    Err(reason) => invalidation = Some(reason),
+                },
+                None => invalidation = Some("identity_unavailable"),
+            }
+        }
+        let mut readable = true;
+        if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+            // Defensive: a regular file seek does not fail in practice, and a
+            // failure still cannot suppress parsing.
+            reused = false;
+            invalidation = Some("resume_failed");
+            start = 0;
+            boundary = 0;
+            reader = fresh();
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                reader.warn("unreadable_input");
+                readable = false;
+            }
+        }
+        if readable {
             let mut stream = BufReader::new(file);
             let mut line = Vec::new();
+            let mut consumed = start;
             loop {
                 line.clear();
                 // A malformed giant line cannot force unbounded allocation.
@@ -661,28 +990,54 @@ pub fn read(path: &Path) -> SessionSummary {
                     .read_until(b'\n', &mut line);
                 match count {
                     Ok(0) => break,
-                    Ok(_) if line.len() as u64 > MAX_RECORD_BYTES => {
-                        reader.warn("oversized_jsonl_record");
-                        reader.coverage.oversized_lines += 1;
-                        if line.last() != Some(&b'\n') && stream.skip_until(b'\n').is_err() {
-                            reader.warn("unreadable_input");
-                            break;
-                        }
-                        continue;
+                    Ok(read) => {
+                        consumed += read as u64;
+                        bytes_read += read as u64;
                     }
-                    Ok(_) => {}
                     Err(_) => {
                         reader.warn("unreadable_input");
                         break;
                     }
                 }
+                let terminated = line.last() == Some(&b'\n');
+                if !terminated {
+                    // Anything after the last complete line is consumed for
+                    // the returned summary but stays outside the
+                    // checkpointed prefix, so the next pass re-reads it.
+                    boundary_state = Some(reader.clone());
+                }
+                if line.len() as u64 > MAX_RECORD_BYTES {
+                    reader.warn("oversized_jsonl_record");
+                    reader.coverage.oversized_lines += 1;
+                    if terminated {
+                        boundary = consumed;
+                    } else {
+                        match stream.skip_until(b'\n') {
+                            Ok(0) => {}
+                            Ok(skipped) => {
+                                consumed += skipped as u64;
+                                bytes_read += skipped as u64;
+                                boundary = consumed;
+                            }
+                            Err(_) => {
+                                reader.warn("unreadable_input");
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if line.iter().all(u8::is_ascii_whitespace) {
+                    if terminated {
+                        boundary = consumed;
+                    }
                     continue;
                 }
                 reader.coverage.lines += 1;
                 match serde_json::from_slice(&line) {
                     Ok(event) => {
                         reader.coverage.events += 1;
+                        events_parsed += 1;
                         reader.event(event);
                     }
                     Err(_) => {
@@ -690,20 +1045,51 @@ pub fn read(path: &Path) -> SessionSummary {
                         reader.coverage.corrupt_lines += 1;
                     }
                 }
+                if terminated {
+                    boundary = consumed;
+                }
             }
+            identity_after = FileIdentity::of_file(stream.get_ref()).ok();
             held = Some(stream.into_inner());
+        } else {
+            identity_after = None;
+            held = Some(file);
         }
-        Err(_) => reader.warn("unreadable_input"),
+    } else {
+        reader.warn("unreadable_input");
     }
+    let stable = identity_before.is_some() && identity_before == identity_after;
+    let nothing_new = reused && bytes_read == 0;
+    let stored_state = if stable && !nothing_new {
+        Some(boundary_state.unwrap_or_else(|| reader.clone()))
+    } else {
+        None
+    };
     let mut summary = reader.finish();
     summary.source = held;
-    summary
+    let checkpoint = stored_state
+        .zip(identity_after)
+        .map(|(state, identity)| ParserCheckpoint {
+            format: CHECKPOINT_FORMAT_VERSION,
+            parser: PARSER_VERSION,
+            boundary,
+            identity,
+            state,
+        });
+    IncrementalRead {
+        summary,
+        bytes_read,
+        events_parsed,
+        reused,
+        invalidation,
+        checkpoint,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{io::Write, path::PathBuf};
 
     fn write(dir: &Path, name: &str, events: &[Value]) -> PathBuf {
         let path = dir.join(name);
@@ -935,5 +1321,362 @@ mod tests {
         assert!(session.warnings.contains("unreadable_input"));
         assert_eq!(session.coverage, Coverage::default());
         assert_eq!(session.row["id"], Value::Null);
+    }
+
+    fn stamped(mut event: Value, text: &str) -> Value {
+        event["timestamp"] = text.into();
+        event
+    }
+
+    fn frame(volume: u64, file: u8, change: i64, size: u64) -> FileIdentity {
+        FileIdentity {
+            volume_serial: volume,
+            file_id: [file; 16],
+            change_time: change,
+            size,
+        }
+    }
+
+    #[test]
+    fn identity_verification_reports_the_first_material_difference() {
+        let base = frame(1, 7, 10, 100);
+        assert!(base.verify_unchanged(&base).is_ok());
+        assert_eq!(
+            base.verify_unchanged(&frame(2, 7, 10, 100)),
+            Err("file_replaced")
+        );
+        assert_eq!(
+            base.verify_unchanged(&frame(1, 7, 10, 40)),
+            Err("file_truncated")
+        );
+        assert_eq!(
+            base.verify_unchanged(&frame(1, 7, 10, 140)),
+            Err("file_grew")
+        );
+        assert_eq!(
+            base.verify_unchanged(&frame(1, 7, 11, 100)),
+            Err("file_modified")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn in_place_mutation_with_preserved_size_and_time_changes_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(root.path(), "identity.jsonl", &[meta("thread_identity")]);
+        let first = FileIdentity::of_path(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let position = bytes.len() / 2;
+        bytes[position] = if bytes[position] == b'x' { b'y' } else { b'x' };
+        let mut handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        handle.write_all(&bytes).unwrap();
+        handle.sync_all().unwrap();
+        handle.set_modified(modified).unwrap();
+        drop(handle);
+        let preserved = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            preserved
+                .duration_since(modified)
+                .is_ok_and(|delta| delta.as_millis() < 1),
+            "the modification time was not preserved: {preserved:?} vs {modified:?}"
+        );
+        let second = FileIdentity::of_path(&path).unwrap();
+        assert_eq!(second.size, first.size);
+        assert_eq!(second.file_id, first.file_id);
+        assert_ne!(
+            second.change_time, first.change_time,
+            "a write must advance the NTFS change time even when the write time is restored"
+        );
+        assert_eq!(first.verify_unchanged(&second), Err("file_modified"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_and_truncation_change_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(root.path(), "replaced.jsonl", &[meta("thread_one")]);
+        let first = FileIdentity::of_path(&path).unwrap();
+        assert!(
+            first
+                .verify_unchanged(&FileIdentity::of_path(&path).unwrap())
+                .is_ok()
+        );
+        std::fs::remove_file(&path).unwrap();
+        let text = format!("{}\n", meta("thread_one"));
+        std::fs::write(&path, text).unwrap();
+        let replaced = FileIdentity::of_path(&path).unwrap();
+        assert!(first.verify_unchanged(&replaced).is_err());
+        std::fs::write(&path, "{}").unwrap();
+        let truncated = FileIdentity::of_path(&path).unwrap();
+        assert_eq!(replaced.verify_unchanged(&truncated), Err("file_truncated"));
+    }
+
+    #[test]
+    fn usage_records_keep_recorded_timestamps_and_turn_context_attribution() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first_context = context();
+        first_context["payload"]["turn_id"] = "turn_one".into();
+        let mut second_context = context();
+        second_context["payload"]["model"] = "other-model".into();
+        second_context["payload"]["turn_id"] = "turn_two".into();
+        let path = write(
+            root.path(),
+            "attribution.jsonl",
+            &[
+                meta("thread_attribution"),
+                first_context,
+                stamped(
+                    record("turn_one", "resp_one", 10, 10),
+                    "2026-09-20T10:00:00Z",
+                ),
+                second_context,
+                stamped(
+                    record("turn_two", "resp_two", 20, 30),
+                    "2026-09-20T11:00:00Z",
+                ),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.turns.len(), 2);
+        assert_eq!(
+            session.turns[0].timestamp,
+            timestamp(&json!("2026-09-20T10:00:00Z"))
+        );
+        assert_eq!(session.turns[0].model.as_deref(), Some("fixture-model"));
+        assert_eq!(session.turns[0].effort.as_deref(), Some("high"));
+        assert_eq!(session.turns[1].model.as_deref(), Some("other-model"));
+        assert_eq!(
+            session.turns[1].timestamp,
+            timestamp(&json!("2026-09-20T11:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn cumulative_snapshots_and_unidentified_records_keep_their_recorded_data() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = |amount: u64, stamp: &str| {
+            stamped(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":counts(amount)}}}),
+                stamp,
+            )
+        };
+        let mut unnamed = record("turn_one", "unused", 5, 5);
+        unnamed["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("response_id");
+        let path = write(
+            root.path(),
+            "evidence.jsonl",
+            &[
+                meta("thread_evidence"),
+                context(),
+                snapshot(10, "2026-09-20T10:00:00Z"),
+                snapshot(20, "2026-09-20T11:00:00Z"),
+                stamped(unnamed, "2026-09-20T11:30:00Z"),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.cumulative.len(), 2);
+        assert_eq!(
+            session.cumulative[0].timestamp,
+            timestamp(&json!("2026-09-20T10:00:00Z"))
+        );
+        assert_eq!(session.cumulative[0].usage["input_tokens"], Some(10));
+        assert_eq!(session.cumulative[1].usage["input_tokens"], Some(20));
+        assert_eq!(session.unidentified.len(), 1);
+        assert_eq!(session.unidentified[0].usage["input_tokens"], Some(5));
+        assert_eq!(
+            session.unidentified[0].timestamp,
+            timestamp(&json!("2026-09-20T11:30:00Z"))
+        );
+    }
+
+    #[test]
+    fn an_unchanged_checkpointed_read_reuses_the_prefix_without_reading() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "resume.jsonl",
+            &[
+                meta("thread_resume"),
+                context(),
+                stamped(
+                    record("turn_one", "resp_one", 10, 10),
+                    "2026-09-20T10:00:00Z",
+                ),
+            ],
+        );
+        let first = read_incremental(&path, None);
+        assert!(!first.reused);
+        assert_eq!(first.invalidation, None);
+        assert_eq!(first.bytes_read, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(first.events_parsed, 3);
+        let checkpoint = first.checkpoint.clone().unwrap();
+        assert_eq!(
+            checkpoint.boundary(),
+            std::fs::metadata(&path).unwrap().len()
+        );
+        let second = read_incremental(&path, Some(checkpoint));
+        assert!(second.reused);
+        assert_eq!(second.invalidation, None);
+        assert_eq!(second.bytes_read, 0);
+        assert_eq!(second.events_parsed, 0);
+        assert!(
+            second.checkpoint.is_none(),
+            "an unchanged input needs no rewritten checkpoint"
+        );
+        assert_eq!(second.summary.row, first.summary.row);
+        assert_eq!(second.summary.fingerprint, first.summary.fingerprint);
+        assert_eq!(second.summary.coverage, first.summary.coverage);
+        assert_eq!(second.summary.turns, first.summary.turns);
+        assert_eq!(second.summary.warnings, first.summary.warnings);
+    }
+
+    #[test]
+    fn a_partial_trailing_line_is_re_read_until_complete() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("partial.jsonl");
+        let lines = [meta("thread_partial").to_string(), context().to_string()];
+        let third = stamped(
+            record("turn_one", "resp_one", 10, 10),
+            "2026-09-20T10:00:00Z",
+        )
+        .to_string();
+        let cut = third.len() - 5;
+        std::fs::write(
+            &path,
+            [lines[0].as_str(), lines[1].as_str(), &third[..cut]].join("\n"),
+        )
+        .unwrap();
+        let first = read_incremental(&path, None);
+        assert!(first.summary.warnings.contains("corrupt_jsonl"));
+        let checkpoint = first.checkpoint.clone().unwrap();
+        assert_eq!(
+            checkpoint.boundary(),
+            (lines[0].len() + lines[1].len() + 2) as u64
+        );
+        // The unchanged partial tail is re-read from the last complete line
+        // and is never covered by the checkpoint.
+        let unchanged = read_incremental(&path, Some(checkpoint.clone()));
+        assert!(unchanged.reused);
+        // Only the unterminated fragment after the last complete line is
+        // re-read; everything before the boundary is reused.
+        assert_eq!(unchanged.bytes_read, cut as u64);
+        assert_eq!(unchanged.summary.row, first.summary.row);
+        assert_eq!(unchanged.summary.coverage, first.summary.coverage);
+        // Completing the event grows the file: growth alone cannot prove the
+        // prefix unchanged, so the file is parsed in full and the completed
+        // event is consumed exactly once.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&third.as_bytes()[cut..]).unwrap();
+        drop(file);
+        let full = read(&path);
+        let resumed = read_incremental(&path, Some(checkpoint));
+        assert!(!resumed.reused);
+        assert_eq!(resumed.invalidation, Some("file_grew"));
+        assert_eq!(resumed.bytes_read, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(resumed.summary.row, full.row);
+        assert_eq!(resumed.summary.coverage, full.coverage);
+        assert_eq!(resumed.summary.turns, full.turns);
+        assert_eq!(resumed.summary.turns.len(), 1);
+        assert!(!resumed.summary.warnings.contains("corrupt_jsonl"));
+    }
+
+    #[test]
+    fn a_changed_file_forces_a_full_parse_with_a_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "grown.jsonl",
+            &[meta("thread_grown"), context()],
+        );
+        let first = read_incremental(&path, None);
+        let checkpoint = first.checkpoint.clone().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(format!("{}\n", record("turn_one", "resp_one", 10, 10)).as_bytes())
+            .unwrap();
+        drop(file);
+        let resumed = read_incremental(&path, Some(checkpoint));
+        assert!(!resumed.reused);
+        assert_eq!(resumed.invalidation, Some("file_grew"));
+        assert_eq!(
+            resumed.bytes_read,
+            std::fs::metadata(&path).unwrap().len(),
+            "an unproven prefix cannot reduce reads"
+        );
+        let full = read(&path);
+        assert_eq!(resumed.summary.row, full.row);
+        assert_eq!(resumed.summary.coverage, full.coverage);
+        assert_eq!(resumed.summary.turns, full.turns);
+    }
+
+    #[test]
+    fn checkpoints_reject_corrupt_bytes_and_foreign_versions() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "checkpoint.jsonl",
+            &[meta("thread_checkpoint")],
+        );
+        let checkpoint = read_incremental(&path, None).checkpoint.unwrap();
+        let bytes = checkpoint.to_bytes().unwrap();
+        let restored = ParserCheckpoint::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.boundary(), checkpoint.boundary());
+        assert!(matches!(
+            ParserCheckpoint::from_bytes(b"not a checkpoint"),
+            Err(CheckpointError::Corrupt)
+        ));
+        let foreign =
+            String::from_utf8(bytes)
+                .unwrap()
+                .replacen("\"parser\":1", "\"parser\":999", 1);
+        assert!(matches!(
+            ParserCheckpoint::from_bytes(foreign.as_bytes()),
+            Err(CheckpointError::VersionMismatch)
+        ));
+    }
+
+    #[test]
+    fn resuming_from_a_checkpoint_matches_a_full_read_of_the_same_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "equivalent.jsonl",
+            &[
+                meta("thread_equivalent"),
+                context(),
+                stamped(
+                    record("turn_one", "resp_one", 10, 10),
+                    "2026-09-20T10:00:00Z",
+                ),
+                snapshot_event(20, "2026-09-20T11:00:00Z"),
+            ],
+        );
+        let checkpoint = read_incremental(&path, None).checkpoint.unwrap();
+        let full = read(&path);
+        let resumed = read_incremental(&path, Some(checkpoint));
+        assert_eq!(resumed.summary.row, full.row);
+        assert_eq!(resumed.summary.fingerprint, full.fingerprint);
+        assert_eq!(resumed.summary.coverage, full.coverage);
+        assert_eq!(resumed.summary.instructions, full.instructions);
+        assert_eq!(resumed.summary.tool_output_bytes, full.tool_output_bytes);
+        assert_eq!(resumed.summary.turns, full.turns);
+        assert_eq!(resumed.summary.cumulative, full.cumulative);
+        assert_eq!(resumed.summary.conflicts, full.conflicts);
+    }
+
+    fn snapshot_event(amount: u64, stamp: &str) -> Value {
+        stamped(
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":counts(amount)}}}),
+            stamp,
+        )
     }
 }

@@ -16,6 +16,197 @@ pub const FORMAT_TOKEN_COUNT: &str = "event_msg_token_count";
 /// Newer `token_usage_record` format.
 pub const FORMAT_USAGE_RECORD: &str = "token_usage_record";
 
+/// Version of the declared accounting contract and of the interval usage
+/// output. Bumped when the meaning of the accounting fields changes.
+pub const ACCOUNTING_VERSION: u32 = 1;
+/// Version of the operational incremental counters.
+pub const INCREMENTAL_VERSION: u32 = 1;
+/// Accounting mode: lifetime totals of sessions active inside a window.
+pub const MODE_ACTIVITY: &str = "activity";
+/// Accounting mode: usage attributable to a declared UTC interval.
+pub const MODE_INTERVAL: &str = "interval";
+
+/// Day grouping of the activity-shaped buckets: the day a session started,
+/// never daily spending.
+pub const DAY_BASIS_SESSION_START: &str = "session_start_lifetime";
+/// Interval basis built from recorded per-response usage deltas.
+pub const BASIS_RESPONSE_DELTA: &str = "response_delta";
+/// Interval basis built from increments between recorded cumulative counters.
+pub const BASIS_CUMULATIVE_INCREMENT: &str = "cumulative_increment";
+/// Attribution bucket for usage units without recorded model or effort.
+pub const ATTRIBUTION_UNASSIGNED: &str = "unassigned";
+
+/// Declared accounting semantics of one scan.
+#[derive(Clone, Debug, Serialize)]
+pub struct Accounting {
+    /// Version of this declaration and of the interval usage contract.
+    pub version: u32,
+    /// `activity` or `interval`.
+    pub mode: String,
+    /// Activity window of the scan.
+    pub window_days: Option<u32>,
+    /// Day grouping of the activity-shaped buckets in this report. They are
+    /// session lifetime aggregates, not spending per day.
+    pub day_basis: &'static str,
+    /// Declared interval of an interval scan.
+    pub interval: Option<IntervalWindow>,
+}
+
+impl Accounting {
+    /// Activity declaration for a scan bounded by recorded session activity.
+    pub fn activity(window_days: Option<u32>) -> Self {
+        Self {
+            version: ACCOUNTING_VERSION,
+            mode: MODE_ACTIVITY.to_owned(),
+            window_days,
+            day_basis: DAY_BASIS_SESSION_START,
+            interval: None,
+        }
+    }
+}
+
+/// Declared half-open UTC interval of one interval scan.
+#[derive(Clone, Debug, Serialize)]
+pub struct IntervalWindow {
+    /// Inclusive UTC start, RFC3339.
+    pub start: String,
+    /// Exclusive UTC end, RFC3339.
+    pub end: String,
+    /// Recorded values the window filters: `recorded_event_timestamp`.
+    pub basis: &'static str,
+    /// Where the instants come from.
+    pub timestamp_source: &'static str,
+    /// Boundary convention.
+    pub boundary: &'static str,
+    pub policy: IntervalPolicy,
+}
+
+/// Explicit reset, gap and boundary rules of interval accounting.
+#[derive(Clone, Debug, Serialize)]
+pub struct IntervalPolicy {
+    pub duplication: &'static str,
+    pub cumulative: &'static str,
+    pub reset: &'static str,
+    pub boundary_crossing: &'static str,
+    pub missing_timestamp: &'static str,
+    pub attribution: &'static str,
+}
+
+/// Attributable interval usage of one session.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionInterval {
+    /// `response_delta`, `cumulative_increment` or `unavailable`.
+    pub basis: &'static str,
+    /// Recorded usage attributable to the interval.
+    pub usage: TokenTotals,
+    /// Recorded amounts whose interval allocation stays unknown.
+    pub unallocated: TokenTotals,
+    /// Unknown allocation counts per reason code.
+    pub unallocated_events: BTreeMap<String, u64>,
+    /// Attributed models of in-window usage; `unassigned` when none.
+    pub models: Vec<String>,
+    /// Attributed efforts of in-window usage; `unassigned` when none.
+    pub efforts: Vec<String>,
+    /// Attributable usage that day buckets could not resolve.
+    pub day_unresolved: TokenTotals,
+}
+
+/// Aggregate interval usage of one scan.
+#[derive(Clone, Debug, Serialize)]
+pub struct IntervalUsage {
+    pub usage: TokenTotals,
+    pub unallocated: TokenTotals,
+    pub unallocated_events: BTreeMap<String, u64>,
+    pub coverage: IntervalCoverage,
+    pub by_model: Vec<IntervalBucket>,
+    pub by_effort: Vec<IntervalBucket>,
+    /// Attributable usage per recorded event day (UTC), never session start.
+    pub by_day: Vec<IntervalBucket>,
+    /// Attributable usage the day buckets could not resolve, so
+    /// `by_day` plus this remainder equals `usage`.
+    pub day_unresolved: TokenTotals,
+}
+
+/// Attributable interval usage of one bucket key.
+#[derive(Clone, Debug, Serialize)]
+pub struct IntervalBucket {
+    pub key: String,
+    /// Sessions contributing attributable usage to this key.
+    pub sessions: usize,
+    /// In-window usage units of this key: responses or cumulative steps.
+    pub units: u64,
+    pub usage: TokenTotals,
+}
+
+/// Interval coverage counters of one scan.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct IntervalCoverage {
+    pub sessions_with_usage: usize,
+    pub sessions_with_unallocated: usize,
+    pub sessions_without_evidence: usize,
+    pub response_events_inside: u64,
+    pub response_events_before: u64,
+    pub response_events_after: u64,
+    pub response_events_undated: u64,
+    pub response_events_conflicting: u64,
+    pub response_events_unidentified: u64,
+    pub cumulative_steps_inside: u64,
+    pub cumulative_steps_before: u64,
+    pub cumulative_steps_after: u64,
+    pub cumulative_steps_boundary: u64,
+    pub cumulative_steps_reset: u64,
+    pub cumulative_steps_incomplete: u64,
+    pub cumulative_steps_undated: u64,
+    /// In-window cumulative steps that cross a UTC day boundary, whose amount
+    /// is attributable to the interval but not resolvable to one day.
+    pub cumulative_steps_day_crossing: u64,
+}
+
+/// Versioned operational counters of one analyzer scan.
+///
+/// These counters are mechanical I/O and timing observations. They are
+/// excluded from full-scan equivalence because they describe how the scan was
+/// performed, not what it found.
+#[derive(Clone, Debug, Serialize)]
+pub struct IncrementalStats {
+    pub version: u32,
+    pub enabled: bool,
+    pub files_discovered: usize,
+    pub files_reused: usize,
+    pub files_full_parsed: usize,
+    pub bytes_read: u64,
+    pub bytes_discovered: u64,
+    pub events_parsed: u64,
+    /// Full parses per invalidation reason.
+    pub invalidations: BTreeMap<String, u64>,
+    pub checkpoints_written: usize,
+    pub checkpoint_write_failures: usize,
+    pub checkpoints_pruned: usize,
+    /// Measured wall time of the scan, in milliseconds.
+    pub scan_millis: u64,
+}
+
+impl IncrementalStats {
+    /// An analyzer scan that parsed every discovered file.
+    pub fn disabled() -> Self {
+        Self {
+            version: INCREMENTAL_VERSION,
+            enabled: false,
+            files_discovered: 0,
+            files_reused: 0,
+            files_full_parsed: 0,
+            bytes_read: 0,
+            bytes_discovered: 0,
+            events_parsed: 0,
+            invalidations: BTreeMap::new(),
+            checkpoints_written: 0,
+            checkpoint_write_failures: 0,
+            checkpoints_pruned: 0,
+            scan_millis: 0,
+        }
+    }
+}
+
 /// Output format shared by the commands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -155,6 +346,8 @@ pub struct SessionRow {
     pub elapsed_seconds: Option<i64>,
     pub partial: bool,
     pub warnings: Vec<String>,
+    /// Interval attribution of this session; present in interval scans only.
+    pub interval: Option<SessionInterval>,
 }
 
 /// Aggregate over sessions sharing one key.
@@ -225,6 +418,12 @@ pub struct Report {
     pub by_day: Vec<Bucket>,
     pub totals: Bucket,
     pub coverage: CoverageReport,
+    /// Declared accounting semantics of this scan.
+    pub accounting: Accounting,
+    /// Attributable interval usage; present in interval scans only.
+    pub interval: Option<IntervalUsage>,
+    /// Operational counters of the scan's reader use.
+    pub incremental: IncrementalStats,
     pub limitation: &'static str,
 }
 

@@ -22,13 +22,16 @@ pub use baseline::{
 pub use findings::{Finding, FindingEvidence, FindingsReport, ValidationPlan, analyze};
 pub use identity::write_private_sources;
 pub use model::{
-    Bucket, ContextAggregate, CoverageReport, Format, Report, Scan, SessionContext, SessionRow,
-    TokenTotals,
+    Accounting, Bucket, ContextAggregate, CoverageReport, Format, IncrementalStats, IntervalBucket,
+    IntervalCoverage, IntervalPolicy, IntervalUsage, IntervalWindow, Report, Scan, SessionContext,
+    SessionInterval, SessionRow, TokenTotals,
 };
 pub use render::{
     PRESENTATION_LIMIT, render_findings_json, render_findings_text, render_json, render_text,
 };
-pub use report::{ScanOptions, default_sessions_root, discover, now, scan};
+pub use report::{
+    ScanOptions, default_checkpoint_directory, default_sessions_root, discover, now, scan,
+};
 pub use retention::{
     Detail, Kind as RetainedKind, RETENTION_LIMIT,
     default_directory as default_retention_directory, retain as retain_detail, select_finding,

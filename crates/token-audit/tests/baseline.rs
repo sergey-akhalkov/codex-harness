@@ -12,8 +12,8 @@ use std::{
     process::{Command, Output, Stdio},
 };
 use token_audit::{
-    BaselineDiff, Bucket, ContextAggregate, CoverageReport, Report, Scan, SessionContext,
-    SessionRow, TokenTotals, baseline_diff, now, save_baseline,
+    Accounting, BaselineDiff, Bucket, ContextAggregate, CoverageReport, IncrementalStats, Report,
+    Scan, SessionContext, SessionRow, TokenTotals, baseline_diff, now, save_baseline,
 };
 
 /// `FILE_SHARE_READ`: open a file so that replacing it is a sharing violation.
@@ -215,6 +215,7 @@ fn scan_with(stamp: chrono::DateTime<chrono::Utc>, sessions: &[(&str, Option<u64
             } else {
                 Vec::new()
             },
+            interval: None,
         });
     }
     coverage.usage_basis = basis.clone();
@@ -244,6 +245,9 @@ fn scan_with(stamp: chrono::DateTime<chrono::Utc>, sessions: &[(&str, Option<u64
         by_day: vec![bucket.clone()],
         totals: bucket,
         coverage,
+        accounting: Accounting::activity(None),
+        interval: None,
+        incremental: IncrementalStats::disabled(),
         limitation: "fixture scan",
     };
     Scan {
