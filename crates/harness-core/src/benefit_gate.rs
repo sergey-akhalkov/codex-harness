@@ -13,9 +13,14 @@
 //! contradictory or malformed ones - so a newer record is never silently
 //! skipped in favor of an older adoption. [`assess`] classifies the newest
 //! attributable record; [`default_allowed`] is true only for an adoption whose
-//! recorded comparison is complete, arithmetically consistent and within its
-//! declared tolerance. These checks validate what the record says; they are
-//! not independent execution and not proof of the underlying experiment.
+//! recorded comparison is complete, arithmetically consistent, within its
+//! declared tolerance and records a positive effect: an improved quality
+//! outcome or a reduced candidate time. A record that stays within tolerance
+//! only because quality is unchanged and the candidate is not faster - still
+//! slower, or exactly at baseline - is a consistent record, not a demonstrated
+//! improvement, so it cannot authorize a default. These checks validate what
+//! the record says; they are not independent execution and not proof of the
+//! underlying experiment.
 
 pub const GATE_PREFIX: &str = "benefit-gate v1";
 
@@ -116,6 +121,8 @@ pub enum Limitation {
     CandidateArm,
     ArmsNotDistinct,
     Accounting,
+    ToleratedRegressionNotBenefit,
+    NoPositiveEffect,
 }
 
 impl Limitation {
@@ -143,6 +150,10 @@ impl Limitation {
             Self::CandidateArm => "candidate arm missing",
             Self::ArmsNotDistinct => "baseline and candidate arms are not distinct",
             Self::Accounting => "accounting basis missing",
+            Self::ToleratedRegressionNotBenefit => {
+                "candidate slower within tolerance: nonregression is not a positive effect"
+            }
+            Self::NoPositiveEffect => "no positive quality or time effect recorded",
         }
     }
 }
@@ -236,8 +247,9 @@ pub fn assess<'a>(records: &'a [GateRecord], item: &str) -> Option<Assessment<'a
 }
 
 /// True only when the newest attributable record is an adoption the recorded
-/// comparison supports. A missing, incomplete, contradictory, malformed or
-/// non-adoption record leaves the improvement unadopted.
+/// comparison supports and records a positive effect for quality or time. A
+/// missing, incomplete, contradictory, malformed, non-adoption or
+/// consistent-without-benefit record leaves the improvement unadopted.
 pub fn default_allowed(records: &[GateRecord], item: &str) -> bool {
     assess(records, item).is_some_and(|assessment| assessment.verdict == Verdict::Consistent)
 }
@@ -328,6 +340,30 @@ fn classify(record: &GateRecord) -> (Verdict, Vec<Limitation>) {
     }
     if record.accounting.as_deref().is_none_or(str::is_empty) {
         limitations.push(Limitation::Accounting);
+    }
+
+    // An otherwise consistent record is not a demonstrated improvement by
+    // itself: the adoption must record a positive effect. Unchanged quality
+    // with the candidate not faster is a consistent-but-inert comparison, and
+    // a regression that stays inside the declared tolerance is tolerated
+    // variation, not a benefit. This last check runs only when no earlier
+    // limitation already denies the record, so an unsupported record keeps its
+    // primary reasons instead of collecting a redundant trailing phrase.
+    if limitations.is_empty()
+        && let (Some(baseline_seconds), Some(candidate_seconds), Some(_)) =
+            (baseline_seconds, candidate_seconds, regression)
+    {
+        let quality = record.quality_outcome();
+        let positive =
+            quality == Some(QualityOutcome::Improved) || candidate_seconds < baseline_seconds;
+        if !positive {
+            let computed = (candidate_seconds - baseline_seconds) / baseline_seconds * 100.0;
+            limitations.push(if computed > 0.0 {
+                Limitation::ToleratedRegressionNotBenefit
+            } else {
+                Limitation::NoPositiveEffect
+            });
+        }
     }
 
     if limitations.is_empty() {
@@ -431,10 +467,13 @@ mod tests {
                 ("regression_percent=-1.0", "regression_percent=0.0"),
             ],
         );
-        assert!(
-            default_allowed(&parse_gate_comments(&[boundary]), "item-a"),
-            "a zero-tolerance record with no regression is consistent"
+        let records = parse_gate_comments(&[boundary]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::NoPositiveEffect],
+            "an arithmetically consistent record with no effect is not a demonstrated improvement"
         );
+        assert!(!default_allowed(&records, "item-a"));
     }
 
     #[test]
@@ -603,9 +642,83 @@ mod tests {
                 ("regression_percent=-1.0", "regression_percent=5.0"),
             ],
         );
+        let records = parse_gate_comments(&[within]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::ToleratedRegressionNotBenefit],
+            "an unchanged-quality regression is tolerated, not a demonstrated improvement"
+        );
         assert!(
-            default_allowed(&parse_gate_comments(&[within]), "item-a"),
-            "a regression inside the declared tolerance remains consistent"
+            !default_allowed(&records, "item-a"),
+            "staying inside tolerance does not turn a regression into a benefit"
+        );
+    }
+
+    #[test]
+    fn consistent_fields_without_a_positive_effect_are_not_a_demonstrated_improvement() {
+        // The audit counterexample: every numeric field is internally
+        // consistent, the arms are distinct and the accounting label is
+        // present, yet the candidate is not faster and quality is unchanged.
+        // Arithmetic and an accounting string alone must not label this a
+        // demonstrated improvement.
+        let no_change = variant(
+            "item-a",
+            &[
+                ("candidate_seconds=99.0", "candidate_seconds=100.0"),
+                ("regression_percent=-1.0", "regression_percent=0.0"),
+            ],
+        );
+        let records = parse_gate_comments(&[no_change]);
+        let assessment = assess(&records, "item-a").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::Unsupported);
+        assert_eq!(assessment.limitations, vec![Limitation::NoPositiveEffect]);
+        assert!(!default_allowed(&records, "item-a"));
+
+        // An unchanged-quality adoption that is slower but stays inside the
+        // declared tolerance is tolerated variation, not a benefit.
+        let tolerated = variant(
+            "item-a",
+            &[
+                ("candidate_seconds=99.0", "candidate_seconds=104.0"),
+                ("regression_percent=-1.0", "regression_percent=4.0"),
+            ],
+        );
+        let records = parse_gate_comments(&[tolerated]);
+        assert_eq!(
+            limitations_of(&records, "item-a"),
+            vec![Limitation::ToleratedRegressionNotBenefit]
+        );
+        assert!(!default_allowed(&records, "item-a"));
+
+        // A recorded quality improvement stays a positive effect even when the
+        // candidate time regresses inside the declared tolerance: the time
+        // change is permitted noncritical variation for the quality objective.
+        let quality_first = variant(
+            "item-a",
+            &[
+                ("quality=unchanged", "quality=improved"),
+                ("candidate_seconds=99.0", "candidate_seconds=104.0"),
+                ("regression_percent=-1.0", "regression_percent=4.0"),
+            ],
+        );
+        assert!(
+            default_allowed(&parse_gate_comments(&[quality_first]), "item-a"),
+            "an improved quality outcome with an in-tolerance regression is supported"
+        );
+
+        // A record that is already unsupported for another reason keeps its
+        // primary limitation instead of collecting a redundant trailing one.
+        let missing_accounting = variant(
+            "item-a",
+            &[
+                (" accounting=check+coordination+rework", ""),
+                ("candidate_seconds=99.0", "candidate_seconds=100.0"),
+                ("regression_percent=-1.0", "regression_percent=0.0"),
+            ],
+        );
+        assert_eq!(
+            limitations_of(&parse_gate_comments(&[missing_accounting]), "item-a"),
+            vec![Limitation::Accounting]
         );
     }
 
