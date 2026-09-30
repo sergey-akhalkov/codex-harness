@@ -3,17 +3,26 @@
 use harness_core::{
     build_identity::hash_file,
     outcome_qualification::{
-        QualificationAttempt, QualificationStatus, RepeatabilityPolicy, RunnerRecord, drift,
-        qualification_attempt, qualify, smoke,
+        API_OBSERVED_LIMITS, ApiObservationPlan, ApiObservations, ApiObservedPolicy, ClientInput,
+        ObservationFailureKind, QualificationAttempt, QualificationMode, QualificationStatus,
+        RepeatabilityPolicy, RunnerRecord, collect_observations, drift, observed_drift,
+        qualification_attempt, qualify, qualify_api_observed, recheck_observations, smoke,
     },
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::{
     fs,
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -963,4 +972,746 @@ fn attempt_runner_identity_drift_blocks_qualification() {
     assert!(result.blocks_comparisons());
     assert_eq!(result.runner_mismatch.len(), 1);
     assert!(result.runner_mismatch[0].changed.is_empty());
+}
+
+/// One owned loopback JSON fixture for declared local API observations. It
+/// answers every request from its current state (with optional per-request
+/// overrides) and records the request targets; nothing leaves loopback, no
+/// model is involved and no private body enters a public error.
+struct ObservationServer {
+    address: SocketAddr,
+    paths: Arc<Mutex<BTreeMap<String, ObservedResponse>>>,
+    overrides: Arc<Mutex<BTreeMap<usize, ObservedResponse>>>,
+    targets: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ObservedResponse {
+    status: u16,
+    body: Vec<u8>,
+    chunked: bool,
+    raw: bool,
+}
+
+impl ObservedResponse {
+    fn json(value: &Value) -> Self {
+        Self {
+            status: 200,
+            body: serde_json::to_vec(value).unwrap(),
+            chunked: false,
+            raw: false,
+        }
+    }
+    fn status(code: u16) -> Self {
+        Self {
+            status: code,
+            body: b"{\"message\":\"private fixture body\"}".to_vec(),
+            chunked: false,
+            raw: false,
+        }
+    }
+    fn raw(body: &str) -> Self {
+        Self {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            chunked: false,
+            raw: true,
+        }
+    }
+    fn chunked(body: &str) -> Self {
+        Self {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            chunked: true,
+            raw: false,
+        }
+    }
+    fn render(&self) -> Vec<u8> {
+        if self.raw {
+            return self.body.clone();
+        }
+        let mut response = format!("HTTP/1.1 {} Fixture\r\n", self.status);
+        if self.chunked {
+            response.push_str("Transfer-Encoding: chunked\r\n");
+        } else {
+            response.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
+        response.push_str("Content-Type: application/json\r\nConnection: close\r\n\r\n");
+        if self.chunked {
+            response.push_str(&format!(
+                "{:x}\r\n{}\r\n0\r\n\r\n",
+                self.body.len(),
+                String::from_utf8_lossy(&self.body)
+            ));
+        } else {
+            response.push_str(&String::from_utf8_lossy(&self.body));
+        }
+        response.into_bytes()
+    }
+}
+
+impl ObservationServer {
+    fn start(initial: ObservedResponse) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let paths = Arc::new(Mutex::new(BTreeMap::new()));
+        let overrides = Arc::new(Mutex::new(BTreeMap::new()));
+        let default = Arc::new(Mutex::new(initial));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let paths = paths.clone();
+            let overrides = overrides.clone();
+            let default = default.clone();
+            let targets = targets.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut served = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut head = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(count) => head.extend_from_slice(&buffer[..count]),
+                            Err(_) => break,
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&head);
+                    let path = request
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_owned();
+                    targets.lock().unwrap().push(format!("GET {path}"));
+                    let response = overrides
+                        .lock()
+                        .unwrap()
+                        .get(&served)
+                        .cloned()
+                        .or_else(|| paths.lock().unwrap().get(&path).cloned())
+                        .unwrap_or_else(|| default.lock().unwrap().clone());
+                    served += 1;
+                    let _ = stream.write_all(&response.render());
+                    let _ = stream.flush();
+                }
+            })
+        };
+        Self {
+            address,
+            paths,
+            overrides,
+            targets,
+            stop,
+            thread: Some(thread),
+        }
+    }
+    fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+    fn set(&self, path: &str, response: ObservedResponse) {
+        self.paths.lock().unwrap().insert(path.to_owned(), response);
+    }
+    fn set_request(&self, index: usize, response: ObservedResponse) {
+        self.overrides.lock().unwrap().insert(index, response);
+    }
+    fn targets(&self) -> Vec<String> {
+        self.targets.lock().unwrap().clone()
+    }
+}
+
+impl Drop for ObservationServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One declared API-observed policy for the synthetic local fixture; never a
+/// private endpoint, model or client input.
+fn api_plan() -> ApiObservationPlan {
+    serde_json::from_value(json!({
+        "requests": [
+            {
+                "path": "/props",
+                "fields": [
+                    {"name": "server.build", "pointer": "/build_info", "required": true},
+                    {"name": "server.model", "pointer": "/model_alias", "required": true},
+                    {"name": "server.context", "pointer": "/default_generation_settings/n_ctx",
+                     "required": true},
+                    {"name": "server.seed",
+                     "pointer": "/default_generation_settings/params/seed", "required": true},
+                    {"name": "server.temperature",
+                     "pointer": "/default_generation_settings/params/temperature",
+                     "required": true},
+                    {"name": "server.template", "pointer": "/chat_template", "required": true,
+                     "binding": "digest"},
+                    {"name": "server.template_caps", "pointer": "/chat_template_caps",
+                     "required": true, "binding": "digest"},
+                    {"name": "limits.weights", "pointer": "/weights_sha256", "required": false}
+                ]
+            },
+            {
+                "path": "/v1/models",
+                "fields": [
+                    {"name": "server.model_id", "pointer": "/data/0/id", "required": true},
+                    {"name": "server.model_meta", "pointer": "/data/0/meta", "required": true,
+                     "binding": "digest"}
+                ]
+            }
+        ],
+        "required_client_inputs": ["profile", "catalogue"]
+    }))
+    .unwrap()
+}
+
+fn api_policy() -> ApiObservedPolicy {
+    ApiObservedPolicy {
+        output: policy(),
+        plan: api_plan(),
+    }
+}
+
+/// The synthetic observation document an owned local API would serve.
+fn props(build: &str) -> Value {
+    json!({
+        "build_info": build,
+        "model_alias": "synth-alias",
+        "model_ftype": "Q4_K_M",
+        "default_generation_settings": {
+            "n_ctx": 262144,
+            "params": {"seed": 42, "temperature": 1.0}
+        },
+        "total_slots": 1,
+        "chat_template": "synthetic chat template ".repeat(60),
+        "chat_template_caps": {"supports_tools": true}
+    })
+}
+
+fn models() -> Value {
+    json!({"data": [{"id": "synth-alias", "meta": {"n_ctx_train": 262144}}]})
+}
+
+/// Serves the declared sources of one unchanged synthetic local API.
+fn serve_sources(server: &ObservationServer, build: &str) {
+    server.set("/props", ObservedResponse::json(&props(build)));
+    server.set("/v1/models", ObservedResponse::json(&models()));
+}
+
+/// Real temporary client files, never the supplied private client inputs.
+struct ApiClientFiles {
+    root: tempfile::TempDir,
+    profile: PathBuf,
+    catalogue: PathBuf,
+}
+
+impl ApiClientFiles {
+    fn new() -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("api-client-")
+            .tempdir()
+            .unwrap();
+        let profile = root.path().join("profile.toml");
+        let catalogue = root.path().join("code-tools.json");
+        fs::write(&profile, "model = \"fixture-local-model\"\n").unwrap();
+        fs::write(&catalogue, "{\"servers\":[]}\n").unwrap();
+        Self {
+            root,
+            profile,
+            catalogue,
+        }
+    }
+    fn inputs(&self) -> Vec<ClientInput> {
+        vec![
+            ClientInput {
+                name: "profile".to_owned(),
+                path: self.profile.clone(),
+            },
+            ClientInput {
+                name: "catalogue".to_owned(),
+                path: self.catalogue.clone(),
+            },
+        ]
+    }
+}
+
+fn api_runner(origin: &str) -> Value {
+    let mut runner = local_runner();
+    runner["endpoint"] = json!(format!("{origin}/v1"));
+    runner
+}
+
+fn prepare_api_observation(f: &Fixture, origin: &str, files: &ApiClientFiles) {
+    f.edit("runner", api_runner(origin));
+    f.edit(
+        "api_observations",
+        serde_json::to_value(api_plan()).unwrap(),
+    );
+    f.edit(
+        "client_inputs",
+        json!([
+            {"name": "profile", "path": files.profile},
+            {"name": "catalogue", "path": files.catalogue}
+        ]),
+    );
+}
+
+#[test]
+fn api_observed_identity_collects_qualifies_and_rechecks_before_arms() {
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+    let run = |content: &str| -> (Value, String) {
+        let out = f
+            .command("success")
+            .env("HARNESS_OUTCOME_SOLUTION", content)
+            .output()
+            .unwrap();
+        let row = f.check(out, 0);
+        let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+        (row, digest)
+    };
+    let (first, first_digest) = run("repeatable api-observed solution\n");
+    assert_eq!(first["status"], "completed");
+    // The attempt collected the declared observations through the real entry
+    // point, before and after the controlled attempt.
+    assert_eq!(first["observed_api_verified"], true);
+    assert!(first["observation_drift"].is_null());
+    assert_eq!(
+        first["observed_api"]["endpoint"],
+        api_runner(&server.url())["endpoint"]
+    );
+    assert_eq!(
+        first["observed_api"]["fields"]["server.build"]["value"],
+        "b-synth-1"
+    );
+    assert_eq!(
+        first["observed_api"]["fields"]["server.model"]["value"],
+        "synth-alias"
+    );
+    assert_eq!(
+        first["observed_api"]["fields"]["server.context"]["value"],
+        "262144"
+    );
+    assert_eq!(
+        first["observed_api"]["fields"]["server.seed"]["value"],
+        "42"
+    );
+    assert_eq!(
+        first["observed_api"]["fields"]["server.temperature"]["value"],
+        "1.0"
+    );
+    assert_eq!(
+        first["observed_api"]["fields"]["server.model_id"]["value"],
+        "synth-alias"
+    );
+    // Large and structured facts are bound by digest with provenance instead
+    // of retaining their full bodies.
+    let template = first["observed_api"]["fields"]["server.template"]["value"]
+        .as_str()
+        .unwrap();
+    assert_eq!(template.len(), 64);
+    assert!(template.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        first["observed_api"]["fields"]["server.template"]["provenance"],
+        "sha256 GET /props /chat_template"
+    );
+    let caps = first["observed_api"]["fields"]["server.template_caps"]["value"]
+        .as_str()
+        .unwrap();
+    assert_eq!(caps.len(), 64);
+    assert_eq!(
+        first["observed_api"]["fields"]["server.build"]["provenance"],
+        "GET /props"
+    );
+    assert_eq!(
+        first["observed_api"]["unknown_optional"]["limits.weights"],
+        "not reported"
+    );
+    assert_eq!(
+        server.targets(),
+        vec![
+            "GET /props",
+            "GET /v1/models",
+            "GET /props",
+            "GET /v1/models"
+        ]
+    );
+
+    // Collection through the API directly is the same retained identity; the
+    // effective client inputs are observed by digest, not by body.
+    let runner = recorded_runner(&first);
+    let retained: ApiObservations = serde_json::from_value(first["observed_api"].clone()).unwrap();
+    let inputs = files.inputs();
+    let collected = collect_observations(&runner, &api_plan(), &inputs).unwrap();
+    assert_eq!(collected, retained);
+    assert_eq!(
+        collected.fields["profile"].value,
+        hash_file(&files.profile).unwrap()
+    );
+    assert_eq!(
+        collected.fields["catalogue"].value,
+        hash_file(&files.catalogue).unwrap()
+    );
+    assert!(
+        collected.fields["profile"]
+            .provenance
+            .starts_with("sha256 ")
+    );
+
+    let (second, second_digest) = run("repeatable api-observed solution\n");
+    assert_eq!(first_digest, second_digest);
+    let mut a1 = observation(&first, &first_digest);
+    a1.attempt_id.push_str("#1");
+    let mut a2 = observation(&second, &second_digest);
+    a2.attempt_id.push_str("#2");
+    let qualification =
+        qualify_api_observed(&runner, &api_policy(), &collected, &[a1, a2]).unwrap();
+    assert!(qualification.qualified(), "{qualification:?}");
+    assert_eq!(qualification.mode, QualificationMode::ApiObserved);
+    assert_eq!(qualification.observed_repeats, 2);
+    assert_eq!(qualification.required_repeats, 2);
+    assert!(qualification.missing_identity.is_empty());
+    assert_eq!(qualification.limits, API_OBSERVED_LIMITS.to_vec());
+    assert_eq!(
+        qualification.observations.unknown_optional["limits.weights"],
+        "not reported"
+    );
+    assert_eq!(qualification.policy_digest, api_policy().digest().unwrap());
+    assert_eq!(
+        qualification.observation_digest,
+        collected.digest().unwrap()
+    );
+
+    // The pre-arm recheck passes only while the observed identity is unchanged.
+    let recheck = recheck_observations(&qualification, &runner, &api_policy(), &inputs);
+    assert!(!recheck.drifted, "{recheck:?}");
+    assert!(recheck.failure.is_none());
+}
+
+#[test]
+fn api_observed_recheck_refuses_server_client_and_required_field_drift() {
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+    let run = |content: &str| -> (Value, String) {
+        let out = f
+            .command("success")
+            .env("HARNESS_OUTCOME_SOLUTION", content)
+            .output()
+            .unwrap();
+        let row = f.check(out, 0);
+        let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+        (row, digest)
+    };
+    let (first, first_digest) = run("stable solution\n");
+    let (second, second_digest) = run("stable solution\n");
+    let runner = recorded_runner(&first);
+    let observations: ApiObservations =
+        serde_json::from_value(first["observed_api"].clone()).unwrap();
+    let inputs = files.inputs();
+    let mut a1 = observation(&first, &first_digest);
+    a1.attempt_id.push_str("#1");
+    let mut a2 = observation(&second, &second_digest);
+    a2.attempt_id.push_str("#2");
+    let qualification =
+        qualify_api_observed(&runner, &api_policy(), &observations, &[a1, a2]).unwrap();
+    assert!(qualification.qualified());
+    assert!(!recheck_observations(&qualification, &runner, &api_policy(), &inputs).drifted);
+
+    // Observed server drift between qualification and an arm suspends it.
+    serve_sources(&server, "b-synth-2");
+    let refused = recheck_observations(&qualification, &runner, &api_policy(), &inputs);
+    assert!(refused.drifted);
+    assert!(
+        refused
+            .changed
+            .contains(&"observed.server.build".to_owned()),
+        "{refused:?}"
+    );
+
+    // A changed large template is visible through its retained digest without
+    // any template body in the record.
+    serve_sources(&server, "b-synth-1");
+    let mut templated = props("b-synth-1");
+    templated["chat_template"] = json!("different synthetic chat template ".repeat(60));
+    server.set("/props", ObservedResponse::json(&templated));
+    let refused = recheck_observations(&qualification, &runner, &api_policy(), &inputs);
+    assert!(
+        refused
+            .changed
+            .contains(&"observed.server.template".to_owned()),
+        "{refused:?}"
+    );
+
+    // Effective client configuration drift suspends it too.
+    serve_sources(&server, "b-synth-1");
+    fs::write(
+        &files.profile,
+        "model = \"fixture-local-model\"\napproval_policy = \"never\"\n",
+    )
+    .unwrap();
+    let refused = recheck_observations(&qualification, &runner, &api_policy(), &inputs);
+    assert!(refused.changed.contains(&"observed.profile".to_owned()));
+    fs::write(&files.profile, "model = \"fixture-local-model\"\n").unwrap();
+
+    // A disappeared catalogue is a distinguishishable collection refusal, not
+    // a pass with a silently dropped input.
+    let moved = files.root.path().join("catalogue.moved");
+    fs::rename(&files.catalogue, &moved).unwrap();
+    let refused = recheck_observations(&qualification, &runner, &api_policy(), &inputs);
+    assert!(refused.drifted);
+    assert_eq!(
+        refused.failure.as_ref().unwrap().kind,
+        ObservationFailureKind::ClientInput
+    );
+    fs::rename(&moved, &files.catalogue).unwrap();
+
+    // A required server field that disappears is a missing observation, not a
+    // dropped one.
+    server.set(
+        "/props",
+        ObservedResponse::json(&json!({
+            "model_alias": "synth-alias",
+            "default_generation_settings": {
+                "n_ctx": 262144,
+                "params": {"seed": 42, "temperature": 1.0}
+            },
+            "chat_template": "synthetic chat template ".repeat(60),
+            "chat_template_caps": {"supports_tools": true}
+        })),
+    );
+    let refused = recheck_observations(&qualification, &runner, &api_policy(), &inputs);
+    assert_eq!(
+        refused.failure.as_ref().unwrap().kind,
+        ObservationFailureKind::Missing
+    );
+    assert!(refused.changed[0].contains("/props"));
+
+    // Endpoint, model and declared-identity changes refuse even without a new
+    // observation.
+    let mut moved_runner = runner.clone();
+    moved_runner.endpoint = format!("{}/v2", server.url());
+    let drift = observed_drift(&qualification, &moved_runner, &api_policy(), &observations);
+    assert!(drift.changed.contains(&"endpoint".to_owned()));
+    let mut renamed = runner.clone();
+    renamed.model = "fixture-model-y".to_owned();
+    let drift = observed_drift(&qualification, &renamed, &api_policy(), &observations);
+    assert!(drift.changed.contains(&"model".to_owned()));
+    let mut redeclared = runner.clone();
+    redeclared.identity.quantization = None;
+    let drift = observed_drift(&qualification, &redeclared, &api_policy(), &observations);
+    assert!(drift.changed.contains(&"identity.quantization".to_owned()));
+    assert!(drift.blocks_comparisons());
+}
+
+#[test]
+fn api_observed_collection_failure_prevents_any_launch_and_stays_inspectable() {
+    let server = ObservationServer::start(ObservedResponse::status(503));
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+
+    // Required fetch/status failure suspends the attempt before launch.
+    let row = f.run("success", 1);
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["observation_failure"]["kind"], "status");
+    assert_eq!(row["observation_failure"]["source"], "/props");
+    assert_eq!(row["observation_failure"]["detail"], "HTTP 503");
+    assert!(!f.case.join("fixture-call.json").exists());
+    assert!(!evidence(&row).join("started.json").exists());
+    assert!(!row.to_string().contains("private fixture body"));
+
+    // An unparsable document is a parse failure, not a missing optional field.
+    server.set(
+        "/props",
+        ObservedResponse::raw(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
+        ),
+    );
+    let row = f.run("success", 1);
+    assert_eq!(row["observation_failure"]["kind"], "parse");
+    assert!(!f.case.join("fixture-call.json").exists());
+
+    // A required field present but unreadable is distinguishable as well.
+    server.set(
+        "/props",
+        ObservedResponse::json(&json!({
+            "build_info": {"nested": true},
+            "model_alias": "synth-alias",
+            "default_generation_settings": {
+                "n_ctx": 262144,
+                "params": {"seed": 42, "temperature": 1.0}
+            },
+            "chat_template": "synthetic chat template ".repeat(60),
+            "chat_template_caps": {"supports_tools": true}
+        })),
+    );
+    let row = f.run("success", 1);
+    assert_eq!(row["observation_failure"]["kind"], "unreadable");
+    assert_eq!(
+        row["observation_failure"]["detail"],
+        "required field 'server.build' is not a bounded scalar"
+    );
+
+    // Chunked framing is decoded through the bounded transport.
+    server.set(
+        "/props",
+        ObservedResponse::chunked(&serde_json::to_string(&props("b-synth-chunked")).unwrap()),
+    );
+    server.set("/v1/models", ObservedResponse::json(&models()));
+    let out = f
+        .command("success")
+        .env("HARNESS_OUTCOME_SOLUTION", "chunked solution\n")
+        .output()
+        .unwrap();
+    let row = f.check(out, 0);
+    assert_eq!(row["status"], "completed");
+    assert_eq!(row["observed_api_verified"], true);
+    assert_eq!(
+        row["observed_api"]["fields"]["server.build"]["value"],
+        "b-synth-chunked"
+    );
+}
+
+#[test]
+fn api_observed_attempt_observation_drift_fails_the_attempt() {
+    // The second observation (after the attempt) sees a changed server fact;
+    // the attempt cannot enter an API-observed qualification.
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+    server.set_request(2, ObservedResponse::json(&props("b-synth-2")));
+    let row = f.run("success", 1);
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["observed_api_verified"], false);
+    assert_eq!(
+        row["observed_api"]["fields"]["server.build"]["value"],
+        "b-synth-1"
+    );
+    assert_eq!(
+        row["observed_api_after"]["fields"]["server.build"]["value"],
+        "b-synth-2"
+    );
+    assert_eq!(row["observation_drift"], json!(["observed.server.build"]));
+    assert!(has_error(&row, "api_observation_drift"));
+    let runner = recorded_runner(&row);
+    let observations: ApiObservations =
+        serde_json::from_value(row["observed_api"].clone()).unwrap();
+    let mut a1 = observation(&row, "digest-a");
+    a1.attempt_id.push_str("#1");
+    let mut a2 = a1.clone();
+    a2.attempt_id.push_str("#2");
+    assert!(!a1.completed);
+    let result = qualify_api_observed(&runner, &api_policy(), &observations, &[a1, a2]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.unfinished_attempts.len(), 2);
+
+    // A failed post-observation is retained distinguishably as well.
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    server.set_request(2, ObservedResponse::status(500));
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+    let row = f.run("success", 1);
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["observed_api_verified"], false);
+    assert_eq!(row["observation_after_failure"]["kind"], "status");
+    assert!(has_error(&row, "api_observation_unavailable"));
+    assert!(row["observed_api"].is_object());
+}
+
+#[test]
+fn api_observed_qualification_requires_tools_verified_metadata_and_equal_output() {
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+
+    // Text-only and model-mismatched attempts stay blocked even though their
+    // declared observations were collected successfully.
+    let text_only = f.run("text-only", 0);
+    let wrong_model = f.run("wrong-model", 0);
+    assert_eq!(text_only["tool_operations"], 0);
+    assert_eq!(wrong_model["observed_model_metadata_verified"], false);
+    let runner = recorded_runner(&text_only);
+    let observations: ApiObservations =
+        serde_json::from_value(text_only["observed_api"].clone()).unwrap();
+    let mut a = observation(&text_only, "digest-a");
+    a.attempt_id.push_str("#1");
+    let mut b = observation(&wrong_model, "digest-a");
+    b.attempt_id.push_str("#2");
+    let result = qualify_api_observed(&runner, &api_policy(), &observations, &[a, b]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.tool_exchange_missing.len(), 1);
+    assert!(result.tool_exchange_missing[0].ends_with("#1"));
+    assert_eq!(result.unverified_attempts.len(), 1);
+    assert!(result.unverified_attempts[0].ends_with("#2"));
+    // No retained observation is dropped by a blocked result.
+    assert!(result.missing_observations.is_empty());
+
+    let run = |content: &str| -> (Value, String) {
+        let out = f
+            .command("success")
+            .env("HARNESS_OUTCOME_SOLUTION", content)
+            .output()
+            .unwrap();
+        let row = f.check(out, 0);
+        let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+        (row, digest)
+    };
+    let (first, first_digest) = run("solution-a\n");
+    let (second, second_digest) = run("solution-b\n");
+    assert_ne!(first_digest, second_digest);
+    let mut a = observation(&first, &first_digest);
+    a.attempt_id.push_str("#3");
+    let mut b = observation(&second, &second_digest);
+    b.attempt_id.push_str("#4");
+    let observations: ApiObservations =
+        serde_json::from_value(first["observed_api"].clone()).unwrap();
+    let result = qualify_api_observed(&runner, &api_policy(), &observations, &[a, b]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.divergent_outputs, vec!["solution.txt"]);
+
+    // A required output that is absent from a repeat is named, not ignored.
+    let mut a = observation(&first, &first_digest);
+    a.attempt_id = "api-missing-output-a".to_owned();
+    let mut b = a.clone();
+    b.attempt_id = "api-missing-output-b".to_owned();
+    b.outputs.clear();
+    let result = qualify_api_observed(&runner, &api_policy(), &observations, &[a, b]).unwrap();
+    assert_eq!(result.missing_outputs, vec!["solution.txt"]);
+    assert!(result.blocks_comparisons());
+
+    // Identical repeats under an unchanged observed identity qualify.
+    let (third, third_digest) = run("solution-b\n");
+    assert_eq!(second_digest, third_digest);
+    let mut a = observation(&second, &second_digest);
+    a.attempt_id.push_str("#5");
+    let mut b = observation(&third, &third_digest);
+    b.attempt_id.push_str("#6");
+    let result = qualify_api_observed(&runner, &api_policy(), &observations, &[a, b]).unwrap();
+    assert!(result.qualified(), "{result:?}");
 }

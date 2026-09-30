@@ -7,7 +7,10 @@ mod events;
 mod process_result;
 
 use harness_core::build_identity::{hash_file, ordinary};
-use harness_core::outcome_qualification::{LocalRunner, MATERIAL_FIELDS, RunnerRecord, WIRE_API};
+use harness_core::outcome_qualification::{
+    ApiObservationPlan, ClientInput, LocalRunner, MATERIAL_FIELDS, RunnerRecord, WIRE_API,
+    collect_observations, observation_changes,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -49,6 +52,17 @@ struct Request {
     /// Explicit local runner configuration. Mutually exclusive with `profile`.
     #[serde(default)]
     runner: Option<LocalRunner>,
+    /// Optional declared API-observation plan for the explicit local runner:
+    /// bounded declared JSON fields from explicit local API sources plus
+    /// effective client inputs observed by digest. Collection is model-free
+    /// and fails the attempt before launch when a required observation is
+    /// unavailable; the declared plan never changes the route or its model.
+    #[serde(default)]
+    api_observations: Option<ApiObservationPlan>,
+    /// Explicit effective client inputs (profile, catalogue files) for the
+    /// declared observation plan. Paths stay private evidence.
+    #[serde(default)]
+    client_inputs: Vec<ClientInput>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +81,7 @@ fn default_output_limit() -> u64 {
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher hidden with captured streams in an isolated temporary case/home (no visible terminal; visible dispatch is a separate path). An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. Private evidence is retained; correctness requires a separate oracle."
+            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher hidden with captured streams in an isolated temporary case/home (no visible terminal; visible dispatch is a separate path). An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. An explicit `api_observations` plan collects bounded declared local API fields and effective client-input digests, model-free, before and after the attempt. Private evidence is retained; correctness requires a separate oracle."
         );
         return Ok(0);
     }
@@ -187,6 +201,14 @@ fn validate(request: &Request) -> io::Result<(PathBuf, PathBuf, Option<PathBuf>,
             .size_limit(1024 * 1024)
             .build()
             .map_err(|_| invalid())?;
+    }
+    // The declared observation plan belongs to the explicit local route, and
+    // client inputs are only meaningful with a declared plan.
+    if request.api_observations.is_some() && request.runner.is_none() {
+        return Err(invalid());
+    }
+    if request.api_observations.is_none() && !request.client_inputs.is_empty() {
+        return Err(invalid());
     }
     Ok((case, home, user, config_arguments(&request.extra_config)?))
 }
@@ -550,6 +572,23 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
         "workingDirectory":case,"stdoutPath":stdout,"stderrPath":stderr,"stdinPath":stdin,
         "memoryLimitMiB":2048,"timeoutSeconds":request.timeout,"outputLimitBytes":request.output_limit,"environment":environment}),
     )?;
+    // Declared API observations are collected before launch: a required
+    // observation that cannot be fetched, read, parsed or confirmed suspends
+    // the attempt before any model or tool work happens.
+    let mut declared_observations = None;
+    if let (Route::Local(runner), Some(plan)) = (&route, &request.api_observations) {
+        result["failure_phase"] = json!("observations");
+        match collect_observations(runner, plan, &request.client_inputs) {
+            Ok(observed) => {
+                result["observed_api"] = serde_json::to_value(&observed)?;
+                declared_observations = Some(observed);
+            }
+            Err(failure) => {
+                result["observation_failure"] = serde_json::to_value(&failure)?;
+                return Err(io::Error::other(failure.to_string()));
+            }
+        }
+    }
     let mut telemetry = events::Events::open(
         &stdout,
         &root.join("observed.jsonl"),
@@ -726,6 +765,39 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     }
     if result["thread_id"].is_null() {
         errors.insert("missing_thread".into());
+    }
+    // Re-observe the declared API identity after the attempt: the collected
+    // set is retained for the record, and a changed or unavailable required
+    // observation fails this attempt instead of entering a qualified
+    // comparison against a configuration it did not actually run under.
+    if let (Route::Local(runner), Some(plan), Some(before)) = (
+        &route,
+        &request.api_observations,
+        declared_observations.as_ref(),
+    ) {
+        result["failure_phase"] = json!("observations");
+        let mut observation_evidence_failed = false;
+        match collect_observations(runner, plan, &request.client_inputs) {
+            Ok(after) => {
+                let verified = after.digest()? == before.digest()?;
+                if !verified {
+                    result["observation_drift"] = json!(observation_changes(before, &after));
+                    errors.insert("api_observation_drift".into());
+                    observation_evidence_failed = true;
+                }
+                result["observed_api_after"] = serde_json::to_value(&after)?;
+                result["observed_api_verified"] = json!(verified);
+            }
+            Err(failure) => {
+                result["observed_api_verified"] = json!(false);
+                result["observation_after_failure"] = serde_json::to_value(&failure)?;
+                errors.insert("api_observation_unavailable".into());
+                observation_evidence_failed = true;
+            }
+        }
+        if observation_evidence_failed && result["status"] == "completed" {
+            result["status"] = json!("failed");
+        }
     }
     if !errors.is_empty() {
         result["evidence_errors"] = json!(errors);
