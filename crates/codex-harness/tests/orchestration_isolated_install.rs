@@ -121,7 +121,11 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     let board_skill =
         fs::read_to_string(user_home.join(".agents/skills/board-workflow/SKILL.md")).unwrap();
     assert!(board_skill.contains("lead_review"), "{board_skill}");
-    assert!(board_skill.contains("feedback-route v1"), "{board_skill}");
+    assert!(
+        board_skill.contains("pacing-observation v1"),
+        "{board_skill}"
+    );
+    assert!(board_skill.contains("route records"), "{board_skill}");
     assert!(skill.contains("vote_threshold"), "{skill}");
     assert!(skill.contains("board-workflow"), "{skill}");
     let config = fs::read_to_string(codex_home.join("config.toml")).unwrap();

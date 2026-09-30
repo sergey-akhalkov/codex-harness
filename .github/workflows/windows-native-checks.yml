@@ -1,0 +1,46 @@
+# Deterministic Windows native checks for this commit only. This workflow is
+# the synthetic CI signal: it never touches the owner's installation, never
+# uses credentials, and never runs model-backed evaluation. Real installed
+# launcher/install/update/recover/transport/MCP acceptance is a separate,
+# explicitly selected route and is not implied by a green run here.
+name: windows-native-checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    name: Deterministic checks (fmt, clippy, tests, ownership, source)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Check out the exact commit
+        # actions/checkout v7.0.1, pinned to its immutable commit revision.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --no-self-update
+          rustup default 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint (warnings are errors)
+        run: cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
+
+      - name: Tests (single-threaded, locked dependencies)
+        run: cargo test --workspace --locked --jobs 1 -- --test-threads=1
+
+      - name: Executable ownership boundary
+        run: cargo run -p codex-harness --locked --bin codex-harness -- ownership-check --source .
+
+      - name: Source and link hygiene
+        run: cargo run -p codex-harness --locked --bin harness-source-check -- --root .

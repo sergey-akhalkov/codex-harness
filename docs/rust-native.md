@@ -119,8 +119,8 @@ foreign-language executables (tracked or untracked), embedded or generated
 foreign programs in maintained Rust source, first-party paths relabeled as
 third-party or inert data without genuine consumer evidence, and stale
 inventory entries fail the check. Remaining classified first-party legacy
-paths stay explicit open findings owned by their migration task, so the
-command exits nonzero until that removal finishes:
+paths are enumerated as explicit inert-data entries, so a clean tree passes
+and any new unclassified executable fails the check:
 
 ```powershell
 cargo run -p codex-harness --bin codex-harness -- ownership-check --source .

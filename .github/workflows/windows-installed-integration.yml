@@ -1,0 +1,59 @@
+# Explicitly selected installed-lifecycle integration. This route is never
+# automatic: it runs only on manual dispatch, so a green default CI run never
+# stands in for it. It builds the workspace and exercises the real
+# launcher/delivery/install/recover/transport/MCP/TUI entry points, including
+# an outside-checkout consumer. It still uses no credentials; model-backed
+# evaluation remains a separate explicit selection outside both workflows.
+name: windows-installed-integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installed:
+    name: Installed lifecycle integration (explicit dispatch only)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Check out the exact commit
+        # actions/checkout v7.0.1, pinned to its immutable commit revision.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --no-self-update
+          rustup default 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Build the workspace binaries
+        run: cargo build --workspace --locked --jobs 1
+
+      - name: Launcher forwarding, fallback and installation recovery
+        run: cargo test --locked -p codex-harness --jobs 1 --test native_launcher -- --test-threads=1
+
+      - name: Manager delivery and stable-link lifecycle
+        run: cargo test --locked -p codex-harness --jobs 1 --test manager_delivery -- --test-threads=1
+
+      - name: Install the pinned upstream Codex CLI (no credentials used)
+        run: |
+          npm install @openai/codex@0.157.1 --prefix "$env:RUNNER_TEMP\codex-cli"
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\codex-cli" -Recurse -Filter codex.exe |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "pinned upstream codex.exe was not installed" }
+          "HARNESS_CONTROL_CODEX_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Isolated install and orchestration outside the checkout
+        run: cargo test --locked -p codex-harness --jobs 1 --test orchestration_isolated_install -- --test-threads=1 --ignored
+
+      - name: Transport ownership
+        run: cargo test --locked -p codex-harness --jobs 1 --test xai_transport -- --test-threads=1
+
+      - name: MCP stdio boundary
+        run: cargo test --locked -p codex-harness --jobs 1 --test mcp_stdio -- --test-threads=1
+
+      - name: Windows TUI entry point
+        run: cargo test --locked -p codex-harness --jobs 1 --test tui -- --test-threads=1

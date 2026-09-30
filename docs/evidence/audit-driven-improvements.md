@@ -233,3 +233,85 @@ while four executor suites occupy the machine; reproducing the memory burst
 now would sabotage them. No correction has been selected yet — the existing
 single bounded retry is not duplicated, and no language or resource policy
 has been weakened.
+
+## Groups 9 and 3: accepted executor slices (2026-09-30)
+
+**Group 9 (tasks 9.1-9.6), merged as `7d32067`.** Executor `exec-ds-benefit`
+delivered the stricter benefit gate (a consistent record without a positive
+effect — improved quality or a faster candidate — can no longer authorize a
+default; tolerated regressions stay non-adoptions) and complete
+experiment/pair/block accounting with unit-level independence (Cartesian
+edges from one unit are not independent samples), retry identity matching,
+single attribution of worker usage and attempt time, undefined per-task ratio
+at zero accepted tasks, predeclared claim classes
+(deterministic/stochastic/unmeasured), and the no-migration/no-blind-pruning
+decisions with a middle-diagnostic counterexample. Executor verification:
+fmt, clippy `-D warnings`, harness-core (731 lib + integration) and every
+codex-harness target in bounded batches (a single workspace invocation cannot
+fit the 1800 s heavy deadline; the policy kill was not a test failure). Lead
+review: diff inspected; 24 benefit_gate/outcome_report lib tests rerun
+independently on the worktree and pass. The group-9 analogues of the owning
+boundaries each have a rejecting regression; the cross-group half of 9.6
+(RTK/baseline/runtime slices) is re-reviewed at integration (13.3).
+
+**Group 3 (tasks 3.1-3.4 complete), merged as `22ba5c9`.** Executor
+`exec-ds-baseline` delivered uniquely named immutable snapshots
+(timestamp + nanosecond publication identity, create-new reservation, private
+staging, pointer replaced only after the complete snapshot commits), full
+snapshot validation with `snapshot_status`/`version_changed`/`compatible`/
+`comparable` kept distinct, usage-basis/partial/warnings/coverage projection
+through snapshot and diff, bounded diff text and stable detail/paging, and
+the resolved-name/Codex-home fixes with escaping-name and pointer rejection.
+Executor verification: fmt, clippy, all 45 token-audit tests, every
+workspace target in chunks (two unrelated concurrency flakes pass in
+isolation), and a local installed save/diff/detail path outside the checkout
+with an isolated home. Lead review: diff inspected; all 45 token-audit tests
+rerun independently on the worktree and pass. Lead ratifies the recorded
+semantics: coverage regression and legacy snapshots yield `comparable=false`;
+`latest` is the last completed publication; an unusable snapshot yields empty
+movements and null baseline totals, never fabricated zeros.
+
+Remaining for group 3: the owning documentation and `tokenomics` skill still
+describe the older baseline surface; reconciling them is the open part of
+tasks 3.5-3.6 (the code, tests and CLI usage text are complete and verified).
+
+## Group 12: deterministic and installed CI routes (tasks 12.1-12.3)
+
+Two workflows were added and are enforced by a native contract test
+(`crates/codex-harness/tests/ci_workflow.rs`, `yaml-rust2` dev-dependency):
+
+- `.github/workflows/windows-native-checks.yml` — the deterministic push/
+  pull-request signal: pinned Rust 1.98.1, `cargo fmt --check`, clippy
+  `-D warnings`, the locked single-threaded workspace suite, the executable
+  ownership check and `harness-source-check`. Only `actions/checkout` is
+  used, pinned to its immutable commit revision
+  `3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1, verified against the
+  GitHub API); permissions are `contents: read`; no cache, no secrets and no
+  model-backed route. The contract test fails when any required check
+  disappears, an action floats off a full revision, a credential appears, or
+  the model-backed selector leaks in — omitted checks cannot look green.
+  Command failure propagation is observed directly (`cargo fmt --check`
+  exited 1 on real formatting drift during this work).
+- `.github/workflows/windows-installed-integration.yml` — the separate
+  installed-lifecycle route, manual `workflow_dispatch` only: build, then
+  launcher/recovery (`native_launcher`), delivery (`manager_delivery`),
+  isolated outside-checkout install (`orchestration_isolated_install` with
+  the pinned `@openai/codex@0.157.1` upstream via
+  `HARNESS_CONTROL_CODEX_EXE` and `--ignored`, failing when the executable is
+  absent), transport, MCP stdio and the Windows TUI. The contract test
+  enforces the separation: no push/pull triggers, and the deterministic
+  workflow contains none of the installed-only steps, so a green default CI
+  run never stands in for installed acceptance.
+
+Local exercise (2026-09-30): all four `ci_workflow` contract tests pass;
+`orchestration_isolated_install` was exercised with the registered real
+upstream Codex 0.157.1 and passed after its stale board-skill assertion
+(`feedback-route v1`, removed from the skill in `bc77f79`) was corrected to
+the current `pacing-observation v1`/`route records` contract — an example of
+exactly the drift this route exists to catch. The ownership check passes
+clean on the current tree (0 findings; its stale "exits nonzero" doc note was
+corrected).
+
+Task 12.4 remains open: an authorized actual CI run tied to the candidate
+revision requires remote publication and Actions enablement, neither of
+which has been authorized in this session.

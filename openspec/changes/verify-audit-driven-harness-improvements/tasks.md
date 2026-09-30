@@ -26,10 +26,10 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 3. Repair baseline persistence and comparison
 
-- [ ] 3.1 Fix returned-name resolution and native Codex-home fallback in `crates/token-audit/src/baseline.rs`, using its existing CLI tests; verify `save -> diff` with returned filename/basename, unset CODEX_HOME, valid latest and rejected escaping names/pointers. Covers A05, A08.
-- [ ] 3.2 Publish uniquely identified immutable snapshots and a coherent latest pointer under concurrent and interrupted writers; verify distinct same-second saves survive and latest never refers to a partial file or overwrites another successful snapshot. Covers A09, N02.
-- [ ] 3.3 Validate the complete snapshot before compatible status, separate format validity from population comparability and version changed semantics; verify expected-schema/missing-fields, corrupt JSON, foreign schema, root/window/mode mismatch and inspectable legacy snapshots without fabricated baseline zeros. Covers A06, A07.
-- [ ] 3.4 Carry usage basis, partial-subtotal status, warnings and relevant coverage through snapshot and diff projections; verify lost usage cannot masquerade as savings and mixed/unknown counters stay labeled in text and machine output. Covers A31, N03.
+- [x] 3.1 Fix returned-name resolution and native Codex-home fallback in `crates/token-audit/src/baseline.rs`, using its existing CLI tests; verify `save -> diff` with returned filename/basename, unset CODEX_HOME, valid latest and rejected escaping names/pointers. Covers A05, A08.
+- [x] 3.2 Publish uniquely identified immutable snapshots and a coherent latest pointer under concurrent and interrupted writers; verify distinct same-second saves survive and latest never refers to a partial file or overwrites another successful snapshot. Covers A09, N02.
+- [x] 3.3 Validate the complete snapshot before compatible status, separate format validity from population comparability and version changed semantics; verify expected-schema/missing-fields, corrupt JSON, foreign schema, root/window/mode mismatch and inspectable legacy snapshots without fabricated baseline zeros. Covers A06, A07.
+- [x] 3.4 Carry usage basis, partial-subtotal status, warnings and relevant coverage through snapshot and diff projections; verify lost usage cannot masquerade as savings and mixed/unknown counters stay labeled in text and machine output. Covers A31, N03.
 - [ ] 3.5 Add documented bounded text diff and stable detail/paging through the existing report/detail owner; verify several thousand session/group movements, byte/row limits, deterministic selection, hidden counts, complete detail and totals equal to exhaustive JSON. Covers A10.
 - [ ] 3.6 Run the baseline/report/CLI compatibility targets and a local installed save/diff/detail path with owned synthetic sessions; verify upgrade and recovery preserve original snapshots and unsupported comparison metadata stays explicit.
 
@@ -72,12 +72,12 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 9. Connect evidence to a defensible benefit decision
 
-- [ ] 9.1 Add counterexamples in the existing `benefit_gate.rs`/`outcome_report.rs` test owners for consistent-without-benefit, tolerated regression, unverifiable evidence and stale input identities; verify none can be labeled demonstrated improvement merely by arithmetic or an accounting string. Covers A23, A24.
-- [ ] 9.2 Extend existing attempt/comparison accounting with explicit independent pair/block and retry identities, complete attributable leader/worker/rework costs and coverage; verify Cartesian comparisons are not independent samples, overlapping time and inherited summaries are not double counted, unknown usage stays unknown and zero accepted tasks produces an undefined ratio. Covers A25, A26, A31, A39.
-- [ ] 9.3 Link actual execution/consumption identity, protected independent oracle, comparability and computed effect through the existing evidence owners; verify changed oracle/input/skill/model/effort and absent model-visible evidence cannot silently authorize adoption. Covers A23, A30.
-- [ ] 9.4 Add predeclared task mix/effect/nuisance/stopping/uncertainty and net-horizon semantics to the existing comparison route; verify deterministic quality improvements, stochastic savings and unmeasured subscription claims are classified separately without retroactively changing historical thresholds. Covers A24, A39.
-- [ ] 9.5 Record the reviewed no-migration and no-blind-pruning selections with primary evidence and a middle-diagnostic counterexample; verify no optional runtime/plugin/default is installed under an unproved benefit assertion. Covers A35, A36.
-- [ ] 9.6 Review the corrected owning boundaries for validated snapshots, prepared presentation, committed observations and verified runtime; verify each specific invalid transition is covered by its native regression without introducing an unused generic framework. Covers A37.
+- [x] 9.1 Add counterexamples in the existing `benefit_gate.rs`/`outcome_report.rs` test owners for consistent-without-benefit, tolerated regression, unverifiable evidence and stale input identities; verify none can be labeled demonstrated improvement merely by arithmetic or an accounting string. Covers A23, A24.
+- [x] 9.2 Extend existing attempt/comparison accounting with explicit independent pair/block and retry identities, complete attributable leader/worker/rework costs and coverage; verify Cartesian comparisons are not independent samples, overlapping time and inherited summaries are not double counted, unknown usage stays unknown and zero accepted tasks produces an undefined ratio. Covers A25, A26, A31, A39.
+- [x] 9.3 Link actual execution/consumption identity, protected independent oracle, comparability and computed effect through the existing evidence owners; verify changed oracle/input/skill/model/effort and absent model-visible evidence cannot silently authorize adoption. Covers A23, A30.
+- [x] 9.4 Add predeclared task mix/effect/nuisance/stopping/uncertainty and net-horizon semantics to the existing comparison route; verify deterministic quality improvements, stochastic savings and unmeasured subscription claims are classified separately without retroactively changing historical thresholds. Covers A24, A39.
+- [x] 9.5 Record the reviewed no-migration and no-blind-pruning selections with primary evidence and a middle-diagnostic counterexample; verify no optional runtime/plugin/default is installed under an unproved benefit assertion. Covers A35, A36.
+- [x] 9.6 Review the corrected owning boundaries for validated snapshots, prepared presentation, committed observations and verified runtime; verify each specific invalid transition is covered by its native regression without introducing an unused generic framework. Covers A37.
 
 ## 10. Verify actual instruction consumption and evaluate context candidates
 
@@ -95,9 +95,9 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 12. Deliver reproducible Windows verification
 
-- [ ] 12.1 Add the public Windows/MSVC workflow using the existing native check commands, identified toolchain, locked inputs, immutable action revisions and minimal permissions; verify local workflow/configuration validity and that untrusted PR execution cannot use production credentials or mutate the owner's installation. Covers A22.
-- [ ] 12.2 Connect deterministic audit regressions and applicable formatting, lint, test, ownership and source/link checks; verify intentional failures propagate nonzero status and omitted/unavailable checks cannot appear green. Covers A22.
-- [ ] 12.3 Define and exercise the separate real launcher/install/update/recover/transport/MCP integration route, including an outside-checkout consumer; verify synthetic default CI is not reported as equivalent to unexecuted installed acceptance and model-backed work remains explicitly selected. Covers A22.
+- [x] 12.1 Add the public Windows/MSVC workflow using the existing native check commands, identified toolchain, locked inputs, immutable action revisions and minimal permissions; verify local workflow/configuration validity and that untrusted PR execution cannot use production credentials or mutate the owner's installation. Covers A22.
+- [x] 12.2 Connect deterministic audit regressions and applicable formatting, lint, test, ownership and source/link checks; verify intentional failures propagate nonzero status and omitted/unavailable checks cannot appear green. Covers A22.
+- [x] 12.3 Define and exercise the separate real launcher/install/update/recover/transport/MCP integration route, including an outside-checkout consumer; verify synthetic default CI is not reported as equivalent to unexecuted installed acceptance and model-backed work remains explicitly selected. Covers A22.
 - [ ] 12.4 Obtain an authorized actual CI run tied to the candidate revision and preserve bounded evidence; verify executed scope and private-data sentinel handling in public artifacts. If remote publication/settings authority or runner capability is unavailable, leave this execution task open with the exact blocker. Covers A22.
 
 ## 13. Integrate, deliver globally and close on actual evidence
