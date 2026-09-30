@@ -822,8 +822,14 @@ pub struct RemovalProposalRecord {
     pub recorded: bool,
 }
 
-/// Records one removal proposal on the card. The proposal is a reference for
-/// the user's decision; nothing here applies the removal.
+/// Records one removal proposal version on the card. The proposal is a
+/// reference for the user's decision; nothing here applies the removal.
+///
+/// A changed version (different loss, evidence, preview or detail) for the
+/// same proposal and target is appended as the new current version and
+/// reported as recorded: an approval is bound to the exact reviewed content,
+/// so a changed proposal needs a fresh decision before any further removal
+/// effect. Repeating the current version adds no comment.
 pub fn record_removal_proposal(
     bd: &Path,
     project: &Path,
@@ -832,10 +838,18 @@ pub fn record_removal_proposal(
 ) -> io::Result<RemovalProposalRecord> {
     require_hypothesis_card(bd, project, item)?;
     let text = proposal.comment(item);
+    let expected = parse_removal_proposal(&text).expect("self-parsed removal proposal");
     let comments = board_feedback::list_comments(bd, project, item)?;
-    let recorded = !comments.iter().any(|comment| comment == &text);
+    let latest = parse_removal_proposals(&comments)
+        .into_iter()
+        .rfind(|record| {
+            record.item == item
+                && record.proposal == proposal.proposal
+                && record.target == proposal.target
+        });
+    let recorded = latest.as_ref() != Some(&expected);
     if recorded {
-        write_comment_once(bd, project, item, &comments, &text)?;
+        json_ok_actor(bd, project, ACTOR, &["comment", item, "--json", &text])?;
     }
     Ok(RemovalProposalRecord {
         proposal: proposal.proposal.clone(),
@@ -951,7 +965,10 @@ impl BoundedRemovalDecision {
         })
     }
 
-    fn comment(&self, item: &str) -> String {
+    /// Binds the decision text to the reviewed proposal content: the behavior
+    /// loss, evidence and unapplied preview are copied exactly as reviewed, so
+    /// a later proposal change is detectable and needs a fresh decision.
+    fn comment(&self, item: &str, reviewed: &RecordedRemovalProposal) -> String {
         let actions = if self.actions.is_empty() {
             "none".to_owned()
         } else {
@@ -962,11 +979,13 @@ impl BoundedRemovalDecision {
                 .join("+")
         };
         let mut text = format!(
-            "{REMOVAL_DECISION_PREFIX} item={item} decision={} proposal={} target={} actions={actions} loss={} basis={}",
+            "{REMOVAL_DECISION_PREFIX} item={item} decision={} proposal={} target={} actions={actions} loss={} evidence={} preview={} basis={}",
             self.decision.as_str(),
-            self.proposal,
-            self.target,
-            self.loss.as_deref().unwrap_or("none"),
+            reviewed.proposal,
+            reviewed.target,
+            reviewed.loss,
+            reviewed.evidence,
+            reviewed.preview.as_deref().unwrap_or("none"),
             self.basis.as_deref().unwrap_or("none")
         );
         if let Some(detail) = &self.detail {
@@ -985,7 +1004,12 @@ pub struct RemovalDecisionRecord {
     pub proposal: Option<String>,
     pub target: Option<String>,
     pub actions: Vec<RemovalAction>,
+    /// The reviewed behavior loss, copied from the proposal at decision time.
     pub loss: Option<String>,
+    /// The reviewed evidence reference, copied from the proposal.
+    pub evidence: Option<String>,
+    /// The reviewed unapplied preview reference, copied from the proposal.
+    pub preview: Option<String>,
     pub basis: Option<String>,
     pub detail: Option<String>,
 }
@@ -1006,6 +1030,8 @@ fn parse_removal_decision(comment: &str) -> Option<RemovalDecisionRecord> {
     let mut target = None;
     let mut actions = Vec::new();
     let mut loss = None;
+    let mut evidence = None;
+    let mut preview = None;
     let mut basis = None;
     for part in head.split_whitespace() {
         let Some((key, value)) = part.split_once('=') else {
@@ -1020,6 +1046,8 @@ fn parse_removal_decision(comment: &str) -> Option<RemovalDecisionRecord> {
                 actions = value.split('+').filter_map(RemovalAction::parse).collect();
             }
             "loss" => loss = non_none(value),
+            "evidence" => evidence = non_none(value),
+            "preview" => preview = non_none(value),
             "basis" => basis = non_none(value),
             _ => {}
         }
@@ -1031,14 +1059,25 @@ fn parse_removal_decision(comment: &str) -> Option<RemovalDecisionRecord> {
         target,
         actions,
         loss,
+        evidence,
+        preview,
         basis,
         detail: detail.map(str::to_owned),
     })
 }
 
-/// Records the user's explicit removal decision on the card. A repeated
-/// identical decision adds no duplicate comment; a different decision is a
-/// new recorded decision that supersedes the previous one.
+/// Records the user's explicit removal decision on the card, bound to the
+/// exact reviewed proposal content (behavior loss, evidence and preview as
+/// currently recorded).
+///
+/// - An approval must name the reviewed behavior loss and it must equal the
+///   recorded proposal's loss; a mismatched loss cannot claim the reviewed
+///   scope.
+/// - The decision is idempotent only against the *latest* decision: repeating
+///   the current decision confirms it without a new comment, while a decision
+///   that differs from the current one is appended and truthfully reported as
+///   a new recorded decision (even when an older comment carries the same
+///   text), so it becomes the current authority.
 pub fn record_removal_decision(
     bd: &Path,
     project: &Path,
@@ -1047,44 +1086,42 @@ pub fn record_removal_decision(
 ) -> io::Result<bool> {
     require_hypothesis_card(bd, project, item)?;
     let comments = board_feedback::list_comments(bd, project, item)?;
-    let proposed = comments.iter().any(|comment| {
-        parse_removal_proposal(comment).is_some_and(|record| {
+    let Some(reviewed) = parse_removal_proposals(&comments)
+        .into_iter()
+        .rfind(|record| {
             record.item == item
                 && record.proposal == decision.proposal
                 && record.target == decision.target
         })
-    });
-    if !proposed {
+    else {
         return Err(invalid(format!(
             "no removal proposal with proposal={} target={} is recorded on {item}; record the reviewed proposal before the user's decision",
             decision.proposal, decision.target
         )));
+    };
+    if let Some(loss) = decision.loss.as_deref()
+        && loss != reviewed.loss
+    {
+        return Err(invalid(format!(
+            "the decision's loss {loss} does not match the recorded proposal's behavior loss {}; a decision cannot claim a scope the user did not review",
+            reviewed.loss
+        )));
     }
-    let text = decision.comment(item);
+    if decision.decision == RemovalDecisionKind::Approve && decision.loss.is_none() {
+        return Err(invalid(
+            "an approval must identify the reviewed behavior loss (loss) so it binds the reviewed proposal content",
+        ));
+    }
+    let text = decision.comment(item, &reviewed);
+    let expected = parse_removal_decision(&text).expect("self-parsed removal decision");
     let latest = parse_removal_decisions(&comments)
         .into_iter()
         .rfind(|record| record.item == item);
-    if latest
-        .as_ref()
-        .is_some_and(|record| record == &decision_record_of(decision, item))
-    {
+    if latest.as_ref() == Some(&expected) {
         return Ok(false);
     }
-    write_comment_once(bd, project, item, &comments, &text)?;
+    json_ok_actor(bd, project, ACTOR, &["comment", item, "--json", &text])?;
     Ok(true)
-}
-
-fn decision_record_of(decision: &BoundedRemovalDecision, item: &str) -> RemovalDecisionRecord {
-    RemovalDecisionRecord {
-        item: item.to_owned(),
-        decision: Some(decision.decision),
-        proposal: Some(decision.proposal.clone()),
-        target: Some(decision.target.clone()),
-        actions: decision.actions.clone(),
-        loss: decision.loss.clone(),
-        basis: decision.basis.clone(),
-        detail: decision.detail.clone(),
-    }
 }
 
 /// One requested stage for which the recorded authority is resolved.
@@ -1115,10 +1152,16 @@ pub enum RemovalAuthority {
     },
 }
 
-/// Resolves the current removal authority from the card's decision comments.
-/// The latest attributable decision controls: an unreadable or out-of-scope
-/// newer decision leaves the request uncovered rather than restoring an older
-/// approval, and a benefit verdict is not consulted at all.
+/// Resolves the current removal authority from the card's decision comments
+/// and the current proposal content. The latest attributable decision
+/// controls, and it is bound to the exact reviewed proposal:
+///
+/// - an unreadable or out-of-scope newer decision leaves the request
+///   uncovered rather than restoring an older approval;
+/// - a proposal version recorded after the decision (changed behavior loss,
+///   evidence or preview - for example a newly discovered consumer) needs a
+///   fresh decision, since the old consent covered different content;
+/// - a benefit verdict is not consulted at all.
 pub fn removal_authority(
     comments: &[String],
     item: &str,
@@ -1150,6 +1193,39 @@ pub fn removal_authority(
                 latest.target.as_deref().unwrap_or("absent"),
                 request.proposal,
                 request.target
+            ),
+            record: Some(latest),
+        };
+    }
+    let current = parse_removal_proposals(comments)
+        .into_iter()
+        .rfind(|record| {
+            record.item == item
+                && record.proposal == request.proposal
+                && record.target == request.target
+        });
+    let Some(current) = current else {
+        return RemovalAuthority::NotCovered {
+            reason: format!(
+                "no current removal proposal record exists for proposal={} target={}",
+                request.proposal, request.target
+            ),
+            record: Some(latest),
+        };
+    };
+    if latest.loss.as_deref() != Some(current.loss.as_str())
+        || latest.evidence.as_deref() != Some(current.evidence.as_str())
+        || latest.preview != current.preview
+    {
+        return RemovalAuthority::NotCovered {
+            reason: format!(
+                "the reviewed proposal changed after the latest decision (reviewed loss={} evidence={} preview={}; current loss={} evidence={} preview={}); a fresh decision is required for the changed proposal",
+                latest.loss.as_deref().unwrap_or("absent"),
+                latest.evidence.as_deref().unwrap_or("absent"),
+                latest.preview.as_deref().unwrap_or("none"),
+                current.loss,
+                current.evidence,
+                current.preview.as_deref().unwrap_or("none")
             ),
             record: Some(latest),
         };
@@ -1428,23 +1504,38 @@ fn parse_reconsideration(comment: &str) -> Option<ReconsiderationComment> {
     })
 }
 
+/// One recorded removal proposal version. The decisions bind to these fields,
+/// and the controller can retain the preview and full references from here
+/// without another tracker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemovalProposalComment {
-    item: String,
-    proposal: String,
-    target: String,
-    evidence: Option<String>,
-    loss: Option<String>,
+pub struct RecordedRemovalProposal {
+    pub item: String,
+    pub proposal: String,
+    pub target: String,
+    pub evidence: String,
+    pub loss: String,
+    pub preview: Option<String>,
+    pub detail: Option<String>,
 }
 
-fn parse_removal_proposal(comment: &str) -> Option<RemovalProposalComment> {
+/// Parses recorded removal proposal versions in board order (oldest first),
+/// so the last matching record is the current version.
+pub fn parse_removal_proposals(comments: &[String]) -> Vec<RecordedRemovalProposal> {
+    comments
+        .iter()
+        .filter_map(|comment| parse_removal_proposal(comment))
+        .collect()
+}
+
+fn parse_removal_proposal(comment: &str) -> Option<RecordedRemovalProposal> {
     let rest = comment.strip_prefix(REMOVAL_PROPOSAL_PREFIX)?.trim();
-    let (head, _) = split_detail(rest);
+    let (head, detail) = split_detail(rest);
     let mut item = None;
     let mut proposal = None;
     let mut target = None;
     let mut evidence = None;
     let mut loss = None;
+    let mut preview = None;
     for part in head.split_whitespace() {
         let Some((key, value)) = part.split_once('=') else {
             continue;
@@ -1453,17 +1544,20 @@ fn parse_removal_proposal(comment: &str) -> Option<RemovalProposalComment> {
             "item" => item = Some(value.to_owned()),
             "proposal" => proposal = Some(value.to_owned()),
             "target" => target = Some(value.to_owned()),
-            "evidence" => evidence = non_none(value),
-            "loss" => loss = non_none(value),
+            "evidence" => evidence = Some(value.to_owned()),
+            "loss" => loss = Some(value.to_owned()),
+            "preview" => preview = non_none(value),
             _ => {}
         }
     }
-    Some(RemovalProposalComment {
+    Some(RecordedRemovalProposal {
         item: item?,
         proposal: proposal?,
         target: target?,
-        evidence,
-        loss,
+        evidence: evidence?,
+        loss: loss?,
+        preview,
+        detail: detail.map(str::to_owned),
     })
 }
 
@@ -1547,9 +1641,21 @@ mod tests {
         }
     }
 
-    fn decision_text(decision: &str, actions: &str, proposal: &str, target: &str) -> String {
+    fn proposal_text(loss: &str, evidence: &str, preview: &str) -> String {
         format!(
-            "removal-decision v1 item=bdct-h1 decision={decision} proposal={proposal} target={target} actions={actions} loss=skill-x basis=user-turn-7 detail=presented proposal and refused it"
+            "removal-proposal v1 item=bdct-h1 proposal=openspec/changes/remove-x target=skill-x evidence={evidence} loss={loss} preview={preview}"
+        )
+    }
+
+    fn decision_text(
+        decision: &str,
+        actions: &str,
+        loss: &str,
+        evidence: &str,
+        preview: &str,
+    ) -> String {
+        format!(
+            "removal-decision v1 item=bdct-h1 decision={decision} proposal=openspec/changes/remove-x target=skill-x actions={actions} loss={loss} evidence={evidence} preview={preview} basis=user-turn-7 detail=presented proposal"
         )
     }
 
@@ -1565,12 +1671,10 @@ mod tests {
             RemovalAuthority::Missing
         );
 
-        let approved = vec![decision_text(
-            "approve",
-            "experiment",
-            "openspec/changes/remove-x",
-            "skill-x",
-        )];
+        let approved = vec![
+            proposal_text("skill-x", "ev-1", "preview-1"),
+            decision_text("approve", "experiment", "skill-x", "ev-1", "preview-1"),
+        ];
         assert!(matches!(
             removal_authority(&approved, "bdct-h1", &request),
             RemovalAuthority::Authorized { .. }
@@ -1587,34 +1691,82 @@ mod tests {
             other => panic!("expected not-covered, got {other:?}"),
         }
 
-        let refused = vec![decision_text(
-            "refuse",
-            "none",
-            "openspec/changes/remove-x",
-            "skill-x",
-        )];
+        let refused = vec![
+            proposal_text("skill-x", "ev-1", "preview-1"),
+            decision_text("refuse", "none", "skill-x", "ev-1", "preview-1"),
+        ];
         assert!(matches!(
             removal_authority(&refused, "bdct-h1", &request),
             RemovalAuthority::Refused { .. }
         ));
-        let withdrawn = vec![decision_text(
-            "withdraw",
-            "none",
-            "openspec/changes/remove-x",
-            "skill-x",
-        )];
+        let withdrawn = vec![
+            proposal_text("skill-x", "ev-1", "preview-1"),
+            decision_text("withdraw", "none", "skill-x", "ev-1", "preview-1"),
+        ];
         assert!(matches!(
             removal_authority(&withdrawn, "bdct-h1", &request),
             RemovalAuthority::Withdrawn { .. }
         ));
 
-        // A decision for another target never covers this one.
-        let other_target = vec![decision_text(
+        // A proposal version recorded after the decision invalidates the old
+        // consent: a changed behavior loss, evidence or preview needs a fresh
+        // decision before any further removal effect.
+        let mut changed_loss = approved.clone();
+        changed_loss.push(proposal_text("skill-x+recovery", "ev-2", "preview-2"));
+        match removal_authority(&changed_loss, "bdct-h1", &request) {
+            RemovalAuthority::NotCovered { reason, .. } => {
+                assert!(reason.contains("changed"), "{reason}");
+            }
+            other => panic!("expected not-covered for a changed proposal, got {other:?}"),
+        }
+        let mut changed_evidence = approved.clone();
+        changed_evidence.push(proposal_text("skill-x", "ev-2", "preview-1"));
+        assert!(matches!(
+            removal_authority(&changed_evidence, "bdct-h1", &request),
+            RemovalAuthority::NotCovered { .. }
+        ));
+        // ...including for an earlier refusal.
+        let mut refused_then_changed = refused.clone();
+        refused_then_changed.push(proposal_text("skill-x+recovery", "ev-2", "preview-2"));
+        assert!(matches!(
+            removal_authority(&refused_then_changed, "bdct-h1", &request),
+            RemovalAuthority::NotCovered { .. }
+        ));
+        // A decision for the changed content restores authority.
+        let mut re_decided = changed_loss.clone();
+        re_decided.push(decision_text(
             "approve",
-            "experiment+integration",
-            "openspec/changes/remove-x",
-            "skill-y",
-        )];
+            "experiment",
+            "skill-x+recovery",
+            "ev-2",
+            "preview-2",
+        ));
+        assert!(matches!(
+            removal_authority(&re_decided, "bdct-h1", &request),
+            RemovalAuthority::Authorized { .. }
+        ));
+        // A decision that does not bind the reviewed content never authorizes.
+        let unbound = vec![
+            proposal_text("skill-x", "ev-1", "preview-1"),
+            "removal-decision v1 item=bdct-h1 decision=approve proposal=openspec/changes/remove-x target=skill-x actions=experiment loss=skill-x basis=user-turn-7".to_owned(),
+        ];
+        assert!(matches!(
+            removal_authority(&unbound, "bdct-h1", &request),
+            RemovalAuthority::NotCovered { .. }
+        ));
+
+        // A decision for another target never covers this one.
+        let other_target = vec![
+            proposal_text("skill-x", "ev-1", "preview-1"),
+            decision_text(
+                "approve",
+                "experiment+integration",
+                "skill-x",
+                "ev-1",
+                "preview-1",
+            )
+            .replace("target=skill-x", "target=skill-y"),
+        ];
         assert!(matches!(
             removal_authority(&other_target, "bdct-h1", &request),
             RemovalAuthority::NotCovered { .. }
@@ -1633,8 +1785,9 @@ mod tests {
         reapplied.push(decision_text(
             "approve",
             "experiment",
-            "openspec/changes/remove-x",
             "skill-x",
+            "ev-1",
+            "preview-1",
         ));
         assert!(matches!(
             removal_authority(&reapplied, "bdct-h1", &request),
@@ -1651,7 +1804,8 @@ mod tests {
 
         // Decisions for another card never apply here.
         let other_item = vec![
-            decision_text("refuse", "none", "openspec/changes/remove-x", "skill-x")
+            proposal_text("skill-x", "ev-1", "preview-1"),
+            decision_text("refuse", "none", "skill-x", "ev-1", "preview-1")
                 .replace("item=bdct-h1", "item=bdct-h2"),
         ];
         assert_eq!(

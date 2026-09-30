@@ -1435,6 +1435,7 @@ fn removal_decision(
     item: &str,
     decision: &str,
     actions: Option<&str>,
+    loss: Option<&str>,
     basis: Option<&str>,
     detail: &str,
 ) -> std::process::Output {
@@ -1451,6 +1452,10 @@ fn removal_decision(
         "--detail",
         detail,
     ];
+    if let Some(loss) = loss {
+        args.push("--loss");
+        args.push(loss);
+    }
     if let Some(actions) = actions {
         args.push("--actions");
         args.push(actions);
@@ -1971,6 +1976,7 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
         &candidate,
         "approve",
         Some("experiment"),
+        Some("skill-x"),
         Some("user-turn-7"),
         "approved the isolated experiment",
     );
@@ -2015,6 +2021,7 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
         &candidate,
         "refuse",
         None,
+        None,
         Some("user-turn-8"),
         "declined the removal",
     );
@@ -2028,6 +2035,7 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
         &candidate,
         "approve",
         Some("experiment+integration"),
+        Some("skill-x"),
         Some("user-turn-9"),
         "approved experiment and integration",
     );
@@ -2045,6 +2053,7 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
         &board,
         &candidate,
         "withdraw",
+        None,
         None,
         None,
         "withdrawn while the loop was stopped",
@@ -2070,6 +2079,7 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
         &candidate,
         "approve",
         Some("experiment"),
+        Some("skill-x"),
         Some("user-turn-10"),
         "re-approved the isolated experiment",
     );
@@ -2086,5 +2096,162 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
         output_text(&authorized)
     );
     assert_no_votes(&board, &candidate);
+    board.drop();
+}
+
+#[test]
+fn removal_consent_binds_to_the_reviewed_proposal_content() {
+    let board = Board::new("removal-binding");
+    let h = admit(&board, "m-remove-bind", "c-remove", "basis-1");
+    let propose = |loss: &str, evidence: &str, preview: &str| {
+        board.feedback(&[
+            "removal-propose",
+            "--item",
+            &h,
+            "--proposal",
+            "openspec/changes/remove-x",
+            "--target",
+            "skill-x",
+            "--evidence",
+            evidence,
+            "--loss",
+            loss,
+            "--preview",
+            preview,
+            "--detail",
+            "preview prepared; nothing applied",
+        ])
+    };
+    let first = propose("skill-x", "ev-1", "preview-1");
+    assert!(first.status.success(), "{}", output_text(&first));
+
+    let approve = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x"),
+        Some("user-turn-7"),
+        "approved the isolated experiment",
+    );
+    assert!(approve.status.success(), "{}", output_text(&approve));
+    assert_eq!(
+        removal_check(&board, &h, "experiment").status.code(),
+        Some(0)
+    );
+
+    // A retry of the *current* decision confirms it without a new comment.
+    let before = board.comment_texts(&h).len();
+    let retry = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x"),
+        Some("user-turn-7"),
+        "approved the isolated experiment",
+    );
+    let text = output_text(&retry);
+    assert!(retry.status.success(), "{text}");
+    assert!(text.contains("record=already-recorded"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before);
+
+    // A changed proposal version for the same proposal and target needs a
+    // fresh decision: the old consent covered different content (here a
+    // newly discovered consumer loss).
+    let changed = propose("skill-x+recovery", "ev-2", "preview-2");
+    let text = output_text(&changed);
+    assert!(changed.status.success(), "{text}");
+    assert!(text.contains("record=written"), "{text}");
+    let uncovered = removal_check(&board, &h, "experiment");
+    let text = output_text(&uncovered);
+    assert_eq!(uncovered.status.code(), Some(1), "{text}");
+    assert!(text.contains("result=not-covered"), "{text}");
+    assert!(text.contains("changed"), "{text}");
+
+    // A mismatched approval loss cannot claim the reviewed scope.
+    let before_mismatch = board.comment_texts(&h).len();
+    let mismatched = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x"),
+        Some("user-turn-8"),
+        "approved with a stale loss",
+    );
+    let text = output_text(&mismatched);
+    assert!(!mismatched.status.success(), "{text}");
+    assert!(
+        text.contains("does not match the recorded proposal"),
+        "{text}"
+    );
+    assert_eq!(board.comment_texts(&h).len(), before_mismatch);
+    assert_eq!(
+        removal_check(&board, &h, "experiment").status.code(),
+        Some(1)
+    );
+
+    // Approving the changed content restores authority.
+    let reapprove = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x+recovery"),
+        Some("user-turn-9"),
+        "approved the changed proposal",
+    );
+    assert!(reapprove.status.success(), "{}", output_text(&reapprove));
+    assert_eq!(
+        removal_check(&board, &h, "experiment").status.code(),
+        Some(0)
+    );
+
+    // Withdraw, then deliberately repeat the earlier approval: the repeated
+    // decision is appended after the withdrawal (never silently skipped
+    // against older history), truthfully reported, and becomes current.
+    let withdraw = removal_decision(&board, &h, "withdraw", None, None, None, "withdrawn");
+    assert!(withdraw.status.success(), "{}", output_text(&withdraw));
+    assert_eq!(
+        removal_check(&board, &h, "experiment").status.code(),
+        Some(1)
+    );
+    let before_repeat = board.comment_texts(&h).len();
+    let repeat = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x+recovery"),
+        Some("user-turn-9"),
+        "approved the changed proposal",
+    );
+    let text = output_text(&repeat);
+    assert!(repeat.status.success(), "{text}");
+    assert!(text.contains("record=written"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before_repeat + 1);
+    let authorized = removal_check(&board, &h, "experiment");
+    assert_eq!(
+        authorized.status.code(),
+        Some(0),
+        "{}",
+        output_text(&authorized)
+    );
+    // The immediately repeated decision is confirmed, not appended again.
+    let confirm = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x+recovery"),
+        Some("user-turn-9"),
+        "approved the changed proposal",
+    );
+    let text = output_text(&confirm);
+    assert!(confirm.status.success(), "{text}");
+    assert!(text.contains("record=already-recorded"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before_repeat + 1);
+    assert_no_votes(&board, &h);
     board.drop();
 }
