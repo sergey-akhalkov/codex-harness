@@ -30,6 +30,10 @@ impl Fixture {
             std::env::temp_dir().join(format!("executor-assignment-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        // Build agents can provide a short 8.3 temp prefix (RUNNER~1) while
+        // the rendered checkout path is canonicalized; anchor every path on
+        // the long form so the rendered brief matches either environment.
+        let root = root.canonicalize().unwrap();
         let source = root.join("proj");
         git(
             &root,
