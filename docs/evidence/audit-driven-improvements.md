@@ -332,6 +332,29 @@ isolated `CODEX_HOME`, from working directories outside the checkout:
   outside the checkout. Global delivery of the merged build itself remains
   task 13.2.
 
+## Group 5: launch integrity separated from freshness (tasks 5.1-5.4)
+
+Implemented in worktree slot 4 (`exec-ds-launch`, base `9c02945`) as commit
+`c8a3cfa` and merged as `1683152` after review. `build_identity` now exposes
+one coherent artifact pass (`integrity`/`artifacts`: every required binary
+hashed exactly once, recorded names validated before opening, no
+compiled-source traversal, no persistent state — a same-size mutation with a
+restored timestamp is rejected) separate from the explicit `check` freshness
+diagnosis (fresh/stale/unavailable distinguished from damage). Launch
+selection and activation consume that single pass without duplicate hashing,
+and `native_build::reusable_candidates` rejects definite
+root/toolchain/target and covered-content mismatches before expensive
+consumer validation while a selected candidate still passes full validation
+(version-tolerant for older producer coverage, guarded by the existing
+cross-version test). Executor evidence: fmt/clippy clean, 733 harness-core
+lib tests, 31/31 `native_launcher` (including measured launch reads — adding
+a 64 MiB compiled payload changed launcher reads by only ~649 B — and
+explicit healthy/stale/unavailable/altered check states with exactly one
+upstream fallback), 8/8 `native_build` including the real
+build→reuse→stale→altered→repair path, and a real heavy-budget CLI build. Lead
+verification: the 24 `build_identity`/`build_selection` tests were rerun
+independently on the merged tree and pass.
+
 ## Groups 9 and 3: accepted executor slices (2026-09-30)
 
 **Group 9 (tasks 9.1-9.6), merged as `7d32067`.** Executor `exec-ds-benefit`

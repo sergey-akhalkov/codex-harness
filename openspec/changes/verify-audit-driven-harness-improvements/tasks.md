@@ -44,10 +44,10 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 5. Shorten installed launch without weakening integrity
 
-- [ ] 5.1 Separate runtime integrity/compatibility from explicit source freshness in `crates/harness-core/src/build_identity.rs` and its `build_selection.rs`/`native_launcher.rs` callers; verify ordinary launch avoids compiled-source freshness traversal while required live shared data still applies. Covers A13, N08.
-- [ ] 5.2 Reuse coherent executable verification within one decision and remove duplicate manager hashing without a persistent mtime trust cache; verify a changed/ambiguous executable invalidates the reused result and all required binaries remain checked. Covers A14.
-- [ ] 5.3 Reject source/toolchain/target mismatches in `crates/harness-core/src/native_build.rs` before expensive consumer validation; verify nonmatching candidates are skipped and a selected matching candidate still passes full required validation. Covers A15.
-- [ ] 5.4 Exercise actual launch/check/diagnose paths with healthy, stale, unavailable and altered inputs; verify accurate explicit freshness, measured launch reads, preserved live defaults and exactly one valid upstream fallback rather than a total Codex outage. Covers A13, N08.
+- [x] 5.1 Separate runtime integrity/compatibility from explicit source freshness in `crates/harness-core/src/build_identity.rs` and its `build_selection.rs`/`native_launcher.rs` callers; verify ordinary launch avoids compiled-source freshness traversal while required live shared data still applies. Covers A13, N08.
+- [x] 5.2 Reuse coherent executable verification within one decision and remove duplicate manager hashing without a persistent mtime trust cache; verify a changed/ambiguous executable invalidates the reused result and all required binaries remain checked. Covers A14.
+- [x] 5.3 Reject source/toolchain/target mismatches in `crates/harness-core/src/native_build.rs` before expensive consumer validation; verify nonmatching candidates are skipped and a selected matching candidate still passes full required validation. Covers A15.
+- [x] 5.4 Exercise actual launch/check/diagnose paths with healthy, stale, unavailable and altered inputs; verify accurate explicit freshness, measured launch reads, preserved live defaults and exactly one valid upstream fallback rather than a total Codex outage. Covers A13, N08.
 
 ## 6. Confine scratch reclamation to abandoned owned work
 
