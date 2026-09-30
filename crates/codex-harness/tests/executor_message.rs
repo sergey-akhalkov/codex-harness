@@ -1363,12 +1363,30 @@ impl AttachedRun {
     }
 
     fn frontend_phases(&self) -> Vec<Value> {
-        fs::read_to_string(self.state.join("frontend-1.json"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        // The host appends phase records while it runs; on a slow agent the
+        // file can be observed mid-write. Retry bounded for a complete
+        // record instead of failing on a torn final line.
+        let path = self.state.join("frontend-1.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let mut phases = Vec::new();
+            let mut torn = false;
+            for line in text.lines().filter(|line| !line.is_empty()) {
+                match serde_json::from_str(line) {
+                    Ok(value) => phases.push(value),
+                    Err(_) => torn = true,
+                }
+            }
+            if !torn {
+                return phases;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "frontend phases never became complete JSON"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     fn tool_identity(&self) -> ProcessIdentity {
