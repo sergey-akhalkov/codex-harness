@@ -331,109 +331,765 @@ fn prepared_command(
     Ok((command, registration.task_control, launcher_sha256))
 }
 
-/// Result of asking the loopback xAI shim port what it is.
-enum ShimProbe {
-    /// Nothing is listening; a shim can be started.
-    Free,
-    /// A kit shim answers and reports the executable that serves it.
-    Ours(PathBuf),
-    /// Something else holds the port (another program, or a shim build from
-    /// before identity reporting existed).
-    Unknown,
+// ---------------------------------------------------------------------------
+// xAI endpoint identity, generation binding and ownership-based retirement.
+//
+// A listener is trusted only as an owned generation of the selected build:
+// the launcher prepares the private generation root and keeps the anchor
+// record, the shim publishes an endpoint receipt into that root binding PID,
+// process creation time, image, port, source and a random control token, and
+// the launcher re-verifies all of it before any secret-bearing request is
+// routed: the loopback listener must be owned by the recorded process (TCP
+// owner table), that process must be the live recorded image under this
+// account, and the listener must answer an authenticated identity challenge
+// with the receipt token. Self-reported identity alone never authenticates.
+//
+// Updates never retire a live generation: a new build selects a new endpoint
+// and sessions of each build keep their compatible generation. Retiring an
+// endpoint requires that generation's token (stale authority is refused), and
+// a generation retires when its recorded owners and accepted work release it.
+// ---------------------------------------------------------------------------
+
+/// The verified xAI endpoint selected for a session. Dropping the value
+/// releases this process's owner lease; retirement then follows the remaining
+/// owners and accepted requests.
+pub struct XaiEndpoint {
+    port: u16,
+    #[cfg(windows)]
+    _lease: Option<xai::OwnerLease>,
 }
 
-fn same_executable(left: &Path, right: &Path) -> bool {
-    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
-    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    left.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-}
-
-/// Send one bounded loopback control request to the shim port. A connection
-/// error means the port is free; any other outcome is interpreted by the
-/// caller.
-fn shim_control_request(port: u16, method: &str, path: &str) -> io::Result<(u16, Vec<u8>)> {
-    use std::io::{Read, Write};
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        std::time::Duration::from_millis(200),
-    )?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
-    stream.write_all(
-        format!(
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
-        .as_bytes(),
-    )?;
-    let mut raw = Vec::new();
-    let mut chunk = [0u8; 1024];
-    while raw.len() < 8192 {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(size) => raw.extend_from_slice(&chunk[..size]),
-            Err(_) => break,
-        }
+impl XaiEndpoint {
+    /// Loopback port the session must route xAI traffic to.
+    pub fn port(&self) -> u16 {
+        self.port
     }
-    let (head, body) = match raw.windows(4).position(|window| window == b"\r\n\r\n") {
-        Some(position) => (&raw[..position], raw[position + 4..].to_vec()),
-        None => (raw.as_slice(), Vec::new()),
-    };
-    let status = String::from_utf8_lossy(head)
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(0);
-    Ok((status, body))
+
+    #[cfg(not(windows))]
+    fn plain(port: u16) -> Self {
+        Self { port }
+    }
 }
 
-fn shim_probe(port: u16) -> ShimProbe {
-    match shim_control_request(port, "GET", crate::xai_responses_shim::IDENTITY_PATH) {
-        Err(_) => ShimProbe::Free,
-        Ok((status, body)) => {
-            let identity = (status == 200)
-                .then(|| serde_json::from_slice::<serde_json::Value>(&body).ok())
-                .flatten()
-                .filter(|value| {
-                    value.get("harness").and_then(|v| v.as_str()) == Some("xai-responses-shim")
-                        && value.get("schema").and_then(|v| v.as_u64()) == Some(1)
-                });
-            match identity
-                .and_then(|value| value.get("exe").and_then(|v| v.as_str()).map(PathBuf::from))
-            {
-                Some(exe) => ShimProbe::Ours(exe),
-                None => ShimProbe::Unknown,
+/// Select a verified owned endpoint for the selected build, preferring
+/// `preferred_port`. An existing live generation of the same build is reused;
+/// otherwise a new generation is started, at the preferred port when it is
+/// confirmed free and at a freshly allocated loopback port when another live
+/// generation, a foreign listener or an unavailable probe holds it. The
+/// selected build's new endpoint is returned so the caller can route the new
+/// session without retiring anybody else's session.
+pub fn ensure_xai_endpoint(
+    manager: &Path,
+    home: &Path,
+    preferred_port: u16,
+) -> io::Result<XaiEndpoint> {
+    #[cfg(windows)]
+    {
+        xai::ensure_endpoint(manager, home, preferred_port)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = home;
+        xai_legacy_spawn(manager, preferred_port)
+    }
+}
+
+/// Ensure the pinned route at `port` is a verified owned xAI transport for a
+/// caller whose session configuration already points there. A verified
+/// generation (this build or a compatible live one) is reused and the calling
+/// process becomes an owner; an unverified, spoofed or unavailable listener
+/// fails explicitly without receiving secrets and is never terminated.
+/// Call from the session host before spawning its owned child tree: the shim
+/// is shared by sessions and must not inherit one app-server's cleanup Job.
+/// The explicit loopback port also permits isolated lifecycle verification.
+pub fn ensure_xai_shim(manager: &Path, port: u16) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let home = codex_home()?;
+        ensure_xai_shim_at(manager, &home, port)
+    }
+    #[cfg(not(windows))]
+    {
+        xai_legacy_spawn(manager, port).map(|_| ())
+    }
+}
+
+/// Pinned-route form for callers that already resolved their Codex home; the
+/// environment-based wrapper above uses the ambient home.
+pub fn ensure_xai_shim_at(manager: &Path, home: &Path, port: u16) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        xai::ensure_pinned(manager, home, port)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = home;
+        xai_legacy_spawn(manager, port).map(|_| ())
+    }
+}
+
+/// Explicit forced recovery: authenticated retirement of the verified
+/// generation serving `port`, after re-verifying its ownership. Only the
+/// generation that answers with its own receipt token can retire, so stale
+/// control authority cannot end another generation's sessions. Returns
+/// whether the generation exited and released the port within the bound.
+pub fn retire_xai_endpoint(home: &Path, port: u16) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        xai::retire(home, port)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (home, port);
+        Err(fail("owned xAI transport retirement requires Windows"))
+    }
+}
+
+/// Read-only loopback evidence: which process owns a listener on `port`, if
+/// any. Read from the OS listener table, so a silent firewall that makes a
+/// closed port time out cannot be mistaken for an occupied one. Grants no
+/// authority over the named process.
+#[cfg(windows)]
+pub fn loopback_listener_owner(port: u16) -> io::Result<Option<u32>> {
+    xai::listener_owner_pid(port)
+}
+
+#[cfg(not(windows))]
+pub fn loopback_listener_owner(port: u16) -> io::Result<Option<u32>> {
+    let _ = port;
+    Err(fail("loopback listener evidence requires Windows"))
+}
+
+/// Route one session's `codex` command at the verified endpoint. Only a
+/// differing port adds an override; the profile's own URL stays authoritative
+/// whenever the selected generation serves the usual port. An explicit later
+/// user override still outranks this routing.
+#[cfg(windows)]
+fn xai_route_command(command: Command, port: u16) -> Command {
+    let mut routed = Command::new(command.get_program());
+    routed.arg("-c");
+    routed.arg(format!(
+        "model_providers.xai.base_url=\"http://127.0.0.1:{port}/v1\""
+    ));
+    routed.args(command.get_args());
+    if let Some(directory) = command.get_current_dir() {
+        routed.current_dir(directory);
+    }
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                routed.env(key, value);
+            }
+            None => {
+                routed.env_remove(key);
             }
         }
     }
+    routed
 }
 
-fn wait_for_shim_free(port: u16) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(70);
-    while std::time::Instant::now() < deadline {
-        if matches!(shim_probe(port), ShimProbe::Free) {
+/// Non-Windows fallback: no ownership infrastructure is delivered there; the
+/// port must be refused by the kernel before a shim is started.
+#[cfg(not(windows))]
+fn xai_legacy_spawn(manager: &Path, port: u16) -> io::Result<XaiEndpoint> {
+    match std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(200),
+    ) {
+        Ok(_) => {
+            return Err(fail(
+                "the xAI compatibility shim port is held by an unidentified listener; it is preserved and receives no requests",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        Err(_) => {
+            return Err(fail(
+                "the xAI compatibility shim port could not be identified; this is not a free port",
+            ));
+        }
+    }
+    if !manager.is_file() {
+        return Err(fail("xAI shim manager is absent from the selected build"));
+    }
+    let mut command = Command::new(manager);
+    command.args(["xai-responses-shim", "--port", &port.to_string()]);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    drop(command.spawn()?);
+    Ok(XaiEndpoint::plain(port))
+}
+
+#[cfg(windows)]
+mod xai {
+    use super::XaiEndpoint;
+    use crate::{
+        broker_endpoint::{self, Instance, Observation},
+        broker_state::{ANCHOR_LIMIT, BrokerRoot, Generation},
+        build_identity,
+        process::{Cancellation, Deadline, ProcessIdentity},
+        process_service::{self, ServiceProcess, current_user},
+        registration_native::{FileGuard, LinkIdentity, StagedFile},
+        xai_responses_shim::{IDENTITY_PATH, OWNERS_PATH, RETIRE_PATH, ROOT_ENV},
+    };
+    use serde::{Deserialize, Serialize};
+    use std::{
+        collections::BTreeMap,
+        io::{self, Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        path::{Path, PathBuf},
+        time::{Duration, Instant},
+    };
+
+    const ANCHOR_OWNER: &str = "codex-harness-xai-responses-shim";
+    const ANCHOR_NAME: &str = "xai-shim.json";
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+    const CONTROL_BOUND: usize = 16 * 1024;
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+    const RETIRE_TIMEOUT: Duration = Duration::from_secs(15);
+    const ADMISSION_TIMEOUT: Duration = Duration::from_secs(20);
+
+    fn fail(message: &'static str) -> io::Error {
+        io::Error::other(message)
+    }
+
+    /// One owner lease: the exact calling process and the image it runs.
+    #[derive(Clone, Debug, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OwnerKey {
+        pid: u32,
+        creation_time: u64,
+        program: PathBuf,
+    }
+
+    /// Verified owned generation currently answering on a loopback port.
+    struct Verified {
+        port: u16,
+        token: String,
+        pid: u32,
+    }
+
+    /// Holds this process's owner lease for the selected generation.
+    pub(super) struct OwnerLease {
+        port: u16,
+        token: String,
+        owner: OwnerKey,
+        /// The exact generation process recorded for `port`; the release is
+        /// sent only while that process still owns the loopback listener, so a
+        /// capability is never handed to an unrelated listener that took the
+        /// port after the generation died.
+        endpoint_pid: u32,
+    }
+
+    impl Drop for OwnerLease {
+        fn drop(&mut self) {
+            if !matches!(listener_owner_pid(self.port), Ok(Some(pid)) if pid == self.endpoint_pid) {
+                return;
+            }
+            let body = serde_json::json!({ "action": "release", "owner": self.owner });
+            let _ = control_request(
+                self.port,
+                "POST",
+                OWNERS_PATH,
+                Some(&self.token),
+                Some(body.to_string().as_bytes()),
+            );
+        }
+    }
+
+    fn owner_key() -> io::Result<OwnerKey> {
+        let program = std::env::current_exe()?.canonicalize()?;
+        let observed = ServiceProcess::observe(std::process::id(), &program, 0, &current_user()?)?;
+        Ok(OwnerKey {
+            pid: observed.identity().pid,
+            creation_time: observed.identity().creation_time,
+            program,
+        })
+    }
+
+    pub(super) fn anchor_path(home: &Path) -> PathBuf {
+        home.join("harness").join("runtime").join(ANCHOR_NAME)
+    }
+
+    /// Serializes generation selection, publication and reclamation for one
+    /// account; the same bounded pattern the shared Serena broker location
+    /// record uses. The handle is held for its lifetime.
+    #[allow(dead_code)]
+    struct Admission(std::os::windows::io::OwnedHandle);
+
+    impl Admission {
+        fn acquire(account: &str) -> io::Result<Self> {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle};
+            use windows_sys::Win32::{
+                Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+                System::Threading::{CreateMutexW, WaitForSingleObject},
+            };
+            let name: Vec<u16> = format!("Global\\CodingAgentsHarness.XaiShim.Location.{account}")
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let raw = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+            let deadline = Instant::now() + ADMISSION_TIMEOUT;
+            loop {
+                match unsafe { WaitForSingleObject(handle.as_raw_handle(), 250) } {
+                    WAIT_OBJECT_0 | WAIT_ABANDONED => return Ok(Self(handle)),
+                    WAIT_TIMEOUT if Instant::now() < deadline => continue,
+                    WAIT_TIMEOUT => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "xAI shim location admission expired; no generation was changed",
+                        ));
+                    }
+                    _ => return Err(io::Error::last_os_error()),
+                }
+            }
+        }
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Anchor {
+        owner: String,
+        account: String,
+        generations: Vec<Generation>,
+    }
+
+    pub(super) struct AnchorState {
+        path: PathBuf,
+        anchor: Anchor,
+        bytes: Vec<u8>,
+        identity: Option<LinkIdentity>,
+    }
+
+    impl AnchorState {
+        pub(super) fn load(path: &Path, account: &str) -> io::Result<Self> {
+            match FileGuard::read_regular(path) {
+                Ok((guard, bytes)) => {
+                    if bytes.len() > ANCHOR_LIMIT {
+                        return Err(fail("xAI shim location record exceeds its bound"));
+                    }
+                    let anchor: Anchor = serde_json::from_slice(&bytes)
+                        .map_err(|_| fail("xAI shim location record is invalid"))?;
+                    if anchor.owner != ANCHOR_OWNER || anchor.account != account {
+                        return Err(fail("xAI shim location record is not owned; preserving it"));
+                    }
+                    let identity = guard.object_identity()?;
+                    drop(guard);
+                    Ok(Self {
+                        path: path.to_path_buf(),
+                        anchor,
+                        bytes,
+                        identity: Some(identity),
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
+                    path: path.to_path_buf(),
+                    anchor: Anchor {
+                        owner: ANCHOR_OWNER.to_owned(),
+                        account: account.to_owned(),
+                        generations: Vec::new(),
+                    },
+                    bytes: Vec::new(),
+                    identity: None,
+                }),
+                Err(error) => Err(error),
+            }
+        }
+
+        fn commit(&mut self, changed: bool) -> io::Result<()> {
+            if !changed {
+                return Ok(());
+            }
+            let bytes = serde_json::to_vec(&self.anchor)
+                .map_err(|_| fail("xAI shim location record encoding failed"))?;
+            if bytes.len() > ANCHOR_LIMIT {
+                return Err(fail("xAI shim location record exceeds its bound"));
+            }
+            match &self.identity {
+                Some(identity) => {
+                    FileGuard::replace_regular(&self.path, identity, &self.bytes, &bytes)?
+                }
+                None => StagedFile::create(&self.path, &bytes)?.commit()?,
+            }
+            self.bytes = bytes;
+            if self.identity.is_none() {
+                let (guard, _) = FileGuard::read_regular(&self.path)?;
+                self.identity = Some(guard.object_identity()?);
+            }
+            Ok(())
+        }
+    }
+
+    /// How a generation root is obtained for this selection.
+    pub(super) enum RootChoice {
+        /// A live, verified generation of the same build is reused.
+        Live { port: u16, token: String, pid: u32 },
+        /// A root is prepared for a newly started generation.
+        Spawn { root: PathBuf },
+    }
+
+    /// Reconcile the anchor: drop entries whose directory is unusable, reclaim
+    /// generations whose instance lease is free and whose receipt is stale or
+    /// absent (only those roots are deleted), keep live ones, and choose a
+    /// root for this selection. `allow_live` reuses a verified live generation
+    /// of the same source; when false (a caller pinned to one port) a live
+    /// same-source generation is preserved and a separate root is selected
+    /// instead of ending it.
+    pub(super) fn plan_root(
+        state: &mut AnchorState,
+        source: &str,
+        allow_live: bool,
+    ) -> io::Result<RootChoice> {
+        let mut kept = Vec::with_capacity(state.anchor.generations.len());
+        let mut freed: Vec<(String, PathBuf)> = Vec::new();
+        let mut live_same: Option<(u16, String, u32)> = None;
+        for entry in std::mem::take(&mut state.anchor.generations) {
+            let root = match BrokerRoot::open(&entry.root) {
+                Ok(root) => root,
+                Err(_) => {
+                    // The location is gone or no longer owned; the entry is
+                    // unusable and nothing there may be deleted blindly.
+                    continue;
+                }
+            };
+            match broker_endpoint::observe(&root) {
+                Ok(Observation::Ready { endpoint, owner }) => {
+                    if allow_live
+                        && entry.source == source
+                        && live_same.is_none()
+                        && let Ok(verified) = verify(&endpoint.identity(), &endpoint, &owner)
+                    {
+                        live_same = Some((verified.port, verified.token, verified.pid));
+                    }
+                    kept.push(entry);
+                }
+                Ok(Observation::Stale | Observation::Absent) => match Instance::claim(&root) {
+                    // No instance lease is held: only now is the exact root
+                    // abandoned, and it becomes reusable (and reclaimable).
+                    Ok(instance) => {
+                        drop(instance);
+                        freed.push((entry.source.clone(), entry.root.clone()));
+                    }
+                    // A live or unpublishable owner is preserved untouched.
+                    Err(_) => kept.push(entry),
+                },
+                // Unavailable state evidence preserves the entry.
+                Err(_) => kept.push(entry),
+            }
+        }
+        state.anchor.generations = kept;
+        let mut changed = true;
+        if let Some((port, token, pid)) = live_same {
+            state.commit(changed)?;
+            freed.clear();
+            return Ok(RootChoice::Live { port, token, pid });
+        }
+        let root = if let Some((_, root)) = freed.iter().find(|(held, _)| held == source) {
+            root.clone()
+        } else if let Some((_, root)) = freed.first() {
+            root.clone()
+        } else {
+            BrokerRoot::prepare()?.keep().path().to_path_buf()
+        };
+        for (_, abandoned) in &freed {
+            if abandoned != &root {
+                // Bounded reclamation of an abandoned owned generation: the
+                // instance lease was free and the receipt stale, so no live
+                // request or process depends on this exact root.
+                let _ = std::fs::remove_dir_all(abandoned);
+            }
+        }
+        if !state
+            .anchor
+            .generations
+            .iter()
+            .any(|held| held.root == root)
+        {
+            state.anchor.generations.push(Generation {
+                source: source.to_owned(),
+                root: root.clone(),
+            });
+        } else {
+            changed = false;
+        }
+        state.commit(changed)?;
+        Ok(RootChoice::Spawn { root })
+    }
+
+    /// `Observation::Ready` already proves the receipt parses, its recorded
+    /// owner process is live with the exact creation time, the image matches
+    /// the recorded program and the account matches. This adds the two
+    /// independent checks the receipt cannot self-report: the loopback
+    /// listener belongs to that exact process, and the listener answers this
+    /// generation's receipt token.
+    fn verify(
+        identity: &ProcessIdentity,
+        endpoint: &broker_endpoint::Endpoint,
+        owner: &ServiceProcess,
+    ) -> Result<Verified, ()> {
+        if owner.identity() != *identity {
+            return Err(());
+        }
+        match listener_owner_pid(endpoint.port) {
+            Ok(Some(pid)) if pid == endpoint.pid => {}
+            Ok(_) => return Err(()),
+            Err(_) => return Err(()),
+        }
+        let (status, body) = match control_request(
+            endpoint.port,
+            "GET",
+            IDENTITY_PATH,
+            Some(endpoint.token()),
+            None,
+        ) {
+            Ok(reply) => reply,
+            Err(_) => return Err(()),
+        };
+        if status != 200 {
+            return Err(());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+        let named = value.get("harness").and_then(|v| v.as_str()) == Some("xai-responses-shim")
+            && value.get("schema").and_then(|v| v.as_u64()) == Some(2)
+            && value.get("pid").and_then(|v| v.as_u64()) == Some(u64::from(endpoint.pid))
+            && value.get("port").and_then(|v| v.as_u64()) == Some(u64::from(endpoint.port))
+            && value.get("source").and_then(|v| v.as_str()) == Some(endpoint.source.as_str());
+        if !named {
+            return Err(());
+        }
+        Ok(Verified {
+            port: endpoint.port,
+            token: endpoint.token().to_owned(),
+            pid: endpoint.pid,
+        })
+    }
+
+    /// Verify the generation published in one root, optionally requiring an
+    /// exact build source.
+    fn verify_root(root: &Path, source: Option<&str>) -> io::Result<Option<Verified>> {
+        let root = match BrokerRoot::open(root) {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
+        match broker_endpoint::observe(&root) {
+            Ok(Observation::Ready { endpoint, owner }) => {
+                if source.is_some_and(|source| endpoint.source != source) {
+                    return Ok(None);
+                }
+                Ok(verify(&endpoint.identity(), &endpoint, &owner).ok())
+            }
+            Ok(_) | Err(_) => Ok(None),
+        }
+    }
+
+    fn verified_at(state: &AnchorState, port: u16) -> io::Result<Option<(Verified, PathBuf)>> {
+        for entry in &state.anchor.generations {
+            if let Some(verified) = verify_root(&entry.root, None)?
+                && verified.port == port
+            {
+                return Ok(Some((verified, entry.root.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn ensure_endpoint(
+        manager: &Path,
+        home: &Path,
+        preferred_port: u16,
+    ) -> io::Result<XaiEndpoint> {
+        let manager = manager
+            .canonicalize()
+            .map_err(|_| fail("xAI shim manager is absent from the selected build"))?;
+        if !manager.is_file() {
+            return Err(fail("xAI shim manager is absent from the selected build"));
+        }
+        let source = build_identity::hash_file(&manager)?;
+        let account = current_user()?;
+        let _admission = Admission::acquire(&account)?;
+        let path = anchor_path(home);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut state = AnchorState::load(&path, &account)?;
+        let choice = plan_root(&mut state, &source, true)?;
+        let (port, token, endpoint_pid) = match choice {
+            RootChoice::Live { port, token, pid } => (port, token, pid),
+            RootChoice::Spawn { root } => {
+                let port = match port_state(preferred_port) {
+                    PortState::Free => preferred_port,
+                    _ => ephemeral_port()?,
+                };
+                let verified = start_generation(&root, &manager, port, &source)?;
+                (verified.port, verified.token, verified.pid)
+            }
+        };
+        let owner = owner_key()?;
+        register_owner(port, &token, &owner)?;
+        Ok(XaiEndpoint {
+            port,
+            _lease: Some(OwnerLease {
+                port,
+                token,
+                owner,
+                endpoint_pid,
+            }),
+        })
+    }
+
+    pub(super) fn ensure_pinned(manager: &Path, home: &Path, port: u16) -> io::Result<()> {
+        let manager = manager
+            .canonicalize()
+            .map_err(|_| fail("xAI shim manager is absent from the selected build"))?;
+        if !manager.is_file() {
+            return Err(fail("xAI shim manager is absent from the selected build"));
+        }
+        let account = current_user()?;
+        let _admission = Admission::acquire(&account)?;
+        let path = anchor_path(home);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut state = AnchorState::load(&path, &account)?;
+        if let Some((verified, _)) = verified_at(&state, port)? {
+            let owner = owner_key()?;
+            register_owner(verified.port, &verified.token, &owner)?;
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        match port_state(port) {
+            PortState::Free => {}
+            PortState::Connected => {
+                return Err(fail(
+                    "the 127.0.0.1 xAI compatibility route is held by a listener that is not a verified harness generation; it is preserved untouched and receives no requests; recovery: end the process that owns that port or let the sessions using it finish, then start the session again",
+                ));
+            }
+            PortState::Unavailable => {
+                return Err(fail(
+                    "the 127.0.0.1 xAI compatibility route could not be identified (the identity probe was unavailable); this is not a confirmed free port; recovery: check the process holding that port, then start the session again",
+                ));
+            }
+        }
+        let source = build_identity::hash_file(&manager)?;
+        let RootChoice::Spawn { root } = plan_root(&mut state, &source, false)? else {
+            return Err(fail(
+                "the xAI shim generation selection changed unexpectedly; no session was started",
+            ));
+        };
+        let verified = start_generation(&root, &manager, port, &source)?;
+        let owner = owner_key()?;
+        register_owner(verified.port, &verified.token, &owner)
     }
-    Err(fail(
-        "the retired xAI compatibility shim did not release its port",
-    ))
-}
 
-/// Start the selected build's shim and confirm the port is served by exactly
-/// that executable, so a foreign or outdated listener is never mistaken for it.
-fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    let service = {
-        use crate::process::{Cancellation, Deadline};
+    pub(super) fn retire(home: &Path, port: u16) -> io::Result<bool> {
+        let account = current_user()?;
+        let _admission = Admission::acquire(&account)?;
+        let path = anchor_path(home);
+        let state = AnchorState::load(&path, &account)?;
+        let Some((verified, root)) = verified_at(&state, port)? else {
+            return Ok(false);
+        };
+        let (status, _) = control_request(
+            verified.port,
+            "POST",
+            RETIRE_PATH,
+            Some(&verified.token),
+            None,
+        )?;
+        if status != 200 {
+            return Err(fail(
+                "the xAI compatibility shim refused retirement; the generation was preserved",
+            ));
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        loop {
+            let released =
+                matches!(port_state(port), PortState::Free) && verify_root(&root, None)?.is_none();
+            if released {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                // Accepted, still draining accepted work within the bounded
+                // retirement window; no new owner was added.
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn register_owner(port: u16, token: &str, owner: &OwnerKey) -> io::Result<()> {
+        let body = serde_json::json!({ "action": "acquire", "owner": owner }).to_string();
+        let mut last = None;
+        for _ in 0..2 {
+            match control_request(
+                port,
+                "POST",
+                OWNERS_PATH,
+                Some(token),
+                Some(body.as_bytes()),
+            ) {
+                Ok((200, _)) => return Ok(()),
+                Ok((status, _)) => {
+                    last = Some(io::Error::other(format!(
+                        "the xAI compatibility shim refused this session's owner lease ({status})"
+                    )));
+                }
+                Err(error) => last = Some(error),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(last.unwrap_or_else(|| {
+            fail("the xAI compatibility shim owner lease could not be established")
+        }))
+    }
+
+    fn start_generation(
+        root: &Path,
+        manager: &Path,
+        port: u16,
+        source: &str,
+    ) -> io::Result<Verified> {
+        let service = spawn(root, manager, port)?;
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            if let Some(verified) = verify_root(root, Some(source))? {
+                if verified.port != port {
+                    return Err(fail(
+                        "the started xAI compatibility shim published another port; the endpoint was preserved for explicit recovery",
+                    ));
+                }
+                if verified.pid != service.identity().pid {
+                    return Err(fail(
+                        "the xAI compatibility endpoint does not belong to the started process; the endpoint was preserved",
+                    ));
+                }
+                return Ok(verified);
+            }
+            if !service.is_running()? {
+                return Err(io::Error::other(format!(
+                    "xAI compatibility shim exited before readiness (exit {:?})",
+                    service.exit_code()?
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(fail("xAI compatibility shim did not become ready"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Start the selected build's shim as an independent service sibling that
+    /// publishes its receipt into the prepared private generation root.
+    fn spawn(root: &Path, manager: &Path, port: u16) -> io::Result<ServiceProcess> {
         // Preflight and tool commands run inside kill-on-close Jobs. A normal
         // detached spawn still inherits that Job and dies when its caller is
         // cleaned up. Use the existing independent service bootstrap, which
         // also prevents inheritance of the caller's output pipe handles.
-        let environment = env::vars_os()
+        let environment = std::env::vars_os()
             .map(|(key, value)| {
                 Ok((
                     key.into_string()
@@ -443,13 +1099,14 @@ fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
                         .map_err(|_| fail("non-Unicode service environment value"))?,
                 ))
             })
-            .collect::<io::Result<_>>()?;
-        let manager = manager.canonicalize()?;
+            .collect::<io::Result<BTreeMap<_, _>>>()?;
+        let mut environment = environment;
+        environment.insert(ROOT_ENV.to_owned(), root.display().to_string());
         let directory = manager
             .parent()
             .ok_or_else(|| fail("shim manager has no directory"))?;
-        let spawned = crate::process_service::spawn(
-            &manager,
+        process_service::spawn(
+            manager,
             directory,
             vec![
                 "xai-responses-shim".into(),
@@ -457,92 +1114,184 @@ fn spawn_xai_shim(port: u16, manager: &Path) -> io::Result<()> {
                 port.to_string(),
             ],
             environment,
-            Deadline::after(std::time::Duration::from_secs(30))?,
+            Deadline::after(STARTUP_TIMEOUT)?,
             &Cancellation::default(),
-        );
-        match spawned {
-            Ok(service) => service,
-            Err(error) => {
-                // Parallel cold starts can race to bind. A losing helper may exit
-                // before its identity is observed; accept only a ready peer from
-                // this exact build, otherwise preserve the bootstrap failure.
-                if matches!(shim_probe(port), ShimProbe::Ours(exe) if same_executable(&exe, &manager))
-                {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-        }
-    };
-    #[cfg(not(windows))]
-    {
-        let mut command = Command::new(manager);
-        command.args(["xai-responses-shim", "--port", &port.to_string()]);
-        command.stdin(std::process::Stdio::null());
-        command.stdout(std::process::Stdio::null());
-        command.stderr(std::process::Stdio::null());
-        drop(command.spawn()?);
+        )
     }
-    for _ in 0..250 {
-        match shim_probe(port) {
-            ShimProbe::Ours(exe) if same_executable(&exe, manager) => return Ok(()),
-            ShimProbe::Ours(_) => {
-                return Err(fail(
-                    "the xAI compatibility shim port is served by another build",
-                ));
-            }
-            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+
+    pub(super) enum PortState {
+        /// The kernel refused a loopback connection: nothing listens there.
+        Free,
+        /// Something accepted the connection; identity is decided elsewhere.
+        Connected,
+        /// No trustworthy evidence: probe timeout or another transport error.
+        Unavailable,
+    }
+
+    pub(super) fn port_state(port: u16) -> PortState {
+        // The listener table is authoritative: on hosts where a firewall makes
+        // a closed port time out silently, a connection probe alone cannot
+        // distinguish free from occupied. A missing row is a free port; a
+        // table failure falls back to direct connection evidence only.
+        match listener_owner_pid(port) {
+            Ok(Some(_)) => return PortState::Connected,
+            Ok(None) => return PortState::Free,
+            Err(_) => {}
         }
-        #[cfg(windows)]
-        if !service.is_running()? {
-            // The peer can bind between the preceding probe and this exit
-            // observation. Recheck readiness after observing the losing child.
-            if matches!(shim_probe(port), ShimProbe::Ours(exe) if same_executable(&exe, manager)) {
-                return Ok(());
+        match TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), CONNECT_TIMEOUT)
+        {
+            Ok(_) => PortState::Connected,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => PortState::Free,
+            Err(_) => PortState::Unavailable,
+        }
+    }
+
+    fn ephemeral_port() -> io::Result<u16> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Ok(listener.local_addr()?.port())
+    }
+
+    /// One bounded loopback control exchange. The caller decides what a
+    /// response means; a timeout, an empty answer and a connection error are
+    /// all distinguishable from a confirmed free port.
+    pub(super) fn control_request(
+        port: u16,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        let mut stream =
+            TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), CONNECT_TIMEOUT)?;
+        stream.set_read_timeout(Some(CONTROL_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONTROL_TIMEOUT))?;
+        let body = body.unwrap_or_default();
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(token) = token {
+            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        head.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ));
+        stream.write_all(head.as_bytes())?;
+        if !body.is_empty() {
+            stream.write_all(body)?;
+        }
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => {
+                    raw.extend_from_slice(&chunk[..size]);
+                    if raw.len() > CONTROL_BOUND {
+                        break;
+                    }
+                }
+                Err(error) if raw.is_empty() => return Err(error),
+                Err(_) => break,
             }
+        }
+        if raw.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the listener did not answer the control request",
+            ));
+        }
+        let (head, body) = match raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            Some(position) => (&raw[..position], raw[position + 4..].to_vec()),
+            None => (raw.as_slice(), Vec::new()),
+        };
+        let status = String::from_utf8_lossy(head)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        Ok((status, body))
+    }
+
+    /// The process that owns the loopback listener, from the Windows TCP
+    /// owner table. This is OS evidence independent of anything the listener
+    /// reports about itself. A missing row means no listener; a query failure
+    /// is unavailable evidence, never a free port.
+    pub(super) fn listener_owner_pid(port: u16) -> io::Result<Option<u32>> {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            state: u32,
+            local_addr: u32,
+            local_port: u32,
+            remote_addr: u32,
+            remote_port: u32,
+            pid: u32,
+        }
+        #[link(name = "iphlpapi")]
+        unsafe extern "system" {
+            fn GetExtendedTcpTable(
+                table: *mut std::ffi::c_void,
+                size: *mut u32,
+                order: i32,
+                family: u32,
+                class: u32,
+                reserved: u32,
+            ) -> u32;
+        }
+        const AF_INET: u32 = 2;
+        const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+        let mut size = 0u32;
+        let mut status = unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if status != ERROR_INSUFFICIENT_BUFFER && status != 0 {
             return Err(io::Error::other(format!(
-                "xAI compatibility shim exited before readiness (exit {:?})",
-                service.exit_code()?
+                "loopback listener table query failed ({status})"
             )));
         }
-    }
-    Err(fail("xAI compatibility shim did not become ready"))
-}
-
-/// Reuse a shim only when it is the selected build's shim. A shim from a
-/// superseded build is retired first, otherwise fixes in the selected build
-/// would never reach new sessions while any Codex process kept the old one
-/// alive. A listener without identity reporting (a pre-identity shim) is
-/// reused as before, with an explicit notice, because it cannot be replaced
-/// without breaking a session that may still depend on it.
-/// Call from the session host before spawning its owned child tree: the shim
-/// is shared by sessions and must not inherit one app-server's cleanup Job.
-/// The explicit loopback port also permits isolated lifecycle verification.
-pub fn ensure_xai_shim(manager: &Path, port: u16) -> io::Result<()> {
-    match shim_probe(port) {
-        ShimProbe::Ours(exe) if same_executable(&exe, manager) => return Ok(()),
-        ShimProbe::Ours(stale) => {
-            eprintln!(
-                "codex-harness: replacing the xAI shim from an earlier build ({}); sessions started from that build must be restarted",
-                stale.display()
-            );
-            // The response may race the shim's exit; the released port is the
-            // observable that matters.
-            let _ = shim_control_request(port, "POST", crate::xai_responses_shim::RETIRE_PATH);
-            wait_for_shim_free(port)?;
+        if size < 4 || size as usize > 16 * 1024 * 1024 {
+            return Err(fail("loopback listener table size is unusable"));
         }
-        ShimProbe::Unknown => {
-            eprintln!(
-                "codex-harness: 127.0.0.1:{port} is held by an unidentified or pre-identity xAI shim; it is reused unchanged (restart all Codex sessions to replace it)"
-            );
-            return Ok(());
+        let mut buffer = vec![0u32; (size as usize).div_ceil(4)];
+        status = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                0,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::other(format!(
+                "loopback listener table query failed ({status})"
+            )));
         }
-        ShimProbe::Free => {}
+        let count = buffer[0] as usize;
+        let available =
+            (buffer.len() - 1) * std::mem::size_of::<u32>() / std::mem::size_of::<Row>();
+        let rows = unsafe {
+            std::slice::from_raw_parts(buffer.as_ptr().add(1).cast::<Row>(), count.min(available))
+        };
+        for row in rows {
+            let local_port = u16::from_be((row.local_port & 0xffff) as u16);
+            let local_addr = u32::from_be(row.local_addr);
+            // 127.0.0.1 or a wildcard listener that also covers loopback.
+            if local_port == port && (local_addr == 0x7f00_0001 || local_addr == 0) {
+                return Ok(Some(row.pid));
+            }
+        }
+        Ok(None)
     }
-    if !manager.is_file() {
-        return Err(fail("xAI shim manager is absent from the selected build"));
-    }
-    spawn_xai_shim(port, manager)
 }
 
 pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
@@ -755,14 +1504,41 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     crate::process::suppress_loader_dialogs();
     let (uncapped, args) = take_uncapped_session_selector(args)?;
     let (command, task_control, _) = prepared_command(executable, home, &args)?;
-    if launcher::xai_shim_requested(&args) {
+    // An xAI session routes only to a verified owned generation of this build.
+    // The owner lease lives until this launcher exits, so the generation
+    // retires with its sessions instead of being replaced under a live
+    // stream; a differing selected endpoint is carried into this session's
+    // routing without touching any other session.
+    let (command, _xai_endpoint) = if launcher::xai_shim_requested(&args) {
         let manager = executable
             .canonicalize()?
             .parent()
             .ok_or_else(|| fail("launcher has no build directory"))?
             .join("codex-harness.exe");
-        ensure_xai_shim(&manager, crate::xai_responses_shim::DEFAULT_PORT)?;
-    }
+        #[cfg(windows)]
+        {
+            let endpoint =
+                ensure_xai_endpoint(&manager, home, crate::xai_responses_shim::DEFAULT_PORT)?;
+            let command = if endpoint.port() == crate::xai_responses_shim::DEFAULT_PORT {
+                command
+            } else {
+                eprintln!(
+                    "codex-harness: the usual xAI compatibility port 127.0.0.1:{} is held by another live generation; this session is routed to the verified owned endpoint 127.0.0.1:{}",
+                    crate::xai_responses_shim::DEFAULT_PORT,
+                    endpoint.port()
+                );
+                xai_route_command(command, endpoint.port())
+            };
+            (command, Some(endpoint))
+        }
+        #[cfg(not(windows))]
+        {
+            ensure_xai_shim(&manager, crate::xai_responses_shim::DEFAULT_PORT)?;
+            (command, None)
+        }
+    } else {
+        (command, None)
+    };
     #[cfg(windows)]
     let _console = ConsoleHandler::install()?;
     #[cfg(windows)]
@@ -1764,6 +2540,7 @@ mod tests {
     use std::{
         fs,
         io::Write,
+        net::TcpListener,
         path::{Path, PathBuf},
         process::Stdio,
         sync::Arc,
@@ -1805,75 +2582,77 @@ mod tests {
         }
     }
 
-    /// Loopback stand-in for a running xAI shim: answers the identity endpoint
-    /// with the file the test wants it to report and honors retirement.
-    struct ShimFixture {
+    /// A foreign loopback responder that records every request it sees: a
+    /// self-reported identity must never authenticate it, and no secret may
+    /// ever be sent to it.
+    struct ForeignListener {
         port: u16,
-        retired: Arc<std::sync::atomic::AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<std::thread::JoinHandle<()>>,
     }
 
-    impl ShimFixture {
-        fn start(exe: &str) -> Self {
+    impl ForeignListener {
+        fn start() -> Self {
             use std::io::{Read, Write};
             use std::net::TcpListener;
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).unwrap();
-            let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let observed = Arc::clone(&retired);
-            let exe = exe.to_string();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = Arc::clone(&seen);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
             let worker = std::thread::spawn(move || {
-                loop {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let mut buffer = [0u8; 2048];
-                            let size = stream.read(&mut buffer).unwrap_or(0);
-                            let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                            if request.starts_with("GET /__harness/xai-shim/identity") {
-                                let body = json!({
-                                    "harness": "xai-responses-shim",
-                                    "schema": 1,
-                                    "exe": exe,
-                                })
-                                .to_string();
-                                let _ = stream.write_all(
-                                format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                    body.len()
-                                )
-                                .as_bytes(),
-                            );
-                            } else if request.starts_with("POST /__harness/xai-shim/retire") {
-                                observed.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let body = "{\"retiring\":true}";
-                                let _ = stream.write_all(
-                                format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                    body.len()
-                                )
-                                .as_bytes(),
-                            );
-                                return;
-                            } else {
-                                let _ = stream.write_all(
-                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
-                                );
-                            }
-                        }
-                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
-                    }
+                while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut buffer = [0u8; 2048];
+                    let size = stream.read(&mut buffer).unwrap_or(0);
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buffer[..size]).into_owned());
+                    // A plausible identity document with a valid-looking shape
+                    // still proves nothing without the receipt ownership.
+                    let body = json!({
+                        "harness": "xai-responses-shim",
+                        "schema": 2,
+                        "pid": std::process::id(),
+                        "port": port,
+                        "source": "0".repeat(64),
+                    })
+                    .to_string();
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
                 }
             });
             Self {
                 port,
-                retired,
+                seen,
+                stop,
                 worker: Some(worker),
             }
         }
 
+        fn saw_authorization(&self) -> bool {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.to_ascii_lowercase().contains("authorization:"))
+        }
+
         fn join(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
             if let Some(worker) = self.worker.take() {
                 worker.join().unwrap();
             }
@@ -1881,78 +2660,154 @@ mod tests {
     }
 
     #[test]
-    fn shim_probe_separates_identity_unknown_and_free_ports() {
-        let mut ours = ShimFixture::start(r"C:\build-a\codex-harness.exe");
-        match shim_probe(ours.port) {
-            ShimProbe::Ours(exe) => {
-                assert!(same_executable(
-                    &exe,
-                    Path::new(r"C:\build-a\codex-harness.exe")
-                ))
-            }
-            other => panic!("expected identity, got {}", probe_name(&other)),
+    fn loopback_owner_table_binds_the_listening_process() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(
+            super::xai::listener_owner_pid(port).unwrap(),
+            Some(std::process::id()),
+            "the OS listener table names the process that bound the port"
+        );
+        drop(listener);
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while super::xai::listener_owner_pid(port).unwrap().is_some() {
+            assert!(std::time::Instant::now() < until, "closed port row cleared");
+            std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = shim_control_request(ours.port, "POST", crate::xai_responses_shim::RETIRE_PATH);
-        ours.join();
+    }
 
-        // A responder that is not the kit shim must classify as unknown.
-        use std::io::Write;
-        use std::net::TcpListener;
-        let foreign = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let foreign_port = foreign.local_addr().unwrap().port();
-        let foreign_worker = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = foreign.accept() {
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    #[test]
+    fn probe_separates_free_unverified_and_unavailable_ports() {
+        use super::xai::{PortState, control_request, port_state};
+        // A dropped listener is a confirmed free port: the listener table has
+        // no row, even where a firewall turns an unbound loopback port into a
+        // silent connect timeout. Parallel listeners can reuse a just-released
+        // ephemeral port, so the candidate is re-checked before use.
+        let mut confirmed = None;
+        for _ in 0..16 {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let candidate = listener.local_addr().unwrap().port();
+            drop(listener);
+            if matches!(port_state(candidate), PortState::Free) {
+                confirmed = Some(candidate);
+                break;
             }
+        }
+        let free_port = confirmed.expect("a dropped listener leaves a free port");
+        let error = control_request(
+            free_port,
+            "GET",
+            crate::xai_responses_shim::IDENTITY_PATH,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::ConnectionRefused
+            ),
+            "no listener can answer a free port: {error:?}"
+        );
+
+        // An answering listener is occupied evidence; a plausible identity
+        // body and a token are still not receipt ownership.
+        let mut foreign = ForeignListener::start();
+        assert!(matches!(port_state(foreign.port), PortState::Connected));
+        let (status, body) = control_request(
+            foreign.port,
+            "GET",
+            crate::xai_responses_shim::IDENTITY_PATH,
+            Some("token"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert!(
+            String::from_utf8_lossy(&body).contains("xai-responses-shim"),
+            "the spoof is plausible; only the launcher's receipt evidence classifies it"
+        );
+        foreign.join();
+
+        // A listener that never answers is occupied and unavailable evidence,
+        // never a free port.
+        let silent = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let held = std::thread::spawn(move || {
+            let (stream, _) = silent.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+            drop(stream);
         });
-        assert!(matches!(shim_probe(foreign_port), ShimProbe::Unknown));
-        foreign_worker.join().unwrap();
-
-        // A dropped listener leaves the port free.
-        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let free_port = free.local_addr().unwrap().port();
-        drop(free);
-        assert!(matches!(shim_probe(free_port), ShimProbe::Free));
-    }
-
-    fn probe_name(probe: &ShimProbe) -> &'static str {
-        match probe {
-            ShimProbe::Free => "free",
-            ShimProbe::Ours(_) => "ours",
-            ShimProbe::Unknown => "unknown",
-        }
+        assert!(matches!(port_state(silent_port), PortState::Connected));
+        let error = control_request(
+            silent_port,
+            "GET",
+            crate::xai_responses_shim::IDENTITY_PATH,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        held.join().unwrap();
     }
 
     #[test]
-    fn matching_shim_is_reused_without_spawning() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = root.path().join("codex-harness.exe");
-        // Deliberately empty: an attempted launch of it would fail, so Ok()
-        // proves the matching shim was reused.
-        fs::write(&manager, b"").unwrap();
-        let mut fixture = ShimFixture::start(&manager.display().to_string());
-        assert!(ensure_xai_shim(&manager, fixture.port).is_ok());
-        assert!(!fixture.retired.load(std::sync::atomic::Ordering::SeqCst));
-        let _ = shim_control_request(fixture.port, "POST", crate::xai_responses_shim::RETIRE_PATH);
-        fixture.join();
+    fn spoofed_listener_never_receives_secrets_and_is_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        let manager = home.path().join("codex-harness.exe");
+        // A file that exists so selection reaches the port decision; it is
+        // never spawned here because the pinned route fails first.
+        fs::write(&manager, b"not a real executable").unwrap();
+        let mut foreign = ForeignListener::start();
+        let error = super::xai::ensure_pinned(&manager, home.path(), foreign.port).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("not a verified harness generation"), "{text}");
+        assert!(
+            !foreign.saw_authorization(),
+            "an unverified listener must never receive a control token or secret"
+        );
+        // The foreign process is preserved: it still owns and accepts on its port.
+        let stream = std::net::TcpStream::connect(("127.0.0.1", foreign.port)).unwrap();
+        drop(stream);
+        foreign.join();
     }
 
     #[test]
-    fn shim_from_another_build_is_retired_before_start() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = root.path().join("codex-harness.exe");
-        let mut fixture = ShimFixture::start(r"C:\superseded-build\codex-harness.exe");
-        let error = ensure_xai_shim(&manager, fixture.port).unwrap_err();
-        assert!(
-            error.to_string().contains("absent from the selected build"),
-            "{error}"
+    fn anchor_reuses_an_abandoned_root_and_keeps_generations_distinct() {
+        let home = tempfile::tempdir().unwrap();
+        let account = crate::process_service::current_user().unwrap();
+        let source = "a".repeat(64);
+        let other = "b".repeat(64);
+        let path = super::xai::anchor_path(home.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut state = super::xai::AnchorState::load(&path, &account).unwrap();
+        let first = match super::xai::plan_root(&mut state, &source, true).unwrap() {
+            super::xai::RootChoice::Spawn { root } => root,
+            super::xai::RootChoice::Live { .. } => panic!("nothing is live yet"),
+        };
+        // The abandoned (never published) generation is reclaimed into the
+        // same root instead of leaking a new location.
+        let again = match super::xai::plan_root(&mut state, &source, true).unwrap() {
+            super::xai::RootChoice::Spawn { root } => root,
+            super::xai::RootChoice::Live { .. } => panic!("nothing was published"),
+        };
+        assert_eq!(first, again);
+        // A freed root serves the next selection for any source: abandoned
+        // owned generations are reclaimed into the same bounded location.
+        let reused_for_other = match super::xai::plan_root(&mut state, &other, true).unwrap() {
+            super::xai::RootChoice::Spawn { root } => root,
+            super::xai::RootChoice::Live { .. } => panic!("nothing was published"),
+        };
+        assert_eq!(first, reused_for_other);
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["owner"], "codex-harness-xai-responses-shim");
+        assert_eq!(record["account"], account);
+        assert_eq!(
+            record["generations"].as_array().unwrap().len(),
+            1,
+            "dead entries are reclaimed instead of growing the record"
         );
-        assert!(fixture.retired.load(std::sync::atomic::Ordering::SeqCst));
-        fixture.join();
-        assert!(
-            matches!(shim_probe(fixture.port), ShimProbe::Free),
-            "retired shim must release the port"
-        );
+        let _ = fs::remove_dir_all(first);
     }
 
     fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {

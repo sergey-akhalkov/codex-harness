@@ -9,8 +9,20 @@
 //! `external_web_access`), rewrites the matching streamed calls back into the
 //! forms Codex routes, and repairs whole-number floats and decorated patch
 //! markers. Every other request and response byte passes through. It stores
-//! no credentials (Authorization passes through), registers no scheduled
-//! task, and exits once no `codex.exe` process remains on the host.
+//! no credentials (Authorization passes through) and registers no scheduled
+//! task.
+//!
+//! A managed generation (started by the launcher with
+//! [`ROOT_ENV`]; see `native_launcher::ensure_xai_endpoint`) additionally
+//! publishes an endpoint receipt into its private generation root, keeps an
+//! authenticated control plane (identity only after proving the receipt
+//! token; retirement only for the authority that names this generation), and
+//! records the live owner processes that depend on it. Retirement then follows
+//! owner/work release instead of the discovery of a newer build, so an update
+//! selects a new endpoint without cutting an existing session's stream. An
+//! unmanaged generation (a direct CLI start without a generation root) serves
+//! requests but has no trusted identity and exits once no `codex.exe` process
+//! remains on the host.
 //!
 //! Qualification (2026-09-26, Codex CLI 0.157.0 through a scripted local
 //! upstream, no provider call): the target CLI still echoes `content: null`
@@ -25,17 +37,24 @@
 //! none is proven removable today.
 
 use crate::{
+    broker_endpoint::Instance,
     broker_state::BrokerRoot,
-    process::{Cancellation, Deadline},
+    build_identity,
+    process::{Cancellation, Deadline, ProcessIdentity},
+    process_service::{ServiceProcess, current_user},
+    registration_native::{FileGuard, StagedFile},
     task_forward::{ForwardRequest, Forwarder},
 };
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -49,6 +68,20 @@ pub const DEFAULT_UPSTREAM: &str = "https://api.x.ai";
 /// selected build (with its fixes) actually serves new sessions.
 pub const IDENTITY_PATH: &str = "/__harness/xai-shim/identity";
 pub const RETIRE_PATH: &str = "/__harness/xai-shim/retire";
+/// Authenticated owner lease add/remove for one managed generation.
+pub const OWNERS_PATH: &str = "/__harness/xai-shim/owners";
+/// The launcher supplies the private generation root; without it the shim is
+/// unmanaged and cannot be verified as an owned transport.
+pub const ROOT_ENV: &str = "HARNESS_XAI_SHIM_ROOT";
+/// Test-only loopback upstream override. Only a literal 127.0.0.1 destination
+/// is honored, so a redirected shim can never carry provider credentials to a
+/// remote third party.
+const UPSTREAM_ENV: &str = "HARNESS_XAI_SHIM_UPSTREAM";
+const POLL_ENV: &str = "HARNESS_XAI_SHIM_POLL_MS";
+const GRACE_ENV: &str = "HARNESS_XAI_SHIM_GRACE_MS";
+const OWNER_FILE: &str = "owners.json";
+const OWNER_LIMIT: usize = 64;
+const OWNER_FILE_BYTES: usize = 16 * 1024;
 const HEAD_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS: usize = 16;
@@ -95,22 +128,102 @@ pub fn run_service(mut guard: crate::process_service::ServiceGuard, options: &Op
 }
 
 fn run_with_ready(options: &Options, ready: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    // A generation root means the launcher owns this endpoint: publish a
+    // receipt bound to this exact process, accept only authenticated control
+    // requests, and retire on owner/work release. Without a root the shim is
+    // unmanaged legacy behavior: it serves, but no launcher may trust it.
+    let managed = std::env::var_os(ROOT_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| BrokerRoot::open(&path))
+        .transpose()?;
+    let mut instance = managed.as_ref().map(Instance::claim).transpose()?;
     let listener = TcpListener::bind(("127.0.0.1", options.port)).map_err(|_| {
         io::Error::other("xai responses shim port unavailable; another shim may be running")
     })?;
+    let control = match instance.as_mut() {
+        Some(instance) => Some(Arc::new(Control::publish(
+            instance,
+            options.port,
+            managed
+                .as_ref()
+                .expect("managed instance has a root")
+                .path(),
+        )?)),
+        None => None,
+    };
     ready()?;
-    serve(
+    let retire = Arc::new(AtomicBool::new(false));
+    let keep_running: Arc<dyn Fn() -> bool + Send + Sync> = match &control {
+        Some(control) => {
+            let control = Arc::clone(control);
+            Arc::new(move || control.keep_running())
+        }
+        None => Arc::new(codex_process_present),
+    };
+    let (poll, grace) = effective_timings(options);
+    let upstream = effective_upstream(options);
+    let result = serve_with_control(
         listener,
-        &options.upstream,
-        Arc::new(codex_process_present),
-        options.poll_interval,
-        options.startup_grace,
-    )
+        &upstream,
+        keep_running,
+        poll,
+        grace,
+        retire,
+        control,
+    );
+    if let Some(instance) = instance {
+        // A clean exit removes this generation's receipt; an unclean exit
+        // leaves it for the launcher's exact stale-owner reclamation.
+        let _ = instance.close();
+    }
+    result
+}
+
+/// Poll/grace knobs for owned test processes. Debug builds only: a release
+/// service always uses the delivered defaults.
+fn effective_timings(options: &Options) -> (Duration, Duration) {
+    let mut poll = options.poll_interval;
+    let mut grace = options.startup_grace;
+    if cfg!(debug_assertions) {
+        if let Some(ms) = env_millis(POLL_ENV) {
+            poll = ms;
+        }
+        if let Some(ms) = env_millis(GRACE_ENV) {
+            grace = ms;
+        }
+    }
+    (poll, grace)
+}
+
+fn env_millis(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| (20..=600_000).contains(ms))
+        .map(Duration::from_millis)
+}
+
+/// The delivered upstream unless a literal loopback override is present.
+fn effective_upstream(options: &Options) -> String {
+    match std::env::var(UPSTREAM_ENV) {
+        Ok(value) if loopback_http(&value) => value,
+        _ => options.upstream.clone(),
+    }
+}
+
+fn loopback_http(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    authority == "127.0.0.1" || authority.starts_with("127.0.0.1:")
 }
 
 /// Serve accepted connections until the host no longer needs the shim.
 /// `keep_running` is polled only while no request is in flight, so an active
 /// stream is never cut by the lifecycle check.
+#[cfg(test)]
 pub(crate) fn serve(
     listener: TcpListener,
     upstream: &str,
@@ -118,23 +231,25 @@ pub(crate) fn serve(
     poll_interval: Duration,
     startup_grace: Duration,
 ) -> io::Result<()> {
-    serve_with_retire(
+    serve_with_control(
         listener,
         upstream,
         keep_running,
         poll_interval,
         startup_grace,
         Arc::new(AtomicBool::new(false)),
+        None,
     )
 }
 
-pub(crate) fn serve_with_retire(
+pub(crate) fn serve_with_control(
     listener: TcpListener,
     upstream: &str,
     keep_running: Arc<dyn Fn() -> bool + Send + Sync>,
     poll_interval: Duration,
     startup_grace: Duration,
     retire: Arc<AtomicBool>,
+    control: Option<Arc<Control>>,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let mut listener = Some(listener);
@@ -173,10 +288,11 @@ pub(crate) fn serve_with_retire(
                 let upstream = upstream.to_string();
                 let active = Arc::clone(&active);
                 let retire = Arc::clone(&retire);
+                let control = control.clone();
                 thread::Builder::new()
                     .name("xai-responses-shim".to_string())
                     .spawn(move || {
-                        handle_connection(stream, &upstream, &retire);
+                        handle_connection(stream, &upstream, &retire, control.as_ref());
                         active.fetch_sub(1, Ordering::SeqCst);
                     })?;
             }
@@ -206,7 +322,12 @@ enum ReadOutcome {
     Drop,
 }
 
-fn handle_connection(mut stream: TcpStream, upstream: &str, retire: &AtomicBool) {
+fn handle_connection(
+    mut stream: TcpStream,
+    upstream: &str,
+    retire: &AtomicBool,
+    control: Option<&Arc<Control>>,
+) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let request = match read_request(&mut stream) {
@@ -217,17 +338,58 @@ fn handle_connection(mut stream: TcpStream, upstream: &str, retire: &AtomicBool)
         }
         _ => return,
     };
-    // Local build-identity control plane: the launcher uses it to reuse only a
-    // shim from the selected build and to retire one from a superseded build.
-    // Handling happens before the upstream hop so it never reaches api.x.ai.
+    // Local generation-control plane: the launcher verifies this exact
+    // generation before routing traffic and retires only with this
+    // generation's authority. Handling happens before the upstream hop so it
+    // never reaches api.x.ai. Every control answer requires the receipt token;
+    // an unmanaged or foreign listener never authenticates.
     if request.method == "GET" && request.target == IDENTITY_PATH {
-        let _ = write_json_response(&mut stream, &identity_body());
+        match control {
+            Some(control) if control.authorized(&request.headers) => {
+                let _ = write_json_response(&mut stream, &control.identity_body());
+            }
+            _ => {
+                let _ = write_json_status(&mut stream, "401 Unauthorized", "unauthorized");
+            }
+        }
         return;
     }
     if request.method == "POST" && request.target == RETIRE_PATH {
-        retire.store(true, Ordering::SeqCst);
-        let body = serde_json::json!({"retiring": true}).to_string();
-        let _ = write_json_response(&mut stream, &body);
+        match control {
+            Some(control) if control.authorized(&request.headers) => {
+                // Explicitly selected forced recovery: stop accepting and
+                // drain accepted work within the bounded retirement window.
+                retire.store(true, Ordering::SeqCst);
+                let _ = write_json_response(&mut stream, r#"{"retiring":true}"#);
+            }
+            _ => {
+                // A stale or foreign authority cannot retire this generation.
+                let _ = write_json_status(&mut stream, "403 Forbidden", "not-this-generation");
+            }
+        }
+        return;
+    }
+    if request.method == "POST" && request.target == OWNERS_PATH {
+        let body = match control {
+            Some(control) if control.authorized(&request.headers) => {
+                control.handle_owners(&request.body)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized",
+            )),
+        };
+        match body {
+            Ok(body) => {
+                let _ = write_json_response(&mut stream, &body);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                let _ = write_json_status(&mut stream, "403 Forbidden", "unauthorized");
+            }
+            Err(_) => {
+                let _ = write_json_status(&mut stream, "409 Conflict", "owner-refused");
+            }
+        }
         return;
     }
     let mut body = request.body;
@@ -1166,21 +1328,286 @@ fn write_json_response(stream: &mut TcpStream, body: &str) -> io::Result<()> {
     )
 }
 
-/// Build identity of this shim process: the launcher compares `exe` with the
-/// manager executable of the selected build. No credentials or request data.
-fn identity_body() -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.canonicalize().ok())
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
-    serde_json::json!({
-        "harness": "xai-responses-shim",
-        "schema": 1,
-        "pid": std::process::id(),
-        "exe": exe,
-    })
-    .to_string()
+fn write_json_status(stream: &mut TcpStream, status: &str, error: &str) -> io::Result<()> {
+    let body = json!({ "harness": "xai-responses-shim", "schema": 2, "error": error }).to_string();
+    stream.write_all(
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+}
+
+/// One recorded live owner: the exact process (PID plus creation time) and the
+/// executable image it runs. Liveness is re-verified against these recorded
+/// fields, so a reused PID never inherits ownership.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Owner {
+    pid: u32,
+    #[serde(rename = "creationTime")]
+    creation_time: u64,
+    program: PathBuf,
+}
+
+impl Owner {
+    fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            creation_time: self.creation_time,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerFile {
+    schema: u64,
+    owners: Vec<Owner>,
+}
+
+#[derive(Default)]
+struct OwnerState {
+    /// True once the owners file existed or a registration arrived; false
+    /// means this generation has no recorded owners at all (legacy fallback).
+    loaded: bool,
+    owners: Vec<Owner>,
+}
+
+/// Authenticated control plane of one managed generation. Its receipt token
+/// (generated with the endpoint receipt, stored only in the private generation
+/// root) authenticates identity answers, owner leases and the explicit
+/// retirement control; a request that cannot present it is not this
+/// generation's authority.
+pub(crate) struct Control {
+    token: String,
+    source: String,
+    program: PathBuf,
+    port: u16,
+    owners_path: PathBuf,
+    owners: Mutex<OwnerState>,
+    retiring: Arc<AtomicBool>,
+}
+
+impl Control {
+    /// Publish this process as the generation's exact endpoint owner. The
+    /// receipt already binds PID, creation time, image hash, port and source;
+    /// the token never leaves the private root and this process's memory.
+    fn publish(instance: &mut Instance<'_>, port: u16, root: &Path) -> io::Result<Self> {
+        let program = std::env::current_exe()?.canonicalize()?;
+        let source = build_identity::hash_file(&program)?;
+        let endpoint = instance.publish(port, &source)?;
+        let owners_path = root.join(OWNER_FILE);
+        let owners = OwnerState::load(&owners_path);
+        Ok(Self {
+            token: endpoint.token().to_owned(),
+            source,
+            program,
+            port,
+            owners_path,
+            owners: Mutex::new(owners),
+            retiring: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn authorized(&self, headers: &[(String, String)]) -> bool {
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .and_then(|(_, value)| value.strip_prefix("Bearer "))
+            .is_some_and(|presented| secret_matches(&self.token, presented))
+    }
+
+    /// Build identity of this generation, answered only to the receipt token.
+    /// No credentials or request data are included.
+    fn identity_body(&self) -> String {
+        let (live, recorded) = self.live_counts();
+        json!({
+            "harness": "xai-responses-shim",
+            "schema": 2,
+            "pid": std::process::id(),
+            "port": self.port,
+            "source": self.source,
+            "program": self.program.display().to_string(),
+            "owners": { "live": live, "recorded": recorded },
+            "retiring": self.retiring.load(Ordering::SeqCst),
+        })
+        .to_string()
+    }
+
+    fn live_counts(&self) -> (usize, usize) {
+        let Ok(mut state) = self.owners.lock() else {
+            return (0, 0);
+        };
+        let live = state.compact_and_count();
+        (live, state.owners.len())
+    }
+
+    /// Keep this generation alive while any recorded owner is live. A managed
+    /// generation always has its owner recorded before a session routes to it
+    /// (`ensure_*` registers before it returns), so an ownerless managed
+    /// generation is an abandoned start attempt and retires after its grace
+    /// instead of lingering on the host-wide legacy check.
+    fn keep_running(&self) -> bool {
+        let Ok(mut state) = self.owners.lock() else {
+            return false;
+        };
+        if !state.loaded {
+            return false;
+        }
+        state.compact_and_count() > 0
+    }
+
+    fn handle_owners(&self, body: &[u8]) -> io::Result<String> {
+        if body.len() > OWNER_FILE_BYTES {
+            return Err(io::Error::other("owner request exceeds its bound"));
+        }
+        let request: Value = serde_json::from_slice(body)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid owner request"))?;
+        let action = request
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing owner action"))?;
+        let owner: Owner = serde_json::from_value(
+            request
+                .get("owner")
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing owner"))?,
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid owner record"))?;
+        if owner.pid == 0
+            || owner.creation_time == 0
+            || !owner.program.is_absolute()
+            || !owner.program.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owner record is not an absolute executable",
+            ));
+        }
+        match action {
+            "acquire" => {
+                // Only a live process running the recorded image under the
+                // current account can hold a lease; an arbitrary PID receipt
+                // never extends a generation's lifetime.
+                let user = current_user()?;
+                match ServiceProcess::inspect(owner.identity(), &owner.program, &user)? {
+                    Some(_) => {}
+                    None => return Err(io::Error::other("owner process is not live")),
+                }
+                let mut state = self
+                    .owners
+                    .lock()
+                    .map_err(|_| io::Error::other("owner state unavailable"))?;
+                state.loaded = true;
+                if !state.owners.iter().any(|held| held == &owner) {
+                    if state.owners.len() >= OWNER_LIMIT {
+                        state.compact_and_count();
+                    }
+                    if state.owners.len() >= OWNER_LIMIT {
+                        return Err(io::Error::other("owner limit reached for this generation"));
+                    }
+                    state.owners.push(owner);
+                }
+                state.persist(&self.owners_path)?;
+                Ok(r#"{"recorded":true}"#.to_string())
+            }
+            "release" => {
+                let mut state = self
+                    .owners
+                    .lock()
+                    .map_err(|_| io::Error::other("owner state unavailable"))?;
+                let before = state.owners.len();
+                state.owners.retain(|held| held != &owner);
+                let removed = state.owners.len() != before;
+                state.persist(&self.owners_path)?;
+                Ok(json!({ "released": removed }).to_string())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown owner action",
+            )),
+        }
+    }
+}
+
+impl OwnerState {
+    fn load(path: &Path) -> Self {
+        let Ok(bytes) = fs::read(path) else {
+            return Self::default();
+        };
+        if bytes.len() > OWNER_FILE_BYTES {
+            return Self::default();
+        }
+        match serde_json::from_slice::<OwnerFile>(&bytes) {
+            Ok(file) if file.schema == 1 && file.owners.len() <= OWNER_LIMIT => Self {
+                loaded: true,
+                owners: file.owners,
+            },
+            // A corrupt record must not authorize or free anything; the
+            // legacy fallback keeps a dependent session running, and the next
+            // registration rewrites the file from verified leases.
+            _ => Self::default(),
+        }
+    }
+
+    /// Drop owners proven dead (an exact exited/reused PID or a mismatched
+    /// image). Unavailable evidence preserves the lease: uncertainty never
+    /// shortens a generation's life.
+    fn compact_and_count(&mut self) -> usize {
+        let user = current_user().ok();
+        let mut live = 0usize;
+        self.owners.retain(|owner| {
+            let alive = match &user {
+                Some(user) => match ServiceProcess::inspect(owner.identity(), &owner.program, user)
+                {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => true,
+                },
+                None => true,
+            };
+            if alive {
+                live += 1;
+            }
+            alive
+        });
+        live
+    }
+
+    fn persist(&self, path: &Path) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&OwnerFile {
+            schema: 1,
+            owners: self.owners.clone(),
+        })
+        .map_err(|_| io::Error::other("owner record encoding failed"))?;
+        if bytes.len() > OWNER_FILE_BYTES {
+            return Err(io::Error::other("owner record exceeds its bound"));
+        }
+        match FileGuard::read_regular(path) {
+            Ok((guard, before)) => {
+                // The read guard must close before the same path is opened
+                // for the transactional replacement.
+                let identity = guard.object_identity()?;
+                drop(guard);
+                FileGuard::replace_regular(path, &identity, &before, &bytes)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                StagedFile::create(path, &bytes)?.commit()
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn secret_matches(expected: &str, presented: &str) -> bool {
+    expected.len() == presented.len()
+        && expected
+            .bytes()
+            .zip(presented.bytes())
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
 }
 
 #[cfg(windows)]
@@ -1665,14 +2092,29 @@ mod tests {
     }
 
     fn control_request(port: u16, method: &str, path: &str) -> (String, String) {
+        control_request_authorized(port, method, path, None, None)
+    }
+
+    fn control_request_authorized(
+        port: u16,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (String, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
+        let body = body.unwrap_or_default();
+        let authorization = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
         stream
             .write_all(
                 format!(
-                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 )
                 .as_bytes(),
             )
@@ -1691,15 +2133,42 @@ mod tests {
         (head.to_string(), body.to_string())
     }
 
+    /// A minimal managed control plane for control-plane unit tests. The
+    /// integration acceptance drives real published generations instead.
+    fn test_control(root: &Path, port: u16) -> Arc<Control> {
+        Arc::new(Control {
+            token: "a".repeat(64),
+            source: "b".repeat(64),
+            program: std::env::current_exe().unwrap().canonicalize().unwrap(),
+            port,
+            owners_path: root.join(OWNER_FILE),
+            owners: Mutex::new(OwnerState::default()),
+            retiring: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn current_owner() -> Owner {
+        let program = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let observed =
+            ServiceProcess::observe(std::process::id(), &program, 0, &current_user().unwrap())
+                .unwrap();
+        Owner {
+            pid: observed.identity().pid,
+            creation_time: observed.identity().creation_time,
+            program,
+        }
+    }
+
     #[test]
-    fn control_endpoints_identify_and_retire_without_an_upstream_hop() {
+    fn control_endpoints_require_the_generation_token_and_stale_authority_cannot_retire() {
+        let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let retire = Arc::new(AtomicBool::new(false));
+        let control = test_control(root.path(), port);
         let worker = {
-            let retire = Arc::clone(&retire);
+            let control = Arc::clone(&control);
             thread::spawn(move || {
-                serve_with_retire(
+                serve_with_control(
                     listener,
                     // An upstream that cannot answer proves control requests
                     // never leave the local shim.
@@ -1707,26 +2176,42 @@ mod tests {
                     Arc::new(|| true),
                     Duration::from_millis(20),
                     Duration::from_secs(30),
-                    retire,
+                    Arc::clone(&control.retiring),
+                    Some(control),
                 )
                 .unwrap();
             })
         };
+        // Unauthenticated and stale-authority requests change nothing: the
+        // identity answer and the retirement control both name this exact
+        // generation through the receipt token.
         let (head, body) = control_request(port, "GET", IDENTITY_PATH);
+        assert!(head.starts_with("HTTP/1.1 401 "), "{head}");
+        let source = "b".repeat(64);
+        assert!(!body.contains(&source), "{body}");
+        let stale = "c".repeat(64);
+        let (head, _) = control_request_authorized(port, "GET", IDENTITY_PATH, Some(&stale), None);
+        assert!(head.starts_with("HTTP/1.1 401 "), "{head}");
+        let (head, _) = control_request_authorized(port, "POST", RETIRE_PATH, Some(&stale), None);
+        assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+        assert!(!control.retiring.load(Ordering::SeqCst));
+
+        let (head, body) =
+            control_request_authorized(port, "GET", IDENTITY_PATH, Some(&control.token), None);
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         let identity: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(identity["harness"], "xai-responses-shim");
-        assert_eq!(identity["schema"], 1);
-        let exe = std::env::current_exe()
-            .unwrap()
-            .canonicalize()
-            .unwrap()
-            .display()
-            .to_string();
-        assert_eq!(identity["exe"], exe.as_str());
+        assert_eq!(identity["schema"], 2);
         assert!(identity["pid"].as_u64().unwrap() > 0);
+        assert_eq!(identity["port"].as_u64().unwrap(), u64::from(port));
+        assert_eq!(identity["source"], source.as_str());
+        assert!(
+            !body.contains(&control.token),
+            "identity must not echo its token"
+        );
 
-        let (head, body) = control_request(port, "POST", RETIRE_PATH);
+        let (head, body) =
+            control_request_authorized(port, "POST", RETIRE_PATH, Some(&control.token), None);
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(body, "{\"retiring\":true}");
         // The listen socket must be released before the process finishes
@@ -1741,7 +2226,61 @@ mod tests {
         }
         assert!(released, "retired shim must release its port");
         worker.join().unwrap();
-        assert!(retire.load(Ordering::SeqCst));
+        assert!(control.retiring.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn owner_leases_require_a_live_recorded_process_and_release_stops_the_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let control = test_control(root.path(), 1);
+        let owner = current_owner();
+        let acquire = json!({ "action": "acquire", "owner": owner }).to_string();
+        let response = control.handle_owners(acquire.as_bytes()).unwrap();
+        assert!(response.contains("true"), "{response}");
+        assert!(control.keep_running(), "a live owner keeps the generation");
+        assert!(
+            root.path().join(OWNER_FILE).is_file(),
+            "leases persist for restart"
+        );
+
+        // A PID receipt that does not match the live process never owns work.
+        let mut stale = current_owner();
+        stale.creation_time = stale.creation_time.wrapping_add(1);
+        let refused = json!({ "action": "acquire", "owner": stale }).to_string();
+        assert!(control.handle_owners(refused.as_bytes()).is_err());
+
+        let release = json!({ "action": "release", "owner": current_owner() }).to_string();
+        let response = control.handle_owners(release.as_bytes()).unwrap();
+        assert!(response.contains("true"), "{response}");
+        assert!(
+            !control.keep_running(),
+            "released owner retires the generation"
+        );
+    }
+
+    #[test]
+    fn dead_owner_leases_prune_but_unavailable_evidence_is_preserved() {
+        let mut state = OwnerState {
+            loaded: true,
+            owners: vec![
+                Owner {
+                    pid: std::process::id(),
+                    creation_time: 1,
+                    program: std::env::current_exe().unwrap().canonicalize().unwrap(),
+                },
+                Owner {
+                    pid: std::process::id(),
+                    creation_time: current_owner().creation_time,
+                    program: std::path::PathBuf::from(r"C:\missing-owner-image.exe"),
+                },
+            ],
+        };
+        // The exact exited/reused PID is dropped; the mismatched image is
+        // unavailable evidence and keeps its lease rather than shortening a
+        // generation's life on uncertainty.
+        let live = state.compact_and_count();
+        assert_eq!(live, 1);
+        assert_eq!(state.owners.len(), 1);
     }
 
     #[test]

@@ -1186,6 +1186,40 @@ regressions run in the standard workspace gate, and the adopted-package check
 (explicit `HARNESS_CODE_TOOLS_REGISTRY`) must complete MCP initialize and
 tools/list before a release is called delivered.
 
+The local xAI compatibility transport is a managed generation with owned
+endpoint identity. The launcher prepares a private generation root; the shim
+publishes an endpoint receipt binding its PID, process creation time, image
+hash, loopback port, build source and a random control token, and
+`native_launcher::ensure_xai_endpoint` / `ensure_xai_shim_at` re-verify that
+evidence before a session routes authorization or payloads to the port: the OS
+listener table must name the receipt's process, that process must be the live
+recorded image under this account, and the listener must answer an
+authenticated identity challenge with the receipt token. A listener's
+self-reported executable path or schema body alone never authenticates; a
+probe timeout is unavailable evidence, never a free port; unknown listeners
+receive no requests and are preserved rather than terminated, and the pinned
+route fails explicitly without changing the requested provider or billing
+route. Ordinary launch or update never retires a live generation: a newer
+build selects its own verified endpoint (the default port when the listener
+table confirms it free, a freshly bound loopback port otherwise), and the
+launcher carries a differing endpoint into that session's routing with a
+`-c model_providers.xai.base_url` override, so existing sessions keep both
+active streams and later requests. `retire_xai_endpoint` is the explicit
+forced-recovery control, authenticated by the generation's own receipt token,
+so stale authority cannot end another generation; a generation otherwise
+retires when its recorded owner processes and accepted work release it, and
+abandoned roots are reclaimed only after the instance lease is free and the
+receipt is stale. Acceptance:
+`cargo test --locked -p codex-harness --test xai_transport -- --test-threads=1`
+covers spoof and timeout rejection, owner-release retirement, concurrent
+launches, unclean owner exit, pinned preflight survival and rollback
+reclamation with owned processes and a synthetic loopback upstream; the long
+stream-continuity case
+`update_selects_a_new_endpoint_while_the_old_session_stream_and_requests_survive`
+is selected explicitly with `--ignored` and makes no provider call.
+`HARNESS_XAI_SHIM_UPSTREAM` is honored only for literal loopback destinations,
+and the shim poll/grace overrides are debug-build test knobs.
+
 ## Diagnostics and dependencies
 
 `dependencies discover` and `dependencies plan` remain read-only; discovery
