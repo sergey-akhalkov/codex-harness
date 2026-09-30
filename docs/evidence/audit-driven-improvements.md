@@ -589,8 +589,8 @@ The partition equivalence is exact: every workspace package and every
 
 ## Task 13.2: global delivery of the integrated candidate
 
-Delivered 2026-09-30 with `codex-harness deploy --source
-D:\home\sergey-akhalkov\codex-harness` from the integrated candidate
+Delivered 2026-09-30 with `codex-harness deploy --source <kit-checkout>`
+from the integrated candidate
 (`31413e9`): status `deployed`, core `connected`, runtime verification
 passed against the registered upstream (sha256 8cb0e69e…), executor probe
 `true`, new build identity `f1fca158d17b1821`, 8 owned links changed of 32,
