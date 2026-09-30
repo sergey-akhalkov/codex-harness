@@ -98,7 +98,7 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 - [x] 12.1 Add the public Windows/MSVC workflow using the existing native check commands, identified toolchain, locked inputs, immutable action revisions and minimal permissions; verify local workflow/configuration validity and that untrusted PR execution cannot use production credentials or mutate the owner's installation. Covers A22.
 - [x] 12.2 Connect deterministic audit regressions and applicable formatting, lint, test, ownership and source/link checks; verify intentional failures propagate nonzero status and omitted/unavailable checks cannot appear green. Covers A22.
 - [x] 12.3 Define and exercise the separate real launcher/install/update/recover/transport/MCP integration route, including an outside-checkout consumer; verify synthetic default CI is not reported as equivalent to unexecuted installed acceptance and model-backed work remains explicitly selected. Covers A22.
-- [ ] 12.4 Obtain an authorized actual CI run tied to the candidate revision and preserve bounded evidence; verify executed scope and private-data sentinel handling in public artifacts. If remote publication/settings authority or runner capability is unavailable, leave this execution task open with the exact blocker. Covers A22.
+- [x] 12.4 Obtain an authorized actual CI run tied to the candidate revision and preserve bounded evidence; verify executed scope and private-data sentinel handling in public artifacts. If remote publication/settings authority or runner capability is unavailable, leave this execution task open with the exact blocker. Covers A22.
 
 ## 13. Integrate, deliver globally and close on actual evidence
 

@@ -695,3 +695,41 @@ evidence (13.1, 13.2, 13.4).
 - **Checkbox backing**: every checked task traces to a per-group evidence
   section with the commands and outcomes actually run; the mechanical
   row-to-task-to-evidence reconciliation (13.3) covers all completed work.
+
+## Task 12.4: authorized actual CI run
+
+Authorization: the user explicitly instructed "пушь и запусти CI" (push and
+run CI) on 2026-09-30; the branch was pushed to `origin/main` and GitHub
+Actions executed the workflows.
+
+- **Deterministic commit-bound signal**: run
+  https://github.com/sergey-akhalkov/codex-harness/actions/runs/36714989859
+  (workflow `windows-native-checks`, push, revision `f3f5b16`) — **success**:
+  pinned Rust 1.98.1 with rustfmt+clippy, checksum-verified pinned board tool
+  (archive sha256 fa4c72c5…, executable 9632ef4e…), long-form temp directory,
+  built process fixture, `cargo fmt --check`, workspace clippy `-D warnings`,
+  every crate's tests plus the codex-harness lib/bins surface with
+  `--no-fail-fast`, executable ownership (0 findings) and source hygiene (0
+  findings). Executed scope: the synthetic deterministic signal exactly as
+  designed; managed integration targets are deliberately excluded and run in
+  the separately dispatched route.
+- **Installed route** (explicit dispatch, `windows-installed-integration`):
+  exercised at multiple revisions; with the fixes found below, dependency
+  probes, executor_message (53/53), native_launcher, xai_transport and the
+  remaining families progressed. As of the final dispatch the
+  `executor_observation` host family still fails on the bare runner with a
+  bare `os error 2` at host startup (works on the fully provisioned local
+  kit). This is recorded as the route's honest open item, not a green claim;
+  a follow-up diagnosis item is filed on the board (the host error message
+  also lacks the failing path — a DX defect worth fixing first).
+
+Real defects found and fixed by these runs (each verified by a rerun):
+minimal toolchains lacked rustfmt/clippy; short 8.3 temp paths broke
+discovery, assignment, rollback, install and route fixtures (canonicalized,
+plus a long-form TMP for the whole job); fresh-process identity validation
+rejected creations a few ms "ahead" of the coarse wall clock (tolerance
+added); a slow-agent receipt/frontend-tail read race (bounded retry); the
+memory-probe receipt can be cut by the job kill before its final write
+(assert the allocation never succeeded instead); `harness-process-fixture`
+must be built for harness-core's process tests. No private data appears in
+any public artifact: the runs' logs contain only synthetic sentinels.
