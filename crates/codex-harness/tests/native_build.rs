@@ -541,6 +541,87 @@ fn compiler_resources_are_covered_or_refused_and_overrides_do_not_reuse_builds()
 }
 
 #[test]
+fn compiled_fixtures_beneath_tests_stay_in_build_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let state = temp.path().join("state");
+    fixture(&source);
+    fs::create_dir_all(source.join("crates/manager/tests/fixtures")).unwrap();
+    let resource = source.join("crates/manager/tests/fixtures/message.txt");
+    fs::write(&resource, "message-a").unwrap();
+    let code = source.join("crates/manager/src/main.rs");
+    fs::write(
+        &code,
+        manager_source(
+            "fn main() { print!(\"{}\", include_str!(\"../tests/fixtures/message.txt\")); }\n",
+        ),
+    )
+    .unwrap();
+    let args = [
+        "build",
+        "--source",
+        source.to_str().unwrap(),
+        "--state",
+        state.to_str().unwrap(),
+    ];
+    let first = cli(&args);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_build: Value = serde_json::from_slice(&first.stdout).unwrap();
+    let first_build = Path::new(first_build["build"].as_str().unwrap());
+    let output = Command::new(first_build.join("codex-harness.exe"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "message-a");
+    // A non-Markdown fixture beneath a test-like path is a real compiler input:
+    // its change invalidates the candidate and the rebuilt binary carries it.
+    fs::write(&resource, "message-b").unwrap();
+    let second = cli(&args);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_build: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_build["reused"], false);
+    let second_build = Path::new(second_build["build"].as_str().unwrap());
+    assert_ne!(second_build, first_build);
+    let output = Command::new(second_build.join("codex-harness.exe"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "message-b");
+    // Markdown beneath tests stays outside the inventory: compiling it is
+    // refused at finalization instead of publishing an artifact the identity
+    // cannot cover.
+    fs::write(
+        source.join("crates/manager/tests/fixtures/notes.md"),
+        "notes",
+    )
+    .unwrap();
+    fs::write(
+        &code,
+        manager_source(
+            "fn main() { print!(\"{}\", include_str!(\"../tests/fixtures/notes.md\")); }\n",
+        ),
+    )
+    .unwrap();
+    let count = fs::read_dir(state.join("builds")).unwrap().count();
+    let uncovered = cli(&args);
+    assert!(!uncovered.status.success());
+    assert!(
+        String::from_utf8_lossy(&uncovered.stderr).contains("Fresh manager finalization failed")
+    );
+    assert_eq!(fs::read_dir(state.join("builds")).unwrap().count(), count);
+    assert!(fs::read_dir(state.join("staging")).unwrap().any(|entry| {
+        fs::read_to_string(entry.unwrap().path().join("finalize.log"))
+            .is_ok_and(|log| log.contains("outside the native input inventory"))
+    }));
+}
+
+#[test]
 fn ancestor_cargo_configuration_changes_invalidate_build_identity() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");

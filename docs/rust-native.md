@@ -52,6 +52,53 @@ codex-harness heavy -- cargo test --workspace --locked --jobs 1 -- --test-thread
 cargo run -p codex-harness --bin harness-source-check -- --root .
 ```
 
+### Development feedback without a publication build
+
+An edit that does not change delivery or publication behavior is checked
+through its existing package or integration target. A cold release
+publication (`codex-harness build`, `install` or `update`) is required only
+when the change itself exercises publication or when it is delivered to the
+installed path; it is not a prerequisite for ordinary feedback. Measured
+2026-09-30 on this checkout (rustc 1.98.1, Windows x64, shared heavy budget,
+`--jobs 1`):
+
+| Route | Measured |
+| --- | --- |
+| Warm focused unit filter (`cargo test -p harness-core --lib -- <filter>`) | ~40 s payload including the incremental rebuild and link; ~1 s once the target is fresh |
+| Warm affected integration filter (`cargo test -p codex-harness --test native_build -- <filter>`) | 658 s payload for three cases, each running the real `codex-harness build` CLI over owned fixture workspaces and real Cargo |
+| Warm full package suite (`cargo test -p harness-core --lib`) | 745 passed in 397 s; 422 s payload |
+| Cold development target (fresh `--target-dir`, `--no-run` for the two affected packages) | 326 s (5 min 26 s), peak 1.84 GiB in the heavy job |
+| Cold release publication (three published packages, seven binaries, real `codex-harness build`) | 448 s end to end, peak 1.88 GiB; the compile step alone is 447 s |
+
+The smallest sufficient loop after an edit is `cargo fmt --all`, then the
+focused unit filter for changed logic, then the affected integration target
+when the edit touches the build or publication path. Completion still
+includes the broader checks above: workspace formatting, warning-as-error
+lint, the affected package targets, and the ownership and source checks.
+
+Publication identity and profile decisions (evaluated 2026-09-30): the source identity
+covers every non-Markdown file under `crates/` (including integration tests
+and fixtures), Markdown under `src`, the root manifest and lockfile,
+toolchain selectors and cargo host configuration. Compiled includes beneath
+test and fixture paths are therefore tracked — a fixture under
+`tests/fixtures/` changes the identity and rebuilds — and a compiled include
+outside that inventory is refused at finalization instead of being published
+without coverage. A narrower publication key was evaluated and **not**
+adopted: exclusion by path category is either unsafe (a fixture can be a
+real compiler input) or unnecessary, while a dep-info-derived key exists only
+after a build and would need retained compiled-input evidence; no measured
+safe benefit justified the change. The release profile (`lto = true`,
+`codegen-units = 1`) was compared once against thin LTO with 16 codegen
+units under identical source and toolchain conditions: the candidate built
+slower (532 s vs 448 s), produced 5.4% larger binaries, and showed equal
+startup and runtime behavior within measurement noise, so the accepted
+profile is retained. A persistent compiler target was rejected for the same
+reason the route already uses fresh targets: Cargo's freshness check trusts
+timestamps, so a changed input with a preserved timestamp silently reuses a
+stale artifact, while an unchanged identity is already served by verified
+artifact reuse (a full live-identity and integrity validation measured
+114-138 ms) without running Cargo at all.
+
 ### Compact verification output
 
 The same verification forms also run through the installed native compression

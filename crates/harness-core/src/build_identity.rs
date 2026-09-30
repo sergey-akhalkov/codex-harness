@@ -519,6 +519,39 @@ mod tests {
         assert_eq!(schema_changed, changed);
         assert!(!schema_changed.files.contains_key(INSPECTION_SCHEMA));
     }
+
+    #[test]
+    fn test_like_paths_are_named_by_content_not_by_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        source(temp.path());
+        fs::create_dir_all(temp.path().join("crates/test/tests/fixtures")).unwrap();
+        fs::write(
+            temp.path().join("crates/test/tests/fixtures/message.txt"),
+            "compiled fixture",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("crates/test/tests/fixtures/notes.md"),
+            "notes",
+        )
+        .unwrap();
+        let identity = source_identity(temp.path()).unwrap();
+        // A real compiler input beneath a test-like path is named by its
+        // content: changing the file changes the identity.
+        assert!(
+            identity
+                .files
+                .contains_key("crates/test/tests/fixtures/message.txt")
+        );
+        // Markdown outside src stays live data; finalization refuses a build
+        // that compiles it instead of admitting an artifact the identity
+        // cannot cover.
+        assert!(
+            !identity
+                .files
+                .contains_key("crates/test/tests/fixtures/notes.md")
+        );
+    }
     #[test]
     fn stale_source_allows_repair_but_altered_manager_does_not() {
         let temp = tempfile::tempdir().unwrap();

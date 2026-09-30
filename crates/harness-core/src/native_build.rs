@@ -1231,6 +1231,81 @@ mod tests {
         );
     }
 
+    /// The compiled-input gate accepts every path the source identity covers,
+    /// including fixture and documentation paths, and refuses a compiled input
+    /// under the checkout that the inventory cannot name.
+    #[test]
+    fn compiled_input_gate_covers_identity_paths_and_refuses_uncovered_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = source_fixture(temp.path(), "source");
+        let target = temp.path().join("target");
+        let release = target.join(TARGET).join("release");
+        fs::create_dir_all(source.join("crates/one/tests/fixtures")).unwrap();
+        fs::create_dir_all(&release).unwrap();
+        let covered = source.join("crates/one/src/lib.rs");
+        let fixture = source.join("crates/one/tests/fixtures/message.txt");
+        fs::write(&fixture, "fixture").unwrap();
+        let banner = source.join("crates/one/src/banner.md");
+        fs::write(&banner, "banner").unwrap();
+        let outside = source.join("crates/one/README.md");
+        fs::write(&outside, "readme").unwrap();
+        let generated = release.join("generated.rs");
+        fs::write(&generated, "generated").unwrap();
+        let foreign = temp.path().join("foreign.rs");
+        fs::write(&foreign, "foreign").unwrap();
+        let identity = build_identity::source_identity(&source).unwrap();
+        assert!(
+            identity
+                .files
+                .contains_key("crates/one/tests/fixtures/message.txt")
+        );
+        assert!(identity.files.contains_key("crates/one/src/banner.md"));
+        assert!(!identity.files.contains_key("crates/one/README.md"));
+        // Production passes the canonical checkout and target roots; the gate
+        // compares canonicalized input paths against them.
+        let source = source.canonicalize().unwrap();
+        let target = target.canonicalize().unwrap();
+        let write = |binary: &str, input: &Path| {
+            for &name in BINARIES {
+                fs::write(release.join(name), "binary").unwrap();
+                let chosen = if name == binary {
+                    input
+                } else {
+                    covered.as_path()
+                };
+                fs::write(
+                    release.join(name).with_extension("d"),
+                    format!("{}: {}\n", release.join(name).display(), chosen.display()),
+                )
+                .unwrap();
+            }
+        };
+        write("", &covered);
+        verify_compiled_inputs(&target, &source, &identity).unwrap();
+        write("harness-rtk.exe", &fixture);
+        verify_compiled_inputs(&target, &source, &identity).unwrap();
+        write("codex.exe", &banner);
+        verify_compiled_inputs(&target, &source, &identity).unwrap();
+        write("token-audit.exe", &generated);
+        verify_compiled_inputs(&target, &source, &identity).unwrap();
+        write("harness-inspect.exe", &outside);
+        let refused = verify_compiled_inputs(&target, &source, &identity)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("outside the native input inventory"),
+            "{refused}"
+        );
+        write("harness-observe.exe", &foreign);
+        let refused = verify_compiled_inputs(&target, &source, &identity)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("outside owned source/build roots"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn delivery_refuses_a_state_without_verified_builds() {
         let temp = tempfile::tempdir().unwrap();
