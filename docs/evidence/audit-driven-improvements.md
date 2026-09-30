@@ -305,6 +305,33 @@ design and the full 38-test suite was rerun independently on the worktree
 13 delivery; the load-sensitive `executor_message` flake the executor
 observed is unrelated to RTK and is to be confirmed on an idle machine.
 
+## Task 13.1: small real user path outside the checkout
+
+Exercised 2026-09-30 with the merged tree (`857eb8a` binaries) and an
+isolated `CODEX_HOME`, from working directories outside the checkout:
+
+- **Analyzer**: `token-audit report --format text` (exact coverage and
+  warnings, no fabricated totals), `baseline save` (uniquely named immutable
+  snapshot with nanosecond publication identity), `baseline diff --format
+  text` (valid snapshot, per-side coverage, `usage_basis=unavailable` and
+  `partial=true` labels — a reduced subtotal is never a saving), retention of
+  the comparison, and `detail --diff <retained> --sessions` paging. A lookup
+  of an evicted comparison produced the designed explicit error naming the
+  remedy.
+- **RTK**: `harness-rtk compact cargo test … -- --list` and
+  `compact git log …` ran the real child exactly once with correct exit
+  status and byte-identical output from an outside working directory;
+  both outputs honestly stayed raw (test-name and log content is not
+  filter-compressible), matching the complete-presentation decision. The
+  packed recall path is covered by the executor's staged outside-checkout
+  compact/recall run (digest-verified window, retention expiry) and the
+  lead's independent 38/38 `rtk_adapter` rerun.
+- **Native launch**: `codex --version` through the installed harness launcher
+  from an outside working directory returned the real upstream
+  `codex-cli 0.157.1` in 845 ms; the merged-tree built manager also ran from
+  outside the checkout. Global delivery of the merged build itself remains
+  task 13.2.
+
 ## Groups 9 and 3: accepted executor slices (2026-09-30)
 
 **Group 9 (tasks 9.1-9.6), merged as `7d32067`.** Executor `exec-ds-benefit`
