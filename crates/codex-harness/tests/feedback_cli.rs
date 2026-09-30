@@ -2103,7 +2103,7 @@ fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
 fn removal_consent_binds_to_the_reviewed_proposal_content() {
     let board = Board::new("removal-binding");
     let h = admit(&board, "m-remove-bind", "c-remove", "basis-1");
-    let propose = |loss: &str, evidence: &str, preview: &str| {
+    let propose = |loss: &str, evidence: &str, preview: &str, detail: &str| {
         board.feedback(&[
             "removal-propose",
             "--item",
@@ -2119,10 +2119,10 @@ fn removal_consent_binds_to_the_reviewed_proposal_content() {
             "--preview",
             preview,
             "--detail",
-            "preview prepared; nothing applied",
+            detail,
         ])
     };
-    let first = propose("skill-x", "ev-1", "preview-1");
+    let first = propose("skill-x", "ev-1", "preview-1", "consumer list: none known");
     assert!(first.status.success(), "{}", output_text(&first));
 
     let approve = removal_decision(
@@ -2159,7 +2159,12 @@ fn removal_consent_binds_to_the_reviewed_proposal_content() {
     // A changed proposal version for the same proposal and target needs a
     // fresh decision: the old consent covered different content (here a
     // newly discovered consumer loss).
-    let changed = propose("skill-x+recovery", "ev-2", "preview-2");
+    let changed = propose(
+        "skill-x+recovery",
+        "ev-2",
+        "preview-2",
+        "consumer list: none known",
+    );
     let text = output_text(&changed);
     assert!(changed.status.success(), "{text}");
     assert!(text.contains("record=written"), "{text}");
@@ -2208,6 +2213,68 @@ fn removal_consent_binds_to_the_reviewed_proposal_content() {
         Some(0)
     );
 
+    // Changing only the bounded prose detail is also a new reviewed version:
+    // identical labels and references cannot retain the old consent.
+    let detail_changed = propose(
+        "skill-x+recovery",
+        "ev-2",
+        "preview-2",
+        "consumer list: recovery path uses it",
+    );
+    let text = output_text(&detail_changed);
+    assert!(detail_changed.status.success(), "{text}");
+    assert!(text.contains("record=written"), "{text}");
+    let detail_uncovered = removal_check(&board, &h, "experiment");
+    let text = output_text(&detail_uncovered);
+    assert_eq!(detail_uncovered.status.code(), Some(1), "{text}");
+    assert!(text.contains("result=not-covered"), "{text}");
+    assert!(text.contains("changed"), "{text}");
+
+    // An incomplete newer attributable proposal record supersedes the earlier
+    // version instead of silently reviving it.
+    comment(
+        &board,
+        &h,
+        &format!(
+            "removal-proposal v1 item={h} proposal=openspec/changes/remove-x target=skill-x loss=skill-x+recovery"
+        ),
+    );
+    let incomplete = removal_check(&board, &h, "experiment");
+    let text = output_text(&incomplete);
+    assert_eq!(incomplete.status.code(), Some(1), "{text}");
+    assert!(text.contains("result=not-covered"), "{text}");
+    assert!(text.contains("incomplete"), "{text}");
+
+    // A fresh complete proposal of the same content plus a fresh explicit
+    // decision restores authority.
+    let restored = propose(
+        "skill-x+recovery",
+        "ev-2",
+        "preview-2",
+        "consumer list: recovery path uses it",
+    );
+    let text = output_text(&restored);
+    assert!(restored.status.success(), "{text}");
+    assert!(text.contains("record=written"), "{text}");
+    let restored_decision = removal_decision(
+        &board,
+        &h,
+        "approve",
+        Some("experiment"),
+        Some("skill-x+recovery"),
+        Some("user-turn-11"),
+        "approved the restored proposal",
+    );
+    assert!(
+        restored_decision.status.success(),
+        "{}",
+        output_text(&restored_decision)
+    );
+    assert_eq!(
+        removal_check(&board, &h, "experiment").status.code(),
+        Some(0)
+    );
+
     // Withdraw, then deliberately repeat the earlier approval: the repeated
     // decision is appended after the withdrawal (never silently skipped
     // against older history), truthfully reported, and becomes current.
@@ -2224,8 +2291,8 @@ fn removal_consent_binds_to_the_reviewed_proposal_content() {
         "approve",
         Some("experiment"),
         Some("skill-x+recovery"),
-        Some("user-turn-9"),
-        "approved the changed proposal",
+        Some("user-turn-11"),
+        "approved the restored proposal",
     );
     let text = output_text(&repeat);
     assert!(repeat.status.success(), "{text}");
@@ -2245,8 +2312,8 @@ fn removal_consent_binds_to_the_reviewed_proposal_content() {
         "approve",
         Some("experiment"),
         Some("skill-x+recovery"),
-        Some("user-turn-9"),
-        "approved the changed proposal",
+        Some("user-turn-11"),
+        "approved the restored proposal",
     );
     let text = output_text(&confirm);
     assert!(confirm.status.success(), "{text}");
