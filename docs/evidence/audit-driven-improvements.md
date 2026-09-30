@@ -355,6 +355,33 @@ build→reuse→stale→altered→repair path, and a real heavy-budget CLI build
 verification: the 24 `build_identity`/`build_selection` tests were rerun
 independently on the merged tree and pass.
 
+## Group 10: consumed skill identity and frozen evaluation (tasks 10.1-10.5)
+
+Implemented in worktree slot 3 (`exec-ds-skills`, base `22ba5c9`) and merged
+as `9f42468` after review. The evaluation entry points now attribute the
+frozen revision's actually consumed catalogue identity, body, references and
+helpers from retained native tool evidence, detect live-library fallback,
+unattributable revisions and post-run replica drift, and give every arm an
+explicit verdict (`Attributed`/`MissingTreatment`/`Contaminated`/`Drifted`/
+`Incomplete`/`Absent`/`Activated` — a valid negative case yields `Absent`).
+Five workflow roles (intended, similar-unsuitable, boundary/failure,
+independent held-out, protected-overlapping) carry frozen acceptance;
+contamination, drift, a skipped declared workflow, protected regression or
+incomplete accounting cannot authorize a candidate. The four measured
+candidates are frozen with treatment/acceptance plans; native deferred
+discovery (A33) is recorded **unsupported** by a model-free probe of the
+installed Codex 0.157.1 (its feature flags were removed) with no replacement
+runtime. Unselected and unexecuted comparisons stay pending; integration
+decisions are recorded inconclusive-pending with reconsideration conditions;
+prior defaults and external OpenSpec packages remain untouched. Model-backed
+arms were neither authorized nor run. Executor verification: fmt/clippy
+clean; `skill_context_evaluation` 10/10, `skills_isolate` 4/4,
+`skill_eval_learning` 2 passed + 3 gated, `skill_eval_pilot` 2 passed +
+3 gated. Lead verification: the 14 non-gated tests were rerun independently
+and pass. Open boundary: enforcement of live-library detection inside the
+outcome-oracle/isolation implementation owners (for callers outside these
+entry points) remains a separate assignment if a future route needs it.
+
 ## Groups 9 and 3: accepted executor slices (2026-09-30)
 
 **Group 9 (tasks 9.1-9.6), merged as `7d32067`.** Executor `exec-ds-benefit`
