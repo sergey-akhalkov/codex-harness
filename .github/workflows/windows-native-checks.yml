@@ -30,6 +30,23 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Install the pinned board tool (checksum-verified public release)
+        run: |
+          $archive = "$env:RUNNER_TEMP\beads_1.3.0_windows_amd64.zip"
+          Invoke-WebRequest -Uri "https://github.com/gastownhall/beads/releases/download/v1.3.0/beads_1.3.0_windows_amd64.zip" -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne "fa4c72c5d27f68f906e89a759656b5a051b330088c4acc38fa445cbb561e5cdf") {
+            throw "board archive identity mismatch: $actual"
+          }
+          $dir = "$env:RUNNER_TEMP\bd-bin"
+          Expand-Archive -Path $archive -DestinationPath $dir
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter bd.exe | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "bd.exe was not in the pinned archive" }
+          if ((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne "9632ef4ea0941a247fcb3178a604404fd434d686e79e50805c6345b35ba9b8f1") {
+            throw "board executable identity mismatch"
+          }
+          (Split-Path $exe) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
