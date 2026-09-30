@@ -586,3 +586,22 @@ implementation groups merged), with the heavy queue otherwise idle:
 
 The partition equivalence is exact: every workspace package and every
 `crates/codex-harness/tests` target has a passing run on this revision.
+
+## Task 13.2: global delivery of the integrated candidate
+
+Delivered 2026-09-30 with `codex-harness deploy --source
+D:\home\sergey-akhalkov\codex-harness` from the integrated candidate
+(`31413e9`): status `deployed`, core `connected`, runtime verification
+passed against the registered upstream (sha256 8cb0e69e…), executor probe
+`true`, new build identity `f1fca158d17b1821`, 8 owned links changed of 32,
+no path change, CPU policy preserved, `model_calls: 0` throughout. The lead
+session that performed the delivery kept running on the previous generation
+(the receipt lists its old-build processes as restart boundaries and
+explicitly did not terminate them) — live session continuity by
+construction. Post-delivery: `check --build f1fca158…` reports
+`healthy`/`management_allowed`/`runtime_allowed`/`serving_allowed` with
+source-linked data authoritative; `recover-build --state …` verified-selects
+a verified build non-destructively (`changed: false`); seven immutable
+builds remain in the state for rollback, including the new build and the
+previously delivered generation. Unrelated user state was not touched (no
+path change; only the owned link set changed).
