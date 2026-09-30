@@ -54,6 +54,7 @@ pub mod environment_path;
 pub mod executable_ownership;
 pub mod feature_edit;
 pub mod heavy_command;
+pub mod improvement_spec;
 #[cfg(windows)]
 pub mod installation_links;
 pub mod installation_lock;

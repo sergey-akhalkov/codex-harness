@@ -616,6 +616,15 @@ code is unchanged. This supersedes the earlier choice that a failure stays
 visible in the tab. A process killed before the host can exit is unchanged:
 stop still ends that host and reports a tab that did not close.
 
+**2026-09-30, confirmed:** implement the evidence-driven continuous loop with
+the supplied local model first, retaining the requirement to qualify repeated
+agent/tool execution under identical controlled inputs. Keep the existing
+DeepSeek executor route ready for an explicit switch; readiness does not
+authorize a silent provider substitution or weaken repeatability. Endpoint,
+model deployment details and qualification evidence remain local run inputs.
+The active [change](../openspec/changes/add-evidence-driven-self-improvement-loop/proposal.md)
+owns the sequential experiments and remaining acceptance.
+
 **2026-09-19/20, confirmed:** the self-improvement loop runs on the consuming
 project's board, not in chat. Lead and executor observations become bounded
 `feedback` tasks; the lead batch-triages at safe boundaries; unique incubator
