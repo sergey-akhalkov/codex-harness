@@ -561,3 +561,28 @@ pinned/app-server continuity policy (reuse a live verified-compatible
 generation, never retire it) is confirmed — new-endpoint selection goes
 through the documented pinned route, and re-wiring the executor call site's
 routing would be a separate owned change if ever needed.
+
+## Task 13.4: complete native checks on the integrated candidate
+
+Run 2026-09-30 on the fully integrated candidate (`3f390ce`, after all ten
+implementation groups merged), with the heavy queue otherwise idle:
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings`
+  — clean (62 s; includes the group-12 contract test and all executor
+  additions; the one real defect the group-8 executor caught in it was fixed
+  in `3c5677e`).
+- Workspace tests, partitioned only because one command cannot fit the shared
+  1800 s heavy deadline: `--workspace --exclude codex-harness` (553 s, all
+  crates green incl. harness-core lib 746/0/38); `codex-harness --lib
+  --bins` (51 s); `--test rtk_adapter` 38/38 (28 s); `--test native_build`
+  9/9 (1344 s, real builds); the remaining 65 integration targets in two
+  alphabetical batches (617 s and 360 s, all green — including the
+  `executor_message` family that two executors had observed as load-sensitive
+  flakes under contention; no flake occurred and no rerun was needed).
+- `ownership-check --source .` — 2 executable files (inert-data: 2), 324
+  scanned Rust files, 0 findings.
+- `harness-source-check --root .` — 896 working-tree files, 0 findings.
+
+The partition equivalence is exact: every workspace package and every
+`crates/codex-harness/tests` target has a passing run on this revision.
