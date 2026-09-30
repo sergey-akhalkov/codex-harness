@@ -44,6 +44,14 @@ const DIAGNOSTIC_USAGE: &str = "usage: harness-rtk.exe diagnostics [--last N] [-
 /// Below this size the retained original would cost more than it saves.
 const RETENTION_FLOOR: usize = 500;
 static HANDLE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Bounded store transaction: one publisher at a time, and a bounded wait so a
+/// stuck holder cannot stall the observed command.
+const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const STORE_LOCK_BACKOFF: Duration = Duration::from_millis(5);
+/// Staging area inside the pack directory, so publication is a same-volume
+/// rename and a crashed writer's leftovers are recoverable under the lock.
+const PACK_STAGING: &str = "staging";
+const STORE_LOCK_FILE: &str = "store.lock";
 
 /// The documented Cargo verification verbs. `test` keeps the pinned RTK
 /// `cargo-test` filter for the test harness on stdout. Installed RTK 0.48.0
@@ -409,6 +417,27 @@ fn codex_home() -> io::Result<PathBuf> {
     Ok(home)
 }
 
+/// Deterministic test seam for the two-process publication, interruption and
+/// eviction reproductions. At a named point the process announces itself on
+/// stderr and then blocks until the owning test unlocks
+/// `<point>.release`; process death releases that lock too, so a lost test can
+/// never wedge an adapter that set `HARNESS_RTK_TEST_BARRIER_DIR`.
+fn test_barrier(point: &str) {
+    let Some(directory) = env::var_os("HARNESS_RTK_TEST_BARRIER_DIR") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let _ = fs::write(directory.join(format!("{point}.reached")), b"");
+    eprintln!("rtk: test barrier {point} reached");
+    let Ok(release) = fs::OpenOptions::new()
+        .read(true)
+        .open(directory.join(format!("{point}.release")))
+    else {
+        return;
+    };
+    let _ = release.lock();
+}
+
 fn raw_directory() -> io::Result<PathBuf> {
     let root = codex_home()?.join("harness/rtk/raw");
     fs::create_dir_all(&root)?;
@@ -426,17 +455,23 @@ fn pack_directory() -> io::Result<PathBuf> {
 /// One retained archive per captured stream. `suffix` is empty for stdout and
 /// `.err` for stderr, so a whole-file re-read of either stream stays
 /// byte-exact and the keep window covers both.
-fn save_raw(raw: &[u8], suffix: &str) -> io::Result<PathBuf> {
+///
+/// The path is planned before anything is written, so the complete
+/// presentation can be measured with the exact locator it would carry; the
+/// archive itself is created only when the compact form is actually delivered.
+fn planned_raw_path(suffix: &str, stamp: u128) -> io::Result<PathBuf> {
     let root = raw_directory()?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?
-        .as_nanos();
-    let path = root.join(format!("rtk-{stamp}-{}{suffix}.log", std::process::id()));
+    Ok(root.join(format!("rtk-{stamp}-{}{suffix}.log", std::process::id())))
+}
+
+fn save_raw_at(path: &Path, raw: &[u8]) -> io::Result<()> {
+    let Some(root) = path.parent() else {
+        return Err(io::Error::other("raw archive path has no directory"));
+    };
     let mut file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&path)?;
+        .open(path)?;
     file.write_all(raw)?;
     let mut files: Vec<_> = fs::read_dir(root)?
         .filter_map(Result::ok)
@@ -450,7 +485,7 @@ fn save_raw(raw: &[u8], suffix: &str) -> io::Result<PathBuf> {
     for old in files.iter().take(files.len().saturating_sub(KEEP_FILES)) {
         let _ = fs::remove_file(old); // Files in our private raw namespace; never recurse.
     }
-    Ok(path)
+    Ok(())
 }
 
 /// One index record per packed observation. `created` orders retention and the
@@ -477,16 +512,78 @@ impl PackEntry {
         })
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        Some(Self {
-            handle: value.get("handle")?.as_str()?.to_owned(),
-            source: value.get("source")?.as_str()?.to_owned(),
-            digest: value.get("digest")?.as_str()?.to_owned(),
-            bytes: value.get("bytes")?.as_u64()?,
-            lines: value.get("lines")?.as_u64()?,
-            created: value.get("created")?.as_u64()?,
+    /// Strict record reader: every field is required with its exact type, and
+    /// an invalid record fails the whole index instead of being dropped, so
+    /// nothing unvalidated can reach path construction or retention.
+    fn from_value(value: &Value) -> Result<Self, String> {
+        let handle = value
+            .get("handle")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the handle is not a string".to_owned())?;
+        if !valid_handle(handle) {
+            return Err(format!("handle {handle:?} is not an observation handle"));
+        }
+        let source = value
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the source is not a string".to_owned())?;
+        let digest = value
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the digest is not a string".to_owned())?;
+        if !valid_digest(digest) {
+            return Err(format!("digest {digest:?} is not a SHA-256 hex digest"));
+        }
+        let bytes = value
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "the byte size is not a non-negative integer".to_owned())?;
+        let lines = value
+            .get("lines")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "the line count is not a non-negative integer".to_owned())?;
+        let created = value
+            .get("created")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "the creation time is not a non-negative integer".to_owned())?;
+        Ok(Self {
+            handle: handle.to_owned(),
+            source: source.to_owned(),
+            digest: digest.to_owned(),
+            bytes,
+            lines,
+            created,
         })
     }
+}
+
+/// The minted observation handle grammar: `ob-<19-digit nanos>-<pid>-<sequence>`.
+/// No other shape may ever be turned into a path, so separators, parent-relative
+/// names and absolute paths cannot enter recall or retention.
+fn valid_handle(handle: &str) -> bool {
+    let Some(rest) = handle.strip_prefix("ob-") else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let (Some(nanos), Some(pid), Some(sequence), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    nanos.len() == 19
+        && nanos.bytes().all(|byte| byte.is_ascii_digit())
+        && !pid.is_empty()
+        && pid.len() <= 10
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.len() >= 6
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn unix_nanos() -> io::Result<u128> {
@@ -531,120 +628,413 @@ fn read_pack_index(pack: &Path) -> io::Result<Vec<PackEntry>> {
     };
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::other(format!("pack index is unreadable: {error}")))?;
+    if value.get("schema").and_then(Value::as_u64) != Some(PACK_SCHEMA) {
+        return Err(io::Error::other(
+            "pack index has an unsupported schema; retained evidence is left untouched",
+        ));
+    }
     let entries = value
         .get("entries")
         .and_then(Value::as_array)
         .ok_or_else(|| io::Error::other("pack index has no entry list"))?;
-    // A damaged record is dropped instead of guessed: its handle can then only
-    // be reported as unknown, never served from unverified metadata.
-    Ok(entries.iter().filter_map(PackEntry::from_value).collect())
+    // Every record must validate: a damaged or unknown record makes the whole
+    // index unusable, because serving or purging from a reduced view would
+    // destroy evidence the dropped records still name.
+    let mut records: Vec<PackEntry> = Vec::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        let record = PackEntry::from_value(entry).map_err(|error| {
+            io::Error::other(format!(
+                "pack index record {position} is invalid ({error}); retained evidence is left untouched"
+            ))
+        })?;
+        if records
+            .iter()
+            .any(|existing| existing.handle == record.handle)
+        {
+            return Err(io::Error::other(format!(
+                "pack index record {position} repeats a handle; retained evidence is left untouched"
+            )));
+        }
+        records.push(record);
+    }
+    let mut total: u64 = 0;
+    for record in &records {
+        total = total.checked_add(record.bytes).ok_or_else(|| {
+            io::Error::other(
+                "pack index retained size is not representable; retained evidence is left untouched",
+            )
+        })?;
+    }
+    Ok(records)
 }
 
 fn write_pack_index(pack: &Path, entries: &[PackEntry]) -> io::Result<()> {
-    let temporary = pack.join("index.json.tmp");
+    // A unique temporary name keeps a concurrent publisher (including an older
+    // adapter build that still uses a common name) from tearing this write.
+    let temporary = pack.join(format!(
+        "index-{}-{}.tmp",
+        std::process::id(),
+        HANDLE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let value = json!({
         "schema": PACK_SCHEMA,
         "entries": entries.iter().map(PackEntry::to_value).collect::<Vec<_>>(),
     });
-    fs::write(
+    if let Err(error) = fs::write(
         &temporary,
         serde_json::to_vec(&value).map_err(io::Error::other)?,
-    )?;
+    ) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     // Replacement rename: a torn write can never be read as the live index.
-    fs::rename(temporary, pack.join("index.json"))
-}
-
-/// One `<handle>.log` per observation. Creation nanoseconds plus a process
-/// sequence and `create_new` keep concurrent sessions from colliding on a name.
-fn write_pack_file(pack: &Path, raw: &[u8]) -> io::Result<String> {
-    for _ in 0..64 {
-        let handle = format!(
-            "ob-{:019}-{}-{:06}",
-            unix_nanos()?,
-            std::process::id(),
-            HANDLE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = pack.join(format!("{handle}.log"));
-        match fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(raw) {
-                    let _ = fs::remove_file(&path);
-                    return Err(error);
-                }
-                return Ok(handle);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+    match fs::rename(&temporary, pack.join("index.json")) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
         }
     }
-    Err(io::Error::other("observation handle allocation failed"))
 }
 
-/// Oldest-first eviction at 64 entries or 128 MiB, plus cleanup of pack files
-/// whose index record is gone (an interrupted mint).
-fn retain(pack: &Path, entries: &mut Vec<PackEntry>) -> io::Result<()> {
-    for file in fs::read_dir(pack)?.filter_map(Result::ok) {
+/// Mint an observation name from one creation stamp. The name is decided
+/// before anything is written, so the delivered footer and the compression
+/// ledger use exactly the handle the store publishes.
+fn mint_handle(nanos: u128) -> String {
+    format!(
+        "ob-{nanos:019}-{}-{:06}",
+        std::process::id(),
+        HANDLE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The handle line a compact presentation advertises; the marker keeps a
+/// stdout handle and a stderr handle distinguishable in the same footer.
+fn pack_line_text(handle: &str, digest: &str, marker: &str) -> String {
+    format!(
+        "[rtk pack{marker}: {handle} sha256:{short} | harness-rtk.exe recall {handle} --offset 1 --limit {RECALL_DEFAULT_LIMIT}]\n",
+        short = short_digest(digest),
+    )
+}
+
+/// One publisher at a time. The lock lives on an open file handle, so process
+/// death releases it and recovery never has to trust a reusable process id.
+struct StoreLock {
+    _file: fs::File,
+}
+
+impl StoreLock {
+    fn acquire(pack: &Path) -> io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(pack.join(STORE_LOCK_FILE))?;
+        let deadline = Instant::now() + STORE_LOCK_TIMEOUT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other(
+                            "observation store is busy; another writer holds it",
+                        ));
+                    }
+                    thread::sleep(STORE_LOCK_BACKOFF);
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Write the payload into `staging/` while the store lock is held. Any staging
+/// file that recovery can still see therefore belongs to a writer that died
+/// inside its transaction; a live writer is either holding the lock or still
+/// waiting for it, and never owns an uncommitted staging file.
+fn stage_observation(pack: &Path, handle: &str, raw: &[u8]) -> io::Result<PathBuf> {
+    let staging = pack.join(PACK_STAGING);
+    fs::create_dir_all(&staging)?;
+    let path = staging.join(format!("{handle}.log"));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)?;
+    if let Err(error) = file.write_all(raw) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+/// Remove only state that an interrupted transaction can leave behind: staging
+/// leftovers and committed `*.log` files the validated index does not name.
+/// Runs under the store lock, where neither can belong to a live writer, and
+/// never follows a reparse point or recurses into a directory.
+fn recover_store(pack: &Path, entries: &[PackEntry]) {
+    if let Ok(listing) = fs::read_dir(pack.join(PACK_STAGING)) {
+        for file in listing.filter_map(Result::ok) {
+            let Ok(kind) = file.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() || !kind.is_file() {
+                continue;
+            }
+            let _ = fs::remove_file(file.path());
+        }
+    }
+    let Ok(listing) = fs::read_dir(pack) else {
+        return;
+    };
+    for file in listing.filter_map(Result::ok) {
         let name = file.file_name();
         let name = name.to_string_lossy();
         let Some(handle) = name.strip_suffix(".log") else {
             continue;
         };
-        if !entries.iter().any(|entry| entry.handle == handle) {
-            let _ = fs::remove_file(file.path()); // Private pack namespace; never recurse.
+        if entries.iter().any(|entry| entry.handle == handle) {
+            continue;
         }
+        let Ok(kind) = file.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() || !kind.is_file() {
+            continue;
+        }
+        let _ = fs::remove_file(file.path()); // Private pack namespace; never recurse.
     }
+}
+
+/// Oldest-first eviction at 64 entries or 128 MiB. The plan is computed before
+/// the index is rewritten and its file removals happen only after that commit.
+fn retention_plan(entries: &mut Vec<PackEntry>) -> io::Result<Vec<PackEntry>> {
     entries
         .sort_by(|left, right| (left.created, &left.handle).cmp(&(right.created, &right.handle)));
-    let mut total: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let mut total = 0u64;
+    for entry in entries.iter() {
+        total = total
+            .checked_add(entry.bytes)
+            .ok_or_else(|| io::Error::other("pack retention arithmetic is not representable"))?;
+    }
+    let mut evicted = Vec::new();
     while entries.len() > PACK_KEEP_FILES || total > PACK_KEEP_BYTES {
         let oldest = entries.remove(0);
         total = total.saturating_sub(oldest.bytes);
-        let _ = fs::remove_file(pack.join(format!("{}.log", oldest.handle)));
+        evicted.push(oldest);
     }
-    Ok(())
+    Ok(evicted)
 }
 
-fn pack_store(raw: &[u8], source: &str) -> io::Result<PackEntry> {
-    let pack = pack_directory()?;
-    let handle = write_pack_file(&pack, raw)?;
+/// Commit one observation in a single short store transaction: validate the
+/// index, recover interrupted state, stage and rename the content, publish the
+/// index, then evict. Validation failures abort before any file is removed, so
+/// damaged metadata can never authorize destructive retention. Command
+/// execution and presentation never run inside the critical section.
+fn commit_observation(
+    pack: &Path,
+    handle: &str,
+    digest: &str,
+    raw: &[u8],
+    source: &str,
+    created: u64,
+) -> io::Result<PackEntry> {
+    test_barrier("store-before-lock");
+    let _lock = StoreLock::acquire(pack)?;
+    let mut entries = read_pack_index(pack)?;
+    recover_store(pack, &entries);
+    let staged = stage_observation(pack, handle, raw)?;
+    test_barrier("store-staged");
+    let final_path = pack.join(format!("{handle}.log"));
+    if fs::symlink_metadata(&final_path).is_ok() {
+        let _ = fs::remove_file(&staged);
+        return Err(io::Error::other(format!(
+            "observation handle {handle} already has committed content"
+        )));
+    }
+    if let Err(error) = fs::rename(&staged, &final_path) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
     let entry = PackEntry {
-        handle,
+        handle: handle.to_owned(),
         source: source.to_owned(),
-        digest: digest_hex(raw),
+        digest: digest.to_owned(),
         bytes: raw.len() as u64,
         lines: split_lines(&String::from_utf8_lossy(raw)).len() as u64,
-        created: (unix_nanos()? / 1_000_000_000) as u64,
+        created,
     };
-    let mut entries = read_pack_index(&pack)?;
     entries.push(entry.clone());
-    retain(&pack, &mut entries)?;
-    write_pack_index(&pack, &entries)?;
+    let evicted = match retention_plan(&mut entries) {
+        Ok(evicted) => evicted,
+        Err(error) => {
+            let _ = fs::remove_file(&final_path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_pack_index(pack, &entries) {
+        let _ = fs::remove_file(&final_path);
+        return Err(error);
+    }
+    test_barrier("store-committed");
+    for old in evicted {
+        let _ = fs::remove_file(pack.join(format!("{}.log", old.handle)));
+    }
     Ok(entry)
 }
 
-/// Packed-observation line for one stream, with the handle it minted. `None`
-/// on any pack failure, so the run keeps today's exact compact output and
-/// packing can never break compression. The marker keeps a stdout handle and a
-/// stderr handle distinguishable in the same footer.
-fn pack_line(raw: &[u8], source: &str, marker: &str) -> Option<(String, String)> {
-    match pack_store(raw, source) {
-        Ok(entry) => Some((
-            format!(
-                "[rtk pack{marker}: {handle} sha256:{short} | harness-rtk.exe recall {handle} --offset 1 --limit {RECALL_DEFAULT_LIMIT}]\n",
-                handle = entry.handle,
-                short = short_digest(&entry.digest),
-            ),
-            entry.handle,
-        )),
-        Err(error) => {
-            eprintln!("rtk: {error}; observation handle not issued");
-            None
-        }
+/// One prepared compact presentation. Every field is exact: the compression
+/// ledger uses these bytes, and delivery writes exactly them (minus a pack line
+/// only when publication fails, which strictly shrinks the footer).
+struct CompactPlan {
+    body: Vec<u8>,
+    raw_path: PathBuf,
+    locator: String,
+    evidence: Evidence,
+}
+
+/// Where a prepared stream's observation evidence stands when the presentation
+/// is selected for delivery.
+enum Evidence {
+    /// The observation is committed under the store lock.
+    Observation(ObservationPlan),
+    /// The pack area itself is unavailable; the failure is reported only if the
+    /// compact form is delivered, so a raw fallback stays as quiet as today.
+    Unavailable(String),
+    /// No source command is known, as in the `filter` entry point; today's
+    /// behavior mints no handle there.
+    Omitted,
+}
+
+struct ObservationPlan {
+    pack: PathBuf,
+    handle: String,
+    digest: String,
+    pack_line: String,
+    source: String,
+    created: u64,
+}
+
+impl CompactPlan {
+    fn footer_len(&self) -> usize {
+        self.locator.len()
+            + match &self.evidence {
+                Evidence::Observation(observation) => observation.pack_line.len(),
+                Evidence::Unavailable(_) | Evidence::Omitted => 0,
+            }
     }
+
+    fn output_len(&self) -> usize {
+        self.body.len() + self.footer_len()
+    }
+}
+
+/// What one compact delivery actually wrote and advertised. The body is not
+/// written here: the caller publishes bodies and footers only after every
+/// stream's evidence state is known.
+struct Delivery {
+    presented: usize,
+    footer: String,
+    handle: Option<String>,
+    raw_path: PathBuf,
+}
+
+impl Delivery {
+    fn output_len(&self) -> usize {
+        self.presented + self.footer.len()
+    }
+}
+
+fn locator_text(dest: Dest, raw_path: &Path) -> String {
+    format!("\n[rtk raw{}: {}]\n", dest.marker(), raw_path.display())
+}
+
+/// Prepare a complete compact presentation for one stream: the filtered body,
+/// the planned raw-archive locator, and the exact handle line it could
+/// advertise. Nothing is written or published here, so a raw fallback leaves
+/// no orphaned observation.
+fn plan_compact(
+    dest: Dest,
+    body: Vec<u8>,
+    raw: &[u8],
+    source: Option<&str>,
+    notices: &Notices,
+) -> Option<CompactPlan> {
+    let Ok(nanos) = unix_nanos() else {
+        notices.emit("rtk: raw capture unavailable; raw passthrough");
+        return None;
+    };
+    let Ok(raw_path) = planned_raw_path(dest.suffix(), nanos) else {
+        notices.emit("rtk: raw capture unavailable; raw passthrough");
+        return None;
+    };
+    let locator = locator_text(dest, &raw_path);
+    let evidence = match source {
+        None => Evidence::Omitted,
+        Some(source) => match pack_directory() {
+            Err(error) => Evidence::Unavailable(error.to_string()),
+            Ok(pack) => {
+                let handle = mint_handle(nanos);
+                let digest = digest_hex(raw);
+                let pack_line = pack_line_text(&handle, &digest, dest.marker());
+                Evidence::Observation(ObservationPlan {
+                    pack,
+                    handle,
+                    digest,
+                    pack_line,
+                    source: source.to_owned(),
+                    created: (nanos / 1_000_000_000) as u64,
+                })
+            }
+        },
+    };
+    Some(CompactPlan {
+        body,
+        raw_path,
+        locator,
+        evidence,
+    })
+}
+
+/// Deliver one prepared compact stream: write its raw archive and commit its
+/// observation, reporting the footer and handle that may be emitted. `None`
+/// means retention itself is unavailable, so the caller keeps the raw stream.
+fn deliver_compact(plan: &CompactPlan, raw: &[u8], notices: &Notices) -> Option<Delivery> {
+    if save_raw_at(&plan.raw_path, raw).is_err() {
+        notices.emit("rtk: raw capture unavailable; raw passthrough");
+        return None;
+    }
+    let mut footer = plan.locator.clone();
+    let mut handle = None;
+    match &plan.evidence {
+        Evidence::Observation(observation) => {
+            match commit_observation(
+                &observation.pack,
+                &observation.handle,
+                &observation.digest,
+                raw,
+                &observation.source,
+                observation.created,
+            ) {
+                Ok(_) => {
+                    footer.push_str(&observation.pack_line);
+                    handle = Some(observation.handle.clone());
+                }
+                Err(error) => notices.emit(&format!("rtk: {error}; observation handle not issued")),
+            }
+        }
+        Evidence::Unavailable(message) => {
+            notices.emit(&format!("rtk: {message}; observation handle not issued"));
+        }
+        Evidence::Omitted => {}
+    }
+    Some(Delivery {
+        presented: plan.body.len(),
+        footer,
+        handle,
+        raw_path: plan.raw_path.clone(),
+    })
 }
 
 /// The two streams a compact Cargo run accounts for separately.
@@ -684,6 +1074,26 @@ impl Dest {
             Dest::Out => io::stdout().lock().write_all(bytes),
             Dest::Err => io::stderr().lock().write_all(bytes),
         }
+    }
+}
+
+/// Adapter-emitted status text for one compact invocation. Every byte the
+/// adapter itself prints participates in the compression ledger, so overhead
+/// that makes the delivered result larger than the raw stream is visible
+/// instead of hidden in an uncounted channel.
+#[derive(Clone, Default)]
+struct Notices {
+    bytes: Arc<AtomicUsize>,
+}
+
+impl Notices {
+    fn emit(&self, message: &str) {
+        let _ = writeln!(io::stderr(), "{message}");
+        self.bytes.fetch_add(message.len() + 1, Ordering::Relaxed);
+    }
+
+    fn measured(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed) as u64
     }
 }
 
@@ -847,14 +1257,21 @@ fn stderr_reports_diagnostics(error: &[u8]) -> bool {
 }
 
 /// Single-stream path for the allowlisted git/rg/pytest commands: today's
-/// behavior, returning the decision for the bounded local record.
-fn filter(mut input: impl Read, name: &str, source: Option<&str>) -> io::Result<StreamOutcome> {
+/// behavior, returning the decision for the bounded local record. The caller
+/// owns the notices ledger so the complete presentation accounts for every
+/// byte the adapter itself emits.
+fn filter(
+    mut input: impl Read,
+    name: &str,
+    source: Option<&str>,
+    notices: &Notices,
+) -> io::Result<StreamOutcome> {
     let mut raw = Vec::new();
     (&mut input)
         .take((RAW_LIMIT + 1) as u64)
         .read_to_end(&mut raw)?;
     if raw.len() > RAW_LIMIT {
-        eprintln!("rtk: stdout exceeds 4 MiB; raw passthrough without retention");
+        notices.emit("rtk: stdout exceeds 4 MiB; raw passthrough without retention");
         Dest::Out.write(&raw)?;
         io::copy(&mut input, &mut io::stdout().lock())?;
         return Ok(StreamOutcome::bypassed(Dest::Out, "oversize"));
@@ -873,65 +1290,83 @@ fn filter(mut input: impl Read, name: &str, source: Option<&str>) -> io::Result<
             raw.len(),
         ));
     }
-    let path = match save_raw(&raw, Dest::Out.suffix()) {
-        Ok(path) => path,
-        Err(_) => {
-            eprintln!("rtk: raw capture unavailable; raw passthrough");
+    // The complete candidate is prepared first, including the locator and
+    // handle text the footer would carry, so the compression decision uses the
+    // same bytes later reported as delivered.
+    let plan = match compressed(&raw, name) {
+        Ok(result) if result.len() < raw.len() => {
+            match plan_compact(Dest::Out, result, &raw, source, notices) {
+                Some(plan) => plan,
+                None => {
+                    Dest::Out.write(&raw)?;
+                    return Ok(StreamOutcome::bypassed_measured(
+                        Dest::Out,
+                        "retention-unavailable",
+                        raw.len(),
+                        raw.len(),
+                    ));
+                }
+            }
+        }
+        Ok(_) => {
             Dest::Out.write(&raw)?;
             return Ok(StreamOutcome::bypassed_measured(
                 Dest::Out,
-                "retention-unavailable",
+                "non-shrinking",
+                raw.len(),
+                raw.len(),
+            ));
+        }
+        Err(error) => {
+            notices.emit(&format!("rtk: {error}; raw passthrough"));
+            Dest::Out.write(&raw)?;
+            return Ok(StreamOutcome::bypassed_measured(
+                Dest::Out,
+                filter_reason(&error),
                 raw.len(),
                 raw.len(),
             ));
         }
     };
-    match compressed(&raw, name) {
-        // Packing belongs to the emitted compact result: when the filter does
-        // not shrink the output, the run stays plain raw and must not leave an
-        // orphaned pack entry whose handle was never presented.
-        Ok(mut result) if result.len() < raw.len() => {
-            let mut footer = format!("\n[rtk raw: {}]\n", path.display());
-            // A handle is minted only here: the compressed path where
-            // `save_raw` already succeeded. The raw locator stays unchanged.
-            let handle = source
-                .and_then(|source| pack_line(&raw, source, Dest::Out.marker()))
-                .map(|(packed, handle)| {
-                    footer.push_str(&packed);
-                    handle
-                });
-            let presented = result.len();
-            result.extend_from_slice(footer.as_bytes());
-            Dest::Out.write(&result)?;
-            Ok(StreamOutcome::applied(
-                Dest::Out,
-                raw.len(),
-                presented,
-                path,
-                handle,
-                footer,
-            ))
-        }
-        Ok(_) => {
-            Dest::Out.write(&raw)?;
-            Ok(StreamOutcome::bypassed_measured(
-                Dest::Out,
-                "non-shrinking",
-                raw.len(),
-                raw.len(),
-            ))
-        }
-        Err(error) => {
-            eprintln!("rtk: {error}; raw passthrough");
-            Dest::Out.write(&raw)?;
-            Ok(StreamOutcome::bypassed_measured(
-                Dest::Out,
-                filter_reason(&error),
-                raw.len(),
-                raw.len(),
-            ))
-        }
+    if plan.output_len() + notices.measured() as usize >= raw.len() {
+        Dest::Out.write(&raw)?;
+        return Ok(StreamOutcome::bypassed_measured(
+            Dest::Out,
+            "non-shrinking",
+            raw.len(),
+            raw.len(),
+        ));
     }
+    let Some(delivery) = deliver_compact(&plan, &raw, notices) else {
+        Dest::Out.write(&raw)?;
+        return Ok(StreamOutcome::bypassed_measured(
+            Dest::Out,
+            "retention-unavailable",
+            raw.len(),
+            raw.len(),
+        ));
+    };
+    // A failed publication replaces the pack line with one shorter notice, but
+    // the exact ledger is re-checked so `applied` always means fewer bytes.
+    if delivery.output_len() + notices.measured() as usize >= raw.len() {
+        Dest::Out.write(&raw)?;
+        return Ok(StreamOutcome::bypassed_measured(
+            Dest::Out,
+            "non-shrinking",
+            raw.len(),
+            raw.len(),
+        ));
+    }
+    Dest::Out.write(&plan.body)?;
+    Dest::Out.write(delivery.footer.as_bytes())?;
+    Ok(StreamOutcome::applied(
+        Dest::Out,
+        raw.len(),
+        delivery.presented,
+        delivery.raw_path,
+        delivery.handle,
+        delivery.footer,
+    ))
 }
 
 /// Bounded state shared with the capture threads: how much output is held in
@@ -951,6 +1386,7 @@ fn drain(
     dest: Dest,
     wire: &Wire,
     overflow_notice: &AtomicBool,
+    notices: &Notices,
 ) -> io::Result<Capture> {
     let mut buffer: Vec<u8> = Vec::new();
     let mut streamed = false;
@@ -966,10 +1402,10 @@ fn drain(
                 streamed = true;
                 wire.overflow.store(true, Ordering::Relaxed);
                 if !overflow_notice.swap(true, Ordering::Relaxed) {
-                    eprintln!(
+                    notices.emit(&format!(
                         "rtk: {} exceeds 4 MiB; raw passthrough without retention; this stream continues live",
                         dest.name()
-                    );
+                    ));
                 }
                 dest.write(&buffer)?;
                 buffer = Vec::new();
@@ -993,7 +1429,7 @@ fn progress_seconds() -> Option<Duration> {
 /// Bounded progress visibility while a compact run holds a long command's
 /// output back for presentation: one measured line per interval, hard-capped,
 /// and none once the run is already streaming raw.
-fn progress_notices(wire: &Wire, stop: &AtomicBool) {
+fn progress_notices(wire: &Wire, stop: &AtomicBool, notices: &Notices) {
     let Some(interval) = progress_seconds() else {
         return;
     };
@@ -1011,9 +1447,9 @@ fn progress_notices(wire: &Wire, stop: &AtomicBool) {
         if captured > 0 && last.elapsed() >= interval {
             last = Instant::now();
             printed += 1;
-            eprintln!(
+            notices.emit(&format!(
                 "rtk: compact capture still running; {captured} bytes captured so far (progress notice {printed}/{PROGRESS_NOTICES})"
-            );
+            ));
         }
     }
 }
@@ -1043,24 +1479,20 @@ const CARGO_STATUS_WORDS: [&str; 21] = [
     "Executable",
 ];
 
-/// A Cargo status line: its status word sits inside Cargo's right-aligned
-/// 12-column status field, so an indented diagnostic body or a code excerpt
-/// never matches.
+/// A Cargo status line: Cargo writes `{:>12} {}`, so the status word ends
+/// exactly at column 12 and a space opens the message. Checking that exact
+/// documented layout - not just an indentation range - keeps user output and
+/// diagnostic noise byte-preserved even when it happens to contain a status
+/// word.
 fn cargo_status_line(line: &str) -> bool {
     let body = line.trim_start_matches(' ');
     let indent = line.len() - body.len();
-    if indent == 0 || indent > 12 {
+    let Some(word) = body.split(' ').next() else {
         return false;
-    }
-    let word = body
-        .split([' ', '\t', '\r', '\n'])
-        .next()
-        .unwrap_or_default();
-    CARGO_STATUS_WORDS.contains(&word)
-        && body
-            .as_bytes()
-            .get(word.len())
-            .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    };
+    indent + word.len() == 12
+        && CARGO_STATUS_WORDS.contains(&word)
+        && body.as_bytes().get(word.len()) == Some(&b' ')
 }
 
 /// Remove recognized Cargo progress lines and keep every other line
@@ -1087,92 +1519,75 @@ fn native_cargo_presentation(raw: &[u8]) -> Option<Vec<u8>> {
     Some(output.into_bytes())
 }
 
-/// Decide one bounded capture. An applied presentation is written to the
-/// stream's own destination with no footer; the caller emits the locator and
-/// handle lines on stdout afterwards.
-fn present_stream(
+/// One prepared stream of the dual-stream Cargo path. Nothing has been written
+/// yet: the run-level decision needs both complete presentations first, so a
+/// raw fallback never leaves an orphaned observation or a half-emitted body.
+enum StreamAttempt {
+    Raw { reason: &'static str },
+    Compact(Box<CompactPlan>),
+}
+
+/// The reason a prepared stream contributes to the run when its compact form
+/// is not the representation the run delivers.
+fn attempt_reason(attempt: &StreamAttempt) -> &'static str {
+    match attempt {
+        StreamAttempt::Raw { reason } => reason,
+        StreamAttempt::Compact(_) => "non-shrinking",
+    }
+}
+
+/// Prepare one bounded capture: run the selected filter, then plan the complete
+/// compact presentation including the locator and handle line it would carry.
+/// The raw stream is never written here.
+fn prepare_stream(
     dest: Dest,
     capture: &Capture,
     verb: CargoVerb,
     command: &str,
-) -> io::Result<StreamOutcome> {
+    notices: &Notices,
+) -> StreamAttempt {
     let raw = &capture.buffer;
     if raw.is_empty() {
-        return Ok(StreamOutcome::bypassed_measured(dest, "empty-output", 0, 0));
+        return StreamAttempt::Raw {
+            reason: "empty-output",
+        };
     }
     if raw.len() < RETENTION_FLOOR {
-        dest.write(raw)?;
-        return Ok(StreamOutcome::bypassed_measured(
-            dest,
-            "short-output",
-            raw.len(),
-            raw.len(),
-        ));
+        return StreamAttempt::Raw {
+            reason: "short-output",
+        };
     }
     if std::str::from_utf8(raw).is_err() || raw.contains(&0) {
-        dest.write(raw)?;
-        return Ok(StreamOutcome::bypassed_measured(
-            dest,
-            "binary-output",
-            raw.len(),
-            raw.len(),
-        ));
+        return StreamAttempt::Raw {
+            reason: "binary-output",
+        };
     }
-    let presentation = match (dest, verb) {
+    let body = match (dest, verb) {
         (Dest::Out, CargoVerb::Test) => match compressed(raw, "cargo-test") {
             Ok(result) if result.len() < raw.len() => Some(result),
             Ok(_) => None,
             Err(error) => {
-                eprintln!("rtk: {error}; raw passthrough");
-                dest.write(raw)?;
-                return Ok(StreamOutcome::bypassed_measured(
-                    dest,
-                    filter_reason(&error),
-                    raw.len(),
-                    raw.len(),
-                ));
+                notices.emit(&format!("rtk: {error}; raw passthrough"));
+                return StreamAttempt::Raw {
+                    reason: filter_reason(&error),
+                };
             }
         },
         _ => native_cargo_presentation(raw),
     };
-    let Some(presentation) = presentation else {
-        dest.write(raw)?;
-        return Ok(StreamOutcome::bypassed_measured(
-            dest,
-            "non-shrinking",
-            raw.len(),
-            raw.len(),
-        ));
-    };
-    let raw_path = match save_raw(raw, dest.suffix()) {
-        Ok(path) => path,
-        Err(_) => {
-            eprintln!("rtk: raw capture unavailable; raw passthrough");
-            dest.write(raw)?;
-            return Ok(StreamOutcome::bypassed_measured(
-                dest,
-                "retention-unavailable",
-                raw.len(),
-                raw.len(),
-            ));
-        }
+    let Some(body) = body else {
+        return StreamAttempt::Raw {
+            reason: "non-shrinking",
+        };
     };
     let marker = dest.marker();
-    let mut footer = format!("\n[rtk raw{marker}: {}]\n", raw_path.display());
     let source = format!("{command} {marker}");
-    let handle = pack_line(raw, source.trim_end(), marker).map(|(packed, handle)| {
-        footer.push_str(&packed);
-        handle
-    });
-    dest.write(&presentation)?;
-    Ok(StreamOutcome::applied(
-        dest,
-        raw.len(),
-        presentation.len(),
-        raw_path,
-        handle,
-        footer,
-    ))
+    match plan_compact(dest, body, raw, Some(source.trim_end()), notices) {
+        Some(plan) => StreamAttempt::Compact(Box::new(plan)),
+        None => StreamAttempt::Raw {
+            reason: "retention-unavailable",
+        },
+    }
 }
 
 /// Dual-stream Cargo path: drain both pipes concurrently, decide each stream
@@ -1195,20 +1610,24 @@ fn run_cargo(
     let wire = Arc::new(Wire::default());
     let stop = Arc::new(AtomicBool::new(false));
     let overflow_notice = Arc::new(AtomicBool::new(false));
+    let notices = Notices::default();
     let out_thread = thread::spawn({
         let wire = Arc::clone(&wire);
         let notice = Arc::clone(&overflow_notice);
-        move || drain(stdout, Dest::Out, &wire, &notice)
+        let notices = notices.clone();
+        move || drain(stdout, Dest::Out, &wire, &notice, &notices)
     });
     let err_thread = thread::spawn({
         let wire = Arc::clone(&wire);
         let notice = Arc::clone(&overflow_notice);
-        move || drain(stderr, Dest::Err, &wire, &notice)
+        let notices = notices.clone();
+        move || drain(stderr, Dest::Err, &wire, &notice, &notices)
     });
     let progress = thread::spawn({
         let wire = Arc::clone(&wire);
         let stop = Arc::clone(&stop);
-        move || progress_notices(&wire, &stop)
+        let notices = notices.clone();
+        move || progress_notices(&wire, &stop, &notices)
     });
     let code = child.wait()?.code().unwrap_or(1);
     stop.store(true, Ordering::Relaxed);
@@ -1219,7 +1638,7 @@ fn run_cargo(
         .join()
         .map_err(|_| io::Error::other("stderr capture failed"))??;
     let _ = progress.join();
-    let notice = env::var("HARNESS_RTK_DIAGNOSTIC").as_deref() == Ok("1");
+    let announcement = env::var("HARNESS_RTK_DIAGNOSTIC").as_deref() == Ok("1");
     if wire.overflow.load(Ordering::Relaxed) {
         // Already committed to raw passthrough: flush whatever the other stream
         // still holds, and record the limit without inventing measurements.
@@ -1238,32 +1657,186 @@ fn run_cargo(
                 StreamOutcome::bypassed(Dest::Out, "oversize"),
                 StreamOutcome::bypassed(Dest::Err, "oversize"),
             ],
-            None,
             Some(code),
-        );
-        if notice {
+        )
+        .adapter_bytes(Some(notices.measured()));
+        if announcement {
             record.report();
         }
         record.store();
         return Ok(code);
     }
-    let mut outcomes = vec![
-        present_stream(Dest::Out, &out, verb, command)?,
-        present_stream(Dest::Err, &err, verb, command)?,
+    // Prepare both complete presentations before deciding, so the labeled
+    // decision covers every byte the run can emit: both bodies, locators,
+    // handle text, the exit notice and the adapter's own measured notices.
+    let attempts = [
+        prepare_stream(Dest::Out, &out, verb, command, &notices),
+        prepare_stream(Dest::Err, &err, verb, command, &notices),
     ];
+    let captures = [&out, &err];
+    let destinations = [Dest::Out, Dest::Err];
+    let raw_total = out.buffer.len() + err.buffer.len();
+    let exit_notice = if code == 0 {
+        String::new()
+    } else {
+        format!("[rtk cargo exit: {code}]\n")
+    };
+    let planned: usize = attempts
+        .iter()
+        .zip(captures)
+        .map(|(attempt, capture)| match attempt {
+            StreamAttempt::Compact(plan) => plan.output_len(),
+            StreamAttempt::Raw { .. } => capture.buffer.len(),
+        })
+        .sum();
+    let has_compact = attempts
+        .iter()
+        .any(|attempt| matches!(attempt, StreamAttempt::Compact(_)));
+    if !has_compact || planned + exit_notice.len() + notices.measured() as usize >= raw_total {
+        // The complete accounted presentation is not smaller than the captured
+        // originals: both streams stay byte-raw and nothing is published.
+        Dest::Out.write(&out.buffer)?;
+        Dest::Err.write(&err.buffer)?;
+        let outcomes = raw_outcomes(&attempts, &captures, destinations);
+        return Ok(finish_run(
+            command,
+            verb,
+            code,
+            outcomes,
+            None,
+            notices.measured(),
+            announcement,
+        ));
+    }
+    // Deliver evidence next; a publication failure replaces a pack line with
+    // one shorter notice, and the exact ledger is re-checked before the label
+    // is applied, so `applied` always means fewer emitted bytes.
+    let deliveries = [
+        match &attempts[0] {
+            StreamAttempt::Compact(plan) => deliver_compact(plan, &out.buffer, &notices),
+            StreamAttempt::Raw { .. } => None,
+        },
+        match &attempts[1] {
+            StreamAttempt::Compact(plan) => deliver_compact(plan, &err.buffer, &notices),
+            StreamAttempt::Raw { .. } => None,
+        },
+    ];
+    let delivered: usize = deliveries
+        .iter()
+        .zip(captures)
+        .map(|(delivery, capture)| match delivery {
+            Some(delivery) => delivery.output_len(),
+            None => capture.buffer.len(),
+        })
+        .sum();
+    let any_delivered = deliveries.iter().any(Option::is_some);
+    if !any_delivered {
+        Dest::Out.write(&out.buffer)?;
+        Dest::Err.write(&err.buffer)?;
+        let outcomes = raw_outcomes(&attempts, &captures, destinations);
+        return Ok(finish_run(
+            command,
+            verb,
+            code,
+            outcomes,
+            None,
+            notices.measured(),
+            announcement,
+        ));
+    }
+    let with_exit = delivered + exit_notice.len() + notices.measured() as usize;
+    if with_exit >= raw_total {
+        // A storage fallback grew the ledger past the raw originals; the run
+        // reports raw delivery and never advertises an unshown handle.
+        Dest::Out.write(&out.buffer)?;
+        Dest::Err.write(&err.buffer)?;
+        let outcomes = raw_outcomes(&attempts, &captures, destinations);
+        return Ok(finish_run(
+            command,
+            verb,
+            code,
+            outcomes,
+            None,
+            notices.measured(),
+            announcement,
+        ));
+    }
+    let mut outcomes = Vec::with_capacity(2);
     let mut footer = String::new();
-    for outcome in &mut outcomes {
-        if let Some(text) = outcome.footer.take() {
-            footer.push_str(&text);
+    for index in 0..2 {
+        match (&attempts[index], &deliveries[index]) {
+            (StreamAttempt::Compact(plan), Some(delivery)) => {
+                destinations[index].write(&plan.body)?;
+                footer.push_str(&delivery.footer);
+                outcomes.push(StreamOutcome::applied(
+                    destinations[index],
+                    captures[index].buffer.len(),
+                    delivery.presented,
+                    delivery.raw_path.clone(),
+                    delivery.handle.clone(),
+                    delivery.footer.clone(),
+                ));
+            }
+            _ => {
+                destinations[index].write(&captures[index].buffer)?;
+                outcomes.push(StreamOutcome::bypassed_measured(
+                    destinations[index],
+                    attempt_reason(&attempts[index]),
+                    captures[index].buffer.len(),
+                    captures[index].buffer.len(),
+                ));
+            }
         }
     }
     if !footer.is_empty() {
         // The child's own result stays visible in a compacted presentation.
         if code != 0 {
-            footer.push_str(&format!("[rtk cargo exit: {code}]\n"));
+            footer.push_str(&exit_notice);
         }
         Dest::Out.write(footer.as_bytes())?;
     }
+    let footer_bytes = (!footer.is_empty()).then_some(footer.len() as u64);
+    Ok(finish_run(
+        command,
+        verb,
+        code,
+        outcomes,
+        footer_bytes,
+        notices.measured(),
+        announcement,
+    ))
+}
+
+/// The all-raw outcome pair for a run whose complete presentation does not
+/// shrink, with each stream keeping its own honest reason.
+fn raw_outcomes(
+    attempts: &[StreamAttempt; 2],
+    captures: &[&Capture; 2],
+    destinations: [Dest; 2],
+) -> Vec<StreamOutcome> {
+    (0..2)
+        .map(|index| {
+            StreamOutcome::bypassed_measured(
+                destinations[index],
+                attempt_reason(&attempts[index]),
+                captures[index].buffer.len(),
+                captures[index].buffer.len(),
+            )
+        })
+        .collect()
+}
+
+/// Record one finished compact run and return the child's exit code. The
+/// record is evidence, never a gate: a failed write never changes the result.
+fn finish_run(
+    command: &str,
+    verb: CargoVerb,
+    code: i32,
+    outcomes: Vec<StreamOutcome>,
+    footer_bytes: Option<u64>,
+    adapter_bytes: u64,
+    announcement: bool,
+) -> i32 {
     let applied = outcomes.iter().any(|outcome| outcome.decision == "applied");
     let reason = outcomes
         .iter()
@@ -1276,14 +1849,15 @@ fn run_cargo(
         if applied { "applied" } else { "bypassed" },
         if applied { "applied" } else { reason },
         outcomes,
-        Some(footer.len() as u64).filter(|bytes| *bytes > 0),
         Some(code),
-    );
-    if notice {
+    )
+    .footer_bytes(footer_bytes)
+    .adapter_bytes(Some(adapter_bytes));
+    if announcement {
         record.report();
     }
     record.store();
-    Ok(code)
+    code
 }
 
 /// One bounded local decision record for an explicitly inspected invocation.
@@ -1297,6 +1871,9 @@ struct RunRecord {
     reason: &'static str,
     streams: Vec<StreamOutcome>,
     footer_bytes: Option<u64>,
+    /// Adapter-emitted progress/status/error text. `None` for an invocation
+    /// whose streams were never captured, where no measurement is claimed.
+    adapter_bytes: Option<u64>,
     exit_code: Option<i32>,
 }
 
@@ -1307,7 +1884,6 @@ impl RunRecord {
         decision: &'static str,
         reason: &'static str,
         streams: Vec<StreamOutcome>,
-        footer_bytes: Option<u64>,
         exit_code: Option<i32>,
     ) -> Self {
         Self {
@@ -1316,13 +1892,27 @@ impl RunRecord {
             decision,
             reason,
             streams,
-            footer_bytes,
+            footer_bytes: None,
+            adapter_bytes: None,
             exit_code,
         }
     }
 
-    /// Complete presentation size: every stream's delivered payload plus the
-    /// footer lines. `None` while any part of it was never captured.
+    /// The footer text emitted after the presented bodies, when any.
+    fn footer_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.footer_bytes = bytes;
+        self
+    }
+
+    /// The adapter's own emitted notice bytes for this run.
+    fn adapter_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.adapter_bytes = bytes;
+        self
+    }
+
+    /// Complete presentation size: every stream's delivered payload, the footer
+    /// lines and the adapter's own emitted notices. `None` while any part of it
+    /// was never captured.
     fn presentation_bytes(&self) -> Option<u64> {
         if self.streams.is_empty() {
             // A bypassed invocation whose streams were inherited rather than
@@ -1335,7 +1925,7 @@ impl RunRecord {
             .iter()
             .map(|stream| stream.presented_bytes)
             .sum();
-        Some(streams? + self.footer_bytes.unwrap_or(0))
+        Some(streams? + self.footer_bytes.unwrap_or(0) + self.adapter_bytes.unwrap_or(0))
     }
 
     fn to_value(&self) -> Value {
@@ -1357,6 +1947,7 @@ impl RunRecord {
             })).collect::<Vec<_>>(),
             "presentation_bytes": self.presentation_bytes(),
             "footer_bytes": self.footer_bytes,
+            "adapter_bytes": self.adapter_bytes,
             "exit_code": self.exit_code,
             "tokens": Value::Null,
             "token_measurement": "unavailable",
@@ -1384,8 +1975,13 @@ impl RunRecord {
             .presentation_bytes()
             .map(|bytes| format!("{bytes} B"))
             .unwrap_or_else(|| "unavailable".to_owned());
+        let adapter = self
+            .adapter_bytes
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| format!("; {bytes} B adapter notices"))
+            .unwrap_or_default();
         eprintln!(
-            "rtk: compact `{}` -> {} ({}); {}; presentation {presentation}; tokens unavailable",
+            "rtk: compact `{}` -> {} ({}); {}; presentation {presentation}{adapter}; tokens unavailable",
             self.command,
             self.decision,
             self.reason,
@@ -1660,6 +2256,11 @@ fn recall(arguments: &[std::ffi::OsString]) -> io::Result<i32> {
     let Some(handle) = handle else {
         return usage_error("an observation handle is required");
     };
+    // The requested name must match the minted grammar before any path is
+    // constructed from it; anything else can only be an unknown handle.
+    if !valid_handle(handle) {
+        return unknown_handle(handle);
+    }
     let pack = pack_directory()?;
     let entries = match read_pack_index(&pack) {
         Ok(entries) => entries,
@@ -1673,6 +2274,10 @@ fn recall(arguments: &[std::ffi::OsString]) -> io::Result<i32> {
     let Some(entry) = entries.into_iter().find(|entry| entry.handle == handle) else {
         return unknown_handle(handle);
     };
+    // Deterministic seam for the reader/eviction overlap reproduction: the
+    // committed observation is known, and the test may now evict it before the
+    // content read below.
+    test_barrier("recall-indexed");
     let bytes = match fs::read(pack.join(format!("{}.log", entry.handle))) {
         Ok(bytes) => bytes,
         // An index record without its content is an evicted observation.
@@ -1793,7 +2398,6 @@ fn run(arguments: &[OsString], compact: bool) -> io::Result<i32> {
                 "bypassed",
                 reason.reason(),
                 Vec::new(),
-                None,
                 Some(code),
             );
             if env::var("HARNESS_RTK_DIAGNOSTIC").as_deref() == Ok("1") {
@@ -1829,7 +2433,8 @@ fn run_pipe(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     let mut child = line.spawn()?;
-    let outcome = match filter(child.stdout.take().unwrap(), name, Some(command)) {
+    let notices = Notices::default();
+    let outcome = match filter(child.stdout.take().unwrap(), name, Some(command), &notices) {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = child.kill();
@@ -1849,9 +2454,10 @@ fn run_pipe(
         outcome.decision,
         outcome.reason,
         vec![outcome],
-        footer_bytes,
         Some(code),
-    );
+    )
+    .footer_bytes(footer_bytes)
+    .adapter_bytes(Some(notices.measured()));
     if env::var("HARNESS_RTK_DIAGNOSTIC").as_deref() == Ok("1") {
         record.report();
     }
@@ -1866,7 +2472,13 @@ fn main() {
         Some("filter") if arguments.len() == 3 => {
             // No source command is known here, so this entry keeps the raw
             // locator only and never mints an observation handle.
-            filter(io::stdin().lock(), &arguments[2].to_string_lossy(), None).map(|_| 0)
+            filter(
+                io::stdin().lock(),
+                &arguments[2].to_string_lossy(),
+                None,
+                &Notices::default(),
+            )
+            .map(|_| 0)
         }
         Some("recall") => recall(&arguments[2..]),
         Some("diagnostics") => diagnostics(&arguments[2..]),
@@ -1895,7 +2507,9 @@ mod tests {
     }
 
     /// The presentation's whole safety property: a status line is progress, and
-    /// a diagnostic or a code excerpt is never mistaken for one.
+    /// a diagnostic, a code excerpt or misaligned user text is never mistaken
+    /// for one. Cargo writes `{:>12} {}`, so the status word must end exactly at
+    /// column 12 and a space must open the message.
     #[test]
     fn cargo_status_lines_are_progress_and_nothing_else() {
         for line in [
@@ -1905,6 +2519,9 @@ mod tests {
             "     Running unittests src/lib.rs (target/debug/deps/demo-1)\n",
             "   Doc-tests demo\n",
             "    Building [=====>     ] 3/30\n",
+            "       Fresh demo v0.1.0\n",
+            " Downloading crates ...\n",
+            "  Downloaded demo v0.1.0\n",
         ] {
             assert!(cargo_status_line(line), "{line:?}");
         }
@@ -1915,7 +2532,13 @@ mod tests {
             "  |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it\n",
             "running 2 tests\n",
             "test result: ok. 2 passed; 0 failed; 0 ignored\n",
+            // Wrong width for the word: user text that merely starts with a
+            // status word stays byte-preserved.
             "Compiling demo starts at column one, so it is not a status line\n",
+            "  Compiling demo is one column short of the status field\n",
+            "    Compiling demo is one column past the status field\n",
+            "    Doc-tests demo is not Cargo's aligned doc-test line\n",
+            "   Compiling\n",
             "             Compiling sits past the 12-column status field\n",
             "Finished\n",
             "For more information about this error, try `rustc --explain E0308`.\n",

@@ -10,9 +10,13 @@ use harness_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
     time::Instant,
 };
@@ -308,6 +312,152 @@ fn only_raw_archive(home: &Path) -> PathBuf {
 fn present_locator(stdout: &[u8]) -> bool {
     let text = String::from_utf8_lossy(stdout);
     text.contains("[rtk pack:") || text.contains("[rtk raw:")
+}
+
+const BARRIER_ENV: &str = "HARNESS_RTK_TEST_BARRIER_DIR";
+
+/// Holds one test barrier release latch. The adapter announces its arrival on
+/// stderr and then blocks on this file's exclusive lock; dropping the guard (or
+/// the test process exiting) releases the child, so a lost test cannot wedge it.
+struct Barrier {
+    _release: fs::File,
+}
+
+impl Barrier {
+    fn arm(directory: &Path, point: &str) -> Barrier {
+        let release = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join(format!("{point}.release")))
+            .unwrap();
+        release
+            .try_lock()
+            .expect("the test owns the barrier release latch");
+        Barrier { _release: release }
+    }
+
+    fn release(self) {}
+}
+
+/// Kills a child that never reaches its barrier, so a broken regression fails
+/// the suite instead of hanging it.
+struct Watchdog {
+    done: Arc<AtomicBool>,
+    killer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn arm(pid: u32) -> Watchdog {
+        let done = Arc::new(AtomicBool::new(false));
+        let killer = std::thread::spawn({
+            let done = Arc::clone(&done);
+            move || {
+                for _ in 0..240 {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        Watchdog {
+            done,
+            killer: Some(killer),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(killer) = self.killer.take() {
+            let _ = killer.join();
+        }
+    }
+}
+
+/// A barrier-driven adapter invocation: stdout is drained continuously while
+/// the test blocks on stderr for the announced barrier point.
+struct BarrierChild {
+    child: std::process::Child,
+    stderr: std::io::BufReader<std::process::ChildStderr>,
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    _watchdog: Watchdog,
+}
+
+impl BarrierChild {
+    fn spawn(
+        adapter: &Path,
+        args: &[&str],
+        cwd: &Path,
+        home: &Path,
+        extra: &[(&str, &str)],
+    ) -> BarrierChild {
+        let mut command = Command::new(adapter);
+        command.args(args).current_dir(cwd).env("CODEX_HOME", home);
+        command.env_remove("HARNESS_RTK_DISABLE");
+        command.env("PROCESS_CASE_ROOT", cwd);
+        for (key, value) in extra {
+            command.env(*key, *value);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let watchdog = Watchdog::arm(child.id());
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes).unwrap()
+        });
+        BarrierChild {
+            child,
+            stderr: std::io::BufReader::new(stderr),
+            stdout: reader,
+            _watchdog: watchdog,
+        }
+    }
+
+    /// Event wait, not a sleep: the adapter announces the point before it
+    /// blocks, so a blocking line read observes it deterministically.
+    fn wait_for_barrier(&mut self, point: &str) {
+        let needle = format!("rtk: test barrier {point} reached");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self.stderr.read_line(&mut line).unwrap();
+            assert!(read > 0, "the child exited before barrier {point}");
+            if line.contains(&needle) {
+                return;
+            }
+        }
+    }
+
+    fn wait(mut self) -> (std::process::ExitStatus, Vec<u8>, String) {
+        let status = self.child.wait().unwrap();
+        let stdout = self.stdout.join().unwrap();
+        let mut stderr = self.stderr;
+        let mut rest = String::new();
+        stderr.read_to_string(&mut rest).unwrap();
+        (status, stdout, rest)
+    }
+
+    fn kill(mut self) -> (std::process::ExitStatus, Vec<u8>) {
+        let _ = self.child.kill();
+        let status = self.child.wait().unwrap();
+        let stdout = self.stdout.join().unwrap();
+        (status, stdout)
+    }
 }
 
 /// Numbered content lines of a recall response, in emitted order.
@@ -1380,8 +1530,11 @@ fn cargo_corpus_forms_enter_the_documented_compression_paths() {
     fs::create_dir(&home).unwrap();
     let (binary, _) = staged(root.path());
     let cargo = cargo_double(&binary);
-    let stdout = warning_stream();
-    let stderr = warning_stream();
+    // Repeated eight times: the complete accounted presentation (both bodies,
+    // both locators, both handles) must genuinely shrink before a run is
+    // labeled applied.
+    let stdout = warning_stream().repeat(8);
+    let stderr = warning_stream().repeat(8);
     let ledger = fixture_ledger(root.path());
     let forms: [(&str, &[&str]); 6] = [
         (
@@ -1491,6 +1644,16 @@ fn cargo_corpus_forms_enter_the_documented_compression_paths() {
         let record = record_for(&records, &command);
         assert_eq!(record["selection"], *selection, "{args:?}: {record}");
         assert_eq!(record["decision"], "applied", "{args:?}: {record}");
+        let raw_total = record["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stream| stream["raw_bytes"].as_u64().unwrap())
+            .sum::<u64>();
+        assert!(
+            record["presentation_bytes"].as_u64().unwrap() < raw_total,
+            "{args:?}: an applied run must deliver fewer bytes than its raw originals: {record}"
+        );
     }
 }
 
@@ -1605,7 +1768,9 @@ fn cargo_stderr_only_compile_failure_keeps_stream_and_exit() {
     fs::create_dir(&home).unwrap();
     let (binary, _) = staged(root.path());
     let cargo = cargo_double(&binary);
-    let failure = compile_failure_stream();
+    // Repeated eight times so the complete presentation (body, locator, handle
+    // and the failure notice) genuinely shrinks before the stream is applied.
+    let failure = compile_failure_stream().repeat(8);
     let ledger = fixture_ledger(root.path());
     let output = invoke_bounded(
         &binary,
@@ -1837,8 +2002,9 @@ fn cargo_oversized_stream_passes_raw_with_an_explicit_limit() {
     assert_eq!(record["presentation_bytes"], Value::Null, "{record}");
 }
 
-/// Task 1.2: blocks the adapter does not recognize stay byte-verbatim, and a
-/// short stream stays raw rather than paying for retention.
+/// Task 1.2/1.4: blocks the adapter does not recognize stay byte-verbatim, a
+/// short stream stays raw, and a stream whose complete presentation cannot pay
+/// for its locator and handle falls back to the raw bytes as well.
 #[test]
 fn cargo_unknown_blocks_and_short_streams_stay_raw() {
     let root = tempfile::tempdir().unwrap();
@@ -1848,7 +2014,13 @@ fn cargo_unknown_blocks_and_short_streams_stay_raw() {
     fs::create_dir(&home).unwrap();
     let (binary, _) = staged(root.path());
     let cargo = cargo_double(&binary);
-    let unknown = format!("   Compiling synthetic-demo v0.1.0\n{}", unknown_block());
+    // Enough recognized progress lines to pay for the footer, then a block the
+    // adapter must not touch.
+    let mut unknown = String::new();
+    for _ in 0..32 {
+        unknown.push_str("   Compiling synthetic-demo v0.1.0\n");
+    }
+    unknown.push_str(&unknown_block());
     let output = invoke_bounded(
         &binary,
         &["compact", cargo.to_str().unwrap(), "check", "--locked"],
@@ -1868,7 +2040,7 @@ fn cargo_unknown_blocks_and_short_streams_stay_raw() {
     );
     assert!(
         !out.contains("Compiling"),
-        "the recognized progress line is elided: {out}"
+        "recognized progress lines are elided: {out}"
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
@@ -1882,6 +2054,40 @@ fn cargo_unknown_blocks_and_short_streams_stay_raw() {
     assert_eq!(record["streams"][1]["reason"], "short-output", "{record}");
     assert_eq!(record["streams"][1]["raw_bytes"], short, "{record}");
     assert_eq!(record["streams"][1]["presented_bytes"], short, "{record}");
+
+    // One recognized line cannot pay for the locator and handle, so the
+    // complete presentation does not shrink: the raw bytes stay, including the
+    // status-like text, and the fallback publishes nothing new.
+    let almost = format!("   Compiling synthetic-demo v0.1.0\n{}", unknown_block());
+    let output = invoke_bounded(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", almost.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", "   Compiling demo\n"),
+        ],
+        Duration::from_secs(30),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        almost,
+        "a non-shrinking complete presentation keeps the raw bytes"
+    );
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display()));
+    assert_eq!(record["decision"], "bypassed", "{record}");
+    assert_eq!(record["streams"][0]["reason"], "non-shrinking", "{record}");
+    assert_eq!(record["streams"][0]["handle"], Value::Null, "{record}");
+    let index: Value =
+        serde_json::from_slice(&fs::read(home.join("harness/rtk/pack/index.json")).unwrap())
+            .unwrap();
+    assert!(
+        index["entries"].as_array().unwrap().len() == 1,
+        "the raw fallback publishes nothing new: {index}"
+    );
 }
 
 /// Task 1.2: a failing or timing-out formatter keeps the original output
@@ -2016,7 +2222,9 @@ fn cargo_long_run_reports_bounded_progress() {
     fs::create_dir(&home).unwrap();
     let (binary, _) = staged(root.path());
     let cargo = cargo_double(&binary);
-    let stdout = warning_stream();
+    // Large enough that the compact presentation still shrinks once the
+    // emitted progress notices are part of the accounted bytes.
+    let stdout = warning_stream().repeat(8);
     let output = invoke_bounded(
         &binary,
         &["compact", cargo.to_str().unwrap(), "check", "--locked"],
@@ -2041,6 +2249,23 @@ fn cargo_long_run_reports_bounded_progress() {
     );
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(out.contains("[rtk pack: "), "the run still compacts: {out}");
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display()));
+    assert_eq!(record["decision"], "applied", "{record}");
+    assert!(
+        record["adapter_bytes"].as_u64().unwrap() > 0,
+        "the progress notices are measured into the ledger: {record}"
+    );
+    let raw_total = record["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stream| stream["raw_bytes"].as_u64().unwrap_or(0))
+        .sum::<u64>();
+    assert!(
+        record["presentation_bytes"].as_u64().unwrap() < raw_total,
+        "applied bytes shrink on the same basis diagnostics report: {record}"
+    );
     // Zero disables the notice instead of printing one per tick.
     let quiet = invoke_bounded(
         &binary,
@@ -2071,7 +2296,8 @@ fn compression_decisions_and_byte_evidence_are_recorded() {
     fs::create_dir(&home).unwrap();
     let (binary, _) = staged(root.path());
     let cargo = cargo_double(&binary);
-    let stdout = warning_stream();
+    // Repeated four times: the complete presentation must genuinely shrink.
+    let stdout = warning_stream().repeat(4);
     let plain = format!(
         "{}fixture stderr without a cargo status word\n",
         "x".repeat(600)
@@ -2109,8 +2335,23 @@ fn compression_decisions_and_byte_evidence_are_recorded() {
         record["presentation_bytes"].as_u64().unwrap(),
         record["streams"][0]["presented_bytes"].as_u64().unwrap()
             + record["streams"][1]["presented_bytes"].as_u64().unwrap()
-            + record["footer_bytes"].as_u64().unwrap(),
+            + record["footer_bytes"].as_u64().unwrap()
+            + record["adapter_bytes"].as_u64().unwrap(),
         "{record}"
+    );
+    let raw_total = record["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stream| stream["raw_bytes"].as_u64().unwrap())
+        .sum::<u64>();
+    assert!(
+        record["presentation_bytes"].as_u64().unwrap() < raw_total,
+        "an applied run shrinks on the same basis diagnostics report: {record}"
+    );
+    assert_eq!(
+        record["adapter_bytes"], 0,
+        "no adapter notice was emitted in this run: {record}"
     );
     assert_eq!(record["tokens"], Value::Null, "{record}");
     assert_eq!(record["token_measurement"], "unavailable", "{record}");
@@ -2191,8 +2432,10 @@ fn recall_serves_both_cargo_streams_without_rerunning() {
     fs::create_dir(&home).unwrap();
     let (binary, _) = staged(root.path());
     let cargo = cargo_double(&binary);
-    let stdout = warning_stream();
-    let stderr = compile_failure_stream();
+    // Repeated eight times: both complete stream presentations must shrink
+    // before each is labeled applied and packed.
+    let stdout = warning_stream().repeat(8);
+    let stderr = compile_failure_stream().repeat(8);
     let ledger = fixture_ledger(root.path());
     let output = invoke_with_env(
         &binary,
@@ -2319,4 +2562,1116 @@ fn diagnostics_records_stay_bounded_and_readable() {
     assert_eq!(empty.status.code(), Some(0));
     assert!(empty.stdout.is_empty());
     assert!(String::from_utf8_lossy(&empty.stderr).contains("no compact-run decision records yet"));
+}
+
+/// A01: two real processes publish into one observation store at a controlled
+/// interleaving. The second writer starts while the first holds the store
+/// transaction open, and below the retention limits both successful handles
+/// must recall their exact originals with valid digests.
+#[test]
+fn two_process_publication_keeps_both_handles_below_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    let barrier = root.path().join("barrier");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&barrier).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let ledger = fixture_ledger(root.path());
+    let first_stdout = warning_stream().repeat(6);
+    let second_stdout = compile_failure_stream().repeat(6);
+
+    // The first writer is parked on the store boundary itself: the second
+    // writer runs a complete publication before the first enters its
+    // transaction. The declared invariant is that every advertised handle
+    // recalls its exact original; on the pre-fix code the second writer's
+    // retention deletes the first writer's content exactly here.
+    let latch = Barrier::arm(&barrier, "store-before-lock");
+    let mut first = BarrierChild::spawn(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            (BARRIER_ENV, barrier.to_str().unwrap()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", first_stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+    );
+    first.wait_for_barrier("store-before-lock");
+    let second = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", second_stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+    );
+    latch.release();
+    let (first_status, first_out, first_err) = first.wait();
+    assert_eq!(first_status.code(), Some(0), "{first_err}");
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let first_text = String::from_utf8(first_out).unwrap();
+    let second_text = String::from_utf8(second.stdout).unwrap();
+    let first_handle = packed_handle(&first_text);
+    let second_handle = packed_handle(&second_text);
+    assert_ne!(
+        first_handle, second_handle,
+        "each stream keeps its own handle"
+    );
+    assert_eq!(ledger_runs(&ledger), 2, "each process ran its Cargo once");
+
+    // Every advertised handle must recall its own exact original: this is the
+    // invariant that the pre-fix publication/retention interleaving broke.
+    let recalled = invoke(&binary, &["recall", &first_handle], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "the first writer's advertised handle must recall its original: {}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    let recalled_text = String::from_utf8_lossy(&recalled.stdout).into_owned();
+    assert!(
+        recalled_text.contains("digest: sha256 ") && recalled_text.contains(" verified"),
+        "{recalled_text}"
+    );
+    for line in first_stdout.lines().take(4) {
+        assert!(recalled_text.contains(line), "{recalled_text}");
+    }
+    let recalled = invoke(
+        &binary,
+        &["recall", &second_handle],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "the second writer's advertised handle must recall its original: {}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    let recalled_text = String::from_utf8_lossy(&recalled.stdout).into_owned();
+    for line in second_stdout.lines().take(4) {
+        assert!(recalled_text.contains(line), "{recalled_text}");
+    }
+    assert_eq!(
+        fs::read(pack_file(&home, &first_handle)).unwrap(),
+        first_stdout.as_bytes(),
+        "the first observation keeps its exact original"
+    );
+    assert_eq!(
+        fs::read(pack_file(&home, &second_handle)).unwrap(),
+        second_stdout.as_bytes(),
+        "neither writer removes the other's content"
+    );
+    let index: Value =
+        serde_json::from_slice(&fs::read(home.join("harness/rtk/pack/index.json")).unwrap())
+            .unwrap();
+    assert_eq!(index["entries"].as_array().unwrap().len(), 2, "{index}");
+    let staging = home.join("harness/rtk/pack/staging");
+    let leftovers = fs::read_dir(&staging)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0, "no writer leaves staging leftovers behind");
+}
+
+/// A01: while one writer holds its store transaction open, a second writer's
+/// bounded store access expires. The waiting run keeps its raw output usable
+/// and never advertises a handle for content it did not commit; the holder
+/// completes normally afterwards.
+#[test]
+fn store_contention_is_bounded_and_never_advertises_an_unusable_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    let barrier = root.path().join("barrier");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&barrier).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let first_stdout = warning_stream().repeat(6);
+    let second_stdout = warning_stream().repeat(6);
+
+    let latch = Barrier::arm(&barrier, "store-staged");
+    let mut first = BarrierChild::spawn(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            (BARRIER_ENV, barrier.to_str().unwrap()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", first_stdout.as_str()),
+        ],
+    );
+    first.wait_for_barrier("store-staged");
+    let started = Instant::now();
+    let second = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_CARGO_STDOUT", second_stdout.as_str())],
+    );
+    let waited = started.elapsed();
+    println!("rtk store contention: bounded publication attempt returned after {waited:?}");
+    latch.release();
+    let (first_status, first_out, first_err) = first.wait();
+
+    // The holder completes normally, and everything it advertised is real.
+    assert_eq!(first_status.code(), Some(0), "{first_err}");
+    let first_text = String::from_utf8(first_out).unwrap();
+    let handle = packed_handle(&first_text);
+    let recalled = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "the holder's advertised handle must recall its original: {}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    assert!(
+        String::from_utf8(recalled.stdout)
+            .unwrap()
+            .contains("digest: sha256 ")
+    );
+
+    assert_eq!(second.status.code(), Some(0));
+    let second_text = String::from_utf8_lossy(&second.stdout).into_owned();
+    assert!(
+        !second_text.contains("[rtk pack:"),
+        "no handle may be advertised for uncommitted content: {second_text}"
+    );
+    assert!(
+        second_text.contains("[rtk raw: "),
+        "the original stays reachable through its locator: {second_text}"
+    );
+    let second_err = String::from_utf8_lossy(&second.stderr).into_owned();
+    assert!(
+        second_err.contains("observation store is busy")
+            && second_err.contains("observation handle not issued"),
+        "{second_err}"
+    );
+    assert!(
+        waited >= Duration::from_millis(1500),
+        "the bounded store access is a bounded wait, not an immediate failure: {waited:?}"
+    );
+    let locator = second_text
+        .lines()
+        .find(|line| line.starts_with("[rtk raw: "))
+        .expect("the waiting run still reports its raw locator");
+    let raw_path = PathBuf::from(&locator["[rtk raw: ".len()..locator.len() - 1]);
+    assert_eq!(
+        fs::read(&raw_path).unwrap(),
+        second_stdout.as_bytes(),
+        "the waiting run's original is byte-exact"
+    );
+
+    let index: Value =
+        serde_json::from_slice(&fs::read(home.join("harness/rtk/pack/index.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        index["entries"].as_array().unwrap().len(),
+        1,
+        "only the completed writer is committed: {index}"
+    );
+}
+
+/// A01: a writer that dies before its commit leaves only recoverable staging; a
+/// writer that dies after the commit boundary leaves committed evidence that
+/// still reads. Both interleavings preserve previously committed observations.
+#[test]
+fn interrupted_publication_recovers_before_and_after_the_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    let barrier = root.path().join("barrier");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&barrier).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let pack = home.join("harness/rtk/pack");
+    let payload = |count: usize| warning_stream().repeat(count);
+
+    let baseline = payload(6);
+    let first = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_CARGO_STDOUT", baseline.as_str())],
+    );
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let baseline_handle = packed_handle(&String::from_utf8(first.stdout).unwrap());
+
+    // Crash before the commit boundary: the transaction is interrupted while
+    // the staged payload exists, so no handle was ever published.
+    let latch = Barrier::arm(&barrier, "store-staged");
+    let interrupted = payload(7);
+    let mut crashed = BarrierChild::spawn(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            (BARRIER_ENV, barrier.to_str().unwrap()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", interrupted.as_str()),
+        ],
+    );
+    crashed.wait_for_barrier("store-staged");
+    let (status, crashed_out) = crashed.kill();
+    assert_ne!(status.code(), Some(0), "the writer did not complete");
+    assert!(
+        crashed_out.is_empty(),
+        "an interrupted writer advertises no handle: {}",
+        String::from_utf8_lossy(&crashed_out)
+    );
+    latch.release();
+
+    // The next operation recovers: staging is empty and the previously
+    // committed observation still reads.
+    let recovered = payload(8);
+    let second = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_CARGO_STDOUT", recovered.as_str())],
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_handle = packed_handle(&String::from_utf8(second.stdout).unwrap());
+    let leftovers = fs::read_dir(pack.join("staging"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0, "interrupted staging is recovered");
+    let recalled = invoke(
+        &binary,
+        &["recall", &baseline_handle],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "committed evidence survives the interrupted writer: {}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    assert_eq!(
+        fs::read(pack_file(&home, &baseline_handle)).unwrap(),
+        baseline.as_bytes()
+    );
+
+    // Crash after the commit boundary: the observation is committed before the
+    // writer is killed, so it stays readable even though its author died.
+    let mut before: Vec<String> = fs::read_dir(&pack)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".log")
+                .map(str::to_owned)
+        })
+        .collect();
+    before.sort();
+    let latch = Barrier::arm(&barrier, "store-committed");
+    let committed = payload(9);
+    let mut crashed = BarrierChild::spawn(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            (BARRIER_ENV, barrier.to_str().unwrap()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", committed.as_str()),
+        ],
+    );
+    crashed.wait_for_barrier("store-committed");
+    let (status, crashed_out) = crashed.kill();
+    assert_ne!(status.code(), Some(0));
+    assert!(
+        crashed_out.is_empty(),
+        "the killed writer never got to advertise its handle"
+    );
+    latch.release();
+    let mut after: Vec<String> = fs::read_dir(&pack)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".log")
+                .map(str::to_owned)
+        })
+        .collect();
+    after.sort();
+    let new_handles: Vec<String> = after
+        .iter()
+        .filter(|name| !before.contains(name))
+        .cloned()
+        .collect();
+    assert_eq!(
+        new_handles.len(),
+        1,
+        "the committed observation is the only new content: {after:?}"
+    );
+    let handle = &new_handles[0];
+    assert_eq!(
+        fs::read(pack_file(&home, handle)).unwrap(),
+        committed.as_bytes(),
+        "the committed bytes are complete after the writer's death"
+    );
+    let recalled = invoke(&binary, &["recall", handle], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "a committed observation survives its writer: {}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    let recalled_text = String::from_utf8(recalled.stdout).unwrap();
+    for line in committed.lines().take(4) {
+        assert!(recalled_text.contains(line), "{recalled_text}");
+    }
+    // The store stays usable: a later writer still publishes and recalls.
+    let later = payload(10);
+    let third = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[("HARNESS_RTK_FIXTURE_CARGO_STDOUT", later.as_str())],
+    );
+    assert_eq!(third.status.code(), Some(0));
+    let third_handle = packed_handle(&String::from_utf8(third.stdout).unwrap());
+    assert!(
+        third_handle != *handle && third_handle != second_handle,
+        "each publication keeps its own handle"
+    );
+    assert_eq!(
+        invoke(&binary, &["recall", &third_handle], &workspace, &home, None)
+            .status
+            .code(),
+        Some(0)
+    );
+}
+
+/// A01: a recall that overlaps legitimate eviction either serves verified
+/// committed content or reports explicit expiry - never a partial window and
+/// never a deadlock.
+#[test]
+fn recall_overlapping_eviction_reports_expiry_without_mixed_content() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    let barrier = root.path().join("barrier");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&barrier).unwrap();
+    let (binary, command) = staged(root.path());
+    let target = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        target.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&target.stderr)
+    );
+    let handle = packed_handle(&String::from_utf8(target.stdout).unwrap());
+
+    let latch = Barrier::arm(&barrier, "recall-indexed");
+    let mut reader = BarrierChild::spawn(
+        &binary,
+        &["recall", &handle],
+        &workspace,
+        &home,
+        &[(BARRIER_ENV, barrier.to_str().unwrap())],
+    );
+    reader.wait_for_barrier("recall-indexed");
+    // The reader already holds its verified index record; 64 further
+    // publications now push that record out of the 64-record retention window.
+    let mut newest = String::new();
+    for _ in 0..64 {
+        let output = invoke(
+            &binary,
+            &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+            &workspace,
+            &home,
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        newest = packed_handle(&String::from_utf8(output.stdout).unwrap());
+    }
+    latch.release();
+    let (status, stdout, stderr) = reader.wait();
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        stdout.is_empty(),
+        "an evicted observation serves no partial window: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(stderr.contains("unknown observation handle"), "{stderr}");
+    // The store stays coherent for everything it still names.
+    let recalled = invoke(&binary, &["recall", &newest], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    assert!(
+        String::from_utf8(recalled.stdout)
+            .unwrap()
+            .contains("digest: sha256 ")
+    );
+}
+
+/// A01: an unusable store write path keeps the command output usable and issues
+/// no handle, instead of failing the run or advertising missing content.
+#[test]
+fn store_write_failure_keeps_raw_output_and_issues_no_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "300"], &workspace);
+    // A file where the staging area belongs makes every store write fail.
+    let pack = home.join("harness/rtk/pack");
+    fs::create_dir_all(&pack).unwrap();
+    fs::write(pack.join("staging"), b"not a directory").unwrap();
+    let output = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "300"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("fixture-pipe git-log: 300 lines"), "{text}");
+    assert!(
+        !text.contains("[rtk pack:"),
+        "no handle may be issued for unreachable content: {text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("observation handle not issued"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !pack.join("index.json").exists(),
+        "no store state is invented"
+    );
+    let locator = text
+        .lines()
+        .find(|line| line.starts_with("[rtk raw: "))
+        .expect("the raw locator stays present");
+    let raw_path = PathBuf::from(&locator["[rtk raw: ".len()..locator.len() - 1]);
+    assert_eq!(
+        fs::read(&raw_path).unwrap(),
+        expected,
+        "the delivered original is byte-exact"
+    );
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} log -n 300", command.display()));
+    assert_eq!(record["decision"], "applied", "{record}");
+    assert_eq!(record["streams"][0]["handle"], Value::Null, "{record}");
+}
+
+/// W2/N01: malformed or unknown index metadata never authorizes destructive
+/// retention. Publication and recall refuse, committed evidence survives and
+/// outside sentinels stay byte-identical.
+#[test]
+fn invalid_index_metadata_preserves_evidence_and_outside_sentinels() {
+    let cases = [
+        "parent-relative handle",
+        "absolute handle",
+        "separator handle",
+        "unsupported schema",
+        "malformed digest",
+        "size accounting overflow",
+        "missing field",
+    ];
+    for case in cases {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let home = root.path().join("codex");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&home).unwrap();
+        let (binary, command) = staged(root.path());
+        let compact = invoke(
+            &binary,
+            &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+            &workspace,
+            &home,
+            None,
+        );
+        assert_eq!(compact.status.code(), Some(0), "{case}");
+        let valid_handle = packed_handle(&String::from_utf8(compact.stdout).unwrap());
+        let pack = home.join("harness/rtk/pack");
+        let index_path = pack.join("index.json");
+        let mut index: Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        let crafted = |handle: &str, bytes: u64| {
+            json!({
+                "handle": handle,
+                "source": "synthetic sentinel",
+                "digest": "0".repeat(64),
+                "bytes": bytes,
+                "lines": 1,
+                "created": 0
+            })
+        };
+        let mut sentinel: Option<PathBuf> = None;
+        match case {
+            "parent-relative handle" => {
+                // A naive reader would delete `pack/../../sentinel.log`.
+                index["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(crafted(r"..\..\sentinel", 200 * 1024 * 1024));
+                let path = home.join("harness/sentinel.log");
+                fs::write(&path, b"parent-relative sentinel").unwrap();
+                sentinel = Some(path);
+            }
+            "absolute handle" => {
+                let path = root.path().join("absolute-sentinel.log");
+                fs::write(&path, b"absolute sentinel").unwrap();
+                let handle = path.to_string_lossy().trim_end_matches(".log").to_owned();
+                index["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(crafted(&handle, 200 * 1024 * 1024));
+                sentinel = Some(path);
+            }
+            "separator handle" => {
+                fs::create_dir_all(pack.join("sub")).unwrap();
+                let path = pack.join("sub").join("sentinel.log");
+                fs::write(&path, b"separator sentinel").unwrap();
+                index["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(crafted(r"sub\sentinel", 200 * 1024 * 1024));
+                sentinel = Some(path);
+            }
+            "unsupported schema" => index["schema"] = json!(2),
+            "malformed digest" => {
+                let mut record = crafted("ob-0000000000000000001-42-000001", 1);
+                record["digest"] = json!("00ff");
+                index["entries"].as_array_mut().unwrap().push(record);
+            }
+            "size accounting overflow" => {
+                index["entries"].as_array_mut().unwrap().extend([
+                    crafted("ob-0000000000000000001-42-000001", u64::MAX),
+                    crafted("ob-0000000000000000002-42-000002", u64::MAX),
+                ]);
+            }
+            "missing field" => {
+                let mut record = crafted("ob-0000000000000000001-42-000001", 1);
+                record.as_object_mut().unwrap().remove("lines");
+                index["entries"].as_array_mut().unwrap().push(record);
+            }
+            _ => unreachable!(),
+        }
+        let mutated = serde_json::to_vec(&index).unwrap();
+        fs::write(&index_path, &mutated).unwrap();
+        let valid_pack = pack_file(&home, &valid_handle);
+        let valid_bytes = fs::read(&valid_pack).unwrap();
+
+        let attempt = invoke(
+            &binary,
+            &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+            &workspace,
+            &home,
+            None,
+        );
+        assert_eq!(attempt.status.code(), Some(0), "{case}");
+        let text = String::from_utf8_lossy(&attempt.stdout).into_owned();
+        assert!(
+            !text.contains("[rtk pack:"),
+            "{case}: invalid metadata must not authorize a handle: {text}"
+        );
+        assert!(text.contains("[rtk raw: "), "{case}: {text}");
+        let stderr = String::from_utf8_lossy(&attempt.stderr).into_owned();
+        assert!(
+            stderr.contains("pack index") && stderr.contains("observation handle not issued"),
+            "{case}: the invalid metadata is named: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&index_path).unwrap(),
+            mutated,
+            "{case}: the invalid index is left untouched"
+        );
+        assert_eq!(
+            fs::read(&valid_pack).unwrap(),
+            valid_bytes,
+            "{case}: committed evidence survives"
+        );
+        if let Some(path) = &sentinel {
+            assert!(
+                path.is_file(),
+                "{case}: the outside sentinel is not removed"
+            );
+        }
+        // Recall must not claim success from an unusable index.
+        let recall = invoke(&binary, &["recall", &valid_handle], &workspace, &home, None);
+        assert_eq!(recall.status.code(), Some(1), "{case}");
+        assert!(recall.stdout.is_empty(), "{case}");
+        assert!(
+            String::from_utf8_lossy(&recall.stderr).contains("pack index"),
+            "{case}: {}",
+            String::from_utf8_lossy(&recall.stderr)
+        );
+    }
+}
+
+/// W2/N01: recovery and retention never follow a reparse point. A junction with
+/// an observation-shaped name inside the store stays a junction and its outside
+/// target survives.
+#[test]
+fn store_recovery_never_follows_reparse_sentinels() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, command) = staged(root.path());
+    let first = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(first.status.code(), Some(0));
+    let first_handle = packed_handle(&String::from_utf8(first.stdout).unwrap());
+
+    // A junction named like an orphaned observation record points outside.
+    let pack = home.join("harness/rtk/pack");
+    let target = home.join("outside");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("inside.txt"), b"reparse target").unwrap();
+    let junction = pack.join("ob-0000000000000000000-1-000000.log");
+    // `mklink` is a cmd builtin and rejects forward slashes in a link path as
+    // switches, so both paths go in as separate, backslash-normalized args.
+    let created = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(junction.display().to_string().replace('/', "\\"))
+        .arg(target.display().to_string().replace('/', "\\"))
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "junction creation: {}{}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&junction)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the fixture is a reparse point"
+    );
+
+    // A normal publication recovers the store: the junction is skipped, the
+    // outside target is untouched and both committed observations still read.
+    let second = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "12"],
+        &workspace,
+        &home,
+        None,
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_handle = packed_handle(&String::from_utf8(second.stdout).unwrap());
+    assert!(
+        fs::symlink_metadata(&junction)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "recovery leaves the reparse point in place"
+    );
+    assert_eq!(
+        fs::read(target.join("inside.txt")).unwrap(),
+        b"reparse target",
+        "the outside target survives"
+    );
+    for handle in [&first_handle, &second_handle] {
+        let recalled = invoke(&binary, &["recall", handle], &workspace, &home, None);
+        assert_eq!(
+            recalled.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&recalled.stderr)
+        );
+    }
+}
+
+/// A02/N07: a status-only Cargo stream cannot pay for its own locator and
+/// handle, so the complete presentation stays raw; the same deep path still
+/// compacts when the removed progress is large enough, and the applied ledger
+/// is exactly the emitted presentation diagnostics report.
+#[test]
+fn complete_presentation_accounting_falls_back_to_raw_when_metadata_outweighs_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    // A long home makes the raw locator itself a material part of the ledger.
+    let home = root.path().join("d".repeat(210)).join("e".repeat(110));
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let ledger = fixture_ledger(root.path());
+    let status_line = "    Checking synthetic-demo v0.1.0\n";
+
+    // 15 removed lines (525 bytes) do not cover the ~580 byte footer: raw wins.
+    let almost = status_line.repeat(15);
+    let output = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", almost.as_str()),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        almost,
+        "the complete presentation does not shrink, so the raw bytes stay"
+    );
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display()));
+    assert_eq!(record["decision"], "bypassed", "{record}");
+    assert_eq!(record["reason"], "non-shrinking", "{record}");
+    assert_eq!(
+        record["presentation_bytes"].as_u64().unwrap(),
+        almost.len() as u64,
+        "{record}"
+    );
+    assert!(
+        !home.join("harness/rtk/pack/index.json").exists(),
+        "a raw fallback publishes nothing"
+    );
+
+    // 40 removed lines (1000 bytes) cover the same footer: applied, and the
+    // reported presentation is exactly what the adapter emitted.
+    let paid = status_line.repeat(40);
+    let output = invoke_with_env(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        None,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", paid.as_str()),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(text.contains("[rtk pack: "), "{text}");
+    let handle = packed_handle(&text);
+    let records = diagnostics(&binary, &workspace, &home);
+    let record = record_for(&records, &format!("{} check --locked", cargo.display()));
+    assert_eq!(record["decision"], "applied", "{record}");
+    assert_eq!(
+        record["presentation_bytes"].as_u64().unwrap(),
+        output.stdout.len() as u64,
+        "the ledger is the emitted presentation: {record}"
+    );
+    assert!(
+        record["presentation_bytes"].as_u64().unwrap() < paid.len() as u64,
+        "an applied run delivers fewer bytes than its raw original: {record}"
+    );
+    assert_eq!(
+        ledger_runs(&ledger),
+        2,
+        "each run executed Cargo exactly once"
+    );
+    let recalled = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    assert!(
+        String::from_utf8(recalled.stdout)
+            .unwrap()
+            .contains("stored: 40 lines")
+    );
+}
+
+/// A02/N07: the non-Cargo compact route obeys the same complete-presentation
+/// rule for its raw locator. A long path flips a barely-compressible stream to
+/// raw while the identical command under a short home still compacts.
+#[test]
+fn non_cargo_compact_route_accounts_for_its_long_locator() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let short_home = root.path().join("short-codex");
+    let long_home = root.path().join("g".repeat(215)).join("h".repeat(215));
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&short_home).unwrap();
+    fs::create_dir_all(&long_home).unwrap();
+    let (binary, command) = staged(root.path());
+    let expected = command_output(&command, &["log", "-n", "4"], &workspace);
+    assert!(expected.len() >= 500);
+
+    // Short home: the fixture's small compaction pays for a short locator.
+    let compact = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "4"],
+        &workspace,
+        &short_home,
+        None,
+    );
+    assert_eq!(
+        compact.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let text = String::from_utf8(compact.stdout).unwrap();
+    assert!(text.contains("[rtk pack: "), "{text}");
+    let handle = packed_handle(&text);
+
+    // Long home: the same body cannot pay for the long locator, so the run
+    // stays byte-raw and publishes nothing.
+    let raw = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "4"],
+        &workspace,
+        &long_home,
+        None,
+    );
+    assert_eq!(
+        raw.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    assert_eq!(
+        raw.stdout, expected,
+        "a long locator that outweighs the compaction keeps the raw bytes"
+    );
+    assert!(
+        !long_home.join("harness/rtk/pack/index.json").exists(),
+        "the long-path fallback publishes nothing"
+    );
+    let records = diagnostics(&binary, &workspace, &long_home);
+    let record = record_for(&records, &format!("{} log -n 4", command.display()));
+    assert_eq!(record["decision"], "bypassed", "{record}");
+    assert_eq!(record["reason"], "non-shrinking", "{record}");
+
+    // A larger removal in the same long home still compacts, and the long
+    // locator it prints points at the byte-exact original.
+    let larger = command_output(&command, &["log", "-n", "8"], &workspace);
+    let applied = invoke(
+        &binary,
+        &["compact", command.to_str().unwrap(), "log", "-n", "8"],
+        &workspace,
+        &long_home,
+        None,
+    );
+    assert_eq!(applied.status.code(), Some(0));
+    let text = String::from_utf8(applied.stdout).unwrap();
+    let locator = text
+        .lines()
+        .find(|line| line.starts_with("[rtk raw: "))
+        .expect("the applied run carries its locator");
+    let raw_path = PathBuf::from(&locator["[rtk raw: ".len()..locator.len() - 1]);
+    assert!(
+        raw_path.to_string_lossy().len() > 260,
+        "the long-path case really uses the long path: {raw_path:?}"
+    );
+    assert_eq!(fs::read(&raw_path).unwrap(), larger);
+    let applied_handle = packed_handle(&text);
+    let recalled = invoke(
+        &binary,
+        &["recall", &applied_handle],
+        &workspace,
+        &long_home,
+        None,
+    );
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+
+    // The short-home observation still recalls its own exact original.
+    let recalled = invoke(&binary, &["recall", &handle], &workspace, &short_home, None);
+    assert_eq!(recalled.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&recalled.stdout).contains("digest: sha256 "));
+}
+
+/// A03: only lines whose status word ends exactly at Cargo's 12-column status
+/// field are removed. Wrong-width imitations, bare status words, unknown
+/// diagnostic blocks and binary input stay byte-preserved, the child's status
+/// is preserved, the original stays recallable and Cargo runs exactly once.
+#[test]
+fn cargo_status_recognition_is_conservative_and_preserves_originals() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("codex");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&home).unwrap();
+    let (binary, _) = staged(root.path());
+    let cargo = cargo_double(&binary);
+    let ledger = fixture_ledger(root.path());
+    let user_lines = [
+        "Compiling demo starts at column one\n",
+        "  Compiling demo is one column short\n",
+        "    Compiling demo is one column past\n",
+        "    Doc-tests demo is not Cargo's layout\n",
+        "error[E0308]: mismatched types\n",
+        " --> broken/src/lib.rs:2:5\n",
+    ];
+    let mut stdout = String::new();
+    for _ in 0..32 {
+        stdout.push_str("    Checking synthetic-demo v0.1.0\n");
+    }
+    for line in user_lines {
+        stdout.push_str(line);
+    }
+    stdout.push_str(&unknown_block());
+    let mut stderr = String::new();
+    stderr.push_str("  Compiling demo is one column short\n");
+    for _ in 0..16 {
+        stderr.push_str("     Running unittests src/lib.rs (target/debug/deps/demo-1)\n");
+    }
+    stderr.push_str("    Running unittests with one extra column\n");
+
+    let output = invoke_bounded(
+        &binary,
+        &["compact", cargo.to_str().unwrap(), "check", "--locked"],
+        &workspace,
+        &home,
+        &[
+            ("HARNESS_RTK_FIXTURE_CARGO_STDOUT", stdout.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_STDERR", stderr.as_str()),
+            ("HARNESS_RTK_FIXTURE_CARGO_EXIT", "101"),
+            ("HARNESS_RTK_FIXTURE_LEDGER", ledger.to_str().unwrap()),
+        ],
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(101),
+        "the child's own exit status survives: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    for line in user_lines {
+        assert!(
+            out.contains(line),
+            "wrong-width user text stays byte-verbatim: {line:?} in {out}"
+        );
+    }
+    assert!(out.contains(&unknown_block()), "{out}");
+    assert!(
+        !out.contains("Checking synthetic-demo"),
+        "exactly aligned status lines are elided: {out}"
+    );
+    assert!(
+        err.contains("  Compiling demo is one column short"),
+        "a wrong-indentation stderr line survives: {err}"
+    );
+    assert!(
+        err.contains("    Running unittests with one extra column"),
+        "a wrong-width stderr line survives: {err}"
+    );
+    assert!(
+        !err.contains("     Running unittests src/lib.rs"),
+        "an aligned stderr status line is elided: {err}"
+    );
+    assert!(
+        out.contains("[rtk cargo exit: 101]"),
+        "the failure notice stays visible: {out}"
+    );
+    assert_eq!(ledger_runs(&ledger), 1, "Cargo runs exactly once");
+
+    // The exact original, including every elided line, stays recallable.
+    let handle = packed_handle(&out);
+    let recalled = invoke(&binary, &["recall", &handle], &workspace, &home, None);
+    assert_eq!(
+        recalled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recalled.stderr)
+    );
+    let recalled = String::from_utf8(recalled.stdout).unwrap();
+    assert!(
+        recalled.contains("    Checking synthetic-demo v0.1.0"),
+        "{recalled}"
+    );
+    for line in user_lines {
+        assert!(recalled.contains(line), "{recalled}");
+    }
+
+    // The shared binary guard bypasses recognition entirely.
+    let binary_input: Vec<u8> = [0xff, 0xfe, 0x00, 0x01, b'\n'].repeat(120);
+    let output = invoke(
+        &binary,
+        &["filter", "git-log"],
+        &workspace,
+        &home,
+        Some(&binary_input),
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, binary_input, "binary input passes byte-raw");
 }
