@@ -532,6 +532,13 @@ pub struct ServiceProcess {
     identity: ProcessIdentity,
 }
 
+/// The wall clock is read with `GetSystemTimeAsFileTime` granularity while a
+/// freshly created process carries a finer kernel timestamp, so a process
+/// spawned microseconds ago can legitimately appear a few milliseconds
+/// "ahead" of the read clock. Future-looking identity garbage is still
+/// rejected beyond this tolerance.
+const CREATION_CLOCK_TOLERANCE: u64 = 10_000_000;
+
 impl ServiceProcess {
     pub fn observe(
         pid: u32,
@@ -541,7 +548,11 @@ impl ServiceProcess {
     ) -> io::Result<Self> {
         let process = Self::open(pid)?;
         if process.identity.creation_time < created_after
-            || process.identity.creation_time > creation_clock()
+            || process
+                .identity
+                .creation_time
+                .saturating_sub(creation_clock())
+                > CREATION_CLOCK_TOLERANCE
         {
             return Err(io::Error::other(
                 "service process identity mismatch; preserving process",
