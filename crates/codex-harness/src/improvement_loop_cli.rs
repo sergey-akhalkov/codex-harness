@@ -13,7 +13,7 @@
 
 use crate::executor_cli::{
     ConversationState, VisibleAccepted, VisibleConversation, conversation_state,
-    dispatch_visible_conversation, executor_title,
+    dispatch_visible_conversation, executor_title, stop_owned_run,
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;
@@ -21,15 +21,15 @@ use harness_core::build_identity;
 use harness_core::build_selection;
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, Cursor, DispatchFacts, DispatchGate, EffectKind,
-    ObservedOutcome, Phase, RemovalGate, ResumeReport, RunSpec, RunStore, SPEC_FILE, VariantSet,
-    declared_removal_gate, dispatch_gate, dispatch_owner, frozen_removal_digest, now_ms, read_json,
-    selection_gate, settle_completed_reuse, write_json_atomic,
+    ObservedOutcome, Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE,
+    VariantSet, declared_removal_gate, dispatch_gate, dispatch_owner, frozen_removal_digest,
+    now_ms, read_json, selection_gate, settle_completed_reuse, write_json_atomic,
 };
 use harness_core::improvement_spec::{OpenSpec, PlanningReceipt};
 use harness_core::orchestration_config;
 use harness_core::outcome_qualification::Qualification;
 use serde_json::json;
-use std::{ffi::OsString, io, path::Path, path::PathBuf};
+use std::{ffi::OsString, io, path::Path, path::PathBuf, time::Duration};
 
 const USAGE: &str = "\
 codex-harness improve start --run DIRECTORY --spec FILE
@@ -175,10 +175,12 @@ struct Run {
     store: RunStore,
     spec: RunSpec,
     cursor: Cursor,
+    /// The exclusive run-mutation guard. It is held for the whole mutating
+    /// command and `None` only for the read-only `status` view.
+    guard: Option<RunMutation>,
 }
 
-fn open_run(dir: &Path) -> io::Result<Run> {
-    let store = RunStore::open(dir)?;
+fn read_run(store: RunStore) -> io::Result<Run> {
     let spec = store.spec()?;
     let cursor = store.cursor()?;
     if cursor.run != spec.run {
@@ -196,7 +198,35 @@ fn open_run(dir: &Path) -> io::Result<Run> {
         store,
         spec,
         cursor,
+        guard: None,
     })
+}
+
+/// Read-only view. `status` stays cheap and takes no mutation guard.
+fn open_run(dir: &Path) -> io::Result<Run> {
+    read_run(RunStore::open(dir)?)
+}
+
+/// Mutating view: the exclusive run-mutation guard is acquired *before* the
+/// spec and cursor are read, so the caller's gates, effects and persisted
+/// state all observe one fresh state under the guard. A concurrent mutation
+/// waits bounded and then reports the busy owner instead of acting on stale
+/// state.
+fn open_run_locked(dir: &Path) -> io::Result<Run> {
+    let (store, guard) = RunStore::open_locked(dir)?;
+    let mut run = read_run(store)?;
+    run.guard = Some(guard);
+    Ok(run)
+}
+
+/// Records this command as the run's owner under the held mutation guard and
+/// journals a takeover note when a previously recorded owner was replaced.
+fn claim_ownership(run: &mut Run) -> io::Result<()> {
+    let ownership = run.store.claim_ownership(&run.spec.run)?;
+    if let Some(note) = ownership.takeover_note() {
+        run.cursor.effect(EffectKind::OwnershipTaken, note);
+    }
+    Ok(())
 }
 
 fn comments(spec: &RunSpec) -> io::Result<Vec<String>> {
@@ -428,10 +458,11 @@ fn print_attempts(cursor: &Cursor) -> String {
         .iter()
         .map(|attempt| {
             let mut line = format!(
-                "  - id={} role={} state={} owner={} title=\"{}\" profile={}",
+                "  - id={} role={} state={} observed={} owner={} title=\"{}\" profile={}",
                 attempt.id,
                 attempt.role.as_str(),
                 attempt.state.as_str(),
+                observed_state(attempt),
                 attempt.owner,
                 attempt.title,
                 attempt.profile
@@ -449,6 +480,33 @@ fn print_attempts(cursor: &Cursor) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The read-only receipt observation of one attempt. Status reports the
+/// durable state and this authoritative observation side by side, so a
+/// retained live conversation is never conflated with a truly unknown effect.
+fn observed_state(attempt: &Attempt) -> String {
+    let Some(receipt) = &attempt.receipt else {
+        return "no receipt".to_owned();
+    };
+    match conversation_state(receipt) {
+        Ok(ConversationState::Completed) => "completed".to_owned(),
+        Ok(ConversationState::Failed(cause)) => named_observation("failed", &cause),
+        Ok(ConversationState::Interrupted(cause)) => named_observation("interrupted", &cause),
+        Ok(ConversationState::Stopped(cause)) => named_observation("stopped", &cause),
+        Ok(ConversationState::Active) => "active(host live)".to_owned(),
+        Ok(ConversationState::Unknown(reason)) => format!("unknown({reason})"),
+        Ok(ConversationState::Missing) => "missing".to_owned(),
+        Err(error) => format!("unreadable({error})"),
+    }
+}
+
+fn named_observation(name: &str, cause: &str) -> String {
+    if cause.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name}({cause})")
+    }
 }
 
 fn removal_text(gate: &Option<RemovalGate>) -> String {
@@ -504,6 +562,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             "id": attempt.id,
             "role": attempt.role.as_str(),
             "state": attempt.state.as_str(),
+            "observed": observed_state(attempt),
             "owner": attempt.owner,
             "title": attempt.title,
             "receipt": attempt.receipt.as_ref().map(|path| path.display().to_string()),
@@ -666,7 +725,12 @@ fn start(args: &[OsString]) -> io::Result<i32> {
     let board_comments =
         board_feedback::list_comments(&spec.board.bd, &spec.board.project, &spec.hypothesis_item)?;
     let frozen = frozen_removal_digest(&spec, &board_comments);
-    let store = RunStore::create(&run_dir, &spec, &spec.digest()?, &receipt.change_root)?;
+    // The exclusive run-mutation guard is acquired before the run exists and
+    // stays held across creation, ownership claiming, the gates, any dispatch
+    // and the persisted state, so two concurrent starts cannot both create or
+    // dispatch into this run.
+    let (store, guard) = RunStore::lock_new(&run_dir)?;
+    store.create_locked(&spec, &spec.digest()?, &receipt.change_root)?;
     store.save_planning(&receipt)?;
     let mut cursor = store.cursor()?;
     cursor.removal_frozen = frozen;
@@ -682,7 +746,9 @@ fn start(args: &[OsString]) -> io::Result<i32> {
         store,
         spec,
         cursor,
+        guard: Some(guard),
     };
+    claim_ownership(&mut run)?;
 
     let facts = dispatch_facts(&run.spec, &run.cursor, &board_comments)?;
     let gate = dispatch_gate(&run.cursor, AttemptRole::Investigator, &facts);
@@ -883,12 +949,12 @@ fn status(args: &[OsString]) -> io::Result<i32> {
 
 fn select(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(args, &["--run", "--variant"], &[])?;
-    let run = open_run(&PathBuf::from(options.required("--run")?))?;
+    let mut run = open_run_locked(&PathBuf::from(options.required("--run")?))?;
     let variant = options.required("--variant")?.to_owned();
     if !matches!(variant.as_str(), "baseline" | "candidate") {
         return Err(invalid("--variant is baseline or candidate"));
     }
-    run.store.claim_ownership(&run.spec.run)?;
+    claim_ownership(&mut run)?;
     let board_comments = comments(&run.spec)?;
     let removal = removal_state(&run.spec, &run.cursor, &board_comments);
     selection_gate(&run.cursor, &variant, removal.as_ref()).map_err(invalid)?;
@@ -960,31 +1026,250 @@ fn select(args: &[OsString]) -> io::Result<i32> {
     Ok(0)
 }
 
+fn timeout_option(value: Option<&str>) -> io::Result<Duration> {
+    match value {
+        None => Ok(Duration::from_secs(30)),
+        Some(text) => {
+            let seconds: u64 = text
+                .parse()
+                .map_err(|_| invalid("--timeout must be a whole number of seconds"))?;
+            if !(1..=600).contains(&seconds) {
+                return Err(invalid("--timeout must be between 1 and 600 seconds"));
+            }
+            Ok(Duration::from_secs(seconds))
+        }
+    }
+}
+
+/// The pooled slot an attempt's dispatch receipt records for the exact owner.
+/// `None` means this attempt's effect cannot be located as one owned pooled
+/// run, so no process may be terminated on this evidence.
+fn pooled_slot(receipt: &Path, owner: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt).ok()?).ok()?;
+    let slot = value.get("slot")?;
+    let index = slot.get("index")?.as_u64()?;
+    let recorded_owner = slot.get("owner").and_then(|value| value.as_str())?;
+    (recorded_owner == owner && index > 0 && index <= u32::MAX as u64).then_some(index as u32)
+}
+
+fn terminal_outcome(state: &ConversationState) -> Option<ObservedOutcome> {
+    match state {
+        ConversationState::Completed => Some(ObservedOutcome::Completed),
+        ConversationState::Failed(_) => Some(ObservedOutcome::Failed),
+        ConversationState::Interrupted(_) => Some(ObservedOutcome::Interrupted),
+        ConversationState::Stopped(_) => Some(ObservedOutcome::Stopped),
+        ConversationState::Active | ConversationState::Unknown(_) | ConversationState::Missing => {
+            None
+        }
+    }
+}
+
+fn state_reason(state: &ConversationState) -> Option<String> {
+    match state {
+        ConversationState::Completed => Some("the recorded run completed".to_owned()),
+        ConversationState::Failed(cause) => Some(if cause.is_empty() {
+            "the recorded run failed".to_owned()
+        } else {
+            cause.clone()
+        }),
+        ConversationState::Interrupted(cause) => Some(if cause.is_empty() {
+            "the recorded run was interrupted".to_owned()
+        } else {
+            cause.clone()
+        }),
+        ConversationState::Stopped(cause) => Some(if cause.is_empty() {
+            "the recorded run is stopped".to_owned()
+        } else {
+            cause.clone()
+        }),
+        ConversationState::Active | ConversationState::Unknown(_) | ConversationState::Missing => {
+            None
+        }
+    }
+}
+
+/// Verified owned cleanup of every attempt whose effect may still exist. Each
+/// known owned attempt is stopped through the exact-identity executor stop
+/// owner, which verifies the slot binding and the recorded host identity and
+/// terminates only that run's recorded process tree. Where cleanup cannot be
+/// established - no receipt, no pooled address, a refused or partial stop, or
+/// a receipt that records no terminal state - the effect stays explicitly
+/// retained as unknown and is never replayed. Attempts that are already
+/// terminal are left untouched.
+fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, String)> {
+    let ids: Vec<String> = run
+        .cursor
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.state.is_in_flight() || attempt.state == AttemptState::Unknown)
+        .map(|attempt| attempt.id.clone())
+        .collect();
+    let at = now_ms();
+    let mut notes = Vec::new();
+    for id in ids {
+        let Some(index) = run
+            .cursor
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == id)
+        else {
+            continue;
+        };
+        let (receipt, owner) = {
+            let attempt = &run.cursor.attempts[index];
+            (attempt.receipt.clone(), attempt.owner.clone())
+        };
+        let Some(receipt) = receipt else {
+            notes.push((
+                id.clone(),
+                "no dispatch receipt is recorded, so no owned effect can be located; the effect stays retained as unknown and is never replayed"
+                    .to_owned(),
+            ));
+            run.cursor.effect(
+                EffectKind::OwnedCleanup,
+                format!("attempt={id}: no dispatch receipt; retained unknown"),
+            );
+            continue;
+        };
+        if !receipt.is_file() {
+            notes.push((
+                id.clone(),
+                "the recorded dispatch receipt is missing, so no owned effect can be located; the effect stays retained as unknown and is never replayed"
+                    .to_owned(),
+            ));
+            run.cursor.effect(
+                EffectKind::OwnedCleanup,
+                format!("attempt={id}: dispatch receipt missing; retained unknown"),
+            );
+            continue;
+        }
+        let Some(slot) = pooled_slot(&receipt, &owner) else {
+            notes.push((
+                id.clone(),
+                "the dispatch receipt does not name this attempt's pooled slot and owner, so cleanup could not be established; the effect stays retained as unknown"
+                    .to_owned(),
+            ));
+            run.cursor.effect(
+                EffectKind::OwnedCleanup,
+                format!("attempt={id}: no pooled address; retained unknown"),
+            );
+            continue;
+        };
+        let exit = stop_owned_run(
+            &run.spec.project,
+            &run.spec.codex_home,
+            slot,
+            &owner,
+            timeout,
+        );
+        let observed = conversation_state(&receipt);
+        let (outcome, note) = match (&exit, &observed) {
+            (Err(error), _) => (
+                None,
+                format!(
+                    "cleanup could not be established: {error}; the effect stays retained as unknown"
+                ),
+            ),
+            (Ok(code), Ok(state)) => match terminal_outcome(state) {
+                Some(outcome) => (
+                    Some(outcome),
+                    format!(
+                        "owned stop of slot {slot} (exit {code}) verified: {}",
+                        state_reason(state)
+                            .unwrap_or_else(|| "settled from the receipt".to_owned())
+                    ),
+                ),
+                None => {
+                    let detail = match state {
+                        ConversationState::Active => {
+                            "the receipt still reports a live host".to_owned()
+                        }
+                        ConversationState::Unknown(reason) => reason.clone(),
+                        ConversationState::Missing => "the receipt disappeared".to_owned(),
+                        _ => "the receipt records no terminal state".to_owned(),
+                    };
+                    (
+                        None,
+                        format!(
+                            "the owned stop of slot {slot} exited {code} but {detail}; the effect stays retained as unknown"
+                        ),
+                    )
+                }
+            },
+            (Ok(code), Err(error)) => (
+                None,
+                format!(
+                    "the owned stop of slot {slot} exited {code} and the receipt is unreadable: {error}; the effect stays retained as unknown"
+                ),
+            ),
+        };
+        {
+            let attempt = &mut run.cursor.attempts[index];
+            match outcome {
+                Some(outcome) => {
+                    attempt.settle(outcome, at);
+                    attempt.reason = Some(note.clone());
+                }
+                None => {
+                    if attempt.state != AttemptState::Unknown {
+                        attempt.settle(ObservedOutcome::Unknown, at);
+                    }
+                    attempt.reason = Some(note.clone());
+                }
+            }
+        }
+        run.cursor.effect(
+            EffectKind::OwnedCleanup,
+            format!("attempt={id} owner={owner} slot={slot}: {note}"),
+        );
+        notes.push((id, note));
+    }
+    notes
+}
+
 fn stop(args: &[OsString]) -> io::Result<i32> {
-    let options = Options::parse(args, &["--run", "--reason"], &[])?;
-    let run = open_run(&PathBuf::from(options.required("--run")?))?;
-    run.store.claim_ownership(&run.spec.run)?;
+    let options = Options::parse(args, &["--run", "--reason", "--timeout"], &[])?;
+    let mut run = open_run_locked(&PathBuf::from(options.required("--run")?))?;
+    claim_ownership(&mut run)?;
     let reason = options
         .get("--reason")
         .map(str::to_owned)
         .unwrap_or_else(|| "stopped through `improve stop`".to_owned());
-    let mut cursor = run.cursor.clone();
-    if cursor.phase == Phase::Stopped {
-        println!("improve stop: run {} is already stopped", run.spec.run);
-        return Ok(0);
+    let timeout = timeout_option(options.get("--timeout"))?;
+
+    // Every known owned effect is resolved through the exact-identity executor
+    // stop owner; anything that cannot be verified stays retained as unknown.
+    let cleanup = cleanup_owned_attempts(&mut run, timeout);
+
+    let already_stopped = run.cursor.phase == Phase::Stopped;
+    if !already_stopped {
+        run.cursor.stop(&reason);
     }
-    cursor.stop(&reason);
-    run.store.save_cursor(&cursor)?;
-    println!(
-        "improve stop: run {} stopped ({}); {} in-flight attempt(s) are retained as unknown and are never replayed; owned executor processes are untouched - reconcile them through `executor watch`/`executor stop`",
-        run.spec.run,
-        reason,
-        cursor
-            .attempts
-            .iter()
-            .filter(|attempt| attempt.state == AttemptState::Unknown)
-            .count()
-    );
+    run.store.save_cursor(&run.cursor)?;
+
+    if already_stopped {
+        println!(
+            "improve stop: run {} is already stopped; owned cleanup ran again for {} retained effect(s)",
+            run.spec.run,
+            cleanup.len()
+        );
+    } else {
+        println!("improve stop: run {} stopped ({reason})", run.spec.run);
+    }
+    for (id, note) in &cleanup {
+        println!("improve stop: attempt {id}: {note}");
+    }
+    let retained = run
+        .cursor
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.state == AttemptState::Unknown)
+        .count();
+    if retained > 0 {
+        println!(
+            "improve stop: {retained} attempt(s) stay retained as unknown (their effect could not be verified); they are never replayed - reconcile them through `executor watch`/`executor stop` or resume after their receipt becomes terminal"
+        );
+    }
     Ok(0)
 }
 
@@ -1002,82 +1287,96 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
     }
     let stale_planning = || "planning inputs changed since the attempt".to_owned();
     let at = now_ms();
-    for attempt in &mut cursor.attempts {
-        if !attempt.state.is_in_flight() {
-            if attempt.state == AttemptState::Completed {
-                let already = attempt.reuse_refused.is_some();
-                if !settle_completed_reuse(
-                    attempt,
-                    planning_ok.clone().map_err(|_| stale_planning()),
-                ) && !already
-                {
-                    report.remeasure.push((
-                        attempt.id.clone(),
-                        attempt.reuse_refused.clone().unwrap_or_default(),
-                    ));
-                }
-            }
+    // In-flight attempts and attempts retained as unknown both reconcile from
+    // their exact receipts: an authoritative terminal outcome settles them
+    // once, a live host stays retained live, and a truly unobserved effect
+    // stays unknown without ever being replayed.
+    let reconcile_ids: Vec<String> = cursor
+        .attempts_requiring_reconciliation()
+        .iter()
+        .map(|attempt| attempt.id.clone())
+        .collect();
+    for id in reconcile_ids {
+        let Some(index) = cursor.attempts.iter().position(|attempt| attempt.id == id) else {
             continue;
-        }
+        };
+        let attempt = &mut cursor.attempts[index];
+        let previous = attempt.state;
         let Some(receipt) = attempt.receipt.clone() else {
-            attempt.settle(ObservedOutcome::Unknown, at);
-            attempt.reason = Some(
-                "no dispatch receipt was recorded; the outcome is unknown and the attempt is never resubmitted"
-                    .to_owned(),
-            );
+            if previous != AttemptState::Unknown {
+                attempt.settle(ObservedOutcome::Unknown, at);
+                attempt.reason = Some(
+                    "no dispatch receipt was recorded; the outcome is unknown and the attempt is never resubmitted"
+                        .to_owned(),
+                );
+            }
             report.unknown.push(attempt.id.clone());
             continue;
         };
-        match conversation_state(&receipt)? {
-            ConversationState::Completed => {
-                attempt.settle(ObservedOutcome::Completed, at);
-                if !settle_completed_reuse(
+        let state = conversation_state(&receipt)?;
+        if let Some(outcome) = terminal_outcome(&state) {
+            attempt.settle(outcome, at);
+            attempt.reason = state_reason(&state);
+            if outcome == ObservedOutcome::Completed
+                && !settle_completed_reuse(
                     attempt,
                     planning_ok.clone().map_err(|_| stale_planning()),
-                ) {
-                    report.remeasure.push((
-                        attempt.id.clone(),
-                        attempt.reuse_refused.clone().unwrap_or_default(),
-                    ));
+                )
+            {
+                report.remeasure.push((
+                    attempt.id.clone(),
+                    attempt.reuse_refused.clone().unwrap_or_default(),
+                ));
+            }
+            report.settled.push(attempt.id.clone());
+            continue;
+        }
+        match state {
+            ConversationState::Active => {
+                if previous == AttemptState::Unknown {
+                    attempt.reason = Some(
+                        "retained live: the recorded host still runs; the outcome stays unknown until its receipt is terminal"
+                            .to_owned(),
+                    );
+                    report.retained_live.push(attempt.id.clone());
+                } else {
+                    report.active.push(attempt.id.clone());
                 }
-                report.settled.push(attempt.id.clone());
             }
-            ConversationState::Failed(cause) => {
-                attempt.settle(ObservedOutcome::Failed, at);
-                attempt.reason = Some(if cause.is_empty() {
-                    "the recorded run failed".to_owned()
-                } else {
-                    cause
-                });
-                report.settled.push(attempt.id.clone());
-            }
-            ConversationState::Interrupted(cause) => {
-                attempt.settle(ObservedOutcome::Interrupted, at);
-                attempt.reason = Some(if cause.is_empty() {
-                    "the run was interrupted; the visible surface may be lost".to_owned()
-                } else {
-                    cause
-                });
-                report.settled.push(attempt.id.clone());
-            }
-            ConversationState::Stopped(cause) => {
-                attempt.settle(ObservedOutcome::Stopped, at);
-                attempt.reason = (!cause.is_empty()).then_some(cause);
-                report.settled.push(attempt.id.clone());
-            }
-            ConversationState::Active => report.active.push(attempt.id.clone()),
             ConversationState::Unknown(reason) => {
-                attempt.settle(ObservedOutcome::Unknown, at);
+                if previous != AttemptState::Unknown {
+                    attempt.settle(ObservedOutcome::Unknown, at);
+                }
                 attempt.reason = Some(reason);
                 report.unknown.push(attempt.id.clone());
             }
             ConversationState::Missing => {
-                attempt.settle(ObservedOutcome::Unknown, at);
+                if previous != AttemptState::Unknown {
+                    attempt.settle(ObservedOutcome::Unknown, at);
+                }
                 attempt.reason = Some(
                     "the recorded dispatch receipt is missing; the outcome is unknown and the attempt is never resubmitted"
                         .to_owned(),
                 );
                 report.unknown.push(attempt.id.clone());
+            }
+            ConversationState::Completed
+            | ConversationState::Failed(_)
+            | ConversationState::Interrupted(_)
+            | ConversationState::Stopped(_) => unreachable!("terminal states settled above"),
+        }
+    }
+    // Completed attempts settle reuse against the current planning inputs.
+    for attempt in &mut cursor.attempts {
+        if attempt.state == AttemptState::Completed {
+            let already = attempt.reuse_refused.is_some();
+            if !settle_completed_reuse(attempt, planning_ok.clone().map_err(|_| stale_planning()))
+                && !already
+            {
+                report.remeasure.push((
+                    attempt.id.clone(),
+                    attempt.reuse_refused.clone().unwrap_or_default(),
+                ));
             }
         }
     }
@@ -1086,8 +1385,8 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
 
 fn resume(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(args, &["--run"], &[])?;
-    let run = open_run(&PathBuf::from(options.required("--run")?))?;
-    run.store.claim_ownership(&run.spec.run)?;
+    let mut run = open_run_locked(&PathBuf::from(options.required("--run")?))?;
+    claim_ownership(&mut run)?;
     let (mut cursor, report, notes) = reconcile(&run)?;
     cursor.resume_phase();
     cursor.effect(
@@ -1136,22 +1435,6 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
             | Some(RemovalGate::Refused { .. })
             | Some(RemovalGate::Withdrawn { .. })
     );
-    let outstanding_unknown: Vec<String> = cursor
-        .attempts
-        .iter()
-        .filter(|attempt| attempt.state == AttemptState::Unknown)
-        .map(|attempt| attempt.id.clone())
-        .collect();
-    if !outstanding_unknown.is_empty() {
-        let unknown_condition = format!(
-            "unknown outcome for attempt(s) {}: reconcile through the owning dispatcher before dependent work and never resubmit them",
-            outstanding_unknown.join(", ")
-        );
-        condition = Some(match condition {
-            Some(existing) => format!("{existing}; {unknown_condition}"),
-            None => unknown_condition,
-        });
-    }
     if removal_blocks {
         let removal_condition = format!("removal authority: {}", removal_text(&removal));
         condition = Some(match condition {
@@ -1163,14 +1446,10 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
         Some(condition) => cursor.block(condition),
         None => cursor.clear_blocked(),
     }
-    run.store.save_cursor(&cursor)?;
+    run.cursor = cursor;
+    run.store.save_cursor(&run.cursor)?;
 
-    let resumed = Run {
-        store: RunStore::open(run.store.root())?,
-        spec: run.spec,
-        cursor,
-    };
-    print_report(&resumed)?;
+    print_report(&run)?;
     if !report.settled.is_empty() {
         println!(
             "resume: settled attempt(s) {} from their receipts; no model attempt was replayed",
@@ -1183,16 +1462,16 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
             report.active.join(", ")
         );
     }
+    if !report.retained_live.is_empty() {
+        println!(
+            "resume: attempt(s) {} are retained live: the recorded host still runs, the outcome stays unknown and the frozen runtime is kept",
+            report.retained_live.join(", ")
+        );
+    }
     if !report.unknown.is_empty() {
         println!(
             "resume: attempt(s) {} have unknown outcomes; reconcile them through the owning dispatcher and never resubmit them",
             report.unknown.join(", ")
-        );
-    }
-    if report.unknown.is_empty() && !outstanding_unknown.is_empty() {
-        println!(
-            "resume: attempt(s) {} still have unknown outcomes; reconcile them through the owning dispatcher and never resubmit them",
-            outstanding_unknown.join(", ")
         );
     }
     if !report.remeasure.is_empty() {

@@ -3,6 +3,7 @@ use crate::board_hypothesis::{AuthorityRequest, RemovalAction};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 fn fixture_root(name: &str) -> tempfile::TempDir {
@@ -169,7 +170,43 @@ fn a_second_start_duplicates_ownership_and_is_refused() {
 }
 
 #[test]
-fn a_live_owner_blocks_takeover_and_a_dead_owner_allows_it() {
+fn the_exclusive_mutation_guard_serializes_state_writers() {
+    let root = fixture_root("mutation");
+    let spec = spec_fixture(root.path(), "mutation");
+    let run_dir = root.path().join("run");
+    let change_root = root.path().join("openspec/changes/add-synthetic");
+    let (store, guard) = RunStore::lock_new(&run_dir).unwrap();
+    store
+        .create_locked(&spec, &spec.digest().unwrap(), &change_root)
+        .unwrap();
+    store.claim_ownership(&spec.run).unwrap();
+
+    // A second writer waits bounded and then reports the busy owner instead of
+    // reading or changing state.
+    let error = RunStore::lock_new_within(&run_dir, Duration::from_millis(150)).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("run-mutation guard"), "{message}");
+    assert!(
+        message.contains("no state was read or changed"),
+        "{message}"
+    );
+
+    // Releasing the guard admits the next writer, which then observes the
+    // fresh state and refuses to create a duplicate run.
+    drop(guard);
+    let (store, _guard) = RunStore::lock_new_within(&run_dir, Duration::from_secs(5)).unwrap();
+    assert_eq!(store.cursor().unwrap().phase, Phase::Planning);
+    let error = store
+        .create_locked(&spec, &spec.digest().unwrap(), &change_root)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate run ownership"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ownership_takeover_is_recorded_under_the_guard() {
     let root = fixture_root("live-owner");
     let spec = spec_fixture(root.path(), "live-owner");
     let run_dir = root.path().join("run");
@@ -204,12 +241,18 @@ fn a_live_owner_blocks_takeover_and_a_dead_owner_allows_it() {
         claimed_ms: now_ms(),
     };
     write_json_atomic(&store.owner_path(), &record).unwrap();
-    let error = store.claim_ownership(&spec.run).unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("owned by live process") || message.contains("cannot be verified"),
-        "{message}"
+    let ownership = store.claim_ownership(&spec.run).unwrap();
+    assert_eq!(
+        ownership.previous.as_ref().map(|previous| previous.pid),
+        Some(sleeper.id())
     );
+    assert_eq!(ownership.previous_live, Some(true));
+    let note = ownership.takeover_note().expect("takeover is recorded");
+    assert!(
+        note.contains("still running") && note.contains("exclusive run-mutation guard"),
+        "{note}"
+    );
+    assert_eq!(store.owner().unwrap().unwrap().pid, std::process::id());
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 
@@ -222,10 +265,54 @@ fn a_live_owner_blocks_takeover_and_a_dead_owner_allows_it() {
         claimed_ms: 0,
     };
     write_json_atomic(&store.owner_path(), &dead).unwrap();
-    let claimed = store
+    let ownership = store
         .claim_ownership(&spec.run)
         .expect("stale owner taken over");
-    assert_eq!(claimed.pid, std::process::id());
+    assert_eq!(ownership.owner.pid, std::process::id());
+    assert_eq!(ownership.previous_live, Some(false));
+    assert!(
+        ownership
+            .takeover_note()
+            .unwrap()
+            .contains("no longer running")
+    );
+}
+
+#[test]
+fn stopped_unknown_attempts_remain_reconciliation_candidates() {
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    cursor
+        .push_attempt(attempt(
+            "a1",
+            AttemptRole::Implementer,
+            AttemptState::Started,
+        ))
+        .unwrap();
+    cursor
+        .push_attempt(attempt(
+            "a2",
+            AttemptRole::Baseline,
+            AttemptState::Completed,
+        ))
+        .unwrap();
+    assert_eq!(cursor.attempts_requiring_reconciliation().len(), 1);
+    cursor.stop("owner pause");
+    assert_eq!(cursor.attempt("a1").unwrap().state, AttemptState::Unknown);
+    let pending: Vec<&str> = cursor
+        .attempts_requiring_reconciliation()
+        .iter()
+        .map(|attempt| attempt.id.as_str())
+        .collect();
+    assert_eq!(
+        pending,
+        ["a1"],
+        "a retained unknown attempt is reconciled on the next resume while a terminal arm is not"
+    );
 }
 
 fn resolve_pwsh() -> Option<PathBuf> {

@@ -10,8 +10,48 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+fn powershell() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH for the owner PowerShell 7");
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|candidate| candidate.is_file())
+        .expect("owner PowerShell 7 (pwsh.exe) on PATH")
+}
+
+fn start_sleeper() -> Child {
+    Command::new(powershell())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 120",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleeper starts")
+}
+
+fn child_running(child: &mut Child) -> bool {
+    child.try_wait().expect("child state is readable").is_none()
+}
+
+fn wait_gone(child: &mut Child) -> bool {
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        if !child_running(child) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
 
 fn manager() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codex-harness"))
@@ -1015,4 +1055,409 @@ fn select_consumes_prepared_variants_and_refuses_an_active_attempt() {
         "{}",
         text(&select)
     );
+}
+
+#[test]
+fn concurrent_starts_create_exactly_one_owner() {
+    let fixture = Fixture::new("concurrent-start");
+    fixture.write_spec(&[], None);
+    let spawn = || {
+        Command::new(manager())
+            .args([
+                "improve",
+                "start",
+                "--run",
+                fixture.run.to_str().unwrap(),
+                "--spec",
+                fixture.spec.to_str().unwrap(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("improve start spawns")
+    };
+    let first = spawn();
+    let second = spawn();
+    let first_id = first.id() as u64;
+    let second_id = second.id() as u64;
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    let first_ok = first.status.success();
+    let second_ok = second.status.success();
+    assert!(
+        first_ok ^ second_ok,
+        "exactly one concurrent start creates the run: {}\n{}",
+        text(&first),
+        text(&second)
+    );
+    let loser = if first_ok { &second } else { &first };
+    assert_eq!(loser.status.code(), Some(2), "{}", text(loser));
+    assert!(
+        text(loser).contains("duplicate run ownership"),
+        "{}",
+        text(loser)
+    );
+
+    // One consistent run exists, owned by the winner, with a single cursor.
+    assert_eq!(fixture.cursor()["phase"], "blocked");
+    let owner: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("owner.json")).unwrap()).unwrap();
+    let winner_pid = if first_ok { first_id } else { second_id };
+    assert_eq!(owner["pid"].as_u64().unwrap(), winner_pid);
+}
+
+#[test]
+fn concurrent_mutations_serialize_without_lost_updates() {
+    let fixture = Fixture::new("concurrent-select");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let (baseline_state, baseline_build) = prepare_runtime(&fixture.root, "base");
+    let (candidate_state, candidate_build) = prepare_runtime(&fixture.root, "cand");
+    fs::write(
+        fixture.run.join("variants.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "baseline": {"state": baseline_state, "build": baseline_build, "identity": Value::Null},
+            "candidate": {"state": candidate_state, "build": candidate_build, "identity": Value::Null},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let spawn = |variant: &'static str| {
+        Command::new(manager())
+            .args([
+                "improve",
+                "select",
+                "--run",
+                fixture.run.to_str().unwrap(),
+                "--variant",
+                variant,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("improve select spawns")
+    };
+    let first = spawn("baseline");
+    let second = spawn("candidate");
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert!(first.status.success(), "{}", text(&first));
+    assert!(second.status.success(), "{}", text(&second));
+
+    // Serialized read-modify-write: both selections are journaled and the
+    // persisted selection stays internally consistent with one variant.
+    let cursor = fixture.cursor();
+    let selected = cursor["selected_variant"].as_str().unwrap().to_owned();
+    assert!(matches!(selected.as_str(), "baseline" | "candidate"));
+    let runtime = cursor["selected_runtime"].as_str().unwrap();
+    let expected = if selected == "baseline" {
+        "base-build"
+    } else {
+        "cand-build"
+    };
+    assert!(runtime.contains(expected), "{cursor}");
+    let selections = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|effect| effect["kind"] == "variant-selected")
+        .count();
+    assert_eq!(
+        selections, 2,
+        "no selection may be lost to a stale cursor overwrite: {cursor}"
+    );
+}
+
+#[test]
+fn resume_settles_retained_unknown_attempts_from_late_receipts_once() {
+    let fixture = Fixture::new("late-completion");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // An attempt stops while its outcome is unknown; the owning dispatcher
+    // later records an authoritative completion.
+    let completed = fixture.run.join("late-completed.json");
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-1", "implementer", "started", Some(&completed)),
+        "candidate-attempt",
+    );
+    let stop = fixture.improve(&["stop", "--run", &run_arg, "--reason", "pause"]);
+    assert!(stop.status.success(), "{}", text(&stop));
+    assert!(
+        text(&stop).contains("retained as unknown"),
+        "an attempt without a locatable owned effect is retained explicitly: {}",
+        text(&stop)
+    );
+    assert_eq!(fixture.cursor()["attempts"][0]["state"], "unknown");
+    seed_receipt(&completed, "completed", Some(0));
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("settled attempt(s) implementer-1"),
+        "{}",
+        text(&resume)
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][0]["state"], "completed");
+    assert_eq!(cursor["attempts"][0]["reuse_refused"], Value::Null);
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1);
+
+    // Settled once: another resume neither replays nor re-settles it.
+    let again = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(
+        !text(&again).contains("settled attempt(s)"),
+        "{}",
+        text(&again)
+    );
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture.cursor()["attempts"][0]["state"], "completed");
+
+    // A failed outcome settles too, while a truly unobserved attempt stays
+    // unknown and keeps dependent dispatch blocked.
+    let failed = fixture.run.join("late-failed.json");
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-2", "implementer", "started", Some(&failed)),
+        "candidate-attempt",
+    );
+    let stop = fixture.improve(&["stop", "--run", &run_arg, "--reason", "pause"]);
+    assert!(stop.status.success(), "{}", text(&stop));
+    seed_receipt(&failed, "failed", Some(1));
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(
+        text(&resume).contains("settled attempt(s) implementer-2"),
+        "{}",
+        text(&resume)
+    );
+    let failed_attempt = fixture.cursor()["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == "implementer-2")
+        .unwrap()
+        .clone();
+    assert_eq!(failed_attempt["state"], "failed");
+
+    seed_attempt(
+        &fixture,
+        attempt_json(
+            "implementer-3",
+            "implementer",
+            "started",
+            Some(&fixture.run.join("absent-receipt.json")),
+        ),
+        "candidate-attempt",
+    );
+    let stop = fixture.improve(&["stop", "--run", &run_arg, "--reason", "pause"]);
+    assert!(stop.status.success(), "{}", text(&stop));
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(text(&resume).contains("implementer-3"), "{}", text(&resume));
+    let report: Value = serde_json::from_str(&text(
+        &fixture.improve(&["status", "--run", &run_arg, "--json"]),
+    ))
+    .unwrap();
+    let dispatch = report["dispatch"]["reason"].as_str().unwrap();
+    assert!(dispatch.contains("unknown outcome"), "{report}");
+}
+
+#[test]
+fn status_distinguishes_a_retained_live_attempt_from_unknown() {
+    let fixture = Fixture::new("retained-live");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // The recorded host is this test process: still live and authoritative.
+    let (pid, created, program) =
+        harness_core::improvement_loop::current_process_identity().unwrap();
+    let receipt = fixture.run.join("live-receipt.json");
+    fs::write(
+        &receipt,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "launcher": program,
+            "profile": "ds",
+            "mode": "tui",
+            "visible": true,
+            "host": "windows-terminal-tab",
+            "observation": {
+                "schema": 1,
+                "coverage": "native",
+                "reason": Value::Null,
+                "state": "running",
+                "session": Value::Null,
+                "previousSession": Value::Null,
+                "exitCode": Value::Null,
+                "events": 0,
+                "messages": 0,
+                "toolCalls": 0,
+                "malformed": 0,
+                "cause": Value::Null,
+                "host": {"pid": pid, "created": created, "program": program},
+                "result": Value::Null,
+                "detail": Value::Null,
+                "updatedMs": 1,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-1", "implementer", "unknown", Some(&receipt)),
+        "candidate-attempt",
+    );
+
+    let report: Value = serde_json::from_str(&text(
+        &fixture.improve(&["status", "--run", &run_arg, "--json"]),
+    ))
+    .unwrap();
+    assert_eq!(report["attempts"][0]["state"], "unknown");
+    assert_eq!(
+        report["attempts"][0]["observed"], "active(host live)",
+        "{report}"
+    );
+
+    let resume = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(text(&resume).contains("retained live"), "{}", text(&resume));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][0]["state"], "unknown");
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn stop_cleans_up_owned_attempts_and_preserves_foreign_processes() {
+    let fixture = Fixture::new("cleanup");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // A real pooled binding for one owned attempt: slot worktree, slot record
+    // and a dispatch receipt whose recorded host is a live owned process.
+    let slot = fixture.root.join(format!(
+        "{}-wt1",
+        fixture.proj.file_name().unwrap().to_string_lossy()
+    ));
+    git(
+        &fixture.proj,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            slot.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let owner = "loop-fixture-investigator-1";
+    let state_dir = harness_core::task_worktree::pool_state_dir(&fixture.home, &fixture.proj)
+        .expect("pool state directory");
+    fs::create_dir_all(&state_dir).unwrap();
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fs::write(
+        state_dir.join("slot-1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "source": fixture.proj,
+            "index": 1,
+            "path": slot,
+            "state": "occupied",
+            "owner": owner,
+            "base": base,
+            "disposition": Value::Null,
+            "reason": Value::Null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut owned = start_sleeper();
+    let user = harness_core::process_service::current_user().unwrap();
+    let pwsh = powershell();
+    let identity =
+        harness_core::process_service::ServiceProcess::observe(owned.id(), &pwsh, 0, &user)
+            .expect("the owned child is identifiable by its exact identity")
+            .identity();
+    let mut foreign = start_sleeper();
+    let receipt = state_dir.join("spawn-1.json");
+    fs::write(
+        &receipt,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "launcher": pwsh,
+            "profile": "ds",
+            "mode": "tui",
+            "args": [],
+            "visible": true,
+            "host": "windows-terminal-tab",
+            "slot": {
+                "index": 1,
+                "path": slot,
+                "source": fixture.proj,
+                "owner": owner,
+                "base": base,
+                "remote": "origin",
+                "branch": Value::Null,
+            },
+            "observation": {
+                "schema": 1,
+                "coverage": "native",
+                "reason": Value::Null,
+                "state": "running",
+                "session": Value::Null,
+                "previousSession": Value::Null,
+                "exitCode": Value::Null,
+                "events": 0,
+                "messages": 0,
+                "toolCalls": 0,
+                "malformed": 0,
+                "cause": Value::Null,
+                "host": {"pid": identity.pid, "created": identity.creation_time, "program": pwsh},
+                "result": Value::Null,
+                "detail": Value::Null,
+                "updatedMs": 1,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    seed_attempt(
+        &fixture,
+        attempt_json("investigator-1", "investigator", "started", Some(&receipt)),
+        "planning",
+    );
+
+    let stop = fixture.improve(&[
+        "stop",
+        "--run",
+        &run_arg,
+        "--reason",
+        "owner cleanup",
+        "--timeout",
+        "20",
+    ]);
+    assert!(stop.status.success(), "{}", text(&stop));
+    assert!(
+        wait_gone(&mut owned),
+        "the owned recorded child is terminated: {}",
+        text(&stop)
+    );
+    assert!(
+        child_running(&mut foreign),
+        "a foreign process the run never recorded stays untouched"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"][0]["state"], "stopped");
+    let receipt_json: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(receipt_json["stop"]["outcome"], "stopped", "{receipt_json}");
+    let _ = foreign.kill();
+    let _ = foreign.wait();
 }

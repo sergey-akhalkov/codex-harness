@@ -14,11 +14,13 @@
 //! controller slice that cannot perform that effect reports the phase as
 //! explicitly pending instead of advancing.
 
+use crate::process::{Cancellation, Deadline, ExclusiveFileLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 pub const RUN_SCHEMA: u32 = 1;
@@ -34,6 +36,9 @@ pub const MAX_EFFECTS: usize = 256;
 pub const MAX_ATTEMPTS: usize = 64;
 pub const MAX_SCOPE_ENTRIES: usize = 32;
 pub const MAX_OWNER_BYTES: usize = 64;
+/// How long a mutating command waits for the exclusive run-mutation guard
+/// before reporting the busy controller instead of acting on stale state.
+pub const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 const MAX_TOKEN: usize = 200;
 const MAX_REASON: usize = 1024;
@@ -592,6 +597,10 @@ pub enum EffectKind {
     VariantSelected,
     VariantsUnavailable,
     StopRequested,
+    /// One verified owned-process cleanup performed by the exact-identity
+    /// executor stop owner, or the explicit retention when cleanup could not
+    /// be established.
+    OwnedCleanup,
     OwnershipTaken,
     Resumed,
     Reconciled,
@@ -739,6 +748,20 @@ impl Cursor {
             .collect()
     }
 
+    /// The attempts a resume must reconcile from their exact receipts: every
+    /// in-flight attempt plus every attempt whose outcome is still unknown.
+    /// A stopped run retains its in-flight effects as unknown, and a later
+    /// authoritative receipt completion or failure settles them once; a truly
+    /// unobserved attempt stays unknown and is never replayed.
+    pub fn attempts_requiring_reconciliation(&self) -> Vec<&Attempt> {
+        self.attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.state.is_in_flight() || attempt.state == AttemptState::Unknown
+            })
+            .collect()
+    }
+
     pub fn push_attempt(&mut self, attempt: Attempt) -> io::Result<()> {
         if self.attempts.len() >= MAX_ATTEMPTS {
             return Err(invalid(format!(
@@ -783,6 +806,41 @@ impl OwnerRecord {
             program,
             claimed_ms: now_ms(),
         })
+    }
+}
+
+/// The resolved ownership of one mutation: the record this command wrote and
+/// the record it replaced, when one was recorded. The exclusive run-mutation
+/// guard - not pid liveness - is the mutual exclusion, so a previously
+/// recorded owner that still runs is reported as a takeover instead of
+/// blocking the serialized writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ownership {
+    pub owner: OwnerRecord,
+    pub previous: Option<OwnerRecord>,
+    /// Whether the replaced owner still ran when it was replaced.
+    pub previous_live: Option<bool>,
+}
+
+impl Ownership {
+    pub fn takeover_note(&self) -> Option<String> {
+        let previous = self.previous.as_ref()?;
+        if previous.pid == self.owner.pid
+            && previous.created == self.owner.created
+            && previous.program == self.owner.program
+        {
+            return None;
+        }
+        Some(format!(
+            "ownership taken over from the previously recorded owner pid {} ({}, {}) under the exclusive run-mutation guard",
+            previous.pid,
+            previous.program.display(),
+            match self.previous_live {
+                Some(true) => "still running",
+                Some(false) => "no longer running",
+                None => "liveness unverifiable",
+            }
+        ))
     }
 }
 
@@ -843,37 +901,107 @@ pub const CURSOR_FILE: &str = "cursor.json";
 pub const OWNER_FILE: &str = "owner.json";
 pub const VARIANTS_FILE: &str = "variants.json";
 pub const ASSIGNMENTS_DIR: &str = "assignments";
+/// The stable lock file for the exclusive run-mutation guard. Every mutating
+/// operation acquires it *before* reading run state, so two commands can
+/// neither create duplicate run ownership nor overwrite each other's cursor
+/// with a stale read-modify-write.
+pub const MUTATION_LOCK_FILE: &str = "mutation.lock";
+
+/// The exclusive run-mutation guard: a native whole-file OS lock held across
+/// the fresh state read, the gates, the recorded effects and the persisted
+/// state. Dropping it releases the lock; read-only `status` does not take it.
+#[derive(Debug)]
+pub struct RunMutation {
+    _lock: ExclusiveFileLock,
+}
+
+fn acquire_mutation_lock(root: &Path, wait: Duration) -> io::Result<RunMutation> {
+    let path = root.join(MUTATION_LOCK_FILE);
+    let deadline = Deadline::after(wait)?;
+    ExclusiveFileLock::acquire(&path, deadline, &Cancellation::default())
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "the exclusive run-mutation guard at {} was not acquired within {:.1}s: {error}; another controller or command owns this run, so no state was read or changed",
+                    path.display(),
+                    wait.as_secs_f32()
+                ),
+            )
+        })
+        .map(|lock| RunMutation { _lock: lock })
+}
 
 impl RunStore {
-    /// Creates a fresh run store. An existing store is a duplicate run
-    /// ownership: the second `start` is refused with the resume remedy.
+    /// Creates the run directory (when needed) and acquires the exclusive
+    /// mutation guard *before* any run state is read or written. An existing
+    /// store is a duplicate run ownership: the second `start` is refused with
+    /// the resume remedy.
     pub fn create(
         root: &Path,
         spec: &RunSpec,
         spec_digest: &str,
         change_root: &Path,
     ) -> io::Result<Self> {
+        let (store, _guard) = Self::lock_new(root)?;
+        store.create_locked(spec, spec_digest, change_root)?;
+        store.claim_ownership(&spec.run)?;
+        Ok(store)
+    }
+
+    /// Acquires the exclusive mutation guard for a run that does not exist yet.
+    /// The caller must hold the guard across creation, ownership claiming and
+    /// every subsequent state read or write.
+    pub fn lock_new(root: &Path) -> io::Result<(Self, RunMutation)> {
+        Self::lock_new_within(root, MUTATION_LOCK_WAIT)
+    }
+
+    pub fn lock_new_within(root: &Path, wait: Duration) -> io::Result<(Self, RunMutation)> {
         if !root.is_absolute() {
             return Err(invalid("the run directory must be absolute"));
         }
-        if root.join(SPEC_FILE).exists() || root.join(CURSOR_FILE).exists() {
-            return Err(invalid(format!(
-                "run state already exists at {}; a second start would duplicate run ownership - use `improve resume` to take over the interrupted or stopped run",
-                root.display()
-            )));
-        }
-        fs::create_dir_all(root.join(ASSIGNMENTS_DIR))?;
+        fs::create_dir_all(root)?;
+        let guard = acquire_mutation_lock(root, wait)?;
         let store = Self {
             root: root.to_path_buf(),
         };
-        write_json_atomic(&store.spec_path(), spec)?;
-        store.save_cursor(&Cursor::new(
+        Ok((store, guard))
+    }
+
+    /// Opens an existing run and acquires the exclusive mutation guard before
+    /// the caller reads any state.
+    pub fn open_locked(root: &Path) -> io::Result<(Self, RunMutation)> {
+        Self::open_locked_within(root, MUTATION_LOCK_WAIT)
+    }
+
+    pub fn open_locked_within(root: &Path, wait: Duration) -> io::Result<(Self, RunMutation)> {
+        let store = Self::open(root)?;
+        let guard = acquire_mutation_lock(&store.root, wait)?;
+        Ok((store, guard))
+    }
+
+    /// Writes a fresh store under an already-held mutation guard. Repeating
+    /// this for an existing run is the duplicate-ownership refusal.
+    pub fn create_locked(
+        &self,
+        spec: &RunSpec,
+        spec_digest: &str,
+        change_root: &Path,
+    ) -> io::Result<()> {
+        if self.root.join(SPEC_FILE).exists() || self.root.join(CURSOR_FILE).exists() {
+            return Err(invalid(format!(
+                "run state already exists at {}; a second start would duplicate run ownership - use `improve resume` to take over the interrupted or stopped run",
+                self.root.display()
+            )));
+        }
+        fs::create_dir_all(self.root.join(ASSIGNMENTS_DIR))?;
+        write_json_atomic(&self.spec_path(), spec)?;
+        self.save_cursor(&Cursor::new(
             &spec.run,
             spec_digest.to_owned(),
             change_root.to_path_buf(),
             &spec.hypothesis_item,
-        ))?;
-        Ok(store)
+        ))
     }
 
     pub fn open(root: &Path) -> io::Result<Self> {
@@ -955,40 +1083,32 @@ impl RunStore {
         }
     }
 
-    pub fn claim_ownership(&self, run: &str) -> io::Result<OwnerRecord> {
-        if let Some(current) = self.owner()? {
-            match owner_is_live(&current)? {
-                Some(false) if current.run == run => {}
-                Some(false) => {
-                    return Err(invalid(format!(
-                        "run state records owner run={} instead of {run}",
-                        current.run
-                    )));
-                }
-                Some(true) => {
-                    let me = current_process_identity().ok();
-                    let me_is_owner = me.as_ref().is_some_and(|(pid, created, _)| {
-                        *pid == current.pid && *created == current.created
-                    });
-                    if !me_is_owner {
-                        return Err(invalid(format!(
-                            "run {run} is owned by live process pid {} ({}); stop or resume it there instead of sharing one run",
-                            current.pid,
-                            current.program.display()
-                        )));
-                    }
-                }
-                None => {
-                    return Err(invalid(format!(
-                        "the recorded owner of run {run} (pid {}) cannot be verified live or gone; refusing to take over its state",
-                        current.pid
-                    )));
-                }
-            }
+    /// Records this process as the run's owner. The caller holds the exclusive
+    /// run-mutation guard, so the replacement is serialized; a previously
+    /// recorded owner is reported (and whether it still ran) rather than
+    /// refusing the takeover, because liveness cannot prove that the old owner
+    /// still holds the guard.
+    pub fn claim_ownership(&self, run: &str) -> io::Result<Ownership> {
+        let previous = self.owner()?;
+        if let Some(previous) = &previous
+            && previous.run != run
+        {
+            return Err(invalid(format!(
+                "run state records owner run={} instead of {run}",
+                previous.run
+            )));
         }
+        let previous_live = match &previous {
+            Some(previous) => owner_is_live(previous)?,
+            None => None,
+        };
         let owner = OwnerRecord::current(run)?;
         write_json_atomic(&self.owner_path(), &owner)?;
-        Ok(owner)
+        Ok(Ownership {
+            owner,
+            previous,
+            previous_live,
+        })
     }
 }
 
@@ -1318,6 +1438,9 @@ pub fn dispatch_owner(run: &str, role: AttemptRole, ordinal: u32) -> String {
 pub struct ResumeReport {
     /// Attempts whose host still runs; they keep the runtime frozen.
     pub active: Vec<String>,
+    /// Unknown attempts whose exact receipt still reports a live host: the
+    /// outcome is retained as unknown, never guessed and never replayed.
+    pub retained_live: Vec<String>,
     /// Attempts settled just now from their receipts.
     pub settled: Vec<String>,
     /// Attempts whose outcome remains unknown; they are never replayed.
@@ -1333,6 +1456,12 @@ impl ResumeReport {
             parts.push(format!(
                 "attempt(s) {} are still active; the frozen runtime is kept until they finish or are stopped",
                 self.active.join(", ")
+            ));
+        }
+        if !self.retained_live.is_empty() {
+            parts.push(format!(
+                "attempt(s) {} are retained live: their recorded host still runs, their outcome stays unknown and the frozen runtime is kept",
+                self.retained_live.join(", ")
             ));
         }
         if !self.unknown.is_empty() {

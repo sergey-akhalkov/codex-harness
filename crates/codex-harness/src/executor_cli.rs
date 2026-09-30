@@ -1428,6 +1428,34 @@ pub(crate) fn conversation_state(receipt: &Path) -> io::Result<ConversationState
     }
 }
 
+/// Stops one exact owned pooled run for another native controller.
+///
+/// It delegates to the existing urgent-stop owner, so the slot binding, the
+/// recorded host identity (pid, creation time and image path) and the recorded
+/// process tree are verified before anything is terminated; a refused,
+/// partial or unobserved stop stays explicit. The controller uses it for
+/// `improve stop` cleanup and never touches a process the run did not record.
+pub(crate) fn stop_owned_run(
+    source: &Path,
+    codex_home: &Path,
+    slot: u32,
+    owner: &str,
+    timeout: Duration,
+) -> io::Result<i32> {
+    executor_stop::run(&[
+        OsString::from("--source"),
+        source.as_os_str().to_owned(),
+        OsString::from("--codex-home"),
+        codex_home.as_os_str().to_owned(),
+        OsString::from("--slot"),
+        OsString::from(slot.to_string()),
+        OsString::from("--owner"),
+        OsString::from(owner),
+        OsString::from("--timeout"),
+        OsString::from(timeout.as_secs().to_string()),
+    ])
+}
+
 /// The dispatch text for the bound slot: free text keeps the caller's own words
 /// and gains the installed escalation and waiting guidance, while a structured
 /// assignment is validated and rendered with the actual checkout, the committed
