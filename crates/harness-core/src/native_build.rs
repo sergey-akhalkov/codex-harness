@@ -16,8 +16,18 @@ use std::{
 
 pub(crate) const OWNER: &[u8] = b"codex-harness-native-state-v1\n";
 const TARGET: &str = "x86_64-pc-windows-msvc";
-const SCRATCH_PREFIXES: &[&str] = &["hcb-", "hcc-", "hca-"];
-const SCRATCH_SWEEP_AGE: Duration = Duration::from_secs(48 * 60 * 60);
+/// Dedicated owned scratch root beneath the process temp directory. The name
+/// stays short because nested compiler paths contend for the MSVC path limit.
+const SCRATCH_ROOT_NAME: &str = "chx";
+/// Ownership record file written into the owned root and every entry.
+const SCRATCH_OWNER_FILE: &str = "owner";
+/// Lease object held exclusively while an owned entry is in use. Keeping it
+/// separate from the record leaves the ownership identity readable even while
+/// a live operation holds the lease.
+const SCRATCH_LEASE_FILE: &str = "lease";
+/// Leading identity line of an ownership record. Ownership is this content,
+/// never a directory name, timestamp or process identifier.
+const SCRATCH_OWNER: &str = "codex-harness-native-scratch-v1\n";
 
 #[path = "native_handoff.rs"]
 mod handoff;
@@ -136,9 +146,7 @@ pub struct PreparedBuild {
 
 fn tool_version(tool: &OsStr, args: &[&str], source: &Path) -> io::Result<String> {
     let executable = resolve_tool(tool)?;
-    let temp = tempfile::Builder::new()
-        .prefix("harness-build-prerequisite-")
-        .tempdir()?;
+    let temp = owned_scratch()?;
     let output_path = temp.path().join("stdout");
     let error_path = temp.path().join("stderr");
     let mut command = CommandSpec::new(&executable);
@@ -266,47 +274,263 @@ pub(crate) fn start_admitted_compiler(
     admission.spawn_in_envelope(job, command)?.resume()
 }
 
-/// Reclaim scratch trees abandoned by interrupted explicit management.
+fn scratch_root() -> PathBuf {
+    std::env::temp_dir().join(SCRATCH_ROOT_NAME)
+}
+
+/// Ownership record for a fresh entry: the identity line plus the diagnostic
+/// details an operator can use during bounded recovery. Only the identity line
+/// is ever compared; the details never decide anything.
+fn scratch_record() -> String {
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!(
+        "{SCRATCH_OWNER}pid={} started={started}\n",
+        std::process::id()
+    )
+}
+
+/// True when `path` is an ordinary file that begins with the ownership record.
+fn carries_scratch_ownership(path: &Path) -> bool {
+    if build_identity::ordinary(path).is_err() {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut identity = [0u8; SCRATCH_OWNER.len()];
+    file.read_exact(&mut identity).is_ok() && identity == SCRATCH_OWNER.as_bytes()
+}
+
+/// Establish the ownership record for an empty or fresh directory.
+fn write_scratch_record(dir: &Path) -> io::Result<()> {
+    let record = dir.join(SCRATCH_OWNER_FILE);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&record)
+    {
+        Ok(mut file) => {
+            file.write_all(SCRATCH_OWNER.as_bytes())?;
+            file.sync_all()
+        }
+        // A concurrent creator may have won the race; adopt only its identity.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if carries_scratch_ownership(&record) {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "Scratch root ownership record is foreign; preserving it.",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Verify or establish the dedicated owned scratch root.
+///
+/// A same-named directory is adopted only when it is empty or already carries
+/// this harness's ownership record. Anything else is unproven foreign data and
+/// is preserved untouched instead of being swept or reused.
+fn owned_scratch_root(root: &Path, create: bool) -> io::Result<Option<PathBuf>> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || build_identity::ordinary(root).is_err() {
+                return Ok(None);
+            }
+            if carries_scratch_ownership(&root.join(SCRATCH_OWNER_FILE)) {
+                return Ok(Some(root.to_owned()));
+            }
+            if fs::read_dir(root)?.next().is_some() {
+                return Ok(None);
+            }
+            if create {
+                write_scratch_record(root)?;
+            }
+            Ok(Some(root.to_owned()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !create {
+                return Ok(None);
+            }
+            match fs::create_dir(root) {
+                Ok(()) => {
+                    build_identity::ordinary(root)?;
+                    write_scratch_record(root)?;
+                    Ok(Some(root.to_owned()))
+                }
+                // Another creator won the race; adopt only verified data.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    owned_scratch_root(root, create)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// One owned scratch tree with a live lease.
+///
+/// The entry is a short random directory beneath the owned root, so nested
+/// compiler paths stay short. Its record file carries the ownership identity
+/// and its lease object carries the exclusive operating-system lock held while
+/// the entry is in use: the kernel releases that lock when the owning process
+/// ends, so an interrupted operation leaves proven ownership with a dead lease
+/// for the next explicit operation. The field order releases the lease before
+/// `TempDir` removes the tree.
+struct ScratchEntry {
+    lease: Option<ExclusiveFileLock>,
+    dir: tempfile::TempDir,
+}
+
+impl ScratchEntry {
+    /// Create one leased entry beneath an already verified owned root.
+    fn leased(root: &Path) -> io::Result<Self> {
+        let dir = tempfile::Builder::new().prefix("").tempdir_in(root)?;
+        // Publish the identity before taking the lease: a sweep verifies the
+        // identity and then takes only an existing released lease, so it can
+        // never reclaim a directory whose lease is not yet held.
+        let mut owner = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join(SCRATCH_OWNER_FILE))?;
+        owner.write_all(scratch_record().as_bytes())?;
+        owner.sync_all()?;
+        drop(owner);
+        let lease = ExclusiveFileLock::try_acquire(&dir.path().join(SCRATCH_LEASE_FILE))?
+            .ok_or_else(|| {
+                io::Error::other("A fresh scratch lease is already held; retry the explicit build.")
+            })?;
+        Ok(Self {
+            lease: Some(lease),
+            dir,
+        })
+    }
+
+    /// Unproven short-lived scratch when the owned root cannot be claimed.
+    fn unproven() -> io::Result<Self> {
+        Ok(Self {
+            lease: None,
+            dir: tempfile::Builder::new().prefix("hcb-").tempdir()?,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Retain the tree for diagnostics. The released lease keeps it
+    /// reclaimable by the next explicit operation instead of leaking unproven
+    /// data.
+    fn keep(self) -> PathBuf {
+        let Self { lease, dir } = self;
+        drop(lease);
+        dir.keep()
+    }
+}
+
+/// Create one scratch tree in the dedicated owned root.
+///
+/// A same-named unproven root is preserved, so the build falls back to
+/// unproven short-lived scratch instead of failing an otherwise valid build
+/// over a name collision in the process temp directory.
+fn owned_scratch() -> io::Result<ScratchEntry> {
+    match owned_scratch_root(&scratch_root(), true)? {
+        Some(root) => ScratchEntry::leased(&root),
+        None => ScratchEntry::unproven(),
+    }
+}
+
+/// Reclaim owned scratch trees abandoned by an interrupted explicit operation.
 ///
 /// `TempDir` cleanup only runs when the manager unwinds normally, so a killed
-/// install/update leaks its build/evidence tree into the process temp root.
-/// The owned prefixes identify this manager's scratch; the age gate protects
-/// fresh evidence from a concurrent management operation, and every removal
-/// stays best-effort so hygiene can never fail the build.
-fn sweep_stale_scratch(root: &Path, min_age: Duration) {
-    let Some(threshold) = SystemTime::now().checked_sub(min_age) else {
-        return;
-    };
+/// install/update leaks its scratch. Reclamation requires both the ownership
+/// record and a released lease: a matching name, an age or a process
+/// identifier never authorizes removal, and active or foreign data survives.
+/// Reparse points are skipped rather than followed, and every step stays
+/// best-effort so hygiene can never fail or delay a valid build.
+fn sweep_owned_scratch(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !SCRATCH_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+            || build_identity::ordinary(&path).is_err()
+            || !carries_scratch_ownership(&path.join(SCRATCH_OWNER_FILE))
         {
             continue;
         }
-        // Directory metadata from read_dir does not traverse reparse points;
-        // skipping them keeps the sweep from deleting or following a link.
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() || file_type.is_symlink() {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
-            continue;
-        };
-        if modified > threshold {
+        // Missing or linked lease evidence is never authoritative, and a
+        // missing lease must not be created: a directory whose lease is not yet
+        // held belongs to an operation that is still being created.
+        let lease = path.join(SCRATCH_LEASE_FILE);
+        if build_identity::ordinary(&lease).is_err() {
             continue;
         }
-        let _ = fs::remove_dir_all(entry.path());
+        match ExclusiveFileLock::try_acquire_existing(&lease) {
+            // The lease outlives its operation only while that process lives;
+            // reclaim the entry while holding the released lease. A live or
+            // unprovable lease preserves the entry untouched.
+            Ok(Some(lease)) => reclaim_owned_entry(&path, lease),
+            Ok(None) => {}
+            Err(_) => {}
+        }
     }
+}
+
+/// Remove one abandoned owned entry. The ownership record is removed last and
+/// kept whenever any part of the tree resists removal, so a failed cleanup
+/// leaves a still-reclaimable owned entry instead of unproven debris.
+fn reclaim_owned_entry(path: &Path, lease: ExclusiveFileLock) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    let mut blocked = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == SCRATCH_OWNER_FILE || name == SCRATCH_LEASE_FILE {
+            continue;
+        }
+        let child = entry.path();
+        let removed = if build_identity::ordinary(&child).is_err() {
+            // A reparse point is skipped, never followed or unlinked.
+            Err(io::Error::other("reparse point"))
+        } else if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            fs::remove_dir_all(&child)
+        } else {
+            fs::remove_file(&child)
+        };
+        if removed.is_err() {
+            blocked = true;
+        }
+    }
+    if blocked {
+        return;
+    }
+    let Ok(mut remaining) = fs::read_dir(path) else {
+        return;
+    };
+    if remaining.any(|entry| {
+        entry.is_ok_and(|entry| {
+            let name = entry.file_name();
+            name != SCRATCH_OWNER_FILE && name != SCRATCH_LEASE_FILE
+        })
+    }) {
+        return;
+    }
+    // Release the lease before removing the lease object and record; a fresh
+    // operation never adopts this directory name, so no new owner is
+    // displaced here. The identity is removed last: a failed removal therefore
+    // stays owned and the next sweep can finish the job.
+    drop(lease);
+    let _ = fs::remove_file(path.join(SCRATCH_LEASE_FILE));
+    let _ = fs::remove_file(path.join(SCRATCH_OWNER_FILE));
+    let _ = fs::remove_dir(path);
 }
 
 pub(crate) fn owner_root(state: &Path) -> io::Result<()> {
@@ -505,7 +729,7 @@ pub fn consumer_check(
 ) -> io::Result<build_identity::BuildCheck> {
     let before = build_identity::verify_record_integrity(build)?;
     let receipt_hash = build_identity::hash_file(&build.join("build.json"))?;
-    let evidence = tempfile::Builder::new().prefix("hcc-").tempdir()?;
+    let evidence = owned_scratch()?;
     let mut command = CommandSpec::new(build.join("codex-harness.exe"));
     command.args = vec![
         "check".into(),
@@ -580,7 +804,7 @@ pub fn activate_candidate(
     if !check.runtime_allowed {
         return Err(io::Error::other(check.action));
     }
-    let evidence = tempfile::Builder::new().prefix("hca-").tempdir()?;
+    let evidence = owned_scratch()?;
     let mut command = CommandSpec::new(manager);
     command.args = vec![
         "activate-build".into(),
@@ -690,7 +914,11 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     let deadline = budget.deadline()?;
     owner_root(&state)?;
     let lock = lock_owned_state(&state)?;
-    sweep_stale_scratch(&std::env::temp_dir(), SCRATCH_SWEEP_AGE);
+    // Best-effort hygiene: a foreign or unavailable root is preserved, never
+    // swept, and never fails the build.
+    if let Ok(Some(root)) = owned_scratch_root(&scratch_root(), false) {
+        sweep_owned_scratch(&root);
+    }
     if let Some(reused) = find_reusable(&state, &source, &rustc, &cargo_version)? {
         return Ok(reused);
     }
@@ -713,7 +941,7 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     // Unchanged builds reuse their verified immutable artifacts above.
     // Keep compiler paths short: nested state/build IDs can exceed MSVC's
     // practical object-file path limit even when Rust accepts verbatim paths.
-    let scratch = tempfile::Builder::new().prefix("hcb-").tempdir()?;
+    let scratch = owned_scratch()?;
     let target = scratch.path().to_owned();
     ordinary_ancestors(&target)?;
     let mut command = CommandSpec::new(resolve_tool(cargo)?);
@@ -990,58 +1218,191 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_owned_scratch_is_swept_and_fresh_or_foreign_entries_survive() {
-        let root = tempfile::tempdir().unwrap();
-        let stale_build = root.path().join("hcb-stale");
-        fs::create_dir_all(stale_build.join("x86_64-pc-windows-msvc/release")).unwrap();
+    /// Create an NTFS junction without requiring the symlink privilege.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(not(windows))]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    /// Give a file a clearly stale timestamp.
+    fn backdate(path: &Path) {
+        let old = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// Plant an owned entry whose lease is not held, like a killed operation.
+    /// The recorded process identifier is diagnostic and proves nothing.
+    fn abandoned_entry(root: &Path, pid: u32) -> PathBuf {
+        let dir = root.join(format!("hcb-abandoned-{pid:08x}"));
+        fs::create_dir(&dir).unwrap();
         fs::write(
-            stale_build.join("x86_64-pc-windows-msvc/release/artifact.bin"),
-            b"x",
+            dir.join(SCRATCH_OWNER_FILE),
+            format!("{SCRATCH_OWNER}pid={pid} started=1\n"),
         )
         .unwrap();
-        let stale_check = root.path().join("hcc-stale");
-        fs::create_dir_all(&stale_check).unwrap();
-        fs::write(stale_check.join("stdout.json"), b"{}").unwrap();
+        fs::write(dir.join(SCRATCH_LEASE_FILE), b"").unwrap();
+        dir
+    }
 
-        std::thread::sleep(Duration::from_millis(250));
-
-        let fresh = root.path().join("hcb-fresh");
-        fs::create_dir_all(&fresh).unwrap();
-        fs::write(fresh.join("in-flight"), b"y").unwrap();
-        let foreign = root.path().join("unrelated-dir");
-        fs::create_dir_all(&foreign).unwrap();
-        let foreign_prefixed_file = root.path().join("hcb-not-a-directory");
-        fs::write(&foreign_prefixed_file, b"z").unwrap();
-
-        sweep_stale_scratch(root.path(), Duration::from_millis(100));
-
-        assert!(!stale_build.exists());
-        assert!(!stale_check.exists());
-        assert!(fresh.is_dir());
-        assert!(foreign.is_dir());
-        assert!(foreign_prefixed_file.is_file());
+    fn owned_root_fixture(outer: &Path) -> PathBuf {
+        let root = outer.join("chx");
+        fs::create_dir(&root).unwrap();
+        write_scratch_record(&root).unwrap();
+        root
     }
 
     #[test]
-    fn scratch_sweep_skips_reparse_entries() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("keep.txt"), b"keep").unwrap();
-        let link = root.path().join("hcb-link");
+    fn scratch_root_is_adopted_only_with_its_ownership_record() {
+        let outer = tempfile::tempdir().unwrap();
+        let foreign = outer.path().join("chx");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("foreign"), "keep").unwrap();
+        assert!(owned_scratch_root(&foreign, true).unwrap().is_none());
+        assert_eq!(fs::read_to_string(foreign.join("foreign")).unwrap(), "keep");
+        assert!(!foreign.join(SCRATCH_OWNER_FILE).exists());
+        let file = outer.path().join("chx-file");
+        fs::write(&file, "keep").unwrap();
+        assert!(owned_scratch_root(&file, true).unwrap().is_none());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep");
+        let empty = outer.path().join("chx-empty");
+        fs::create_dir(&empty).unwrap();
+        assert!(owned_scratch_root(&empty, true).unwrap().is_some());
+        assert!(carries_scratch_ownership(&empty.join(SCRATCH_OWNER_FILE)));
+        assert!(owned_scratch_root(&empty, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn scratch_entries_hold_a_live_lease_and_keep_paths_short() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = owned_root_fixture(outer.path());
+        let entry = ScratchEntry::leased(&root).unwrap();
+        let path = entry.path().to_owned();
+        // One short component beneath the owned root keeps compiler paths short.
+        assert_eq!(path.parent(), Some(root.as_path()));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.len() <= 8, "unexpected scratch name {name}");
+        assert!(carries_scratch_ownership(&path.join(SCRATCH_OWNER_FILE)));
+        // A second operation cannot take a live lease.
+        let lease = path.join(SCRATCH_LEASE_FILE);
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease)
+            .unwrap();
+        assert!(probe.try_lock().is_err(), "lease is live");
+        drop(probe);
+        // Normal unwinding removes the whole tree and its record.
+        drop(entry);
+        assert!(
+            !path.exists(),
+            "normal cleanup failed for {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn sweep_reclaims_only_abandoned_owned_entries() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = owned_root_fixture(outer.path());
+
+        // Old foreign prefixed data inside the owned root has no record.
+        let foreign = root.join("hcb-old-foreign");
+        fs::create_dir_all(foreign.join("nested")).unwrap();
+        fs::write(foreign.join("nested/keep"), "keep").unwrap();
+        backdate(&foreign.join("nested/keep"));
+        // A legacy directory beside the root is a neighboring namespace.
+        let neighbor = outer.path().join("hcc-neighbor");
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(neighbor.join("keep"), "keep").unwrap();
+        backdate(&neighbor.join("keep"));
+        // An outside sentinel reachable only through a reparse point.
+        let sentinel = outer.path().join("outside");
+        fs::create_dir(&sentinel).unwrap();
+        fs::write(sentinel.join("keep"), "keep").unwrap();
+        let link = root.join("hcb-reparse-entry");
+        assert!(junction(&link, &sentinel), "junction creation failed");
+
+        // An active operation keeps a live lease even while it looks ancient.
+        let active = ScratchEntry::leased(&root).unwrap();
+        let active_lease = active.path().join(SCRATCH_LEASE_FILE);
+        backdate(&active.path().join(SCRATCH_OWNER_FILE));
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&active_lease)
+            .unwrap();
+        assert!(probe.try_lock().is_err(), "lease is live");
+
+        // Abandoned owned scratch: no lease, whatever its name or age.
+        let abandoned = abandoned_entry(&root, std::process::id());
+        // Abandoned owned scratch whose removal a foreign handle blocks.
+        // Non-Windows removal does not fail on open files, so this case is
+        // Windows-only: it is the platform whose cleanup semantics matter here.
         #[cfg(windows)]
-        let created = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
-        #[cfg(not(windows))]
-        let created = std::os::unix::fs::symlink(&target, &link).is_ok();
-        if !created {
-            // Link creation is privilege-restricted on some Windows setups.
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-        sweep_stale_scratch(root.path(), Duration::from_millis(100));
+        let blocked = abandoned_entry(&root, 0);
+        #[cfg(windows)]
+        fs::write(blocked.join("held"), b"x").unwrap();
+        #[cfg(windows)]
+        let hold = {
+            use std::os::windows::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .share_mode(0)
+                .open(blocked.join("held"))
+                .unwrap()
+        };
+
+        sweep_owned_scratch(&root);
+
+        assert!(
+            !abandoned.exists(),
+            "an abandoned owned entry is reclaimed whatever it records"
+        );
+        assert!(active.path().is_dir(), "an active lease survives");
+        #[cfg(windows)]
+        assert!(
+            blocked.join("held").is_file(),
+            "blocked removal is preserved"
+        );
+        #[cfg(windows)]
+        assert!(
+            blocked.join(SCRATCH_OWNER_FILE).is_file(),
+            "a failed cleanup keeps the entry reclaimable"
+        );
+        assert!(
+            foreign.join("nested/keep").is_file(),
+            "foreign data survives"
+        );
+        assert!(link.is_dir(), "a reparse entry is skipped");
+        assert_eq!(fs::read_to_string(sentinel.join("keep")).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(neighbor.join("keep")).unwrap(), "keep");
+
+        // Once the block is gone the next sweep reclaims the entry.
+        #[cfg(windows)]
+        drop(hold);
+        sweep_owned_scratch(&root);
+        #[cfg(windows)]
+        assert!(!blocked.exists());
+        assert!(active.path().is_dir());
         assert!(link.is_dir());
-        assert!(target.join("keep.txt").exists());
+        assert_eq!(fs::read_to_string(sentinel.join("keep")).unwrap(), "keep");
     }
 
     #[test]

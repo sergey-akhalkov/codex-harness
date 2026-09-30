@@ -929,3 +929,216 @@ fn older_producer_finalizes_expanded_consumer_with_new_input_rules() {
     );
     println!("transition evidence {}", root.display());
 }
+
+/// Run the real CLI under an isolated process temp root.
+fn cli_in_temp(temp: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(args)
+        .env("TMP", temp)
+        .env("TEMP", temp)
+        .output()
+        .unwrap()
+}
+
+/// Create an NTFS junction without requiring the symlink privilege.
+fn junction(link: &Path, target: &Path) -> bool {
+    Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Wait for the interrupted build's own scratch entry (`owner` record plus the
+/// cargo target tree). Tool probes share the root and leave `stdout` capture
+/// files, so they cannot be mistaken for the build scratch.
+fn wait_for_build_scratch(
+    child: &mut std::process::Child,
+    root: &Path,
+    log: &Path,
+) -> std::path::PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.join("owner").is_file() && path.join("x86_64-pc-windows-msvc").is_dir() {
+                    return path;
+                }
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "the build exited with {status} before its scratch could be interrupted; {}",
+                fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no build scratch appeared; {}",
+            fs::read_to_string(log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Scratch reclamation must follow verified ownership and a released lease
+/// only: an interrupted build is reclaimed, while foreign, blocked and
+/// reparse-point data survives without ever failing a valid build.
+#[test]
+fn abandoned_scratch_is_reclaimed_only_for_owned_entries() {
+    let outer = tempfile::Builder::new()
+        .prefix("harness-native-lease-")
+        .tempdir()
+        .unwrap();
+    // The isolated process temp root stands in for %TEMP%; the real user temp
+    // state is never used or swept here.
+    let temp = outer.path().join("process-temp");
+    fs::create_dir(&temp).unwrap();
+    let source = outer.path().join("source");
+    let state = outer.path().join("state");
+    fixture(&source);
+    let arguments = [
+        "build",
+        "--source",
+        source.to_str().unwrap(),
+        "--state",
+        state.to_str().unwrap(),
+    ];
+    let evidence = |path: &Path| format!("{} (isolated {})", path.display(), temp.display());
+
+    // A neighboring temp namespace is not swept or modified.
+    let neighbor = temp.join("hcb-neighbor-legacy");
+    fs::create_dir(&neighbor).unwrap();
+    fs::write(neighbor.join("sentinel"), "keep").unwrap();
+
+    // Interrupt a real build once its owned scratch lease exists. The killed
+    // manager releases the lease and leaves the tree behind.
+    let log_path = outer.path().join("interrupted.log");
+    let log = fs::File::create(&log_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(arguments)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let root = temp.join("chx");
+    let entry = wait_for_build_scratch(&mut child, &root, &log_path);
+    child.kill().unwrap();
+    let _ = child.wait().unwrap();
+    assert!(
+        entry.join("owner").is_file(),
+        "an interrupted operation leaves owned scratch: {}",
+        evidence(&entry)
+    );
+    // The lease died with its process: a recorded identifier alone is nothing.
+    let released = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(entry.join("lease"))
+        .unwrap();
+    assert!(
+        released.try_lock().is_ok(),
+        "the interrupted lease must be released: {}",
+        evidence(&entry)
+    );
+    drop(released);
+
+    // Outside data reachable only through a reparse point, foreign prefixed
+    // data inside the owned root, and a removal the platform still blocks.
+    let sentinel = outer.path().join("outside-sentinel");
+    fs::create_dir(&sentinel).unwrap();
+    fs::write(sentinel.join("keep.txt"), "keep").unwrap();
+    let link = root.join("hcb-junction-entry");
+    assert!(
+        junction(&link, &sentinel),
+        "junction creation failed for {}",
+        evidence(&link)
+    );
+    let foreign = root.join("hcb-old-foreign");
+    fs::create_dir_all(foreign.join("nested")).unwrap();
+    fs::write(foreign.join("nested/keep"), "keep").unwrap();
+    fs::write(entry.join("blocked"), b"pending removal").unwrap();
+    let hold = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(entry.join("blocked"))
+            .unwrap()
+    };
+
+    // A repeat build succeeds even though cleanup is blocked, and it preserves
+    // everything unproven, active or outside the owned root.
+    let repeated = cli_in_temp(&temp, &arguments);
+    assert!(
+        repeated.status.success(),
+        "{}; {}",
+        String::from_utf8_lossy(&repeated.stderr),
+        evidence(&entry)
+    );
+    let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["reused"], false);
+    assert!(
+        entry.join("owner").is_file(),
+        "a failed cleanup keeps the record: {}",
+        evidence(&entry)
+    );
+    assert_eq!(
+        fs::read_to_string(sentinel.join("keep.txt")).unwrap(),
+        "keep"
+    );
+    assert!(
+        link.is_dir(),
+        "a reparse entry is skipped: {}",
+        link.display()
+    );
+    assert_eq!(
+        fs::read_to_string(foreign.join("nested/keep")).unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        fs::read_to_string(neighbor.join("sentinel")).unwrap(),
+        "keep"
+    );
+
+    // Releasing the block lets the next repeat build reclaim the entry.
+    drop(hold);
+    let reclaimed = cli_in_temp(&temp, &arguments);
+    assert!(
+        reclaimed.status.success(),
+        "{}; {}",
+        String::from_utf8_lossy(&reclaimed.stderr),
+        evidence(&entry)
+    );
+    let reclaimed: Value = serde_json::from_slice(&reclaimed.stdout).unwrap();
+    assert_eq!(reclaimed["reused"], true);
+    assert!(
+        !entry.exists(),
+        "abandoned owned scratch is reclaimed: {}",
+        evidence(&entry)
+    );
+    assert_eq!(
+        fs::read_to_string(sentinel.join("keep.txt")).unwrap(),
+        "keep"
+    );
+    assert!(
+        link.is_dir(),
+        "outside reparse data survives: {}",
+        link.display()
+    );
+    assert_eq!(
+        fs::read_to_string(foreign.join("nested/keep")).unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        fs::read_to_string(neighbor.join("sentinel")).unwrap(),
+        "keep"
+    );
+    assert!(neighbor.is_dir());
+}

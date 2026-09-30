@@ -1006,12 +1006,29 @@ of the previous build keep their broker until they finish. A generation with no
 consumers retires on its idle timeout; explicit retirement remains a separate
 maintenance command.
 
-Every compilation uses a fresh owned temporary target with a short path for
+Every compilation uses a fresh leased scratch target with a short path for
 MSVC; unchanged candidates reuse verified immutable binaries. Explicit release
 compilation uses the [shared heavy-command budget](#heavy-command-budget).
-Abandoned management scratch (the `hcb-`/`hcc-`/`hca-` temp prefixes) is
-reclaimed at the next explicit build once older than 48 hours; only ordinary
-prefixed directories are removed and reparse points are skipped. Retained
+All explicit-management scratch (compilation targets, tool probes and
+consumer/activation evidence) lives beneath one dedicated short owned root,
+`%TEMP%\chx`. Each entry carries an ownership record and a live lease: an
+exclusive lock the operation holds on its lease object, which the operating
+system releases when its process ends. The next explicit build or update
+reclaims an entry only after verifying the record and taking that released
+lease; a matching name, a timestamp or a process identifier never authorizes
+removal, active or foreign data and reparse points are preserved, and cleanup
+stays best-effort, so a failed removal cannot fail a build. Failure evidence
+retained under the root is reclaimed by the next explicit operation; copy it
+out if it must outlive that. Legacy `hcb-`/`hcc-`/`hca-` and
+`harness-build-prerequisite-` directories in the process temp root carry no
+recoverable ownership evidence and are left untouched instead of being deleted
+by name; they no longer expire automatically. Bounded recovery: confirm that no
+explicit build, update or activation is running, then remove only the legacy
+directories you recognize as harness build scratch, in a namespace that does
+not belong to another tool; the harness then keeps using `%TEMP%\chx`. A
+same-named `%TEMP%\chx` is used only when it is empty or carries the ownership
+record; anything else is preserved untouched, and scratch falls back to
+unproven short-lived directories instead of failing the build. Retained
 verification targets from soak or long checks are removed after their
 conclusions are recorded (for example `cargo clean`), so verification state
 does not accumulate on the system drive.
