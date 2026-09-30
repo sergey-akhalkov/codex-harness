@@ -47,6 +47,14 @@ jobs:
           }
           (Split-Path $exe) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
+      - name: Use a long-form temporary directory
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\harness-tmp | Out-Null
+          "TMP=C:\harness-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=C:\harness-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the Rust process fixture
+        run: cargo build --locked -p codex-harness --bin harness-process-fixture --jobs 1
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
