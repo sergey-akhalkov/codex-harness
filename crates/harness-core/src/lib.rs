@@ -58,6 +58,7 @@ pub mod heavy_command;
 pub mod improvement_experiment;
 pub mod improvement_loop;
 pub mod improvement_policy;
+pub mod improvement_runtime;
 pub mod improvement_spec;
 #[cfg(windows)]
 pub mod installation_links;
