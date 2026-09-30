@@ -65,10 +65,10 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 8. Improve development feedback and evaluate publication candidates
 
-- [ ] 8.1 Exercise and document the smallest sufficient existing dev/package/integration route for a representative small edit, retaining required broader checks; verify a useful check through the real affected entry point without first publishing a cold release. Covers A16.
-- [ ] 8.2 Compare source-identity inputs with actual compiler dep-info/build/configuration inputs; verify compiled includes beneath fixture/test/documentation paths remain tracked and record whether a narrower safe publication key is justified before changing it. Covers A17.
-- [ ] 8.3 Declare and run bounded native comparisons for justified build-key, reusable-target or compiler-profile candidates using the same source/toolchain/resource conditions; verify unchanged publication integrity and retain the current route when a candidate has no established safe benefit. Covers A18.
-- [ ] 8.4 Record separate cold/warm feedback, publication, startup, runtime and artifact measurements plus preparation/recovery cost in the existing owner; verify each optional candidate has an evidenced adopt/reject/inconclusive decision and only accepted candidates reach the installed path. Covers A18.
+- [x] 8.1 Exercise and document the smallest sufficient existing dev/package/integration route for a representative small edit, retaining required broader checks; verify a useful check through the real affected entry point without first publishing a cold release. Covers A16.
+- [x] 8.2 Compare source-identity inputs with actual compiler dep-info/build/configuration inputs; verify compiled includes beneath fixture/test/documentation paths remain tracked and record whether a narrower safe publication key is justified before changing it. Covers A17.
+- [x] 8.3 Declare and run bounded native comparisons for justified build-key, reusable-target or compiler-profile candidates using the same source/toolchain/resource conditions; verify unchanged publication integrity and retain the current route when a candidate has no established safe benefit. Covers A18.
+- [x] 8.4 Record separate cold/warm feedback, publication, startup, runtime and artifact measurements plus preparation/recovery cost in the existing owner; verify each optional candidate has an evidenced adopt/reject/inconclusive decision and only accepted candidates reach the installed path. Covers A18.
 
 ## 9. Connect evidence to a defensible benefit decision
 
