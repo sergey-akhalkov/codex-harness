@@ -533,3 +533,31 @@ merged tree. The executor also caught a pre-existing `clippy::bool_comparison`
 in the group-12 `ci_workflow.rs` test (a semantics-preserving one-line fix,
 applied as `3c5677e`) — a lead verification gap, since that file had only
 been cargo-tested, not clippy-checked, when added.
+
+## Group 7: owned xAI transport identity and generations (tasks 7.1-7.5)
+
+Implemented in worktree slot 1 (`exec-ds-xai`, base `bfff088`) and merged as
+`b785cd5` after review. A listener is now authenticated by operating-system
+evidence — the TCP owner-table pid bound to the receipt pid, the live process
+image/creation/account through `ServiceProcess::inspect`, and a
+token-authenticated identity challenge — never by a self-reported executable
+path (BREAKING: unidentified listeners are no longer trusted transports; a
+timeout is not a free port, and on this stealth-SYN host the OS listener
+table is the authoritative free/occupied evidence). Foreign and spoofed
+listeners never receive `Authorization`; foreign processes survive; control
+retirement is token-scoped so stale authority cannot retire another
+generation. Generations are leased by owners: an update selects a new
+endpoint while an existing session's stream continues (exercised 70 s past
+the former 60 s grace), a concurrent new session works on the new endpoint, a
+later old-session request succeeds, and unclean exits reclaim only abandoned
+generations — all against a synthetic loopback upstream with zero production
+model calls. Executor verification: harness-core lib 746/0, `xai_transport`
+4 passed + the long ignored case run explicitly (74 s), scoped clippy clean,
+source check 896 files 0 findings. Lead verification: the `xai_transport`
+suite was rerun independently on the worktree (4/4 non-ignored; the long case
+was executed by the executor). Lead decisions: the reported pre-existing
+`ci_workflow.rs` lint was already fixed by the lead (`3c5677e`); the
+pinned/app-server continuity policy (reuse a live verified-compatible
+generation, never retire it) is confirmed — new-endpoint selection goes
+through the documented pinned route, and re-wiring the executor call site's
+routing would be a separate owned change if ever needed.
