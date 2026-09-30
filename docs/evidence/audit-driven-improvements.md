@@ -271,6 +271,40 @@ same session; `cargo clippy -p harness-core --all-targets --locked --
 outside the checkout waits for the corrected build to reach the global
 lifecycle (group 13 delivery).
 
+## Group 1: RTK publication, validation and presentation (tasks 1.1-1.6)
+
+Implemented in worktree slot 1 (`exec-ds-rtk`, base `dd5b151`) and merged as
+`975a026` after lead review and independent verification. Changed owners:
+`crates/harness-rtk/src/main.rs` and
+`crates/codex-harness/tests/rtk_adapter.rs` only.
+
+Behavior: one short store transaction (`store.lock` with a bounded 2 s wait,
+staging under `pack/staging/` written inside the lock, rename into place,
+atomic index replacement through a unique temporary name, oldest-first
+eviction only after the index commit); recovery under the lock removes only
+staging leftovers and validated-index-unreferenced `*.log` files and never
+follows reparse points; strict index validation (schema, per-record types,
+handle grammar, 64-hex digest, duplicates, checked size accounting) aborts
+publication and retention before any deletion; recall serves verified
+committed content with explicit expiry; complete-presentation accounting
+decides `applied` only when the delivered bytes (both streams, locators,
+handles, exit notice, adapter notices) are smaller than the captured raw
+bytes, with fallbacks recomputed; Cargo status recognition requires the exact
+`{:>12} ` layout and keeps every nonmatching line byte-verbatim. A
+deterministic barrier seam (`HARNESS_RTK_TEST_BARrier_DIR`) is inert without
+the environment variable.
+
+Verification: executor ran fmt/clippy clean, the 38-test `rtk_adapter` suite,
+decomposed package coverage (a single workspace invocation cannot fit the
+1800 s heavy deadline), pre-fix failure demonstrations on an instrumented
+base revision (two-process publication loss, unbounded contention, N01
+parent-relative deletion of an outside sentinel) and an outside-checkout
+staged run with an isolated home. Lead review inspected the transaction
+design and the full 38-test suite was rerun independently on the worktree
+(38/38 pass). The global installed acceptance of task 1.6 folds into group
+13 delivery; the load-sensitive `executor_message` flake the executor
+observed is unrelated to RTK and is to be confirmed on an idle machine.
+
 ## Groups 9 and 3: accepted executor slices (2026-09-30)
 
 **Group 9 (tasks 9.1-9.6), merged as `7d32067`.** Executor `exec-ds-benefit`
