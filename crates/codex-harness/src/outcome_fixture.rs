@@ -22,9 +22,33 @@ pub fn run() -> io::Result<()> {
     fs::write(
         "fixture-call.json",
         serde_json::to_vec(
-            &json!({"argv":args,"prompt":prompt,"home":home,"cwd":env::current_dir()?,"userprofile":env::var("USERPROFILE").ok()}),
+            &json!({"argv":args,"prompt":prompt,"home":home,"cwd":env::current_dir()?,
+                "userprofile":env::var("USERPROFILE").ok(),
+                "openai_api_key_present":env::var_os("OPENAI_API_KEY").is_some()}),
         )?,
     )?;
+    // Echo the requested model and reasoning so a synthetic local runner can
+    // verify its recorded identity through the real rollout-reader plumbing.
+    let requested_model = args
+        .windows(2)
+        .find(|pair| pair[0] == "-m" || pair[0] == "--model")
+        .map(|pair| pair[1].clone());
+    let requested_effort = args
+        .windows(2)
+        .find(|pair| pair[0] == "-c" && pair[1].starts_with("model_reasoning_effort="))
+        .map(|pair| {
+            pair[1]
+                .trim_start_matches("model_reasoning_effort=")
+                .trim_matches('"')
+                .to_owned()
+        });
+    // A controlled required solution output; the test supplies identical or
+    // divergent content across repeated controlled inputs.
+    if let Ok(solution) = env::var("HARNESS_OUTCOME_SOLUTION")
+        && !solution.is_empty()
+    {
+        fs::write("solution.txt", solution)?;
+    }
     let final_path = args
         .windows(2)
         .find(|pair| pair[0] == "--output-last-message")
@@ -38,9 +62,21 @@ pub fn run() -> io::Result<()> {
         let sessions = home.join("sessions/2026/09/09");
         fs::create_dir_all(&sessions)?;
         let model = if mode == "wrong-model" {
-            "grok-4.6"
+            "grok-4.6".to_owned()
         } else {
-            "gpt-6-astra"
+            requested_model
+                .clone()
+                .unwrap_or_else(|| "gpt-6-astra".to_owned())
+        };
+        let effort = requested_effort
+            .clone()
+            .unwrap_or_else(|| "xhigh".to_owned());
+        // An intentionally overlapping token subset for the accounting cases:
+        // cached input above total input and reasoning above output.
+        let (cached, reasoning_tokens) = if env::var("HARNESS_OUTCOME_TOKEN_OVERLAP").is_ok() {
+            (25, 9)
+        } else {
+            (5, 2)
         };
         let recorded_id = if mode == "misnamed-rollout" {
             child
@@ -49,8 +85,9 @@ pub fn run() -> io::Result<()> {
         };
         let records = [
             json!({"type":"session_meta","payload":{"id":recorded_id}}),
-            json!({"type":"turn_context","payload":{"model":model,"effort":"xhigh"}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":5,"output_tokens":7,"reasoning_output_tokens":2,"total_tokens":27}}}}),
+            json!({"type":"turn_context","payload":{"model":model,"effort":effort}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":cached,"output_tokens":7,"reasoning_output_tokens":reasoning_tokens,"total_tokens":27}}}}),
+            json!({"type":"token_usage_record","payload":{"response_id":"response-1","turn_id":"turn-1","usage":{"input_tokens":20,"cached_input_tokens":cached,"output_tokens":7,"reasoning_output_tokens":reasoning_tokens,"total_tokens":27}}}),
         ];
         let bytes = records.iter().map(|r| format!("{r}\n")).collect::<String>();
         fs::write(sessions.join(format!("rollout-{ID}.jsonl")), &bytes)?;
@@ -67,18 +104,22 @@ pub fn run() -> io::Result<()> {
     emit(
         json!({"type":"item.completed","item":{"type":"agent_message","id":"message","text":"Tests passed"}}),
     )?;
-    emit(
-        json!({"type":"item.started","item":{"type":"command_execution","id":"starting","status":"in_progress","aggregated_output":"","exit_code":0,"command":"native verify"}}),
-    )?;
-    emit(
-        json!({"type":"item.completed","item":{"type":"command_execution","id":"unknown","status":"completed","aggregated_output":"","exit_code":null,"command":"native verify"}}),
-    )?;
-    emit(
-        json!({"type":"item.completed","item":{"type":"command_execution","id":"read","status":"completed","aggregated_output":"","exit_code":0,"command":"pwd"}}),
-    )?;
-    emit(
-        json!({"type":"item.completed","item":{"type":"command_execution","id":"check","status":"completed","aggregated_output":"","exit_code":0,"command":"native verify"}}),
-    )?;
+    // A text-only completion exercises the unsupported-tool-exchange path:
+    // the model answers without any tool round-trip.
+    if mode != "text-only" {
+        emit(
+            json!({"type":"item.started","item":{"type":"command_execution","id":"starting","status":"in_progress","aggregated_output":"","exit_code":0,"command":"native verify"}}),
+        )?;
+        emit(
+            json!({"type":"item.completed","item":{"type":"command_execution","id":"unknown","status":"completed","aggregated_output":"","exit_code":null,"command":"native verify"}}),
+        )?;
+        emit(
+            json!({"type":"item.completed","item":{"type":"command_execution","id":"read","status":"completed","aggregated_output":"","exit_code":0,"command":"pwd"}}),
+        )?;
+        emit(
+            json!({"type":"item.completed","item":{"type":"command_execution","id":"check","status":"completed","aggregated_output":"","exit_code":0,"command":"native verify"}}),
+        )?;
+    }
     if mode == "oracle"
         && let Ok(skill) = env::var("HARNESS_OUTCOME_ORACLE_SKILL")
     {

@@ -5,13 +5,14 @@ mod events;
 mod process_result;
 
 use harness_core::build_identity::{hash_file, ordinary};
+use harness_core::outcome_qualification::{LocalRunner, MATERIAL_FIELDS, RunnerRecord, WIRE_API};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -43,6 +44,9 @@ struct Request {
     profile: Option<String>,
     #[serde(default)]
     xai_auth: Option<XaiAuth>,
+    /// Explicit local runner configuration. Mutually exclusive with `profile`.
+    #[serde(default)]
+    runner: Option<LocalRunner>,
 }
 
 #[derive(Deserialize)]
@@ -61,7 +65,7 @@ fn default_output_limit() -> u64 {
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher in an isolated temporary case/home. Private evidence is retained; correctness requires a separate oracle."
+            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher in an isolated temporary case/home. An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. Private evidence is retained; correctness requires a separate oracle."
         );
         return Ok(0);
     }
@@ -197,10 +201,19 @@ pub(crate) fn isolated(path: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn selected_runner(request: &Request) -> io::Result<(&'static str, &'static str)> {
-    match request.profile.as_deref() {
-        None | Some("") => Ok((MODEL, "OpenAI")),
-        Some("xai") => {
+/// One explicitly selected route. The selection is exclusive: a conflicting
+/// or unknown selection is rejected instead of falling back to another route.
+enum Route<'a> {
+    Default,
+    Xai,
+    Local(&'a LocalRunner),
+}
+
+fn selected_route(request: &Request) -> io::Result<Route<'_>> {
+    match (request.profile.as_deref(), request.runner.as_ref()) {
+        (Some(_), Some(_)) => Err(invalid()),
+        (Some(""), None) | (None, None) => Ok(Route::Default),
+        (Some("xai"), None) => {
             let auth = request.xai_auth.as_ref().ok_or_else(invalid)?;
             if !auth.command.is_absolute()
                 || !auth.command.is_file()
@@ -209,10 +222,71 @@ fn selected_runner(request: &Request) -> io::Result<(&'static str, &'static str)
             {
                 return Err(invalid());
             }
-            Ok((XAI_MODEL, "xai"))
+            Ok(Route::Xai)
+        }
+        (None, Some(runner)) => {
+            validate_local_runner(runner)?;
+            Ok(Route::Local(runner))
         }
         _ => Err(invalid()),
     }
+}
+
+/// Bounded, control-free declaration text.
+fn token(value: &str, limit: usize) -> bool {
+    !value.is_empty() && value.chars().count() <= limit && !value.chars().any(char::is_control)
+}
+
+/// Documented reasoning levels the installed client advertises. The local
+/// serving configuration may support a narrower set; unsupported levels fail
+/// visibly during qualification rather than being silently rewritten.
+const REASONING_LEVELS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+fn validate_local_runner(runner: &LocalRunner) -> io::Result<()> {
+    let endpoint = runner.endpoint.as_str();
+    let rest = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .ok_or_else(invalid)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty()
+        || endpoint.len() > 2048
+        || !endpoint.bytes().all(|byte| byte.is_ascii_graphic())
+        || authority.contains('@')
+        || rest.contains(['?', '#'])
+        || !token(&runner.model, 256)
+    {
+        return Err(invalid());
+    }
+    for name in MATERIAL_FIELDS {
+        if let Some(value) = runner.identity.declared(name)
+            && !token(value, 512)
+        {
+            return Err(invalid());
+        }
+    }
+    if let Some(reasoning) = runner.identity.declared("reasoning")
+        && !REASONING_LEVELS.contains(&reasoning)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Writes the explicit local provider configuration into the isolated home.
+/// No credentials are written; the route sends no provider authorization.
+fn write_local_home(home: &Path, runner: &LocalRunner) -> io::Result<()> {
+    let quote = |value: &str| serde_json::to_string(value);
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model = {}\nmodel_provider = \"local\"\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[model_providers.local]\nname = \"Local\"\nbase_url = {}\nwire_api = \"{WIRE_API}\"\n\n[windows]\nsandbox = \"unelevated\"\n\n[features]\nhooks = false\n",
+            quote(&runner.model)?,
+            quote(&runner.endpoint)?,
+        ),
+    )
 }
 
 fn write_xai_home(home: &Path, auth: &XaiAuth) -> io::Result<()> {
@@ -286,12 +360,18 @@ pub(crate) fn config_arguments(config: &BTreeMap<String, Value>) -> io::Result<V
             || [
                 "model",
                 "profile",
+                "runner",
                 "credential",
                 "auth",
                 "forced_login",
                 "service_tier",
                 "openai_base_url",
                 "chatgpt_base_url",
+                "temperature",
+                "top_p",
+                "top_k",
+                "seed",
+                "cache_prompt",
                 "cli_auth_credentials_store",
                 "oss_provider",
             ]
@@ -342,18 +422,42 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     };
     result["failure_phase"] = json!("validation");
     let (case, home, user, mut extra) = validate(request)?;
-    let (model, provider) = selected_runner(request)?;
-    if provider == "xai" {
-        write_xai_home(&home, request.xai_auth.as_ref().ok_or_else(invalid)?)?;
-        extra.splice(
-            0..0,
-            [
-                "-c".into(),
-                format!("model_provider={}", json!("xai")),
-                "--disable".into(),
-                "hooks".into(),
-            ],
-        );
+    let route = selected_route(request)?;
+    let model = match &route {
+        Route::Default => MODEL.to_owned(),
+        Route::Xai => XAI_MODEL.to_owned(),
+        Route::Local(runner) => runner.model.clone(),
+    };
+    let reasoning = match &route {
+        Route::Local(runner) => runner.identity.declared("reasoning").map(str::to_owned),
+        _ => Some(EFFORT.to_owned()),
+    };
+    match &route {
+        Route::Xai => {
+            write_xai_home(&home, request.xai_auth.as_ref().ok_or_else(invalid)?)?;
+            extra.splice(
+                0..0,
+                [
+                    "-c".into(),
+                    format!("model_provider={}", json!("xai")),
+                    "--disable".into(),
+                    "hooks".into(),
+                ],
+            );
+        }
+        Route::Local(runner) => {
+            write_local_home(&home, runner)?;
+            extra.splice(
+                0..0,
+                [
+                    "-c".into(),
+                    format!("model_provider={}", json!("local")),
+                    "--disable".into(),
+                    "hooks".into(),
+                ],
+            );
+        }
+        Route::Default => {}
     }
     if root.starts_with(&case)
         || root.starts_with(&home)
@@ -366,7 +470,7 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     let stdout = root.join("events.jsonl");
     let stderr = root.join("stderr.txt");
     let stdin = root.join("stdin.txt");
-    let args: Vec<String> = [
+    let mut args: Vec<String> = [
         "exec",
         "--strict-config",
         "--skip-git-repo-check",
@@ -375,26 +479,33 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     ]
     .into_iter()
     .map(str::to_owned)
-    .chain([
-        display_path(&case),
-        "-m".into(),
-        model.into(),
-        "-c".into(),
-        format!("model_reasoning_effort={}", json!(EFFORT)),
-    ])
-    .chain(extra)
-    .chain([
+    .chain([display_path(&case), "-m".into(), model.clone()])
+    .collect();
+    if let Some(reasoning) = &reasoning {
+        args.extend([
+            "-c".into(),
+            format!("model_reasoning_effort={}", json!(reasoning)),
+        ]);
+    }
+    args.extend(extra);
+    args.extend([
         "--output-last-message".into(),
         display_path(&final_path),
         "-".into(),
-    ])
-    .collect();
+    ]);
     create(&stdin)?.write_all(request.prompt.as_bytes())?;
     let mut spec = CommandSpec::new(&request.launcher);
     spec.args = args.iter().map(OsString::from).collect();
     spec.current_dir = Some(case.clone());
     spec.env
         .insert("CODEX_HOME".into(), Some(display_path(&home).into()));
+    if matches!(route, Route::Local(_)) {
+        // The explicit local route never inherits ambient provider credentials:
+        // an unattended fallback to a cloud endpoint or billing route is refused.
+        for name in ["OPENAI_API_KEY", "OPENAI_BASE_URL"] {
+            spec.env.insert(name.into(), None);
+        }
+    }
     if let Some(user) = &user {
         spec.env
             .insert("USERPROFILE".into(), Some(display_path(user).into()));
@@ -407,11 +518,29 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     spec.stderr = Some(create(&stderr)?);
     result["executable_sha256"] = json!(hash_file(&request.launcher)?);
     result["model"] = json!(model);
-    result["effort"] = json!(EFFORT);
+    result["effort"] = json!(reasoning);
+    if let Route::Local(runner) = &route {
+        result["runner"] = serde_json::to_value(RunnerRecord::new(runner))?;
+        // Verified against the installed client: its Responses request carries
+        // model/instructions/input/tools/reasoning and no sampling or prompt
+        // cache fields, so a per-request fixed seed, `cache_prompt=false` or
+        // deterministic decoding cannot be expressed through this transport.
+        // The route records that limitation instead of pretending to control
+        // decoding; supplied serving settings stay declared runner identity.
+        result["determinism"] = json!({
+            "client_overrides": [],
+            "effect": "server-side defaults apply",
+            "unsupported_request_controls": ["seed", "temperature", "top_p", "cache_prompt"],
+            "note": "the route applies no per-request decoding or prompt-cache controls because the installed client transport exposes no such request fields"
+        });
+    }
     let mut environment = json!({"CODEX_HOME": home});
     if let Some(user) = &user {
         environment["USERPROFILE"] = json!(user);
         environment["HOME"] = json!(user);
+    }
+    if matches!(route, Route::Local(_)) {
+        environment["removedProviderCredentials"] = json!(["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
     }
     write_new(
         &root.join("request.json"),
@@ -497,6 +626,15 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
         result[key] = value.clone();
     }
     let mut errors = telemetry.errors;
+    match observed_counters(&stdout) {
+        Ok((tool_operations, rounds)) => {
+            result["tool_operations"] = json!(tool_operations);
+            result["rounds"] = json!(rounds);
+        }
+        Err(_) => {
+            errors.insert("missing_observation_counters".into());
+        }
+    }
     if result["status"] == "completed" && result["turn_completed"] != true {
         result["status"] = json!("incomplete");
     }
@@ -553,18 +691,32 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
     let verified = identities_match
         && errors.is_empty()
         && observed.iter().all(|t| {
-            (t["model"] == model
-                || t["model"] == format!("openai/{model}")
-                || t["model"] == format!("xai/{model}"))
-                && t["reasoning"] == EFFORT
-                && t["provider"]
+            let observed_model = t["model"].as_str().unwrap_or("");
+            let model_match = observed_model == model
+                || observed_model == format!("openai/{model}")
+                || observed_model == format!("xai/{model}");
+            let reasoning_match = reasoning.as_deref() == t["reasoning"].as_str();
+            let provider_match = match &route {
+                Route::Default => t["provider"]
                     .as_str()
-                    .is_some_and(|seen| seen.eq_ignore_ascii_case(provider))
+                    .is_some_and(|seen| seen.eq_ignore_ascii_case("OpenAI")),
+                Route::Xai => t["provider"]
+                    .as_str()
+                    .is_some_and(|seen| seen.eq_ignore_ascii_case("xai")),
+                // Arbitrary local model names stay unattributed; the observed
+                // attribution must agree with this model name's own mapping.
+                Route::Local(_) => {
+                    t["provider"].as_str().map(str::to_owned)
+                        == harness_core::rollout_reader::model_provider(&model).map(str::to_owned)
+                }
+            };
+            model_match && reasoning_match && provider_match
         });
     if !verified {
         errors.insert("observed_model_policy_unverified".into());
     }
-    // This is observed model/effort metadata, not endpoint or authentication proof.
+    // Observed model/effort/route-attribution consistency, not endpoint or
+    // authentication proof.
     result["observed_model_metadata_verified"] = json!(verified);
     result["observed_threads"] = json!(observed);
     if result["children"].as_array().is_some_and(|a| !a.is_empty()) {
@@ -586,6 +738,33 @@ fn execute(request: &Request, root: &Path, result: &mut Value) -> io::Result<()>
 #[cfg(not(windows))]
 fn execute(_: &Request, _: &Path, _: &mut Value) -> io::Result<()> {
     Err(invalid())
+}
+
+/// Counts completed interaction rounds and completed tool items from the
+/// retained visible event stream. Only complete JSON lines count, so a failed
+/// attempt retains what was actually observed and nothing more. Call and
+/// operation counts stay distinguishable from model-request counts, which the
+/// rollout usage carries separately.
+fn observed_counters(events: &Path) -> io::Result<(u64, u64)> {
+    let mut rounds = 0_u64;
+    let mut tool_operations = 0_u64;
+    for line in io::BufReader::new(File::open(events)?).lines() {
+        let Ok(event) = serde_json::from_str::<Value>(&line?) else {
+            continue;
+        };
+        if event["type"] == "turn.completed" {
+            rounds = rounds.saturating_add(1);
+        }
+        if event["type"] == "item.completed"
+            && matches!(
+                event["item"]["type"].as_str(),
+                Some("command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call")
+            )
+        {
+            tool_operations = tool_operations.saturating_add(1);
+        }
+    }
+    Ok((tool_operations, rounds))
 }
 
 fn rollout_paths(

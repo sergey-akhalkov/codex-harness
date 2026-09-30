@@ -137,6 +137,26 @@ pub fn wall_span(spans: &[Value]) -> Option<f64> {
     elapsed.is_finite().then_some(elapsed)
 }
 
+/// One retained observed counter over an attempt's native runs: `null` when no
+/// run recorded it, otherwise the sum. A missing counter is never assumed.
+fn counter_total(runs: &[Value], key: &str) -> Value {
+    if runs.is_empty() {
+        return Value::Null;
+    }
+    let mut total = 0_u64;
+    for run in runs {
+        match run
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| total.checked_add(value))
+        {
+            Some(value) => total = value,
+            None => return Value::Null,
+        }
+    }
+    json!(total)
+}
+
 fn strings(values: &[Value]) -> io::Result<BTreeSet<String>> {
     values
         .iter()
@@ -300,6 +320,8 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     if status != "accepted" {
         reasons.insert(format!("outcome_{status}"));
     }
+    row["tool_operations"] = counter_total(native, "tool_operations");
+    row["rounds"] = counter_total(native, "rounds");
     row["unit"] = json!(unit_of(record));
     row["excluded_reasons"] = json!(reasons);
     Ok(row)
@@ -488,6 +510,26 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
                 .map(|(a, b)| a + b)
                 .filter(|v| v.is_finite())
         );
+        // Retried work stays accounted: the chain total includes every
+        // recorded attempt's observed counters, and an unknown counter on any
+        // recorded attempt keeps the whole total unknown.
+        let chain_counter = |key: &str| -> Value {
+            let mut total = 0_u64;
+            for &i in &chain {
+                match rows[i][key]
+                    .as_u64()
+                    .and_then(|value| total.checked_add(value))
+                {
+                    Some(value) => total = value,
+                    None => return Value::Null,
+                }
+            }
+            json!(total)
+        };
+        let total_tool_operations = chain_counter("tool_operations");
+        let total_rounds = chain_counter("rounds");
+        rows[index]["total_tool_operations"] = total_tool_operations;
+        rows[index]["total_rounds"] = total_rounds;
         rows[index]["task_root"] = if complete {
             rows[*chain.last().unwrap()]["attempt_id"].clone()
         } else {
@@ -1191,6 +1233,45 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn tool_operation_and_round_counters_stay_scoped_and_unknown() {
+        let mut row = attempt("a", "baseline", 0.0, 10.0);
+        row["native_runs"][0]["tool_operations"] = json!(3);
+        row["native_runs"][0]["rounds"] = json!(1);
+        let result = summarize_attempts(&[row.clone()]).unwrap();
+        assert_eq!(result["attempts"][0]["tool_operations"], 3);
+        assert_eq!(result["attempts"][0]["rounds"], 1);
+        assert_eq!(result["attempts"][0]["total_tool_operations"], 3);
+        assert_eq!(result["attempts"][0]["total_rounds"], 1);
+
+        // An unrecorded counter is unknown, not assumed, and the counters are
+        // independent of each other.
+        let mut partial = attempt("b", "baseline", 0.0, 10.0);
+        partial["native_runs"][0]["tool_operations"] = json!(2);
+        let result = summarize_attempts(&[partial]).unwrap();
+        assert_eq!(result["attempts"][0]["tool_operations"], 2);
+        assert!(result["attempts"][0]["rounds"].is_null());
+        assert!(result["attempts"][0]["total_rounds"].is_null());
+
+        // Retried work stays accounted: the chain total includes every
+        // recorded attempt once, and an unknown counter keeps it unknown.
+        let mut retry = attempt("c", "baseline", 11.0, 20.0);
+        retry["retry_of"] = "a".into();
+        retry["native_runs"][0]["tool_operations"] = json!(2);
+        retry["native_runs"][0]["rounds"] = json!(1);
+        let result = summarize_attempts(&[row, retry]).unwrap();
+        let tip = &result["attempts"][1];
+        assert_eq!(tip["total_tool_operations"], 5);
+        assert_eq!(tip["total_rounds"], 2);
+        assert_eq!(tip["result_attempt_ids"], json!(["a", "c"]));
+
+        let mut unobserved = attempt("d", "baseline", 0.0, 10.0);
+        unobserved["native_runs"] = json!([]);
+        let result = summarize_attempts(&[unobserved]).unwrap();
+        assert!(result["attempts"][0]["tool_operations"].is_null());
+        assert!(result["attempts"][0]["total_tool_operations"].is_null());
     }
 
     #[test]

@@ -85,6 +85,7 @@ pub mod nuphus_stdio;
 pub mod opencodex_login;
 pub mod orchestration_config;
 pub mod orchestration_lifecycle;
+pub mod outcome_qualification;
 pub mod outcome_report;
 pub mod pacing;
 pub mod path_plan;

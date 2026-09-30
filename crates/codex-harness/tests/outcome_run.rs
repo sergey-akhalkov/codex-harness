@@ -1,6 +1,14 @@
 //! Actual CLI and Rust process doubles. No live model, OAuth or global writes.
 #![cfg(windows)]
+use harness_core::{
+    build_identity::hash_file,
+    outcome_qualification::{
+        QualificationAttempt, QualificationStatus, RepeatabilityPolicy, RunnerRecord, drift,
+        qualification_attempt, qualify, smoke,
+    },
+};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -85,6 +93,52 @@ fn has_error(row: &Value, error: &str) -> bool {
     row["evidence_errors"]
         .as_array()
         .is_some_and(|a| a.iter().any(|v| v == error))
+}
+
+/// Synthetic local runner values: never the supplied private model identity.
+fn local_identity() -> Value {
+    json!({
+        "weights": "synth-gguf-sha256-0000",
+        "quantization": "Q4_K_M",
+        "tokenizer": "synth-tokenizer-v1",
+        "template": "synth-template-v3",
+        "backend": "synth-server-build-1",
+        "sampling": "temperature=1.0;top_k=20;top_p=0.95",
+        "seed": "server-default-random",
+        "reasoning": "xhigh",
+        "context": "262144",
+        "cache": "single-slot",
+        "environment": "owned fixture double; no inference"
+    })
+}
+
+fn local_runner() -> Value {
+    json!({
+        "endpoint": "http://127.0.0.1:65500/v1",
+        "model": "fixture-local-model",
+        "identity": local_identity()
+    })
+}
+
+fn policy() -> RepeatabilityPolicy {
+    RepeatabilityPolicy {
+        repeats: 2,
+        required_outputs: vec!["solution.txt".into()],
+        ignored_metadata: vec!["timing".into(), "thread_id".into()],
+    }
+}
+
+fn observation(result: &Value, digest: &str) -> QualificationAttempt {
+    qualification_attempt(
+        result,
+        BTreeMap::from([("solution.txt".to_owned(), digest.to_owned())]),
+    )
+    .unwrap()
+}
+
+fn recorded_runner(result: &Value) -> harness_core::outcome_qualification::LocalRunner {
+    let record: RunnerRecord = serde_json::from_value(result["runner"].clone()).unwrap();
+    record.runner()
 }
 
 #[test]
@@ -399,4 +453,400 @@ fn output_and_final_file_limits_stop_the_actual_process() {
         assert_eq!(row["process"]["Status"], "output-limit");
         assert_eq!(row["process"]["job"]["active_processes"], 0);
     }
+}
+
+#[test]
+fn local_runner_configuration_is_explicit_recorded_and_shared() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let row = f.run("success", 0);
+    assert_eq!(row["status"], "completed");
+    assert_eq!(row["model"], "fixture-local-model");
+    assert_eq!(row["effort"], "xhigh");
+    assert_eq!(row["runner"]["kind"], "local");
+    assert_eq!(row["runner"]["wire_api"], "responses");
+    assert_eq!(row["runner"]["endpoint"], "http://127.0.0.1:65500/v1");
+    assert_eq!(row["runner"]["identity"]["quantization"], "Q4_K_M");
+    assert!(
+        row["runner"]["identity_missing"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // The actual launcher invocation consumed the explicit local route.
+    let call = read(&f.case.join("fixture-call.json"));
+    let args = call["argv"].as_array().unwrap();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == "fixture-local-model")
+    );
+    assert!(args.contains(&json!("model_reasoning_effort=\"xhigh\"")));
+    assert!(args.contains(&json!("model_provider=\"local\"")));
+    assert!(args.contains(&json!("--disable")) && args.contains(&json!("hooks")));
+    // The effective provider configuration in the isolated home is the
+    // Responses-API local provider with no credentials.
+    let text = fs::read_to_string(f.home.join("config.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(config["model"].as_str(), Some("fixture-local-model"));
+    assert_eq!(config["model_provider"].as_str(), Some("local"));
+    assert_eq!(
+        config["model_providers"]["local"]["base_url"].as_str(),
+        Some("http://127.0.0.1:65500/v1")
+    );
+    assert_eq!(
+        config["model_providers"]["local"]["wire_api"].as_str(),
+        Some("responses")
+    );
+    assert!(config["model_providers"]["local"].get("env_key").is_none());
+    assert_eq!(config["approval_policy"].as_str(), Some("never"));
+    // The observed rollout echoed the requested identity through real plumbing.
+    assert_eq!(row["observed_model_metadata_verified"], true);
+    assert_eq!(row["observed_threads"][0]["model"], "fixture-local-model");
+    assert_eq!(row["observed_threads"][0]["reasoning"], "xhigh");
+    assert!(row["observed_threads"][0]["provider"].is_null());
+    // The verified transport limitation is evidence, not a silent assumption:
+    // per-request seed/cache_prompt/decoding controls are not expressible.
+    assert_eq!(row["determinism"]["client_overrides"], json!([]));
+    assert_eq!(row["determinism"]["effect"], "server-side defaults apply");
+    assert_eq!(
+        row["determinism"]["unsupported_request_controls"],
+        json!(["seed", "temperature", "top_p", "cache_prompt"])
+    );
+    // Local usage stays unattributed instead of being booked to a cloud route.
+    assert_eq!(row["usage"]["unattributed"]["total_tokens"], 27);
+    assert_eq!(row["usage"]["unattributed"]["thread_count"], 1);
+    assert_eq!(row["usage"]["status"], "partial");
+    assert!(
+        row["usage"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "unsupported_or_missing_model")
+    );
+}
+
+#[test]
+fn local_runner_rejects_missing_invalid_or_conflicting_selection() {
+    let f = Fixture::new();
+    for (key, value) in [
+        ("endpoint", json!("")),
+        ("endpoint", json!("not-a-url")),
+        ("endpoint", json!("ftp://127.0.0.1:65500/v1")),
+        (
+            "endpoint",
+            json!("http://user:private-secret@127.0.0.1:65500/v1"),
+        ),
+        (
+            "endpoint",
+            json!("http://127.0.0.1:65500/v1?token=PRIVATE_QUERY"),
+        ),
+        ("endpoint", json!("http://127.0.0.1:65500/v1#fragment")),
+        ("model", json!("")),
+        ("model", json!("x".repeat(300))),
+        ("identity.weights", json!("w".repeat(600))),
+        ("identity.reasoning", json!("brisk")),
+    ] {
+        let mut runner = local_runner();
+        if let Some(identity_key) = key.strip_prefix("identity.") {
+            runner["identity"][identity_key] = value;
+        } else {
+            runner[key] = value;
+        }
+        f.edit("runner", runner);
+        let row = f.run("success", 1);
+        assert_eq!(row["status"], "failed", "{key}");
+        assert!(!evidence(&row).join("started.json").exists());
+        assert!(!f.case.join("fixture-call.json").exists());
+        let serialized = row.to_string();
+        for secret in ["private-secret", "PRIVATE_QUERY"] {
+            assert!(!serialized.contains(secret), "{key}");
+        }
+    }
+    // An explicit profile route and an explicit local runner never combine.
+    f.edit("runner", local_runner());
+    f.edit("profile", json!("xai"));
+    let row = f.run("success", 1);
+    assert_eq!(row["status"], "failed");
+    assert!(!f.case.join("fixture-call.json").exists());
+    // Structurally missing or unknown runner fields are rejected before any
+    // evidence directory exists.
+    for runner in [
+        json!({"model": "fixture-local-model", "identity": local_identity()}),
+        json!({"endpoint": "http://127.0.0.1:65500/v1", "identity": local_identity()}),
+        json!({"endpoint": "http://127.0.0.1:65500/v1", "model": "fixture-local-model",
+               "wire_api": "responses", "identity": local_identity()}),
+        json!({"endpoint": "http://127.0.0.1:65500/v1", "model": "fixture-local-model",
+               "identity": local_identity(), "extra": true}),
+    ] {
+        f.edit("runner", runner);
+        let out = f.command("success").output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(!f.case.join("fixture-call.json").exists());
+    }
+}
+
+#[test]
+fn missing_identity_is_recorded_and_blocks_qualification() {
+    let f = Fixture::new();
+    let mut runner = local_runner();
+    runner["identity"]["quantization"] = Value::Null;
+    runner["identity"]["cache"] = Value::Null;
+    f.edit("runner", runner);
+    let row = f.run("success", 0);
+    assert_eq!(row["observed_model_metadata_verified"], true);
+    assert_eq!(
+        row["runner"]["identity_missing"],
+        json!(["quantization", "cache"])
+    );
+    let mut first = observation(&row, "digest-a");
+    let mut second = first.clone();
+    second.attempt_id.push_str("#2");
+    first.attempt_id.push_str("#1");
+    let result = qualify(&recorded_runner(&row), &policy(), &[first, second]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.missing_identity, vec!["quantization", "cache"]);
+    assert_eq!(result.divergent_outputs.len(), 0);
+}
+
+#[test]
+fn controlled_repeats_qualify_and_divergent_outputs_suspend_comparisons() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let run = |content: &str| -> (Value, String) {
+        let out = f
+            .command("success")
+            .env("HARNESS_OUTCOME_SOLUTION", content)
+            .output()
+            .unwrap();
+        let row = f.check(out, 0);
+        let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+        (row, digest)
+    };
+    let (first, first_digest) = run("repeatable controlled solution\n");
+    assert_eq!(first["status"], "completed");
+    assert_eq!(first["tool_operations"], 3);
+    assert_eq!(first["rounds"], 1);
+    let (second, second_digest) = run("repeatable controlled solution\n");
+    assert_eq!(first_digest, second_digest);
+    let runner = recorded_runner(&first);
+    let mut a1 = observation(&first, &first_digest);
+    let mut a2 = observation(&second, &second_digest);
+    a1.attempt_id.push_str("#1");
+    a2.attempt_id.push_str("#2");
+    assert!(a1.model_metadata_verified && a2.model_metadata_verified);
+    assert!(a1.tool_operations > 0 && a2.tool_operations > 0);
+    let result = qualify(&runner, &policy(), &[a1.clone(), a2]).unwrap();
+    assert_eq!(result.status, QualificationStatus::Qualified, "{result:?}");
+    assert!(result.missing_identity.is_empty());
+
+    // A repeat that produced different controlled output must suspend strict
+    // dependent comparisons and name the divergent output.
+    let (third, third_digest) = run("divergent controlled solution\n");
+    assert_ne!(first_digest, third_digest);
+    let mut a3 = observation(&third, &third_digest);
+    a3.attempt_id.push_str("#3");
+    let result = qualify(&runner, &policy(), &[a1.clone(), a3]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.divergent_outputs, vec!["solution.txt"]);
+    assert!(result.missing_outputs.is_empty());
+}
+
+#[test]
+fn text_only_attempt_reports_unsupported_tool_exchange() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let row = f.run("text-only", 0);
+    assert_eq!(row["status"], "completed");
+    assert_eq!(row["tool_operations"], 0);
+    assert_eq!(row["rounds"], 1);
+    assert!(row["first_command_result"].is_null());
+    assert_eq!(row["observed_model_metadata_verified"], true);
+    let mut a1 = observation(&row, "digest-a");
+    let mut a2 = a1.clone();
+    a1.attempt_id.push_str("#1");
+    a2.attempt_id.push_str("#2");
+    let result = qualify(&recorded_runner(&row), &policy(), &[a1, a2]).unwrap();
+    assert!(result.blocks_comparisons());
+    assert_eq!(result.tool_exchange_missing.len(), 2);
+}
+
+#[test]
+fn runner_drift_is_detected_from_recorded_attempt_evidence() {
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let first = f.run("success", 0);
+    let mut changed = local_runner();
+    changed["identity"]["quantization"] = json!("Q5_K_M");
+    f.edit("runner", changed);
+    let second = f.run("success", 0);
+    let result = drift(&recorded_runner(&first), &recorded_runner(&second));
+    assert!(result.drifted);
+    assert_eq!(result.changed, vec!["identity.quantization"]);
+    let unchanged = drift(&recorded_runner(&first), &recorded_runner(&first));
+    assert!(!unchanged.drifted && unchanged.changed.is_empty());
+}
+
+#[test]
+fn local_route_refuses_provider_treatment_and_never_falls_back() {
+    // A failed local attempt keeps its explicit route identity and does not
+    // retry through another provider, model or endpoint.
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let row = f.run("nonzero", 1);
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["model"], "fixture-local-model");
+    assert_eq!(row["runner"]["kind"], "local");
+    assert_eq!(row["tool_operations"], 3);
+    assert_eq!(row["rounds"], 1);
+    let request = read(&evidence(&row).join("request.json"));
+    let args = request["arguments"].as_array().unwrap();
+    assert_eq!(args.iter().filter(|arg| *arg == "-m").count(), 1);
+    assert!(args.contains(&json!("fixture-local-model")));
+    assert!(args.contains(&json!("model_provider=\"local\"")));
+    assert_eq!(
+        request["environment"]["removedProviderCredentials"],
+        json!(["OPENAI_API_KEY", "OPENAI_BASE_URL"])
+    );
+
+    // Ambient provider credentials cannot reach an explicit local attempt.
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let out = f
+        .command("success")
+        .env("OPENAI_API_KEY", "PRIVATE_AMBIENT_KEY")
+        .output()
+        .unwrap();
+    let row = f.check(out, 0);
+    assert!(!row.to_string().contains("PRIVATE_AMBIENT_KEY"));
+    let call = read(&f.case.join("fixture-call.json"));
+    assert_eq!(call["openai_api_key_present"], false);
+
+    // Provider, model and runner settings stay invalid treatment options.
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    for key in [
+        "model",
+        "model_provider",
+        "model_providers.local.base_url",
+        "model_providers.local.env_key",
+        "openai_base_url",
+        "runner",
+        "seed",
+        "temperature",
+        "top_p",
+        "top_k",
+        "cache_prompt",
+    ] {
+        f.edit("extra_config", json!({key: "PRIVATE_OVERRIDE"}));
+        let row = f.run("success", 1);
+        assert_eq!(row["status"], "failed", "{key}");
+        assert!(!f.case.join("fixture-call.json").exists());
+        assert!(!row.to_string().contains("PRIVATE_OVERRIDE"));
+    }
+}
+
+#[test]
+fn local_attempts_retain_counters_and_keep_accounting_scoped() {
+    // Unknown usage stays unknown while observed counters are retained.
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    f.edit("useful_command_pattern", Value::Null);
+    let row = f.run("no-rollout", 0);
+    assert_eq!(row["status"], "completed");
+    assert_eq!(row["tool_operations"], 3);
+    assert_eq!(row["rounds"], 1);
+    assert_eq!(row["usage"]["status"], "unknown");
+    assert!(row["usage"]["totals"]["total_tokens"].is_null());
+
+    // Overlapping token subsets are detected and stay recorded categories:
+    // one model request carried several tool operations, and cached input or
+    // reasoning tokens are not added into their supersets.
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    let out = f
+        .command("success")
+        .env("HARNESS_OUTCOME_TOKEN_OVERLAP", "1")
+        .output()
+        .unwrap();
+    let row = f.check(out, 0);
+    let totals = &row["usage"]["totals"];
+    assert_eq!(totals["input_tokens"], 20);
+    assert_eq!(totals["cached_input_tokens"], 25);
+    assert_eq!(totals["output_tokens"], 7);
+    assert_eq!(totals["reasoning_output_tokens"], 9);
+    assert_eq!(totals["total_tokens"], 27);
+    assert_eq!(row["usage"]["responses"]["response_count"], 1);
+    assert_eq!(row["tool_operations"], 3);
+    assert_eq!(row["rounds"], 1);
+    assert_eq!(row["usage"]["status"], "partial");
+    let warnings = row["usage"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "cached_input_exceeds_input")
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "reasoning_not_included_in_output")
+    );
+
+    // Timed-out work keeps its observed counters and process outcome.
+    let f = Fixture::new();
+    f.edit("runner", local_runner());
+    f.edit("timeout", json!(1));
+    let row = f.run("timeout", 1);
+    assert_eq!(row["status"], "timeout");
+    assert_eq!(row["process"]["Status"], "timeout");
+    assert_eq!(row["tool_operations"], 3);
+    assert_eq!(row["rounds"], 1);
+    assert_eq!(row["usage"]["totals"]["total_tokens"], 27);
+}
+
+#[test]
+fn smoke_observes_real_tool_round_trip_while_strict_qualification_stays_open() {
+    let f = Fixture::new();
+    // The supplied endpoint's weights and serving proof are not available on
+    // this host; those material facts stay unknown instead of being invented.
+    let mut runner = local_runner();
+    for field in [
+        "weights",
+        "quantization",
+        "tokenizer",
+        "template",
+        "backend",
+        "sampling",
+        "seed",
+        "context",
+        "cache",
+    ] {
+        runner["identity"][field] = Value::Null;
+    }
+    f.edit("runner", runner);
+    let out = f
+        .command("success")
+        .env("HARNESS_OUTCOME_SOLUTION", "smoke solution\n")
+        .output()
+        .unwrap();
+    let row = f.check(out, 0);
+    assert_eq!(row["status"], "completed");
+    assert_eq!(row["observed_model_metadata_verified"], true);
+    let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+    let recorded = recorded_runner(&row);
+    let attempt = observation(&row, &digest);
+    let basic = smoke(&recorded, std::slice::from_ref(&attempt));
+    assert!(basic.basic_execution_observed());
+    assert_eq!(basic.verified_attempts, 1);
+    assert_eq!(basic.tool_attempts, 1);
+    assert_eq!(basic.tool_operations, 3);
+    assert_eq!(basic.missing_identity.len(), 9);
+    // Strict repeatability qualification stays open: the material identity is
+    // incomplete, so dependent comparisons remain suspended.
+    let mut second = attempt.clone();
+    second.attempt_id.push_str("#2");
+    let strict = qualify(&recorded, &policy(), &[attempt, second]).unwrap();
+    assert!(strict.blocks_comparisons());
+    assert_eq!(strict.missing_identity.len(), 9);
+    assert!(strict.tool_exchange_missing.is_empty());
+    assert!(strict.divergent_outputs.is_empty());
 }

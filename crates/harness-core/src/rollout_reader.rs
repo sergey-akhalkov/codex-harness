@@ -361,6 +361,17 @@ pub fn unknown_usage() -> Usage {
     usage(&Value::Null)
 }
 
+/// Name-based provider attribution for recognized model names. Unknown or
+/// local model names stay unattributed (`None`): this function never guesses
+/// a provider or billing route.
+pub fn model_provider(model: &str) -> Option<&'static str> {
+    match model {
+        "gpt-6-astra" | "openai/gpt-6-astra" => Some("OpenAI"),
+        "xai/grok-4.6" | "grok-4.6" => Some("xai"),
+        _ => None,
+    }
+}
+
 pub fn list(value: &Value) -> &[Value] {
     value.as_array().map_or(&[], Vec::as_slice)
 }
@@ -623,7 +634,10 @@ impl Reader {
             let effort = effort
                 .as_str()
                 .filter(|v| {
-                    ["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(v)
+                    [
+                        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+                    ]
+                    .contains(v)
                 })
                 .map(str::to_owned);
             if let Some(e) = &effort {
@@ -820,11 +834,7 @@ impl Reader {
             self.warn("conflicting_parent_ids");
         }
         let model = only(&self.models);
-        let mut provider = match model.as_deref() {
-            Some("gpt-6-astra" | "openai/gpt-6-astra") => Some("OpenAI"),
-            Some("xai/grok-4.6" | "grok-4.6") => Some("xai"),
-            _ => None,
-        };
+        let mut provider = model.as_deref().and_then(model_provider);
         if self.models.len() > 1 {
             self.warn("mixed_model_attribution");
         } else if provider.is_none() {
