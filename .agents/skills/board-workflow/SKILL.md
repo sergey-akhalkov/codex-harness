@@ -215,3 +215,8 @@ Custom status `lead_review` (wip): configure with
 On a new lead session: read the board first (`lead_review`, assignee `lead`,
 ready work). Create new tasks for new situation; do not re-open completed
 verification.
+
+For a requested continuous improvement loop, use `self-improvement-loop` and
+the [sequential comparison record guide](references/self-improvement.md).
+It keeps hypotheses and scoped removal decisions on this board while the
+native controller owns run recovery; ordinary feedback routing stays above.

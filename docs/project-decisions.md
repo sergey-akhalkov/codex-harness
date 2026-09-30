@@ -625,6 +625,16 @@ model deployment details and qualification evidence remain local run inputs.
 The active [change](../openspec/changes/add-evidence-driven-self-improvement-loop/proposal.md)
 owns the sequential experiments and remaining acceptance.
 
+Each candidate and real evaluation workload has its own complete OpenSpec
+change before implementation, including instruction edits. Beads owns their
+hypotheses and evidence-backed decisions; the controller cursor owns only
+operational recovery. A-on-B then B-on-C uses exact retained candidates,
+independently checked solutions, frozen task inputs and separate runtimes.
+No change, reuse, simplification and subtraction are part of intake; size
+alone is no efficiency evidence. Removal needs a reviewable proposal and
+explicit consent covering the actual affected stages, independently of
+benefit. Experimental activation and live publication remain separate.
+
 **2026-09-19/20, confirmed:** the self-improvement loop runs on the consuming
 project's board, not in chat. Lead and executor observations become bounded
 `feedback` tasks; the lead batch-triages at safe boundaries; unique incubator
