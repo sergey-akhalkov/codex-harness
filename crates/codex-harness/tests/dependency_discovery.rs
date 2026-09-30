@@ -19,9 +19,14 @@ impl Fixture {
             .prefix("dependency-observation проверка-")
             .tempdir()
             .unwrap();
-        let source = root.path().join("source");
-        let home = root.path().join("absent-home");
-        let bin = root.path().join("bin");
+        // Canonicalize before every join: the process-observation cases
+        // compare discovered roots with the paths the OS reports for spawned
+        // children, and build agents can hand out a short 8.3 temp prefix
+        // (RUNNER~1) while the reported image path is the long form.
+        let base = root.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let home = base.join("absent-home");
+        let bin = base.join("bin");
         fs::create_dir_all(source.join("global")).unwrap();
         fs::copy(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../global/code-tools.json"),
@@ -44,7 +49,7 @@ impl Fixture {
             .arg(&self.source)
             .arg("--user-home")
             .arg(&self.home)
-            .current_dir(self.root.path());
+            .current_dir(self.home.parent().unwrap());
         command
     }
     fn observe(&self, extra: &[&str]) -> Value {
