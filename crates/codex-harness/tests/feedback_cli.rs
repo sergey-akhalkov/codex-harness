@@ -1318,3 +1318,773 @@ fn ledger_reports_a_withdrawal_after_a_supported_adoption() {
     );
     board.drop();
 }
+
+/// Admits one hypothesis through the real entry point and returns its card id.
+fn admit(board: &Board, mechanism: &str, conditions: &str, basis: &str) -> String {
+    admit_with(board, mechanism, conditions, basis, None)
+}
+
+/// The same, optionally naming a fresh evidential basis for reconsideration.
+fn admit_with(
+    board: &Board,
+    mechanism: &str,
+    conditions: &str,
+    basis: &str,
+    fresh_basis: Option<&str>,
+) -> String {
+    let mut args = vec![
+        "hypothesis-admit",
+        "--mechanism",
+        mechanism,
+        "--conditions",
+        conditions,
+        "--observation",
+        "ev-observation",
+        "--predicted",
+        "less repeated work",
+        "--counterexample",
+        "the burden does not recover",
+        "--acceptance",
+        "the declared check passes",
+        "--spec",
+        "openspec/changes/demo",
+        "--basis",
+        basis,
+    ];
+    if let Some(fresh) = fresh_basis {
+        args.push("--fresh-basis");
+        args.push(fresh);
+    }
+    let out = board.feedback(&args);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    let id = text
+        .split_whitespace()
+        .nth(1)
+        .expect("hypothesis id")
+        .to_owned();
+    assert!(id.starts_with("bdct-"), "{text}");
+    id
+}
+
+/// Publishes one evidence-bound decision through the real entry point.
+#[allow(clippy::too_many_arguments)]
+fn decision(
+    board: &Board,
+    item: &str,
+    experiment: &str,
+    outcome: &str,
+    quality: &str,
+    candidate_seconds: &str,
+    close: bool,
+    defer: Option<&str>,
+) -> std::process::Output {
+    let mut args = vec![
+        "hypothesis-decision",
+        "--item",
+        item,
+        "--experiment",
+        experiment,
+        "--outcome",
+        outcome,
+        "--quality",
+        quality,
+        "--matched",
+        "2",
+        "--tolerance-percent",
+        "10",
+        "--baseline-seconds",
+        "100",
+        "--candidate-seconds",
+        candidate_seconds,
+        "--baseline-arm",
+        "direct",
+        "--candidate-arm",
+        "lane",
+        "--accounting",
+        "check+rework",
+        "--baseline-revision",
+        "base001",
+        "--candidate-revision",
+        "cand002",
+        "--acceptance",
+        "evidence-9",
+        "--coverage",
+        "time+rounds",
+        "--scope",
+        "task:synthetic",
+        "--reason",
+        "lane-contention",
+        "--detail",
+        "paired synthetic task",
+    ];
+    if close {
+        args.push("--close");
+        args.push("yes");
+    }
+    if let Some(until) = defer {
+        args.push("--defer");
+        args.push(until);
+    }
+    board.feedback(&args)
+}
+
+/// Records one scoped user removal decision through the real entry point.
+fn removal_decision(
+    board: &Board,
+    item: &str,
+    decision: &str,
+    actions: Option<&str>,
+    basis: Option<&str>,
+    detail: &str,
+) -> std::process::Output {
+    let mut args = vec![
+        "removal-decide",
+        "--item",
+        item,
+        "--decision",
+        decision,
+        "--proposal",
+        "openspec/changes/remove-x",
+        "--target",
+        "skill-x",
+        "--detail",
+        detail,
+    ];
+    if let Some(actions) = actions {
+        args.push("--actions");
+        args.push(actions);
+    }
+    if let Some(basis) = basis {
+        args.push("--basis");
+        args.push(basis);
+    }
+    board.feedback(&args)
+}
+
+/// Resolves one exact removal scope through the real entry point.
+fn removal_check(board: &Board, item: &str, action: &str) -> std::process::Output {
+    board.feedback(&[
+        "removal-check",
+        "--item",
+        item,
+        "--proposal",
+        "openspec/changes/remove-x",
+        "--target",
+        "skill-x",
+        "--action",
+        action,
+    ])
+}
+
+fn hypothesis_card_count(board: &Board) -> usize {
+    let cards = bd_json(
+        &board.bd,
+        &board.project,
+        &["list", "--label", "hypothesis", "--all", "--json"],
+    );
+    cards.as_array().map(Vec::len).unwrap_or_default()
+}
+
+fn assert_no_votes(board: &Board, item: &str) {
+    let comments = board.comment_texts(item);
+    assert!(
+        !comments
+            .iter()
+            .any(|comment| comment.contains("feedback-vote")),
+        "hypothesis records must not manufacture votes: {comments:?}"
+    );
+}
+
+#[test]
+fn hypothesis_cards_own_relationships_and_pending_workload_benefit() {
+    let board = Board::new("hypothesis-ownership");
+    let a = admit(&board, "m-cache", "c-dispatch", "basis-a");
+    let b = admit(&board, "m-work", "c-dispatch", "basis-b");
+    assert_ne!(a, b);
+
+    let trial = board.feedback(&[
+        "hypothesis-trial",
+        "--item",
+        &a,
+        "--experiment",
+        "exp-1",
+        "--role",
+        "candidate",
+        "--counterpart",
+        &b,
+        "--evidence",
+        "runs/exp-1",
+    ]);
+    let text = output_text(&trial);
+    assert!(trial.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "trial hypothesis {a} experiment=exp-1 role=candidate counterpart={b} comment=written related=established"
+        )),
+        "{text}"
+    );
+    let after_trial = board.comment_texts(&a);
+    let retry = board.feedback(&[
+        "hypothesis-trial",
+        "--item",
+        &a,
+        "--experiment",
+        "exp-1",
+        "--role",
+        "candidate",
+        "--counterpart",
+        &b,
+    ]);
+    let text = output_text(&retry);
+    assert!(retry.status.success(), "{text}");
+    assert!(
+        text.contains("comment=already-recorded related=already-present"),
+        "{text}"
+    );
+    assert_eq!(
+        board.comment_texts(&a),
+        after_trial,
+        "an identical trial adds no comment"
+    );
+
+    let implementation = board.feedback(&[
+        "hypothesis-implement",
+        "--item",
+        &b,
+        "--role",
+        "workload",
+        "--branch",
+        "hypothesis/b",
+        "--base",
+        "0b960b4c87f21a38f5ade8b8d27e374bacb81b8a",
+        "--revision",
+        "abc1234",
+        "--worktree",
+        "wt-loc-1",
+        "--runtime",
+        "runtime-h-a",
+        "--baseline-runtime",
+        "runtime-h",
+    ]);
+    let text = output_text(&implementation);
+    assert!(implementation.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "implementation hypothesis {b} role=workload branch=hypothesis/b revision=abc1234 comment=written"
+        )),
+        "{text}"
+    );
+
+    let decided = decision(
+        &board,
+        &a,
+        "exp-1",
+        "reject",
+        "regressed",
+        "140",
+        true,
+        None,
+    );
+    let text = output_text(&decided);
+    assert!(decided.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "decision hypothesis {a} experiment=exp-1 outcome=reject publication=written"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("closed hypothesis {a} outcome=reject")),
+        "{text}"
+    );
+
+    // A finished its investigation; B still awaits its own benefit evaluation.
+    assert_eq!(board.item(&a)["status"], "closed");
+    assert_eq!(board.item(&b)["status"], "open");
+    let b_comments = board.comment_texts(&b);
+    assert!(
+        b_comments
+            .iter()
+            .any(|comment| comment.starts_with("hypothesis-implementation v1")),
+        "{b_comments:?}"
+    );
+    assert!(
+        !b_comments
+            .iter()
+            .any(|comment| comment.starts_with("benefit-gate")),
+        "an implemented workload records no adoption of its own: {b_comments:?}"
+    );
+    assert_no_votes(&board, &a);
+    assert_no_votes(&board, &b);
+
+    // The evaluation relationship is the nonblocking `related` edge.
+    let dependencies = board.item(&a)["dependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        dependencies.iter().any(|dependency| {
+            dependency["id"].as_str() == Some(b.as_str())
+                && dependency["dependency_type"] == "related"
+        }),
+        "{dependencies:?}"
+    );
+    assert_eq!(
+        hypothesis_card_count(&board),
+        2,
+        "one durable card per hypothesis"
+    );
+    board.drop();
+}
+
+#[test]
+fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
+    let board = Board::new("hypothesis-decision");
+    let h = admit(&board, "m-lane", "c-synthetic", "basis-1");
+    let before = board.comment_texts(&h).len();
+
+    let adopted = decision(&board, &h, "exp-1", "adopt", "unchanged", "96", false, None);
+    let text = output_text(&adopted);
+    assert!(adopted.status.success(), "{text}");
+    assert!(text.contains("publication=written"), "{text}");
+    assert_eq!(board.comment_texts(&h).len(), before + 1);
+
+    // The ledger reads the recorded evidence binding back.
+    let ledger = board.feedback(&["ledger", "--item", &h]);
+    let text = output_text(&ledger);
+    assert!(ledger.status.success(), "{text}");
+    assert!(text.contains("default=adopted"), "{text}");
+    assert!(text.contains("supported=yes"), "{text}");
+    assert!(text.contains("experiment=exp-1"), "{text}");
+
+    // A retried publication confirms the recorded decision with no new
+    // comment and no second apparent experiment.
+    let retry = decision(&board, &h, "exp-1", "adopt", "unchanged", "96", false, None);
+    let text = output_text(&retry);
+    assert!(retry.status.success(), "{text}");
+    assert!(text.contains("publication=already-recorded"), "{text}");
+    assert_eq!(
+        board.comment_texts(&h).len(),
+        before + 1,
+        "a retry adds no duplicate decision comment"
+    );
+
+    // Missing or contradictory evidence cannot authorize adoption.
+    let inert = decision(
+        &board,
+        &h,
+        "exp-2",
+        "adopt",
+        "unchanged",
+        "104",
+        false,
+        None,
+    );
+    let text = output_text(&inert);
+    assert!(!inert.status.success(), "{text}");
+    assert!(
+        text.contains("is not supported by its own comparison"),
+        "{text}"
+    );
+
+    let same_revision = board.feedback(&[
+        "hypothesis-decision",
+        "--item",
+        &h,
+        "--experiment",
+        "exp-3",
+        "--outcome",
+        "adopt",
+        "--quality",
+        "unchanged",
+        "--matched",
+        "2",
+        "--tolerance-percent",
+        "10",
+        "--baseline-seconds",
+        "100",
+        "--candidate-seconds",
+        "96",
+        "--baseline-arm",
+        "direct",
+        "--candidate-arm",
+        "lane",
+        "--accounting",
+        "check",
+        "--baseline-revision",
+        "base001",
+        "--candidate-revision",
+        "base001",
+        "--acceptance",
+        "evidence-9",
+        "--coverage",
+        "time",
+        "--scope",
+        "task:synthetic",
+        "--reason",
+        "lane-contention",
+    ]);
+    let text = output_text(&same_revision);
+    assert!(!same_revision.status.success(), "{text}");
+    assert!(text.contains("identical"), "{text}");
+
+    let missing = board.feedback(&[
+        "hypothesis-decision",
+        "--item",
+        &h,
+        "--experiment",
+        "exp-4",
+        "--outcome",
+        "adopt",
+        "--quality",
+        "unchanged",
+        "--matched",
+        "2",
+        "--tolerance-percent",
+        "10",
+        "--baseline-seconds",
+        "100",
+        "--candidate-seconds",
+        "96",
+        "--baseline-arm",
+        "direct",
+        "--candidate-arm",
+        "lane",
+        "--accounting",
+        "check",
+        "--baseline-revision",
+        "base001",
+        "--candidate-revision",
+        "cand002",
+        "--acceptance",
+        "",
+        "--coverage",
+        "time",
+        "--scope",
+        "task:synthetic",
+        "--reason",
+        "lane-contention",
+    ]);
+    let text = output_text(&missing);
+    assert!(!missing.status.success(), "{text}");
+    assert!(text.contains("acceptance is required"), "{text}");
+
+    assert_eq!(
+        board.comment_texts(&h).len(),
+        before + 1,
+        "refused publications write nothing"
+    );
+    assert_no_votes(&board, &h);
+    board.drop();
+}
+
+#[test]
+fn hypothesis_search_reuses_prior_conclusions_and_never_duplicates_cards() {
+    let board = Board::new("hypothesis-search");
+    let rejected = admit(&board, "m-rejected", "c-search", "basis-r");
+    let decided = decision(
+        &board,
+        &rejected,
+        "exp-r",
+        "reject",
+        "regressed",
+        "140",
+        true,
+        None,
+    );
+    assert!(decided.status.success(), "{}", output_text(&decided));
+
+    let deferred = admit(&board, "m-deferred", "c-search", "basis-d");
+    let inconclusive = decision(
+        &board,
+        &deferred,
+        "exp-d",
+        "inconclusive",
+        "unmeasurable",
+        "100",
+        false,
+        Some("+24h"),
+    );
+    assert!(
+        inconclusive.status.success(),
+        "{}",
+        output_text(&inconclusive)
+    );
+    assert_eq!(board.item(&deferred)["status"], "deferred");
+
+    let open = admit(&board, "m-open", "c-search", "basis-o");
+
+    // Search covers open, closed and deferred cards with their conclusions.
+    let search = board.feedback(&["hypothesis-search"]);
+    let text = output_text(&search);
+    assert!(search.status.success(), "{text}");
+    assert!(text.contains("hypotheses: 3 matching"), "{text}");
+    assert!(
+        text.contains(&format!("hypothesis {rejected} status=closed")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "hypothesis {rejected} latest=reject experiment=exp-r"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("hypothesis {deferred} status=deferred")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("hypothesis {open} status=open")),
+        "{text}"
+    );
+    let filtered = board.feedback(&["hypothesis-search", "--mechanism", "m-rejected"]);
+    let text = output_text(&filtered);
+    assert!(text.contains("hypotheses: 1 matching"), "{text}");
+    assert!(!text.contains(&open), "{text}");
+
+    // The same-condition rejection is reused as recorded: no new card, no
+    // new comment.
+    let before = board.comment_texts(&rejected);
+    let reused = board.feedback(&[
+        "hypothesis-admit",
+        "--mechanism",
+        "m-rejected",
+        "--conditions",
+        "c-search",
+        "--observation",
+        "ev-observation",
+        "--predicted",
+        "less repeated work",
+        "--counterexample",
+        "the burden does not recover",
+        "--acceptance",
+        "the declared check passes",
+        "--spec",
+        "openspec/changes/demo",
+        "--basis",
+        "basis-r",
+    ]);
+    let text = output_text(&reused);
+    assert!(reused.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "hypothesis {rejected} reused conclusion=reject experiment=exp-r reason=lane-contention basis=basis-r"
+        )),
+        "{text}"
+    );
+    assert_eq!(board.comment_texts(&rejected), before);
+    assert_eq!(hypothesis_card_count(&board), 3);
+
+    // A fresh evidential basis reconsiders the same card and preserves the
+    // earlier result.
+    let fresh = admit_with(
+        &board,
+        "m-rejected",
+        "c-search",
+        "basis-r",
+        Some("ev-fresh-2"),
+    );
+    assert_eq!(fresh, rejected, "reconsideration reuses the existing card");
+    let comments = board.comment_texts(&rejected);
+    assert!(
+        comments.iter().any(|comment| comment
+            == &format!(
+                "hypothesis-reconsideration v1 item={rejected} basis=ev-fresh-2 prior=exp-r conclusion=reject"
+            )),
+        "{comments:?}"
+    );
+    assert!(
+        comments
+            .iter()
+            .any(|comment| comment.starts_with("benefit-gate v2")),
+        "the earlier rejection is preserved: {comments:?}"
+    );
+    assert_eq!(board.item(&rejected)["status"], "open");
+    assert_eq!(hypothesis_card_count(&board), 3);
+
+    // Once reconsidered (active again), a repeated admission returns the
+    // existing card rather than creating another one.
+    let existing = admit_with(
+        &board,
+        "m-rejected",
+        "c-search",
+        "basis-r",
+        Some("ev-fresh-3"),
+    );
+    assert_eq!(existing, rejected);
+    assert_eq!(hypothesis_card_count(&board), 3);
+    assert_no_votes(&board, &rejected);
+    board.drop();
+}
+
+#[test]
+fn removal_authority_is_scoped_separate_from_benefit_and_latest_controlled() {
+    let board = Board::new("removal");
+    let candidate = admit(&board, "m-remove", "c-remove", "basis-1");
+    let workload = admit(&board, "m-workload", "c-remove", "basis-2");
+
+    // No decision exists yet; run-start authority and benefit verdicts are
+    // never treated as consent.
+    let missing = removal_check(&board, &candidate, "experiment");
+    assert_eq!(missing.status.code(), Some(1), "{}", output_text(&missing));
+    assert!(output_text(&missing).contains("result=missing"));
+
+    let proposal = board.feedback(&[
+        "removal-propose",
+        "--item",
+        &candidate,
+        "--proposal",
+        "openspec/changes/remove-x",
+        "--target",
+        "skill-x",
+        "--evidence",
+        "ev-removal",
+        "--loss",
+        "skill-x",
+        "--detail",
+        "preview prepared; nothing applied",
+    ]);
+    assert!(proposal.status.success(), "{}", output_text(&proposal));
+
+    // A decision for an unrecorded proposal is refused: the user decides on
+    // a presented proposal.
+    let early = board.feedback(&[
+        "removal-decide",
+        "--item",
+        &candidate,
+        "--decision",
+        "approve",
+        "--proposal",
+        "openspec/changes/remove-y",
+        "--target",
+        "skill-x",
+        "--actions",
+        "experiment",
+    ]);
+    let text = output_text(&early);
+    assert!(!early.status.success(), "{text}");
+    assert!(text.contains("no removal proposal"), "{text}");
+
+    let approve = removal_decision(
+        &board,
+        &candidate,
+        "approve",
+        Some("experiment"),
+        Some("user-turn-7"),
+        "approved the isolated experiment",
+    );
+    assert!(approve.status.success(), "{}", output_text(&approve));
+
+    let authorized = removal_check(&board, &candidate, "experiment");
+    assert_eq!(
+        authorized.status.code(),
+        Some(0),
+        "{}",
+        output_text(&authorized)
+    );
+    assert!(output_text(&authorized).contains("result=authorized"));
+    let uncovered = removal_check(&board, &candidate, "integration");
+    assert_eq!(uncovered.status.code(), Some(1));
+    assert!(output_text(&uncovered).contains("result=not-covered"));
+
+    // Workload B needs its own approval before any removal arm applies.
+    let workload_check = removal_check(&board, &workload, "experiment");
+    assert_eq!(workload_check.status.code(), Some(1));
+    assert!(output_text(&workload_check).contains("result=missing"));
+
+    // A favorable benefit result is not removal consent.
+    let benefit = decision(
+        &board,
+        &candidate,
+        "exp-1",
+        "adopt",
+        "unchanged",
+        "96",
+        false,
+        None,
+    );
+    assert!(benefit.status.success(), "{}", output_text(&benefit));
+    let after_benefit = removal_check(&board, &candidate, "integration");
+    assert_eq!(after_benefit.status.code(), Some(1));
+    assert!(output_text(&after_benefit).contains("result=not-covered"));
+
+    // Refusal is recorded separately, and a later approval supersedes it.
+    let refuse = removal_decision(
+        &board,
+        &candidate,
+        "refuse",
+        None,
+        Some("user-turn-8"),
+        "declined the removal",
+    );
+    assert!(refuse.status.success(), "{}", output_text(&refuse));
+    let refused = removal_check(&board, &candidate, "experiment");
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(output_text(&refused).contains("result=refused"));
+
+    let reapprove = removal_decision(
+        &board,
+        &candidate,
+        "approve",
+        Some("experiment+integration"),
+        Some("user-turn-9"),
+        "approved experiment and integration",
+    );
+    assert!(reapprove.status.success(), "{}", output_text(&reapprove));
+    let integration = removal_check(&board, &candidate, "integration");
+    assert_eq!(
+        integration.status.code(),
+        Some(0),
+        "{}",
+        output_text(&integration)
+    );
+
+    // Withdrawal blocks the next removal effect.
+    let withdraw = removal_decision(
+        &board,
+        &candidate,
+        "withdraw",
+        None,
+        None,
+        "withdrawn while the loop was stopped",
+    );
+    assert!(withdraw.status.success(), "{}", output_text(&withdraw));
+    let withdrawn = removal_check(&board, &candidate, "experiment");
+    assert_eq!(withdrawn.status.code(), Some(1));
+    assert!(output_text(&withdrawn).contains("result=withdrawn"));
+
+    // A newer unreadable decision cannot recover the older approval.
+    comment(
+        &board,
+        &candidate,
+        &format!("removal-decision v1 item={candidate}"),
+    );
+    let malformed = removal_check(&board, &candidate, "experiment");
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(output_text(&malformed).contains("result=not-covered"));
+
+    // A valid newer approval is honored again.
+    let final_approve = removal_decision(
+        &board,
+        &candidate,
+        "approve",
+        Some("experiment"),
+        Some("user-turn-10"),
+        "re-approved the isolated experiment",
+    );
+    assert!(
+        final_approve.status.success(),
+        "{}",
+        output_text(&final_approve)
+    );
+    let authorized = removal_check(&board, &candidate, "experiment");
+    assert_eq!(
+        authorized.status.code(),
+        Some(0),
+        "{}",
+        output_text(&authorized)
+    );
+    assert_no_votes(&board, &candidate);
+    board.drop();
+}

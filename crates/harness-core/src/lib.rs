@@ -4,6 +4,7 @@ pub mod analysis_samples;
 pub mod benefit_gate;
 pub mod board_cli;
 pub mod board_feedback;
+pub mod board_hypothesis;
 #[cfg(windows)]
 pub mod board_lifecycle;
 #[cfg(windows)]
