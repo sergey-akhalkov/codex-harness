@@ -15,12 +15,13 @@
 //! lead merges it or records an explicit discard.
 use crate::build_identity::hash_bytes;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs,
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1124,6 +1125,721 @@ pub fn upstream(path: &Path) -> io::Result<(String, Option<String>)> {
     };
     let branch = default_branch(path, &remote);
     Ok((remote, branch))
+}
+
+// ---------------------------------------------------------------------------
+// Experiment checkouts: frozen task copies and owned candidate worktrees.
+//
+// These additive operations serve the improvement experiment consumer. A
+// frozen task copy is an independent minimal repository materialized from an
+// exact committed tree: linked worktrees share objects and references and
+// therefore cannot hide a sibling solution. A candidate checkout is a
+// dedicated branch in its own worktree. The reuse verdict is read-only: it
+// never adopts, resets or deletes state it did not create.
+// ---------------------------------------------------------------------------
+
+const FROZEN_COMMIT_MESSAGE: &str = "frozen task snapshot";
+const FROZEN_IDENTITY_NAME: &str = "frozen-task";
+const FROZEN_IDENTITY_EMAIL: &str = "frozen-task@invalid";
+
+/// An independent minimal repository holding exactly the committed tree of
+/// one task revision. It has no remote, no parent history and no reference to
+/// the source checkout, so a sibling solution kept in the source repository is
+/// not discoverable from the copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenCopy {
+    pub source: PathBuf,
+    /// Resolved commit in the source repository.
+    pub source_revision: String,
+    pub path: PathBuf,
+    /// Root commit created in the copy; identical across copies of one
+    /// revision that share identity and dates.
+    pub revision: String,
+    /// Tree object recorded by the root commit.
+    pub tree: String,
+    /// Content digest over the snapshot's tree entries (`mode`, `object`,
+    /// `path`), independent of repository or commit identity.
+    pub tree_sha256: String,
+}
+
+/// A dedicated candidate branch in its own owned worktree, bound to an
+/// explicit accepted base revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateCheckout {
+    pub source: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    pub base: String,
+    pub revision: String,
+}
+
+/// Why an existing worktree cannot be reused. Every refusal leaves the
+/// worktree exactly as found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReuseBlock {
+    /// The source checkout itself or the running session's checkout.
+    CurrentCheckout,
+    Missing,
+    /// Not a registered worktree of the source repository.
+    Foreign,
+    /// An active experiment attempt or a Git operation owns the tree.
+    Busy,
+    /// Local, untracked or unmerged work would be lost by reuse.
+    Unpreserved,
+}
+
+/// Read-only reuse verdict for an existing allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorktreeReuse {
+    Eligible { revision: String },
+    Blocked { kind: ReuseBlock, reason: String },
+}
+
+struct TreeEntry {
+    mode: String,
+    object: String,
+    path: Vec<u8>,
+}
+
+fn git_bytes(cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+    let out = Command::new(git_program())
+        .args(args)
+        .current_dir(cwd)
+        .output()?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(io::Error::other(format!(
+            "git {}: {}",
+            args.first().unwrap_or(&"git"),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+fn frozen_error(detail: impl std::fmt::Display) -> io::Error {
+    pool_error(&format!("frozen task copy: {detail}"))
+}
+
+/// Refuse paths a Git tree cannot represent on an ordinary filesystem: no
+/// absolute prefix, no drive or backslash component, no `.`/`..` traversal.
+fn frozen_relative(path: &[u8]) -> io::Result<String> {
+    let text = std::str::from_utf8(path)
+        .map_err(|_| frozen_error("a tree path is not Unicode; refusing an inexact copy"))?;
+    if text.is_empty()
+        || text.starts_with('/')
+        || text.contains('\\')
+        || text.contains(':')
+        || text.contains('\0')
+        || !text
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+    {
+        return Err(frozen_error(format!(
+            "unsupported tree path '{text}'; refusing an inexact copy"
+        )));
+    }
+    Ok(text.to_owned())
+}
+
+/// The committed tree of `revision`, refusing entries the copy cannot
+/// represent exactly (submodules, symbolic links).
+fn frozen_tree_entries(repo: &Path, revision: &str) -> io::Result<Vec<TreeEntry>> {
+    let raw = git_bytes(repo, &["ls-tree", "-r", "-z", revision])?;
+    let mut entries = Vec::new();
+    for record in raw.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| frozen_error("unreadable tree entry"))?;
+        let meta = std::str::from_utf8(&record[..tab])
+            .map_err(|_| frozen_error("unreadable tree entry"))?;
+        let mut fields = meta.split(' ');
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let object = fields.next().unwrap_or_default();
+        if mode == "160000" {
+            return Err(frozen_error(
+                "the frozen revision contains a submodule; materialize it explicitly instead of an incomplete copy",
+            ));
+        }
+        if mode == "120000" {
+            return Err(frozen_error(
+                "the frozen revision contains a symbolic link; this platform cannot represent it exactly",
+            ));
+        }
+        if kind != "blob" || !matches!(mode, "100644" | "100755") {
+            return Err(frozen_error(format!(
+                "unsupported tree entry ({mode} {kind}) in the frozen revision"
+            )));
+        }
+        let path = record[tab + 1..].to_vec();
+        frozen_relative(&path)?;
+        entries.push(TreeEntry {
+            mode: mode.to_owned(),
+            object: object.to_owned(),
+            path,
+        });
+    }
+    Ok(entries)
+}
+
+/// Content digest over the snapshot's tree entries; independent of repository
+/// identity, commit metadata and working-tree state.
+fn frozen_tree_digest(entries: &[(String, String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    for (mode, object, path) in entries {
+        hasher.update(mode.as_bytes());
+        hasher.update(b" ");
+        hasher.update(object.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn frozen_entries_digest(entries: &[TreeEntry]) -> String {
+    let plain: Vec<(String, String, String)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.mode.clone(),
+                entry.object.clone(),
+                String::from_utf8_lossy(&entry.path).into_owned(),
+            )
+        })
+        .collect();
+    frozen_tree_digest(&plain)
+}
+
+/// Materialize every blob of the committed tree into `target` exactly as the
+/// object database stores it, without working-tree filters.
+fn frozen_materialize(
+    repo: &Path,
+    entries: &[TreeEntry],
+    target: &Path,
+) -> io::Result<Vec<(String, String)>> {
+    let mut child = Command::new(git_program())
+        .args(["cat-file", "--batch"])
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| frozen_error("git cat-file stdin was not captured"))?;
+    let mut stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| frozen_error("git cat-file stdout was not captured"))?,
+    );
+    let result = (|| -> io::Result<Vec<(String, String)>> {
+        let mut written = Vec::new();
+        for entry in entries {
+            writeln!(stdin, "{}", entry.object)?;
+            let mut header = String::new();
+            if stdout.read_line(&mut header)? == 0 {
+                return Err(frozen_error("git cat-file ended before the tree was read"));
+            }
+            let mut fields = header.trim_end().split(' ');
+            let object = fields.next().unwrap_or_default();
+            let kind = fields.next().unwrap_or_default();
+            let size: u64 = fields
+                .next()
+                .and_then(|size| size.parse().ok())
+                .ok_or_else(|| frozen_error("git cat-file returned an unreadable entry"))?;
+            if object != entry.object || kind != "blob" {
+                return Err(frozen_error(
+                    "git cat-file did not return the expected blob",
+                ));
+            }
+            let relative = frozen_relative(&entry.path)?;
+            let file = target.join(&relative);
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::File::create_new(&file)?;
+            let mut remaining = size;
+            let mut buffer = [0_u8; 64 * 1024];
+            while remaining > 0 {
+                let want = remaining.min(buffer.len() as u64) as usize;
+                let read = stdout.read(&mut buffer[..want])?;
+                if read == 0 {
+                    return Err(frozen_error("git cat-file ended inside a blob"));
+                }
+                file.write_all(&buffer[..read])?;
+                remaining -= read as u64;
+            }
+            let mut newline = [0_u8; 1];
+            stdout.read_exact(&mut newline)?;
+            if newline[0] != b'\n' {
+                return Err(frozen_error("git cat-file framing is inconsistent"));
+            }
+            file.sync_all()?;
+            written.push((relative, entry.object.clone()));
+        }
+        Ok(written)
+    })();
+    drop(stdin);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    if result.is_ok() && !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        return Err(frozen_error(format!(
+            "git cat-file failed: {}",
+            stderr.trim()
+        )));
+    }
+    result
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) -> io::Result<()> {
+    git(cwd, args).map(|_| ())
+}
+
+/// Create the copy's root commit from the materialized tree through plumbing
+/// only, so no attribute, filter or template can alter the frozen content.
+fn frozen_commit(
+    target: &Path,
+    tree: &str,
+    entries: &[TreeEntry],
+    files: &[(String, String)],
+    date: &str,
+) -> io::Result<String> {
+    git_ok(target, &["init", "-q", "-b", "main"])?;
+    for (key, value) in [
+        ("user.name", FROZEN_IDENTITY_NAME),
+        ("user.email", FROZEN_IDENTITY_EMAIL),
+        ("core.autocrlf", "false"),
+        ("core.safecrlf", "false"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git_ok(target, &["config", key, value])?;
+    }
+    let mut hash_object = Command::new(git_program())
+        .args(["hash-object", "-w", "--stdin-paths", "--no-filters"])
+        .current_dir(target)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = hash_object
+            .stdin
+            .take()
+            .ok_or_else(|| frozen_error("git hash-object stdin was not captured"))?;
+        for (relative, _) in files {
+            writeln!(stdin, "{relative}")?;
+        }
+    }
+    let output = hash_object.wait_with_output()?;
+    if !output.status.success() {
+        return Err(frozen_error(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let hashed: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .map_err(|_| frozen_error("git hash-object returned non-Unicode output"))?
+        .lines()
+        .collect();
+    if hashed.len() != files.len() {
+        return Err(frozen_error("git hash-object returned an unexpected count"));
+    }
+    for ((relative, expected), actual) in files.iter().zip(hashed) {
+        if actual.trim() != expected {
+            return Err(frozen_error(format!(
+                "materialized content of '{relative}' does not match the committed blob"
+            )));
+        }
+    }
+    let mut index_info = Vec::new();
+    for entry in entries {
+        index_info.extend_from_slice(entry.mode.as_bytes());
+        index_info.push(b' ');
+        index_info.extend_from_slice(entry.object.as_bytes());
+        index_info.push(b'\t');
+        index_info.extend_from_slice(&entry.path);
+        index_info.push(b'\n');
+    }
+    let mut update = Command::new(git_program())
+        .args(["update-index", "--index-info"])
+        .current_dir(target)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = update
+            .stdin
+            .take()
+            .ok_or_else(|| frozen_error("git update-index stdin was not captured"))?;
+        stdin.write_all(&index_info)?;
+    }
+    let output = update.wait_with_output()?;
+    if !output.status.success() {
+        return Err(frozen_error(format!(
+            "git update-index failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let written_tree = git(target, &["write-tree"])?.trim().to_owned();
+    if written_tree != tree {
+        return Err(frozen_error(
+            "the copy's tree does not match the frozen revision's tree",
+        ));
+    }
+    let revision = {
+        let out = Command::new(git_program())
+            .args(["commit-tree", tree, "-m", FROZEN_COMMIT_MESSAGE])
+            .current_dir(target)
+            .env("GIT_AUTHOR_NAME", FROZEN_IDENTITY_NAME)
+            .env("GIT_AUTHOR_EMAIL", FROZEN_IDENTITY_EMAIL)
+            .env("GIT_COMMITTER_NAME", FROZEN_IDENTITY_NAME)
+            .env("GIT_COMMITTER_EMAIL", FROZEN_IDENTITY_EMAIL)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()?;
+        if !out.status.success() {
+            return Err(frozen_error(format!(
+                "git commit-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    git_ok(target, &["update-ref", "refs/heads/main", &revision])?;
+    git_ok(target, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    git_ok(target, &["read-tree", "--reset", "HEAD"])?;
+    Ok(revision)
+}
+
+/// Materialize an independent minimal repository containing exactly the
+/// committed tree of `revision` in `source`. The target must not exist: the
+/// copy never merges into, adopts or overwrites existing state.
+pub fn frozen_copy(source: &Path, revision: &str, target: &Path) -> io::Result<FrozenCopy> {
+    let source = resolve_source(source)?;
+    if !is_git_checkout(&source)? {
+        return Err(frozen_error(
+            "a frozen task copy requires a Git source checkout",
+        ));
+    }
+    let absolute = std::path::absolute(target)?;
+    if absolute.exists() {
+        return Err(frozen_error(format!(
+            "{} already exists; refusing to merge or overwrite it",
+            absolute.display()
+        )));
+    }
+    let commit = resolve_commit(&source, revision)?;
+    let entries = frozen_tree_entries(&source, &commit)?;
+    let tree = git(&source, &["rev-parse", &format!("{commit}^{{tree}}")])?
+        .trim()
+        .to_owned();
+    let tree_sha256 = frozen_entries_digest(&entries);
+    let date = git(&source, &["show", "-s", "--format=%cI", &commit])?
+        .trim()
+        .to_owned();
+    if let Some(parent) = absolute.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(&absolute)?;
+    let populated = (|| -> io::Result<String> {
+        let files = frozen_materialize(&source, &entries, &absolute)?;
+        frozen_commit(&absolute, &tree, &entries, &files, &date)
+    })();
+    let revision = match populated {
+        Ok(revision) => revision,
+        Err(error) => {
+            // The target was exclusively created by this call; a partial copy
+            // is removed instead of being left as a half-materialized task.
+            let _ = fs::remove_dir_all(&absolute);
+            return Err(error);
+        }
+    };
+    let single = git(&absolute, &["rev-list", "--all", "--count"])?
+        .trim()
+        .to_owned();
+    let remotes = git(&absolute, &["remote"])?;
+    if single != "1" || !remotes.trim().is_empty() {
+        let _ = fs::remove_dir_all(&absolute);
+        return Err(frozen_error(
+            "the materialized copy is not an independent single-commit repository",
+        ));
+    }
+    Ok(FrozenCopy {
+        source,
+        source_revision: commit,
+        path: absolute,
+        revision,
+        tree,
+        tree_sha256,
+    })
+}
+
+/// Re-verify a frozen copy from its own repository content: the recorded root
+/// commit, tree and content digest still match, the repository has no remote
+/// and no shared parent history. Working-tree edits made by a task executor do
+/// not change the verified snapshot.
+pub fn verify_frozen(copy: &FrozenCopy) -> io::Result<()> {
+    if !copy.path.is_dir() {
+        return Err(frozen_error(format!("{} is missing", copy.path.display())));
+    }
+    let parents = git(
+        &copy.path,
+        &["rev-list", "--parents", "-n", "1", &copy.revision],
+    )?;
+    if parents.split_whitespace().count() != 1 {
+        return Err(frozen_error(
+            "the frozen revision has parent history; it is not an independent copy",
+        ));
+    }
+    let tree = git(
+        &copy.path,
+        &["rev-parse", &format!("{}^{{tree}}", copy.revision)],
+    )?;
+    if tree.trim() != copy.tree {
+        return Err(frozen_error("the frozen revision's tree changed"));
+    }
+    if !git(&copy.path, &["remote"])?.trim().is_empty() {
+        return Err(frozen_error(
+            "the frozen copy has a remote; sibling history may be reachable",
+        ));
+    }
+    let refs = git(&copy.path, &["for-each-ref", "--format=%(refname)"])?;
+    for reference in refs.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if !reference.starts_with("refs/heads/") && !reference.starts_with("refs/tags/") {
+            return Err(frozen_error(format!(
+                "the frozen copy holds foreign references ({reference})"
+            )));
+        }
+    }
+    let entries = frozen_tree_entries(&copy.path, &copy.revision)?;
+    if frozen_entries_digest(&entries) != copy.tree_sha256 {
+        return Err(frozen_error("the frozen content digest changed"));
+    }
+    Ok(())
+}
+
+/// Read-only reuse verdict for an existing worktree allocation. `current` is
+/// the checkout the running session executes from; `active` reports an active
+/// experiment attempt on the candidate. Refusals never touch the tree.
+pub fn worktree_reuse(
+    source: &Path,
+    path: &Path,
+    current: &Path,
+    expected_revision: &str,
+    active: bool,
+) -> io::Result<WorktreeReuse> {
+    let source = resolve_source(source)?;
+    let absolute = std::path::absolute(path)?;
+    let blocked = |kind: ReuseBlock, reason: String| Ok(WorktreeReuse::Blocked { kind, reason });
+    if same_path(&absolute, &source) || same_path(&absolute, current) {
+        return blocked(
+            ReuseBlock::CurrentCheckout,
+            format!(
+                "{} is the current checkout; reuse is refused",
+                absolute.display()
+            ),
+        );
+    }
+    if !absolute.is_dir() {
+        return blocked(
+            ReuseBlock::Missing,
+            format!("{} does not exist", absolute.display()),
+        );
+    }
+    if !is_git_checkout(&absolute)? {
+        return blocked(
+            ReuseBlock::Foreign,
+            format!("{} is not a Git checkout", absolute.display()),
+        );
+    }
+    let registered = registered_trees(&source)?;
+    if !registered
+        .iter()
+        .any(|tree| same_path(&tree.path, &absolute))
+    {
+        return blocked(
+            ReuseBlock::Foreign,
+            format!(
+                "{} is not a registered worktree of {}",
+                absolute.display(),
+                source.display()
+            ),
+        );
+    }
+    if active {
+        return blocked(
+            ReuseBlock::Busy,
+            "an experiment attempt is active in this worktree; it keeps its allocation".to_owned(),
+        );
+    }
+    let lock = git(&absolute, &["rev-parse", "--git-path", "index.lock"])?;
+    let lock = PathBuf::from(lock.trim());
+    let lock = if lock.is_absolute() {
+        lock
+    } else {
+        absolute.join(lock)
+    };
+    if lock.exists() {
+        return blocked(
+            ReuseBlock::Busy,
+            "a Git operation is in progress (index.lock exists); reuse is refused".to_owned(),
+        );
+    }
+    if !slot_status(&absolute)?.trim().is_empty() {
+        return blocked(
+            ReuseBlock::Unpreserved,
+            "the worktree holds local or untracked changes; they are preserved".to_owned(),
+        );
+    }
+    let head = git(&absolute, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let expected = resolve_commit(&absolute, expected_revision)?;
+    if head != expected {
+        return blocked(
+            ReuseBlock::Unpreserved,
+            format!(
+                "the worktree holds commits beyond the recorded revision {expected_revision}; they are preserved"
+            ),
+        );
+    }
+    Ok(WorktreeReuse::Eligible { revision: head })
+}
+
+/// Allocate the dedicated candidate branch in a new owned worktree from an
+/// explicit accepted base. An existing path or branch is another task's state
+/// and is never adopted, reset or reused here.
+pub fn allocate_candidate_checkout(
+    source: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> io::Result<CandidateCheckout> {
+    let source = resolve_source(source)?;
+    if !is_git_checkout(&source)? {
+        return Err(pool_error(
+            "candidate worktrees require a Git source checkout",
+        ));
+    }
+    let branch = branch.trim();
+    if branch.is_empty()
+        || branch.len() > 200
+        || branch.starts_with('-')
+        || branch.contains(char::is_whitespace)
+    {
+        return Err(pool_error(
+            "a candidate branch name is required and must be a plain Git branch name",
+        ));
+    }
+    let absolute = std::path::absolute(path)?;
+    if absolute.exists() {
+        return Err(pool_error(&format!(
+            "{} already exists; allocation refuses to adopt or reset an existing path",
+            absolute.display()
+        )));
+    }
+    if git(
+        &source,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .is_ok()
+    {
+        return Err(pool_error(&format!(
+            "branch {branch} already exists; refusing to reuse another task's branch"
+        )));
+    }
+    let commit = resolve_commit(&source, base)?;
+    if let Some(parent) = absolute.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let path_text = absolute
+        .to_str()
+        .ok_or_else(|| pool_error("candidate worktree path must be Unicode"))?;
+    let out = Command::new(git_program())
+        .args(["worktree", "add", "-b", branch, path_text, &commit])
+        .current_dir(&source)
+        .output()?;
+    if !out.status.success() {
+        return Err(pool_error(&format!(
+            "candidate worktree could not be created: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let revision = git(&absolute, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let head_branch = git(&absolute, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_owned();
+    if revision != commit || head_branch != branch {
+        return Err(pool_error(
+            "the new candidate worktree did not land on its branch and base",
+        ));
+    }
+    Ok(CandidateCheckout {
+        source,
+        path: absolute,
+        branch: branch.to_owned(),
+        base: commit.clone(),
+        revision: commit,
+    })
+}
+
+/// Verify a candidate checkout binding: the worktree is registered to its
+/// source repository, is on its dedicated branch and still records the exact
+/// committed revision. Uncommitted work in the tree is not a binding failure.
+pub fn verify_candidate_checkout(checkout: &CandidateCheckout) -> io::Result<()> {
+    if !checkout.path.is_dir() {
+        return Err(pool_error(&format!(
+            "candidate worktree {} is missing",
+            checkout.path.display()
+        )));
+    }
+    let head = git(&checkout.path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+    if head != checkout.revision {
+        return Err(pool_error(&format!(
+            "candidate worktree is at {head} instead of the bound revision {}",
+            checkout.revision
+        )));
+    }
+    let branch = git(
+        &checkout.path,
+        &["rev-parse", &format!("refs/heads/{}", checkout.branch)],
+    )?
+    .trim()
+    .to_owned();
+    if branch != checkout.revision {
+        return Err(pool_error(
+            "the candidate branch does not point at the bound revision",
+        ));
+    }
+    let registered = registered_trees(&checkout.source)?;
+    if !registered
+        .iter()
+        .any(|tree| same_path(&tree.path, &checkout.path))
+    {
+        return Err(pool_error(
+            "the candidate worktree is not registered to its source repository",
+        ));
+    }
+    Ok(())
 }
 
 fn default_branch(path: &Path, remote: &str) -> Option<String> {
