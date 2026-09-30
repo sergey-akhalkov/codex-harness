@@ -468,3 +468,38 @@ corrected).
 Task 12.4 remains open: an authorized actual CI run tied to the candidate
 revision requires remote publication and Actions enablement, neither of
 which has been authorized in this session.
+
+## Group 4: interval usage and proven incremental reuse (tasks 4.1-4.6)
+
+Implemented in worktree slot 2 (`exec-ds-interval`, base `22ba5c9`) and
+merged as `5239cc3` after review. The analyzer now carries versioned explicit
+activity-window and interval-usage accounting (half-open UTC windows,
+recorded-event-timestamp basis, declared reset/gap policy, attributable
+per-session usage with `unallocated` amounts and reasons, model/effort/day
+buckets with an explicit unresolved remainder, interval coverage counters;
+unknown stays unknown and no session-start bucket is spending). The shared
+reader carries per-response timestamps, turn-context attribution, cumulative
+snapshots, unidentified records and conflicts with unchanged `read()`
+semantics; the delegation-usage acceptance is unchanged (38/38). Incremental
+reuse rests on a proven change identity (NTFS ChangeTime plus `FILE_ID_INFO`
+plus size, no new dependency; the N09 same-size preserved-time mutation is
+caught), versioned disposable checkpoints at the last complete line, explicit
+full-parse fallback reasons and an atomic bounded cache store; equivalence
+holds on unchanged, append, partial tail, truncate, replace, same-size
+preserved-time mutation, corrupt cache, foreign parser version and missing
+cache. Measurements: synthetic 12.3 MB corpus cold 12.3 MB read, warm 0
+bytes/0 events with a byte-identical normalized report; real quiescent
+corpus (62 files, 228.6 MB) full scan 2873 ms, warm 388 ms with 0 bytes
+re-read and a byte-identical report; live 120 s tail: two grown files
+re-parsed (growth alone never proves an unchanged prefix), seven reused.
+Executor verification: check/fmt/clippy clean, all token-audit test binaries
+green (report 20/20, cli 10/10, baseline 11/11, findings 3/3, detail 9/9,
+lib 3/3), harness-core lib 746/746 after correcting the executor's own
+over-assertive append test, `rollout_reader` module 18/18, delegation-usage
+38/38. Lead verification: the 20 report tests were rerun independently and
+pass. Lead decisions: the small ownership extension (model.rs and one lib.rs
+export, two baseline test literals) is confirmed as necessary for the
+versioned output; the USN append fast path is not required for closure
+(changed files conservatively full-parse, the permitted fallback) and remains
+a future candidate behind its own evidence gate; interval text presentation
+stays a bounded follow-up in render.rs with JSON carrying the full contract.
