@@ -54,6 +54,19 @@ cargo run -p codex-harness --bin harness-source-check -- --root .
 
 ### Development feedback without a publication build
 
+The installed OpenSpec planning prerequisite is exercised without model calls:
+
+```powershell
+codex-harness heavy -- cargo test --locked -p harness-core --test improvement_spec --jobs 1 -- --include-ignored --test-threads=1
+```
+
+These checks cover repository and registered-store planning, missing acceptance
+sections and changed frozen artifacts. Fixtures isolate both `XDG_CONFIG_HOME`
+and `XDG_DATA_HOME`: OpenSpec's store registry uses its data directory, so checking
+the config path alone does not establish registry isolation. The adapter checks
+the resolved planning root before creating a change. Controller dispatch and
+model-backed comparisons require their separate integration acceptance.
+
 An edit that does not change delivery or publication behavior is checked
 through its existing package or integration target. A cold release
 publication (`codex-harness build`, `install` or `update`) is required only

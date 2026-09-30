@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fs, path::Path, process::Command};
 fn contract() -> ExperimentContract {
     ExperimentContract {
         acceptance_artifact: "design.md".into(),
+        acceptance_heading: "## Experiment acceptance".into(),
         mechanism: "Avoid repeated parsing of identical source input".into(),
         counterexample: "The source changes on every invocation".into(),
         applicability: "Repeated reads at the same source revision".into(),
@@ -88,6 +89,14 @@ fn installed_case(store: bool) {
             "XDG_CONFIG_HOME".to_owned(),
             configuration.display().to_string(),
         ),
+        (
+            "XDG_DATA_HOME".to_owned(),
+            configuration.display().to_string(),
+        ),
+        (
+            "LOCALAPPDATA".to_owned(),
+            configuration.display().to_string(),
+        ),
     ]);
     // Prove isolation before any CLI operation that changes a store registry.
     let resolved = native(&["config", "path"], &source, &environment);
@@ -115,6 +124,12 @@ fn installed_case(store: bool) {
             &source,
             &environment,
         );
+        assert!(
+            configuration
+                .join("openspec/stores/registry.yaml")
+                .is_file(),
+            "store registry was not written to the isolated data home"
+        );
     } else {
         fs::create_dir_all(source.join("openspec/changes")).unwrap();
         fs::write(source.join("openspec/config.yaml"), "schema: spec-driven\n").unwrap();
@@ -126,6 +141,15 @@ fn installed_case(store: bool) {
         planning_root: planning_root.clone(),
     };
     let api = OpenSpec { environment };
+    let mut wrong_creation = target.clone();
+    wrong_creation.change = "must-not-create".into();
+    wrong_creation.planning_root = temporary.path().to_owned();
+    assert!(api.scaffold(&wrong_creation).is_err());
+    assert!(
+        !planning_root
+            .join("openspec/changes/must-not-create")
+            .exists()
+    );
     api.scaffold(&target).unwrap();
     api.instructions(&target, "proposal").unwrap();
     assert!(
@@ -156,9 +180,21 @@ fn installed_case(store: bool) {
     let mut absent = contract();
     absent.independent_acceptance.clear();
     assert!(api.qualify(&target, &absent).is_err());
+    let design = fs::read_to_string(root.join("design.md")).unwrap();
     fs::write(
         root.join("design.md"),
-        "## Revised acceptance\nThe workload now has different requirements.\n",
+        "## Design\nNo experiment acceptance is specified.\n",
+    )
+    .unwrap();
+    assert!(
+        api.qualify(&target, &contract())
+            .unwrap_err()
+            .to_string()
+            .contains("acceptance section")
+    );
+    fs::write(
+        root.join("design.md"),
+        format!("{design}\nThe workload now has different requirements.\n"),
     )
     .unwrap();
     assert!(

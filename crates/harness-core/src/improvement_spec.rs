@@ -32,6 +32,8 @@ pub struct Specification {
 pub struct ExperimentContract {
     /// An artifact returned by OpenSpec, relative to the resolved change root.
     pub acceptance_artifact: PathBuf,
+    /// Exact Markdown heading of the acceptance section in that artifact.
+    pub acceptance_heading: String,
     pub mechanism: String,
     pub counterexample: String,
     pub applicability: String,
@@ -44,6 +46,18 @@ pub struct ExperimentContract {
 
 impl ExperimentContract {
     pub fn validate(&self) -> io::Result<()> {
+        let heading = self.acceptance_heading.trim();
+        let level = heading.bytes().take_while(|byte| *byte == b'#').count();
+        if !(1..=6).contains(&level)
+            || !heading[level..].starts_with(' ')
+            || heading[level..].trim().is_empty()
+            || heading.contains(['\n', '\r'])
+            || heading.len() > 512
+        {
+            return Err(invalid(
+                "acceptance_heading must identify a Markdown section",
+            ));
+        }
         for (name, value) in [
             ("mechanism", &self.mechanism),
             ("counterexample", &self.counterexample),
@@ -137,6 +151,13 @@ impl OpenSpec {
     }
 
     pub fn scaffold(&self, target: &Specification) -> io::Result<Value> {
+        let context = self.json(target, &["context", "--json"])?;
+        let resolved = PathBuf::from(required(&context["root"], "path")?).canonicalize()?;
+        if resolved != target.planning_root.canonicalize()? {
+            return Err(invalid(
+                "OpenSpec resolved a different planning root; no change was created",
+            ));
+        }
         self.json(
             target,
             &[
@@ -225,6 +246,25 @@ impl OpenSpec {
         if !artifacts.contains_key(&acceptance) {
             return Err(invalid(
                 "experiment acceptance must reference a resolved OpenSpec artifact",
+            ));
+        }
+        let acceptance_text = fs::read_to_string(&acceptance)?;
+        let heading = contract.acceptance_heading.trim();
+        let level = heading.bytes().take_while(|byte| *byte == b'#').count();
+        let mut lines = acceptance_text
+            .lines()
+            .skip_while(|line| line.trim() != heading);
+        if lines.next().is_none()
+            || !lines
+                .take_while(|line| {
+                    let line = line.trim();
+                    let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
+                    next_level == 0 || next_level > level || !line[next_level..].starts_with(' ')
+                })
+                .any(|line| !line.trim().is_empty())
+        {
+            return Err(invalid(
+                "missing or empty experiment acceptance section in the linked OpenSpec artifact",
             ));
         }
         // The native validator owns syntax and requirement/scenario checks.
