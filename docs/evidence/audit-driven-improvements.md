@@ -605,3 +605,30 @@ a verified build non-destructively (`changed: false`); seven immutable
 builds remain in the state for rollback, including the new build and the
 previously delivered generation. Unrelated user state was not touched (no
 path change; only the owned link set changed).
+
+## Task 11.3: installed-consumer semantic exercise outside the checkout
+
+Exercised 2026-09-30 through the delivered global installation (build
+`f1fca158d17b1821`, task 13.2) by driving the installed
+`codex-harness mcp serena` stdio server over real JSON-RPC against the wt4
+project root (a full workspace copy outside the main checkout):
+
+- **Retained Rust navigation**: `find_symbol per_model_effort` returned the
+  real symbol with its body location in
+  `crates\harness-core\src\launcher.rs` — rust-analyzer navigation through
+  the managed worker.
+- **Multi-language navigation**: `get_symbols_overview` on the Python
+  fixture `tests/fixtures/lsp/delayed-mcp.py` returned its real symbols
+  (`entry`, `marker`) — BasedPyright through the same managed route.
+- **Useful failure**: a deliberately missing symbol produced an explicit
+  error result (`isError` path with the underlying language-server
+  exception), never silent success or a fabricated empty match.
+- **Unaffected operations**: the lead session's own managed Serena consumer
+  kept working throughout, and the new worker cold-started under the
+  serialized-startup bound (task 11.2) without disturbing it.
+- **Boundary observed honestly**: the managed route validates its launch
+  inputs; an ad-hoc directory without real project markers is refused before
+  any language server starts (both old and new builds behave identically),
+  and a stdio-less invocation is refused with an explicit pipe-endpoint
+  error. Diagnostic freshness was qualified separately through the diagnose
+  surface (group 2).
