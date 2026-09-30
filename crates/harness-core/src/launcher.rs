@@ -242,23 +242,36 @@ fn session_command(args: &[OsString]) -> bool {
     )
 }
 
+/// The effective native configuration a session start carries, resolved by the
+/// caller over the installed consumer's layers. `resolved` is false when that
+/// resolution failed: the launcher then injects nothing rather than promote a
+/// fallback over an unknown native choice.
+#[derive(Clone, Copy, Debug)]
+pub struct NativePreferences<'a> {
+    pub resolved: bool,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
 /// Apply the per-model default effort to a session start without an explicit
 /// effort selection. Explicit arguments, profiles, remote routes and the
-/// compatibility effort selector always keep precedence.
-pub fn per_model_effort(args: &[OsString], configured_model: Option<&str>) -> Vec<OsString> {
+/// compatibility effort selector always keep precedence, and an applicable
+/// native configuration effort wins over the harness fallback.
+pub fn per_model_effort(args: &[OsString], native: NativePreferences<'_>) -> Vec<OsString> {
     if args
         .first()
         .and_then(|s| s.to_str())
         .is_some_and(|first| option(first, "--harness-effort"))
         || !session_command(args)
+        || !native.resolved
     {
         return args.to_vec();
     }
     let (explicit, model) = effort_selection(args);
-    if explicit {
+    if explicit || native.effort.is_some() {
         return args.to_vec();
     }
-    let model = model.or_else(|| configured_model.map(str::to_owned));
+    let model = model.or_else(|| native.model.map(str::to_owned));
     let Some(effort) = model.as_deref().and_then(default_effort) else {
         return args.to_vec();
     };

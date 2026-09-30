@@ -460,6 +460,144 @@ fn explicit_native_precedence_and_package_manager_metadata() {
 }
 
 #[test]
+fn saved_native_effort_survives_per_model_default_injection() {
+    let f = Fixture::new();
+    // A saved native model/effort pair is the effective session choice: the
+    // launcher must not promote the per-model max default over the lighter
+    // saved effort as a CLI override.
+    fs::write(
+        f.home.join("config.toml"),
+        "model = 'zai/glm-5.3'\nmodel_reasoning_effort = 'low'\n",
+    )
+    .unwrap();
+    let out = f.command().args(["exec", "hello"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!(["-c", "approval_policy=\"never\"", "exec", "hello"])
+    );
+    // A plain TUI session start resolves the same effective configuration.
+    let out = f.command().output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The daemon opt-out is unrelated to effort; no effort override appears.
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "features.daemon_auto_start=false"
+        ])
+    );
+}
+
+#[test]
+fn trusted_project_preferences_win_over_shared_defaults() {
+    let f = Fixture::new();
+    // The shared portable defaults carry both keys; an applicable trusted
+    // project file is the native choice and shields both promotions.
+    fs::write(
+        f.source.join("global/harness.config.toml"),
+        "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'xhigh'\n",
+    )
+    .unwrap();
+    let project = f.root.path().join("project");
+    fs::create_dir_all(project.join(".codex")).unwrap();
+    fs::write(
+        f.home.join("config.toml"),
+        format!(
+            "[projects.'{}']\ntrust_level = 'trusted'\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.join(".codex/config.toml"),
+        "model = 'zai/glm-5.3'\nmodel_reasoning_effort = 'medium'\n",
+    )
+    .unwrap();
+    let out = f
+        .command()
+        .current_dir(&project)
+        .args(["exec", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["args"], json!(["exec", "hello"]));
+}
+
+#[test]
+fn per_model_default_applies_without_any_native_effort() {
+    let f = Fixture::new();
+    // A saved model without any applicable effort keeps the fallback path:
+    // the mapped default is injected at its documented precedence.
+    fs::write(f.home.join("config.toml"), "model = 'zai/glm-5.3'\n").unwrap();
+    let out = f.command().args(["exec", "hello"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "model_reasoning_effort=\"max\"",
+            "exec",
+            "hello"
+        ])
+    );
+}
+
+#[test]
+fn unresolved_native_configuration_blocks_default_injection() {
+    let f = Fixture::new();
+    // An unreadable native configuration is an unknown choice: no fallback is
+    // promoted over it, and the launch-availability contract is preserved.
+    fs::write(f.home.join("config.toml"), "model = [\n").unwrap();
+    let out = f
+        .command()
+        .args(["-m", "zai/glm-5.3", "exec", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "codex-harness: shared harness unavailable; launching registered Codex without harness overrides"
+        ),
+        "{stderr}"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["args"],
+        json!(["-m", "zai/glm-5.3", "exec", "hello"])
+    );
+}
+
+#[test]
 fn embedded_tui_sessions_suppress_the_daemon_fallback_warning() {
     let f = Fixture::new();
     let out = f.command().args(["--profile", "user"]).output().unwrap();

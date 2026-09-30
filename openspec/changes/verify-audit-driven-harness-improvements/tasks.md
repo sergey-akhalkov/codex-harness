@@ -19,10 +19,10 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 2. Preserve effective native model and effort
 
-- [ ] 2.1 Qualify the installed native configuration-resolution and provenance contract against `crates/harness-core/src/portable_config.rs`, `launcher.rs` and `native_launcher.rs`; verify actual user/project/profile/CLI precedence and trust behavior with owned synthetic configuration before selecting the smallest supported integration. Covers A04, N04.
-- [ ] 2.2 Change default injection so an applicable native model/effort choice survives and the existing per-model mapping applies only to absent effort; verify the saved model/low-effort counterexample through final launch arguments and actual native effective configuration. Covers A04.
-- [ ] 2.3 Exercise TUI and exec, nested trusted/untrusted project configuration, CLI overrides, profiles, remote/compatibility selectors, missing effort, unknown models and malformed optional defaults; verify source-of-value diagnostics, native fallback and one payload launch without exposing private values. Covers A04, N04.
-- [ ] 2.4 Reconcile the existing operational guidance for saved preferences and fallback mapping in its owning docs/skill only where behavior changed; verify examples against the installed path and retain global live-data and provider-selection constraints.
+- [x] 2.1 Qualify the installed native configuration-resolution and provenance contract against `crates/harness-core/src/portable_config.rs`, `launcher.rs` and `native_launcher.rs`; verify actual user/project/profile/CLI precedence and trust behavior with owned synthetic configuration before selecting the smallest supported integration. Covers A04, N04.
+- [x] 2.2 Change default injection so an applicable native model/effort choice survives and the existing per-model mapping applies only to absent effort; verify the saved model/low-effort counterexample through final launch arguments and actual native effective configuration. Covers A04.
+- [x] 2.3 Exercise TUI and exec, nested trusted/untrusted project configuration, CLI overrides, profiles, remote/compatibility selectors, missing effort, unknown models and malformed optional defaults; verify source-of-value diagnostics, native fallback and one payload launch without exposing private values. Covers A04, N04.
+- [x] 2.4 Reconcile the existing operational guidance for saved preferences and fallback mapping in its owning docs/skill only where behavior changed; verify examples against the installed path and retain global live-data and provider-selection constraints.
 
 ## 3. Repair baseline persistence and comparison
 

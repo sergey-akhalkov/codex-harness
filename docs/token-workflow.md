@@ -109,9 +109,14 @@ For a new task select effort with native configuration, for example
 `reasoning_effort` parameter. A first-position
 `--harness-effort routine|standard|demanding` stays a compatibility alias for
 `low|high|xhigh`; explicit native effort or profile wins. Without an explicit
-selection the launcher applies per-model defaults: `zai/glm-5.3` at `max`,
-`xai/grok-4.6` and Astra at `xhigh`; unmapped models keep native
-configuration. The installed CLI cannot change effort in a running turn; an
+selection the launcher applies per-model defaults, and only as a fallback:
+`zai/glm-5.3` at `max`, `xai/grok-4.6` and Astra at `xhigh`. A model or
+effort chosen by applicable native configuration — user settings or a
+trusted-project `.codex/config.toml` — always survives; unmapped models keep
+native configuration, and an unreadable configuration blocks the fallback
+instead of overriding an unknown native choice. `codex-harness diagnose`
+reports the effective model and effort with their sources. The installed CLI
+cannot change effort in a running turn; an
 app-server client may set `turn/start.effort` for the next turn. Effort names
 do not prove a savings percentage. Apply the
 [model selection and recovery rules](agent-delegation.md#how-selection-works);

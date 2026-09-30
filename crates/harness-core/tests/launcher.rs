@@ -1,7 +1,7 @@
 //! Accepted script-launcher dispatch cases, ported as argument-vector oracles.
 use harness_core::launcher::{
-    additional_roots, daemon_opt_out, executor_limited, per_model_effort, profile_arguments,
-    task_arguments, xai_shim_requested,
+    NativePreferences, additional_roots, daemon_opt_out, executor_limited, per_model_effort,
+    profile_arguments, task_arguments, xai_shim_requested,
 };
 use std::ffi::OsString;
 
@@ -202,20 +202,31 @@ fn per_model_effort_defaults_without_explicit_selection() {
         let input = argv(&["-m", model, "exec", "hello"]);
         let mut expected = argv(&["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
         expected.extend(input.clone());
-        assert_eq!(per_model_effort(&input, None), expected);
+        assert_eq!(per_model_effort(&input, resolved(None)), expected);
     }
     let plain = argv(&["exec", "hello"]);
     let mut expected = argv(&["-c", "model_reasoning_effort=\"max\""]);
     expected.extend(plain.clone());
-    assert_eq!(per_model_effort(&plain, Some("zai/glm-5.3")), expected);
     assert_eq!(
-        per_model_effort(&argv(&["-m", "other/model", "exec"]), None),
+        per_model_effort(&plain, resolved(Some("zai/glm-5.3"))),
+        expected
+    );
+    assert_eq!(
+        per_model_effort(&argv(&["-m", "other/model", "exec"]), resolved(None)),
         argv(&["-m", "other/model", "exec"])
     );
     assert_eq!(
-        per_model_effort(&argv(&["mcp", "list"]), Some("zai/glm-5.3")),
+        per_model_effort(&argv(&["mcp", "list"]), resolved(Some("zai/glm-5.3"))),
         argv(&["mcp", "list"])
     );
+}
+
+fn resolved<'a>(model: Option<&'a str>) -> NativePreferences<'a> {
+    NativePreferences {
+        resolved: true,
+        model,
+        effort: None,
+    }
 }
 
 #[test]
@@ -237,18 +248,71 @@ fn per_model_effort_respects_explicit_selections() {
         argv(&["--model=zai/glm-5.3", "--profile", "personal", "exec"]),
         argv(&["--remote=ws://localhost:9999", "-m", "zai/glm-5.3"]),
     ] {
-        assert_eq!(per_model_effort(&rest, Some("xai/grok-4.6")), rest);
+        assert_eq!(
+            per_model_effort(&rest, resolved(Some("xai/grok-4.6"))),
+            rest
+        );
     }
     let input = argv(&["--harness-effort=routine", "-m", "zai/glm-5.3"]);
-    assert_eq!(per_model_effort(&input, None), input);
+    assert_eq!(per_model_effort(&input, resolved(None)), input);
     let input = argv(&["-c", "model=\"xai/grok-4.6\"", "exec"]);
     let mut expected = argv(&["-c", "model_reasoning_effort=\"xhigh\""]);
     expected.extend(input.clone());
-    assert_eq!(per_model_effort(&input, None), expected);
+    assert_eq!(per_model_effort(&input, resolved(None)), expected);
+}
+
+#[test]
+fn per_model_effort_yields_to_applicable_native_configuration() {
+    // A saved native model/effort pair is the effective session choice: the
+    // harness mapping must not replace the lighter effort with a CLI
+    // override, whatever the model's per-model default would be.
+    let saved = argv(&["exec", "hello"]);
+    assert_eq!(
+        per_model_effort(
+            &saved,
+            NativePreferences {
+                resolved: true,
+                model: Some("zai/glm-5.3"),
+                effort: Some("low"),
+            }
+        ),
+        saved
+    );
+    // The same applies when the model is only known from configuration and
+    // the effort comes from a trusted project layer.
+    assert_eq!(
+        per_model_effort(
+            &saved,
+            NativePreferences {
+                resolved: true,
+                model: None,
+                effort: Some("medium"),
+            }
+        ),
+        saved
+    );
+    // An unresolved configuration is an unknown native choice: no fallback is
+    // promoted over it, even when the invocation names a mapped model.
+    assert_eq!(
+        per_model_effort(
+            &argv(&["-m", "zai/glm-5.3", "exec"]),
+            NativePreferences {
+                resolved: false,
+                model: None,
+                effort: None,
+            }
+        ),
+        argv(&["-m", "zai/glm-5.3", "exec"])
+    );
 }
 
 #[test]
 fn canonical_native_effort_needs_no_legacy_selector() {
+    let resolved = NativePreferences {
+        resolved: true,
+        model: None,
+        effort: None,
+    };
     // The native configuration is the canonical interface: both functions
     // leave it untouched, including beside a model with a per-model default.
     let native = argv(&[
@@ -260,7 +324,7 @@ fn canonical_native_effort_needs_no_legacy_selector() {
         "hello",
     ]);
     assert_eq!(task_arguments(&native).unwrap(), native);
-    assert_eq!(per_model_effort(&native, None), native);
+    assert_eq!(per_model_effort(&native, resolved), native);
 
     // A translated compatibility selector is already explicit native
     // configuration, so no per-model default stacks on top of it.
@@ -281,13 +345,13 @@ fn canonical_native_effort_needs_no_legacy_selector() {
             "exec"
         ])
     );
-    assert_eq!(per_model_effort(&translated, None), translated);
+    assert_eq!(per_model_effort(&translated, resolved), translated);
 
     // The `--model=` spelling reaches the same per-model default.
     let selected = argv(&["--model=zai/glm-5.3", "exec"]);
     let mut expected = argv(&["-c", "model_reasoning_effort=\"max\""]);
     expected.extend(selected.clone());
-    assert_eq!(per_model_effort(&selected, None), expected);
+    assert_eq!(per_model_effort(&selected, resolved), expected);
 }
 
 #[test]
@@ -303,7 +367,7 @@ fn executor_launches_keep_the_translated_or_profiled_effort() {
             "work",
         ]))
         .unwrap(),
-        None,
+        resolved(None),
     );
     assert_eq!(
         executor_limited(translated, true),
@@ -328,7 +392,7 @@ fn executor_launches_keep_the_translated_or_profiled_effort() {
             "exec",
         ]))
         .unwrap(),
-        Some("zai/glm-5.3"),
+        resolved(Some("zai/glm-5.3")),
     );
     assert_eq!(
         executor_limited(routed, true),

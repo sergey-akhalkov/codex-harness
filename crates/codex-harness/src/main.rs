@@ -139,7 +139,11 @@ fn run() -> io::Result<i32> {
                 );
             }
         } else {
-            let values = harness_core::portable_config::overrides(&shared, &home)?;
+            let values = harness_core::portable_config::overrides(
+                &shared,
+                &home,
+                &std::env::current_dir()?,
+            )?;
             println!(
                 "{}",
                 serde_json::to_string(

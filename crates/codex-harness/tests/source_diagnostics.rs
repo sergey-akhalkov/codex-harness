@@ -379,6 +379,15 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
     let reasoning = setting(&clean, "model_reasoning_effort");
     assert_eq!(setting(&clean, "model_reasoning_effort")["value"], "xhigh");
     assert!(!reasoning["origin"].is_null(), "{reasoning}");
+    // The launcher-side view names the same effective values with their
+    // sources; no credential or private text appears in it.
+    assert_eq!(clean["launcherPreferences"]["model"], "gpt-6-astra");
+    assert_eq!(
+        clean["launcherPreferences"]["modelSource"],
+        "shared-default"
+    );
+    assert!(clean["launcherPreferences"]["effort"].is_null());
+    assert_eq!(clean["launcherPreferences"]["effortSource"], "none");
     assert!(
         clean["layers"]
             .as_array()
@@ -434,9 +443,12 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
             .any(|f| f["code"] == "setting-overridden"),
         "the explicit harness profile remains authoritative: {conflicted}"
     );
+    // An applicable trusted-project effort is the effective native choice:
+    // the shared portable default stays a fallback and is no longer promoted
+    // over it as a CLI override (verify-audit-driven-harness-improvements).
     assert_eq!(
         setting(&conflicted, "model_reasoning_effort")["value"],
-        "xhigh"
+        "low"
     );
     assert!(
         setting(&conflicted, "model_reasoning_effort")["declarations"]
@@ -446,6 +458,11 @@ fn actual_native_layers_conflicts_privacy_and_restoration() {
             .any(|declaration| declaration["source"]["type"] == "project"
                 && declaration["value"] == "low"),
         "the lower project declaration stays visible: {conflicted}"
+    );
+    assert_eq!(conflicted["launcherPreferences"]["effort"], "low");
+    assert_eq!(
+        conflicted["launcherPreferences"]["effortSource"],
+        "trusted-project"
     );
     assert_eq!(setting(&conflicted, "features.hooks")["value"], false);
     fs::remove_file(duplicate.join("SKILL.md")).unwrap();

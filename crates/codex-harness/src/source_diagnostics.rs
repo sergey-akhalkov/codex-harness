@@ -215,8 +215,61 @@ pub(crate) fn diagnose(request: &Request) -> io::Result<Value> {
         "attention"
     });
     report["findings"] = json!(findings);
+    report["launcherPreferences"] = launcher_preferences(request);
     report["elapsedMilliseconds"] = json!(started.elapsed().as_millis());
     Ok(report)
+}
+
+/// The launcher-side view of the effective model and reasoning effort for
+/// this project: what the per-model default decision resolves and where each
+/// value came from. It is a bounded resolution over the installed consumer's
+/// user and applicable trusted-project layers, never a second full loader,
+/// and secrets never appear because only these two keys are read.
+fn launcher_preferences(request: &Request) -> Value {
+    if request.profile != "harness" {
+        return json!({"status":"not-the-shared-harness-profile"});
+    }
+    match harness_profile_path(request).and_then(|profile_path| {
+        harness_core::portable_config::effective_preferences(
+            &profile_path,
+            &request.codex_home,
+            &request.project,
+        )
+    }) {
+        Ok(preferences) => json!({
+            "model": preferences.model,
+            "modelSource": preferences.model_source.label(),
+            "effort": preferences.effort,
+            "effortSource": preferences.effort_source.label(),
+        }),
+        Err(_) => json!({
+            "status":"unresolved",
+            "action":"Inspect the user and applicable trusted-project configuration locally; no harness default is promoted over an unresolved native choice."
+        }),
+    }
+}
+
+/// The live shared harness profile path recorded for this installation.
+fn harness_profile_path(request: &Request) -> io::Result<PathBuf> {
+    let source = match &request.source {
+        Some(source) => source.clone(),
+        None => {
+            let state: Value = serde_json::from_slice(&fs::read(
+                request.codex_home.join("harness/installation.json"),
+            )?)
+            .map_err(|_| invalid())?;
+            PathBuf::from(
+                state["sourceRoot"]
+                    .as_str()
+                    .or_else(|| state["settings"]["sourceRoot"].as_str())
+                    .ok_or_else(invalid)?,
+            )
+        }
+    };
+    let manifest: harness_core::inventory::Manifest =
+        serde_json::from_slice(&fs::read(source.join("global/kit.json"))?)
+            .map_err(|_| invalid())?;
+    Ok(source.join(manifest.profile))
 }
 
 fn observe(
@@ -242,31 +295,14 @@ fn observe(
     }
     let shared_consumer = request.profile == "harness";
     let profile_path = if shared_consumer {
-        let source = match &request.source {
-            Some(source) => source.clone(),
-            None => {
-                let state: Value =
-                    serde_json::from_slice(&fs::read(home.join("harness/installation.json"))?)
-                        .map_err(|_| invalid())?;
-                PathBuf::from(
-                    state["sourceRoot"]
-                        .as_str()
-                        .or_else(|| state["settings"]["sourceRoot"].as_str())
-                        .ok_or_else(invalid)?,
-                )
-            }
-        };
-        let manifest: harness_core::inventory::Manifest =
-            serde_json::from_slice(&fs::read(source.join("global/kit.json"))?)
-                .map_err(|_| invalid())?;
-        source.join(manifest.profile)
+        harness_profile_path(request)?
     } else {
         request
             .codex_home
             .join(format!("{}.config.toml", request.profile))
     };
     let overrides: Vec<String> = if shared_consumer {
-        harness_core::portable_config::overrides(&profile_path, &home)?
+        harness_core::portable_config::overrides(&profile_path, &home, &request.project)?
             .into_iter()
             .map(|v| v.to_string_lossy().into_owned())
             .collect()

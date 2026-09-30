@@ -150,26 +150,41 @@ fn launcher_identity_matches(build: &Path) -> io::Result<bool> {
         && build_identity::hash_file(&launcher).is_ok_and(|actual| actual == *expected))
 }
 
-fn shared_config_args(build: &Path, home: &Path) -> io::Result<Vec<OsString>> {
+fn shared_config_args(
+    build: &Path,
+    home: &Path,
+    working_directory: &Path,
+) -> io::Result<Vec<OsString>> {
     let record = build_identity::read_record(build)?;
     let bytes = std::fs::read(record.source_root.join("global/kit.json"))?;
     let manifest: crate::inventory::Manifest =
         serde_json::from_slice(&bytes).map_err(|_| fail("invalid live kit manifest"))?;
-    crate::portable_config::overrides(&record.source_root.join(manifest.profile), home)
-}
-
-/// Best-effort model a plain session start would use for per-model effort
-/// defaults. Read failures degrade to no injection, never a blocked launch.
-fn session_model(build: &Path, home: &Path) -> Option<String> {
-    let record = build_identity::read_record(build).ok()?;
-    let bytes = std::fs::read(record.source_root.join("global/kit.json")).ok()?;
-    let manifest: crate::inventory::Manifest = serde_json::from_slice(&bytes).ok()?;
-    crate::portable_config::effective_default_model(
+    crate::portable_config::overrides(
         &record.source_root.join(manifest.profile),
         home,
+        working_directory,
     )
-    .ok()
-    .flatten()
+}
+
+/// Effective native model and effort a plain session start would use, for
+/// per-model effort defaults and shared-default shielding. Read failures
+/// degrade to unresolved: no injection, never a blocked launch.
+fn session_preferences(
+    build: &Path,
+    home: &Path,
+    working_directory: &Path,
+) -> io::Result<crate::portable_config::EffectivePreferences> {
+    let record = build_identity::read_record(build)
+        .map_err(|_| fail("native build record is unavailable"))?;
+    let bytes = std::fs::read(record.source_root.join("global/kit.json"))
+        .map_err(|_| fail("live kit manifest is unavailable"))?;
+    let manifest: crate::inventory::Manifest =
+        serde_json::from_slice(&bytes).map_err(|_| fail("invalid live kit manifest"))?;
+    crate::portable_config::effective_preferences(
+        &record.source_root.join(manifest.profile),
+        home,
+        working_directory,
+    )
 }
 
 fn notice_degraded_session(task_args: &[OsString]) {
@@ -250,9 +265,24 @@ fn prepared_command(
             "upstream points to a harness launcher; explicit repair required",
         ));
     }
+    let working_directory = env::current_dir()?;
     let task_args = launcher::task_arguments(args)?;
-    let default_model = session_model(&selected, home);
-    let task_args = launcher::per_model_effort(&task_args, default_model.as_deref());
+    let preferences = session_preferences(&selected, home, &working_directory);
+    let task_args = launcher::per_model_effort(
+        &task_args,
+        match &preferences {
+            Ok(resolved) => launcher::NativePreferences {
+                resolved: true,
+                model: resolved.model.as_deref(),
+                effort: resolved.effort.as_deref(),
+            },
+            Err(_) => launcher::NativePreferences {
+                resolved: false,
+                model: None,
+                effort: None,
+            },
+        },
+    );
     // Executor sessions must stay single-agent: the marker is inherited by
     // every Codex process an executor starts, including a raw nested `codex`
     // invocation, so the agent capability stays off for the whole tree.
@@ -260,12 +290,12 @@ fn prepared_command(
         task_args,
         env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some(),
     );
-    let roots = launcher::additional_roots(&task_args, &env::current_dir()?);
+    let roots = launcher::additional_roots(&task_args, &working_directory);
     let mut command = Command::new(target);
     let classified = launcher::profile_arguments(&task_args);
     let mut shared_overrides = false;
     if shared && classified.len() != task_args.len() {
-        match shared_config_args(&selected, home) {
+        match shared_config_args(&selected, home, &working_directory) {
             Ok(overrides) => {
                 command.args(overrides);
                 shared_overrides = true;

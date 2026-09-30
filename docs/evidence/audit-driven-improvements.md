@@ -72,3 +72,81 @@ that revision:
 - Evidence locations: public synthetic commands and outcomes live in this
   tracked record; raw logs, model-backed inputs and machine-local detail stay
   in local temporary or private roots outside the repository.
+
+## Group 2: installed native configuration contract (task 2.1)
+
+The installed consumer is Codex CLI 0.157.1
+(`@openai/codex` npm package, registered upstream
+`.../@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe`,
+sha256 `8cb0e69e99ff2a158c54815db82d0f2e524d8f301bc30184722cfd1ae5973574`).
+It was qualified on 2026-09-29 with owned synthetic homes and project
+directories; every case ran `codex doctor --json` through the upstream
+executable directly, which is model-free. Observed contract:
+
+- Layer order: trusted-project file over user configuration; CLI `-c`/`-m`
+  overrides win over both. A trusted-project file is the nearest
+  `.codex/config.toml` from the working directory up to a directory whose
+  exact `[projects."<path>"]` trust entry is `trusted`; outside a git
+  worktree only the working directory itself can be that directory, inside
+  one any ancestor up to the worktree root can, and the nearest trust entry
+  wins (verified with trusted cwd, trusted intermediate, trusted root,
+  untrusted, outside-worktree, non-git-ancestor, no-trust and both-trusted
+  tie cases).
+- Untrusted project files never apply. Model or effort keys inside the
+  `[projects]` table itself are not applied; the table carries trust state.
+- `profile`/`--profile` now selects a sandbox policy (`CONFIG_PROFILE_V2`).
+  A `[profiles.p]` table with model or effort keys makes the whole
+  configuration fail to load with `invalid data`; configuration-load failure
+  is therefore a required launcher state, not a theoretical one.
+- `codex doctor --json` reports the effective `model` but not
+  `model_reasoning_effort`; no supported model-free API exposes the
+  effective effort. The app-server `config/read` route used by
+  `codex-harness diagnose` reports per-setting values with layer
+  declarations, including project declarations.
+
+The launcher fix therefore resolves the two applicable configuration files
+for the two decision keys (model, `model_reasoning_effort`) with the trust
+rule above, treats any read or parse failure as an unknown native choice that
+blocks fallback injection, and keeps `codex-harness diagnose` as the
+provenance owner: its settings/declarations come from the real native RPC and
+its `launcherPreferences` view reports the launcher-side resolution with
+sources.
+
+## Group 2: implementation and verification (tasks 2.2-2.4)
+
+Changed owners: `crates/harness-core/src/portable_config.rs` (layer
+resolution, shared-default shield), `crates/harness-core/src/launcher.rs`
+(`NativePreferences` input to `per_model_effort`),
+`crates/harness-core/src/native_launcher.rs` (effective-preference
+resolution with the working directory),
+`crates/codex-harness/src/source_diagnostics.rs` (`launcherPreferences`
+view), `crates/codex-harness/src/main.rs` (project-aware
+`config-overrides`), `docs/token-workflow.md` (fallback-mapping wording),
+and the launcher/diagnostic test owners.
+
+Verified 2026-09-30 on this tree (heavy-command route, `--jobs 1`):
+
+- `cargo test --locked -p harness-core --lib --test launcher -- --test-threads=1`:
+  726 lib tests and 11 launcher tests passed, including the new
+  `per_model_effort_yields_to_applicable_native_configuration`,
+  layer-resolution, worktree-boundary, error and shield unit tests.
+- `cargo test --locked -p codex-harness --test native_launcher --test source_diagnostics --test mcp_cli -- --test-threads=1`:
+  27 native-launcher tests (including the saved model/low-effort
+  counterexample, trusted-project preference, fallback-only injection and
+  unresolved-configuration cases), 4 source-diagnostics tests and 4 mcp_cli
+  tests passed.
+- Explicit real-CLI acceptance
+  (`HARNESS_SOURCE_REAL_CLI` = registered Codex 0.157.1 upstream,
+  `HARNESS_SOURCE_REAL_GIT` = installed Git):
+  `actual_native_layers_conflicts_privacy_and_restoration` passed with the
+  corrected expectation — a trusted project's `model_reasoning_effort = low`
+  is the effective native value (previously the shared `xhigh` default
+  overrode it), the lower declarations stay visible, private sentinels never
+  appear, and `launcherPreferences` reports the model/effort sources
+  (`shared-default`, `trusted-project`).
+
+The TUI launch variant, CLI/profile/remote/compatibility-selector bypass,
+missing effort, unmapped models and malformed configuration states are
+covered by the same launcher tests; the profile-shaped `[profiles.p]`
+configuration failure is exercised through the unresolved-configuration
+case, matching the qualified 0.157.1 behavior above.
