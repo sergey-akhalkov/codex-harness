@@ -36,6 +36,14 @@ jobs:
       - name: Lint (warnings are errors)
         run: cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
 
+      - name: Install the pinned upstream Codex CLI (no credentials used)
+        run: |
+          npm install @openai/codex@0.157.1 --prefix "$env:RUNNER_TEMP\codex-cli"
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\codex-cli" -Recurse -Filter codex.exe |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "pinned upstream codex.exe was not installed" }
+          (Split-Path $exe) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Tests (single-threaded, locked dependencies)
         run: cargo test --workspace --locked --jobs 1 -- --test-threads=1
 
