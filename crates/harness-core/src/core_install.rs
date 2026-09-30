@@ -805,6 +805,16 @@ mod tests {
                 .tempdir()
                 .unwrap()
                 .keep();
+            // Anchor on the ordinary long form: build agents hand out a
+            // short 8.3 temp prefix while installation records canonical
+            // ownership strings.
+            let root = root
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .strip_prefix(r"\\?\")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(root);
             let source = root.join("source");
             let build = root.join("build");
             for dir in [
