@@ -8,8 +8,10 @@ mod process_result;
 
 use harness_core::build_identity::{hash_file, ordinary};
 use harness_core::outcome_qualification::{
-    ApiObservationPlan, ClientInput, LocalRunner, MATERIAL_FIELDS, RunnerRecord, WIRE_API,
-    collect_observations, observation_changes,
+    ApiObservationPlan, ApiObservations, ApiObservedPolicy, ApiObservedQualification, ClientInput,
+    LocalRunner, MATERIAL_FIELDS, QualificationAttempt, RunnerRecord, WIRE_API,
+    collect_observations, observation_changes, qualification_attempt, qualify_api_observed,
+    recheck_observations,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -78,43 +80,240 @@ fn default_output_limit() -> u64 {
     128 * 1024 * 1024
 }
 
-pub fn run(args: &[OsString]) -> io::Result<i32> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "codex-harness outcome-run --request PATH --run-model-probes\nRuns one explicitly selected native launcher hidden with captured streams in an isolated temporary case/home (no visible terminal; visible dispatch is a separate path). An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. An explicit `api_observations` plan collects bounded declared local API fields and effective client-input digests, model-free, before and after the attempt. Private evidence is retained; correctness requires a separate oracle."
-        );
-        return Ok(0);
+/// One explicit invocation of this command. The observation modes never
+/// launch a process or call a model; only the native attempt mode runs the
+/// selected launcher.
+enum Invocation {
+    Attempt { request: PathBuf, probes: bool },
+    Observations(PathBuf),
+    Qualify(PathBuf),
+    Recheck(PathBuf),
+    Skipped,
+}
+
+/// Declared collection inputs for the model-free `--observations` mode.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationsRequest {
+    runner: LocalRunner,
+    plan: ApiObservationPlan,
+    #[serde(default)]
+    client_inputs: Vec<ClientInput>,
+}
+
+/// Declared qualification inputs for the model-free `--qualify` mode: the
+/// policy fixed before repeats, the collected observations it binds to, and
+/// the retained attempts. No launcher, case or evidence root is involved.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualifyRequest {
+    runner: LocalRunner,
+    policy: ApiObservedPolicy,
+    observations: ApiObservations,
+    #[serde(default)]
+    attempts: Vec<RetainedAttempt>,
+}
+
+/// One retained attempt: either an already-extracted attempt record or the
+/// retained native result together with its required-output digests, which are
+/// extracted through the same conservative owner the controller uses.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RetainedAttempt {
+    Record(Box<QualificationAttempt>),
+    Result {
+        result: Value,
+        #[serde(default)]
+        outputs: BTreeMap<String, String>,
+    },
+}
+
+impl RetainedAttempt {
+    fn extract(&self) -> io::Result<QualificationAttempt> {
+        match self {
+            Self::Record(attempt) => Ok((**attempt).clone()),
+            Self::Result { result, outputs } => qualification_attempt(result, outputs.clone()),
+        }
     }
-    let mut request = None;
-    let mut opted_in = false;
+}
+
+/// Declared pre-arm recheck inputs for the model-free `--recheck` mode: the
+/// retained qualification, the current declared runner and policy, and the
+/// explicit client inputs of the declaration.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecheckRequest {
+    qualification: ApiObservedQualification,
+    runner: LocalRunner,
+    policy: ApiObservedPolicy,
+    #[serde(default)]
+    client_inputs: Vec<ClientInput>,
+}
+
+fn read_input<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+    let bytes = bounded_read(path, INPUT_LIMIT).map_err(|_| invalid())?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
+fn print_result(value: &Value) -> io::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn option(iter: &mut std::slice::Iter<'_, OsString>, slot: &mut Option<PathBuf>) -> io::Result<()> {
+    let value = iter.next().ok_or_else(invalid)?;
+    if slot.is_some() {
+        return Err(invalid());
+    }
+    *slot = Some(PathBuf::from(value));
+    Ok(())
+}
+
+fn parse_invocation(args: &[OsString]) -> io::Result<Invocation> {
+    let (mut request, mut probes) = (None, false);
+    let (mut observations, mut qualify, mut recheck) = (None, None, None);
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--request" && request.is_none() {
-            request = Some(PathBuf::from(iter.next().ok_or_else(invalid)?));
-        } else if arg == "--run-model-probes" && !opted_in {
-            opted_in = true;
+        if arg == "--request" {
+            option(&mut iter, &mut request)?;
+        } else if arg == "--run-model-probes" {
+            if probes {
+                return Err(invalid());
+            }
+            probes = true;
+        } else if arg == "--observations" {
+            option(&mut iter, &mut observations)?;
+        } else if arg == "--qualify" {
+            option(&mut iter, &mut qualify)?;
+        } else if arg == "--recheck" {
+            option(&mut iter, &mut recheck)?;
         } else {
             return Err(invalid());
         }
     }
-    // No request read, discovery, model or evidence-directory creation by default.
-    if !opted_in {
+    // The model-free observation modes are exclusive: they never combine with
+    // the native attempt mode or with each other.
+    let declared = [observations.is_some(), qualify.is_some(), recheck.is_some()]
+        .iter()
+        .filter(|declared| **declared)
+        .count();
+    if declared > 1
+        || (declared == 1 && (request.is_some() || probes))
+        || (observations.is_none()
+            && qualify.is_none()
+            && recheck.is_none()
+            && probes
+            && request.is_none())
+    {
+        return Err(invalid());
+    }
+    Ok(match (request, observations, qualify, recheck) {
+        (Some(request), None, None, None) => Invocation::Attempt { request, probes },
+        (None, Some(path), None, None) => Invocation::Observations(path),
+        (None, None, Some(path), None) => Invocation::Qualify(path),
+        (None, None, None, Some(path)) => Invocation::Recheck(path),
+        (None, None, None, None) => Invocation::Skipped,
+        _ => return Err(invalid()),
+    })
+}
+
+pub fn run(args: &[OsString]) -> io::Result<i32> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "{}",
-            json!({"status":"skipped","reason":"explicit --run-model-probes required","model_calls":0})
+            "codex-harness outcome-run [--request PATH --run-model-probes | --observations PATH | --qualify PATH | --recheck PATH]\n\
+             Runs one explicitly selected native launcher hidden with captured streams in an isolated temporary case/home (no visible terminal; visible dispatch is a separate path). An explicit `runner` selects the local endpoint/model (Responses API); provider changes stay invalid treatment settings and no other route is used as a fallback. An explicit `api_observations` plan collects bounded declared local API fields and effective client-input digests, model-free, before and after the attempt.\n\
+             --observations PATH collects the declared bounded local API fields and effective client-input digests without launching a process or calling a model.\n\
+             --qualify PATH evaluates retained native attempts under the declared API-observed policy without launching a process or calling a model.\n\
+             --recheck PATH re-collects the declared observations and refuses dependent comparisons when a retained qualification is internally inconsistent or no longer matches; it launches nothing and calls no model.\n\
+             The model-free modes print one JSON object on stdout and exit 0 (collected/qualified/unchanged), 1 (failed/blocked/drifted) or 2 (invalid input). Private evidence is retained; correctness requires a separate oracle."
         );
         return Ok(0);
     }
-    let path = request.ok_or_else(invalid)?;
-    let bytes = bounded_read(&path, INPUT_LIMIT).map_err(|_| invalid())?;
-    let request: Request = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    let result = attempt(request)?;
-    let code = if result["status"] == "completed" {
-        0
-    } else {
-        1
-    };
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    match parse_invocation(args)? {
+        Invocation::Attempt {
+            request,
+            probes: true,
+        } => {
+            let request: Request = read_input(&request)?;
+            let result = attempt(request)?;
+            let code = if result["status"] == "completed" {
+                0
+            } else {
+                1
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(code)
+        }
+        Invocation::Observations(path) => observations_mode(&read_input(&path)?),
+        Invocation::Qualify(path) => qualify_mode(&read_input(&path)?),
+        Invocation::Recheck(path) => recheck_mode(&read_input(&path)?),
+        // No request read, discovery, model or evidence-directory creation by
+        // default.
+        Invocation::Attempt { probes: false, .. } | Invocation::Skipped => {
+            println!(
+                "{}",
+                json!({"status":"skipped","reason":"explicit --run-model-probes required","model_calls":0})
+            );
+            Ok(0)
+        }
+    }
+}
+
+/// Collects the declared bounded local API fields and effective client-input
+/// digests. Model-free and process-free: it performs only the declared reads.
+fn observations_mode(request: &ObservationsRequest) -> io::Result<i32> {
+    validate_local_runner(&request.runner)?;
+    match collect_observations(&request.runner, &request.plan, &request.client_inputs) {
+        Ok(observations) => {
+            print_result(&json!({"status": "collected", "observations": observations}))?;
+            Ok(0)
+        }
+        Err(failure) => {
+            print_result(&json!({"status": "failed", "observation_failure": failure}))?;
+            Ok(1)
+        }
+    }
+}
+
+/// Qualifies retained native attempts under the declared API-observed policy.
+/// Model-free and process-free: it consumes the retained attempts and the
+/// collected observations as declared evidence.
+fn qualify_mode(request: &QualifyRequest) -> io::Result<i32> {
+    validate_local_runner(&request.runner)?;
+    let attempts: Vec<QualificationAttempt> = request
+        .attempts
+        .iter()
+        .map(RetainedAttempt::extract)
+        .collect::<io::Result<_>>()?;
+    let qualification = qualify_api_observed(
+        &request.runner,
+        &request.policy,
+        &request.observations,
+        &attempts,
+    )?;
+    let code = if qualification.qualified() { 0 } else { 1 };
+    print_result(&json!({
+        "status": if qualification.qualified() { "qualified" } else { "blocked" },
+        "qualification": qualification,
+    }))?;
+    Ok(code)
+}
+
+/// Re-collects the declared observations and rechecks a retained
+/// qualification before an arm. Model-free and process-free.
+fn recheck_mode(request: &RecheckRequest) -> io::Result<i32> {
+    validate_local_runner(&request.runner)?;
+    let drift = recheck_observations(
+        &request.qualification,
+        &request.runner,
+        &request.policy,
+        &request.client_inputs,
+    );
+    let code = if drift.drifted { 1 } else { 0 };
+    print_result(&json!({
+        "status": if drift.drifted { "drifted" } else { "unchanged" },
+        "drift": drift,
+    }))?;
     Ok(code)
 }
 

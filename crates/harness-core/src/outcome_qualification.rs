@@ -1405,6 +1405,105 @@ impl ApiObservedQualification {
     }
 }
 
+/// Declared required observation facts that the observed identity does not
+/// provide: required server/client facts absent, and declared facts that carry
+/// no recorded state at all. A declared optional fact that stays
+/// `unknown_optional` is a disclosed limit, not a missing observation.
+fn missing_declared_observations(
+    policy: &ApiObservedPolicy,
+    observations: &ApiObservations,
+) -> Vec<String> {
+    policy
+        .declared_fields()
+        .into_iter()
+        .filter(|(name, required)| {
+            !observations.fields.contains_key(*name)
+                && !(!required && observations.unknown_optional.contains_key(*name))
+        })
+        .map(|(name, _)| name.to_owned())
+        .collect()
+}
+
+/// Blocking reasons for reusing a retained API-observed qualification before
+/// any dependent comparison. The retained envelope itself is checked: correct
+/// mode, a valid bound declaration, recomputed policy and observation digests,
+/// plan and runner linkage, required observed facts, and successful-status
+/// evidence that agrees with the record. This is internal consistency of the
+/// retained evidence, not proof that an arbitrarily authored record is
+/// authentic: a record is refused, never repaired or re-hashed in place, and
+/// `status == Qualified` alone is never sufficient.
+pub fn retained_qualification_reasons(qualification: &ApiObservedQualification) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if qualification.mode != QualificationMode::ApiObserved {
+        reasons.push("retained.mode".to_owned());
+    }
+    if qualification.policy.validate().is_err() {
+        reasons.push("retained.policy".to_owned());
+    }
+    if qualification.policy.digest().ok().as_deref() != Some(qualification.policy_digest.as_str()) {
+        reasons.push("retained.policy-digest".to_owned());
+    }
+    if qualification.observations.digest().ok().as_deref()
+        != Some(qualification.observation_digest.as_str())
+    {
+        reasons.push("retained.observation-digest".to_owned());
+    }
+    if qualification.policy.plan.digest().ok().as_deref()
+        != Some(qualification.observations.plan_digest.as_str())
+    {
+        reasons.push("retained.plan-linkage".to_owned());
+    }
+    if qualification.runner.endpoint != qualification.observations.endpoint
+        || qualification.runner.model != qualification.observations.model
+    {
+        reasons.push("retained.runner-linkage".to_owned());
+    }
+    if qualification.missing_identity != qualification.runner.missing_identity() {
+        reasons.push("retained.missing-identity".to_owned());
+    }
+    for name in missing_declared_observations(&qualification.policy, &qualification.observations) {
+        reasons.push(format!("retained.missing-observation.{name}"));
+    }
+    if qualification.status == QualificationStatus::Qualified {
+        for (recorded, reason) in [
+            (
+                &qualification.missing_observations,
+                "retained.recorded-missing-observations",
+            ),
+            (
+                &qualification.unfinished_attempts,
+                "retained.unfinished-attempts",
+            ),
+            (
+                &qualification.unverified_attempts,
+                "retained.unverified-attempts",
+            ),
+            (
+                &qualification.tool_exchange_missing,
+                "retained.tool-exchange-missing",
+            ),
+            (&qualification.missing_outputs, "retained.missing-outputs"),
+            (
+                &qualification.divergent_outputs,
+                "retained.divergent-outputs",
+            ),
+        ] {
+            if !recorded.is_empty() {
+                reasons.push(reason.to_owned());
+            }
+        }
+        if !qualification.runner_mismatch.is_empty() {
+            reasons.push("retained.runner-mismatch".to_owned());
+        }
+        if qualification.observed_repeats != qualification.required_repeats
+            || qualification.required_repeats != qualification.policy.output.repeats
+        {
+            reasons.push("retained.repeats".to_owned());
+        }
+    }
+    reasons
+}
+
 /// Evaluates the declared API-observed policy over controlled attempts.
 ///
 /// The bound observations must belong to this declared policy and runner;
@@ -1433,15 +1532,7 @@ pub fn qualify_api_observed(
     }
     validate_attempts(attempts)?;
     let (missing_outputs, divergent_outputs) = output_states(&policy.output, attempts);
-    let missing_observations: Vec<String> = policy
-        .declared_fields()
-        .into_iter()
-        .filter(|(name, required)| {
-            !observations.fields.contains_key(*name)
-                && !(!required && observations.unknown_optional.contains_key(*name))
-        })
-        .map(|(name, _)| name.to_owned())
-        .collect();
+    let missing_observations = missing_declared_observations(policy, observations);
     let unfinished_attempts: Vec<String> = attempts
         .iter()
         .filter(|attempt| !attempt.completed)
@@ -1564,18 +1655,26 @@ impl ApiObservedDrift {
 }
 
 /// Compares a retained qualification against the current declared runner, the
-/// current policy and freshly observed identity. Any changed, dropped or
-/// unavailable fact refuses dependent comparisons: the policy is bound to the
-/// qualification and can never be silently downgraded or dropped.
+/// current policy and freshly observed identity. The retained envelope itself
+/// is validated first (see [`retained_qualification_reasons`]), and any
+/// internally inconsistent or changed, dropped or unavailable fact refuses
+/// dependent comparisons: the policy is bound to the qualification and can
+/// never be silently downgraded or dropped.
 pub fn observed_drift(
     qualification: &ApiObservedQualification,
     runner: &LocalRunner,
     policy: &ApiObservedPolicy,
     observations: &ApiObservations,
 ) -> ApiObservedDrift {
-    let mut changed = Vec::new();
+    let mut changed = retained_qualification_reasons(qualification);
     if qualification.blocks_comparisons() {
         changed.push("qualification.blocked".to_owned());
+    }
+    if policy.validate().is_err() {
+        changed.push("current.policy".to_owned());
+    }
+    for name in missing_declared_observations(policy, observations) {
+        changed.push(format!("current.missing-observation.{name}"));
     }
     let mut policy_changed = Vec::new();
     policy_differences(&qualification.policy, policy, &mut policy_changed);
@@ -1646,7 +1745,8 @@ pub fn observation_changes(before: &ApiObservations, after: &ApiObservations) ->
 
 /// Re-collects the declared observations and compares them with the retained
 /// qualification. A collection failure is itself a refusal with the
-/// distinguishable cause retained.
+/// distinguishable cause retained; retained-envelope problems are reported
+/// alongside it instead of being hidden behind the collection failure.
 pub fn recheck_observations(
     qualification: &ApiObservedQualification,
     runner: &LocalRunner,
@@ -1655,11 +1755,15 @@ pub fn recheck_observations(
 ) -> ApiObservedDrift {
     match collect_observations(runner, &policy.plan, client_inputs) {
         Ok(observations) => observed_drift(qualification, runner, policy, &observations),
-        Err(failure) => ApiObservedDrift {
-            drifted: true,
-            changed: vec![failure.to_string()],
-            failure: Some(failure),
-        },
+        Err(failure) => {
+            let mut changed = retained_qualification_reasons(qualification);
+            changed.push(failure.to_string());
+            ApiObservedDrift {
+                drifted: true,
+                changed,
+                failure: Some(failure),
+            }
+        }
     }
 }
 
@@ -2382,7 +2486,11 @@ mod tests {
         let drift = observed_drift(&qualification, &runner(), &policy, &changed);
         assert_eq!(
             drift.changed,
-            vec!["observed.server.context", "optional.server.context"]
+            vec![
+                "current.missing-observation.server.context",
+                "observed.server.context",
+                "optional.server.context"
+            ]
         );
 
         let mut changed = observations.clone();
@@ -2475,6 +2583,113 @@ mod tests {
         assert!(blocked.blocks_comparisons());
         let drift = observed_drift(&blocked, &runner(), &policy, &incomplete);
         assert!(drift.changed.contains(&"qualification.blocked".to_owned()));
+    }
+
+    #[test]
+    fn retained_api_observed_envelope_is_validated_before_reuse() {
+        let policy = api_policy();
+        let observations = api_observations(&policy);
+        let attempts = vec![attempt("a", 2, "d1"), attempt("b", 2, "d1")];
+        let qualification =
+            qualify_api_observed(&runner(), &policy, &observations, &attempts).unwrap();
+        assert!(retained_qualification_reasons(&qualification).is_empty());
+        assert!(!observed_drift(&qualification, &runner(), &policy, &observations).drifted);
+
+        // A wrong retained mode is never reused, even before any comparison.
+        let mut wrong_mode = qualification.clone();
+        wrong_mode.mode = QualificationMode::FullMaterial;
+        assert!(retained_qualification_reasons(&wrong_mode).contains(&"retained.mode".to_owned()));
+
+        // Regression: a stored observation edited to match a changed server
+        // while the old digest is retained must refuse, so matching fresh
+        // fields cannot launder the edit into a pass.
+        let mut tampered = qualification.clone();
+        tampered
+            .observations
+            .fields
+            .get_mut("server.build")
+            .unwrap()
+            .value = "b-other".to_owned();
+        assert_ne!(
+            tampered.observations.digest().unwrap(),
+            tampered.observation_digest
+        );
+        let mut fresh = observations.clone();
+        fresh.fields.get_mut("server.build").unwrap().value = "b-other".to_owned();
+        let drift = observed_drift(&tampered, &runner(), &policy, &fresh);
+        assert!(drift.drifted);
+        assert!(
+            drift
+                .changed
+                .contains(&"retained.observation-digest".to_owned()),
+            "{drift:?}"
+        );
+
+        // A re-hashed record that still misses a required declared server or
+        // client fact refuses: the check recomputes the requirement instead of
+        // trusting the recorded lists.
+        let mut missing_server = qualification.clone();
+        missing_server.observations.fields.remove("server.build");
+        missing_server.observation_digest = missing_server.observations.digest().unwrap();
+        assert!(
+            retained_qualification_reasons(&missing_server)
+                .contains(&"retained.missing-observation.server.build".to_owned())
+        );
+        let mut missing_client = qualification.clone();
+        missing_client.observations.fields.remove("profile");
+        missing_client.observation_digest = missing_client.observations.digest().unwrap();
+        assert!(
+            retained_qualification_reasons(&missing_client)
+                .contains(&"retained.missing-observation.profile".to_owned())
+        );
+
+        // An invalid retained or current declaration refuses.
+        let mut invalid_retained = qualification.clone();
+        invalid_retained.policy.plan.requests[0].path = "props".to_owned();
+        assert!(
+            retained_qualification_reasons(&invalid_retained)
+                .contains(&"retained.policy".to_owned())
+        );
+        let mut invalid_current = policy.clone();
+        invalid_current.plan.requests[0].fields[0].pointer = "build".to_owned();
+        let drift = observed_drift(&qualification, &runner(), &invalid_current, &observations);
+        assert!(drift.changed.contains(&"current.policy".to_owned()));
+
+        // Declared facts missing from the current observations refuse too.
+        let mut current_missing = observations.clone();
+        current_missing.fields.remove("catalogue");
+        let drift = observed_drift(&qualification, &runner(), &policy, &current_missing);
+        assert!(
+            drift
+                .changed
+                .contains(&"current.missing-observation.catalogue".to_owned()),
+            "{drift:?}"
+        );
+
+        // Successful-status evidence must agree with the record: a qualified
+        // record that carries recorded failures or an impossible repeat count
+        // is internally inconsistent.
+        let mut unfinished = qualification.clone();
+        unfinished.unfinished_attempts = vec!["ghost".to_owned()];
+        assert!(
+            retained_qualification_reasons(&unfinished)
+                .contains(&"retained.unfinished-attempts".to_owned())
+        );
+        let mut inconsistent_repeats = qualification.clone();
+        inconsistent_repeats.observed_repeats = 3;
+        assert!(
+            retained_qualification_reasons(&inconsistent_repeats)
+                .contains(&"retained.repeats".to_owned())
+        );
+        let mut inconsistent_outputs = qualification.clone();
+        inconsistent_outputs.divergent_outputs = vec!["solution.txt".to_owned()];
+        assert!(
+            retained_qualification_reasons(&inconsistent_outputs)
+                .contains(&"retained.divergent-outputs".to_owned())
+        );
+
+        // The unchanged valid record remains accepted.
+        assert!(retained_qualification_reasons(&qualification).is_empty());
     }
 
     #[test]

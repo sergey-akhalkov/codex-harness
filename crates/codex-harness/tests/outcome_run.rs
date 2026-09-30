@@ -1255,19 +1255,29 @@ fn api_runner(origin: &str) -> Value {
     runner
 }
 
+fn client_inputs_value(files: &ApiClientFiles) -> Value {
+    json!([
+        {"name": "profile", "path": files.profile},
+        {"name": "catalogue", "path": files.catalogue}
+    ])
+}
+
 fn prepare_api_observation(f: &Fixture, origin: &str, files: &ApiClientFiles) {
     f.edit("runner", api_runner(origin));
     f.edit(
         "api_observations",
         serde_json::to_value(api_plan()).unwrap(),
     );
-    f.edit(
-        "client_inputs",
-        json!([
-            {"name": "profile", "path": files.profile},
-            {"name": "catalogue", "path": files.catalogue}
-        ]),
-    );
+    f.edit("client_inputs", client_inputs_value(files));
+}
+
+fn mode_command(mode: &str, request: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    command
+        .args(["outcome-run", mode])
+        .arg(request)
+        .current_dir(cwd);
+    command
 }
 
 #[test]
@@ -1445,6 +1455,39 @@ fn api_observed_recheck_refuses_server_client_and_required_field_drift() {
         refused
             .changed
             .contains(&"observed.server.build".to_owned()),
+        "{refused:?}"
+    );
+
+    // Regression: a stored observation edited to match the changed server
+    // while the old digest is retained must refuse, so matching fresh server
+    // fields cannot be laundered into a pass.
+    let mut tampered = qualification.clone();
+    tampered
+        .observations
+        .fields
+        .get_mut("server.build")
+        .unwrap()
+        .value = "b-synth-2".to_owned();
+    assert_ne!(
+        tampered.observations.digest().unwrap(),
+        tampered.observation_digest
+    );
+    let refused = recheck_observations(&tampered, &runner, &api_policy(), &inputs);
+    assert!(refused.drifted);
+    assert!(
+        refused
+            .changed
+            .contains(&"retained.observation-digest".to_owned()),
+        "{refused:?}"
+    );
+
+    // An inconsistent retained mode is refused before any field comparison.
+    let mut wrong_mode = qualification.clone();
+    wrong_mode.mode = QualificationMode::FullMaterial;
+    let refused = recheck_observations(&wrong_mode, &runner, &api_policy(), &inputs);
+    assert!(refused.drifted);
+    assert!(
+        refused.changed.contains(&"retained.mode".to_owned()),
         "{refused:?}"
     );
 
@@ -1714,4 +1757,379 @@ fn api_observed_qualification_requires_tools_verified_metadata_and_equal_output(
     b.attempt_id.push_str("#6");
     let result = qualify_api_observed(&runner, &api_policy(), &observations, &[a, b]).unwrap();
     assert!(result.qualified(), "{result:?}");
+}
+
+#[test]
+fn observations_mode_collects_model_free_without_process_dispatch() {
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    let request = f.root.path().join("observations-request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(&json!({
+            "runner": api_runner(&server.url()),
+            "plan": serde_json::to_value(api_plan()).unwrap(),
+            "client_inputs": client_inputs_value(&files),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = mode_command("--observations", &request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "collected");
+    assert_eq!(
+        value["observations"]["fields"]["server.build"]["value"],
+        "b-synth-1"
+    );
+    assert_eq!(
+        value["observations"]["fields"]["server.model_id"]["value"],
+        "synth-alias"
+    );
+    assert_eq!(
+        value["observations"]["fields"]["profile"]["value"],
+        hash_file(&files.profile).unwrap()
+    );
+    assert_eq!(
+        value["observations"]["unknown_optional"]["limits.weights"],
+        "not reported"
+    );
+    // The mode never launches the native launcher and keeps no attempt root.
+    assert!(value["evidence_root"].is_null());
+    assert!(!f.case.join("fixture-call.json").exists());
+    assert_eq!(server.targets(), vec!["GET /props", "GET /v1/models"]);
+
+    // A required field that disappears is a reported failure, not a pass.
+    server.set(
+        "/props",
+        ObservedResponse::json(&json!({
+            "model_alias": "synth-alias",
+            "default_generation_settings": {
+                "n_ctx": 262144,
+                "params": {"seed": 42, "temperature": 1.0}
+            },
+            "chat_template": "synthetic chat template ".repeat(60),
+            "chat_template_caps": {"supports_tools": true}
+        })),
+    );
+    let out = mode_command("--observations", &request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["observation_failure"]["kind"], "missing");
+    assert!(
+        value["observation_failure"]["source"]
+            .as_str()
+            .unwrap()
+            .contains("/props")
+    );
+    assert!(!f.case.join("fixture-call.json").exists());
+}
+
+#[test]
+fn qualify_and_recheck_modes_use_retained_attempts_model_free() {
+    let server = ObservationServer::start(ObservedResponse::status(404));
+    serve_sources(&server, "b-synth-1");
+    let f = Fixture::new();
+    let files = ApiClientFiles::new();
+    prepare_api_observation(&f, &server.url(), &files);
+    let run = |content: &str| -> (Value, String) {
+        let out = f
+            .command("success")
+            .env("HARNESS_OUTCOME_SOLUTION", content)
+            .output()
+            .unwrap();
+        let row = f.check(out, 0);
+        let digest = hash_file(&f.case.join("solution.txt")).unwrap();
+        (row, digest)
+    };
+    let (first, first_digest) = run("retained solution\n");
+    let (second, second_digest) = run("retained solution\n");
+    let call_before = fs::read(f.case.join("fixture-call.json")).unwrap();
+    // Two retained attempts carry their own attempt identities; the fixture
+    // deliberately reuses one thread id for both runs.
+    let mut first_attempt = first.clone();
+    first_attempt["thread_id"] = json!("00000000-1111-2222-3333-444444444401");
+    let mut second_attempt = second.clone();
+    second_attempt["thread_id"] = json!("00000000-1111-2222-3333-444444444402");
+    let qualify_body = |attempts: Value| -> Value {
+        json!({
+            "runner": api_runner(&server.url()),
+            "policy": serde_json::to_value(api_policy()).unwrap(),
+            "observations": first["observed_api"],
+            "attempts": attempts,
+        })
+    };
+    let qualified_request = f.root.path().join("qualify-request.json");
+    fs::write(
+        &qualified_request,
+        serde_json::to_vec(&qualify_body(json!([
+            {"result": first_attempt, "outputs": {"solution.txt": first_digest}},
+            {"result": second_attempt, "outputs": {"solution.txt": second_digest}}
+        ])))
+        .unwrap(),
+    )
+    .unwrap();
+    let targets_before = server.targets().len();
+    let out = mode_command("--qualify", &qualified_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "qualified");
+    assert_eq!(value["qualification"]["mode"], "api-observed");
+    assert_eq!(value["qualification"]["observed_repeats"], 2);
+    // Qualification consumes retained evidence only: no HTTP and no dispatch.
+    assert_eq!(server.targets().len(), targets_before);
+    assert_eq!(
+        fs::read(f.case.join("fixture-call.json")).unwrap(),
+        call_before
+    );
+    let qualified = value["qualification"].clone();
+
+    // Divergent retained outputs block through the same mode.
+    let blocked_request = f.root.path().join("qualify-blocked-request.json");
+    fs::write(
+        &blocked_request,
+        serde_json::to_vec(&qualify_body(json!([
+            {"result": first_attempt, "outputs": {"solution.txt": first_digest}},
+            {"result": second_attempt, "outputs": {"solution.txt": "0".repeat(64)}}
+        ])))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = mode_command("--qualify", &blocked_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "blocked");
+    assert_eq!(
+        value["qualification"]["divergent_outputs"],
+        json!(["solution.txt"])
+    );
+
+    // An already-extracted attempt record is accepted as well.
+    let extracted_request = f.root.path().join("qualify-extracted-request.json");
+    let extracted_first = observation(&first_attempt, &first_digest);
+    let extracted_second = observation(&second_attempt, &second_digest);
+    fs::write(
+        &extracted_request,
+        serde_json::to_vec(&qualify_body(json!([
+            serde_json::to_value(&extracted_first).unwrap(),
+            serde_json::to_value(&extracted_second).unwrap(),
+        ])))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = mode_command("--qualify", &extracted_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "qualified");
+
+    let recheck_body = |qualification: &Value| -> Value {
+        json!({
+            "qualification": qualification,
+            "runner": api_runner(&server.url()),
+            "policy": serde_json::to_value(api_policy()).unwrap(),
+            "client_inputs": client_inputs_value(&files),
+        })
+    };
+    let recheck_request = f.root.path().join("recheck-request.json");
+    let write_recheck = |body: &Value| {
+        fs::write(&recheck_request, serde_json::to_vec(body).unwrap()).unwrap();
+    };
+    write_recheck(&recheck_body(&qualified));
+    let out = mode_command("--recheck", &recheck_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "unchanged");
+    assert_eq!(value["drift"]["drifted"], false);
+
+    // Observed server drift refuses through the CLI.
+    serve_sources(&server, "b-synth-2");
+    write_recheck(&recheck_body(&qualified));
+    let out = mode_command("--recheck", &recheck_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["status"], "drifted");
+    assert!(
+        value["drift"]["changed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("observed.server.build"))
+    );
+
+    // Regression: a retained record edited to match the changed server while
+    // keeping the old digest refuses; matching fresh fields cannot launder it.
+    let mut tampered = qualified.clone();
+    tampered["observations"]["fields"]["server.build"]["value"] = json!("b-synth-2");
+    write_recheck(&recheck_body(&tampered));
+    let out = mode_command("--recheck", &recheck_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["drift"]["changed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("retained.observation-digest")),
+        "{value}"
+    );
+
+    // A wrong retained mode and a re-hashed record missing a required retained
+    // fact refuse as well.
+    let mut wrong_mode = qualified.clone();
+    wrong_mode["mode"] = json!("full-material");
+    write_recheck(&recheck_body(&wrong_mode));
+    let out = mode_command("--recheck", &recheck_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["drift"]["changed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("retained.mode"))
+    );
+    let mut redigested = qualified.clone();
+    let mut observations: ApiObservations =
+        serde_json::from_value(redigested["observations"].clone()).unwrap();
+    observations.fields.remove("profile");
+    redigested["observations"] = serde_json::to_value(&observations).unwrap();
+    redigested["observation_digest"] = json!(observations.digest().unwrap());
+    write_recheck(&recheck_body(&redigested));
+    let out = mode_command("--recheck", &recheck_request, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["drift"]["changed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("retained.missing-observation.profile"))
+    );
+    // No mode above dispatched the launcher again.
+    assert_eq!(
+        fs::read(f.case.join("fixture-call.json")).unwrap(),
+        call_before
+    );
+}
+
+#[test]
+fn observation_modes_reject_invalid_input_and_keep_help_clear() {
+    let f = Fixture::new();
+    let missing = f.root.path().join("absent.json");
+    let missing_text = missing.to_str().unwrap();
+    for args in [
+        vec![
+            "outcome-run",
+            "--observations",
+            missing_text,
+            "--run-model-probes",
+        ],
+        vec![
+            "outcome-run",
+            "--qualify",
+            missing_text,
+            "--recheck",
+            missing_text,
+        ],
+        vec![
+            "outcome-run",
+            "--observations",
+            missing_text,
+            "--request",
+            missing_text,
+        ],
+        vec![
+            "outcome-run",
+            "--observations",
+            missing_text,
+            "--observations",
+            missing_text,
+        ],
+        vec!["outcome-run", "--observations", missing_text],
+        vec!["outcome-run", "--qualify", missing_text],
+        vec!["outcome-run", "--recheck", missing_text],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .args(&args)
+            .current_dir(f.root.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(!f.case.join("fixture-call.json").exists(), "{args:?}");
+    }
+
+    // Unknown fields, an unrelated schema and malformed JSON all refuse.
+    for body in [
+        json!({"runner": "x", "plan": {}, "extra": true}),
+        json!({"nope": 1}),
+    ] {
+        let path = f.root.path().join("invalid-observations.json");
+        fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        let out = mode_command("--observations", &path, f.root.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(!f.case.join("fixture-call.json").exists());
+    }
+    let malformed = f.root.path().join("malformed.json");
+    fs::write(&malformed, b"{").unwrap();
+    let out = mode_command("--observations", &malformed, f.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+
+    // The help names the model-free modes and their property.
+    let out = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["outcome-run", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "--observations PATH",
+        "--qualify PATH",
+        "--recheck PATH",
+        "without launching a process",
+    ] {
+        assert!(help.contains(needle), "{needle}");
+    }
 }
