@@ -271,9 +271,14 @@ semantics: coverage regression and legacy snapshots yield `comparable=false`;
 `latest` is the last completed publication; an unusable snapshot yields empty
 movements and null baseline totals, never fabricated zeros.
 
-Remaining for group 3: the owning documentation and `tokenomics` skill still
-describe the older baseline surface; reconciling them is the open part of
-tasks 3.5-3.6 (the code, tests and CLI usage text are complete and verified).
+Group 3 documentation reconciliation (2026-09-30): the bounded token-report
+section of `docs/rust-native.md`, the baseline entry in
+`docs/memory/token-audit.md` and the `tokenomics` skill's decide-with-a-
+baseline step now describe the published surface (immutable snapshots,
+publication-order `latest`, validation-before-compatibility, explicit weaker
+status, bounded diff with exact degradation labels, `detail --diff` paging).
+The documented command forms were verified against the merged CLI usage text
+and `harness-source-check --root .` passed with 0 findings over 894 files.
 
 ## Group 12: deterministic and installed CI routes (tasks 12.1-12.3)
 

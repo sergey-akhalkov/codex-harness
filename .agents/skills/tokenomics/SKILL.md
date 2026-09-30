@@ -23,8 +23,11 @@ subscription savings.
 4. **Decide with a baseline**: before adopting an idea, run
    `token-audit baseline save`; after the trial period, run
    `token-audit baseline diff` and compare movement per session, project,
-   model and day. Record the accept/reject decision and its evidence in the
-   owning record, not in a new report.
+   model and day; the bounded text keeps exact totals, coverage and
+   degradation labels, so a lower recorded subtotal is never a saving. Page
+   individual movements with `token-audit detail --diff PATH --session ID` or
+   `--group KIND:KEY`. Record the accept/reject decision and its evidence in
+   the owning record, not in a new report.
 
 Text reports retain complete same-scan JSON and print its local path, ranked
 records and omitted counts. Read only the needed record with

@@ -491,8 +491,12 @@ for ranked summaries. They state omitted counts and retain complete coverage,
 warnings and limitations. Full same-scan JSON is retained locally (newest 20
 files per kind); the summary prints its locator. `token-audit detail --report
 PATH --session ID` or `detail --findings PATH --finding ID` reads just the
-requested record without rescanning sessions. Missing/evicted evidence is an
-error. `--format json` preserves the complete contract; baselines are unchanged.
+requested record without rescanning sessions; `detail --diff PATH --session ID`
+or `--group KIND:KEY` pages a baseline comparison the same way, and
+`baseline diff` prints a bounded movement summary whose totals, coverage and
+degradation labels stay exact — a lower recorded subtotal is never presented
+as a saving. Missing/evicted evidence is an error. `--format json` preserves
+the complete contract.
 The [audit owner](memory/token-audit.md) describes interpretation and limits.
 
 ## Verification capture

@@ -30,8 +30,8 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 - [x] 3.2 Publish uniquely identified immutable snapshots and a coherent latest pointer under concurrent and interrupted writers; verify distinct same-second saves survive and latest never refers to a partial file or overwrites another successful snapshot. Covers A09, N02.
 - [x] 3.3 Validate the complete snapshot before compatible status, separate format validity from population comparability and version changed semantics; verify expected-schema/missing-fields, corrupt JSON, foreign schema, root/window/mode mismatch and inspectable legacy snapshots without fabricated baseline zeros. Covers A06, A07.
 - [x] 3.4 Carry usage basis, partial-subtotal status, warnings and relevant coverage through snapshot and diff projections; verify lost usage cannot masquerade as savings and mixed/unknown counters stay labeled in text and machine output. Covers A31, N03.
-- [ ] 3.5 Add documented bounded text diff and stable detail/paging through the existing report/detail owner; verify several thousand session/group movements, byte/row limits, deterministic selection, hidden counts, complete detail and totals equal to exhaustive JSON. Covers A10.
-- [ ] 3.6 Run the baseline/report/CLI compatibility targets and a local installed save/diff/detail path with owned synthetic sessions; verify upgrade and recovery preserve original snapshots and unsupported comparison metadata stays explicit.
+- [x] 3.5 Add documented bounded text diff and stable detail/paging through the existing report/detail owner; verify several thousand session/group movements, byte/row limits, deterministic selection, hidden counts, complete detail and totals equal to exhaustive JSON. Covers A10.
+- [x] 3.6 Run the baseline/report/CLI compatibility targets and a local installed save/diff/detail path with owned synthetic sessions; verify upgrade and recovery preserve original snapshots and unsupported comparison metadata stays explicit.
 
 ## 4. Add honest interval usage and safe incremental analysis
 

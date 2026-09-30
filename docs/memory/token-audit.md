@@ -23,9 +23,16 @@ owns the loop's decisions and limits; runtime discipline stays in
   measured/inferred/estimated, mass tokens, evidence locators, owner,
   validation plan); the default filter is measured-only and hidden bases are
   counted, never silently dropped.
-- `token-audit baseline save|diff` keeps local aggregate snapshots under
-  `CODEX_HOME/harness/token-audit/baselines` with a latest pointer; an
-  incompatible snapshot is an explicit marker, not a best-effort comparison.
+- `token-audit baseline save|diff` publishes uniquely named immutable
+  snapshots under `CODEX_HOME/harness/token-audit/baselines`; `latest` names
+  the last completed publication, never a partial one. A snapshot is fully
+  validated before any compatibility claim: format validity, population
+  comparability and version changes stay distinct, legacy or
+  reduced-coverage snapshots compare with an explicit weaker status, and an
+  unusable snapshot yields empty movements with null baseline totals instead
+  of fabricated zeros. The diff carries usage basis, partial-subtotal status,
+  warnings and coverage, prints a bounded movement summary with exact
+  omitted counts and totals, and keeps stable detail paging.
 - One shared rollout reader (`harness-core::rollout_reader`) serves both the
   analyzer and `codex-harness delegation-usage`; format drift is a reader
   defect, not a per-consumer parser.
