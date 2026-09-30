@@ -63,8 +63,22 @@ impl Fixture {
         )
     }
     fn receipt(&self) -> Value {
-        serde_json::from_slice(&fs::read(self.executable.with_extension("receipt.json")).unwrap())
-            .unwrap()
+        let path = self.executable.with_extension("receipt.json");
+        // A slow agent can observe the child's exit before its final receipt
+        // bytes are durable; wait bounded for a complete record.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let bytes = fs::read(&path).unwrap();
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receipt never became complete JSON: {} bytes",
+                bytes.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     fn removed(&self) {
         let receipt = self.receipt();
