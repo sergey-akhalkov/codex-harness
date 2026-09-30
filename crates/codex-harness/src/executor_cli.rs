@@ -1208,7 +1208,17 @@ struct SlotBinding {
     branch: Option<String>,
 }
 
-fn dispatch(request: &Dispatch) -> io::Result<i32> {
+/// One dispatch prepared up to (not including) opening its surface: the bound
+/// slot, the resolved profile binding, the kit-local run paths and the control
+/// route. Shared by the `spawn` command and reusable native controllers.
+struct PreparedDispatch {
+    binding: SlotBinding,
+    bound: ProfileBinding,
+    paths: RunPaths,
+    route: HostRoute,
+}
+
+fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
     let bound = orchestration_config::binding(request.codex_home, request.profile)?;
     let slot = acquire_pool_slot(request)?;
     let binding = SlotBinding {
@@ -1239,7 +1249,183 @@ fn dispatch(request: &Dispatch) -> io::Result<i32> {
         port: None,
         resume_session: None,
     }));
-    launch_bound(request, &binding, route, &bound, &paths)
+    Ok(PreparedDispatch {
+        binding,
+        bound,
+        paths,
+        route,
+    })
+}
+
+fn dispatch(request: &Dispatch) -> io::Result<i32> {
+    let prepared = prepare_dispatch(request)?;
+    launch_bound(
+        request,
+        &prepared.binding,
+        prepared.route,
+        &prepared.bound,
+        &prepared.paths,
+    )
+}
+
+/// One bounded visible conversation requested by another native controller
+/// (the improvement loop). It reuses this module's pooled dispatch owner
+/// verbatim: the installed profile binding, slot allocation, structured
+/// assignment validation against the bound checkout, the native frontend
+/// attach wait and the receipt/observation artifacts. It is the only accepted
+/// route for controller-generated model work; `outcome-run` stays the hidden
+/// measurement route and never substitutes for a visible conversation.
+pub(crate) struct VisibleConversation {
+    pub codex_home: PathBuf,
+    pub source: PathBuf,
+    /// Bounded, distinct owner label; the console title derives from it.
+    pub owner: String,
+    pub profile: String,
+    pub base: Option<String>,
+    pub assignment: PathBuf,
+}
+
+/// The accepted dispatch: the exact effective binding, the titled surface and
+/// the kit-local artifacts the controller records for recovery.
+pub(crate) struct VisibleAccepted {
+    pub owner: String,
+    pub title: String,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub checkout: PathBuf,
+    pub receipt: PathBuf,
+    pub result: PathBuf,
+    pub detail: PathBuf,
+}
+
+pub(crate) fn dispatch_visible_conversation(
+    request: &VisibleConversation,
+) -> io::Result<VisibleAccepted> {
+    refuse_executor_dispatch(std::env::var_os(EXECUTOR_SESSION_ENV))?;
+    if !request.source.is_absolute() || !request.codex_home.is_absolute() {
+        return Err(invalid(
+            "visible conversation source and codex home must be absolute paths",
+        ));
+    }
+    let config = load(&request.source)?;
+    let profile = executor_profile(&config, Some(request.profile.as_str()))?.to_owned();
+    let assignment = executor_assignment::Assignment::load(&request.assignment)?;
+    let dispatch = Dispatch {
+        codex_home: &request.codex_home,
+        source: &request.source,
+        pool_size: config.max_concurrent_executors,
+        named_slot: None,
+        owner: &request.owner,
+        base: request.base.as_deref(),
+        profile: &profile,
+        prompt: PromptSource::Structured(assignment),
+        mode: SpawnMode::Tui,
+        resumed_session: None,
+        terminal_profile: None,
+        terminal_window: None,
+    };
+    let prepared = prepare_dispatch(&dispatch)?;
+    let accepted = VisibleAccepted {
+        owner: prepared.binding.owner.clone(),
+        title: executor_title(&profile, &prepared.binding.owner),
+        model: prepared.bound.model.clone(),
+        model_provider: prepared.bound.model_provider.clone(),
+        reasoning_effort: prepared.bound.reasoning_effort.clone(),
+        checkout: prepared.binding.path.clone(),
+        receipt: prepared.paths.receipt.clone(),
+        result: prepared.paths.result.clone(),
+        detail: prepared.paths.detail.clone(),
+    };
+    launch_bound(
+        &dispatch,
+        &prepared.binding,
+        prepared.route,
+        &prepared.bound,
+        &prepared.paths,
+    )?;
+    Ok(accepted)
+}
+
+/// The lifecycle fact one controller needs from a dispatch receipt. It is a
+/// bounded projection of the recorded observation; the full observation
+/// module stays private to this dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConversationState {
+    /// Terminal with an accepted final message.
+    Completed,
+    /// Terminal failure or defect with the recorded cause.
+    Failed(String),
+    /// Terminal interruption; a cause naming the frontend identifies a lost
+    /// visible surface.
+    Interrupted(String),
+    /// Terminal explicit stop.
+    Stopped(String),
+    /// Nonterminal and the recorded host still runs.
+    Active,
+    /// Nonterminal without a live host, or no readable native coverage: the
+    /// outcome is unknown and must not be replayed.
+    Unknown(String),
+    /// No receipt exists at the recorded path.
+    Missing,
+}
+
+/// Reads one dispatch receipt without mutating it. Anything the receipt
+/// cannot establish stays explicitly unknown instead of being guessed.
+pub(crate) fn conversation_state(receipt: &Path) -> io::Result<ConversationState> {
+    let bytes = match fs::read(receipt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ConversationState::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::other(format!("receipt is not JSON: {error}")))?;
+    let Some(run) = RunObservation::from_receipt(&value) else {
+        return Ok(ConversationState::Unknown(
+            "the receipt carries no observation record".to_owned(),
+        ));
+    };
+    if run.coverage != COVERAGE_NATIVE {
+        return Ok(ConversationState::Unknown(format!(
+            "the recorded run has no native coverage: {}",
+            run.reason
+                .as_deref()
+                .unwrap_or("this mode records no event stream")
+        )));
+    }
+    let cause = run.cause.clone().unwrap_or_default();
+    match run.state.as_str() {
+        STATE_COMPLETED if run.exit_code == Some(0) => Ok(ConversationState::Completed),
+        STATE_COMPLETED => Ok(ConversationState::Failed(if cause.is_empty() {
+            "the run completed without a zero exit code".to_owned()
+        } else {
+            cause
+        })),
+        STATE_FAILED | STATE_DEFECT => Ok(ConversationState::Failed(cause)),
+        STATE_INTERRUPTED => Ok(ConversationState::Interrupted(cause)),
+        observation::STATE_STOPPED | observation::STATE_PARTIAL_STOP => {
+            Ok(ConversationState::Stopped(cause))
+        }
+        STATE_ACCEPTED | STATE_STARTED | observation::STATE_RUNNING => {
+            let ended = match &run.host {
+                Some(host) => observation::host_ended(host),
+                None => observation::now_ms() > run.updated_ms + HOST_GRACE.as_millis() as u64,
+            };
+            if ended {
+                Ok(ConversationState::Unknown(
+                    "the recorded session host is gone and no terminal event was recorded"
+                        .to_owned(),
+                ))
+            } else {
+                Ok(ConversationState::Active)
+            }
+        }
+        other => Ok(ConversationState::Unknown(format!(
+            "unrecognized recorded state {other}"
+        ))),
+    }
 }
 
 /// The dispatch text for the bound slot: free text keeps the caller's own words
@@ -1412,8 +1598,40 @@ fn slot_summary(binding: &SlotBinding, named: Option<u32>) -> String {
     line
 }
 
-fn executor_title(profile: &str, owner: &str) -> String {
-    format!("CEx ({profile}) - {owner}")
+/// The console/tab title one executor conversation carries.
+///
+/// The native TUI truncates a long caption, while the frontend attach guard
+/// (`task_control::caption_loaded`) matches the complete expected name; a title
+/// the TUI would shorten therefore prevents attachment before any model call.
+/// The title stays within a bound the captioned surface preserves, and a long
+/// owner keeps a readable head plus a stable digest suffix so distinct owners
+/// on the same profile keep distinct titles.
+pub(crate) const EXECUTOR_TITLE_LIMIT: usize = 48;
+
+pub(crate) fn executor_title(profile: &str, owner: &str) -> String {
+    // The profile is bounded first so the total title stays within the limit
+    // even for an unusually long configured profile name.
+    let prefix = format!("CEx ({}) - ", bounded_title_component(profile, 16));
+    let budget = EXECUTOR_TITLE_LIMIT
+        .saturating_sub(prefix.chars().count())
+        .max(8);
+    if owner.chars().count() <= budget {
+        return format!("{prefix}{owner}");
+    }
+    format!("{prefix}{}", bounded_title_component(owner, budget))
+}
+
+/// A title component that keeps a short value verbatim and bounds a long one
+/// with a stable digest suffix, so distinct values keep distinct titles.
+fn bounded_title_component(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+    let digest = harness_core::build_identity::hash_bytes(value.as_bytes());
+    let suffix = &digest[..6];
+    let keep = max.saturating_sub(suffix.len() + 1);
+    let head: String = value.chars().take(keep).collect();
+    format!("{head}-{suffix}")
 }
 
 /// Report the inventory the pool invariant covers: dispatch allocates only
@@ -6762,6 +6980,33 @@ mod tests {
         )
         .expect("valid terminal arguments");
         assert!(args.windows(2).any(|pair| pair == ["--title", &first]));
+    }
+
+    /// A long owner must not produce a title the native TUI truncates before
+    /// the frontend attach guard can match it: the title stays bounded and a
+    /// digest suffix keeps distinct owners distinct.
+    #[test]
+    fn executor_titles_stay_bounded_for_long_owners_and_remain_distinct() {
+        let long_a = format!("run-{}", "a".repeat(160));
+        let long_b = format!("run-{}", "b".repeat(160));
+        let first = executor_title("ds", &long_a);
+        let second = executor_title("ds", &long_b);
+        assert!(
+            first.chars().count() <= EXECUTOR_TITLE_LIMIT,
+            "bounded title: {first}"
+        );
+        assert!(first.starts_with("CEx (ds) - "), "{first}");
+        assert_ne!(first, second);
+        assert_eq!(first, executor_title("ds", &long_a));
+        let long_profile = executor_title(&"p".repeat(48), "owner");
+        assert!(
+            long_profile.chars().count() <= EXECUTOR_TITLE_LIMIT,
+            "{long_profile}"
+        );
+        // The caption the frontend sets on load keeps the complete title as
+        // its prefix, which is exactly what the attach guard checks.
+        let caption = format!("{first} | ready");
+        assert!(caption.starts_with(&format!("{first} | ")));
     }
 
     #[test]

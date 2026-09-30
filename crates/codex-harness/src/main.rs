@@ -18,6 +18,8 @@ mod feedback_cli;
 #[cfg(windows)]
 mod heavy_command_cli;
 #[cfg(windows)]
+mod improvement_loop_cli;
+#[cfg(windows)]
 mod install_cli;
 #[cfg(windows)]
 mod mcp_cli;
@@ -314,6 +316,9 @@ fn run() -> io::Result<i32> {
         );
         println!("codex-harness lead message [--text TEXT | --file FILE] [--notify]");
         println!(
+            "codex-harness improve start|status|select|stop|resume --run DIRECTORY ... (explicit private improvement run; see improve --help)"
+        );
+        println!(
             "codex-harness executor message|stop|watch [--source CHECKOUT] [--codex-home DIRECTORY] [--slot N] [--owner ID] (content: --text TEXT, --file FILE or piped stdin)"
         );
         println!(
@@ -466,6 +471,13 @@ fn run() -> io::Result<i32> {
     if args[0] == "lead" {
         verify_runtime()?;
         return executor_cli::lead(&args[1..]);
+    }
+    #[cfg(windows)]
+    if args[0] == "improve" {
+        // The improvement controller validates source trees, reads the board
+        // and plans and dispatches through the visible executor owner.
+        verify_runtime()?;
+        return improvement_loop_cli::run(&args[1..]);
     }
     #[cfg(windows)]
     if args[0] == "heavy" {
