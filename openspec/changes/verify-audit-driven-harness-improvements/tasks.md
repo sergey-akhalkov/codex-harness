@@ -51,9 +51,9 @@ Dependencies: group 0 establishes current inputs. Groups 1, 2, 3, 6, 7 and 11 ca
 
 ## 6. Confine scratch reclamation to abandoned owned work
 
-- [ ] 6.1 Add native ownership counterexamples for the existing scratch sweep using old foreign prefixed directories, an old active operation and outside reparse sentinels; verify expected preservation is independent of matching name/age. Covers A19.
-- [ ] 6.2 Introduce the dedicated short owned scratch root and validated live lease in the existing native-build lifecycle; verify abandoned owned data is reclaimed, active/foreign/reparse data survives, PID reuse is not ownership and cleanup failure does not fail a valid build. Covers A19.
-- [ ] 6.3 Preserve legacy unproven scratch and document bounded recovery in its existing owner; verify repeat build/update and interruption recovery retain short Windows paths and do not sweep neighboring TEMP namespaces. Covers A19.
+- [x] 6.1 Add native ownership counterexamples for the existing scratch sweep using old foreign prefixed directories, an old active operation and outside reparse sentinels; verify expected preservation is independent of matching name/age. Covers A19.
+- [x] 6.2 Introduce the dedicated short owned scratch root and validated live lease in the existing native-build lifecycle; verify abandoned owned data is reclaimed, active/foreign/reparse data survives, PID reuse is not ownership and cleanup failure does not fail a valid build. Covers A19.
+- [x] 6.3 Preserve legacy unproven scratch and document bounded recovery in its existing owner; verify repeat build/update and interruption recovery retain short Windows paths and do not sweep neighboring TEMP namespaces. Covers A19.
 
 ## 7. Protect xAI transport ownership and generation continuity
 

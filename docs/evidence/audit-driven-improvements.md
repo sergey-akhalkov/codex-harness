@@ -150,3 +150,38 @@ missing effort, unmapped models and malformed configuration states are
 covered by the same launcher tests; the profile-shaped `[profiles.p]`
 configuration failure is exercised through the unresolved-configuration
 case, matching the qualified 0.157.1 behavior above.
+
+## Group 6: owned scratch reclamation (tasks 6.1-6.3)
+
+Implemented in worktree slot 4 (`exec-ds-scratch`, base `dd5b151`) and
+merged as `f5d835f` after lead review. Changed owners:
+`crates/harness-core/src/native_build.rs` (dedicated `%TEMP%\chx` root with
+an ownership record, per-entry `owner` identity plus a live `lease` object
+held by an exclusive file lock, sweep that reclaims only verified owned
+entries with a released lease, reparse children skipped, record removed last),
+`crates/codex-harness/tests/native_build.rs` (real interrupted-build
+acceptance) and `docs/rust-native.md` (bounded recovery text). The legacy
+`hcb-`/`hcc-`/`hca-` and `harness-build-prerequisite-` sweeps are removed:
+unproven legacy scratch is preserved (BREAKING per the change spec) with
+documented manual recovery.
+
+Executor evidence (all through `codex-harness heavy --`): 12
+`native_build` lib tests, the 8-test `native_build` integration suite
+including a real killed build with lease release, blocked-cleanup and
+foreign/junction/neighbor survival (1212 s), `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`harness-source-check --root .` and `codex-harness ownership-check` clean.
+The full workspace suite cannot finish inside the shared 30-minute heavy
+deadline, so the executor ran the identical scope as three partitioned runs
+(`--workspace --exclude codex-harness`, the codex-harness lib/bins and 63
+test targets excluding `native_build`, and `--test native_build`), all
+passing; the literal single-command workspace gate remains part of the
+integrated-candidate acceptance below.
+
+Lead review and independent verification (2026-09-30): diff inspected
+(ownership verification, lease acquisition on an existing lease file only,
+record-last removal, reparse refusal, foreign-root preservation); the 12
+`native_build` lib tests were rerun independently on the executor worktree
+and pass. Lead decisions: the three-partition workspace evidence is accepted
+for this slice; the short `chx` root name and the bounded empty-directory
+crash window (identity not yet published) are accepted as designed.
