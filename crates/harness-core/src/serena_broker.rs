@@ -56,6 +56,47 @@ pub struct Configuration {
     pub source_root: PathBuf,
 }
 
+fn retry_allowed(
+    operation: &str,
+    payload: &Value,
+    error: &io::Error,
+    deadline: Deadline,
+    cancel: &Cancellation,
+) -> bool {
+    if cancel.is_cancelled() || deadline.expired() {
+        return false;
+    }
+    let transport = serena::transport_failure(error);
+    if !transport && !serena_rpc_recoverable(error) {
+        return false;
+    }
+    if operation == "connect" {
+        return true;
+    }
+    if operation != "rpc" {
+        return false;
+    }
+    match payload["method"].as_str() {
+        Some(
+            "tools/list" | "ping" | "resources/list" | "resources/read" | "prompts/list"
+            | "prompts/get",
+        ) => true,
+        Some("tools/call") => matches!(
+            payload["params"]["name"].as_str(),
+            Some(
+                "get_symbols_overview"
+                    | "find_symbol"
+                    | "find_referencing_symbols"
+                    | "find_declaration"
+                    | "find_implementations"
+                    | "get_diagnostics_for_file"
+                    | "get_diagnostics_for_symbol"
+            )
+        ),
+        _ => false,
+    }
+}
+
 fn serena_rpc_recoverable(error: &io::Error) -> bool {
     let text = error.to_string();
     text.contains("tree cleanup was not confirmed") || text.contains("route echo is incomplete")
@@ -241,6 +282,57 @@ impl Client {
         deadline: Deadline,
         cancel: &Cancellation,
     ) -> io::Result<Value> {
+        let first = match self.invoke_once(operation, payload, deadline, cancel) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !retry_allowed(operation, payload, &first, deadline, cancel) {
+            if operation == "rpc"
+                && payload["method"] == "tools/call"
+                && serena::transport_failure(&first)
+            {
+                return Err(io::Error::new(
+                    first.kind(),
+                    format!(
+                        "Serena {} transport failed: {first}; request was not replayed; inspect the project before repeating an edit",
+                        payload["params"]["name"].as_str().unwrap_or("tool")
+                    ),
+                ));
+            }
+            return Err(first);
+        }
+        eprintln!("serena-client: recovering one failed {operation}: {first}");
+        let recovery = (|| {
+            if serena_rpc_recoverable(&first) {
+                let root = BrokerRoot::open(&self.location()?)?;
+                let until = Deadline::after(deadline.remaining().min(CONTROL))?;
+                if let broker_launch::Retirement::Pending { pid } =
+                    broker_launch::retire(&root, until, cancel)?
+                {
+                    return Err(io::Error::other(format!(
+                        "Serena broker retirement still pending (pid {pid:?})"
+                    )));
+                }
+            }
+            // ensure re-observes the authenticated owner and source identity.
+            // A reset is not permission to terminate a healthy shared broker.
+            self.invoke_once(operation, payload, deadline, cancel)
+        })();
+        recovery.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Serena {operation} failed: {first}; recovery failed: {error}"),
+            )
+        })
+    }
+
+    fn invoke_once(
+        &self,
+        operation: &str,
+        payload: &Value,
+        deadline: Deadline,
+        cancel: &Cancellation,
+    ) -> io::Result<Value> {
         let mut environment = BTreeMap::new();
         for key in ["SystemRoot", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"] {
             if let Ok(value) = std::env::var(key) {
@@ -254,7 +346,7 @@ impl Client {
         ];
         let startup = Deadline::after(deadline.remaining().min(CONTROL))?;
         let mut location = self.location()?;
-        let mut endpoint = match broker_launch::ensure(
+        let endpoint = match broker_launch::ensure(
             &BrokerRoot::open(&location)?,
             &std::env::current_exe()?,
             arguments.clone(),
@@ -282,31 +374,7 @@ impl Client {
             }
             Err(error) => return Err(error),
         };
-        match Self::rpc_once(&endpoint, operation, payload, deadline, cancel) {
-            Ok(value) => Ok(value),
-            Err(error) if serena_rpc_recoverable(&error) => {
-                let retry = Deadline::after(deadline.remaining().min(CONTROL))?;
-                match broker_launch::retire(&BrokerRoot::open(&location)?, retry, cancel)? {
-                    broker_launch::Retirement::Pending { pid } => Err(io::Error::other(format!(
-                        "Serena broker retirement still pending (pid {pid:?})"
-                    ))),
-                    broker_launch::Retirement::Absent
-                    | broker_launch::Retirement::Exited { .. } => {
-                        endpoint = broker_launch::ensure(
-                            &BrokerRoot::open(&location)?,
-                            &std::env::current_exe()?,
-                            arguments,
-                            environment,
-                            &self.source,
-                            retry,
-                            cancel,
-                        )?;
-                        Self::rpc_once(&endpoint, operation, payload, deadline, cancel)
-                    }
-                }
-            }
-            Err(error) => Err(error),
-        }
+        Self::rpc_once(&endpoint, operation, payload, deadline, cancel)
     }
 
     fn location(&self) -> io::Result<PathBuf> {
@@ -333,7 +401,12 @@ impl Client {
         cancel: &Cancellation,
     ) -> io::Result<Value> {
         match broker_rpc::invoke(endpoint, operation, payload, deadline, cancel) {
-            Ok(value) if value.get("error").is_some() => Err(io::Error::other(
+            Ok(value) if value.get("error").is_some() => Err(io::Error::new(
+                if value["transport_failure"] == true {
+                    io::ErrorKind::ConnectionReset
+                } else {
+                    io::ErrorKind::Other
+                },
                 value["error"]
                     .as_str()
                     .unwrap_or("Serena broker request failed"),
@@ -505,7 +578,8 @@ impl broker_service::Backend for Backend {
             Ok(value) => Ok(value),
             Err(error) => {
                 eprintln!("serena-broker: {operation} failed: {error}");
-                Ok(json!({"error": error.to_string()}))
+                Ok(json!({"error": error.to_string(),
+                    "transport_failure": serena::transport_failure(&error)}))
             }
         }
     }
@@ -587,6 +661,87 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_replay_is_bounded_to_known_reads_and_live_deadlines() {
+        let cancel = Cancellation::default();
+        let deadline = Deadline::after(Duration::from_secs(10)).unwrap();
+        let read = json!({"method":"tools/call","params":{"name":"get_symbols_overview"}});
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotConnected,
+        ] {
+            let error = io::Error::new(kind, "localized transport detail");
+            assert!(retry_allowed("rpc", &read, &error, deadline, &cancel));
+            assert!(retry_allowed(
+                "connect",
+                &json!({}),
+                &error,
+                deadline,
+                &cancel
+            ));
+            for tool in [
+                "insert_after_symbol",
+                "replace_symbol_body",
+                "replace_in_files",
+                "rename_symbol",
+                "safe_delete_symbol",
+                "activate_project",
+                "unknown_tool",
+            ] {
+                assert!(
+                    !retry_allowed(
+                        "rpc",
+                        &json!({"method":"tools/call","params":{"name":tool}}),
+                        &error,
+                        deadline,
+                        &cancel
+                    ),
+                    "{tool}"
+                );
+            }
+        }
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!retry_allowed(
+                "rpc",
+                &read,
+                &io::Error::new(kind, "error"),
+                deadline,
+                &cancel
+            ));
+        }
+        let reset = io::Error::from_raw_os_error(10054);
+        assert!(retry_allowed("rpc", &read, &reset, deadline, &cancel));
+        cancel.cancel();
+        assert!(!retry_allowed("rpc", &read, &reset, deadline, &cancel));
+        let expired = Deadline::after(Duration::from_nanos(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(!retry_allowed(
+            "rpc",
+            &read,
+            &reset,
+            expired,
+            &Cancellation::default()
+        ));
+        let edit = json!({"method":"tools/call","params":{"name":"insert_after_symbol"}});
+        assert!(!retry_allowed(
+            "rpc",
+            &edit,
+            &io::Error::other("tree cleanup was not confirmed"),
+            deadline,
+            &Cancellation::default()
+        ));
+    }
 
     #[test]
     fn grown_record_from_repeated_deliveries_is_pruned_and_reused() {

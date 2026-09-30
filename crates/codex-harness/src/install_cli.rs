@@ -469,7 +469,7 @@ fn current_state() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("deploy requires --state or --build"))
 }
 
-fn verification(codex_home: &Path) -> serde_json::Value {
+fn verification(codex_home: &Path, source: &Path) -> serde_json::Value {
     let installed = codex_home.join("harness/bin/codex-harness.exe");
     let version = Command::new(&installed).arg("--version").output();
     let probe = Command::new(&installed)
@@ -489,7 +489,45 @@ fn verification(codex_home: &Path) -> serde_json::Value {
         "installed": installed,
         "version": version,
         "executor_probe_ok": probe_ok,
+        "serena": serena_verification(&installed, codex_home, source),
     })
+}
+
+fn serena_verification(manager: &Path, codex_home: &Path, source: &Path) -> serde_json::Value {
+    let registry = codex_home.join("harness/code-tools.json");
+    if registry.exists()
+        || codex_home
+            .join("harness/code-tools-registration.json")
+            .exists()
+    {
+        match Command::new(manager)
+            .args(["mcp", "serena-check", "--source"])
+            .arg(source)
+            .arg("--registry")
+            .arg(&registry)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    Ok(report)
+                        if report["status"] == "semantic-ready"
+                            && report["owned_state_removed"] == true =>
+                    {
+                        report
+                    }
+                    _ => {
+                        serde_json::json!({"status":"failed", "error":"invalid Serena semantic acceptance receipt"})
+                    }
+                }
+            }
+            Ok(output) => serde_json::json!({"status":"failed",
+                "error":String::from_utf8_lossy(&output.stderr).trim(),
+                "exit_code":output.status.code()}),
+            Err(error) => serde_json::json!({"status":"failed","error":error.to_string()}),
+        }
+    } else {
+        serde_json::json!({"status":"not-connected"})
+    }
 }
 
 /// Arguments for one `deploy --all` component step. The step is executed by
@@ -607,6 +645,29 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
     let build_identity = harness_core::build_identity::read_record(&build)
         .map(|record| record.source.sha256.chars().take(16).collect::<String>())
         .unwrap_or_default();
+    let preflight = if preview {
+        None
+    } else {
+        let check = harness_core::build_identity::check(&build, Some(&source));
+        if !check.runtime_allowed {
+            return Err(io::Error::other(
+                "native candidate build is stale, missing or altered; explicit build required",
+            ));
+        }
+        let report = serena_verification(&build.join("codex-harness.exe"), &codex_home, &source);
+        if report["status"] == "failed" {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status":"verification-failed", "source":source, "build":build,
+                    "build_identity":build_identity, "installation_changed":false,
+                    "verification":{"serena":report},
+                }))?
+            );
+            return Ok(1);
+        }
+        Some(report)
+    };
     let reset_report = if reset && !preview {
         Some(serde_json::to_value(installation_reset::run(
             &codex_home,
@@ -705,8 +766,15 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
     let verify = if preview {
         None
     } else {
-        Some(verification(&codex_home))
+        Some(verification(&codex_home, &source))
     };
+    if let Some(report) = &verify
+        && (report["executor_probe_ok"] != true
+            || report["version"] == ""
+            || report["serena"]["status"] == "failed")
+    {
+        status = "partial";
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -718,9 +786,10 @@ pub fn deploy(args: &[OsString]) -> io::Result<i32> {
             "core": core,
             "components": components,
             "verification": verify,
+            "serena_preflight": preflight,
         }))?
     );
-    Ok(0)
+    Ok(if status == "partial" { 1 } else { 0 })
 }
 
 #[cfg(test)]

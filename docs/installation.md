@@ -78,6 +78,12 @@ delivery:
 codex-harness deploy --source "<absolute-kit-checkout>" [--all] [--reset]
 ```
 
+For connected code tools, delivery requires real Serena semantic acceptance
+before link changes and through the installed manager afterward. The receipt's
+`verification.serena.status` must be `semantic-ready`; `not-connected` records
+an installation without code tools. Failed verification exits nonzero. See the
+[acceptance scope and standalone check](code-tools.md#explicit-lifecycle).
+
 The explicit candidate flow below remains for scoped, pinned or
 no-Cargo situations; `install`, `update` and `check` never compile.
 

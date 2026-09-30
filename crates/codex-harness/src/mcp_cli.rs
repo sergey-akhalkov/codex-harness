@@ -28,6 +28,16 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     if args.first().is_some_and(|arg| arg == "serena") {
         return serena(&args[1..]);
     }
+    if args.first().is_some_and(|arg| arg == "serena-check") {
+        if args.len() != 5 || args[1] != "--source" || args[3] != "--registry" {
+            return Err(invalid());
+        }
+        let source = local_path(Path::new(&args[2]))?;
+        let registry = local_path(Path::new(&args[4]))?;
+        let report = harness_core::serena_acceptance::verify(&source, &registry)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
+    }
     if args.first().is_some_and(|arg| arg == "nuphus") {
         return nuphus(&args[1..]);
     }
@@ -62,6 +72,7 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "codex-harness mcp broker-prepare\ncodex-harness mcp broker-retire --root DIRECTORY\ncodex-harness mcp serena --help"
         );
         println!("codex-harness mcp nuphus --help");
+        println!("codex-harness mcp serena-check --source DIRECTORY --registry FILE");
         return Ok(0);
     }
     Err(invalid())

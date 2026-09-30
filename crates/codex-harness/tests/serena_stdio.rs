@@ -8,6 +8,351 @@ use harness_core::{
     process::{Cancellation, Deadline},
 };
 use serde_json::{Value, json};
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn native_semantic_acceptance_checks_real_backends_and_edit_readback() {
+    let registry = std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").expect("explicit registry");
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["mcp", "serena-check", "--source"])
+        .arg(repo())
+        .arg("--registry")
+        .arg(registry)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "semantic-ready");
+    assert_eq!(report["languages"], json!(["rust", "python"]));
+    assert_eq!(report["owned_state_removed"], true);
+    assert_eq!(
+        report["manager_sha256"],
+        harness_core::build_identity::hash_file(Path::new(env!("CARGO_BIN_EXE_codex-harness")))
+            .unwrap()
+    );
+}
+
+#[test]
+fn native_semantic_acceptance_fails_on_missing_dependencies() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("registry.json");
+    fs::write(&registry, r#"{"mcp":[],"languages":[]}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["mcp", "serena-check", "--source"])
+        .arg(repo())
+        .arg("--registry")
+        .arg(registry)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("adopted console entrypoint"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("semantic-ready"));
+}
+
+// Test-owned relay: forward to the real broker, then reset a completed response.
+struct ResetRelay {
+    receipt: PathBuf,
+    original: Vec<u8>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    faults: Arc<Mutex<(String, usize, usize)>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ResetRelay {
+    fn start(codex_home: &Path) -> Self {
+        use std::{
+            net::{Ipv4Addr, TcpListener},
+            sync::atomic::{AtomicBool, Ordering},
+        };
+        let record: Value = serde_json::from_slice(
+            &fs::read(codex_home.join("harness/runtime/serena-broker.json")).unwrap(),
+        )
+        .unwrap();
+        let receipt = PathBuf::from(record["root"].as_str().unwrap()).join("endpoint.json");
+        let original = fs::read(&receipt).unwrap();
+        let mut endpoint: Value = serde_json::from_slice(&original).unwrap();
+        let port = endpoint["port"].as_u64().unwrap() as u16;
+        let token = endpoint["token"].as_str().unwrap().to_owned();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        endpoint["port"] = json!(listener.local_addr().unwrap().port());
+        let stop = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(Mutex::new((String::new(), 0, 0)));
+        let thread_stop = stop.clone();
+        let thread_faults = faults.clone();
+        let worker = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(peer) => peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("relay accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let deadline = Deadline::after(Duration::from_secs(240)).unwrap();
+                let cancel = Cancellation::default();
+                let request =
+                    harness_core::broker_http::read_request(&mut stream, &token, deadline, &cancel)
+                        .unwrap();
+                let operation = request["operation"].as_str().unwrap();
+                let response = harness_core::broker_http::exchange(
+                    port,
+                    &token,
+                    operation,
+                    &request["payload"],
+                    deadline,
+                    &cancel,
+                );
+                let reset = {
+                    let mut faults = thread_faults.lock().unwrap();
+                    if operation == "request/invoke"
+                        && request["payload"]["payload"]["params"]["name"] == faults.0
+                    {
+                        faults.2 += 1;
+                        if faults.1 > 0 {
+                            faults.1 -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if reset {
+                    assert!(response.is_ok(), "relay backend: {response:?}");
+                    use std::os::windows::io::AsRawSocket;
+                    use windows_sys::Win32::Networking::WinSock::{
+                        LINGER, SO_LINGER, SOL_SOCKET, setsockopt,
+                    };
+                    let linger = LINGER {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    assert_eq!(
+                        unsafe {
+                            setsockopt(
+                                stream.as_raw_socket() as _,
+                                SOL_SOCKET,
+                                SO_LINGER,
+                                (&linger as *const LINGER).cast(),
+                                std::mem::size_of::<LINGER>() as i32,
+                            )
+                        },
+                        0
+                    );
+                    drop(stream);
+                } else {
+                    let body = match response {
+                        Ok(value) => json!({"result": value}),
+                        Err(error) => json!({"error": error.to_string()}),
+                    };
+                    harness_core::broker_http::write_response(
+                        &mut stream,
+                        200,
+                        &body,
+                        deadline,
+                        &cancel,
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        fs::write(&receipt, serde_json::to_vec(&endpoint).unwrap()).unwrap();
+        Self {
+            receipt,
+            original,
+            stop,
+            faults,
+            worker: Some(worker),
+        }
+    }
+    fn arm(&self, tool: &str, failures: usize) {
+        *self.faults.lock().unwrap() = (tool.into(), failures, 0);
+    }
+    fn calls(&self) -> usize {
+        self.faults.lock().unwrap().2
+    }
+}
+
+impl Drop for ResetRelay {
+    fn drop(&mut self) {
+        fs::write(&self.receipt, &self.original).unwrap();
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let outcome = worker.join();
+            if !thread::panicking() {
+                outcome.unwrap();
+            }
+        }
+    }
+}
+
+struct OwnedBroker(PathBuf);
+impl OwnedBroker {
+    fn crash(&self) {
+        let record: Value = serde_json::from_slice(
+            &fs::read(self.0.join("harness/runtime/serena-broker.json")).unwrap(),
+        )
+        .unwrap();
+        let root = BrokerRoot::open(Path::new(record["root"].as_str().unwrap())).unwrap();
+        let broker_endpoint::Observation::Ready { owner, .. } =
+            broker_endpoint::observe(&root).unwrap()
+        else {
+            panic!("owned broker absent")
+        };
+        assert!(owner.terminate(137).unwrap());
+        let until = Instant::now() + Duration::from_secs(10);
+        while owner.is_running().unwrap() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!owner.is_running().unwrap());
+    }
+}
+impl Drop for OwnedBroker {
+    fn drop(&mut self) {
+        let path = self.0.join("harness/runtime/serena-broker.json");
+        let result = (|| -> std::io::Result<()> {
+            if !path.exists() {
+                return Ok(());
+            }
+            let record: Value = serde_json::from_slice(&fs::read(path)?)?;
+            let root = BrokerRoot::open(Path::new(record["root"].as_str().unwrap()))?;
+            let outcome = broker_launch::retire(
+                &root,
+                Deadline::after(Duration::from_secs(60))?,
+                &Cancellation::default(),
+            )?;
+            if matches!(outcome, broker_launch::Retirement::Pending { .. }) {
+                return Err(std::io::Error::other("owned test broker cleanup pending"));
+            }
+            Ok(())
+        })();
+        if !thread::panicking() {
+            result.unwrap();
+        } else if let Err(error) = result {
+            eprintln!("owned broker cleanup: {error}");
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let until = Instant::now() + Duration::from_secs(10);
+        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires explicit HARNESS_CODE_TOOLS_REGISTRY for the adopted Serena package"]
+fn real_serena_recovers_reset_without_replaying_edits() {
+    let console = adopted_console();
+    let registry = PathBuf::from(std::env::var_os("HARNESS_CODE_TOOLS_REGISTRY").unwrap());
+    let root = tempfile::tempdir().unwrap();
+    eprintln!("Serena reset acceptance root: {}", root.path().display());
+    let codex_home = root.path().join("codex-home");
+    let cleanup = OwnedBroker(codex_home.clone());
+    let project = crate_project(root.path(), "reset alpha", 601);
+    let mut proxy = Proxy::start(root.path(), &codex_home, &registry, &project, &console);
+    let reply = proxy.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "reset-acceptance", "version": "0.1.0"}
+        }),
+    );
+    assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
+    assert!(symbol_text(&mut proxy, 2).contains("601"));
+    let relay = ResetRelay::start(&codex_home);
+    let query = json!({"name": "get_symbols_overview", "arguments": {
+        "relative_path": "src/lib.rs", "depth": 0, "max_answer_chars": 3800
+    }});
+    relay.arm("get_symbols_overview", 1);
+    let reply = proxy.request(3, "tools/call", query.clone());
+    assert_eq!(reply["id"], 3);
+    assert!(
+        reply.get("error").is_none(),
+        "read must recover the reset: {reply}"
+    );
+    assert!(reply["result"].to_string().contains("shared"), "{reply}");
+    assert_eq!(relay.calls(), 2, "one bounded replay");
+    relay.arm("get_symbols_overview", 3);
+    let reply = proxy.request(4, "tools/call", query.clone());
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    assert_eq!(relay.calls(), 2, "persistent failure stops after one retry");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("recovery"),
+        "{reply}"
+    );
+    relay.arm("insert_after_symbol", 1);
+    let reply = proxy.request(
+        5,
+        "tools/call",
+        json!({
+            "name": "insert_after_symbol", "arguments": {
+                "relative_path": "src/lib.rs", "name_path": "shared",
+                "body": "\npub fn inserted_once() -> i32 { 602 }\n"
+            }
+        }),
+    );
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    assert_eq!(relay.calls(), 1, "uncertain edit must never replay");
+    let source = fs::read_to_string(project.join("src/lib.rs")).unwrap();
+    assert_eq!(source.matches("fn inserted_once").count(), 1, "{source}");
+    let reply = proxy.request(6, "tools/call", query);
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert!(
+        reply["result"].to_string().contains("inserted_once"),
+        "{reply}"
+    );
+    drop(relay);
+    let status = broker_status(&codex_home);
+    let worker = &status["backend"]["workers"][0];
+    let identity = harness_core::process::ProcessIdentity {
+        pid: worker["pid"].as_u64().unwrap() as u32,
+        creation_time: worker["creation_time"].as_u64().unwrap(),
+    };
+    let owner = harness_core::process_service::ServiceProcess::inspect(
+        identity,
+        &console,
+        &harness_core::process_service::current_user().unwrap(),
+    )
+    .unwrap()
+    .expect("owned test worker identity");
+    assert!(owner.terminate(137).unwrap());
+    let until = Instant::now() + Duration::from_secs(10);
+    while owner.is_running().unwrap() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!owner.is_running().unwrap());
+    assert!(symbol_text(&mut proxy, 7).contains("601"));
+    assert_ne!(
+        worker_pid(&broker_status(&codex_home), &project),
+        Some(u64::from(identity.pid))
+    );
+    cleanup.crash();
+    // Existing stdio conversation restores its cached route after broker exit.
+    assert!(symbol_text(&mut proxy, 8).contains("601"));
+    proxy.finish();
+}
+
 use std::{
     fs,
     io::{BufRead, BufReader, Write},

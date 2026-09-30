@@ -1,0 +1,72 @@
+# Real upstream Serena and language backends; no account credentials or models.
+name: windows-serena-integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  serena:
+    name: Real Serena session and semantic acceptance
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Prepare pinned Rust and its actual language server
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rust-analyzer --no-self-update
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup default 1.98.1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Prepare isolated adopted upstream dependencies
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP 'serena-env'
+          python -m venv $venv
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $python = Join-Path $venv 'Scripts/python.exe'
+          & $python -m pip install --only-binary=:all: 'serena-agent==1.7.0'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $nodeRoot = Join-Path $env:RUNNER_TEMP 'serena-node'
+          npm install --ignore-scripts --prefix $nodeRoot 'basedpyright@1.39.10'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $analyzer = (rustup which rust-analyzer).Trim()
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $registry = @{
+            mcp = @(@{
+              id = 'serena'; identity = 'serena-agent'; status = 'adopted'; version = '1.7.0'
+              paths = @{
+                console_entrypoint = (Join-Path $venv 'Scripts/serena.exe')
+                python = $python
+                module_root = (Join-Path $venv 'Lib/site-packages')
+                entrypoint = (Join-Path $venv 'Lib/site-packages/serena/cli.py')
+              }
+            })
+            languages = @(
+              @{ id = 'rust'; serena_id = 'rust'; status = 'adopted'; paths = @{ executable = $analyzer } }
+              @{ id = 'python'; serena_id = 'python_basedpyright'; status = 'adopted'; paths = @{
+                node = (Get-Command node.exe).Source
+                entrypoint = (Join-Path $nodeRoot 'node_modules/basedpyright/langserver.index.js')
+              } }
+            )
+          }
+          $path = Join-Path $env:RUNNER_TEMP 'serena-registry.json'
+          $registry | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding utf8
+          "HARNESS_CODE_TOOLS_REGISTRY=$path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-Item -ItemType Directory -Force -Path C:\harness-tmp | Out-Null
+          "TMP=C:\harness-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=C:\harness-tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Real MCP, connection reset, broker restart, edits and semantic delivery gate
+        run: cargo test --locked -p codex-harness --test serena_stdio --jobs 1 -- --include-ignored --test-threads=1 --nocapture
+
+      - name: Enforce the automatic workflow contract
+        run: cargo test --locked -p codex-harness --test ci_workflow --jobs 1 -- --test-threads=1
+

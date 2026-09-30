@@ -8,6 +8,40 @@ use yaml_rust2::{Yaml, YamlLoader};
 const WORKFLOW: &str = ".github/workflows/windows-native-checks.yml";
 const INSTALLED_WORKFLOW: &str = ".github/workflows/windows-installed-integration.yml";
 
+#[test]
+fn real_serena_acceptance_is_automatic_and_cannot_silently_skip() {
+    let document = tracked_workflow(".github/workflows/windows-serena-integration.yml");
+    assert!(!document["on"]["push"].is_badvalue());
+    assert!(!document["on"]["pull_request"].is_badvalue());
+    assert_eq!(document["permissions"]["contents"].as_str(), Some("read"));
+    let scripts = all_run_scripts(&document).join("\n");
+    for required in [
+        "--component rust-analyzer",
+        "serena-agent==1.7.0",
+        "basedpyright@1.39.10",
+        "HARNESS_CODE_TOOLS_REGISTRY",
+        "--test serena_stdio",
+        "--include-ignored",
+        "--test-threads=1",
+    ] {
+        assert!(
+            scripts.contains(required),
+            "missing real acceptance input: {required}"
+        );
+    }
+    assert!(!scripts.contains("--run-model-probes"));
+    for (_, job) in document["jobs"].as_hash().unwrap() {
+        assert!(job["continue-on-error"].is_badvalue());
+        for step in steps(job) {
+            assert!(step["continue-on-error"].is_badvalue());
+            assert!(
+                step["if"].is_badvalue(),
+                "real acceptance must not be conditionally skipped"
+            );
+        }
+    }
+}
+
 fn workflow() -> Yaml {
     tracked_workflow(WORKFLOW)
 }

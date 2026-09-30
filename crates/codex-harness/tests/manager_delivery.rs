@@ -2,6 +2,53 @@
 //! while earlier processes keep the previous one, without any build file being
 //! replaced, deleted or rewritten.
 #![cfg(windows)]
+#[test]
+fn failed_serena_preflight_preserves_the_previous_installation_even_with_reset() {
+    let fixture = Fixture::new();
+    let older = fixture.publish("accepted");
+    let candidate = fixture.publish("candidate");
+    fs::create_dir_all(fixture.manager_link().parent().unwrap()).unwrap();
+    symlink_file(older.join("codex-harness.exe"), fixture.manager_link()).unwrap();
+    let registry = fixture.home.join("harness/code-tools.json");
+    fs::write(&registry, r#"{"mcp":[],"languages":[]}"#).unwrap();
+    let metadata = fixture.home.join("harness/installation.json");
+    fs::write(&metadata, b"preserve prior installation").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .arg("deploy")
+        .arg("--source")
+        .arg(&fixture.source)
+        .arg("--build")
+        .arg(&candidate)
+        .arg("--codex-home")
+        .arg(&fixture.home)
+        .arg("--user-home")
+        .arg(fixture.root.path())
+        .arg("--reset")
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "report")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(report["status"], "verification-failed");
+    assert_eq!(report["installation_changed"], false);
+    assert_eq!(report["verification"]["serena"]["status"], "failed");
+    assert_eq!(fs::read(&metadata).unwrap(), b"preserve prior installation");
+    assert_eq!(
+        fs::read_link(fixture.manager_link()).unwrap(),
+        older.join("codex-harness.exe")
+    );
+}
+
 use harness_core::{
     build_identity::{self, BINARIES, BuildRecord, INSPECTION_SCHEMA, SCHEMA},
     registration::{LinkChange, Registration},

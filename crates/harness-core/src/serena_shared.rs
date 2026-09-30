@@ -357,6 +357,7 @@ impl Pool {
             "clients": table.clients.len(),
             "workers": table.workers.values().map(|slot| json!({
                 "pid": slot.identity.pid,
+                "creation_time": slot.identity.creation_time,
                 "project": slot.route.project,
                 "key": slot.key,
                 "generation": slot.generation,
@@ -931,6 +932,16 @@ impl Pool {
                 None => Err(io::Error::other("Serena worker is closed")),
             };
             let elapsed = started.elapsed();
+            // A live process can still have a permanently closed MCP pipe.
+            // Retire the broken channel even for an uncertain edit; only the
+            // proxy's safe-read policy may replay the operation once.
+            if outcome
+                .as_ref()
+                .err()
+                .is_some_and(serena::transport_failure)
+            {
+                self.retire(&slot);
+            }
             if let Ok(mut table) = self.table.lock() {
                 table.request.record(elapsed);
             }
@@ -1240,10 +1251,19 @@ struct SerenaWorker {
 
 impl SharedWorker for SerenaWorker {
     fn request(&mut self, method: &str, params: Value, deadline: Deadline) -> io::Result<Value> {
-        self.session
+        let session = self
+            .session
             .as_mut()
-            .ok_or_else(|| io::Error::other("Serena shared worker is closed"))?
-            .request(method, params, deadline)
+            .ok_or_else(|| io::Error::other("Serena shared worker is closed"))?;
+        session.request(method, params, deadline).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Serena worker {method} failed: {error}; stderr: {}",
+                    session.stderr_path().display()
+                ),
+            )
+        })
     }
 
     fn initialized(&self) -> Value {
@@ -1386,6 +1406,7 @@ mod tests {
         settle: Option<(PathBuf, String)>,
         request_barrier: Option<Arc<Barrier>>,
         request_failure: bool,
+        pipe_failure: bool,
         close_hold: Option<Arc<Signal>>,
         fatal_calls: Option<Arc<AtomicU64>>,
     }
@@ -1432,6 +1453,12 @@ mod tests {
             }
             if self.plan.request_failure {
                 return Err(io::Error::other("fixture request outcome unknown"));
+            }
+            if self.plan.pipe_failure {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pipe reached EOF",
+                ));
             }
             if !self.state.lock().unwrap().alive {
                 return Err(io::Error::other("fixture worker is unavailable"));
@@ -1872,6 +1899,47 @@ mod tests {
         assert_eq!(fixture.starts.load(Ordering::SeqCst), 2);
         assert!(fixture.closed(0) && fixture.closed(1));
         assert_eq!(fixture.requests(0).len(), 1);
+        assert_eq!(fixture.requests(1).len(), 1);
+        pool.close(Fixture::deadline()).unwrap();
+    }
+
+    #[test]
+    fn eof_retires_a_live_worker_without_replaying_an_uncertain_edit() {
+        let (fixture, pool) = Fixture::new("pipe-loss", 3, 300);
+        let project = fixture.project("pipe-project");
+        fixture.plan(
+            &project,
+            Plan {
+                pipe_failure: true,
+                ..Plan::default()
+            },
+        );
+        connect(&pool, &Fixture::client(1), &project).unwrap();
+        let error = rpc(
+            &pool,
+            &Fixture::client(1),
+            &project,
+            "tools/call",
+            json!({"name":"insert_after_symbol","arguments":{}}),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            fixture.closed(0),
+            "live process with a closed pipe must be retired"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.requests(0).len(), 1, "no edit replay");
+        fixture.plan(&project, Plan::default());
+        rpc(
+            &pool,
+            &Fixture::client(1),
+            &project,
+            "tools/call",
+            json!({"name":"get_symbols_overview","arguments":{}}),
+        )
+        .unwrap();
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.requests(1).len(), 1);
         pool.close(Fixture::deadline()).unwrap();
     }

@@ -236,6 +236,38 @@ applied; they are not missing language support.
 The standalone native MCP health check reports `protocol-ready` after handshake
 and tools/list. That status establishes protocol availability, not representative
 operations or completed language acceptance.
+
+`codex-harness deploy` runs real Serena semantic acceptance when code tools are
+connected. It checks the verified candidate before changing installation links,
+then the installed manager after delivery. Failure produces a nonzero exit and
+a failed verification receipt; a preflight failure leaves the installation
+unchanged. The check uses the adopted Serena, rust-analyzer and basedpyright in
+owned temporary Rust and Python projects, exercising symbol overview, body
+lookup, a semantic edit and semantic/disk readback. No package is installed and
+no user project is modified. Run it directly with:
+
+```powershell
+codex-harness mcp serena-check --source <ABSOLUTE-KIT-CHECKOUT> --registry <CODEX_HOME>/harness/code-tools.json
+```
+
+The automatic `windows-serena-integration` workflow provisions pinned upstream
+packages in its isolated runner and explicitly includes the real integration
+tests. It covers independent projects, configuration replacement, diagnostics,
+edits, TCP reset after a real backend response, persistent transport failure,
+non-replayed edits and broker restart within the same MCP conversation. The
+broader installed-lifecycle workflow remains manual; neither route calls a
+model. Missing prerequisites fail instead of silently skipping these tests.
+
+Transient reset, refused/aborted connection, broken pipe and EOF allow one
+retry of known read operations under the original deadline. The client
+revalidates the broker and restores its cached route without retiring a healthy
+shared owner. A worker with a closed MCP pipe is retired even if its process
+still appears alive; the typed transport failure reaches the same bounded
+retry policy. Worker errors retain the stderr evidence path. Unknown tools
+and edits are not replayed after an uncertain
+response. Persistent failure remains an error. Existing conversations retain
+their loaded proxy binary until restarted after an update.
+
 The handshake's `serverInfo.version` (currently 1.28.1) is the vendored MCP
 SDK version reported by FastMCP; the Serena distribution itself is 1.7.0
 (`serena --version`). Do not read the SDK string as a Serena upgrade.

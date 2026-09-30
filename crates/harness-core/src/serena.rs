@@ -55,6 +55,18 @@ fn ordinary(path: &Path) -> io::Result<PathBuf> {
     crate::dependency_discovery::local_path(path)
 }
 
+pub(crate) fn transport_failure(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    )
+}
+
 /// Launch inputs that passed adoption and path validation.
 pub struct Validated {
     pub serena: PathBuf,

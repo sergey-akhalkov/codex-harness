@@ -100,6 +100,7 @@ pub mod rollout_reader;
 pub mod scoped_observations;
 #[cfg(windows)]
 pub mod serena;
+pub mod serena_acceptance;
 pub mod serena_broker;
 pub mod serena_configuration;
 pub mod serena_route;
