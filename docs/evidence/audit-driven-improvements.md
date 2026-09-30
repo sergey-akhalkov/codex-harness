@@ -665,3 +665,33 @@ actual CI run tied to the candidate revision, blocked only on remote
 publication/Actions authority that no one has granted in this session; and
 **A38/A39/N10**, which close with this very reconciliation and the delivery
 evidence (13.1, 13.2, 13.4).
+
+## Task 13.5: rollback and decision-vector review
+
+- **Rollback**: seven immutable builds remain in the native state, including
+  the delivered `f1fca158…` and the previously serving generation;
+  `recover-build` verified-selects non-destructively (`changed: false`); the
+  delivery did not terminate old-generation processes, so a rollback path
+  keeps live sessions intact; RTK pack evidence, baseline snapshots and
+  parser caches are versioned/disposable with explicit migration notes.
+- **Required corrections and global delivery pass**: 45 of 49 matrix rows
+  closed on executed evidence; the integrated candidate passed the complete
+  native check set (13.4) and was delivered and re-verified through the
+  global lifecycle (13.2), with the installed-consumer semantic exercise
+  (11.3) run against the delivered build outside the checkout.
+- **Optional investigations carry honest decisions**: build-key narrowing not
+  adopted; persistent compiler target rejected (Cargo mtime trap
+  demonstrated); thin-LTO/16-CGU rejected (measured worse); deferred MCP
+  discovery unsupported on the installed CLI; skill/context integration
+  decisions inconclusive-pending with reconsideration conditions; no
+  candidate reached the installed path without evidence.
+- **Outstanding authorization/execution stays open**: task 12.4 (A22) — an
+  actual CI run requires remote publication and Actions authority that has
+  not been granted; the task remains unchecked with that exact blocker, as
+  its own terms direct.
+- **No invented quota percentages**: the only percentages in the evidence
+  are the configured worker CPU share and the two measured build-comparison
+  deltas; no token, subscription or quota percentage is claimed anywhere.
+- **Checkbox backing**: every checked task traces to a per-group evidence
+  section with the commands and outcomes actually run; the mechanical
+  row-to-task-to-evidence reconciliation (13.3) covers all completed work.
