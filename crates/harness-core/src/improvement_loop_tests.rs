@@ -58,6 +58,7 @@ fn spec_fixture(root: &Path, name: &str) -> RunSpec {
         publication_scope: vec![PublicationStage::Experiment],
         oracle: "outcome-oracle:private-request".to_owned(),
         removal: None,
+        evidence_root: None,
     }
 }
 
@@ -914,4 +915,223 @@ fn terminal_evidence_is_retained_bounded_with_digests() {
             .retain_evidence("implementer-4", &root.path().join("absent.json"), None)
             .is_err()
     );
+}
+
+#[test]
+fn planner_role_applies_no_treatment_and_is_not_measured() {
+    assert_eq!(AttemptRole::Planner.as_str(), "planner");
+    assert_eq!(AttemptRole::Planner.short(), "plan");
+    assert!(!AttemptRole::Planner.is_measured());
+    assert!(!AttemptRole::Planner.applies_treatment());
+    assert!(AttemptRole::Implementer.applies_treatment());
+    // A declared removal blocks the treatment-applying conversations and not
+    // the bounded planning conversation.
+    let root = fixture_root("planner");
+    let launcher = root.path().join("codex.exe");
+    fs::write(&launcher, "fixture launcher").unwrap();
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        root.path().join("openspec/changes/add-synthetic"),
+        "bdct-h1",
+    );
+    let facts = DispatchFacts {
+        runner_declared: true,
+        launcher: Some(launcher),
+        removal: Some(RemovalGate::Pending {
+            reason: "no reviewed removal proposal is recorded".to_owned(),
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        dispatch_gate(&cursor, AttemptRole::Planner, &facts),
+        DispatchGate::Ready
+    ));
+    assert!(matches!(
+        dispatch_gate(&cursor, AttemptRole::Implementer, &facts),
+        DispatchGate::Blocked { .. }
+    ));
+    cursor.phase = Phase::CandidateReady;
+    assert!(!Phase::CandidateReady.requires_comparison_owner());
+    assert!(Phase::BaselineAttempt.requires_comparison_owner());
+}
+
+#[test]
+fn candidate_change_references_resolve_or_refuse_mismatched_sources() {
+    assert_eq!(
+        candidate_change_name("openspec/changes/add-bounded-output").unwrap(),
+        "add-bounded-output"
+    );
+    assert_eq!(
+        candidate_change_name("add-bounded-output").unwrap(),
+        "add-bounded-output"
+    );
+    // Path-shaped references must live under the run's own planning root.
+    assert!(candidate_change_name("other/openspec/changes/add-x").is_err());
+    assert!(candidate_change_name("").is_err());
+    assert!(candidate_change_name("openspec/changes/..").is_err());
+    assert!(candidate_change_name(&format!("openspec/changes/{}", "x".repeat(201))).is_err());
+    let error = candidate_change_name("somewhere/else/add-x").unwrap_err();
+    assert!(error.contains("mismatched source"), "{error}");
+}
+
+#[test]
+fn changed_paths_stay_inside_the_scope_or_the_candidate_change() {
+    let scope = vec!["crates/one".to_owned()];
+    let inside = vec![
+        "crates/one/src/lib.rs".to_owned(),
+        "openspec/changes/add-x/tasks.md".to_owned(),
+    ];
+    assert!(changed_paths_within_scope(&inside, &scope, "add-x").is_ok());
+
+    let escaped = vec!["global/orchestration.toml".to_owned()];
+    let error = changed_paths_within_scope(&escaped, &scope, "add-x").unwrap_err();
+    assert!(
+        error.contains("outside the declared writable scope"),
+        "{error}"
+    );
+
+    // A sibling prefix is not inside the scope, and traversal is refused.
+    assert!(
+        changed_paths_within_scope(&["crates/one-extra/lib.rs".to_owned()], &scope, "add-x")
+            .is_err()
+    );
+    assert!(
+        changed_paths_within_scope(&["crates/../global/x".to_owned()], &scope, "add-x").is_err()
+    );
+    // Another change's directory is not the candidate's own change.
+    assert!(
+        changed_paths_within_scope(
+            &["openspec/changes/add-y/specs/a.md".to_owned()],
+            &scope,
+            "add-x"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn evidence_locators_are_stable_and_path_safe() {
+    assert_eq!(
+        evidence_locator("rollouts/run-1.jsonl").as_deref(),
+        Some("file:rollouts/run-1.jsonl")
+    );
+    assert_eq!(
+        evidence_locator(r"rollouts\run-1.jsonl").as_deref(),
+        Some("file:rollouts/run-1.jsonl")
+    );
+    assert!(evidence_locator("../escape.jsonl").is_none());
+    assert!(evidence_locator("/rooted.jsonl").is_none());
+    assert!(evidence_locator("C:/drive.jsonl").is_none());
+    assert!(evidence_locator("   ").is_none());
+}
+
+#[test]
+fn cursor_round_trips_intake_and_candidate_state_with_legacy_defaults() {
+    let root = fixture_root("state");
+    let mut cursor = Cursor::new(
+        "loop-state",
+        "a".repeat(64),
+        root.path().join("openspec/changes/add-synthetic"),
+        "bdct-h1",
+    );
+    cursor
+        .record_intake(IntakeState {
+            result_sha256: "b".repeat(64),
+            evidence_digest: "c".repeat(64),
+            outcomes: vec![OutcomeRecord::new("admitted", Some("bdct-h2"), "a new card").unwrap()],
+            consumed_ms: 7,
+        })
+        .unwrap();
+    let candidate = CandidateState {
+        removal_required: true,
+        removal_frozen: Some("digest".to_owned()),
+        worktree: None,
+        planning_receipt: Some(root.path().join("candidate-planning.json")),
+        planner_attempt: Some("planner-1".to_owned()),
+        implementer_attempt: None,
+        revision: Some("d".repeat(40)),
+        result: None,
+        ..CandidateState::new("bdct-h2", "add-bounded-output").unwrap()
+    };
+    cursor.select_candidate(candidate.clone()).unwrap();
+    let json = serde_json::to_value(&cursor).unwrap();
+    let decoded: Cursor = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(
+        decoded.intake.as_ref().map(|intake| intake.outcomes.len()),
+        Some(1)
+    );
+    assert_eq!(decoded.candidate.as_ref(), Some(&candidate));
+    assert!(cursor.candidate.as_ref().unwrap().is_ready());
+
+    // A legacy cursor without the new fields still reads: the intake and
+    // candidate state default to absent.
+    let legacy = serde_json::json!({
+        "schema": 1,
+        "run": "loop-state",
+        "spec_digest": "a".repeat(64),
+        "change_root": root.path().join("openspec/changes/add-synthetic"),
+        "phase": "planning",
+        "previous_phase": null,
+        "condition": null,
+        "hypothesis_item": "bdct-h1",
+        "experiment": "loop-state-experiment-1",
+        "removal_frozen": null,
+        "attempts": [],
+        "effects": [],
+        "effects_dropped": 0,
+        "selected_variant": null,
+        "selected_runtime": null,
+        "selected_identity": null,
+        "updated_ms": 1,
+    });
+    let decoded: Cursor = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.intake.is_none());
+    assert!(decoded.candidate.is_none());
+
+    // A run that already validated one candidate does not silently switch
+    // hypotheses.
+    let mut validated = cursor.clone();
+    validated.candidate.as_mut().unwrap().revision = Some("e".repeat(40));
+    let switch = validated.select_candidate(CandidateState::new("bdct-h3", "add-y").unwrap());
+    assert!(switch.is_err());
+    let repeat = validated.select_candidate(candidate);
+    assert!(repeat.is_ok());
+}
+
+#[test]
+fn candidate_removal_gate_requires_a_recorded_proposal_and_decision() {
+    let missing = candidate_removal_gate("bdct-h2", &[], None);
+    match missing {
+        RemovalGate::Pending { reason } => {
+            assert!(
+                reason.contains("no reviewable removal proposal"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected pending, got {other:?}"),
+    }
+    let proposal = proposal_text("retired-skill", "evidence-1", "preview-1", DETAIL);
+    let pending = candidate_removal_gate("bdct-h1", std::slice::from_ref(&proposal), None);
+    assert!(matches!(pending, RemovalGate::Pending { .. }));
+    let approved = vec![
+        proposal.clone(),
+        decision_text("approve", "experiment", "retired-skill", DETAIL),
+    ];
+    let authorized = candidate_removal_gate("bdct-h1", &approved, None);
+    assert!(matches!(authorized, RemovalGate::Authorized { .. }));
+    let frozen = frozen_candidate_removal_digest("bdct-h1", &[proposal]);
+    assert!(frozen.is_some());
+}
+
+#[test]
+fn evidence_root_must_be_absolute_when_declared() {
+    let root = fixture_root("evidence-root");
+    let mut spec = spec_fixture(root.path(), "evidence-root");
+    spec.evidence_root = Some(PathBuf::from("relative/evidence"));
+    assert!(spec.validate().is_err());
+    spec.evidence_root = Some(root.path().join("evidence"));
+    assert!(spec.validate().is_ok());
+    spec.evidence_root = None;
+    assert!(spec.validate().is_ok());
 }

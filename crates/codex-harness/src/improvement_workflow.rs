@@ -1,0 +1,1874 @@
+//! The planning/implementation workflow of one improvement run.
+//!
+//! This module consumes the accepted owners instead of duplicating them: the
+//! grounded intake owner turns one retained investigator result into board
+//! outcomes, the installed OpenSpec CLI owns the candidate's planning
+//! artifacts, the task-worktree owner allocates and verifies the candidate
+//! branch, the visible executor dispatch owner opens every model
+//! conversation, and the Beads board owns the card references. The controller
+//! contributes only the deterministic bookkeeping between them:
+//!
+//! 1. a retained terminal investigator result is re-read from the run store
+//!    and consumed through [`improvement_intake::intake`] against an evidence
+//!    index the controller builds from retained owner evidence - never from
+//!    investigator-supplied labels;
+//! 2. an admitted or reconsidered card becomes the selected candidate, and a
+//!    matching `existing` outcome for this run's declared card is reused;
+//! 3. the candidate's own OpenSpec change is qualified inside its owned
+//!    worktree; a missing change is scaffolded through the installed CLI and
+//!    authored by a bounded planning conversation, and implementation is
+//!    dispatched only after the change qualifies;
+//! 4. the returned implementation checkout is validated against the exact
+//!    committed base, the declared writable scope and the frozen planning
+//!    artifacts, transferred onto the candidate branch and retained as
+//!    `candidate-ready`.
+//!
+//! Every conversation works in the dispatcher's own pooled slot checkout, so
+//! the controller validates the *returned* checkout and then advances the
+//! owned candidate branch to the committed revision. Nothing here merges into
+//! the accepted mainline, records a benefit decision or applies a removal.
+
+use super::*;
+use harness_core::board_hypothesis::{self, BoundedImplementation};
+use harness_core::improvement_intake::{
+    self, ClaimKind, EvidenceIndex, EvidenceItem, EvidenceOwner, IntakeOutcome,
+};
+use harness_core::improvement_loop::{
+    CandidateState, IntakeState, OutcomeRecord, candidate_change_dir, candidate_change_name,
+    changed_paths_within_scope, frozen_candidate_removal_digest,
+};
+use harness_core::improvement_spec::{OpenSpec, PlanningReceipt, Specification};
+use harness_core::task_worktree::{self, CandidateCheckout, WorktreeReuse};
+use std::fs;
+use std::process::Command;
+
+/// The run-local qualified receipt of the selected candidate's own OpenSpec
+/// change. The run's declared `planning.json` stays the frozen anchor receipt.
+const CANDIDATE_PLANNING_FILE: &str = "candidate-planning.json";
+/// Bounds for the deterministic evidence index the controller builds from the
+/// declared local evidence root and its own retained attempt evidence.
+const MAX_EVIDENCE_ROOT_FILES: usize = 24;
+const MAX_RETAINED_EVIDENCE_ITEMS: usize = 32;
+const MAX_EVIDENCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LISTED_EVIDENCE: usize = 6;
+const MAX_ASSIGNMENT_BYTES: usize = 256 * 1024;
+const MAX_ASSIGNMENT_INPUTS: usize = 32;
+
+/// Advances the run as far as the recorded state and the dispatch gates
+/// allow. Returns human-readable progress notes; a blocked or idle condition
+/// is recorded in the cursor by this function.
+pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
+    let mut notes = Vec::new();
+    if run.cursor.phase == Phase::Stopped {
+        return Ok(notes);
+    }
+    if let Some(candidate) = run.cursor.candidate.clone() {
+        if candidate.is_ready() {
+            retain_candidate_ready(run, &candidate, &mut notes)?;
+            return Ok(notes);
+        }
+        advance_candidate(run, &candidate, &mut notes)?;
+        return Ok(notes);
+    }
+    advance_selection(run, &mut notes)?;
+    if let Some(candidate) = run.cursor.candidate.clone() {
+        if !candidate.is_ready() {
+            advance_candidate(run, &candidate, &mut notes)?;
+        } else {
+            retain_candidate_ready(run, &candidate, &mut notes)?;
+        }
+    }
+    Ok(notes)
+}
+
+fn retain_candidate_ready(
+    run: &mut Run,
+    candidate: &CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    if run.cursor.phase == Phase::CandidateReady {
+        return Ok(());
+    }
+    run.cursor.phase = Phase::CandidateReady;
+    run.cursor.condition = None;
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "candidate-ready: hypothesis {} revision {} is retained for the measured-pair owner",
+        candidate.hypothesis,
+        candidate.revision.as_deref().unwrap_or("unknown")
+    ));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Selection: consume a retained investigator result through grounded intake.
+// ---------------------------------------------------------------------------
+
+fn advance_selection(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
+    // A retained completed investigator result is consumed first: its
+    // terminal outcome settles even when the surface is currently lost.
+    if consume_investigator_result(run, notes)? {
+        return Ok(());
+    }
+    let evidence = build_evidence(run)?;
+    let facts = dispatch_facts_for(run, AttemptRole::Investigator)?;
+    let gate = dispatch_gate(&run.cursor, AttemptRole::Investigator, &facts);
+    if evidence.index.is_empty() {
+        return match gate {
+            // Nothing to investigate from: the honest state is idle, with the
+            // next evidence source named, and no model work is started.
+            DispatchGate::Ready => idle(
+                run,
+                notes,
+                "no retained evidence is available: declare an evidence root in the run inputs or retain completed attempt evidence, then resume - no model work is started without grounding".to_owned(),
+            ),
+            // A blocked gate (missing model inputs, lost visibility, an
+            // unresolved attempt) is the actionable condition and stays the
+            // recorded blocker.
+            DispatchGate::Blocked { reason } => {
+                run.cursor.effect(EffectKind::DispatchRefused, &reason);
+                run.cursor.block(reason);
+                run.store.save_cursor(&run.cursor)?;
+                Ok(())
+            }
+        };
+    }
+    // An unchanged evidence set after a recorded round does not justify
+    // another model round; the recorded idle/deferred condition stands.
+    if let Some(intake) = &run.cursor.intake
+        && intake.evidence_digest == evidence.digest
+    {
+        if run.cursor.phase != Phase::Idle && run.cursor.condition.is_none() {
+            idle(
+                run,
+                notes,
+                "the retained evidence set is unchanged since the last investigator round; awaiting fresh evidence or a new decision - no model work is started".to_owned(),
+            )?;
+        }
+        return Ok(());
+    }
+    match gate {
+        DispatchGate::Ready => {
+            dispatch_investigator(run, &evidence, notes)?;
+        }
+        DispatchGate::Blocked { reason } => {
+            run.cursor.effect(EffectKind::DispatchRefused, &reason);
+            run.cursor.block(reason);
+            run.store.save_cursor(&run.cursor)?;
+        }
+    }
+    Ok(())
+}
+
+/// Consumes one retained completed investigator result that differs from the
+/// already-consumed one. Returns whether a result was handled (consumed or
+/// explicitly blocked), so the caller never falls through to a new dispatch
+/// while unconsumed evidence exists.
+fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
+    let latest = run
+        .cursor
+        .attempts
+        .iter()
+        .rev()
+        .find(|attempt| {
+            attempt.role == AttemptRole::Investigator && attempt.state == AttemptState::Completed
+        })
+        .cloned();
+    let Some(attempt) = latest else {
+        return Ok(false);
+    };
+    let Some(result) = retained_result(&attempt) else {
+        let reason = format!(
+            "the completed investigator attempt {} retained no terminal result, so no structured report can be consumed; the attempt is not replayed - dispatch a fresh bounded round or retain the result",
+            attempt.id
+        );
+        refused(run, notes, reason)?;
+        return Ok(true);
+    };
+    let bytes = match fs::read(&result) {
+        Ok(bytes) if bytes.len() as u64 <= improvement_intake::MAX_REPORT_BYTES => bytes,
+        Ok(bytes) => {
+            let reason = format!(
+                "the retained investigator result at {} is {} bytes; the intake report bound is {} bytes, so it cannot be consumed",
+                result.display(),
+                bytes.len(),
+                improvement_intake::MAX_REPORT_BYTES
+            );
+            refused(run, notes, reason)?;
+            return Ok(true);
+        }
+        Err(error) => {
+            let reason = format!(
+                "the retained investigator result at {} is unreadable: {error}; no intake round runs",
+                result.display()
+            );
+            refused(run, notes, reason)?;
+            return Ok(true);
+        }
+    };
+    let result_sha256 = build_identity::hash_bytes(&bytes);
+    if run
+        .cursor
+        .intake
+        .as_ref()
+        .is_some_and(|intake| intake.result_sha256 == result_sha256)
+    {
+        return Ok(false);
+    }
+    let report = match improvement_intake::read_report(&result) {
+        Ok(report) => report,
+        Err(error) => {
+            let reason = format!(
+                "the retained investigator result at {} is not a bounded schema-1 investigator report ({error}); no candidate is admitted from unreadable output and no model round is started",
+                result.display()
+            );
+            refused(run, notes, reason)?;
+            return Ok(true);
+        }
+    };
+    let evidence = build_evidence(run)?;
+    let outcomes = match improvement_intake::intake(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &report,
+        &evidence.index,
+    ) {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            let reason = format!(
+                "grounded intake could not be completed: {error}; the board failure is reported instead of being replaced by a local journal, and no model round is started"
+            );
+            refused(run, notes, reason)?;
+            return Ok(true);
+        }
+    };
+    let mut records = Vec::new();
+    for outcome in &outcomes.outcomes {
+        records.push(outcome_record(outcome)?);
+    }
+    run.cursor.record_intake(IntakeState {
+        result_sha256: result_sha256.clone(),
+        evidence_digest: evidence.digest.clone(),
+        outcomes: records,
+        consumed_ms: now_ms(),
+    })?;
+    run.cursor.effect(
+        EffectKind::IntakeConsumed,
+        format!(
+            "attempt={} result={} sha256={} outcomes={}",
+            attempt.id,
+            result.display(),
+            &result_sha256[..16.min(result_sha256.len())],
+            outcomes.outcomes.len()
+        ),
+    );
+    notes.push(format!(
+        "intake: consumed the retained investigator result of attempt {} ({} outcome(s))",
+        attempt.id,
+        outcomes.outcomes.len()
+    ));
+
+    let selected = select_outcome(&run.spec, &outcomes.outcomes);
+    match selected {
+        Some((card, removal_required)) => {
+            select_candidate(run, &card, removal_required, notes)?;
+        }
+        None => {
+            let reason = idle_reason(&outcomes.outcomes);
+            run.store.save_cursor(&run.cursor)?;
+            idle(run, notes, reason)?;
+        }
+    }
+    Ok(true)
+}
+
+fn retained_result(attempt: &Attempt) -> Option<PathBuf> {
+    let retained = attempt.retained.as_ref()?;
+    retained.result.clone()
+}
+
+fn outcome_record(outcome: &IntakeOutcome) -> io::Result<OutcomeRecord> {
+    match outcome {
+        IntakeOutcome::Admitted {
+            id,
+            removal_required,
+            ..
+        } => OutcomeRecord::new(
+            "admitted",
+            Some(id),
+            &format!(
+                "a new hypothesis card was created{}{}",
+                if *removal_required {
+                    "; the candidate applies a declared removal and needs the informed decision"
+                } else {
+                    ""
+                },
+                ""
+            ),
+        ),
+        IntakeOutcome::Existing { id, status, .. } => OutcomeRecord::new(
+            "existing",
+            Some(id),
+            &format!("an active card matches the proposal (status {status})"),
+        ),
+        IntakeOutcome::ReusedRejection {
+            id,
+            experiment,
+            reason,
+            ..
+        } => OutcomeRecord::new(
+            "reused-rejection",
+            Some(id),
+            &format!(
+                "the same-condition rejection is reused (experiment {}, reason {})",
+                experiment.as_deref().unwrap_or("none"),
+                reason.as_deref().unwrap_or("none")
+            ),
+        ),
+        IntakeOutcome::ReusedInconclusive {
+            id,
+            experiment,
+            reason,
+            ..
+        } => OutcomeRecord::new(
+            "reused-inconclusive",
+            Some(id),
+            &format!(
+                "the same-condition inconclusive result is reused (experiment {}, reason {})",
+                experiment.as_deref().unwrap_or("none"),
+                reason.as_deref().unwrap_or("none")
+            ),
+        ),
+        IntakeOutcome::Reconsidered {
+            id,
+            basis,
+            prior_outcome,
+            ..
+        } => OutcomeRecord::new(
+            "reconsidered",
+            Some(id),
+            &format!("a fresh basis {basis} reopened the card (prior outcome {prior_outcome})"),
+        ),
+        IntakeOutcome::NoChange { reason } => OutcomeRecord::new(
+            "no-change",
+            None,
+            &format!("no change is supported: {reason}"),
+        ),
+        IntakeOutcome::ReuseSuffices { existing } => OutcomeRecord::new(
+            "reuse-suffices",
+            None,
+            &format!("an existing route {existing} satisfies the evidenced need"),
+        ),
+        IntakeOutcome::Deferred { reason, next } => {
+            OutcomeRecord::new("deferred", None, &format!("{reason}; next check: {next}"))
+        }
+        IntakeOutcome::Refused { reasons } => {
+            OutcomeRecord::new("refused", None, &reasons.join("; "))
+        }
+        IntakeOutcome::Idle { reason } => OutcomeRecord::new("idle", None, reason),
+    }
+}
+
+/// The candidate selection rule: admission or reconsideration selects the new
+/// hypothesis; a matching `existing` outcome selects this run's declared card
+/// (its own change is the run's frozen planning anchor); every other outcome
+/// leaves the loop idle without duplicate work.
+fn select_outcome(spec: &RunSpec, outcomes: &[IntakeOutcome]) -> Option<(String, bool)> {
+    for outcome in outcomes {
+        match outcome {
+            IntakeOutcome::Admitted {
+                id,
+                removal_required,
+                ..
+            } => return Some((id.clone(), *removal_required)),
+            IntakeOutcome::Reconsidered { id, .. } => return Some((id.clone(), false)),
+            _ => {}
+        }
+    }
+    for outcome in outcomes {
+        if let IntakeOutcome::Existing { id, status, .. } = outcome
+            && id == &spec.hypothesis_item
+            && !matches!(status.as_str(), "closed" | "deferred")
+        {
+            return Some((id.clone(), spec.removal.is_some()));
+        }
+    }
+    None
+}
+
+fn idle_reason(outcomes: &[IntakeOutcome]) -> String {
+    if let Some(IntakeOutcome::Idle { reason }) = outcomes.first() {
+        return reason.clone();
+    }
+    let mut parts = Vec::new();
+    for outcome in outcomes.iter().take(4) {
+        parts.push(match outcome {
+            IntakeOutcome::Deferred { reason, next } => {
+                format!("deferred: {reason} (next: {next})")
+            }
+            IntakeOutcome::Refused { reasons } => format!("refused: {}", reasons.join("; ")),
+            IntakeOutcome::ReusedRejection { id, .. } => {
+                format!("reused prior rejection of {id}")
+            }
+            IntakeOutcome::ReusedInconclusive { id, .. } => {
+                format!("reused prior inconclusive result of {id}")
+            }
+            IntakeOutcome::NoChange { reason } => format!("no change: {reason}"),
+            IntakeOutcome::ReuseSuffices { existing } => {
+                format!("reuse of {existing} suffices")
+            }
+            IntakeOutcome::Existing { id, status, .. } => {
+                format!("existing card {id} ({status}) continues outside this run")
+            }
+            IntakeOutcome::Admitted { id, .. } | IntakeOutcome::Reconsidered { id, .. } => {
+                format!("candidate {id} requires its own run authority")
+            }
+            IntakeOutcome::Idle { reason } => reason.clone(),
+        });
+    }
+    format!(
+        "no grounded candidate remains: {}; awaiting fresh evidence, an authorized decision or a new run",
+        parts.join("; ")
+    )
+}
+
+fn idle(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result<()> {
+    run.cursor.phase = Phase::Idle;
+    run.cursor.condition = Some(reason.clone());
+    run.cursor.effect(EffectKind::IdleRecorded, &reason);
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!("idle: {reason}"));
+    Ok(())
+}
+
+fn select_candidate(
+    run: &mut Run,
+    card: &str,
+    removal_required: bool,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let snapshot =
+        match board_hypothesis::load_card(&run.spec.board.bd, &run.spec.board.project, card) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return refused(
+                    run,
+                    notes,
+                    format!("the selected hypothesis card {card} is not readable: {error}"),
+                );
+            }
+        };
+    if !snapshot.labels.iter().any(|label| label == "hypothesis") {
+        return refused(
+            run,
+            notes,
+            format!("the selected card {card} is not a hypothesis card"),
+        );
+    }
+    if matches!(snapshot.status.as_str(), "closed" | "deferred") {
+        let reason = format!(
+            "the selected hypothesis card {card} is {}; a closed or deferred investigation needs a recorded reconsideration basis before implementation",
+            snapshot.status
+        );
+        return refused(run, notes, reason);
+    }
+    let Some(admission) = board_hypothesis::parse_admission(&snapshot.description) else {
+        let reason = format!(
+            "the selected hypothesis card {card} carries no recognized admission record; record its mechanism, conditions, acceptance and spec reference before implementation"
+        );
+        return refused(run, notes, reason);
+    };
+    let reference = admission.spec.unwrap_or_default();
+    let change = match candidate_change_name(&reference) {
+        Ok(change) => change,
+        Err(reason) => {
+            return refused(run, notes, reason);
+        }
+    };
+    let mut candidate = CandidateState::new(card, &change)?;
+    candidate.removal_required = removal_required;
+    if removal_required {
+        let board_comments = comments(&run.spec)?;
+        candidate.removal_frozen = frozen_candidate_removal_digest(card, &board_comments);
+    }
+    run.cursor.select_candidate(candidate)?;
+    run.cursor.phase = Phase::Planning;
+    run.cursor.condition = None;
+    run.cursor.effect(
+        EffectKind::CandidateSelected,
+        format!(
+            "hypothesis={card} change={change}{}",
+            if removal_required {
+                " removal-required=true"
+            } else {
+                ""
+            }
+        ),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "candidate: selected hypothesis {card} for its own OpenSpec change {change}"
+    ));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Evidence index: retained owner evidence only.
+// ---------------------------------------------------------------------------
+
+struct Evidence {
+    index: EvidenceIndex,
+    digest: String,
+    listing: Vec<String>,
+    root: Option<PathBuf>,
+}
+
+/// Builds the controller-owned evidence index: the declared local evidence
+/// root's retained files (read through the rollout/build-identity owners) and
+/// the run's own retained attempt receipts and terminal results. Locators are
+/// derived from the retained paths, so an investigator can cite only items
+/// that actually exist.
+fn build_evidence(run: &Run) -> io::Result<Evidence> {
+    let mut items: Vec<EvidenceItem> = Vec::new();
+    let mut listing: Vec<String> = Vec::new();
+    if let Some(root) = &run.spec.evidence_root {
+        for (relative, path) in walk_evidence_root(root)? {
+            let locator = match harness_core::improvement_loop::evidence_locator(&relative) {
+                Some(locator) => locator,
+                None => continue,
+            };
+            let item = if relative.to_ascii_lowercase().ends_with(".jsonl") {
+                EvidenceItem::read_rollout(&locator, &path)?
+            } else {
+                match EvidenceItem::read_source(&locator, &run.spec.run, &path) {
+                    Ok(item) => item,
+                    Err(error) => EvidenceItem::new(
+                        &locator,
+                        EvidenceOwner::Source,
+                        ClaimKind::Inferred,
+                        &format!("the retained file {relative} could not be captured"),
+                        &[format!("{error}")],
+                        &[],
+                    )?,
+                }
+            };
+            listing.push(summarize(&item));
+            items.push(item);
+            if items.len() >= MAX_EVIDENCE_ROOT_FILES {
+                break;
+            }
+        }
+    }
+    let mut retained: Vec<EvidenceItem> = Vec::new();
+    for attempt in run.cursor.attempts.iter().rev() {
+        let Some(retained_evidence) = &attempt.retained else {
+            continue;
+        };
+        let locator = format!("run:{}/receipt", attempt.id);
+        retained.push(EvidenceItem::new(
+            &locator,
+            EvidenceOwner::AuthorizedWork,
+            ClaimKind::Observed,
+            &format!(
+                "retained native receipt of attempt {} role={} state={} sha256={}",
+                attempt.id,
+                attempt.role.as_str(),
+                attempt.state.as_str(),
+                &retained_evidence.receipt_sha256[..16.min(retained_evidence.receipt_sha256.len())]
+            ),
+            &[],
+            &[],
+        )?);
+        if let (Some(_result), Some(sha)) =
+            (&retained_evidence.result, &retained_evidence.result_sha256)
+        {
+            retained.push(EvidenceItem::new(
+                &format!("run:{}/result", attempt.id),
+                EvidenceOwner::AuthorizedWork,
+                ClaimKind::Observed,
+                &format!(
+                    "retained terminal result of attempt {} role={} sha256={}",
+                    attempt.id,
+                    attempt.role.as_str(),
+                    &sha[..16.min(sha.len())]
+                ),
+                &[],
+                &[],
+            )?);
+        }
+        if retained.len() >= MAX_RETAINED_EVIDENCE_ITEMS {
+            break;
+        }
+    }
+    retained.reverse();
+    for item in retained {
+        listing.push(summarize(&item));
+        items.push(item);
+    }
+    let digest = index_digest(&items);
+    let index = EvidenceIndex::new(items)?;
+    Ok(Evidence {
+        index,
+        digest,
+        listing,
+        root: run.spec.evidence_root.clone(),
+    })
+}
+
+fn summarize(item: &EvidenceItem) -> String {
+    let partial = if item.is_partial() { " partial" } else { "" };
+    format!(
+        "{} [{} {}{}]",
+        item.locator,
+        item.owner.as_str(),
+        item.kind.as_str(),
+        partial
+    )
+}
+
+fn index_digest(items: &[EvidenceItem]) -> String {
+    let mut text = String::new();
+    for item in items {
+        text.push_str(&format!(
+            "{}|{}|{}|{}|{}|{}\n",
+            item.locator,
+            item.owner.as_str(),
+            item.kind.as_str(),
+            item.coverage,
+            item.errors.join(";"),
+            item.warnings.join(";")
+        ));
+    }
+    build_identity::hash_bytes(text.as_bytes())
+}
+
+/// Deterministically walks the declared evidence root: sorted relative paths,
+/// bounded file count, repository metadata and oversized files skipped.
+fn walk_evidence_root(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    if !root.is_dir() {
+        return Ok(files);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0_usize;
+    while let Some(directory) = stack.pop() {
+        if visited >= MAX_EVIDENCE_ROOT_FILES * 8 {
+            break;
+        }
+        visited += 1;
+        let mut entries: Vec<PathBuf> = fs::read_dir(&directory)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules") {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !metadata.is_file()
+                || metadata.len() == 0
+                || metadata.len() > MAX_EVIDENCE_FILE_BYTES
+            {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            files.push((relative, path));
+        }
+    }
+    files.sort();
+    files.truncate(MAX_EVIDENCE_ROOT_FILES);
+    Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// Candidate stages: allocation, planning and implementation.
+// ---------------------------------------------------------------------------
+
+fn advance_candidate(
+    run: &mut Run,
+    candidate: &CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let mut candidate = candidate.clone();
+    ensure_allocation(run, &mut candidate, notes)?;
+    run.cursor.candidate = Some(candidate.clone());
+    run.store.save_cursor(&run.cursor)?;
+    if candidate.worktree.is_none() {
+        return Ok(());
+    }
+    if candidate.planning_receipt.is_none() {
+        ensure_planning(run, &mut candidate, notes)?;
+        run.cursor.candidate = Some(candidate.clone());
+        run.store.save_cursor(&run.cursor)?;
+    }
+    if candidate.planning_receipt.is_some() && !candidate.is_ready() {
+        ensure_implementation(run, &mut candidate, notes)?;
+        run.cursor.candidate = Some(candidate.clone());
+        run.store.save_cursor(&run.cursor)?;
+        if candidate.is_ready() {
+            retain_candidate_ready(run, &candidate, notes)?;
+        }
+    }
+    Ok(())
+}
+
+fn block(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result<()> {
+    run.cursor.effect(EffectKind::DispatchRefused, &reason);
+    run.cursor.block(reason.clone());
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!("blocked: {reason}"));
+    Ok(())
+}
+
+/// A content outcome the loop cannot turn into work: unsupported evidence,
+/// refused output or a mismatched source. It is recorded as idle with the
+/// exact reason and never triggers filler model work; a later resume can
+/// re-evaluate it after the missing fact is supplied.
+fn refused(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result<()> {
+    idle(run, notes, reason)
+}
+
+/// Binds the candidate branch/worktree to the admitted Beads card and the
+/// exact committed base. An existing recorded allocation is kept for this
+/// candidate; a pre-existing path is reused only through the worktree owner's
+/// read-only eligibility verdict and never forced.
+fn ensure_allocation(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    if candidate.worktree.is_some() {
+        return Ok(());
+    }
+    let path = run
+        .store
+        .root()
+        .join("candidates")
+        .join(&candidate.hypothesis);
+    let branch = format!("improve/{}/{}", run.spec.run, candidate.hypothesis);
+    let checkout = if path.exists() {
+        let active = run
+            .cursor
+            .attempts
+            .iter()
+            .any(|attempt| attempt.state.is_in_flight());
+        match task_worktree::worktree_reuse(
+            &run.spec.project,
+            &path,
+            &run.spec.project,
+            &run.spec.base_revision,
+            active,
+        )? {
+            WorktreeReuse::Eligible { revision } => {
+                // Keep the existing allocation's own dedicated branch; a
+                // detached or foreign checkout is refused instead of being
+                // adopted under this run's branch name.
+                let existing = match git_text(&path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+                    Ok(branch) if branch != "HEAD" && !branch.trim().is_empty() => branch,
+                    Ok(_) => {
+                        return refused(
+                            run,
+                            notes,
+                            format!(
+                                "the preserved candidate worktree {} is on a detached HEAD; it is not a dedicated candidate branch and is left untouched",
+                                path.display()
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        return refused(
+                            run,
+                            notes,
+                            format!(
+                                "the preserved candidate worktree {} branch could not be read: {error}",
+                                path.display()
+                            ),
+                        );
+                    }
+                };
+                CandidateCheckout {
+                    source: run.spec.project.clone(),
+                    path: path.clone(),
+                    branch: existing,
+                    base: revision.clone(),
+                    revision,
+                }
+            }
+            WorktreeReuse::Blocked { kind, reason } => {
+                let reason = format!(
+                    "the recorded candidate worktree {} cannot be reused ({kind:?}): {reason}",
+                    path.display()
+                );
+                return refused(run, notes, reason);
+            }
+        }
+    } else {
+        match task_worktree::allocate_candidate_checkout(
+            &run.spec.project,
+            &path,
+            &branch,
+            &run.spec.base_revision,
+        ) {
+            Ok(checkout) => checkout,
+            Err(error) => {
+                let reason = format!(
+                    "the candidate branch {branch} could not be allocated from the frozen base {}: {error}",
+                    run.spec.base_revision
+                );
+                return refused(run, notes, reason);
+            }
+        }
+    };
+    if let Err(error) = verify_candidate_base(run, &checkout) {
+        return refused(run, notes, error);
+    }
+    board_hypothesis::record_implementation(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+        &BoundedImplementation {
+            role: board_hypothesis::HypothesisRole::Candidate,
+            branch: checkout.branch.clone(),
+            base: checkout.base.clone(),
+            revision: checkout.revision.clone(),
+            worktree: checkout.path.to_string_lossy().into_owned(),
+            runtime: None,
+            baseline_runtime: None,
+        },
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "the candidate allocation could not be recorded on hypothesis card {}: {error}",
+            candidate.hypothesis
+        ))
+    })?;
+    run.cursor.effect(
+        EffectKind::CandidateAllocated,
+        format!(
+            "hypothesis={} branch={} base={} worktree={}",
+            candidate.hypothesis,
+            checkout.branch,
+            checkout.base,
+            checkout.path.display()
+        ),
+    );
+    notes.push(format!(
+        "allocation: branch {} at {} in {}",
+        checkout.branch,
+        checkout.base,
+        checkout.path.display()
+    ));
+    candidate.worktree = Some(checkout);
+    Ok(())
+}
+
+/// The candidate allocation must descend from the run's exact committed base;
+/// a changed or unreadable base blocks all dependent effects.
+fn verify_candidate_base(run: &Run, checkout: &CandidateCheckout) -> Result<(), String> {
+    let expected = git_text(
+        &run.spec.project,
+        &[
+            "rev-parse",
+            &format!("{}^{{commit}}", run.spec.base_revision),
+        ],
+    )?;
+    if expected != checkout.base {
+        return Err(format!(
+            "the candidate worktree is based on {} instead of the run's frozen base {expected}; implementation is refused",
+            checkout.base
+        ));
+    }
+    task_worktree::verify_candidate_checkout(checkout)
+        .map_err(|error| format!("the candidate worktree binding does not verify: {error}"))
+}
+
+/// Ensures the candidate's own OpenSpec change is complete and qualified
+/// inside its worktree. A missing change is scaffolded through the installed
+/// CLI; an incomplete one is authored by a bounded planning conversation, and
+/// implementation is dispatched only after re-qualification succeeds.
+fn ensure_planning(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(checkout) = candidate.worktree.clone() else {
+        return Ok(());
+    };
+    let target = candidate_specification(run, &checkout, candidate);
+    let openspec = OpenSpec::default();
+    // The bounded planning conversation returning its committed change is
+    // consumed first: an already-completed conversation settles without a new
+    // model round.
+    if let Some(id) = candidate.planner_attempt.clone() {
+        let Some(attempt) = run.cursor.attempt(&id).cloned() else {
+            let reason = format!(
+                "the recorded planning attempt {id} is missing from the cursor; reconcile the run state before dependent work"
+            );
+            return refused(run, notes, reason);
+        };
+        if attempt.state == AttemptState::Completed {
+            return consume_planner_result(run, candidate, notes);
+        }
+        if attempt.state == AttemptState::Failed && attempt.binding.is_none() {
+            // A refusal before submission made no model request; a fresh
+            // attempt is the documented recovery.
+            candidate.planner_attempt = None;
+        } else {
+            let reason = format!(
+                "the planning attempt {id} is {} ({}); reconcile it through the owning dispatcher before dependent work and never resubmit it",
+                attempt.state.as_str(),
+                attempt.reason.as_deref().unwrap_or("no recorded reason")
+            );
+            return block(run, notes, reason);
+        }
+    }
+    // A change complete at the current candidate revision needs no
+    // conversation; only a change that does not qualify triggers planning.
+    match openspec.qualify(&target, &run.spec.experiment) {
+        Ok(receipt) => {
+            return store_candidate_receipt(run, candidate, &receipt, notes);
+        }
+        Err(error) => {
+            let text = error.to_string();
+            if text.contains("different planning root") || text.contains("different change") {
+                let reason = format!(
+                    "the candidate change {} does not resolve under the run's planning environment: {error}; the mismatched source blocks dependent effects",
+                    candidate.change
+                );
+                return refused(run, notes, reason);
+            }
+        }
+    }
+    // The change is missing or incomplete: prepare its model-free scaffold in
+    // the candidate worktree and commit it, so the planning conversation's
+    // pooled checkout can see the change at the current candidate revision.
+    let change_dir = checkout.path.join(candidate_change_dir(&candidate.change));
+    if !change_dir.exists() {
+        if target.store.is_some() {
+            let reason = format!(
+                "the candidate change {} is not present and the run plans through a registered OpenSpec store; store preparation is a separate owner and this controller refuses to create a change outside its checkout",
+                candidate.change
+            );
+            return refused(run, notes, reason);
+        }
+        match openspec.scaffold(&target) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("already exists") => {}
+            Err(error) => {
+                let reason = format!(
+                    "the candidate change {} could not be scaffolded through the installed OpenSpec CLI: {error}",
+                    candidate.change
+                );
+                return refused(run, notes, reason);
+            }
+        }
+        if let Err(reason) = commit_worktree_paths(
+            &checkout,
+            &[candidate_change_dir(&candidate.change)],
+            &format!("scaffold OpenSpec change {}", candidate.change),
+        ) {
+            return refused(run, notes, reason);
+        }
+        let revision = match git_text(&checkout.path, &["rev-parse", "HEAD"]) {
+            Ok(revision) => revision,
+            Err(error) => {
+                return refused(
+                    run,
+                    notes,
+                    format!("the scaffold commit is unreadable: {error}"),
+                );
+            }
+        };
+        let mut scaffolded = checkout.clone();
+        scaffolded.revision = revision;
+        candidate.worktree = Some(scaffolded);
+        run.cursor.effect(
+            EffectKind::PlanningQualified,
+            format!(
+                "scaffolded OpenSpec change {} in {} and committed it at {} through the installed CLI (model-free preparation)",
+                candidate.change,
+                change_dir.display(),
+                candidate.worktree.as_ref().map(|c| c.revision.clone()).unwrap_or_default()
+            ),
+        );
+        notes.push(format!(
+            "planning: scaffolded change {} at {}",
+            candidate.change,
+            change_dir.display()
+        ));
+    }
+    // The candidate cannot reach its own supervisor, planning artifacts,
+    // acceptance inputs or run state through its writable scope.
+    let gated = RunSpec {
+        project: checkout.path.clone(),
+        ..run.spec.clone()
+    };
+    if let Err(error) = gated.supervisor_gate(run.store.root(), &change_dir, &run.spec.oracle) {
+        return refused(run, notes, error.to_string());
+    }
+    let facts = dispatch_facts_for(run, AttemptRole::Planner)?;
+    match dispatch_gate(&run.cursor, AttemptRole::Planner, &facts) {
+        DispatchGate::Ready => dispatch_planner(run, candidate, notes),
+        DispatchGate::Blocked { reason } => block(run, notes, reason),
+    }
+}
+
+fn candidate_specification(
+    run: &Run,
+    checkout: &CandidateCheckout,
+    candidate: &CandidateState,
+) -> Specification {
+    Specification {
+        project: checkout.path.clone(),
+        change: candidate.change.clone(),
+        store: run.spec.specification.store.clone(),
+        planning_root: checkout.path.clone(),
+    }
+}
+
+fn store_candidate_receipt(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    receipt: &PlanningReceipt,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    write_json_atomic(&run.store.root().join(CANDIDATE_PLANNING_FILE), receipt)?;
+    candidate.planning_receipt = Some(run.store.root().join(CANDIDATE_PLANNING_FILE));
+    run.cursor.effect(
+        EffectKind::PlanningQualified,
+        format!(
+            "candidate={} change={} artifacts={} state={}",
+            candidate.hypothesis,
+            receipt.specification.change,
+            receipt.artifacts.len(),
+            receipt.implementation_state
+        ),
+    );
+    notes.push(format!(
+        "planning: change {} qualified ({} artifact(s), state {})",
+        receipt.specification.change,
+        receipt.artifacts.len(),
+        receipt.implementation_state
+    ));
+    Ok(())
+}
+
+fn consume_planner_result(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let id = candidate.planner_attempt.clone().unwrap_or_default();
+    let Some(attempt) = run.cursor.attempt(&id).cloned() else {
+        let reason = format!("the recorded planning attempt {id} is missing from the cursor");
+        return refused(run, notes, reason);
+    };
+    if attempt.retained.is_none() {
+        let reason = format!(
+            "the planning attempt {} completed without retained terminal evidence; unverified output never authorizes implementation",
+            attempt.id
+        );
+        return refused(run, notes, reason);
+    }
+    // Only the change directory may differ: the planning conversation authors
+    // one change and touches nothing else.
+    let Some(checkout) = candidate.worktree.clone() else {
+        let reason =
+            "the candidate allocation is missing; planning validation is refused".to_owned();
+        return refused(run, notes, reason);
+    };
+    // The returned commit is transferred once; a resume after a partial
+    // transfer re-qualifies the already-advanced branch instead of replaying.
+    let returned_head = match attempt
+        .checkout
+        .as_ref()
+        .map(|path| git_text(path, &["rev-parse", "HEAD"]))
+        .transpose()
+    {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            let reason = format!(
+                "the planning attempt {} records no returned checkout, so its change cannot be attributed",
+                attempt.id
+            );
+            return refused(run, notes, reason);
+        }
+        Err(error) => {
+            let reason = format!("the planning checkout could not be read: {error}");
+            return refused(run, notes, reason);
+        }
+    };
+    if returned_head != checkout.revision
+        && let Err(reason) = transfer_returned(run, candidate, &attempt, &[])
+    {
+        return refused(run, notes, reason);
+    }
+    let Some(checkout) = candidate.worktree.clone() else {
+        let reason = "the candidate allocation is missing after the planning transfer".to_owned();
+        return refused(run, notes, reason);
+    };
+    let target = candidate_specification(run, &checkout, candidate);
+    let openspec = OpenSpec::default();
+    match openspec.qualify(&target, &run.spec.experiment) {
+        Ok(receipt) => store_candidate_receipt(run, candidate, &receipt, notes),
+        Err(error) => {
+            let reason = format!(
+                "the planning conversation finished but the candidate change {} does not qualify: {error}; implementation stays undispatched until the missing artifacts are complete",
+                candidate.change
+            );
+            refused(run, notes, reason)
+        }
+    }
+}
+
+fn dispatch_planner(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let host = match dispatch_host(run, candidate) {
+        Ok(host) => host,
+        Err(reason) => return refused(run, notes, reason),
+    };
+    let change_dir = host.checkout.join(candidate_change_dir(&candidate.change));
+    let inputs = relative_files(&host.checkout, &change_dir)?;
+    let acceptance_artifact = run.spec.experiment.acceptance_artifact.clone();
+    let acceptance_heading = run.spec.experiment.acceptance_heading.clone();
+    let objective = format!(
+        "Author the complete OpenSpec change {} for the selected hypothesis card {}. Read the card with `{} show {} --json` from {}. Use the installed OpenSpec CLI in this checkout (`openspec instructions proposal --change {} --json`, then specs/design/tasks) and keep the artifacts consistent with the card's mechanism, conditions, predicted effect, counterexample and acceptance. The run's predeclared experiment acceptance must appear as the Markdown section '{}' inside '{}' under the change. Run `openspec validate {} --strict --no-interactive` until it passes, then commit the change (git add/commit) and leave the tree clean; the controller validates and advances the owned candidate branch to your committed revision. Do not edit product source; the change directory is the only output.",
+        candidate.change,
+        candidate.hypothesis,
+        run.spec.board.bd.display(),
+        candidate.hypothesis,
+        run.spec.board.project.display(),
+        candidate.change,
+        acceptance_heading,
+        acceptance_artifact.display(),
+        candidate.change
+    );
+    let outputs = vec![
+        format!("{}/proposal.md", candidate_change_dir(&candidate.change)),
+        format!("{}/design.md", candidate_change_dir(&candidate.change)),
+        format!("{}/tasks.md", candidate_change_dir(&candidate.change)),
+        format!(
+            "{}/{}",
+            candidate_change_dir(&candidate.change),
+            acceptance_artifact.display()
+        ),
+    ];
+    let assignment = json!({
+        "schema": 1,
+        "objective": objective,
+        "inputs": inputs,
+        "outputs": outputs,
+        "invariants": [
+            "only the candidate's own OpenSpec change directory is written; product source stays untouched",
+            "the installed OpenSpec workflow definitions and schemas are never edited",
+            "the authored change is committed in this checkout and the tree is left without uncommitted or untracked files",
+            format!("the implementation conversation that follows must find a strictly valid change for {}", candidate.change),
+        ],
+        "acceptance": [
+            format!("`openspec validate {} --strict --no-interactive` passes inside this checkout", candidate.change),
+            format!("the change contains proposal, requirements, design and tasks plus the predeclared acceptance section '{}'", acceptance_heading),
+            "one committed revision contains exactly the authored change and the working tree is clean",
+        ],
+        "consumer": "the improvement controller (codex-harness improve)",
+        "escalate": [],
+    });
+    let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Planner);
+    candidate.planner_attempt = Some(attempt_id.clone());
+    dispatch_bound_assignment(
+        run,
+        host,
+        assignment,
+        AttemptRole::Planner,
+        attempt_id,
+        notes,
+    )
+}
+
+fn dispatch_implementer(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let host = match dispatch_host(run, candidate) {
+        Ok(host) => host,
+        Err(reason) => return refused(run, notes, reason),
+    };
+    let change_dir = host.checkout.join(candidate_change_dir(&candidate.change));
+    let inputs = relative_files(&host.checkout, &change_dir)?;
+    let scope = run.spec.writable_scope.join(", ");
+    let objective = format!(
+        "Implement the complete work items of the candidate's OpenSpec change {} inside this checkout, staying inside the declared writable scope: {scope}. The change artifacts under {} are read-only for this conversation. Read the hypothesis card with `{} show {} --json` from {}. Commit every change on this checkout's current HEAD and leave no uncommitted or untracked files; the controller validates the committed revision against the frozen base, advances the owned candidate branch {} to it, re-qualifies the change and refuses dirty, escaped or unverified output. Report in your final message the commit revision, the changed paths and the exact check commands you ran with their observed results.",
+        candidate.change,
+        candidate_change_dir(&candidate.change),
+        run.spec.board.bd.display(),
+        candidate.hypothesis,
+        run.spec.board.project.display(),
+        host.branch
+    );
+    let assignment = json!({
+        "schema": 1,
+        "objective": objective,
+        "inputs": inputs,
+        "outputs": [],
+        "invariants": [
+            format!("every edit stays inside the declared writable scope: {scope}"),
+            format!("the change artifacts under {} are not modified; the frozen planning digests must still verify", candidate_change_dir(&candidate.change)),
+            "all work is committed on this checkout and the tree is left clean; the controller advances the owned candidate branch to the returned revision",
+            "the returned checks are independently re-verified by the controller and the parent acceptance owner; a success sentence alone is not evidence",
+        ],
+        "acceptance": [
+            run.spec.experiment.independent_acceptance.clone(),
+            format!("the committed candidate re-qualifies through `openspec validate {} --strict --no-interactive`", candidate.change),
+        ],
+        "consumer": "the improvement controller (codex-harness improve)",
+        "escalate": [],
+    });
+    let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Implementer);
+    candidate.implementer_attempt = Some(attempt_id.clone());
+    dispatch_bound_assignment(
+        run,
+        host,
+        assignment,
+        AttemptRole::Implementer,
+        attempt_id,
+        notes,
+    )
+}
+
+/// One conversation's bound checkout: the candidate worktree for the first
+/// dispatch, and the implementer's own returned checkout base afterwards.
+struct DispatchHost {
+    checkout: PathBuf,
+    base: String,
+    branch: String,
+}
+
+fn dispatch_host(_run: &Run, candidate: &CandidateState) -> Result<DispatchHost, String> {
+    let Some(checkout) = &candidate.worktree else {
+        return Err(
+            "the candidate allocation is missing; dependent dispatch is refused".to_owned(),
+        );
+    };
+    if !checkout.path.is_dir() {
+        return Err(format!(
+            "the candidate worktree {} is missing; dependent dispatch is refused",
+            checkout.path.display()
+        ));
+    }
+    Ok(DispatchHost {
+        checkout: checkout.path.clone(),
+        base: checkout.revision.clone(),
+        branch: checkout.branch.clone(),
+    })
+}
+
+/// Writes the bounded assignment and dispatches one visible conversation,
+/// recording the accepted native identity exactly like the investigator path.
+fn dispatch_bound_assignment(
+    run: &mut Run,
+    host: DispatchHost,
+    assignment: serde_json::Value,
+    role: AttemptRole,
+    attempt_id: String,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let surface = surface(&run.spec);
+    let Some(binding) = surface.binding.clone() else {
+        let reason =
+            "the dispatch profile binding is unavailable; no dispatch was attempted".to_owned();
+        return block(run, notes, reason);
+    };
+    let owner = dispatch_owner(&run.spec.run, role, attempt_ordinal(&attempt_id));
+    let title = executor_title(&binding.profile, &owner);
+    let assignment_path = run
+        .store
+        .assignments_dir()
+        .join(format!("{attempt_id}.json"));
+    let bytes = serde_json::to_vec_pretty(&assignment)?;
+    if bytes.len() > MAX_ASSIGNMENT_BYTES {
+        let reason = format!(
+            "the {attempt_id} assignment exceeds the bounded assignment size; the dispatch is refused before any model request"
+        );
+        return refused(run, notes, reason);
+    }
+    write_json_atomic(&assignment_path, &assignment)?;
+    let attempt = Attempt {
+        id: attempt_id.clone(),
+        role,
+        binding: None,
+        retained: None,
+        owner: owner.clone(),
+        title: title.clone(),
+        profile: binding.profile.clone(),
+        model: binding.model.clone(),
+        model_provider: binding.model_provider.clone(),
+        reasoning_effort: binding.reasoning_effort.clone(),
+        checkout: None,
+        assignment: Some(assignment_path.clone()),
+        receipt: None,
+        result: None,
+        detail: None,
+        state: AttemptState::Requested,
+        reason: None,
+        reuse_refused: None,
+        started_ms: now_ms(),
+        updated_ms: now_ms(),
+    };
+    run.cursor.push_attempt(attempt)?;
+    run.cursor.effect(
+        EffectKind::DispatchPrepared,
+        format!(
+            "attempt={attempt_id} role={} owner={owner} title=\"{title}\" assignment={}",
+            role.as_str(),
+            assignment_path.display()
+        ),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    match dispatch_visible_conversation(&VisibleConversation {
+        codex_home: run.spec.codex_home.clone(),
+        source: host.checkout.clone(),
+        owner: owner.clone(),
+        profile: binding.profile.clone(),
+        base: Some(host.base.clone()),
+        assignment: assignment_path,
+    }) {
+        Ok(accepted) => {
+            record_accepted(&mut run.cursor, &attempt_id, &accepted);
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(format!(
+                "dispatched: the bounded {} conversation was accepted through the visible owner",
+                role.as_str()
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            let reason = format!(
+                "dispatch refused before submission: {error}; no fallback was attempted and no model request was made"
+            );
+            if let Some(attempt) = run
+                .cursor
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+            {
+                attempt.state = AttemptState::Failed;
+                attempt.reason = Some(reason.clone());
+                attempt.updated_ms = now_ms();
+            }
+            block(run, notes, reason)
+        }
+    }
+}
+
+/// The deterministic identity of the next bounded conversation of one role.
+fn next_attempt_id(cursor: &Cursor, role: AttemptRole) -> String {
+    let ordinal = cursor
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.role == role)
+        .count() as u32
+        + 1;
+    format!("{}-{ordinal}", role.as_str())
+}
+
+fn attempt_ordinal(attempt_id: &str) -> u32 {
+    attempt_id
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Dispatches the bounded investigator conversation. Its only output is the
+/// schema-1 investigator report as its final message; the controller consumes
+/// that report through grounded intake, so the conversation itself admits no
+/// hypothesis.
+fn dispatch_investigator(
+    run: &mut Run,
+    evidence: &Evidence,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let host = DispatchHost {
+        checkout: run.spec.project.clone(),
+        base: run.spec.base_revision.clone(),
+        branch: String::new(),
+    };
+    let listed = evidence
+        .listing
+        .iter()
+        .take(MAX_LISTED_EVIDENCE)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let root_note = match &evidence.root {
+        Some(root) => format!(
+            " Locators shaped file:<relative path> name retained files under {}.",
+            root.display()
+        ),
+        None => String::new(),
+    };
+    let objective = format!(
+        "Bounded improvement investigation for run {}. Inspect this checkout's source and the {} retained evidence item(s): {}.{} Your final message is ONLY the JSON investigator report described in the invariants; the controller consumes it through grounded intake. Do not edit source and start no other model or paid calls.",
+        run.spec.run,
+        evidence.index.len(),
+        listed,
+        root_note
+    );
+    let assignment = json!({
+        "schema": 1,
+        "objective": objective,
+        "inputs": [],
+        "outputs": [],
+        "invariants": [
+            "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"add-<short-name>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates",
+            "every candidate cites at least one observed retained locator; intake refuses an ungrounded or prediction-only citation",
+            "the spec field names the candidate's own OpenSpec change (add-<short-name>); the controller creates and validates that change before any implementation",
+            "this conversation edits no file and dispatches no other model work",
+        ],
+        "acceptance": [
+            "the report parses as a bounded schema-1 investigator report and every candidate cites at least one retained observed locator",
+        ],
+        "consumer": "the improvement controller's grounded intake (codex-harness improve)",
+        "escalate": [],
+    });
+    let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Investigator);
+    dispatch_bound_assignment(
+        run,
+        host,
+        assignment,
+        AttemptRole::Investigator,
+        attempt_id,
+        notes,
+    )
+}
+
+fn relative_files(root: &Path, directory: &Path) -> io::Result<Vec<String>> {
+    let mut files = Vec::new();
+    if directory.is_dir() {
+        let mut stack = vec![directory.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            let mut entries: Vec<PathBuf> = fs::read_dir(&next)?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if let Ok(relative) = path.strip_prefix(root) {
+                    files.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+                if files.len() >= MAX_ASSIGNMENT_INPUTS {
+                    break;
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// Implementation: dispatch, validate the returned evidence, retain ready.
+// ---------------------------------------------------------------------------
+
+fn ensure_implementation(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    if let Some(id) = candidate.implementer_attempt.clone() {
+        let Some(attempt) = run.cursor.attempt(&id).cloned() else {
+            let reason = format!(
+                "the recorded implementation attempt {id} is missing from the cursor; reconcile the run state before dependent work"
+            );
+            return refused(run, notes, reason);
+        };
+        if attempt.state == AttemptState::Failed && attempt.binding.is_none() {
+            candidate.implementer_attempt = None;
+        } else if attempt.state == AttemptState::Completed {
+            return validate_implementation(run, candidate, &attempt, notes);
+        } else {
+            let reason = format!(
+                "the implementation attempt {id} is {} ({}); reconcile it through the owning dispatcher before dependent work and never resubmit it",
+                attempt.state.as_str(),
+                attempt.reason.as_deref().unwrap_or("no recorded reason")
+            );
+            return block(run, notes, reason);
+        }
+    }
+    let facts = dispatch_facts_for(run, AttemptRole::Implementer)?;
+    match dispatch_gate(&run.cursor, AttemptRole::Implementer, &facts) {
+        DispatchGate::Ready => dispatch_implementer(run, candidate, notes),
+        DispatchGate::Blocked { reason } => block(run, notes, reason),
+    }
+}
+
+/// Validates the returned committed implementation against the exact base, the
+/// declared writable scope, the frozen planning artifacts and the retained
+/// terminal evidence before anything reaches `candidate-ready`.
+fn validate_implementation(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    attempt: &Attempt,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    if attempt.retained.is_none() {
+        let reason = format!(
+            "the implementation attempt {} completed without retained terminal evidence; unverified output never reaches candidate-ready",
+            attempt.id
+        );
+        return refused(run, notes, reason);
+    }
+    let Some(returned) = attempt.checkout.clone() else {
+        let reason = format!(
+            "the implementation attempt {} records no returned checkout, so the committed work cannot be attributed",
+            attempt.id
+        );
+        return refused(run, notes, reason);
+    };
+    let Some(_checkout) = candidate.worktree.clone() else {
+        let reason =
+            "the candidate allocation is missing; dependent validation is refused".to_owned();
+        return refused(run, notes, reason);
+    };
+    // Structural facts first: the returned work must be an owned, registered,
+    // clean checkout whose committed revision descends from the candidate
+    // branch and stays inside the declared writable scope.
+    if let Err(reason) = verify_returned(candidate, attempt, &run.spec.writable_scope) {
+        return refused(run, notes, reason);
+    }
+    // Acceptance inputs stay frozen: the committed change must still qualify
+    // and its artifact digests must equal the receipt qualified before
+    // implementation, checked before the branch advances.
+    let receipt = match read_json::<PlanningReceipt>(
+        &run.store.root().join(CANDIDATE_PLANNING_FILE),
+        MAX_RUN_SPEC_BYTES,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let reason = format!(
+                "the qualified candidate planning receipt is unavailable: {error}; candidate-ready is refused"
+            );
+            return refused(run, notes, reason);
+        }
+    };
+    let returned_target = Specification {
+        project: returned.clone(),
+        change: candidate.change.clone(),
+        store: run.spec.specification.store.clone(),
+        planning_root: returned.clone(),
+    };
+    let openspec = OpenSpec::default();
+    let current = match openspec.qualify(&returned_target, &run.spec.experiment) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let reason = format!(
+                "the committed implementation broke the candidate's planning contract: {error}; candidate-ready is refused"
+            );
+            return refused(run, notes, reason);
+        }
+    };
+    let frozen = match artifact_digests(&receipt) {
+        Ok(frozen) => frozen,
+        Err(reason) => return refused(run, notes, reason),
+    };
+    let committed = match artifact_digests(&current) {
+        Ok(committed) => committed,
+        Err(reason) => return refused(run, notes, reason),
+    };
+    if committed != frozen || current.contract_digest != receipt.contract_digest {
+        let reason = "the committed implementation changed the candidate's planning artifacts; acceptance inputs stay frozen and the result is refused".to_owned();
+        return refused(run, notes, reason);
+    }
+    // The returned commit is transferred once; a resume after a partial
+    // transfer retains the already-advanced revision instead of replaying.
+    let current_head = candidate
+        .worktree
+        .as_ref()
+        .map(|checkout| checkout.revision.clone())
+        .unwrap_or_default();
+    let returned_head = match git_text(&returned, &["rev-parse", "HEAD"]) {
+        Ok(head) => head,
+        Err(error) => {
+            let reason = format!("the returned checkout could not be read: {error}");
+            return refused(run, notes, reason);
+        }
+    };
+    let changed = if returned_head == current_head {
+        // Already transferred by an earlier command; re-report the owned
+        // candidate's scope from its allocation base.
+        let base = candidate
+            .worktree
+            .as_ref()
+            .map(|checkout| checkout.base.clone())
+            .unwrap_or_default();
+        match changed_paths(&returned, &format!("{base}..{returned_head}")) {
+            Ok(changed) => changed,
+            Err(reason) => return refused(run, notes, reason),
+        }
+    } else {
+        match transfer_returned(run, candidate, attempt, &run.spec.writable_scope) {
+            Ok(changed) => changed,
+            Err(reason) => return refused(run, notes, reason),
+        }
+    };
+    let head = candidate
+        .worktree
+        .as_ref()
+        .map(|checkout| checkout.revision.clone())
+        .unwrap_or_default();
+    let returned_result = retained_result(attempt).map(|path| path.to_string_lossy().into_owned());
+    board_hypothesis::record_implementation(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+        &BoundedImplementation {
+            role: board_hypothesis::HypothesisRole::Candidate,
+            branch: candidate
+                .worktree
+                .as_ref()
+                .map(|checkout| checkout.branch.clone())
+                .unwrap_or_default(),
+            base: candidate
+                .worktree
+                .as_ref()
+                .map(|checkout| checkout.base.clone())
+                .unwrap_or_default(),
+            revision: head.clone(),
+            worktree: candidate
+                .worktree
+                .as_ref()
+                .map(|checkout| checkout.path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            runtime: None,
+            baseline_runtime: None,
+        },
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "the validated candidate revision could not be recorded on hypothesis card {}: {error}",
+            candidate.hypothesis
+        ))
+    })?;
+    candidate.revision = Some(head.clone());
+    candidate.result = returned_result.map(PathBuf::from);
+    run.cursor.effect(
+        EffectKind::ImplementationValidated,
+        format!(
+            "attempt={} hypothesis={} revision={} changed={} paths retained-result={} (reported checks are retained, not re-executed by this controller)",
+            attempt.id,
+            candidate.hypothesis,
+            head,
+            changed.len(),
+            candidate
+                .result
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+    );
+    notes.push(format!(
+        "candidate-ready: validated revision {} ({} changed path(s) inside the declared scope)",
+        head,
+        changed.len()
+    ));
+    Ok(())
+}
+
+/// Validates one completed conversation's returned checkout and advances the
+/// owned candidate branch to its committed revision. The returned work must be
+/// an owned, registered, clean worktree of this repository whose revision
+/// descends from the current candidate revision; `allowed` is the writable
+/// scope it may change, and the candidate's own change directory is always
+/// allowed. Returns the changed paths.
+fn transfer_returned(
+    _run: &Run,
+    candidate: &mut CandidateState,
+    attempt: &Attempt,
+    allowed: &[String],
+) -> Result<Vec<String>, String> {
+    let (head, changed) = verify_returned(candidate, attempt, allowed)?;
+    let Some(checkout) = candidate.worktree.clone() else {
+        return Err("the candidate allocation is missing".to_owned());
+    };
+    git_text(&checkout.path, &["merge", "--ff-only", &head]).map_err(|error| {
+        format!(
+            "the validated revision {head} could not be advanced onto the candidate branch {}: {error}",
+            checkout.branch
+        )
+    })?;
+    let advanced = CandidateCheckout {
+        revision: head,
+        ..checkout
+    };
+    task_worktree::verify_candidate_checkout(&advanced).map_err(|error| {
+        format!("the candidate branch did not reach the validated revision: {error}")
+    })?;
+    candidate.worktree = Some(advanced);
+    Ok(changed)
+}
+
+/// The read-only structural validation of one returned checkout: it is an
+/// owned, registered, clean worktree of this repository, its committed
+/// revision descends from the current candidate revision and every changed
+/// path stays inside `allowed` plus the candidate's own change directory.
+/// Returns the committed revision and the changed paths.
+fn verify_returned(
+    candidate: &CandidateState,
+    attempt: &Attempt,
+    allowed: &[String],
+) -> Result<(String, Vec<String>), String> {
+    let Some(checkout) = candidate.worktree.clone() else {
+        return Err("the candidate allocation is missing".to_owned());
+    };
+    let Some(returned) = attempt.checkout.clone() else {
+        return Err(format!(
+            "the attempt {} records no returned checkout, so its committed work cannot be attributed",
+            attempt.id
+        ));
+    };
+    let head = git_text(&returned, &["rev-parse", "HEAD"])?;
+    if head == checkout.revision {
+        return Err(format!(
+            "the attempt {} returned no committed revision beyond the candidate revision {}; an empty result never advances the candidate",
+            attempt.id, checkout.revision
+        ));
+    }
+    match task_worktree::worktree_reuse(&checkout.path, &returned, &checkout.path, &head, false)
+        .map_err(|error| format!("the returned checkout could not be inspected: {error}"))?
+    {
+        WorktreeReuse::Eligible { .. } => {}
+        WorktreeReuse::Blocked { kind, reason } => {
+            return Err(format!(
+                "the returned checkout is not eligible ({kind:?}): {reason}"
+            ));
+        }
+    }
+    if !git_ok(
+        &checkout.path,
+        &["merge-base", "--is-ancestor", &checkout.revision, &head],
+    )
+    .map_err(|error| format!("the returned ancestry could not be checked: {error}"))?
+    {
+        return Err(format!(
+            "the returned revision {head} is not a descendant of the current candidate revision {}; a wrong-base result is refused",
+            checkout.revision
+        ));
+    }
+    let changed = changed_paths(&checkout.path, &format!("{}..{}", checkout.revision, head))?;
+    changed_paths_within_scope(&changed, allowed, &candidate.change)?;
+    Ok((head, changed))
+}
+
+/// Commits the named relative paths in the owned candidate worktree (used for
+/// the model-free OpenSpec scaffold). Unrelated working-tree state is never
+/// staged.
+fn commit_worktree_paths(
+    checkout: &CandidateCheckout,
+    paths: &[String],
+    message: &str,
+) -> Result<(), String> {
+    let mut add: Vec<&str> = vec!["add", "--"];
+    add.extend(paths.iter().map(String::as_str));
+    git_text(&checkout.path, &add)?;
+    let mut commit: Vec<&str> = vec![
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--no-verify",
+        "--only",
+        "-m",
+        message,
+        "--",
+    ];
+    commit.extend(paths.iter().map(String::as_str));
+    git_text(&checkout.path, &commit)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Small read-only Git helpers over the owner-allocated worktrees.
+// ---------------------------------------------------------------------------
+
+/// The planning artifacts of one receipt keyed by change-relative path, so
+/// two checkouts of the same change compare by content and not by checkout
+/// location.
+fn artifact_digests(
+    receipt: &PlanningReceipt,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for (path, digest) in &receipt.artifacts {
+        let relative = path.strip_prefix(&receipt.change_root).map_err(|_| {
+            format!(
+                "the qualified planning artifact {} escapes its change root; the receipt is refused",
+                path.display()
+            )
+        })?;
+        map.insert(
+            relative.to_string_lossy().replace('\\', "/"),
+            digest.clone(),
+        );
+    }
+    Ok(map)
+}
+
+/// The changed paths of one committed range, normalized to forward slashes.
+fn changed_paths(cwd: &Path, range: &str) -> Result<Vec<String>, String> {
+    let text = git_text(
+        cwd,
+        &["diff", "--name-only", "--diff-filter=ACDMRTUXB", range],
+    )?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.replace('\\', "/"))
+        .collect())
+}
+
+fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.len() > 1024 * 1024 {
+        return Err(format!(
+            "git {}: output exceeds the read bound",
+            args.join(" ")
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) -> io::Result<bool> {
+    let status = Command::new("git").args(args).current_dir(cwd).status()?;
+    Ok(status.success())
+}

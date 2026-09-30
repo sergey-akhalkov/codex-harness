@@ -9,7 +9,16 @@
 //! conversation. Comparison execution and frozen runtime preparation are
 //! separate owners; phases that need them stay explicitly pending here until
 //! an actual effect records them.
+//!
+//! The planning/implementation stage of the loop lives in the
+//! [`improvement_workflow`] child module: a retained investigator result is
+//! consumed through grounded intake, the selected candidate's own OpenSpec
+//! change is qualified before any implementation, and only a validated
+//! committed candidate reaches the retained `candidate-ready` state.
 #![cfg(windows)]
+
+#[path = "improvement_workflow.rs"]
+mod improvement_workflow;
 
 use crate::executor_cli::{
     ConversationState, VisibleAccepted, VisibleConversation, dispatch_visible_conversation,
@@ -21,12 +30,13 @@ use harness_core::build_identity;
 use harness_core::build_selection;
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, Cursor, DispatchBinding, DispatchFacts, DispatchGate,
-    EffectKind, HostBinding, IdentityCheck, ObservedIdentity, ObservedOutcome, Phase, RemovalGate,
-    ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE, VariantSet, declared_removal_gate,
-    dispatch_gate, dispatch_owner, frozen_removal_digest, now_ms, read_json, selection_gate,
-    settle_completed_reuse, verify_dispatch_identity, write_json_atomic,
+    EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity, ObservedOutcome,
+    Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE, VariantSet,
+    candidate_removal_gate, declared_removal_gate, dispatch_gate, dispatch_owner,
+    frozen_removal_digest, now_ms, read_json, selection_gate, settle_completed_reuse,
+    verify_dispatch_identity, write_json_atomic,
 };
-use harness_core::improvement_spec::{OpenSpec, PlanningReceipt};
+use harness_core::improvement_spec::OpenSpec;
 use harness_core::orchestration_config;
 use harness_core::outcome_qualification::Qualification;
 use serde_json::json;
@@ -47,19 +57,23 @@ execution and frozen runtime preparation stay separate owners; phases needing
 them remain pending until an actual effect records them.
 
 start validates the explicit run inputs (project, board, OpenSpec target, base
-revision, writable scope, runner profile, oracle, publication scope and any
-removal scope), refuses duplicate run ownership, qualifies the linked OpenSpec
-change through the installed CLI, creates the private run directory and
-performs model-free preparation. When the runner, visibility, qualification and
-removal gates are all satisfied it dispatches the bounded investigator
-conversation through the visible owner; otherwise it records the exact missing
-fact as blocked and starts no model work.
+revision, writable scope, runner profile, evidence root, oracle, publication
+scope and any removal scope), refuses duplicate run ownership, qualifies the
+linked OpenSpec change through the installed CLI, creates the private run
+directory and performs model-free preparation. It then advances the bounded
+investigation/planning/implementation workflow: a retained investigator report
+is consumed through grounded intake, the selected hypothesis' own OpenSpec
+change must qualify before any implementation, and a validated committed
+candidate reaches candidate-ready. Each model conversation uses the visible
+owner; a missing evidence base records idle, a missing gate records blocked,
+and neither starts hidden model work.
 
 status prints the recoverable phase cursor: current phase and condition, the
 hypothesis card, the qualified planning change, the effective runner binding,
-the dispatch gate, the removal gate, every attempt with its receipt, the
-selected prepared variant and the phases still pending. It performs no model
-call. --json prints the same report as JSON.
+the evidence root, the consumed intake outcomes, the selected candidate with
+its branch/base/revision, the dispatch gate, the removal gate, every attempt
+with its receipt, the selected prepared variant and the phases still pending.
+It performs no model call. --json prints the same report as JSON.
 
 select activates an already prepared baseline/candidate runtime through the
 build-selection owner, records its effective identity and performs no model
@@ -71,7 +85,8 @@ stop suspends new work, preserves every attempt and marks in-flight attempts
 unknown so resume never replays them. resume takes over a stopped or
 interrupted run, reconciles recorded receipts (a completed arm is reused only
 while its planning inputs still validate), re-resolves the current removal
-authority, and reports the recovered phase and next action.
+authority, advances the planning/implementation workflow for any settled
+conversation and never replays an unknown or already completed effect.
 
 The run inputs are strict schema 1 JSON: {\"schema\":1,\"run\":\"ID\",
 \"project\":\"DIRECTORY\",\"codex_home\":\"DIRECTORY\",
@@ -82,6 +97,7 @@ The run inputs are strict schema 1 JSON: {\"schema\":1,\"run\":\"ID\",
 \"writable_scope\":[\"relative/path\"],\"runner\":{\"profile\":\"NAME\",
 \"model\":null,\"model_provider\":null,\"reasoning_effort\":null},
 \"local_runner\":null,\"qualification\":null,
+\"evidence_root\":null,
 \"publication_scope\":[\"experiment\"],\"oracle\":\"REFERENCE\",
 \"removal\":null}. Private run data stays outside tracked source: the run
 directory, the spec file and every retained receipt are local inputs.
@@ -413,34 +429,93 @@ fn surface_loss(cursor: &Cursor) -> Option<String> {
     None
 }
 
-fn dispatch_facts(
-    spec: &RunSpec,
-    cursor: &Cursor,
-    comments: &[String],
-) -> io::Result<DispatchFacts> {
+/// The evidence and gate facts for the next bounded conversation of `role`.
+/// The declared run removal stays authoritative for the run's anchor card; a
+/// selected removal candidate's gate resolves against its own card and the
+/// proposal digest frozen when it was selected.
+fn dispatch_facts_for(run: &Run, role: AttemptRole) -> io::Result<DispatchFacts> {
+    let spec = &run.spec;
+    let cursor = &run.cursor;
     let surface = surface(spec);
+    let removal = match cursor.candidate.as_ref() {
+        Some(candidate) if candidate.removal_required => {
+            if candidate.hypothesis == spec.hypothesis_item {
+                let board_comments = comments(spec)?;
+                declared_removal_gate(
+                    spec,
+                    cursor,
+                    &board_comments,
+                    board_hypothesis::RemovalAction::Experiment,
+                )
+            } else {
+                let board_comments = board_feedback::list_comments(
+                    &spec.board.bd,
+                    &spec.board.project,
+                    &candidate.hypothesis,
+                )?;
+                Some(candidate_removal_gate(
+                    &candidate.hypothesis,
+                    &board_comments,
+                    candidate.removal_frozen.as_deref(),
+                ))
+            }
+        }
+        _ => {
+            let board_comments = comments(spec)?;
+            declared_removal_gate(
+                spec,
+                cursor,
+                &board_comments,
+                board_hypothesis::RemovalAction::Experiment,
+            )
+        }
+    };
+    let _ = role;
     Ok(DispatchFacts {
         runner_declared: spec.runner.is_some(),
         launcher: surface.launcher.is_file().then_some(surface.launcher),
         binding_error: surface.binding_error,
         qualification_block: qualification_block(spec)?,
-        removal: removal_state(spec, cursor, comments),
+        removal,
         surface_loss: surface_loss(cursor),
     })
 }
 
+/// The conversation stage the cursor is waiting on, for status and gate
+/// reporting without performing any dispatch.
+fn stage_role(cursor: &Cursor) -> AttemptRole {
+    if let Some(candidate) = &cursor.candidate {
+        if candidate.planning_receipt.is_none() {
+            return AttemptRole::Planner;
+        }
+        if !candidate.is_ready() {
+            return AttemptRole::Implementer;
+        }
+    }
+    AttemptRole::Investigator
+}
+
 fn pending_phases() -> &'static str {
-    "candidate-ready -> baseline-attempt -> candidate-attempt -> acceptance -> decision-recorded -> activation-confirmed (comparison execution and frozen runtime preparation are separate owners; this controller slice records them as pending until an actual effect exists)"
+    "baseline-attempt -> candidate-attempt -> acceptance -> decision-recorded -> activation-confirmed (candidate-ready is reached by the controller's own planning/implementation path; the sequential measured-pair driver and frozen runtime preparation are separate owners and stay pending until an actual effect exists)"
 }
 
 fn next_action(cursor: &Cursor, gate: &DispatchGate, removal: &Option<RemovalGate>) -> String {
     if cursor.phase == Phase::Stopped {
         return "the run is stopped; `improve resume` restores the suspended phase".to_owned();
     }
+    if cursor.phase == Phase::Idle {
+        return format!(
+            "awaiting new evidence or a decision: {}; no model work is started while idle",
+            cursor
+                .condition
+                .as_deref()
+                .unwrap_or("no grounded candidate remains")
+        );
+    }
     let base = match gate {
         DispatchGate::Blocked { reason } => format!("resolve before dispatch: {reason}"),
         DispatchGate::Ready => format!(
-            "dispatch may proceed through the visible owner for the next ready role; pending phases: {}",
+            "dispatch may proceed through the visible owner for the next ready stage; pending phases: {}",
             pending_phases()
         ),
     };
@@ -602,10 +677,10 @@ fn removal_text(gate: &Option<RemovalGate>) -> String {
 }
 
 fn run_report(run: &Run) -> io::Result<serde_json::Value> {
-    let board_comments = comments(&run.spec)?;
-    let facts = dispatch_facts(&run.spec, &run.cursor, &board_comments)?;
-    let gate = dispatch_gate(&run.cursor, AttemptRole::Investigator, &facts);
-    let removal = removal_state(&run.spec, &run.cursor, &board_comments);
+    let stage = stage_role(&run.cursor);
+    let facts = dispatch_facts_for(run, stage)?;
+    let gate = dispatch_gate(&run.cursor, stage, &facts);
+    let removal = facts.removal.clone();
     let planning = run.store.planning()?;
     let variants = run.store.variants_path();
     Ok(json!({
@@ -658,6 +733,30 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
         "selected_variant": run.cursor.selected_variant,
         "selected_runtime": run.cursor.selected_runtime.as_ref().map(|path| path.display().to_string()),
         "selected_identity": run.cursor.selected_identity,
+        "stage": stage.as_str(),
+        "evidence_root": run.spec.evidence_root.as_ref().map(|path| path.display().to_string()),
+        "intake": run.cursor.intake.as_ref().map(|intake| json!({
+            "result_sha256": intake.result_sha256,
+            "evidence_digest": intake.evidence_digest,
+            "outcomes": intake.outcomes.iter().map(|outcome| json!({
+                "outcome": outcome.outcome,
+                "hypothesis": outcome.hypothesis,
+                "detail": outcome.detail,
+            })).collect::<Vec<_>>(),
+        })),
+        "candidate": run.cursor.candidate.as_ref().map(|candidate| json!({
+            "hypothesis": candidate.hypothesis,
+            "change": candidate.change,
+            "removal_required": candidate.removal_required,
+            "branch": candidate.worktree.as_ref().map(|checkout| checkout.branch.clone()),
+            "base": candidate.worktree.as_ref().map(|checkout| checkout.base.clone()),
+            "worktree": candidate.worktree.as_ref().map(|checkout| checkout.path.display().to_string()),
+            "planning_receipt": candidate.planning_receipt.as_ref().map(|path| path.display().to_string()),
+            "planner_attempt": candidate.planner_attempt,
+            "implementer_attempt": candidate.implementer_attempt,
+            "revision": candidate.revision,
+            "result": candidate.result.as_ref().map(|path| path.display().to_string()),
+        })),
         "pending_phases": pending_phases(),
         "next": next_action(&run.cursor, &gate, &removal),
     }))
@@ -713,15 +812,79 @@ fn print_report(run: &Run) -> io::Result<()> {
             println!("runner: pending (no runner profile declared; model-free preparation only)")
         }
     }
-    let board_comments = comments(&run.spec)?;
-    let facts = dispatch_facts(&run.spec, &run.cursor, &board_comments)?;
-    let gate = dispatch_gate(&run.cursor, AttemptRole::Investigator, &facts);
+    let stage = stage_role(&run.cursor);
+    let facts = dispatch_facts_for(run, stage)?;
+    let gate = dispatch_gate(&run.cursor, stage, &facts);
     match &gate {
-        DispatchGate::Ready => println!("dispatch: ready through the visible owner"),
+        DispatchGate::Ready => println!(
+            "dispatch: ready through the visible owner for the next {} stage",
+            stage.as_str()
+        ),
         DispatchGate::Blocked { reason } => println!("dispatch: blocked ({reason})"),
     }
-    let removal = removal_state(&run.spec, &run.cursor, &board_comments);
+    let removal = facts.removal.clone();
     println!("removal: {}", removal_text(&removal));
+    match &run.spec.evidence_root {
+        Some(root) => println!("evidence root: {}", root.display()),
+        None => println!("evidence root: none declared (run-retained attempt evidence only)"),
+    }
+    match &run.cursor.intake {
+        Some(intake) => println!(
+            "intake: result sha256={} evidence={} outcomes={}",
+            &intake.result_sha256[..16.min(intake.result_sha256.len())],
+            &intake.evidence_digest[..16.min(intake.evidence_digest.len())],
+            intake.outcomes.len()
+        ),
+        None => println!("intake: no investigator result consumed yet"),
+    }
+    for outcome in run
+        .cursor
+        .intake
+        .as_ref()
+        .map(|intake| intake.outcomes.as_slice())
+        .unwrap_or_default()
+    {
+        println!(
+            "  intake {}{}: {}",
+            outcome.outcome,
+            outcome
+                .hypothesis
+                .as_deref()
+                .map(|card| format!(" card={card}"))
+                .unwrap_or_default(),
+            outcome.detail
+        );
+    }
+    match &run.cursor.candidate {
+        Some(candidate) => {
+            println!(
+                "candidate: hypothesis={} change={} removal-required={}",
+                candidate.hypothesis, candidate.change, candidate.removal_required
+            );
+            match &candidate.worktree {
+                Some(checkout) => println!(
+                    "candidate branch: {} base={} worktree={} revision={}",
+                    checkout.branch,
+                    checkout.base,
+                    checkout.path.display(),
+                    checkout.revision
+                ),
+                None => println!("candidate branch: not allocated yet"),
+            }
+            println!(
+                "candidate planning: {} planner-attempt={} implementer-attempt={} revision={}",
+                candidate
+                    .planning_receipt
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "pending".to_owned()),
+                candidate.planner_attempt.as_deref().unwrap_or("none"),
+                candidate.implementer_attempt.as_deref().unwrap_or("none"),
+                candidate.revision.as_deref().unwrap_or("none")
+            );
+        }
+        None => println!("candidate: none selected"),
+    }
     println!("attempts:\n{}", print_attempts(&run.cursor));
     println!(
         "variants: {}",
@@ -835,166 +998,20 @@ fn start(args: &[OsString]) -> io::Result<i32> {
     };
     claim_ownership(&mut run)?;
 
-    let facts = dispatch_facts(&run.spec, &run.cursor, &board_comments)?;
-    let gate = dispatch_gate(&run.cursor, AttemptRole::Investigator, &facts);
-    match gate {
-        DispatchGate::Ready => {
-            let dispatched = dispatch_investigator(&run, &receipt)?;
-            run.cursor = run.store.cursor()?;
-            print_report(&run)?;
-            if dispatched {
-                println!(
-                    "dispatched: the bounded investigator conversation was accepted through the visible owner"
-                );
-            }
-        }
-        DispatchGate::Blocked { reason } => {
-            run.cursor.effect(EffectKind::DispatchRefused, &reason);
-            run.cursor.block(reason);
-            run.store.save_cursor(&run.cursor)?;
-            print_report(&run)?;
-        }
+    // The planning/implementation workflow advances as far as the recorded
+    // state and the dispatch gates allow: it consumes a retained investigator
+    // result through grounded intake, qualifies the selected candidate's own
+    // OpenSpec change and dispatches bounded conversations. A missing
+    // evidence base records an honest idle state and starts no model work.
+    let notes = improvement_workflow::advance(&mut run)?;
+    print_report(&run)?;
+    for note in &notes {
+        println!("{note}");
     }
     Ok(0)
 }
 
 /// Dispatches the bounded investigator conversation through the visible
-/// executor owner. Returns whether a conversation was accepted. A refusal
-/// records the exact cause and never substitutes another route.
-fn dispatch_investigator(run: &Run, receipt: &PlanningReceipt) -> io::Result<bool> {
-    let mut cursor = run.cursor.clone();
-    let surface = surface(&run.spec);
-    let Some(binding) = surface.binding.clone() else {
-        cursor.effect(
-            EffectKind::DispatchRefused,
-            "the profile binding is unavailable; no dispatch was attempted",
-        );
-        cursor.block("the dispatch profile binding is unavailable");
-        run.store.save_cursor(&cursor)?;
-        return Ok(false);
-    };
-    let runner = run
-        .spec
-        .runner
-        .as_ref()
-        .expect("ready gate requires a declared runner");
-    let mut inputs = Vec::new();
-    for path in receipt.artifacts.keys() {
-        let Ok(relative) = path.strip_prefix(&run.spec.project) else {
-            let reason = format!(
-                "planning artifact {} lives outside the project checkout; the bounded assignment cannot reference it by relative path, so implementation dispatch stays pending",
-                path.display()
-            );
-            cursor.effect(EffectKind::DispatchRefused, &reason);
-            cursor.block(reason);
-            run.store.save_cursor(&cursor)?;
-            return Ok(false);
-        };
-        inputs.push(relative.to_string_lossy().replace('\\', "/"));
-    }
-    inputs.sort();
-    inputs.dedup();
-    let ordinal = cursor
-        .attempts
-        .iter()
-        .filter(|attempt| attempt.role == AttemptRole::Investigator)
-        .count() as u32
-        + 1;
-    let owner = dispatch_owner(&run.spec.run, AttemptRole::Investigator, ordinal);
-    let title = executor_title(&runner.profile, &owner);
-    let attempt_id = format!("investigator-{ordinal}");
-    let assignment_path = run
-        .store
-        .assignments_dir()
-        .join(format!("{attempt_id}.json"));
-    let assignment = json!({
-        "schema": 1,
-        "objective": format!(
-            "Produce a bounded implementation plan for hypothesis {} against the qualified planning change {}: name the exact writable-scope changes, the independent acceptance path, the existing owners to reuse and concrete risks or counterexamples. Do not edit source; report the plan and any missing input.",
-            run.spec.hypothesis_item, run.spec.specification.change
-        ),
-        "inputs": inputs,
-        "outputs": run.spec.writable_scope,
-        "invariants": [
-            "keep every change inside the declared writable scope",
-            "the planning artifacts, the independent oracle and the run state stay read-only",
-        ],
-        "acceptance": [run.spec.experiment.independent_acceptance],
-        "consumer": "the improvement controller (codex-harness improve)",
-        "escalate": [],
-    });
-    write_json_atomic(&assignment_path, &assignment)?;
-    let attempt = Attempt {
-        id: attempt_id.clone(),
-        role: AttemptRole::Investigator,
-        binding: None,
-        retained: None,
-        owner: owner.clone(),
-        title: title.clone(),
-        profile: binding.profile.clone(),
-        model: binding.model.clone(),
-        model_provider: binding.model_provider.clone(),
-        reasoning_effort: binding.reasoning_effort.clone(),
-        checkout: None,
-        assignment: Some(assignment_path.clone()),
-        receipt: None,
-        result: None,
-        detail: None,
-        state: AttemptState::Requested,
-        reason: None,
-        reuse_refused: None,
-        started_ms: now_ms(),
-        updated_ms: now_ms(),
-    };
-    if let Err(error) = cursor.push_attempt(attempt) {
-        cursor.effect(EffectKind::DispatchRefused, error.to_string());
-        cursor.block(error.to_string());
-        run.store.save_cursor(&cursor)?;
-        return Ok(false);
-    }
-    cursor.effect(
-        EffectKind::DispatchPrepared,
-        format!(
-            "owner={owner} title=\"{title}\" assignment={}",
-            assignment_path.display()
-        ),
-    );
-    run.store.save_cursor(&cursor)?;
-
-    match dispatch_visible_conversation(&VisibleConversation {
-        codex_home: run.spec.codex_home.clone(),
-        source: run.spec.project.clone(),
-        owner: owner.clone(),
-        profile: binding.profile.clone(),
-        base: Some(run.spec.base_revision.clone()),
-        assignment: assignment_path,
-    }) {
-        Ok(accepted) => {
-            record_accepted(&mut cursor, &attempt_id, &accepted);
-            run.store.save_cursor(&cursor)?;
-            Ok(true)
-        }
-        Err(error) => {
-            let reason = format!(
-                "dispatch refused before submission: {error}; no fallback was attempted and no model request was made"
-            );
-            if let Some(attempt) = cursor
-                .attempts
-                .iter_mut()
-                .find(|attempt| attempt.id == attempt_id)
-            {
-                attempt.state = AttemptState::Failed;
-                attempt.reason = Some(reason.clone());
-                attempt.updated_ms = now_ms();
-            }
-            cursor.effect(EffectKind::DispatchRefused, &reason);
-            cursor.block(reason);
-            run.store.save_cursor(&cursor)?;
-            Ok(false)
-        }
-    }
-}
-
 fn record_accepted(cursor: &mut Cursor, attempt_id: &str, accepted: &VisibleAccepted) {
     // Freeze the accepted native dispatch identity from the dispatcher's own
     // receipt, at the moment of acceptance. The receipt path alone is not
@@ -1663,14 +1680,26 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
             None => removal_condition,
         });
     }
-    match condition {
-        Some(condition) => cursor.block(condition),
-        None => cursor.clear_blocked(),
-    }
     run.cursor = cursor;
+    // Advance the planning/implementation workflow over the reconciled state:
+    // a settled investigator result is consumed through grounded intake, the
+    // selected candidate's own change is qualified and bounded conversations
+    // are dispatched - or an honest idle/blocked condition is recorded.
+    let advanced = improvement_workflow::advance(&mut run)?;
+    match condition {
+        Some(condition) => merge_condition(&mut run.cursor, condition),
+        None => {
+            if run.cursor.phase != Phase::Idle {
+                run.cursor.clear_blocked();
+            }
+        }
+    }
     run.store.save_cursor(&run.cursor)?;
 
     print_report(&run)?;
+    for note in &advanced {
+        println!("{note}");
+    }
     if !report.settled.is_empty() {
         println!(
             "resume: settled attempt(s) {} from their receipts; no model attempt was replayed",
@@ -1710,4 +1739,24 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
         println!("resume: {note}");
     }
     Ok(0)
+}
+
+/// Merges a reconciliation-derived condition into the cursor without
+/// discarding an idle conclusion the workflow recorded; a transient blocked
+/// gate is replaced by the reconciliation condition as before.
+fn merge_condition(cursor: &mut Cursor, condition: String) {
+    if matches!(cursor.phase, Phase::Idle | Phase::Blocked) {
+        let merged = match &cursor.condition {
+            Some(existing) => format!("{existing}; {condition}"),
+            None => condition,
+        };
+        if cursor.phase == Phase::Idle {
+            cursor.condition = Some(merged);
+            cursor.updated_ms = now_ms();
+        } else {
+            cursor.block(merged);
+        }
+    } else {
+        cursor.block(condition);
+    }
 }

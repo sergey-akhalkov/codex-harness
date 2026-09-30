@@ -13,6 +13,14 @@
 //! decision, activation) are reachable only by recording an actual effect; a
 //! controller slice that cannot perform that effect reports the phase as
 //! explicitly pending instead of advancing.
+//!
+//! The planning/implementation portion of the loop is controller-owned: a
+//! retained investigator result is consumed through
+//! [`crate::improvement_intake`], the selected hypothesis' own OpenSpec change
+//! is qualified, the candidate branch/worktree is bound to its Beads card and
+//! a validated committed implementation reaches [`Phase::CandidateReady`].
+//! The cursor records those references as recovery data only; the board and
+//! OpenSpec remain the decision and planning owners.
 
 use crate::process::{Cancellation, Deadline, ExclusiveFileLock};
 use serde::{Deserialize, Serialize};
@@ -36,6 +44,12 @@ pub const MAX_EFFECTS: usize = 256;
 pub const MAX_ATTEMPTS: usize = 64;
 pub const MAX_SCOPE_ENTRIES: usize = 32;
 pub const MAX_OWNER_BYTES: usize = 64;
+/// The bounded intake summary the cursor retains for one consumed investigator
+/// result. The board owns the admitted cards and their conclusions; this is
+/// recovery data only.
+pub const MAX_INTAKE_OUTCOMES: usize = 16;
+const MAX_OUTCOME: usize = 32;
+const MAX_OUTCOME_DETAIL: usize = 512;
 /// How long a mutating command waits for the exclusive run-mutation guard
 /// before reporting the busy controller instead of acting on stale state.
 pub const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -250,6 +264,11 @@ pub struct RunSpec {
     pub oracle: String,
     /// The removal treatment this run evaluates, when it is a removal.
     pub removal: Option<RemovalScope>,
+    /// The local evidence root the bounded investigator may cite: retained
+    /// files from existing owners (rollouts, outcome records). `None` means
+    /// only the run's own retained attempt evidence is indexed.
+    #[serde(default)]
+    pub evidence_root: Option<PathBuf>,
 }
 
 impl RunSpec {
@@ -338,6 +357,11 @@ impl RunSpec {
             return Err(invalid("publication_scope names a stage more than once"));
         }
         line("oracle reference", &self.oracle, MAX_REASON)?;
+        if let Some(root) = &self.evidence_root
+            && !root.is_absolute()
+        {
+            return Err(invalid("the evidence root must be an absolute path"));
+        }
         if let Some(removal) = &self.removal {
             token("removal proposal", &removal.proposal, MAX_TOKEN)?;
             token("removal target", &removal.target, MAX_TOKEN)?;
@@ -399,6 +423,176 @@ pub fn absolute_path_reference(reference: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// The stable, bounded locator of one file retained under the declared local
+/// evidence root. It is derived from the file's repository-relative path, so
+/// the controller and the investigator name the same retained item without
+/// trusting an investigator-supplied identity. Absolute paths, traversal and
+/// empty components are refused.
+pub fn evidence_locator(relative: &str) -> Option<String> {
+    let normalized = normalize_relative(relative)?;
+    let locator = format!("file:{normalized}");
+    (locator.len() <= 240).then_some(locator)
+}
+
+fn normalize_relative(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 240 {
+        return None;
+    }
+    let normalized = trimmed.replace('\\', "/");
+    if normalized.starts_with('/') || normalized.contains(':') || normalized.contains('\0') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in normalized.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        if part == "." || part == ".." {
+            return None;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// The OpenSpec change named by a hypothesis card's spec reference, resolved
+/// under the run's planning root. A path-shaped reference must live under the
+/// default `openspec/changes` root; anything else is a mismatched source that
+/// blocks dependent implementation instead of being guessed.
+pub fn candidate_change_name(reference: &str) -> Result<String, String> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "the hypothesis card records no OpenSpec change reference; every candidate needs its own complete change before implementation"
+                .to_owned(),
+        );
+    }
+    let normalized = trimmed.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(name) = parts.last() else {
+        return Err(format!("the spec reference {reference} names no change"));
+    };
+    if parts.len() > 1 && parts[..parts.len() - 1] != ["openspec", "changes"] {
+        return Err(format!(
+            "the spec reference {reference} does not resolve under the run's openspec/changes planning root; a different project or store is a mismatched source and blocks dependent effects"
+        ));
+    }
+    if name.len() > 200
+        || name.starts_with('-')
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        || matches!(*name, "." | "..")
+    {
+        return Err(format!(
+            "the spec reference {reference} does not name a valid OpenSpec change"
+        ));
+    }
+    Ok((*name).to_owned())
+}
+
+/// The candidate's own OpenSpec change directory, relative to the candidate
+/// project: the planning part of its branch that implementation may not
+/// escape.
+pub fn candidate_change_dir(change: &str) -> String {
+    format!("openspec/changes/{change}")
+}
+
+/// Whether every changed path of a committed candidate implementation stays
+/// inside the declared writable scope or the candidate's own OpenSpec change.
+/// Anything else is an escaped scope that must not reach `candidate-ready`.
+pub fn changed_paths_within_scope(
+    changed: &[String],
+    scope: &[String],
+    change: &str,
+) -> Result<(), String> {
+    let mut allowed: Vec<String> = Vec::new();
+    for entry in scope {
+        match normalize_relative(entry) {
+            Some(entry) => allowed.push(entry),
+            None => return Err(format!("the declared writable scope {entry} is unusable")),
+        }
+    }
+    allowed.push(candidate_change_dir(change));
+    let mut escaped = Vec::new();
+    for path in changed {
+        let Some(path) = normalize_relative(path) else {
+            escaped.push(format!("{path} (unresolvable path)"));
+            continue;
+        };
+        let inside = allowed.iter().any(|allowed| {
+            path == *allowed
+                || (path.len() > allowed.len()
+                    && path.starts_with(allowed.as_str())
+                    && path.as_bytes()[allowed.len()] == b'/')
+        });
+        if !inside {
+            escaped.push(path);
+        }
+    }
+    if escaped.is_empty() {
+        return Ok(());
+    }
+    let named = escaped
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let extra = escaped.len().saturating_sub(4);
+    Err(format!(
+        "the committed implementation changed {named}{}; those paths are outside the declared writable scope and the candidate's own change, so the result is refused",
+        if extra > 0 {
+            format!(" and {extra} more path(s)")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// The current removal authority for an intake-selected candidate card: the
+/// latest recorded proposal for that item, bound to the digest frozen when
+/// the candidate was selected. Without a recorded proposal the dependent
+/// implementation stays pending the informed decision.
+pub fn candidate_removal_gate(
+    item: &str,
+    comments: &[String],
+    frozen_reviewed: Option<&str>,
+) -> RemovalGate {
+    let proposal = crate::board_hypothesis::parse_removal_proposals(comments)
+        .into_iter()
+        .rfind(|proposal| proposal.item == item);
+    let Some(proposal) = proposal else {
+        return RemovalGate::Pending {
+            reason: format!(
+                "the candidate {item} requires an informed removal decision, but no reviewable removal proposal is recorded on its card; prepare the proposal and obtain the user's decision before any removal effect"
+            ),
+        };
+    };
+    let request = crate::board_hypothesis::AuthorityRequest {
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+        action: crate::board_hypothesis::RemovalAction::Experiment,
+    };
+    removal_gate_at(item, &request, comments, frozen_reviewed)
+}
+
+/// The digest to freeze when a removal candidate is selected: the current
+/// complete proposal version, when one is already recorded.
+pub fn frozen_candidate_removal_digest(item: &str, comments: &[String]) -> Option<String> {
+    let proposal = crate::board_hypothesis::parse_removal_proposals(comments)
+        .into_iter()
+        .rfind(|proposal| proposal.item == item)?;
+    Some(crate::board_hypothesis::reviewed_proposal_digest(&proposal))
+}
+
 /// The recoverable phase cursor. `Blocked`/`Idle`/`Stopped` are conditions of
 /// the surrounding phase, not a second hypothesis lifecycle.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -434,11 +628,13 @@ impl Phase {
 
     /// A phase that needs the comparison/runtime-preparation owners. This
     /// controller slice never advances into one without a recorded effect.
+    /// `CandidateReady` is *not* listed: the controller's own validated
+    /// committed candidate reaches it, while every measured or activated
+    /// phase still needs the comparison and activation owners.
     pub fn requires_comparison_owner(self) -> bool {
         matches!(
             self,
-            Self::CandidateReady
-                | Self::BaselineAttempt
+            Self::BaselineAttempt
                 | Self::CandidateAttempt
                 | Self::Acceptance
                 | Self::DecisionRecorded
@@ -451,6 +647,11 @@ impl Phase {
 #[serde(rename_all = "kebab-case")]
 pub enum AttemptRole {
     Investigator,
+    /// The bounded planning conversation that authors one selected
+    /// hypothesis' own OpenSpec change. Planning precedes any dependent
+    /// implementation and applies no treatment, so it is allowed while a
+    /// declared removal still waits for the user's decision.
+    Planner,
     Implementer,
     Baseline,
     Candidate,
@@ -460,6 +661,7 @@ impl AttemptRole {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Investigator => "investigator",
+            Self::Planner => "planner",
             Self::Implementer => "implementer",
             Self::Baseline => "baseline",
             Self::Candidate => "candidate",
@@ -469,6 +671,7 @@ impl AttemptRole {
     pub fn short(self) -> &'static str {
         match self {
             Self::Investigator => "inv",
+            Self::Planner => "plan",
             Self::Implementer => "impl",
             Self::Baseline => "base",
             Self::Candidate => "cand",
@@ -744,6 +947,20 @@ impl Attempt {
 #[serde(rename_all = "kebab-case")]
 pub enum EffectKind {
     PlanningQualified,
+    /// One retained investigator result was consumed through the grounded
+    /// intake owner; the recorded outcomes are recovery data.
+    IntakeConsumed,
+    /// No grounded candidate remains: the loop idles with the recorded
+    /// reason and starts no model work.
+    IdleRecorded,
+    /// The run selected one hypothesis card as its candidate implementation.
+    CandidateSelected,
+    /// The candidate's dedicated branch/worktree allocation was bound to its
+    /// Beads card, or an eligible preserved allocation was reused.
+    CandidateAllocated,
+    /// One validated committed candidate implementation reached the retained
+    /// candidate-ready state.
+    ImplementationValidated,
     DispatchPrepared,
     DispatchAccepted,
     DispatchRefused,
@@ -767,6 +984,107 @@ pub struct Effect {
     pub kind: EffectKind,
     pub detail: String,
     pub at_ms: u64,
+}
+
+/// One bounded intake outcome recorded as recovery data. The admitted card,
+/// its status and its conclusions stay on the board; this summary only lets a
+/// resume report what the consumed investigator result produced.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeRecord {
+    /// The kebab-case intake outcome tag (`admitted`, `deferred`, ...).
+    pub outcome: String,
+    /// The hypothesis card this outcome names, when it names one.
+    #[serde(default)]
+    pub hypothesis: Option<String>,
+    pub detail: String,
+}
+
+impl OutcomeRecord {
+    pub fn new(outcome: &str, hypothesis: Option<&str>, detail: &str) -> io::Result<Self> {
+        Ok(Self {
+            outcome: token("intake outcome", outcome, MAX_OUTCOME)?,
+            hypothesis: hypothesis
+                .map(|value| token("outcome hypothesis", value, MAX_TOKEN))
+                .transpose()?,
+            detail: line("intake outcome detail", detail, MAX_OUTCOME_DETAIL)?,
+        })
+    }
+}
+
+/// The durable summary of one consumed investigator result. `result_sha256`
+/// is the retained result identity; `evidence_digest` identifies the evidence
+/// index shape the intake round ran against, so a resume can tell fresh
+/// evidence from an unchanged round without asking a model again.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeState {
+    pub result_sha256: String,
+    pub evidence_digest: String,
+    pub outcomes: Vec<OutcomeRecord>,
+    pub consumed_ms: u64,
+}
+
+/// The selected candidate hypothesis and its owned implementation state. The
+/// Beads card stays the identity/decision owner; this records the exact
+/// references the controller validated.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateState {
+    /// The admitted/reused Beads hypothesis card selected by intake.
+    pub hypothesis: String,
+    /// The candidate's own OpenSpec change name, resolved under the run's
+    /// planning root.
+    pub change: String,
+    /// The candidate is a removal treatment: its implementation needs the
+    /// user's informed decision before any removal effect.
+    #[serde(default)]
+    pub removal_required: bool,
+    /// The reviewed removal proposal digest frozen when the candidate was
+    /// selected; a changed proposal needs a fresh decision.
+    #[serde(default)]
+    pub removal_frozen: Option<String>,
+    /// The owned candidate worktree bound to the card and the exact base.
+    #[serde(default)]
+    pub worktree: Option<crate::task_worktree::CandidateCheckout>,
+    /// The qualified receipt of the candidate's own OpenSpec change.
+    #[serde(default)]
+    pub planning_receipt: Option<PathBuf>,
+    /// The bounded planning conversation attempt for this candidate.
+    #[serde(default)]
+    pub planner_attempt: Option<String>,
+    /// The bounded implementation conversation attempt for this candidate.
+    #[serde(default)]
+    pub implementer_attempt: Option<String>,
+    /// The validated committed candidate revision.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// The retained terminal result locator of the implementation attempt.
+    #[serde(default)]
+    pub result: Option<PathBuf>,
+}
+
+impl CandidateState {
+    pub fn new(hypothesis: &str, change: &str) -> io::Result<Self> {
+        Ok(Self {
+            hypothesis: token("candidate hypothesis", hypothesis, MAX_TOKEN)?,
+            change: token("candidate change", change, MAX_TOKEN)?,
+            removal_required: false,
+            removal_frozen: None,
+            worktree: None,
+            planning_receipt: None,
+            planner_attempt: None,
+            implementer_attempt: None,
+            revision: None,
+            result: None,
+        })
+    }
+
+    /// The candidate implementation is retained and ready for the separate
+    /// measured-pair owner.
+    pub fn is_ready(&self) -> bool {
+        self.revision.is_some()
+    }
 }
 
 /// The durable cursor: bounded recovery data referencing the board, planning
@@ -798,6 +1116,12 @@ pub struct Cursor {
     pub selected_variant: Option<String>,
     pub selected_runtime: Option<PathBuf>,
     pub selected_identity: Option<String>,
+    /// The consumed investigator result and its recorded intake outcomes.
+    #[serde(default)]
+    pub intake: Option<IntakeState>,
+    /// The hypothesis selected for planning/implementation in this run.
+    #[serde(default)]
+    pub candidate: Option<CandidateState>,
     pub updated_ms: u64,
 }
 
@@ -820,8 +1144,39 @@ impl Cursor {
             selected_variant: None,
             selected_runtime: None,
             selected_identity: None,
+            intake: None,
+            candidate: None,
             updated_ms: now_ms(),
         }
+    }
+
+    /// Records the bounded summary of one consumed investigator result.
+    pub fn record_intake(&mut self, state: IntakeState) -> io::Result<()> {
+        if state.outcomes.len() > MAX_INTAKE_OUTCOMES {
+            return Err(invalid(format!(
+                "the intake summary carries {} outcomes; at most {MAX_INTAKE_OUTCOMES} are retained",
+                state.outcomes.len()
+            )));
+        }
+        self.intake = Some(state);
+        self.updated_ms = now_ms();
+        Ok(())
+    }
+
+    /// Selects one hypothesis as the candidate this run plans and implements.
+    pub fn select_candidate(&mut self, candidate: CandidateState) -> io::Result<()> {
+        if let Some(existing) = &self.candidate
+            && existing.hypothesis != candidate.hypothesis
+            && existing.revision.is_some()
+        {
+            return Err(invalid(format!(
+                "candidate {} already reached a validated implementation; the run does not silently switch hypotheses",
+                existing.hypothesis
+            )));
+        }
+        self.candidate = Some(candidate);
+        self.updated_ms = now_ms();
+        Ok(())
     }
 
     pub fn effect(&mut self, kind: EffectKind, detail: impl Into<String>) {
