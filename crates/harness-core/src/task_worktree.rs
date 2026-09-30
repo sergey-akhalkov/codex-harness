@@ -1637,6 +1637,98 @@ pub fn verify_frozen(copy: &FrozenCopy) -> io::Result<()> {
     Ok(())
 }
 
+/// Pre-attempt gate for a frozen copy: the snapshot identity still verifies and
+/// the copy is pristine — no prior solution edits or untracked artifacts, no
+/// extra or moved references, no unreachable sibling objects and no alternate
+/// or shared object database. The check is read-only: contaminated state is
+/// reported with its cause and preserved, never cleaned or reset. Use
+/// [`verify_frozen`] for post-attempt snapshot checks after an executor has
+/// legitimately worked in the copy.
+pub fn verify_frozen_pristine(copy: &FrozenCopy) -> io::Result<()> {
+    verify_frozen(copy)?;
+    let git_dir = copy.path.join(".git");
+    if !git_dir.is_dir() {
+        return Err(frozen_error(
+            "the copy's Git directory is not an independent repository",
+        ));
+    }
+    if git_dir.join("commondir").exists() {
+        return Err(frozen_error(
+            "the copy shares a common Git directory; sibling history may be reachable",
+        ));
+    }
+    let alternates = git(
+        &copy.path,
+        &["rev-parse", "--git-path", "objects/info/alternates"],
+    )?;
+    let alternates = PathBuf::from(alternates.trim());
+    let alternates = if alternates.is_absolute() {
+        alternates
+    } else {
+        copy.path.join(alternates)
+    };
+    if alternates.exists() {
+        return Err(frozen_error(
+            "the copy shares an alternate object store; sibling history may be reachable",
+        ));
+    }
+    let refs = git(&copy.path, &["for-each-ref", "--format=%(refname)"])?;
+    let refs: Vec<&str> = refs
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if refs != ["refs/heads/main"] {
+        return Err(frozen_error(
+            "the copy holds extra or missing references; a pre-attempt copy has exactly its frozen branch",
+        ));
+    }
+    let branch = git(&copy.path, &["rev-parse", "refs/heads/main"])?
+        .trim()
+        .to_owned();
+    if branch != copy.revision {
+        return Err(frozen_error(
+            "the frozen branch moved off the frozen revision; prior work is preserved but the copy is not pristine",
+        ));
+    }
+    let head = git(&copy.path, &["rev-parse", "HEAD"])?.trim().to_owned();
+    if head != copy.revision {
+        return Err(frozen_error(
+            "HEAD is not the frozen revision; a prior checkout or solution is present",
+        ));
+    }
+    let status = git(
+        &copy.path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.trim().is_empty() {
+        return Err(frozen_error(
+            "the working tree holds edits or artifacts from an earlier solution; they are preserved",
+        ));
+    }
+    let fsck = Command::new(git_program())
+        .args(["fsck", "--unreachable", "--no-reflogs", "--no-progress"])
+        .current_dir(&copy.path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&fsck.stdout);
+    let stderr = String::from_utf8_lossy(&fsck.stderr);
+    for line in stdout.lines().chain(stderr.lines()) {
+        let line = line.trim();
+        if line.starts_with("unreachable ") || line.starts_with("dangling ") {
+            return Err(frozen_error(format!(
+                "the copy holds Git objects outside the frozen revision ({line}); reconstruct it instead of reusing contaminated state"
+            )));
+        }
+    }
+    if !fsck.status.success() {
+        return Err(frozen_error(format!(
+            "the copy does not pass Git integrity verification: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Read-only reuse verdict for an existing worktree allocation. `current` is
 /// the checkout the running session executes from; `active` reports an active
 /// experiment attempt on the candidate. Refusals never touch the tree.

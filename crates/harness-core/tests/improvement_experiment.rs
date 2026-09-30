@@ -7,7 +7,7 @@ use harness_core::improvement_experiment::{
 };
 use harness_core::task_worktree::{
     ReuseBlock, WorktreeReuse, allocate_candidate_checkout, frozen_copy, verify_candidate_checkout,
-    verify_frozen, worktree_reuse,
+    verify_frozen, verify_frozen_pristine, worktree_reuse,
 };
 use harness_core::{build_identity, build_selection};
 use std::{
@@ -40,6 +40,33 @@ fn git_result(cwd: &Path, args: &[&str]) -> bool {
         .expect("git is available")
         .status
         .success()
+}
+
+fn git_stdin(cwd: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("git is available");
+    child
+        .stdin
+        .take()
+        .expect("stdin captured")
+        .write_all(input.as_bytes())
+        .expect("stdin write");
+    let out = child.wait_with_output().expect("git output");
+    assert!(
+        out.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn rev(cwd: &Path) -> String {
@@ -479,12 +506,32 @@ fn bindings_validate_operational_independence() {
         ],
     };
     bindings.validate().unwrap();
+    bindings.verify_pre_attempt().unwrap();
     assert_eq!(bindings.arm(Arm::Candidate).unwrap().runtime.label, "H+A");
 
     // Shared homes, different frozen revisions and a changed binding refuse.
     let mut tampered = bindings.clone();
     tampered.arms[1].home = tampered.arms[0].home.clone();
     assert!(tampered.validate().is_err());
+
+    // Nested, cross-aliased and canonical aliased allocations refuse even when
+    // the corresponding paths differ.
+    let nested = temp.path().join("homes/baseline/nested");
+    fs::create_dir_all(&nested).unwrap();
+    let mut tampered = bindings.clone();
+    tampered.arms[1].home = nested;
+    let error = tampered.validate().unwrap_err().to_string();
+    assert!(error.contains("overlap"), "{error}");
+
+    let mut tampered = bindings.clone();
+    tampered.arms[1].home = tampered.arms[0].workload.path.clone();
+    let error = tampered.validate().unwrap_err().to_string();
+    assert!(error.contains("overlap"), "{error}");
+
+    let mut tampered = bindings.clone();
+    tampered.arms[1].workload.path = temp.path().join("workload/candidate/../baseline");
+    let error = tampered.validate().unwrap_err().to_string();
+    assert!(error.contains("overlap"), "{error}");
 
     fs::write(task.join("later.txt"), "later revision\n").unwrap();
     git(&task, &["add", "."]);
@@ -509,4 +556,97 @@ fn bindings_validate_operational_independence() {
     assert!(error.contains("changed since preparation"), "{error}");
 
     assert!(prepare_home(&bindings.arms[0].home).is_err());
+
+    // Contamination is refused by the pre-attempt gate while the structural
+    // validation, the snapshot check and the artifact stay usable.
+    let candidate_workload = bindings.arm(Arm::Candidate).unwrap().workload.path.clone();
+    fs::write(
+        candidate_workload.join("prior-solution.txt"),
+        "earlier attempt\n",
+    )
+    .unwrap();
+    let error = bindings.verify_pre_attempt().unwrap_err().to_string();
+    assert!(error.contains("pristine"), "{error}");
+    bindings.validate().unwrap();
+    verify_frozen(&bindings.arm(Arm::Candidate).unwrap().workload).unwrap();
+    assert!(candidate_workload.join("prior-solution.txt").is_file());
+}
+
+#[test]
+fn pre_attempt_gate_rejects_contamination_and_preserves_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = fixture_repo(temp.path(), "task");
+    let revision = rev(&source);
+
+    // A pristine copy passes the gate.
+    let copy = frozen_copy(&source, &revision, &temp.path().join("copy-pristine")).unwrap();
+    verify_frozen_pristine(&copy).unwrap();
+
+    // An added solution file invalidates the gate, is preserved unchanged and
+    // does not break the post-attempt snapshot check.
+    fs::write(copy.path.join("prior-solution.txt"), "earlier attempt\n").unwrap();
+    let error = verify_frozen_pristine(&copy).unwrap_err().to_string();
+    assert!(error.contains("earlier solution"), "{error}");
+    verify_frozen(&copy).unwrap();
+    assert_eq!(
+        fs::read_to_string(copy.path.join("prior-solution.txt")).unwrap(),
+        "earlier attempt\n"
+    );
+
+    // A modified tracked input invalidates the gate and is preserved.
+    let modified = frozen_copy(&source, &revision, &temp.path().join("copy-modified")).unwrap();
+    let edited = "fn main() { /* prior attempt */ }\n";
+    fs::write(modified.path.join("main.rs"), edited).unwrap();
+    assert!(verify_frozen_pristine(&modified).is_err());
+    assert_eq!(
+        fs::read_to_string(modified.path.join("main.rs")).unwrap(),
+        edited
+    );
+
+    // An extra sibling branch and commit invalidate the gate; the work
+    // survives for preservation or explicit reconstruction.
+    let branched = frozen_copy(&source, &revision, &temp.path().join("copy-branch")).unwrap();
+    git(&branched.path, &["checkout", "-q", "-b", "sibling"]);
+    fs::write(branched.path.join("sibling.txt"), "sibling solution\n").unwrap();
+    git(&branched.path, &["add", "."]);
+    git(&branched.path, &["commit", "-qm", "sibling solution"]);
+    let sibling = rev(&branched.path);
+    let error = verify_frozen_pristine(&branched).unwrap_err().to_string();
+    assert!(error.contains("references"), "{error}");
+    assert_eq!(
+        git(&branched.path, &["rev-parse", "refs/heads/sibling"]).trim(),
+        sibling
+    );
+    verify_frozen(&branched).unwrap();
+
+    // A loose object without any reference is unreachable sibling history.
+    let dangling = frozen_copy(&source, &revision, &temp.path().join("copy-dangling")).unwrap();
+    let object = git_stdin(
+        &dangling.path,
+        &["hash-object", "-w", "--stdin"],
+        "sibling solution\n",
+    );
+    let object = object.trim().to_owned();
+    let error = verify_frozen_pristine(&dangling).unwrap_err().to_string();
+    assert!(error.contains("outside the frozen revision"), "{error}");
+    assert!(git_result(&dangling.path, &["cat-file", "-e", &object]));
+
+    // A shared or alternate object database invalidates the gate.
+    let shared = frozen_copy(&source, &revision, &temp.path().join("copy-shared")).unwrap();
+    let alternates = shared.path.join(".git/objects/info/alternates");
+    fs::create_dir_all(alternates.parent().unwrap()).unwrap();
+    fs::write(
+        &alternates,
+        format!("{}\n", source.join(".git/objects").display()),
+    )
+    .unwrap();
+    let error = verify_frozen_pristine(&shared).unwrap_err().to_string();
+    assert!(error.contains("alternate object store"), "{error}");
+
+    // A legitimate executor commit is post-attempt work: the snapshot check
+    // stays usable while the pre-attempt gate correctly refuses reuse.
+    git(&modified.path, &["add", "."]);
+    git(&modified.path, &["commit", "-qm", "executor work"]);
+    verify_frozen(&modified).unwrap();
+    assert!(verify_frozen_pristine(&modified).is_err());
 }

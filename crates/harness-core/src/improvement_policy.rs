@@ -346,8 +346,22 @@ impl ComparisonPolicy {
 }
 
 impl DeclaredComparison {
+    /// The policy is bound to its digest, and the digest is recomputed from
+    /// the policy itself: a deserialized or mutated declaration whose stored
+    /// digest no longer matches its fields is refused before it can produce a
+    /// decision or an adoption.
+    pub fn verify(&self) -> io::Result<()> {
+        let recomputed = self.policy.declare()?;
+        if recomputed.digest != self.digest {
+            return Err(invalid(
+                "the declared policy changed after its declaration; the stored digest no longer binds it",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn digest_matches(&self, digest: &str) -> bool {
-        self.digest == digest
+        self.verify().is_ok() && self.digest == digest
     }
 }
 
@@ -509,6 +523,7 @@ fn percent_regression(baseline: f64, candidate: f64) -> Option<f64> {
 
 /// Evaluate the declared policy against the authoritative outcome summary.
 pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<PolicyEvaluation> {
+    declared.verify()?;
     let policy = &declared.policy;
     if report.get("schema_version").and_then(Value::as_u64) != Some(2) {
         return Err(invalid(
@@ -960,6 +975,23 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 "the declared metric coverage is incomplete ({}); unmeasured dimensions cannot support adoption",
                 missing_coverage.join(", ")
             ));
+        } else if policy.objective == Objective::Time && worst_time > policy.tolerance_percent {
+            // A favourable subset never offsets a materially regressed primary
+            // metric in the same declared task mix; the aggregate claim would
+            // be unsupported even though the required count of positive units
+            // was recorded.
+            reasons.push(format!(
+                "the candidate materially regressed the primary time metric on at least one matched unit (worst +{worst_time:.1}% beyond the {:.1}% tolerance); a favourable unit does not offset it",
+                policy.tolerance_percent
+            ));
+            decision = PolicyDecision::Reject;
+        } else if policy.objective == Objective::Resource && worst_steps > policy.tolerance_percent
+        {
+            reasons.push(format!(
+                "the candidate materially regressed matched steps on at least one matched unit (worst +{worst_steps:.1}% beyond the {:.1}% tolerance); a favourable unit does not offset it",
+                policy.tolerance_percent
+            ));
+            decision = PolicyDecision::Reject;
         } else {
             let maintenance = policy.basis.maintenance_basis().map(str::to_owned);
             if facts.len() < required_units {
@@ -969,39 +1001,15 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 ));
             } else if positive_units < required_units {
                 if let Some(basis) = &maintenance {
-                    if worst_time > policy.tolerance_percent
-                        || worst_steps > policy.tolerance_percent
-                    {
-                        reasons.push(
-                            "material regression beyond the declared tolerance cannot rest on a maintenance basis"
-                                .to_owned(),
-                        );
-                        decision = PolicyDecision::Reject;
-                    } else {
-                        reasons.push(format!(
-                            "no meaningful efficiency effect was measured; adoption rests on the predeclared maintenance basis: {basis}"
-                        ));
-                        decision = PolicyDecision::Adopt;
-                    }
+                    reasons.push(format!(
+                        "no meaningful efficiency effect was measured; adoption rests on the predeclared maintenance basis: {basis}"
+                    ));
+                    decision = PolicyDecision::Adopt;
                 } else {
-                    if worst_time > policy.tolerance_percent && policy.objective == Objective::Time
-                    {
-                        reasons.push(format!(
-                            "the candidate materially regressed the primary time metric (worst +{worst_time:.1}% beyond the {:.1}% tolerance)",
-                            policy.tolerance_percent
-                        ));
-                    } else if worst_steps > policy.tolerance_percent
-                        && policy.objective == Objective::Resource
-                    {
-                        reasons.push(format!(
-                            "the candidate materially regressed matched steps (worst +{worst_steps:.1}%)"
-                        ));
-                    } else {
-                        reasons.push(
-                            "the recorded effect does not meet the predeclared meaningful threshold; reduced size or an unmeasured benefit is not an efficiency effect"
-                                .to_owned(),
-                        );
-                    }
+                    reasons.push(
+                        "the recorded effect does not meet the predeclared meaningful threshold; reduced size or an unmeasured benefit is not an efficiency effect"
+                            .to_owned(),
+                    );
                     decision = PolicyDecision::Reject;
                 }
             } else {

@@ -22,8 +22,14 @@
 //! 3. [`prepare_home`] once per arm for a fresh owned executor home.
 //! 4. `crate::native_build::prepare` for each arm's runtime, then
 //!    [`prepare_variant`] to bind the exact published build identity.
-//! 5. [`ExperimentBindings::validate`] before the first measured attempt.
-//! 6. [`select_variant`] between attempts (`attempt_active = true` while a
+//! 5. [`ExperimentBindings::validate`] before the first measured attempt; it
+//!    also refuses overlapping or cross-aliased experiment allocations, so
+//!    every home, workload, runtime and candidate checkout is separately owned.
+//! 6. [`ExperimentBindings::verify_pre_attempt`] before each arm begins: the
+//!    pristine frozen-copy gate (no prior solution edits, extra references or
+//!    objects, and no shared object database). It never cleans useful work;
+//!    `task_worktree::verify_frozen` stays the post-attempt snapshot check.
+//! 7. [`select_variant`] between attempts (`attempt_active = true` while a
 //!    measured attempt holds its frozen runtime) and report the returned
 //!    [`ConsumedVariant`] identity as the actually consumed runtime.
 
@@ -249,18 +255,41 @@ pub struct ExperimentBindings {
     pub arms: Vec<ArmBinding>,
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) if a == b => true,
-        _ => {
-            cfg!(windows)
-                && a.to_string_lossy()
-                    .eq_ignore_ascii_case(&b.to_string_lossy())
-        }
-    }
+/// Canonical allocation path without the verbatim prefix `Path::canonicalize`
+/// adds on Windows; a missing path keeps its absolute form so the refusal
+/// still names it.
+fn allocation_path(path: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy().into_owned();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
+}
+
+/// True when one allocation is the other or is nested inside it, including
+/// canonical aliases. Components compare case-insensitively on Windows, where
+/// the filesystem is.
+fn allocations_overlap(left: &Path, right: &Path) -> bool {
+    let components = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|component| {
+                let text = component.as_os_str().to_string_lossy().into_owned();
+                if cfg!(windows) {
+                    text.to_ascii_lowercase()
+                } else {
+                    text
+                }
+            })
+            .collect()
+    };
+    let left = components(&allocation_path(left));
+    let right = components(&allocation_path(right));
+    let (short, long) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    !short.is_empty() && long[..short.len()] == short[..]
 }
 
 impl ExperimentBindings {
@@ -356,25 +385,47 @@ impl ExperimentBindings {
                 "both arms must freeze the same committed task snapshot",
             ));
         }
-        for (left, right) in [
-            (&baseline.home, &candidate_arm.home),
-            (&baseline.workload.path, &candidate_arm.workload.path),
-            (&baseline.runtime.build, &candidate_arm.runtime.build),
-        ] {
-            if same_path(left, right) {
-                return Err(invalid(
-                    "arm homes, workload copies and runtimes must be separately owned",
-                ));
+        // Every experiment allocation must be separately owned: equal paths,
+        // nested paths, cross-aliased arms and canonical aliases are refused,
+        // while ordinary disjoint sibling layouts stay valid.
+        let allocations: [(&str, &Path); 7] = [
+            ("baseline home", &baseline.home),
+            ("candidate home", &candidate_arm.home),
+            ("baseline workload", &baseline.workload.path),
+            ("candidate workload", &candidate_arm.workload.path),
+            ("baseline runtime", &baseline.runtime.build),
+            ("candidate runtime", &candidate_arm.runtime.build),
+            ("candidate checkout", &self.candidate.path),
+        ];
+        for (index, (left_label, left)) in allocations.iter().enumerate() {
+            for (right_label, right) in allocations.iter().skip(index + 1) {
+                if allocations_overlap(left, right) {
+                    return Err(invalid(format!(
+                        "the {left_label} and {right_label} allocations overlap; each experiment allocation must be separately owned"
+                    )));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Pre-attempt gate: call before an arm begins. It performs the structural
+    /// [`Self::validate`] checks and additionally requires both workload
+    /// copies to be the pristine frozen snapshot — no prior solution edits or
+    /// untracked artifacts, no extra or moved references, no unreachable
+    /// sibling objects and no alternate or shared object database. The gate is
+    /// read-only: contamination is reported and preserved, never cleaned, so
+    /// post-attempt snapshot checks (`task_worktree::verify_frozen`) and the
+    /// executor's useful patches remain usable.
+    pub fn verify_pre_attempt(&self) -> io::Result<()> {
+        self.validate()?;
         for binding in &self.arms {
-            if same_path(&binding.workload.path, &self.candidate.path)
-                || same_path(&binding.home, &self.candidate.path)
-            {
-                return Err(invalid(
-                    "the candidate checkout is not a measured workload allocation",
-                ));
-            }
+            task_worktree::verify_frozen_pristine(&binding.workload).map_err(|error| {
+                invalid(format!(
+                    "the {} arm workload is not a pristine pre-attempt snapshot: {error}",
+                    binding.arm.as_str()
+                ))
+            })?;
         }
         Ok(())
     }

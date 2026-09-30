@@ -1062,3 +1062,156 @@ fn shared_costs_and_repeated_edges_count_once_and_drift_is_invalid() {
         evaluation.reasons
     );
 }
+
+#[test]
+fn a_mutated_or_serialized_stale_declaration_is_refused() {
+    let policy = policy();
+    let declared = declare(&policy);
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                80.0,
+                true,
+                Some(3),
+                Some(6),
+                true,
+            ),
+        ],
+        &policy,
+    );
+    assert_eq!(
+        evaluate(&declared, &report).unwrap().decision,
+        PolicyDecision::Adopt,
+        "an untouched declared policy keeps its behavior"
+    );
+
+    // Fields mutated after declaration must not ride on the original digest.
+    let mut relaxed = declared.clone();
+    relaxed.policy.tolerance_percent = 50.0;
+    assert!(evaluate(&relaxed, &report).is_err());
+    assert!(
+        !relaxed.digest_matches(&declared.digest),
+        "the stored digest no longer binds the changed policy"
+    );
+    let mut traded = declared.clone();
+    traded.policy.trade_off = Some(TradeOff {
+        basis: "added after results".into(),
+        allowed_regression_percent: 500.0,
+    });
+    assert!(evaluate(&traded, &report).is_err());
+    let mut basis = declared.clone();
+    basis.policy.basis = Basis::Maintenance {
+        basis: "claimed after results".into(),
+    };
+    assert!(evaluate(&basis, &report).is_err());
+    let mut invalid = declared.clone();
+    invalid.policy.tolerance_percent = -1.0;
+    assert!(evaluate(&invalid, &report).is_err());
+
+    // The same holds for a serialized declaration whose fields were edited.
+    let mut value = serde_json::to_value(&declared).unwrap();
+    value["policy"]["tolerancePercent"] = json!(50.0);
+    let serialized: DeclaredComparison = serde_json::from_value(value).unwrap();
+    assert_eq!(serialized.digest, declared.digest);
+    assert!(evaluate(&serialized, &report).is_err());
+}
+
+#[test]
+fn a_favourable_subset_cannot_offset_a_primary_regression() {
+    let policy = policy();
+    let declared = declare(&policy);
+    // One favourable matched unit reaches the required count, while a larger
+    // regression in the same declared task mix makes the aggregate adoption
+    // unsupported.
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                80.0,
+                true,
+                Some(3),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "b2",
+                "baseline",
+                "case-c",
+                400.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c2",
+                "candidate",
+                "case-c",
+                600.0,
+                140.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("regressed the primary time metric")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(
+        evaluation.matched, 2,
+        "both matched units stay in the record"
+    );
+    assert_eq!(evaluation.attempts, 4, "all attempts remain accounted");
+    assert_eq!(evaluation.accepted_tasks, 4);
+    assert_eq!(evaluation.per_success.status, PerSuccessStatus::Complete);
+    assert_eq!(evaluation.baseline_seconds, Some(200.0));
+    assert_eq!(
+        evaluation.candidate_seconds,
+        Some(220.0),
+        "the aggregate regressed even though one unit improved"
+    );
+    let draft = evaluation
+        .decision_draft("sample-task", "exp-1", "base-sha", "cand-sha", "acceptance")
+        .unwrap();
+    assert!(draft.record().unwrap().contains("outcome=reject"));
+}
