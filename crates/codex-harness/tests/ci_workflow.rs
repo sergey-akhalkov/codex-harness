@@ -118,7 +118,7 @@ fn permissions_are_read_only_and_triggers_are_public() {
         .as_vec()
         .expect("push trigger on main");
     assert_eq!(string(&push[0]), "main");
-    assert!(document["on"]["pull_request"].is_badvalue() == false);
+    assert!(!document["on"]["pull_request"].is_badvalue());
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let raw = fs::read_to_string(root.join(WORKFLOW)).unwrap();
     assert!(
