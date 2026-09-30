@@ -4,6 +4,8 @@
 mod evidence;
 #[path = "outcome_oracle_process.rs"]
 mod process;
+#[path = "outcome_oracle_real_task.rs"]
+mod real_task;
 
 use crate::outcome_run::{isolated, repository, write_new};
 use codex_harness::regression::{CaseRequest, run_case};
@@ -60,16 +62,37 @@ fn now() -> f64 {
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
         println!(
-            "codex-harness outcome-oracle --request PATH\nChecks a controlled temporary case using host-frozen setup and native execution evidence. JSON and streams are private. No model calls."
+            "codex-harness outcome-oracle --request PATH [--request-sha256 SHA256]\nChecks a controlled temporary case or an external native real-task oracle. Real-task requests require the supervisor's frozen request digest. JSON and streams are private. No model calls."
         );
         return Ok(0);
     }
-    if args.len() != 2 || args[0] != "--request" {
+    if !matches!(args.len(), 2 | 4)
+        || args[0] != "--request"
+        || (args.len() == 4 && args[2] != "--request-sha256")
+    {
         return Err(invalid());
     }
     let request_path = PathBuf::from(&args[1]);
-    let request: Request =
-        serde_json::from_slice(&bounded(&request_path, 2 * 1024 * 1024)?).map_err(|_| invalid())?;
+    let request_bytes = bounded(&request_path, 2 * 1024 * 1024)?;
+    let value: Value = serde_json::from_slice(&request_bytes).map_err(|_| invalid())?;
+    if value["kind"] == "real-task" {
+        let expected = args
+            .get(3)
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                io::Error::other("real-task oracle requires the supervisor's --request-sha256")
+            })?;
+        if harness_core::build_identity::hash_bytes(&request_bytes) != expected {
+            return Err(io::Error::other(
+                "frozen oracle request changed; no check was dispatched",
+            ));
+        }
+        return real_task::run(&request_path, &request_bytes);
+    }
+    if args.len() != 2 {
+        return Err(invalid());
+    }
+    let request: Request = serde_json::from_value(value).map_err(|_| invalid())?;
     let workspace = isolated(&request.case_root)?;
     // The host's immutable setup is kept outside the candidate's mutable case.
     if request_path.canonicalize()?.starts_with(&workspace) {
