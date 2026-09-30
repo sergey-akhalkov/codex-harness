@@ -28,11 +28,13 @@ installed OpenSpec skills without editing their workflow. A reusable procedure
 in owned skill scope follows `skill-evolution`.
 
 Require observed repeatability through the actual local agent and tools with
-recorded material identity and a comparison rule declared before the repeats.
-A fixed seed or temperature alone is insufficient. Divergence, drift or an
-unknown material setting holds dependent comparisons. Never change provider
-or billing route implicitly. Every model conversation uses the existing
-visible dispatcher and its own titled terminal surface.
+an explicit identity policy and comparison rule declared before the repeats.
+A fixed seed or temperature alone is insufficient. API-observed identity
+records required server/client observations and unavailable facts as limits;
+full-material identity additionally requires those material facts. Missing
+required observations, drift or divergent output holds dependent comparisons.
+Never silently change the policy, provider or billing route. Every model
+conversation uses the visible dispatcher and its own titled terminal surface.
 
 ## Operate and accept
 

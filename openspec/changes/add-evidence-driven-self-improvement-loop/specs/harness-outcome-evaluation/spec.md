@@ -18,15 +18,25 @@ A real-task comparison SHALL bind the same task prompt, source snapshot, task sp
 
 ### Requirement: Local model comparisons require repeatability qualification
 
-The evaluator SHALL accept an explicit local serving configuration and record actual model/weights identity, quantization, tokenizer and prompt template, server/backend identity, sampling settings, seed behavior, reasoning mode, context/cache settings and relevant execution environment. Before relying on repeated identical inputs, it SHALL perform a declared repeatability qualification through the actual agent and tools, not only a completion API. The required solution output SHALL repeat under identical controlled inputs; timing and explicitly identified nonsemantic metadata SHALL be excluded from output equality only by a rule fixed before qualification. Temperature or a fixed seed alone SHALL NOT establish qualification. Divergence, unknown material identity or configuration drift SHALL suspend dependent comparisons until corrected or a different repeatability policy is explicitly agreed. A changed model or billing route SHALL never be an implicit recovery action.
+The evaluator SHALL accept an explicit local serving configuration and an explicit identity policy. It SHALL record actual available model/deployment metadata, quantization, tokenizer and prompt template, server/backend identity, sampling settings, seed behavior, reasoning mode, context/cache settings, effective client profile/catalogue and relevant execution-environment facts, with unavailable facts identified rather than guessed. Under the user-selected API-observed policy, required observable fields and their provenance SHALL be declared before qualification; endpoint/model and effective client configuration remain required, while unavailable weight hashes and hardware details SHALL be retained as limits rather than prerequisites. Full-material identity checks SHALL remain enforced when that stronger policy is selected. The policy itself SHALL be bound to the qualification; neither a field nor the policy may silently be dropped to obtain a pass.
+
+Before relying on repeated identical inputs, the evaluator SHALL perform a declared repeatability qualification through the actual agent and tools, not only a completion API. The required solution output SHALL repeat under identical controlled inputs; timing and explicitly identified nonsemantic metadata SHALL be excluded from output equality only by a rule fixed before qualification. Temperature or a fixed seed alone SHALL NOT establish qualification. Divergence, an unavailable required observation, disappearance or drift of a declared observed field, or unknown identity required by the selected policy SHALL suspend dependent comparisons until corrected and requalified or a different policy is explicitly agreed. API-observed qualification SHALL NOT claim to detect unobservable changes to weights or hardware. A changed model or billing route SHALL never be an implicit recovery action.
 
 #### Scenario: Identical seeds produce different solutions
 - **WHEN** repeated qualified-input attempts differ in required solution output despite identical sampling settings
 - **THEN** the evaluator reports the divergence and does not run the strict loop as though deterministic behavior had been established
 
 #### Scenario: The serving process changes during a comparison
-- **WHEN** weights, backend, prompt template or a relevant cache/batching setting changes between arms
+- **WHEN** a required observed model/deployment field, backend, prompt template, client configuration or relevant observed cache/batching setting changes between arms
 - **THEN** the affected pair is incomparable and qualification is repeated for the new identity before further comparisons
+
+#### Scenario: The API does not expose weight hashes or hardware
+- **WHEN** API-observed identity is explicitly selected and the declared server/client observations and repeated agent/tool output checks pass
+- **THEN** unavailable weight hashes or hardware details remain disclosed limitations without blocking that policy or being presented as verified full-material identity
+
+#### Scenario: An advertised observation disappears
+- **WHEN** a field required by the declared API-observed policy is absent or cannot be read before an arm begins
+- **THEN** that arm is suspended until observation and qualification are restored, without dropping the field or replacing its value with a guessed default
 
 #### Scenario: The requested model has no usable tool execution route
 - **WHEN** the configured agent cannot execute and observe the required tools through that local serving configuration

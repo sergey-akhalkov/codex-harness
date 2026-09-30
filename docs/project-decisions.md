@@ -622,6 +622,13 @@ agent/tool execution under identical controlled inputs. Keep the existing
 DeepSeek executor route ready for an explicit switch; readiness does not
 authorize a silent provider substitution or weaken repeatability. Endpoint,
 model deployment details and qualification evidence remain local run inputs.
+For this loop, the user selected observed solution repeatability with control
+of parameters available through the serving API. Retain unavailable weight
+hashes and hardware details as explicit limits; their absence does not block
+this selected policy. Changed observed server or client configuration, missing
+previously available observations, or divergent required output requires
+requalification. This does not certify an unchanged unobservable environment
+or authorize a silent downgrade of a different run's identity policy.
 The active [change](../openspec/changes/add-evidence-driven-self-improvement-loop/proposal.md)
 owns the sequential experiments and remaining acceptance.
 
