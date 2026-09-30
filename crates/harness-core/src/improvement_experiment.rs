@@ -25,10 +25,12 @@
 //! 5. [`ExperimentBindings::validate`] before the first measured attempt; it
 //!    also refuses overlapping or cross-aliased experiment allocations, so
 //!    every home, workload, runtime and candidate checkout is separately owned.
-//! 6. [`ExperimentBindings::verify_pre_attempt`] before each arm begins: the
-//!    pristine frozen-copy gate (no prior solution edits, extra references or
-//!    objects, and no shared object database). It never cleans useful work;
-//!    `task_worktree::verify_frozen` stays the post-attempt snapshot check.
+//! 6. [`ExperimentBindings::verify_pre_attempt`] with the upcoming arm before
+//!    that arm begins: the named arm's workload must be a pristine frozen copy
+//!    (no prior solution edits, extra references or objects, and no shared
+//!    object database), while a completed arm keeps its solution — still
+//!    identity-checked — and `task_worktree::verify_frozen` stays the
+//!    post-attempt snapshot check. The gate never cleans useful work.
 //! 7. [`select_variant`] between attempts (`attempt_active = true` while a
 //!    measured attempt holds its frozen runtime) and report the returned
 //!    [`ConsumedVariant`] identity as the actually consumed runtime.
@@ -409,24 +411,27 @@ impl ExperimentBindings {
         Ok(())
     }
 
-    /// Pre-attempt gate: call before an arm begins. It performs the structural
-    /// [`Self::validate`] checks and additionally requires both workload
-    /// copies to be the pristine frozen snapshot — no prior solution edits or
-    /// untracked artifacts, no extra or moved references, no unreachable
-    /// sibling objects and no alternate or shared object database. The gate is
-    /// read-only: contamination is reported and preserved, never cleaned, so
-    /// post-attempt snapshot checks (`task_worktree::verify_frozen`) and the
-    /// executor's useful patches remain usable.
-    pub fn verify_pre_attempt(&self) -> io::Result<()> {
+    /// Pre-attempt gate for one upcoming arm: call immediately before that
+    /// arm begins. It performs the structural [`Self::validate`] checks (which
+    /// keep both arms' identities and a completed arm's output verified
+    /// through the snapshot check) and additionally requires only the named
+    /// arm's workload copy to be the pristine frozen snapshot — no prior
+    /// solution edits or untracked artifacts, no extra or moved references,
+    /// no unreachable sibling objects and no alternate or shared object
+    /// database. A completed arm keeps its committed solution; checking the
+    /// other arm never touches it. The gate is read-only: contamination is
+    /// reported and preserved, never cleaned, so post-attempt snapshot checks
+    /// (`task_worktree::verify_frozen`) and the executor's useful patches
+    /// remain usable.
+    pub fn verify_pre_attempt(&self, arm: Arm) -> io::Result<()> {
         self.validate()?;
-        for binding in &self.arms {
-            task_worktree::verify_frozen_pristine(&binding.workload).map_err(|error| {
-                invalid(format!(
-                    "the {} arm workload is not a pristine pre-attempt snapshot: {error}",
-                    binding.arm.as_str()
-                ))
-            })?;
-        }
+        let binding = self.arm(arm)?;
+        task_worktree::verify_frozen_pristine(&binding.workload).map_err(|error| {
+            invalid(format!(
+                "the {} arm workload is not a pristine pre-attempt snapshot: {error}",
+                arm.as_str()
+            ))
+        })?;
         Ok(())
     }
 }

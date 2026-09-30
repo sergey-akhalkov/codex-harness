@@ -375,6 +375,56 @@ fn native_state(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     (state, source, a, b)
 }
 
+fn prepared_bindings(root: &Path) -> (ExperimentBindings, PathBuf) {
+    let (state, _source, a, b) = native_state(root);
+    let harness = fixture_repo(root, "harness");
+    let base = rev(&harness);
+    let candidate = allocate_candidate_checkout(
+        &harness,
+        &root.join("alloc/candidate"),
+        "hypothesis-1",
+        &base,
+    )
+    .unwrap();
+    let task = fixture_repo(root, "task");
+    let task_revision = rev(&task);
+    let baseline_home = prepare_home(&root.join("homes/baseline")).unwrap();
+    let candidate_home = prepare_home(&root.join("homes/candidate")).unwrap();
+    let baseline_workload =
+        frozen_copy(&task, &task_revision, &root.join("workload/baseline")).unwrap();
+    let candidate_workload =
+        frozen_copy(&task, &task_revision, &root.join("workload/candidate")).unwrap();
+    let baseline_variant = prepare_variant(&state, Arm::Baseline, "H", &a).unwrap();
+    let candidate_variant = prepare_variant(&state, Arm::Candidate, "H+A", &b).unwrap();
+    (
+        ExperimentBindings {
+            schema: 1,
+            hypothesis: "sample-hypothesis-1".into(),
+            case_id: "case-b".into(),
+            base_revision: base,
+            candidate,
+            oracle: "oracle-identity".into(),
+            acceptance: "acceptance/locator".into(),
+            policy_digest: "policy-digest".into(),
+            arms: vec![
+                ArmBinding {
+                    arm: Arm::Baseline,
+                    home: baseline_home,
+                    workload: baseline_workload,
+                    runtime: baseline_variant,
+                },
+                ArmBinding {
+                    arm: Arm::Candidate,
+                    home: candidate_home,
+                    workload: candidate_workload,
+                    runtime: candidate_variant,
+                },
+            ],
+        },
+        task,
+    )
+}
+
 #[test]
 fn prepared_variant_selection_reports_identity_and_refuses_stale_or_busy() {
     let temp = tempfile::tempdir().unwrap();
@@ -453,60 +503,9 @@ fn prepared_variant_selection_reports_identity_and_refuses_stale_or_busy() {
 #[test]
 fn bindings_validate_operational_independence() {
     let temp = tempfile::tempdir().unwrap();
-    let (state, _source, a, b) = native_state(temp.path());
-    let harness = fixture_repo(temp.path(), "harness");
-    let base = rev(&harness);
-    let candidate = allocate_candidate_checkout(
-        &harness,
-        &temp.path().join("alloc/candidate"),
-        "hypothesis-1",
-        &base,
-    )
-    .unwrap();
-    let task = fixture_repo(temp.path(), "task");
-    let task_revision = rev(&task);
-    let baseline_home = prepare_home(&temp.path().join("homes/baseline")).unwrap();
-    let candidate_home = prepare_home(&temp.path().join("homes/candidate")).unwrap();
-    let baseline_workload = frozen_copy(
-        &task,
-        &task_revision,
-        &temp.path().join("workload/baseline"),
-    )
-    .unwrap();
-    let candidate_workload = frozen_copy(
-        &task,
-        &task_revision,
-        &temp.path().join("workload/candidate"),
-    )
-    .unwrap();
-    let baseline_variant = prepare_variant(&state, Arm::Baseline, "H", &a).unwrap();
-    let candidate_variant = prepare_variant(&state, Arm::Candidate, "H+A", &b).unwrap();
-    let bindings = ExperimentBindings {
-        schema: 1,
-        hypothesis: "sample-hypothesis-1".into(),
-        case_id: "case-b".into(),
-        base_revision: base,
-        candidate: candidate.clone(),
-        oracle: "oracle-identity".into(),
-        acceptance: "acceptance/locator".into(),
-        policy_digest: "policy-digest".into(),
-        arms: vec![
-            ArmBinding {
-                arm: Arm::Baseline,
-                home: baseline_home.clone(),
-                workload: baseline_workload,
-                runtime: baseline_variant,
-            },
-            ArmBinding {
-                arm: Arm::Candidate,
-                home: candidate_home,
-                workload: candidate_workload,
-                runtime: candidate_variant,
-            },
-        ],
-    };
+    let (bindings, task) = prepared_bindings(temp.path());
     bindings.validate().unwrap();
-    bindings.verify_pre_attempt().unwrap();
+    bindings.verify_pre_attempt(Arm::Baseline).unwrap();
     assert_eq!(bindings.arm(Arm::Candidate).unwrap().runtime.label, "H+A");
 
     // Shared homes, different frozen revisions and a changed binding refuse.
@@ -565,11 +564,63 @@ fn bindings_validate_operational_independence() {
         "earlier attempt\n",
     )
     .unwrap();
-    let error = bindings.verify_pre_attempt().unwrap_err().to_string();
+    let error = bindings
+        .verify_pre_attempt(Arm::Candidate)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("pristine"), "{error}");
+    bindings.verify_pre_attempt(Arm::Baseline).unwrap();
     bindings.validate().unwrap();
     verify_frozen(&bindings.arm(Arm::Candidate).unwrap().workload).unwrap();
     assert!(candidate_workload.join("prior-solution.txt").is_file());
+}
+
+#[test]
+fn pre_attempt_gate_is_arm_specific_and_preserves_completed_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bindings, _task) = prepared_bindings(temp.path());
+    let baseline = bindings.arm(Arm::Baseline).unwrap().workload.clone();
+    let candidate = bindings.arm(Arm::Candidate).unwrap().workload.clone();
+
+    // Two pristine arms: the first arm's pre-check passes.
+    bindings.verify_pre_attempt(Arm::Baseline).unwrap();
+
+    // The baseline attempt writes and commits a valid solution.
+    fs::write(
+        baseline.path.join("baseline-solution.txt"),
+        "baseline solution\n",
+    )
+    .unwrap();
+    git(&baseline.path, &["add", "."]);
+    git(&baseline.path, &["commit", "-qm", "baseline solution"]);
+    let baseline_commit = rev(&baseline.path);
+
+    // The candidate pre-check passes without touching the completed arm, and
+    // the completed arm stays identity-checked through the snapshot check.
+    bindings.verify_pre_attempt(Arm::Candidate).unwrap();
+    assert_eq!(rev(&baseline.path), baseline_commit);
+    assert!(baseline.path.join("baseline-solution.txt").is_file());
+    verify_frozen(&baseline).unwrap();
+    bindings.validate().unwrap();
+
+    // Re-dispatching the completed arm refuses its prior solution...
+    let error = bindings
+        .verify_pre_attempt(Arm::Baseline)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pristine"), "{error}");
+    // ...while the upcoming arm is unaffected by that refusal.
+    bindings.verify_pre_attempt(Arm::Candidate).unwrap();
+
+    // A dirty upcoming candidate refuses and keeps its artifacts.
+    fs::write(candidate.path.join("scratch.txt"), "wip\n").unwrap();
+    let error = bindings
+        .verify_pre_attempt(Arm::Candidate)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pristine"), "{error}");
+    assert!(candidate.path.join("scratch.txt").is_file());
+    verify_frozen(&candidate).unwrap();
 }
 
 #[test]

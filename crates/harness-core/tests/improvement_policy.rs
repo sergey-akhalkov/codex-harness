@@ -1215,3 +1215,151 @@ fn a_favourable_subset_cannot_offset_a_primary_regression() {
         .unwrap();
     assert!(draft.record().unwrap().contains("outcome=reject"));
 }
+
+#[test]
+fn maintenance_basis_does_not_cover_material_secondary_regression() {
+    let mut maintenance = policy();
+    maintenance.basis = Basis::Maintenance {
+        basis: "user agreed before results: simpler implementation, no efficiency claim".into(),
+    };
+    maintenance.meaningful_effect_percent = None;
+    let declared_maintenance = declare(&maintenance);
+
+    // Time objective: no meaningful time gain and 40% more steps.
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                100.0,
+                true,
+                Some(6),
+                Some(8),
+                true,
+            ),
+        ],
+        &maintenance,
+    );
+    let evaluation = evaluate(&declared_maintenance, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not cover a material regression")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(!evaluation.trade_off_used);
+
+    // The same measurement under a predeclared trade-off runs through the
+    // explicit policy path instead of a bypass.
+    let mut traded = maintenance.clone();
+    traded.trade_off = Some(TradeOff {
+        basis: "predeclared: fewer steps may cost extra operations".into(),
+        allowed_regression_percent: 50.0,
+    });
+    let declared_traded = declare(&traded);
+    let evaluation = evaluate(&declared_traded, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Adopt);
+    assert!(evaluation.trade_off_used);
+
+    // A regression inside the declared tolerance stays admissible.
+    let within = summarize(
+        &[
+            attempt(
+                "b2",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(40),
+                Some(60),
+                true,
+            ),
+            attempt(
+                "c2",
+                "candidate",
+                "case-b",
+                200.0,
+                100.0,
+                true,
+                Some(41),
+                Some(62),
+                true,
+            ),
+        ],
+        &maintenance,
+    );
+    let evaluation = evaluate(&declared_maintenance, &within).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Adopt);
+    assert!(!evaluation.trade_off_used);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("maintenance basis")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // Symmetric resource objective: no meaningful step gain, 40% more time.
+    let mut resource = policy();
+    resource.objective = Objective::Resource;
+    resource.basis = Basis::Maintenance {
+        basis: "agreed before results".into(),
+    };
+    resource.meaningful_effect_percent = None;
+    let declared_resource = declare(&resource);
+    let report = summarize(
+        &[
+            attempt(
+                "b3",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c3",
+                "candidate",
+                "case-b",
+                200.0,
+                140.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &resource,
+    );
+    let evaluation = evaluate(&declared_resource, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Reject);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not cover a material regression")),
+        "{:?}",
+        evaluation.reasons
+    );
+}

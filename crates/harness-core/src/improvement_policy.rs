@@ -1001,10 +1001,46 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 ));
             } else if positive_units < required_units {
                 if let Some(basis) = &maintenance {
-                    reasons.push(format!(
-                        "no meaningful efficiency effect was measured; adoption rests on the predeclared maintenance basis: {basis}"
-                    ));
-                    decision = PolicyDecision::Adopt;
+                    // A maintenance-only basis never covers a material
+                    // regression of a measured dimension: an exchange must be
+                    // admitted by the same predeclared trade-off policy the
+                    // efficiency path uses, never a bypass.
+                    let mut blocked = false;
+                    for (regressions, worst) in [
+                        (&time_regressions, worst_time),
+                        (&steps_regressions, worst_steps),
+                    ] {
+                        if regressions.is_empty() {
+                            continue;
+                        }
+                        if covers(worst) {
+                            trade_off_used = true;
+                        } else {
+                            blocked = true;
+                            reasons.push(format!(
+                                "the maintenance basis does not cover a material regression in a measured dimension (worst +{worst:.1}% beyond the {:.1}% tolerance); it needs the predeclared trade-off policy",
+                                policy.tolerance_percent
+                            ));
+                        }
+                    }
+                    if blocked {
+                        decision = PolicyDecision::Reject;
+                    } else {
+                        if trade_off_used {
+                            reasons.push(format!(
+                                "adopted under the predeclared trade-off: {}",
+                                policy
+                                    .trade_off
+                                    .as_ref()
+                                    .map(|trade_off| trade_off.basis.as_str())
+                                    .unwrap_or("")
+                            ));
+                        }
+                        reasons.push(format!(
+                            "no meaningful efficiency effect was measured; adoption rests on the predeclared maintenance basis: {basis}"
+                        ));
+                        decision = PolicyDecision::Adopt;
+                    }
                 } else {
                     reasons.push(
                         "the recorded effect does not meet the predeclared meaningful threshold; reduced size or an unmeasured benefit is not an efficiency effect"
