@@ -1279,6 +1279,46 @@ reader changes also rerun
 because both consumers share `harness-core::rollout_reader`.
 `outcome-run --request PATH --run-model-probes` executes one explicit native
 launcher in an isolated temporary case/home and defaults to a model-free skip.
+Local repeatability qualification also has three model-free modes:
+
+```powershell
+codex-harness outcome-run --observations collect-request.json
+codex-harness outcome-run --qualify qualification-request.json
+codex-harness outcome-run --recheck recheck-request.json
+```
+
+`--observations` takes `runner`, a declared observation `plan`, and explicit
+`client_inputs` (`name`/`path` pairs). It reads the selected server facts and
+hashes the selected client files. The current collector supports plain HTTP
+GET requests without redirects, authentication or proxies. Observation paths
+are relative to the server origin: `/props` does not inherit the runner's
+`/v1` base path. Required fields and client inputs are fixed before repeats;
+optional unavailable fields remain visible limits.
+
+`--qualify` takes that `runner`, the frozen API-observed `policy`, the inner
+`observations` object returned by the collector, and retained `attempts`.
+An attempt must come from the actual visible agent/tool path, with verified
+model metadata and independently checked required-output digests. Failed,
+unfinished or tool-free attempts cannot qualify. The alternative retained
+native-result form is `{ "result": ..., "outputs": ... }`; supplying a model's
+success claim does not establish those facts. These modes never dispatch a
+model; use the visible executor owner for the controlled repeats.
+
+`--recheck` takes the exact retained inner `qualification`, the current
+`runner`, the same `policy`, and explicit `client_inputs`. It validates the
+retained record before collecting current observations. Required-observation
+loss, changed server/client facts or inconsistent retained evidence blocks
+reuse. API-observed qualification does not certify unavailable weight hashes
+or hardware; the legacy full-material policy still requires its declared
+material identity. Neither mode silently changes the policy or provider.
+
+Each mode writes one JSON object to stdout. Exit 0 means collected, qualified
+or unchanged; exit 1 means failed, blocked or drifted; exit 2 means invalid
+input. Retain requests, observations and native attempt evidence privately.
+A passing controlled repeat proves only its declared output and observed
+conditions, not repeatability of every future task. Native coverage lives in
+`harness-core::outcome_qualification` and the `outcome_run` integration tests.
+
 `outcome-prepare`, `outcome-oracle`, `outcome-discover` and `outcome-arm`
 cover the five local controlled cases, independent oracles, model-free
 discovery and both skill comparison modes. `tools/outcome_native_pairs.py` is
