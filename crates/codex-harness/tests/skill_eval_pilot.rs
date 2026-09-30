@@ -1,12 +1,25 @@
 //! First comparison pair for project-verification shortening. Model runs stay opt-in.
 #![cfg(windows)]
 use serde_json::{Value, json};
-use skill_evolution::{isolation, package, plan};
+use skill_evolution::{comparison, isolation, package, plan};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
 };
+
+#[path = "fixtures/skill_consumption.rs"]
+mod skill_consumption;
+use skill_consumption::Role;
+
+fn role_for(case_id: &str) -> Role {
+    match case_id {
+        "negative" => Role::SimilarUnsuitable,
+        "missing" => Role::BoundaryFailure,
+        "freshness" => Role::IndependentHeldOut,
+        _ => Role::Intended,
+    }
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -273,9 +286,28 @@ fn first_pair_runs_through_outcome_prepare_and_outcome_run() {
             .unwrap();
         let oracle_json: Value = serde_json::from_slice(&oracle.stdout)
             .unwrap_or_else(|_| json!({"status":"unreadable"}));
+        let evidence_root = PathBuf::from(result["evidence_root"].as_str().unwrap());
+        let frozen = skill_consumption::Frozen::new(
+            isolated.library.clone(),
+            vec![library.clone()],
+            skill_consumption::live_skill_roots(),
+        );
+        let consumption = skill_consumption::collect_arm(
+            comparison::Kind::UpdateOld,
+            role_for(&plan.case_id),
+            true,
+            &frozen,
+            &evidence_root,
+            &oracle_json,
+        );
         arms.push(json!({
             "arm": name,
             "library_revision": isolated.library.revision,
+            "catalogue": {
+                "name": isolated.library.name,
+                "description": isolated.library.description,
+                "revision": isolated.library.revision
+            },
             "run_status": result["status"],
             "elapsed_seconds": result["elapsed_seconds"],
             "usage": result["usage"],
@@ -284,7 +316,8 @@ fn first_pair_runs_through_outcome_prepare_and_outcome_run() {
             "model": result["model"],
             "effort": result["effort"],
             "control_files_write": isolated.control_files_write,
-            "control_create_child": isolated.control_create_child
+            "control_create_child": isolated.control_create_child,
+            "consumption": consumption
         }));
         let _ = host.keep();
     }
@@ -372,7 +405,7 @@ fn run_isolated_arm(
     fs::create_dir(&user).unwrap();
     fs::create_dir(&control).unwrap();
     copy_auth(&home);
-    package::copy_into(skill, &library).unwrap();
+    let library_identity = package::copy_into(skill, &library).unwrap();
     fs::write(
         control.join("oracle.json"),
         format!("{{\"case\":{case_id:?}}}"),
@@ -450,11 +483,30 @@ fn run_isolated_arm(
         .unwrap();
     let oracle_json: Value =
         serde_json::from_slice(&oracle.stdout).unwrap_or_else(|_| json!({"status":"unreadable"}));
+    let evidence_root = PathBuf::from(result["evidence_root"].as_str().unwrap());
+    let frozen = skill_consumption::Frozen::new(
+        library_identity,
+        vec![library.clone()],
+        skill_consumption::live_skill_roots(),
+    );
+    let consumption = skill_consumption::collect_arm(
+        comparison::Kind::UpdateOld,
+        role_for(case_id),
+        true,
+        &frozen,
+        &evidence_root,
+        &oracle_json,
+    );
     let _ = host.keep();
     json!({
         "case_id": case_id,
         "arm": arm,
         "library_revision": isolated.library.revision,
+        "catalogue": {
+            "name": isolated.library.name,
+            "description": isolated.library.description,
+            "revision": isolated.library.revision
+        },
         "run_status": result["status"],
         "elapsed_seconds": result["elapsed_seconds"],
         "usage": result["usage"],
@@ -462,7 +514,8 @@ fn run_isolated_arm(
         "oracle_exit": oracle.status.code(),
         "model": result["model"],
         "effort": result["effort"],
-        "control_files_write": isolated.control_files_write
+        "control_files_write": isolated.control_files_write,
+        "consumption": consumption
     })
 }
 

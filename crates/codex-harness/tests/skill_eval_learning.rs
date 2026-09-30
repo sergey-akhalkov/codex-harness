@@ -1,11 +1,17 @@
 //! Independent 7.4 add-vs-absence batch. Model runs stay opt-in.
 #![cfg(windows)]
 use serde_json::{Value, json};
-use skill_evolution::{decision, isolation, package, plan};
+use skill_evolution::{comparison, decision, isolation, package, plan};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+};
+
+#[path = "fixtures/skill_consumption.rs"]
+mod skill_consumption;
+use skill_consumption::{
+    ArmSummary, ArmVerdict, BatchFacts, CasePair, EvidenceVector, Role, frozen_batch_evidence,
 };
 
 fn workspace_root() -> PathBuf {
@@ -37,6 +43,16 @@ fn compared_name(case_id: &str) -> &'static str {
         "harness-process-check"
     } else {
         plan::ACCEPT_SKILL
+    }
+}
+
+fn role_for(case_id: &str) -> Role {
+    match case_id {
+        "process" => Role::ProtectedOverlapping,
+        "negative" | "typo-fix" => Role::SimilarUnsuitable,
+        "missing" => Role::BoundaryFailure,
+        "freshness" | "cli-prior" => Role::IndependentHeldOut,
+        _ => Role::Intended,
     }
 }
 
@@ -107,6 +123,39 @@ fn independent_acceptance_cases_prepare_without_models() {
     assert_eq!(
         package::load(&accept_skill()).unwrap().name,
         plan::ACCEPT_SKILL
+    );
+}
+
+#[test]
+fn protected_process_workflow_prepares_without_models() {
+    let host = tempfile::Builder::new()
+        .prefix("skill-eval-protected-prep-")
+        .tempdir()
+        .unwrap();
+    let prepared = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args([
+            "outcome-prepare",
+            "--case",
+            "process",
+            "--observer",
+            env!("CARGO_BIN_EXE_harness-observe"),
+        ])
+        .current_dir(host.path())
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let prepared: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    assert_eq!(prepared["setup"]["case_id"], "process");
+    assert_eq!(prepared["model_calls"], 0);
+    assert!(
+        prepared["setup"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("bounded capture and cleanup")
     );
 }
 
@@ -220,12 +269,31 @@ fn run_arm(case_id: &str, arm: &str, enable_skill: bool, launcher: &Path, timeou
         .unwrap();
     let oracle_json: Value =
         serde_json::from_slice(&oracle.stdout).unwrap_or_else(|_| json!({"status": "unreadable"}));
+    let evidence_root = PathBuf::from(result["evidence_root"].as_str().unwrap());
+    let frozen = skill_consumption::Frozen::new(
+        isolated.library.clone(),
+        vec![named.clone(), discovered.clone()],
+        skill_consumption::live_skill_roots(),
+    );
+    let consumption = skill_consumption::collect_arm(
+        comparison::Kind::AddAbsence,
+        role_for(case_id),
+        enable_skill,
+        &frozen,
+        &evidence_root,
+        &oracle_json,
+    );
     let _ = host.keep();
     json!({
         "case_id": case_id,
         "arm": arm,
         "skill_enabled": enable_skill,
         "library_revision": isolated.library.revision,
+        "catalogue": {
+            "name": isolated.library.name,
+            "description": isolated.library.description,
+            "revision": isolated.library.revision
+        },
         "run_status": result["status"],
         "elapsed_seconds": result["elapsed_seconds"],
         "usage": result["usage"],
@@ -236,7 +304,8 @@ fn run_arm(case_id: &str, arm: &str, enable_skill: bool, launcher: &Path, timeou
         "compared_skill": oracle_json["details"]["compared_skill"],
         "model": result["model"],
         "effort": result["effort"],
-        "control_files_write": isolated.control_files_write
+        "control_files_write": isolated.control_files_write,
+        "consumption": consumption
     })
 }
 
@@ -264,34 +333,7 @@ fn independent_add_absence_batch_runs_on_authorized_xai() {
         pairs.push(json!({"case_id": case_id, "baseline": baseline, "candidate": candidate}));
     }
     assert_eq!(package::load(&live_skill()).unwrap().revision, live_before);
-    let intended = &pairs[0];
-    let negative = &pairs[1];
-    let held_out = &pairs[2];
-    let intended_gain = intended["candidate"]["oracle_passed"] == true
-        && intended["baseline"]["oracle_passed"] != true;
-    let held_out_gain = held_out["candidate"]["oracle_passed"] == true
-        && held_out["baseline"]["oracle_passed"] != true;
-    let negative_ok = negative["candidate"]["oracle_passed"] == true
-        && negative["baseline"]["oracle_passed"] == true;
-    let evidence = decision::ComparisonEvidence {
-        integrity_ok: pairs.iter().all(|pair| {
-            pair["baseline"]["run_status"] == "completed"
-                && pair["candidate"]["run_status"] == "completed"
-        }),
-        evidence_complete: true,
-        provider_matched: true,
-        must_pass: intended["candidate"]["oracle_passed"] == true
-            && negative_ok
-            && held_out["candidate"]["oracle_passed"] == true,
-        selection_demonstrated: true,
-        protected_regression: negative["candidate"]["oracle_passed"] != true,
-        benefit_established: intended_gain && held_out_gain && negative_ok,
-        within_budgets: true,
-        claim: decision::Claim::Capability,
-        skipped_required_check: false,
-        single_lucky_run: !(intended_gain && held_out_gain),
-        meaningful_difference: intended_gain || held_out_gain,
-    };
+    let evidence = frozen_batch_evidence(&batch_facts(&batch, &pairs, timeout));
     let verdict = decision::decide(&evidence);
     let summary = json!({
         "authorized_runner": "xai/grok-4.6",
@@ -306,6 +348,80 @@ fn independent_add_absence_batch_runs_on_authorized_xai() {
         &summary,
     );
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+}
+
+fn batch_facts(batch: &comparison::Plan, pairs: &[Value], timeout: u64) -> BatchFacts {
+    let declared = skill_consumption::declared_workflows()
+        .into_iter()
+        .filter(|(name, _, _)| *name == "add-absence")
+        .map(|(_, case_id, role)| (case_id.to_owned(), role))
+        .collect();
+    BatchFacts {
+        kind: comparison::Kind::AddAbsence,
+        model: batch.model.clone(),
+        effort: batch.effort.clone(),
+        timeout_seconds: timeout,
+        declared,
+        pairs: pairs
+            .iter()
+            .map(|pair| {
+                let case_id = pair["case_id"].as_str().unwrap().to_owned();
+                CasePair {
+                    role: role_for(&case_id),
+                    case_id,
+                    baseline: summary(&pair["baseline"]),
+                    candidate: summary(&pair["candidate"]),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn summary(arm: &Value) -> ArmSummary {
+    let model = arm["model"].as_str().unwrap_or_default().to_owned();
+    let effort = arm["effort"].as_str().unwrap_or_default().to_owned();
+    let checks = arm["oracle_checks"].clone();
+    let total = arm["usage"]["totals"]["total_tokens"].as_u64();
+    let cached = arm["usage"]["totals"]["cached_input_tokens"].as_u64();
+    ArmSummary {
+        run_status: arm["run_status"].as_str().unwrap_or_default().to_owned(),
+        oracle_passed: arm["oracle_passed"].as_bool(),
+        oracle_readable: !arm["oracle_exit"].is_null(),
+        oracle_agreement: arm["consumption"]["oracle_cross_check"]
+            .as_bool()
+            .unwrap_or(false),
+        verdict: arm["consumption"]["verdict"].as_str().map(verdict_from),
+        live_unchanged: true,
+        elapsed_seconds: arm["elapsed_seconds"]
+            .as_f64()
+            .map(|value| value.max(0.0) as u64),
+        evidence: EvidenceVector {
+            accepted_task_cost: total.map(|tokens| format!("reported {tokens} tokens this arm")),
+            required_discovery: ["positive_activation", "negative_activation"]
+                .iter()
+                .any(|key| checks.get(key).and_then(Value::as_bool) == Some(true)),
+            errors_detail_recovery: checks.is_object(),
+            cache_basis: cached.map(|tokens| format!("within-arm cached_input_tokens={tokens}")),
+            uncertainty: Some(format!(
+                "single pair on {model}/{effort}; quota attribution unknown"
+            )),
+        },
+        model,
+        effort,
+    }
+}
+
+fn verdict_from(value: &str) -> ArmVerdict {
+    match value {
+        "attributed" => ArmVerdict::Attributed,
+        "missing_treatment" => ArmVerdict::MissingTreatment,
+        "contaminated" => ArmVerdict::Contaminated,
+        "drifted" => ArmVerdict::Drifted,
+        "incomplete" => ArmVerdict::Incomplete,
+        "absent" => ArmVerdict::Absent,
+        "activated" => ArmVerdict::Activated,
+        other => panic!("unexpected arm verdict {other}"),
+    }
 }
 
 #[test]

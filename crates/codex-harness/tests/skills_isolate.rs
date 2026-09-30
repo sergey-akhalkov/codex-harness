@@ -6,6 +6,10 @@ use std::{
     process::Command,
 };
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 struct Fixture {
     marker: PathBuf,
     control: PathBuf,
@@ -37,6 +41,10 @@ impl Fixture {
             "---\nname: project-verification\ndescription: Isolation CLI fixture.\n---\nBody\n",
         )
         .unwrap();
+        fs::create_dir_all(library.join("references")).unwrap();
+        fs::create_dir_all(library.join("scripts")).unwrap();
+        fs::write(library.join("references/check.md"), "reference body\n").unwrap();
+        fs::write(library.join("scripts/helper.ps1"), "Write-Output helper\n").unwrap();
         fs::write(control.join("oracle.json"), "{\"pass\":true}").unwrap();
         fs::write(control.join("baseline.json"), "{\"arm\":\"L\"}").unwrap();
         let request = root.path().join("request.json");
@@ -96,6 +104,14 @@ fn isolate_entry_point_denies_control_writes_without_a_model_call() {
         value["isolation"]["library"]["name"],
         "project-verification"
     );
+    assert_eq!(
+        value["isolation"]["library"]["description"],
+        "Isolation CLI fixture."
+    );
+    let files = value["isolation"]["library"]["files"].as_object().unwrap();
+    assert!(files.contains_key("SKILL.md"), "{files:?}");
+    assert!(files.contains_key("references/check.md"), "{files:?}");
+    assert!(files.contains_key("scripts/helper.ps1"), "{files:?}");
     assert_eq!(fs::read(&fixture.marker).unwrap(), before);
     assert!(fixture.source.join("SKILL.md").exists());
     assert!(fixture.case.exists());
@@ -106,6 +122,55 @@ fn isolate_entry_point_denies_control_writes_without_a_model_call() {
             .open(fixture.control.join("oracle.json"))
             .is_err()
     );
+}
+
+#[test]
+fn library_revision_covers_references_and_helpers_not_only_the_body() {
+    let fixture = Fixture::new();
+    let (code, first) = run(&fixture.request);
+    assert_eq!(code, 0, "{first}");
+    fs::write(
+        fixture.library.join("references/check.md"),
+        "changed reference\n",
+    )
+    .unwrap();
+    let (code, second) = run(&fixture.request);
+    assert_eq!(code, 0, "{second}");
+    assert_eq!(
+        first["isolation"]["library"]["files"]["SKILL.md"],
+        second["isolation"]["library"]["files"]["SKILL.md"]
+    );
+    assert_ne!(
+        first["isolation"]["library"]["revision"],
+        second["isolation"]["library"]["revision"]
+    );
+}
+
+#[test]
+fn isolate_denies_a_live_library_root_inside_the_source() {
+    let fixture = Fixture::new();
+    let live = workspace_root()
+        .join(".agents/skills")
+        .join("project-verification");
+    let live_before = fs::read(live.join("SKILL.md")).unwrap();
+    let request = fixture._root.path().join("live-request.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(&json!({
+            "source_root": fixture.source,
+            "case_root": fixture.case,
+            "control_root": fixture.control,
+            "library_root": live,
+            "session_marker": fixture.marker
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, value) = run(&request);
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["model_calls"], 0);
+    assert_eq!(fs::read(live.join("SKILL.md")).unwrap(), live_before);
 }
 
 #[test]
