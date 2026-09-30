@@ -2520,12 +2520,22 @@ fn rollback_preserves_live_peer_and_reports_coverage_loss() {
         .prefix("cpu-rollback-Юникод-")
         .tempdir()
         .unwrap();
-    let source = root.path().join("source");
-    let build = root.path().join("build");
-    let home = root.path().join("home");
-    let user = root.path().join("user");
-    let cpu = root.path().join("cpu-account");
-    let heavy = root.path().join("heavy-account");
+    // Anchor on the ordinary long form: build agents hand out a short 8.3
+    // temp prefix while installation records canonical ownership strings.
+    let base = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.path().canonicalize().unwrap());
+    let source = base.join("source");
+    let build = base.join("build");
+    let home = base.join("home");
+    let user = base.join("user");
+    let cpu = base.join("cpu-account");
+    let heavy = base.join("heavy-account");
     for dir in [
         source.join("global/agents"),
         source.join("skills/one"),

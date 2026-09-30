@@ -68,12 +68,15 @@ fn installed_integration_is_a_separate_explicitly_selected_route() {
         "cargo build --workspace --locked --jobs 1",
         "npm install @openai/codex@0.157.1",
         "HARNESS_CONTROL_CODEX_EXE",
+        "cargo test --locked -p codex-harness --jobs 1",
         "--test native_launcher",
         "--test manager_delivery",
-        "--test orchestration_isolated_install -- --test-threads=1 --ignored",
         "--test xai_transport",
         "--test mcp_stdio",
         "--test tui",
+        "--test executor_observation",
+        "--test rtk_adapter",
+        "--test dependency_discovery",
     ] {
         assert!(
             scripts.contains(required),
@@ -84,18 +87,28 @@ fn installed_integration_is_a_separate_explicitly_selected_route() {
         !scripts.contains("--run-model-probes"),
         "model-backed evaluation stays outside both workflows"
     );
-    // The deterministic signal must not claim this scope either.
-    let deterministic_scripts = all_run_scripts(&workflow()).join("\n---\n");
-    for installed_only in [
-        "cargo build --workspace --locked --jobs 1",
-        "--test orchestration_isolated_install",
-        "--test manager_delivery",
-    ] {
-        assert!(
-            !deterministic_scripts.contains(installed_only),
-            "installed-only route leaked into default CI: {installed_only}"
-        );
-    }
+    // Omitted checks cannot look green: the installed test command must name
+    // every integration target that exists in the tests directory.
+    let tests_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut expected: Vec<String> = std::fs::read_dir(tests_root)
+        .expect("tests directory")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs")
+                .then(|| format!("--test {}", path.file_stem().unwrap().to_string_lossy()))
+        })
+        .collect();
+    expected.sort();
+    let mut declared: Vec<String> = scripts
+        .split("--test ")
+        .skip(1)
+        .map(|rest| format!("--test {}", rest.split_whitespace().next().unwrap_or("")))
+        .collect();
+    declared.sort();
+    assert_eq!(
+        declared, expected,
+        "every integration target must run in the installed route"
+    );
 }
 
 #[test]
@@ -166,7 +179,8 @@ fn every_required_deterministic_check_is_present() {
     for required in [
         "cargo fmt --all -- --check",
         "cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings",
-        "cargo test --workspace --locked --jobs 1 -- --test-threads=1",
+        "cargo test --workspace --exclude codex-harness --locked --jobs 1 -- --test-threads=1",
+        "cargo test -p codex-harness --lib --bins --locked --jobs 1 -- --test-threads=1",
         "cargo run -p codex-harness --locked --bin codex-harness -- ownership-check --source .",
         "cargo run -p codex-harness --locked --bin harness-source-check -- --root .",
         "rustup toolchain install 1.98.1",
@@ -183,5 +197,11 @@ fn every_required_deterministic_check_is_present() {
     assert!(
         !joined.contains("subscription-login"),
         "no credential or subscription route in default CI"
+    );
+    // Integration targets need the managed environment and run only in the
+    // separately dispatched installed route; this signal must not cover them.
+    assert!(
+        !joined.contains("--test "),
+        "integration targets leaked into the deterministic signal"
     );
 }

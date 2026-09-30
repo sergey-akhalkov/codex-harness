@@ -1,9 +1,10 @@
 # Explicitly selected installed-lifecycle integration. This route is never
 # automatic: it runs only on manual dispatch, so a green default CI run never
-# stands in for it. It builds the workspace and exercises the real
-# launcher/delivery/install/recover/transport/MCP/TUI entry points, including
-# an outside-checkout consumer. It still uses no credentials; model-backed
-# evaluation remains a separate explicit selection outside both workflows.
+# stands in for it. It builds the workspace, installs the pinned upstream
+# Codex CLI (no credentials) and runs every codex-harness integration target,
+# which exercises the real launcher, delivery, install, orchestration,
+# transport, MCP, TUI and executor-host surfaces. Model-backed evaluation
+# remains a separate explicit selection outside both workflows.
 name: windows-installed-integration
 
 on:
@@ -32,28 +33,14 @@ jobs:
       - name: Build the workspace binaries
         run: cargo build --workspace --locked --jobs 1
 
-      - name: Launcher forwarding, fallback and installation recovery
-        run: cargo test --locked -p codex-harness --jobs 1 --test native_launcher -- --test-threads=1
-
-      - name: Manager delivery and stable-link lifecycle
-        run: cargo test --locked -p codex-harness --jobs 1 --test manager_delivery -- --test-threads=1
-
       - name: Install the pinned upstream Codex CLI (no credentials used)
         run: |
           npm install @openai/codex@0.157.1 --prefix "$env:RUNNER_TEMP\codex-cli"
           $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\codex-cli" -Recurse -Filter codex.exe |
             Select-Object -First 1 -ExpandProperty FullName
           if (-not $exe) { throw "pinned upstream codex.exe was not installed" }
+          (Split-Path $exe) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "HARNESS_CONTROL_CODEX_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Isolated install and orchestration outside the checkout
-        run: cargo test --locked -p codex-harness --jobs 1 --test orchestration_isolated_install -- --test-threads=1 --ignored
-
-      - name: Transport ownership
-        run: cargo test --locked -p codex-harness --jobs 1 --test xai_transport -- --test-threads=1
-
-      - name: MCP stdio boundary
-        run: cargo test --locked -p codex-harness --jobs 1 --test mcp_stdio -- --test-threads=1
-
-      - name: Windows TUI entry point
-        run: cargo test --locked -p codex-harness --jobs 1 --test tui -- --test-threads=1
+      - name: Every codex-harness integration target with the real environment
+        run: cargo test --locked -p codex-harness --jobs 1 --test agent_config --test analysis_samples --test broker_service --test ci_workflow --test config_boundary --test console --test cpu_budget_status --test delegation_usage --test dependency_apply --test dependency_audit --test dependency_discovery --test dependency_mcp_probe --test dependency_python_stage --test dependency_selection --test dependency_stage --test executable_ownership --test executor_assignment --test executor_control --test executor_message --test executor_observation --test executor_spawn --test executor_stop --test executor_succession --test executor_warning --test feedback_cli --test heavy_command --test installation_lock --test installation_state --test inventory --test lazy_stdio --test lead_message_native --test manager_delivery --test mcp_cli --test mcp_registration --test mcp_stdio --test migration_baseline --test native_build --test native_launcher --test nuphus_stdio --test orchestration_isolated_install --test outcome_arm --test outcome_case_fixture --test outcome_discovery --test outcome_oracle --test outcome_prepare --test outcome_report --test outcome_run --test process_service --test regression --test rtk_adapter --test serena_stdio --test skill_catalog_refresh --test skill_context_evaluation --test skill_eval_learning --test skill_eval_pilot --test skill_natural_apply --test skills_isolate --test skills_usage --test source_check --test source_diagnostics --test structured --test subscription_login --test task_control_contract --test task_control_launch --test tui --test verification_record --test xai_transport -- --test-threads=1
