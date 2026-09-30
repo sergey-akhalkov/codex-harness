@@ -85,30 +85,41 @@ fn fail(message: &'static str) -> io::Error {
 
 const DEGRADED_NOTICE: &str = "codex-harness: shared harness unavailable; launching registered Codex without harness overrides";
 
-fn registered_runtime(registration: &Registration) -> io::Result<(PathBuf, bool)> {
+/// Resolve the registered runtime with the single artifact pass this launch
+/// decision performs. The returned digest is the verified launcher image
+/// identity; the recursion guard below reuses it instead of re-hashing the
+/// same unchanged executable. `false` shared omits the harness overrides for
+/// one upstream launch.
+fn registered_runtime(registration: &Registration) -> io::Result<(PathBuf, bool, String)> {
     let selected = match (
         registration.schema,
         &registration.state,
         &registration.build,
     ) {
         (1, Some(state), None) if state.is_absolute() => match build_selection::selected(state) {
-            Ok(build) => return Ok((build, true)),
+            Ok((build, artifacts)) => {
+                let digest = artifacts.digest("codex.exe").ok_or_else(|| {
+                    fail("registered native build is stale, missing or altered; explicit update required")
+                })?;
+                return Ok((build, artifacts.check().runtime_allowed, digest.to_string()));
+            }
             Err(error) => schema_one_build(state).ok_or(error)?,
         },
         (2, None, Some(build)) if build.is_absolute() => build.clone(),
         _ => return Err(fail("unsupported native launch registration")),
     };
-    if launcher_identity_matches(&selected)? {
-        // Launch admission follows recorded binary integrity: a stale or
-        // unreachable checkout keeps the harness overrides of the delivered
-        // build, and only damaged or unsupported inputs degrade to upstream.
-        let shared = build_identity::check(&selected, None).runtime_allowed;
-        Ok((selected.canonicalize()?, shared))
-    } else {
-        Err(fail(
-            "registered native build is stale, missing or altered; explicit update required",
-        ))
-    }
+    // Launch admission follows recorded artifact integrity: a stale or
+    // unreachable checkout keeps the harness overrides of the delivered
+    // build, and only damaged or unsupported inputs degrade to upstream.
+    let verified = build_identity::artifacts(&selected);
+    let digest = verified.digest("codex.exe").ok_or_else(|| {
+        fail("registered native build is stale, missing or altered; explicit update required")
+    })?;
+    Ok((
+        selected.canonicalize()?,
+        verified.check().runtime_allowed,
+        digest.to_string(),
+    ))
 }
 
 fn schema_one_build(state: &Path) -> Option<PathBuf> {
@@ -135,19 +146,6 @@ fn schema_one_build(state: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(build)
-}
-
-fn launcher_identity_matches(build: &Path) -> io::Result<bool> {
-    let record = match build_identity::read_record(build) {
-        Ok(record) => record,
-        Err(_) => return Ok(false),
-    };
-    let Some(expected) = record.binaries.get("codex.exe") else {
-        return Ok(false);
-    };
-    let launcher = build.join("codex.exe");
-    Ok(build_identity::ordinary(&launcher).is_ok()
-        && build_identity::hash_file(&launcher).is_ok_and(|actual| actual == *expected))
 }
 
 fn shared_config_args(
@@ -232,7 +230,7 @@ fn prepared_command(
     executable: &Path,
     home: &Path,
     args: &[OsString],
-) -> io::Result<(Command, bool)> {
+) -> io::Result<(Command, bool, String)> {
     let mut bytes = Vec::new();
     File::open(home.join("harness/native-launch.json"))?
         .take(REGISTRATION_LIMIT + 1)
@@ -242,7 +240,7 @@ fn prepared_command(
     }
     let registration: Registration = serde_json::from_slice(&bytes)
         .map_err(|_| fail("invalid native launch registration; explicit repair is required"))?;
-    let (selected, shared) = registered_runtime(&registration)?;
+    let (selected, shared, launcher_sha256) = registered_runtime(&registration)?;
     let executable = executable.canonicalize()?;
     if selected.join("codex.exe").canonicalize()? != executable {
         return Err(fail("this launcher is not the selected native build"));
@@ -260,7 +258,9 @@ fn prepared_command(
     }
     let target = upstream.executable.canonicalize()?;
     let target_hash = build_identity::hash_file(&target)?;
-    if target == executable || target_hash == build_identity::hash_file(&executable)? {
+    // `launcher_sha256` is the verified digest of this exact running image,
+    // observed once in this decision; the file cannot change while mapped.
+    if target == executable || target_hash == launcher_sha256 {
         return Err(fail(
             "upstream points to a harness launcher; explicit repair required",
         ));
@@ -328,7 +328,7 @@ fn prepared_command(
         command.env("CODEX_MANAGED_PACKAGE_ROOT", root);
         command.env(variable, "1");
     }
-    Ok((command, registration.task_control))
+    Ok((command, registration.task_control, launcher_sha256))
 }
 
 /// Result of asking the loopback xAI shim port what it is.
@@ -546,7 +546,7 @@ pub fn ensure_xai_shim(manager: &Path, port: u16) -> io::Result<()> {
 }
 
 pub fn command(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<Command> {
-    prepared_command(executable, home, args).map(|(command, _)| command)
+    prepared_command(executable, home, args).map(|(command, _, _)| command)
 }
 
 #[cfg(windows)]
@@ -754,7 +754,7 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     // loader dialog.
     crate::process::suppress_loader_dialogs();
     let (uncapped, args) = take_uncapped_session_selector(args)?;
-    let (command, task_control) = prepared_command(executable, home, &args)?;
+    let (command, task_control, _) = prepared_command(executable, home, &args)?;
     if launcher::xai_shim_requested(&args) {
         let manager = executable
             .canonicalize()?

@@ -103,7 +103,7 @@ fn finish_journal(state: &Path, receipt: &[u8]) -> io::Result<()> {
 
 fn verified_previous(state: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let build = pointer_path(state, bytes)?;
-    let mut check = build_identity::check(&build, None);
+    let mut check = build_identity::integrity(&build);
     if check.status == Health::Incompatible {
         // A v1 predecessor may have a different compiled binary/input set.
         // Verify every recorded artifact before asking that exact manager.
@@ -183,8 +183,11 @@ fn replace_expected_at_publication(
     }
 }
 
-/// Resolve a healthy selection without Cargo, hooks, model calls or mutation.
-pub fn selected(state: &Path) -> io::Result<PathBuf> {
+/// Resolve the selected build without Cargo, hooks, model calls or mutation
+/// and return the one artifact verification this decision performed. The
+/// caller decides launch admission from the artifacts' `runtime_allowed`;
+/// unresolved state still fails here before any verification.
+pub fn selected(state: &Path) -> io::Result<(PathBuf, build_identity::Artifacts)> {
     native_build::verify_owned_state(state)?;
     let state = state.canonicalize()?;
     if read_optional(&state.join(JOURNAL))?.is_some() {
@@ -196,11 +199,8 @@ pub fn selected(state: &Path) -> io::Result<PathBuf> {
         io::Error::other("No active native build; run activate-build explicitly.")
     })?;
     let build = pointer_path(&state, &bytes)?;
-    let check = build_identity::check(&build, None);
-    if !check.runtime_allowed {
-        return Err(io::Error::other(check.action));
-    }
-    Ok(build)
+    let artifacts = build_identity::artifacts(&build);
+    Ok((build, artifacts))
 }
 
 /// Only observed missing/changed owned bytes establish a damaged predecessor.
@@ -225,6 +225,9 @@ fn predecessor_rollback_usable(state: &Path, bytes: &[u8]) -> io::Result<bool> {
     if build_identity::hash_file(&build.join("build.json"))? != pointer.record_sha256 {
         return Ok(false);
     }
+    // One pass over the recorded artifacts decides observed damage; a definite
+    // missing or changed byte is the only evidence that marks the predecessor
+    // unusable, while an indeterminate read stops selection.
     for (name, expected) in &record.binaries {
         let path = build.join(name);
         native_build::ordinary_ancestors(&path)?;
@@ -235,7 +238,18 @@ fn predecessor_rollback_usable(state: &Path, bytes: &[u8]) -> io::Result<bool> {
             Err(error) => return Err(error),
         }
     }
-    verified_previous(state, bytes)?;
+    if !build_identity::required_binaries_present(&record) {
+        // A v1 predecessor may have a different compiled binary/input set.
+        // Its recorded artifacts are intact, so compatibility is the only
+        // remaining question; that exact manager answers it once.
+        let check = native_build::consumer_check(&build, None)?;
+        if !matches!(
+            check.status,
+            Health::Healthy | Health::SourceStale | Health::SourceUnavailable
+        ) {
+            return Err(io::Error::other(check.action));
+        }
+    }
     Ok(true)
 }
 
@@ -252,7 +266,7 @@ fn stage(state: &Path, build: &Path) -> io::Result<Journal> {
             "Only an immutable build published in this owned state can be selected.",
         ));
     }
-    let check = build_identity::check(&build, None);
+    let check = build_identity::integrity(&build);
     if !check.runtime_allowed {
         return Err(io::Error::other(check.action));
     }
@@ -368,7 +382,7 @@ mod publication_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_identity::{BINARIES, BuildRecord, SCHEMA};
+    use crate::build_identity::{BINARIES, BuildRecord, SCHEMA, test_probe};
     use std::collections::BTreeMap;
 
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
@@ -450,7 +464,7 @@ mod tests {
         assert!(recover(&state).unwrap().build.is_some());
         fs::write(record.source_root.join("crates/one/src/lib.rs"), "fixture").unwrap();
         assert!(!activate(&state, &b).unwrap().changed);
-        assert_eq!(selected(&state).unwrap(), b.canonicalize().unwrap());
+        assert_eq!(selected(&state).unwrap().0, b.canonicalize().unwrap());
         assert_eq!(
             held.metadata().unwrap().len(),
             "codex-harness.exe".len() as u64
@@ -462,6 +476,46 @@ mod tests {
             fs::read_to_string(b.join("codex-harness.exe")).unwrap(),
             "altered"
         );
+    }
+
+    #[test]
+    fn selection_verifies_artifacts_without_source_traversal() {
+        let (_temp, state, a, _b) = fixture();
+        activate(&state, &a).unwrap();
+        let record = build_identity::read_record(&a).unwrap();
+        fs::write(record.source_root.join("crates/one/src/lib.rs"), "changed").unwrap();
+        let _ = test_probe::take();
+        let (build, artifacts) = selected(&state).unwrap();
+        assert_eq!(build, a.canonicalize().unwrap());
+        assert_eq!(artifacts.check().status, Health::Healthy);
+        assert!(artifacts.check().runtime_allowed);
+        assert!(artifacts.digest("codex-harness.exe").is_some());
+        let events = test_probe::take();
+        assert!(
+            !events.iter().any(|event| event == "source_identity"),
+            "selection traversed compiled sources: {events:?}"
+        );
+    }
+
+    #[test]
+    fn activation_verifies_each_predecessor_artifact_once() {
+        let (_temp, state, a, b) = fixture();
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+        activate(&state, &a).unwrap();
+        let _ = test_probe::take();
+        activate(&state, &b).unwrap();
+        let events = test_probe::take();
+        let hashes = |path: &Path| {
+            let needle = format!("hash:{}", path.to_string_lossy());
+            events.iter().filter(|event| **event == needle).count()
+        };
+        // Candidate and predecessor are each verified once; the predecessor's
+        // recorded artifacts are reused rather than hashed a second time.
+        assert_eq!(hashes(&a.join("codex-harness.exe")), 1, "{events:?}");
+        assert_eq!(hashes(&b.join("codex-harness.exe")), 1, "{events:?}");
+        assert_eq!(hashes(&a.join("harness-rtk.exe")), 1, "{events:?}");
+        assert_eq!(hashes(&b.join("harness-rtk.exe")), 1, "{events:?}");
     }
 
     #[test]
@@ -535,7 +589,7 @@ mod tests {
         fs::write(state.join(ACTIVE), journal.before.as_ref().unwrap()).unwrap();
         assert!(recover(&state).unwrap().changed);
         assert!(!recover(&state).unwrap().changed);
-        assert_eq!(selected(&state).unwrap(), a.canonicalize().unwrap());
+        assert_eq!(selected(&state).unwrap().0, a.canonicalize().unwrap());
         assert!(b.join("codex-harness.exe").is_file());
     }
 
@@ -673,7 +727,7 @@ mod tests {
                 }
                 interrupt(&state, &b, replaced);
                 assert!(recover(&state).unwrap().changed);
-                assert_eq!(selected(&state).unwrap(), b.canonicalize().unwrap());
+                assert_eq!(selected(&state).unwrap().0, b.canonicalize().unwrap());
                 assert!(!recover(&state).unwrap().changed);
                 let history: Vec<Journal> = fs::read_dir(state.join("build-selection-history"))
                     .unwrap()

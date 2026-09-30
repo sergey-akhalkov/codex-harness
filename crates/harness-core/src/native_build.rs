@@ -685,17 +685,37 @@ fn delivery_from(executable: &Path, source: &Path) -> io::Result<PathBuf> {
         })
 }
 
-fn find_reusable(
+/// A file covered by both the recorded and the live identity whose content
+/// differs: such a record can never match, whichever producer version wrote
+/// it. Coverage that exists on only one side may come from another producer
+/// version's identity rules and is left to that build's own consumer check.
+fn shared_content_differs(
+    recorded: &build_identity::SourceIdentity,
+    live: &build_identity::SourceIdentity,
+) -> bool {
+    recorded.files.iter().any(|(path, digest)| {
+        live.files
+            .get(path)
+            .is_some_and(|current| current != digest)
+    })
+}
+
+/// Candidate records that already match the established source/toolchain/
+/// target identity. A candidate with definitely changed content is rejected
+/// here before any consumer validation is started.
+fn reusable_candidates(
     state: &Path,
     source: &Path,
     rustc: &str,
     cargo: &str,
-) -> io::Result<Option<PreparedBuild>> {
+    expected: &build_identity::SourceIdentity,
+) -> io::Result<Vec<(PathBuf, build_identity::BuildRecord)>> {
     let builds = state.join("builds");
     if !builds.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     directory(&builds)?;
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(builds)? {
         let path = entry?.path();
         let Ok(record) = build_identity::read_record(&path) else {
@@ -705,9 +725,23 @@ fn find_reusable(
             || record.rustc != rustc
             || record.cargo != cargo
             || record.target != TARGET
+            || shared_content_differs(&record.source, expected)
         {
             continue;
         }
+        candidates.push((path, record));
+    }
+    Ok(candidates)
+}
+
+fn find_reusable(
+    state: &Path,
+    source: &Path,
+    rustc: &str,
+    cargo: &str,
+    expected: &build_identity::SourceIdentity,
+) -> io::Result<Option<PreparedBuild>> {
+    for (path, record) in reusable_candidates(state, source, rustc, cargo, expected)? {
         if consumer_check(&path, Some(source))
             .is_ok_and(|check| check.status == build_identity::Health::Healthy)
         {
@@ -795,8 +829,10 @@ pub fn activate_candidate(
             "Candidate must be published in the selected owned state.",
         ));
     }
-    build_identity::verify_record_integrity(&build)?;
     let manager = build.join("codex-harness.exe");
+    // The manager comparison needs a usable image; the self path verifies
+    // through build_selection::activate, and the consumer path verifies the
+    // candidate exactly once before it runs (no separate throwaway pass).
     if manager.canonicalize()? == std::env::current_exe()?.canonicalize()? {
         return crate::build_selection::activate(&state, &build);
     }
@@ -919,7 +955,7 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     if let Ok(Some(root)) = owned_scratch_root(&scratch_root(), false) {
         sweep_owned_scratch(&root);
     }
-    if let Some(reused) = find_reusable(&state, &source, &rustc, &cargo_version)? {
+    if let Some(reused) = find_reusable(&state, &source, &rustc, &cargo_version, &before)? {
         return Ok(reused);
     }
     let sequence = SystemTime::now()
@@ -1145,6 +1181,54 @@ mod tests {
         fs::remove_dir_all(&partial).unwrap();
         fs::remove_dir_all(&newer).unwrap();
         assert_eq!(freshest_verified(&state).unwrap(), older);
+    }
+
+    #[test]
+    fn reuse_selection_rejects_nonmatching_candidates_before_consumer_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        owner_root(&state).unwrap();
+        let source = source_fixture(temp.path(), "source")
+            .canonicalize()
+            .unwrap();
+        let identity = build_identity::source_identity(&source).unwrap();
+        let matching = published_from(&state, "aaaa0000aaaa0000-1500-1", &source, BINARIES);
+        let other = source_fixture(temp.path(), "other").canonicalize().unwrap();
+        let _foreign_checkout = published_from(&state, "bbbb0000bbbb0000-2500-2", &other, BINARIES);
+        let wrong_toolchain = published_from(&state, "cccc0000cccc0000-3500-3", &source, BINARIES);
+        let mut record = build_identity::read_record(&wrong_toolchain).unwrap();
+        record.cargo = "another cargo".into();
+        fs::write(
+            wrong_toolchain.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        // Build recorded from a changed checkout; the live identity no longer
+        // matches it once the checkout is restored.
+        let changed = source.join("crates/one/src/lib.rs");
+        fs::write(&changed, "changed").unwrap();
+        let _changed_checkout =
+            published_from(&state, "dddd0000dddd0000-4500-4", &source, BINARIES);
+        fs::write(&changed, "fixture").unwrap();
+
+        let candidates =
+            reusable_candidates(&state, &source, "fixture", "fixture", &identity).unwrap();
+        let names: Vec<_> = candidates
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, vec!["aaaa0000aaaa0000-1500-1".to_owned()]);
+        assert_eq!(candidates[0].0, matching);
+        // A candidate whose record is intact but whose recorded bytes changed
+        // still reaches consumer validation: filtering is identity, not trust.
+        fs::write(matching.join("harness-rtk.exe"), "changed").unwrap();
+        let candidates =
+            reusable_candidates(&state, &source, "fixture", "fixture", &identity).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            consumer_check(&candidates[0].0, Some(&source)).is_err(),
+            "a candidate with changed recorded bytes must fail its consumer check"
+        );
     }
 
     #[test]

@@ -175,6 +175,85 @@ impl Fixture {
     }
 }
 
+/// Re-record the fixture build's source identity after the test edited the
+/// checkout, so the recorded state matches the live source again.
+fn refresh_record(f: &Fixture) {
+    let build = f.launcher.parent().unwrap();
+    let mut record = build_identity::read_record(build).unwrap();
+    record.source = build_identity::source_identity(&f.source).unwrap();
+    fs::write(
+        build.join("build.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    build_selection::activate(&f.state, build).unwrap();
+}
+
+/// Bytes the launcher process has read so far, from the kernel's own
+/// per-process I/O accounting (never a file-access heuristic).
+fn process_read_bytes(child: &std::process::Child) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::{GetProcessIoCounters, IO_COUNTERS};
+    let mut counters: IO_COUNTERS = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetProcessIoCounters(child.as_raw_handle(), &mut counters) };
+    assert_ne!(
+        ok,
+        0,
+        "GetProcessIoCounters: {}",
+        std::io::Error::last_os_error()
+    );
+    counters.ReadTransferCount
+}
+
+/// One ordinary launch with an interactive upstream: wait until the payload
+/// runs (launch verification is complete), sample the launcher's read bytes,
+/// then let the payload finish.
+fn launch_read_bytes(f: &Fixture) -> u64 {
+    let mut child = f
+        .command()
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "interactive")
+        .env("CARGO", "must-not-run")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (ready, line) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut first = String::new();
+        let _ = reader.read_line(&mut first);
+        let _ = ready.send(first);
+        let mut rest = String::new();
+        while reader
+            .read_line(&mut rest)
+            .map(|read| read > 0)
+            .unwrap_or(false)
+        {
+            rest.clear();
+        }
+    });
+    let line = line
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("launcher never started the interactive payload");
+        });
+    assert!(line.contains("upstream prompt"), "{line}");
+    let reads = process_read_bytes(&child);
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    reads
+}
+
 #[test]
 fn immutable_registration_is_independent_of_build_tool_selection_and_rejects_ambiguous_binding() {
     let fixture = Fixture::new();
@@ -678,6 +757,152 @@ fn stale_missing_altered_and_interrupted_installations_do_not_launch_or_build() 
             "ordinary launch compiled: {mode}"
         );
     }
+}
+
+#[test]
+fn ordinary_launch_reads_do_not_scale_with_compiled_sources() {
+    for immutable in [false, true] {
+        let f = Fixture::new();
+        if immutable {
+            f.register_immutable();
+        }
+        let small = launch_read_bytes(&f);
+        // A checkout-sized compiled input is recorded, then the same launch is
+        // measured again: any compiled-source freshness traversal would read
+        // every byte of it before starting the payload.
+        let payload = f.source.join("crates/one/src/payload.bin");
+        fs::write(&payload, vec![0x5a; 64 * 1024 * 1024]).unwrap();
+        refresh_record(&f);
+        let large = launch_read_bytes(&f);
+        let delta = large.saturating_sub(small);
+        println!("immutable={immutable} launch reads small={small} large={large} delta={delta}");
+        assert!(
+            delta < 4 * 1024 * 1024,
+            "launch read {delta} extra bytes of the compiled payload (small={small}, large={large})"
+        );
+    }
+}
+
+#[test]
+fn every_required_binary_is_reverified_before_launch() {
+    for name in BINARIES.iter().filter(|name| **name != "codex.exe") {
+        let f = Fixture::new();
+        fs::write(f.launcher.parent().unwrap().join(name), b"changed").unwrap();
+        let out = f
+            .command()
+            .args(["exec", "hello"])
+            .env("CARGO", "must-not-run")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("launching registered Codex without harness overrides"),
+            "{name}: {stderr}"
+        );
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(report["args"].is_array(), "{name}: {report}");
+    }
+}
+
+#[test]
+fn altered_bytes_with_a_restored_timestamp_are_not_trusted_at_launch() {
+    let f = Fixture::new();
+    let path = f.launcher.parent().unwrap().join("harness-rtk.exe");
+    let original = fs::read(&path).unwrap();
+    let timestamp = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut altered = original.clone();
+    altered[0] ^= 0xff;
+    fs::write(&path, &altered).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(timestamp)
+        .unwrap();
+    let out = f.command().stdin(Stdio::null()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("launching registered Codex without harness overrides"),
+        "a same-size mutation with a restored timestamp must not reuse verification"
+    );
+    // Restoring the bytes restores admission: each launch verifies again.
+    fs::write(&path, &original).unwrap();
+    let out = f.command().stdin(Stdio::null()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr)
+            .contains("launching registered Codex without harness overrides")
+    );
+}
+
+#[test]
+fn explicit_check_reports_fresh_stale_unavailable_and_altered_sources() {
+    let run = |f: &Fixture| {
+        let out = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+            .arg("check")
+            .arg("--build")
+            .arg(f.launcher.parent().unwrap())
+            .current_dir(f.root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), report)
+    };
+    let f = Fixture::new();
+    let (code, report) = run(&f);
+    assert_eq!(
+        (code, report["status"].as_str()),
+        (Some(0), Some("healthy")),
+        "{report}"
+    );
+    fs::write(f.source.join("crates/one/src/lib.rs"), "changed").unwrap();
+    let (code, report) = run(&f);
+    assert_eq!(
+        (code, report["status"].as_str()),
+        (Some(1), Some("source-stale")),
+        "{report}"
+    );
+    assert_eq!(report["runtime_allowed"], json!(true));
+    assert_eq!(report["management_allowed"], json!(true));
+    fs::rename(&f.source, f.root.path().join("moved-source")).unwrap();
+    let (code, report) = run(&f);
+    assert_eq!(
+        (code, report["status"].as_str()),
+        (Some(1), Some("source-unavailable")),
+        "{report}"
+    );
+    assert_eq!(report["runtime_allowed"], json!(true));
+    // An altered dependent binary is damage, separate from source freshness.
+    fs::rename(f.root.path().join("moved-source"), &f.source).unwrap();
+    fs::write(
+        f.launcher.parent().unwrap().join("harness-rtk.exe"),
+        "changed",
+    )
+    .unwrap();
+    let (code, report) = run(&f);
+    assert_eq!(
+        (code, report["status"].as_str()),
+        (Some(1), Some("altered")),
+        "{report}"
+    );
+    assert_eq!(report["runtime_allowed"], json!(false));
+    assert_eq!(report["management_allowed"], json!(true));
 }
 
 #[test]

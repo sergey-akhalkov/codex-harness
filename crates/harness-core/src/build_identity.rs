@@ -7,6 +7,33 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// Test-only observation of which verification work a decision performed.
+/// Thread-local so parallel test cases never observe another case's reads.
+#[cfg(test)]
+pub(crate) mod test_probe {
+    use std::{cell::RefCell, path::Path};
+
+    thread_local! {
+        static EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record(event: impl Into<String>) {
+        EVENTS.with(|events| events.borrow_mut().push(event.into()));
+    }
+
+    pub(crate) fn hash(path: &Path) {
+        record(format!("hash:{}", path.to_string_lossy()));
+    }
+
+    pub(crate) fn source_identity() {
+        record("source_identity");
+    }
+
+    pub(crate) fn take() -> Vec<String> {
+        EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+}
+
 pub const SCHEMA: u32 = 1;
 pub const BINARIES: &[&str] = &[
     "codex-harness.exe",
@@ -67,6 +94,8 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn hash_file(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    test_probe::hash(path);
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
     io::copy(&mut file, &mut digest)?;
@@ -122,6 +151,8 @@ fn collect(root: &Path, path: &Path, files: &mut BTreeMap<String, String>) -> io
 }
 
 pub fn source_identity(source: &Path) -> io::Result<SourceIdentity> {
+    #[cfg(test)]
+    test_probe::source_identity();
     let root = source.canonicalize()?;
     let mut files = BTreeMap::new();
     for required in ["Cargo.toml", "Cargo.lock", "crates"] {
@@ -254,67 +285,158 @@ pub fn verify_record_integrity(build: &Path) -> io::Result<BuildRecord> {
     Ok(record)
 }
 
-pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
+/// A recorded binary name that may be opened inside the build directory:
+/// a single plain `.exe` file name, never a relative path or link input.
+fn binary_name_is_safe(name: &str) -> bool {
+    name.ends_with(".exe")
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        && Path::new(name).components().count() == 1
+}
+
+/// This consumer's required binary set is recorded exactly.
+pub(crate) fn required_binaries_present(record: &BuildRecord) -> bool {
+    record.binaries.len() == BINARIES.len()
+        && BINARIES
+            .iter()
+            .all(|name| record.binaries.contains_key(*name))
+}
+
+/// One coherent verification pass over a build's recorded artifacts.
+///
+/// Every recorded binary with a safe name is hashed exactly once; no
+/// compiled-source input is traversed. `check` adds the explicit source
+/// freshness diagnosis on top of this result. The pass intentionally keeps
+/// no state beyond its own return value: a later decision verifies again,
+/// so a changed or ambiguous artifact can never ride on earlier evidence.
+pub struct Artifacts {
+    check: BuildCheck,
+    record: Option<BuildRecord>,
+    /// `Some(digest)` only when this pass verified the recorded binary intact.
+    digests: BTreeMap<String, Option<String>>,
+}
+
+impl Artifacts {
+    /// Integrity and metadata-compatibility verdict of this pass.
+    /// `Healthy` here means the required binaries and metadata are intact; it
+    /// makes no claim about source freshness.
+    pub fn check(&self) -> &BuildCheck {
+        &self.check
+    }
+
+    /// Actual digest of a recorded binary verified intact in this pass.
+    pub fn digest(&self, name: &str) -> Option<&str> {
+        self.digests.get(name).and_then(Option::as_deref)
+    }
+}
+
+/// Verify a build's recorded artifacts without touching the checkout.
+pub fn artifacts(build: &Path) -> Artifacts {
     let record = match read_record(build) {
         Ok(record) => record,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return result(
-                Health::Missing,
-                false,
-                "Explicit Cargo bootstrap is required; build metadata is missing.",
-            );
+            return Artifacts {
+                check: result(
+                    Health::Missing,
+                    false,
+                    "Explicit Cargo bootstrap is required; build metadata is missing.",
+                ),
+                record: None,
+                digests: BTreeMap::new(),
+            };
         }
         Err(_) => {
-            return result(
-                Health::Incompatible,
-                false,
-                "Explicit Cargo bootstrap is required; build metadata is invalid.",
-            );
+            return Artifacts {
+                check: result(
+                    Health::Incompatible,
+                    false,
+                    "Explicit Cargo bootstrap is required; build metadata is invalid.",
+                ),
+                record: None,
+                digests: BTreeMap::new(),
+            };
         }
     };
-    if record.schema != SCHEMA
-        || record.profile != "release"
-        || record.target != "x86_64-pc-windows-msvc"
-        || record.binaries.len() != BINARIES.len()
-        || !BINARIES
-            .iter()
-            .all(|name| record.binaries.contains_key(*name))
-        || record.source.sha256
-            != hash_bytes(&serde_json::to_vec(&record.source.files).unwrap_or_default())
-        || record.source.files.keys().any(|p| {
+    let names_are_safe = record.binaries.keys().all(|name| binary_name_is_safe(name));
+    let compatible = record.schema == SCHEMA
+        && record.profile == "release"
+        && record.target == "x86_64-pc-windows-msvc"
+        && required_binaries_present(&record)
+        && record.source.sha256
+            == hash_bytes(&serde_json::to_vec(&record.source.files).unwrap_or_default())
+        && !record.source.files.keys().any(|p| {
             Path::new(p)
                 .components()
                 .any(|c| !matches!(c, Component::Normal(_)))
-        })
-    {
-        return result(
+        });
+    // Each safely named recorded binary is opened and hashed once here; a
+    // malformed name is never resolved against the filesystem.
+    let mut digests = BTreeMap::new();
+    for (name, expected) in &record.binaries {
+        if !binary_name_is_safe(name) {
+            continue;
+        }
+        let path = build.join(name);
+        let actual = match ordinary(&path) {
+            Ok(()) => hash_file(&path).ok(),
+            Err(_) => None,
+        };
+        digests.insert(name.clone(), actual.filter(|digest| digest == expected));
+    }
+    let check = if !names_are_safe || !compatible {
+        result(
             Health::Incompatible,
             false,
             "Explicit Cargo bootstrap is required; metadata schema or inputs are incompatible.",
-        );
+        )
+    } else if digests.values().any(Option::is_none) {
+        let manager_ok = digests
+            .get("codex-harness.exe")
+            .is_some_and(Option::is_some);
+        result(
+            Health::Altered,
+            manager_ok,
+            if manager_ok {
+                "Run explicit native build/update to repair the missing or altered dependent binary; the manager still passes integrity checks."
+            } else {
+                "Explicit Cargo bootstrap is required; the manager is missing or altered."
+            },
+        )
+    } else {
+        result(
+            Health::Healthy,
+            true,
+            "Verified native build integrity; run explicit check or diagnose for source freshness.",
+        )
+    };
+    Artifacts {
+        check,
+        record: Some(record),
+        digests,
     }
-    let manager_ok = record
-        .binaries
-        .get("codex-harness.exe")
-        .is_some_and(|expected| {
-            let manager = build.join("codex-harness.exe");
-            ordinary(&manager).is_ok()
-                && hash_file(&manager).is_ok_and(|actual| actual == *expected)
-        });
-    for (name, expected) in &record.binaries {
-        let path = build.join(name);
-        if ordinary(&path).is_err() || !hash_file(&path).is_ok_and(|actual| actual == *expected) {
-            return result(
-                Health::Altered,
-                manager_ok,
-                if manager_ok {
-                    "Run explicit native build/update to repair the missing or altered dependent binary; the manager still passes integrity checks."
-                } else {
-                    "Explicit Cargo bootstrap is required; the manager is missing or altered."
-                },
-            );
-        }
+}
+
+/// Required runtime integrity and compatibility of one build, without any
+/// compiled-source traversal. Launch and selection decisions use this;
+/// `check` adds the explicit source-freshness diagnosis.
+pub fn integrity(build: &Path) -> BuildCheck {
+    artifacts(build).check
+}
+
+/// Explicit full diagnosis: required artifact integrity plus the freshness of
+/// the recorded checkout. Fresh, stale and unavailable source states are
+/// distinguished from executable damage.
+pub fn check(build: &Path, source_override: Option<&Path>) -> BuildCheck {
+    let artifacts = artifacts(build);
+    if artifacts.check.status != Health::Healthy {
+        return artifacts.check;
     }
+    let record = artifacts
+        .record
+        .as_ref()
+        .expect("a healthy artifact pass carries its record");
     let source = source_override.unwrap_or(&record.source_root);
     match source_identity(source) {
         Ok(current) if current == record.source => result(
@@ -449,5 +571,124 @@ mod tests {
         let altered = check(&build, None);
         assert_eq!(altered.status, Health::Altered);
         assert!(!altered.management_allowed);
+    }
+
+    /// Owned build fixture: an intact record and every required binary.
+    fn build_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+        let root = temp.join("source");
+        source(&root);
+        let build = temp.join("build");
+        fs::create_dir(&build).unwrap();
+        let mut binaries = BTreeMap::new();
+        for name in BINARIES {
+            fs::write(build.join(name), name).unwrap();
+            binaries.insert(name.to_string(), hash_bytes(name.as_bytes()));
+        }
+        let record = BuildRecord {
+            schema: SCHEMA,
+            source_root: root.clone(),
+            source: source_identity(&root).unwrap(),
+            rustc: "test".into(),
+            cargo: "test".into(),
+            target: "x86_64-pc-windows-msvc".into(),
+            profile: "release".into(),
+            binaries,
+        };
+        fs::write(
+            build.join("build.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        (root, build)
+    }
+
+    fn hashes_of(events: &[String], path: &Path) -> usize {
+        let needle = format!("hash:{}", path.to_string_lossy());
+        events.iter().filter(|event| **event == needle).count()
+    }
+
+    #[test]
+    fn integrity_hashes_each_required_binary_once_without_source_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_root, build) = build_fixture(temp.path());
+        let _ = test_probe::take();
+        let verified = integrity(&build);
+        assert_eq!(verified.status, Health::Healthy);
+        assert!(verified.runtime_allowed && verified.serving_allowed);
+        let events = test_probe::take();
+        assert!(
+            !events.iter().any(|event| event == "source_identity"),
+            "integrity traversed compiled sources: {events:?}"
+        );
+        for name in BINARIES {
+            assert_eq!(
+                hashes_of(&events, &build.join(name)),
+                1,
+                "{name} verified more than once: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_reuses_one_artifact_pass_and_still_reports_freshness() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, build) = build_fixture(temp.path());
+        let _ = test_probe::take();
+        assert_eq!(check(&build, None).status, Health::Healthy);
+        let events = test_probe::take();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "source_identity")
+                .count(),
+            1,
+            "explicit check must diagnose sources exactly once: {events:?}"
+        );
+        for name in BINARIES {
+            assert_eq!(
+                hashes_of(&events, &build.join(name)),
+                1,
+                "{name} hashed more than once in one check: {events:?}"
+            );
+        }
+        // Stale and unavailable checkouts stay distinguishable from damage.
+        fs::write(root.join("crates/test/src/lib.rs"), "changed").unwrap();
+        assert_eq!(check(&build, None).status, Health::SourceStale);
+        fs::rename(&root, temp.path().join("moved")).unwrap();
+        assert_eq!(check(&build, None).status, Health::SourceUnavailable);
+    }
+
+    #[test]
+    fn changed_bytes_with_restored_timestamp_invalidate_verified_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_root, build) = build_fixture(temp.path());
+        let original = integrity(&build);
+        assert_eq!(original.status, Health::Healthy);
+        let dependent = build.join("harness-observe.exe");
+        let timestamp = fs::metadata(&dependent).unwrap().modified().unwrap();
+        let mut altered = b"harness-observe.exe".to_vec();
+        altered[0] ^= 0xff;
+        fs::write(&dependent, &altered).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&dependent)
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+        let changed = integrity(&build);
+        assert_eq!(
+            changed.status,
+            Health::Altered,
+            "a same-size mutation with a restored timestamp must not reuse verification"
+        );
+        assert!(changed.management_allowed, "the manager itself is intact");
+        fs::write(&dependent, "harness-observe.exe").unwrap();
+        assert_eq!(integrity(&build).status, Health::Healthy);
+        drop(fs::remove_file(build.join("harness-inspect.exe")));
+        assert_eq!(
+            integrity(&build).status,
+            Health::Altered,
+            "every required binary stays checked"
+        );
     }
 }

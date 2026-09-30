@@ -1038,11 +1038,23 @@ conclusions are recorded (for example `cargo clean`), so verification state
 does not accumulate on the system drive.
 Reusing Cargo's
 mtime cache across changed source hashes is unsafe even if the manifest uses
-content hashes. Changing native source/lock inputs makes Check stale while
-launches keep following the integrity-verified delivered build; an explicit
-build/update (deploy) switches new processes to the newer source.
-Documentation-only changes do not require compilation. Missing or altered
-manager binaries require explicit Cargo bootstrap and still refuse runtime.
+content hashes. Ordinary launch selection verifies the required executables'
+integrity and compatibility against the delivered build's record without
+traversing compiled sources for freshness; live source-owned data (the kit
+manifest and its profile) is still read. Changing native source/lock inputs
+makes explicit Check report stale while launches keep following the
+integrity-verified delivered build; an explicit build/update (deploy)
+switches new processes to the newer source. `check --build` distinguishes
+fresh, stale and unavailable checkouts separately from executable damage, and
+each verification decision hashes every required binary exactly once with no
+timestamp trust carried across launches. A changed or ambiguous executable
+invalidates that decision instead of reusing earlier evidence. Build reuse
+rejects recorded content that differs from the live checkout for an input
+both cover, before any consumer validation runs. Documentation-only changes
+do not require compilation. Missing or altered manager binaries refuse the
+harness runtime and degrade to one verified upstream launch instead of
+blocking Codex; the launcher image itself must match its record or the launch
+stops with the explicit update action.
 Executable text resources
 belong under crate `src`; source-owned skill/configuration data remains live
 filesystem input and must not be embedded in a deployed binary. Source
