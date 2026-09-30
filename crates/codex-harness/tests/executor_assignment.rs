@@ -33,7 +33,13 @@ impl Fixture {
         // Build agents can provide a short 8.3 temp prefix (RUNNER~1) while
         // the rendered checkout path is canonicalized; anchor every path on
         // the long form so the rendered brief matches either environment.
-        let root = root.canonicalize().unwrap();
+        let canonical = root.canonicalize().unwrap();
+        // Strip the verbatim prefix: the manager renders ordinary long paths.
+        let root = canonical
+            .to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .map(PathBuf::from)
+            .unwrap_or(canonical);
         let source = root.join("proj");
         git(
             &root,
