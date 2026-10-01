@@ -1155,19 +1155,40 @@ fn dispatch_planner(
     };
     let change_dir = host.checkout.join(candidate_change_dir(&candidate.change));
     let inputs = relative_files(&host.checkout, &change_dir)?;
+    let assignment = planner_assignment(run, candidate, inputs);
+    let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Planner);
+    candidate.planner_attempt = Some(attempt_id.clone());
+    dispatch_bound_assignment(
+        run,
+        host,
+        assignment,
+        AttemptRole::Planner,
+        attempt_id,
+        notes,
+    )
+}
+
+/// The bounded planning assignment document. Construction is pure, so the
+/// native structured contract can be checked without a controller run.
+fn planner_assignment(
+    run: &Run,
+    candidate: &CandidateState,
+    inputs: Vec<String>,
+) -> serde_json::Value {
     let acceptance_artifact = run.spec.experiment.acceptance_artifact.clone();
     let acceptance_heading = run.spec.experiment.acceptance_heading.clone();
-    let objective = format!(
-        "Author the complete OpenSpec change {} for the selected hypothesis card {}. Read the card with `{} show {} --json` from {}. Use the installed OpenSpec CLI in this checkout (`openspec instructions proposal --change {} --json`, then specs/design/tasks) and keep the artifacts consistent with the card's mechanism, conditions, predicted effect, counterexample and acceptance. The run's predeclared experiment acceptance must appear as the Markdown section '{}' inside '{}' under the change. Run `openspec validate {} --strict --no-interactive` until it passes, then commit the change (git add/commit) and leave the tree clean; the controller validates and advances the owned candidate branch to your committed revision. Do not edit product source; the change directory is the only output.",
-        candidate.change,
-        candidate.hypothesis,
+    let card_read = format!(
+        "read the admitted hypothesis card before authoring: `{} show {} --json`",
         run.spec.board.bd.display(),
-        candidate.hypothesis,
-        run.spec.board.project.display(),
-        candidate.change,
-        acceptance_heading,
-        acceptance_artifact.display(),
-        candidate.change
+        candidate.hypothesis
+    );
+    let card_project = format!(
+        "the board project for the card read is {}",
+        run.spec.board.project.display()
+    );
+    let objective = format!(
+        "Author the complete OpenSpec change {} for the selected hypothesis card {} using the installed OpenSpec CLI in this checkout, and keep the artifacts consistent with the card's mechanism, conditions, predicted effect, counterexample and acceptance. The card read and the run's predeclared acceptance requirements are recorded in the invariants. Run `openspec validate {} --strict --no-interactive` until it passes, then commit the change and leave the tree clean; do not edit product source.",
+        candidate.change, candidate.hypothesis, candidate.change
     );
     let outputs = vec![
         format!("{}/proposal.md", candidate_change_dir(&candidate.change)),
@@ -1179,7 +1200,7 @@ fn dispatch_planner(
             acceptance_artifact.display()
         ),
     ];
-    let assignment = json!({
+    json!({
         "schema": 1,
         "objective": objective,
         "inputs": inputs,
@@ -1189,6 +1210,10 @@ fn dispatch_planner(
             "the installed OpenSpec workflow definitions and schemas are never edited",
             "the authored change is committed in this checkout and the tree is left without uncommitted or untracked files",
             format!("the implementation conversation that follows must find a strictly valid change for {}", candidate.change),
+            card_read,
+            card_project,
+            format!("the run's predeclared acceptance section is titled '{acceptance_heading}'"),
+            format!("the predeclared acceptance section must appear at {} under the change", acceptance_artifact.display()),
         ],
         "acceptance": [
             format!("`openspec validate {} --strict --no-interactive` passes inside this checkout", candidate.change),
@@ -1197,17 +1222,34 @@ fn dispatch_planner(
         ],
         "consumer": "the improvement controller (codex-harness improve)",
         "escalate": [],
-    });
-    let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Planner);
-    candidate.planner_attempt = Some(attempt_id.clone());
-    dispatch_bound_assignment(
-        run,
-        host,
-        assignment,
-        AttemptRole::Planner,
-        attempt_id,
-        notes,
-    )
+    })
+}
+
+/// The declared writable scope as bounded invariant items. Every entry stays
+/// visible in the rendered brief and no item can exceed the native structured
+/// assignment item limit; entries are never shortened, dropped or reordered.
+fn scope_invariants(scope: &[String]) -> Vec<String> {
+    const PREFIX: &str = "every edit stays inside the declared writable scope: ";
+    let limit = crate::executor_assignment::MAX_ITEM_BYTES.saturating_sub(64);
+    let mut items = Vec::new();
+    let mut current = String::from(PREFIX);
+    for entry in scope {
+        let addition = if current.len() == PREFIX.len() {
+            entry.clone()
+        } else {
+            format!(", {entry}")
+        };
+        if current.len() > PREFIX.len() && current.len() + addition.len() > limit {
+            items.push(current);
+            current = format!("{PREFIX}{entry}");
+        } else {
+            current.push_str(&addition);
+        }
+    }
+    if current.len() > PREFIX.len() {
+        items.push(current);
+    }
+    items
 }
 
 fn dispatch_implementer(
@@ -1221,34 +1263,7 @@ fn dispatch_implementer(
     };
     let change_dir = host.checkout.join(candidate_change_dir(&candidate.change));
     let inputs = relative_files(&host.checkout, &change_dir)?;
-    let scope = run.spec.writable_scope.join(", ");
-    let objective = format!(
-        "Implement the complete work items of the candidate's OpenSpec change {} inside this checkout, staying inside the declared writable scope: {scope}. The change artifacts under {} are read-only for this conversation. Read the hypothesis card with `{} show {} --json` from {}. Commit every change on this checkout's current HEAD and leave no uncommitted or untracked files; the controller validates the committed revision against the frozen base, advances the owned candidate branch {} to it, re-qualifies the change and refuses dirty, escaped or unverified output. Report in your final message the commit revision, the changed paths and the exact check commands you ran with their observed results.",
-        candidate.change,
-        candidate_change_dir(&candidate.change),
-        run.spec.board.bd.display(),
-        candidate.hypothesis,
-        run.spec.board.project.display(),
-        host.branch
-    );
-    let assignment = json!({
-        "schema": 1,
-        "objective": objective,
-        "inputs": inputs,
-        "outputs": [],
-        "invariants": [
-            format!("every edit stays inside the declared writable scope: {scope}"),
-            format!("the change artifacts under {} are not modified; the frozen planning digests must still verify", candidate_change_dir(&candidate.change)),
-            "all work is committed on this checkout and the tree is left clean; the controller advances the owned candidate branch to the returned revision",
-            "the returned checks are independently re-verified by the controller and the parent acceptance owner; a success sentence alone is not evidence",
-        ],
-        "acceptance": [
-            run.spec.experiment.independent_acceptance.clone(),
-            format!("the committed candidate re-qualifies through `openspec validate {} --strict --no-interactive`", candidate.change),
-        ],
-        "consumer": "the improvement controller (codex-harness improve)",
-        "escalate": [],
-    });
+    let assignment = implementer_assignment(run, candidate, inputs);
     let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Implementer);
     candidate.implementer_attempt = Some(attempt_id.clone());
     dispatch_bound_assignment(
@@ -1261,12 +1276,58 @@ fn dispatch_implementer(
     )
 }
 
+/// The bounded implementation assignment document. Construction is pure, so
+/// the native structured contract can be checked without a controller run.
+fn implementer_assignment(
+    run: &Run,
+    candidate: &CandidateState,
+    inputs: Vec<String>,
+) -> serde_json::Value {
+    // The declared scope stays in bounded invariant items instead of the
+    // objective: a long multi-file scope cannot overflow the native objective
+    // limit, and no path is shortened, dropped or replaced by a basename.
+    let mut invariants = scope_invariants(&run.spec.writable_scope);
+    invariants.extend([
+        format!(
+            "the change artifacts under {} are not modified; the frozen planning digests must still verify",
+            candidate_change_dir(&candidate.change)
+        ),
+        "all work is committed on this checkout and the tree is left clean; the controller advances the owned candidate branch to the returned revision".to_owned(),
+        "the returned checks are independently re-verified by the controller and the parent acceptance owner; a success sentence alone is not evidence".to_owned(),
+        format!(
+            "read the admitted hypothesis card before implementing: `{} show {} --json`",
+            run.spec.board.bd.display(),
+            candidate.hypothesis
+        ),
+        format!(
+            "the board project for the card read is {}",
+            run.spec.board.project.display()
+        ),
+    ]);
+    let objective = format!(
+        "Implement the complete work items of the candidate's OpenSpec change {}. Stay inside the declared writable scope and keep the change artifacts read-only; both are recorded in the invariants, as is the card read. Commit all work on this checkout's current HEAD and leave no uncommitted or untracked files. Report in your final message the commit revision, the changed paths and the exact check commands you ran with their observed results.",
+        candidate.change
+    );
+    json!({
+        "schema": 1,
+        "objective": objective,
+        "inputs": inputs,
+        "outputs": [],
+        "invariants": invariants,
+        "acceptance": [
+            run.spec.experiment.independent_acceptance.clone(),
+            format!("the committed candidate re-qualifies through `openspec validate {} --strict --no-interactive`", candidate.change),
+        ],
+        "consumer": "the improvement controller (codex-harness improve)",
+        "escalate": [],
+    })
+}
+
 /// One conversation's bound checkout: the candidate worktree for the first
 /// dispatch, and the implementer's own returned checkout base afterwards.
 struct DispatchHost {
     checkout: PathBuf,
     base: String,
-    branch: String,
 }
 
 fn dispatch_host(_run: &Run, candidate: &CandidateState) -> Result<DispatchHost, String> {
@@ -1284,7 +1345,6 @@ fn dispatch_host(_run: &Run, candidate: &CandidateState) -> Result<DispatchHost,
     Ok(DispatchHost {
         checkout: checkout.path.clone(),
         base: checkout.revision.clone(),
-        branch: checkout.branch.clone(),
     })
 }
 
@@ -1417,46 +1477,8 @@ fn dispatch_investigator(
     let host = DispatchHost {
         checkout: run.spec.project.clone(),
         base: run.spec.base_revision.clone(),
-        branch: String::new(),
     };
-    let listed = evidence
-        .listing
-        .iter()
-        .take(MAX_LISTED_EVIDENCE)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("; ");
-    let root_note = match &evidence.root {
-        Some(root) => format!(
-            " Locators shaped file:<relative path> name retained files under {}.",
-            root.display()
-        ),
-        None => String::new(),
-    };
-    let objective = format!(
-        "Bounded improvement investigation for run {}. Inspect this checkout's source and the {} retained evidence item(s): {}.{} Your final message is ONLY the JSON investigator report described in the invariants; the controller consumes it through grounded intake. Do not edit source and start no other model or paid calls.",
-        run.spec.run,
-        evidence.index.len(),
-        listed,
-        root_note
-    );
-    let assignment = json!({
-        "schema": 1,
-        "objective": objective,
-        "inputs": [],
-        "outputs": [],
-        "invariants": [
-            "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"<own OpenSpec change reference>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates",
-            "every candidate cites at least one observed retained locator; intake refuses an ungrounded or prediction-only citation",
-            "the spec field names the candidate's own OpenSpec change under the run's openspec/changes planning root; an existing linked change is valid as it stands, and the controller qualifies it - preparing and authoring a missing change - before any implementation",
-            "this conversation edits no file and dispatches no other model work",
-        ],
-        "acceptance": [
-            "the report parses as a bounded schema-1 investigator report and every candidate cites at least one retained observed locator",
-        ],
-        "consumer": "the improvement controller's grounded intake (codex-harness improve)",
-        "escalate": [],
-    });
+    let assignment = investigator_assignment(run, evidence);
     let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Investigator);
     dispatch_bound_assignment(
         run,
@@ -1466,6 +1488,46 @@ fn dispatch_investigator(
         attempt_id,
         notes,
     )
+}
+
+/// The bounded investigator assignment document. Construction is pure, so the
+/// native structured contract can be checked without a controller run.
+fn investigator_assignment(run: &Run, evidence: &Evidence) -> serde_json::Value {
+    let mut invariants = vec![
+        "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"<own OpenSpec change reference>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates".to_owned(),
+        "every candidate cites at least one observed retained locator; intake refuses an ungrounded or prediction-only citation".to_owned(),
+        "the spec field names the candidate's own OpenSpec change under the run's openspec/changes planning root; an existing linked change is valid as it stands, and the controller qualifies it - preparing and authoring a missing change - before any implementation".to_owned(),
+        "this conversation edits no file and dispatches no other model work".to_owned(),
+    ];
+    // Retained evidence locators are not checkout-relative paths, so the
+    // structured inputs field cannot carry them. Each listed locator stays a
+    // separately bounded invariant item: the whole inspection input remains
+    // visible in the brief and the objective cannot overflow on long roots.
+    for locator in evidence.listing.iter().take(MAX_LISTED_EVIDENCE) {
+        invariants.push(format!("retained evidence to inspect: {locator}"));
+    }
+    if let Some(root) = &evidence.root {
+        invariants.push(format!(
+            "locators shaped file:<relative path> name retained files under {}",
+            root.display()
+        ));
+    }
+    let objective = format!(
+        "Bounded improvement investigation for run {}. Inspect this checkout's source and every retained evidence locator recorded in the invariants. Your final message is ONLY the JSON investigator report described in the other invariants; the controller consumes it through grounded intake. Do not edit source and start no other model or paid calls.",
+        run.spec.run
+    );
+    json!({
+        "schema": 1,
+        "objective": objective,
+        "inputs": [],
+        "outputs": [],
+        "invariants": invariants,
+        "acceptance": [
+            "the report parses as a bounded schema-1 investigator report and every candidate cites at least one retained observed locator",
+        ],
+        "consumer": "the improvement controller's grounded intake (codex-harness improve)",
+        "escalate": [],
+    })
 }
 
 fn relative_files(root: &Path, directory: &Path) -> io::Result<Vec<String>> {
@@ -1880,4 +1942,176 @@ fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
 fn git_ok(cwd: &Path, args: &[&str]) -> io::Result<bool> {
     let status = Command::new("git").args(args).current_dir(cwd).status()?;
     Ok(status.success())
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+
+    const LONG_CHANGE: &str = "add-evidence-grounded-terminal-report-intake";
+
+    fn long_scope() -> Vec<String> {
+        [
+            "crates/one/src/improvement_intake_adapter.rs",
+            "crates/one/src/improvement_workflow_brief.rs",
+            "crates/one/src/executor_assignment_contract.rs",
+            "crates/one/src/terminal_framing_recovery.rs",
+            "crates/one/src/retained_evidence_index.rs",
+            "crates/one/src/dispatch_scope_validation.rs",
+            "crates/one/src/no_replay_recovery.rs",
+        ]
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect()
+    }
+
+    /// One controller fixture with ordinary long owned roots: a long change
+    /// name, seven explicit writable file paths, absolute board paths and
+    /// several retained evidence locators.
+    fn fixture(root: &Path) -> (Run, CandidateState, Evidence) {
+        let checkout = root.join("owned-checkout-with-an-ordinary-long-name");
+        let change_dir = checkout.join(candidate_change_dir(LONG_CHANGE));
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("proposal.md"), "## Why\n\nSynthetic.\n").unwrap();
+        let codex_home = root.join("codex-home-with-an-ordinary-long-name");
+        let bd = codex_home.join("harness/bin/bd.exe");
+        fs::create_dir_all(bd.parent().unwrap()).unwrap();
+        fs::write(&bd, "fixture board executable").unwrap();
+        let document = json!({
+            "schema": 1,
+            "run": "workflow-fixture",
+            "project": checkout,
+            "codex_home": codex_home,
+            "board": {"bd": bd, "project": checkout},
+            "specification": {
+                "project": checkout,
+                "change": LONG_CHANGE,
+                "store": serde_json::Value::Null,
+                "planning_root": checkout,
+            },
+            "hypothesis_item": "bdcw-card",
+            "experiment": {
+                "acceptance_artifact": "specs/synthetic/spec.md",
+                "acceptance_heading": "#### Scenario: Synthetic case",
+                "mechanism": "bounded-output",
+                "counterexample": "diagnostics vanish on failure",
+                "applicability": "local tool runs",
+                "independent_acceptance": "the oracle checker executes",
+                "meaningful_effect": "fewer repeated loads",
+                "operating_conditions": "cold context",
+                "comparison_policy": "matched pairs",
+                "stopping_rule": "two repeats",
+            },
+            "base_revision": "0123456789abcdef0123456789abcdef01234567",
+            "writable_scope": long_scope(),
+            "runner": serde_json::Value::Null,
+            "local_runner": serde_json::Value::Null,
+            "qualification": serde_json::Value::Null,
+            "evidence_root": serde_json::Value::Null,
+            "publication_scope": ["experiment"],
+            "oracle": "outcome-oracle:private-request",
+            "removal": serde_json::Value::Null,
+        });
+        let spec: RunSpec = serde_json::from_value(document).unwrap();
+        fs::write(
+            root.join(SPEC_FILE),
+            serde_json::to_vec_pretty(&spec).unwrap(),
+        )
+        .unwrap();
+        let store = RunStore::open(root).unwrap();
+        let cursor = Cursor::new(
+            &spec.run,
+            "spec-digest".to_owned(),
+            checkout.clone(),
+            &spec.hypothesis_item,
+        );
+        let run = Run {
+            store,
+            spec,
+            cursor,
+            guard: None,
+        };
+        let candidate = CandidateState::new("bdcw-card", LONG_CHANGE).unwrap();
+        let evidence = Evidence {
+            index: EvidenceIndex::default(),
+            digest: "evidence-digest".to_owned(),
+            listing: vec![
+                "file:first-retained-locator-with-an-ordinary-length.txt".to_owned(),
+                "file:second-retained-locator-with-an-ordinary-length.txt".to_owned(),
+                "file:third-retained-locator-with-an-ordinary-length.txt".to_owned(),
+            ],
+            root: Some(root.join("retained-evidence-root-with-an-ordinary-long-name")),
+        };
+        (run, candidate, evidence)
+    }
+
+    /// Validates one generated document through the native structured
+    /// assignment owner and returns the exact rendered brief.
+    fn native_brief(document: &serde_json::Value, checkout: &Path, name: &str) -> String {
+        let path = checkout
+            .parent()
+            .unwrap()
+            .join(format!("{name}-assignment.json"));
+        fs::write(&path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
+        let assignment = crate::executor_assignment::Assignment::load(&path)
+            .unwrap_or_else(|error| panic!("{name} assignment is refused: {error}"));
+        crate::executor_assignment::brief(
+            &assignment,
+            &crate::executor_assignment::AssignmentContext {
+                checkout,
+                base: "0123456789abcdef0123456789abcdef01234567",
+                owner: "unit-assignment-check",
+                source: checkout,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{name} brief is refused: {error}"))
+    }
+
+    #[test]
+    fn generated_assignments_pass_the_native_structured_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let (run, candidate, evidence) = fixture(temp.path());
+        let checkout = run.spec.project.clone();
+
+        // Investigator: the objective stays bounded and every retained
+        // evidence locator remains visible in the invariant items.
+        let brief = native_brief(
+            &investigator_assignment(&run, &evidence),
+            &checkout,
+            "investigator",
+        );
+        for locator in &evidence.listing {
+            assert!(brief.contains(locator), "{brief}");
+        }
+        assert!(
+            brief.contains("retained-evidence-root-with-an-ordinary-long-name"),
+            "{brief}"
+        );
+
+        // Planner: the complete planning reference stays visible.
+        let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
+        let brief = native_brief(
+            &planner_assignment(&run, &candidate, inputs.clone()),
+            &checkout,
+            "planner",
+        );
+        assert!(brief.contains(LONG_CHANGE), "{brief}");
+        assert!(brief.contains("#### Scenario: Synthetic case"), "{brief}");
+        assert!(brief.contains("specs/synthetic/spec.md"), "{brief}");
+        assert!(brief.contains(" show bdcw-card --json"), "{brief}");
+
+        // Implementer: the reproducing multi-file scope stays visible and the
+        // brief satisfies the native objective, item and size bounds.
+        let brief = native_brief(
+            &implementer_assignment(&run, &candidate, inputs),
+            &checkout,
+            "implementer",
+        );
+        assert!(brief.contains(LONG_CHANGE), "{brief}");
+        for entry in &run.spec.writable_scope {
+            assert!(brief.contains(entry), "{entry}: {brief}");
+        }
+        assert!(brief.contains(" show bdcw-card --json"), "{brief}");
+        assert!(brief.contains("the oracle checker executes"), "{brief}");
+    }
 }

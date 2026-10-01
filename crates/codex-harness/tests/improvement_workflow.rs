@@ -102,10 +102,17 @@ struct Fixture {
     spec: PathBuf,
     bd: PathBuf,
     card: String,
+    change: String,
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        Self::new_with_change(name, "add-synthetic")
+    }
+
+    /// One owned synthetic project whose committed OpenSpec change is named
+    /// `change`; the admitted card references that same change.
+    fn new_with_change(name: &str, change: &str) -> Self {
         let cleanup = tempfile::tempdir().unwrap();
         let canonical = cleanup.path().canonicalize().unwrap();
         let root = canonical
@@ -146,18 +153,12 @@ impl Fixture {
         assert!(init.status.success(), "openspec init: {}", text(&init));
         let created = openspec(
             &proj,
-            &[
-                "new",
-                "change",
-                "add-synthetic",
-                "--schema",
-                "spec-driven",
-                "--json",
-            ],
+            &["new", "change", change, "--schema", "spec-driven", "--json"],
         );
         assert!(created.status.success(), "openspec new: {}", text(&created));
         write_change(
             &proj,
+            change,
             "## Why\n\nSynthetic.\n",
             "## Context\n\nSynthetic.\n",
             "## 1. Work\n\n- [ ] 1.1 Do the synthetic thing.\n",
@@ -200,6 +201,7 @@ impl Fixture {
             spec: PathBuf::new(),
             bd,
             card: String::new(),
+            change: change.to_owned(),
         };
         fixture.card = fixture.admit();
         fixture.spec = fixture.root.join(format!("run-spec-{name}.json"));
@@ -208,6 +210,7 @@ impl Fixture {
     }
 
     fn admit(&self) -> String {
+        let spec = format!("openspec/changes/{}", self.change);
         let out = self.feedback(&[
             "hypothesis-admit",
             "--mechanism",
@@ -223,7 +226,7 @@ impl Fixture {
             "--acceptance",
             "the independent oracle passes",
             "--spec",
-            "openspec/changes/add-synthetic",
+            &spec,
             "--basis",
             "evidence-1",
         ]);
@@ -262,7 +265,7 @@ impl Fixture {
             "board": {"bd": self.bd, "project": self.proj},
             "specification": {
                 "project": self.proj,
-                "change": "add-synthetic",
+                "change": self.change,
                 "store": Value::Null,
                 "planning_root": self.proj,
             },
@@ -321,6 +324,21 @@ impl Fixture {
         self.improve(&["resume", "--run", self.run.to_str().unwrap()])
     }
 
+    /// Runs the native model-free structured-assignment check: it loads one
+    /// generated assignment through the same validator a dispatch uses and
+    /// renders the exact brief without claiming, writing or launching.
+    fn assignment_check(&self, slot: u32, assignment: &Path) -> Output {
+        let mut command = Command::new(manager());
+        command
+            .arg("executor")
+            .arg("assignment")
+            .arg("--source")
+            .arg(&self.proj)
+            .args(["--slot", &slot.to_string(), "--assignment"])
+            .arg(assignment);
+        command.output().expect("executor assignment check runs")
+    }
+
     fn status_json(&self) -> Value {
         let status = self.improve(&["status", "--run", self.run.to_str().unwrap(), "--json"]);
         assert!(status.status.success(), "status: {}", text(&status));
@@ -356,8 +374,8 @@ impl Fixture {
     }
 }
 
-fn write_change(proj: &Path, proposal: &str, design: &str, tasks: &str) {
-    let change = proj.join("openspec/changes/add-synthetic");
+fn write_change(proj: &Path, name: &str, proposal: &str, design: &str, tasks: &str) {
+    let change = proj.join("openspec/changes").join(name);
     fs::create_dir_all(change.join("specs/synthetic")).unwrap();
     fs::write(change.join("proposal.md"), proposal).unwrap();
     fs::write(change.join("design.md"), design).unwrap();
@@ -822,6 +840,205 @@ fn an_ambiguous_terminal_message_is_refused_without_model_churn() {
     assert_eq!(
         fixture.cursor()["attempts"].as_array().unwrap().len(),
         baseline + 1
+    );
+}
+
+/// The reproducing ordinary case: one long change name, seven explicit
+/// writable file paths and the fixture's absolute board and project roots.
+/// Every generated workflow assignment must satisfy the native structured
+/// contract through the native model-free path, keep the full declared scope
+/// visible, and keep a pre-submission refusal a recorded failed attempt while
+/// the settled investigator result is consumed exactly once.
+#[test]
+fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
+    let change = "add-evidence-grounded-terminal-report-intake";
+    let fixture = Fixture::new_with_change("brief-budget", change);
+    let (root, locator) = write_evidence_root(&fixture);
+    let scope = [
+        "crates/one/src/improvement_intake_adapter.rs",
+        "crates/one/src/improvement_workflow_brief.rs",
+        "crates/one/src/executor_assignment_contract.rs",
+        "crates/one/src/terminal_framing_recovery.rs",
+        "crates/one/src/retained_evidence_index.rs",
+        "crates/one/src/dispatch_scope_validation.rs",
+        "crates/one/src/no_replay_recovery.rs",
+    ];
+    fixture.write_spec(&[
+        ("evidence_root", json!(root)),
+        ("writable_scope", json!(scope)),
+    ]);
+    fake_launcher(&fixture);
+    // The native `executor assignment` check names this pool slot; it is a
+    // registered worktree of the fixture project, created model-free.
+    slot_worktree(
+        &fixture.proj,
+        &fixture.root.join("proj-brief-budget-wt1"),
+        &head(&fixture.proj),
+    );
+
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    // The start dispatch wrote its investigator assignment before the fake
+    // surface failed; validate that builder through the native model-free path.
+    let investigator_assignment = fixture.run.join("assignments/investigator-1.json");
+    assert!(
+        investigator_assignment.is_file(),
+        "{investigator_assignment:?}"
+    );
+    let check = fixture.assignment_check(1, &investigator_assignment);
+    assert!(check.status.success(), "{}", text(&check));
+    let investigator_brief = text(&check);
+    assert!(
+        investigator_brief.contains("executor assignment valid"),
+        "{investigator_brief}"
+    );
+    assert!(
+        investigator_brief.contains(&locator),
+        "the retained evidence locator stays visible: {investigator_brief}"
+    );
+
+    // The refused pre-submission dispatch is a recorded attempt with a known
+    // outcome, never an unknown or billed one.
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["state"] != "unknown"),
+        "{cursor}"
+    );
+
+    // Replace the refused investigator conversation with the completed one the
+    // real dispatcher would record; the controller must consume it exactly once.
+    let result = fixture.run.join("investigator-result.json");
+    let report = json!({
+        "schema": 1,
+        "candidates": [{
+            "mechanism": "bounded-output",
+            "conditions": "local-tool-runs",
+            "observation": locator,
+            "predicted": "less repeated context loading",
+            "counterexample": "diagnostics vanish on failure",
+            "acceptance": "the independent oracle passes",
+            "spec": format!("openspec/changes/{change}"),
+            "basis": locator,
+            "treatment": "addition",
+            "evidence": [{"locator": locator, "kind": "observed"}],
+            "next_check": null,
+        }],
+        "idle_reason": null,
+    });
+    fs::write(&result, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    let receipt = fixture.run.join("investigator-receipt.json");
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-investigator-1",
+        "gen-1",
+        "completed",
+        Some(0),
+    );
+    replace_attempt(
+        &fixture,
+        attempt_json(
+            "investigator-1",
+            "investigator",
+            "workflow-fixture-investigator-1",
+            "gen-1",
+            &receipt,
+            Some(&result),
+            None,
+            "started",
+        ),
+    );
+    let result_sha = hash_bytes(&fs::read(&result).unwrap());
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(status["candidate"]["hypothesis"], fixture.card, "{status}");
+    assert_eq!(status["candidate"]["change"], change, "{status}");
+    assert_eq!(
+        status["intake"]["outcomes"][0]["outcome"], "existing",
+        "{status}"
+    );
+    assert_eq!(
+        status["intake"]["result_sha256"],
+        json!(result_sha),
+        "{status}"
+    );
+
+    // The implementation dispatch wrote its brief before the fake surface
+    // failed; the refusal is pre-submission and never an unknown billed attempt.
+    let implementer = fixture.cursor()["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == "implementer-1")
+        .cloned()
+        .expect("the implementation dispatch recorded its attempt");
+    assert_eq!(implementer["state"], "failed", "{implementer}");
+    let reason = implementer["reason"].as_str().unwrap().to_owned();
+    assert!(reason.contains("before submission"), "{implementer}");
+    assert!(
+        !reason.contains("objective") && !reason.contains("1024"),
+        "the generated assignment passes the native limits: {implementer}"
+    );
+
+    // Native model-free validation: the reproducing multi-file brief passes
+    // the same validator dispatch uses and renders the full brief.
+    let implementer_assignment = fixture.run.join("assignments/implementer-1.json");
+    assert!(
+        implementer_assignment.is_file(),
+        "{implementer_assignment:?}"
+    );
+    let check = fixture.assignment_check(1, &implementer_assignment);
+    assert!(check.status.success(), "{}", text(&check));
+    let brief = text(&check);
+    assert!(brief.contains("executor assignment valid"), "{brief}");
+    assert!(brief.contains(change), "{brief}");
+    for path in &scope {
+        assert!(
+            brief.contains(*path),
+            "the declared writable path {path} stays visible: {brief}"
+        );
+    }
+    assert!(
+        brief.contains(&fixture.card) && brief.contains(" show "),
+        "the card read stays visible: {brief}"
+    );
+    assert!(
+        brief.contains("the oracle checker executes"),
+        "the predeclared acceptance stays visible: {brief}"
+    );
+
+    // A repeated resume dispatches no new investigator round and never
+    // re-consumes the settled result.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(result_sha),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|attempt| attempt["role"] == "investigator")
+            .count(),
+        1,
+        "{cursor}"
+    );
+    assert!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["state"] != "unknown"),
+        "{cursor}"
     );
 }
 
