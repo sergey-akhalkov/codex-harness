@@ -259,14 +259,25 @@ broader installed-lifecycle workflow remains manual; neither route calls a
 model. Missing prerequisites fail instead of silently skipping these tests.
 
 Transient reset, refused/aborted connection, broken pipe and EOF allow one
-retry of known read operations under the original deadline. The client
+retry of known read operations and project activation under the original
+deadline. The client
 revalidates the broker and restores its cached route without retiring a healthy
 shared owner. A worker with a closed MCP pipe is retired even if its process
 still appears alive; the typed transport failure reaches the same bounded
-retry policy. Worker errors retain the stderr evidence path. Unknown tools
+retry policy. Worker errors retain the stderr evidence path, native exit state
+and available per-worker Job memory observations. Unknown tools
 and edits are not replayed after an uncertain
 response. Persistent failure remains an error. Existing conversations retain
 their loaded proxy binary until restarted after an update.
+
+The broker's parent Windows Job includes its 2 GiB service allowance plus
+4 GiB for each configured worker slot (14 GiB with the default three slots).
+This is a committed-memory ceiling, not preallocated RAM. Each worker retains
+its own 4 GiB limit, and startup/retirement still count against pool capacity.
+The native kernel readback is recorded at startup in the owned service log.
+A smaller parent cap applies to all descendants and can cause simultaneous
+allocation failures despite the larger per-worker limit; see Microsoft's
+[nested Job accounting](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs).
 
 The handshake's `serverInfo.version` (currently 1.28.1) is the vendored MCP
 SDK version reported by FastMCP; the Serena distribution itself is 1.7.0

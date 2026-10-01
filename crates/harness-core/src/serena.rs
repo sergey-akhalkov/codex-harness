@@ -301,6 +301,23 @@ impl Session {
         &self.stderr
     }
 
+    pub fn failure_context(&self) -> String {
+        let exit = match self.child.exit_code() {
+            Ok(Some(code)) => format!("0x{code:08x}"),
+            Ok(None) => "still running".to_owned(),
+            Err(error) => format!("unavailable ({error})"),
+        };
+        let memory = match self.job.as_ref().map(Job::snapshot) {
+            Some(Ok(snapshot)) => format!(
+                "worker_job_peak_bytes={}, worker_job_limit_bytes={}",
+                snapshot.peak_job_memory_bytes, snapshot.memory_limit_bytes
+            ),
+            Some(Err(error)) => format!("worker_job_memory=unavailable ({error})"),
+            None => "worker_job_memory=closed".to_owned(),
+        };
+        format!("pid={}, exit_code={exit}, {memory}", self.identity().pid)
+    }
+
     fn send(&mut self, value: Value, deadline: Deadline) -> io::Result<()> {
         let mut bytes = serde_json::to_vec(&value)?;
         bytes.push(b'\n');

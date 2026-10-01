@@ -277,6 +277,23 @@ fn real_serena_recovers_reset_without_replaying_edits() {
     );
     assert_eq!(reply["result"]["serverInfo"]["name"], "Serena", "{reply}");
     assert!(symbol_text(&mut proxy, 2).contains("601"));
+    let anchor: Value = serde_json::from_slice(
+        &fs::read(codex_home.join("harness/runtime/serena-broker.json")).unwrap(),
+    )
+    .unwrap();
+    let log = fs::read_to_string(Path::new(anchor["root"].as_str().unwrap()).join("service.log"))
+        .unwrap();
+    let memory: Value = serde_json::from_str(
+        log.lines()
+            .find_map(|line| line.strip_prefix("serena-broker: memory "))
+            .expect("actual service Job memory readback"),
+    )
+    .unwrap();
+    assert!(
+        memory["broker_limit_bytes"].as_u64().unwrap()
+            > memory["worker_limit_bytes"].as_u64().unwrap()
+                * memory["worker_capacity"].as_u64().unwrap()
+    );
     let relay = ResetRelay::start(&codex_home);
     let query = json!({"name": "get_symbols_overview", "arguments": {
         "relative_path": "src/lib.rs", "depth": 0, "max_answer_chars": 3800
@@ -322,9 +339,46 @@ fn real_serena_recovers_reset_without_replaying_edits() {
         reply["result"].to_string().contains("inserted_once"),
         "{reply}"
     );
+    let beta = crate_project(root.path(), "reset beta", 701);
+    let activation = json!({"name": "activate_project", "arguments": {"project": beta}});
+    relay.arm("activate_project", 1);
+    let reply = proxy.request(60, "tools/call", activation.clone());
+    assert_eq!(reply["id"], 60);
+    assert!(
+        reply.get("error").is_none(),
+        "activation must recover: {reply}"
+    );
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    assert_eq!(
+        relay.calls(),
+        2,
+        "activation retries once after its response is lost"
+    );
+    assert!(symbol_text(&mut proxy, 61).contains("701"));
+    relay.arm("activate_project", 3);
+    let reply = proxy.request(62, "tools/call", activation);
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    assert_eq!(relay.calls(), 2, "persistent activation failure is bounded");
+    relay.arm("", 0);
+    assert!(symbol_text(&mut proxy, 63).contains("701"));
+    let reply = proxy.request(
+        64,
+        "tools/call",
+        json!({
+            "name":"activate_project", "arguments":{"project":project}
+        }),
+    );
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert!(symbol_text(&mut proxy, 65).contains("601"));
     drop(relay);
     let status = broker_status(&codex_home);
-    let worker = &status["backend"]["workers"][0];
+    let pid = worker_pid(&status, &project).unwrap();
+    let worker = status["backend"]["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|worker| worker["pid"] == pid)
+        .unwrap();
     let identity = harness_core::process::ProcessIdentity {
         pid: worker["pid"].as_u64().unwrap() as u32,
         creation_time: worker["creation_time"].as_u64().unwrap(),
@@ -362,6 +416,51 @@ use std::{
     thread,
     time::Duration,
 };
+
+#[test]
+fn closed_worker_retains_native_exit_and_memory_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command =
+        harness_core::process::CommandSpec::new(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    command.args = vec![
+        "exit-code".into(),
+        root.path().join("exit.json").into(),
+        "42".into(),
+    ];
+    let cancel = Cancellation::default();
+    let mut session = harness_core::serena::Session::start_shared(
+        command,
+        root.path().join("stderr.txt"),
+        &cancel,
+    )
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while session.is_alive() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!session.is_alive(), "owned exit fixture did not stop");
+    let error = session
+        .request(
+            "ping",
+            json!({}),
+            Deadline::after(Duration::from_secs(5)).unwrap(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+        ),
+        "{error:?}"
+    );
+    let context = session.failure_context();
+    assert!(context.contains("exit_code=0x0000002a"), "{context}");
+    assert!(context.contains("worker_job_peak_bytes="), "{context}");
+    assert!(!context.contains("unavailable"), "{context}");
+    let outcome = session.close().unwrap();
+    assert_eq!(outcome.process_exit_code, 42);
+    assert_eq!(outcome.job.active_processes, 0);
+}
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

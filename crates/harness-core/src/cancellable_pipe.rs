@@ -68,6 +68,7 @@ pub enum PipeIoError {
     Cancelled { worker_joined: bool },
     DeadlineExpired { worker_joined: bool },
     EndOfFile,
+    BrokenPipe { code: u32 },
     Io(String),
     Unsupported { reason: String },
     UnresolvedOwnership { reason: String },
@@ -90,6 +91,7 @@ impl From<PipeIoError> for io::Error {
             PipeIoError::Cancelled { .. } => io::Error::new(io::ErrorKind::Interrupted, error),
             PipeIoError::DeadlineExpired { .. } => io::Error::new(io::ErrorKind::TimedOut, error),
             PipeIoError::EndOfFile => io::Error::new(io::ErrorKind::UnexpectedEof, error),
+            PipeIoError::BrokenPipe { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
             PipeIoError::Io(_) => io::Error::other(error),
             PipeIoError::Unsupported { .. } => io::Error::new(io::ErrorKind::Unsupported, error),
             PipeIoError::UnresolvedOwnership { .. } => {
@@ -112,6 +114,9 @@ impl std::fmt::Display for PipeIoError {
                 )
             }
             Self::EndOfFile => write!(f, "pipe reached EOF"),
+            Self::BrokenPipe { code } => {
+                write!(f, "pipe peer closed during write (Windows error {code})")
+            }
             Self::Io(message) => write!(f, "{message}"),
             Self::Unsupported { reason } => write!(f, "unsupported pipe endpoint: {reason}"),
             Self::UnresolvedOwnership { reason } => write!(
@@ -577,8 +582,17 @@ fn map_io_error(op: &str) -> PipeIoError {
             worker_joined: false,
         };
     }
-    if op == "ReadFile" && (code == ERROR_BROKEN_PIPE || code == ERROR_NO_DATA) {
-        return PipeIoError::EndOfFile;
+    if matches!(
+        code,
+        ERROR_BROKEN_PIPE
+            | ERROR_NO_DATA
+            | windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED
+    ) {
+        return if op == "ReadFile" {
+            PipeIoError::EndOfFile
+        } else {
+            PipeIoError::BrokenPipe { code }
+        };
     }
     let error = io::Error::from_raw_os_error(code as i32);
     PipeIoError::Io(format!("{op} failed: {error}"))

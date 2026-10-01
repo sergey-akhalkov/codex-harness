@@ -89,6 +89,31 @@ fn eof_after_peer_writer_close() {
 }
 
 #[test]
+fn closed_reader_preserves_broken_pipe_classification() {
+    let (read, write) = anonymous_pipe(PIPE_BUFFER).unwrap();
+    let cancel = Cancellation::default();
+    let mut writer = CancellablePipe::writer(write, cancel.clone()).unwrap();
+    drop(read);
+    let error = writer
+        .write_all(b"request\n", deadline(5_000), &cancel)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            PipeIoError::BrokenPipe {
+                code: 109 | 232 | 233
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        std::io::Error::from(error).kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    writer.close(deadline(5_000)).unwrap();
+}
+
+#[test]
 fn unicode_multibyte_roundtrip() {
     let (read, write) = anonymous_pipe(PIPE_BUFFER).unwrap();
     let cancel = Cancellation::default();

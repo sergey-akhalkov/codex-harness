@@ -726,6 +726,47 @@ mod native {
     }
 
     #[test]
+    fn updating_job_memory_preserves_containment_and_enforces_new_allowance() {
+        let root = root("memory-update");
+        let job = Job::new(Limits {
+            memory_bytes: Some(80 * 1024 * 1024),
+            cpu_percent: Some(25.0),
+        })
+        .unwrap();
+        let before = job.snapshot().unwrap();
+        assert!(job.set_memory_limit(0).is_err());
+        assert_eq!(
+            job.snapshot().unwrap().memory_limit_bytes,
+            before.memory_limit_bytes
+        );
+        job.set_memory_limit(200 * 1024 * 1024).unwrap();
+        let after = job.snapshot().unwrap();
+        assert_eq!(after.memory_limit_bytes, 200 * 1024 * 1024);
+        assert_eq!(after.cpu_rate, before.cpu_rate);
+        assert!(after.cpu_hard_cap && after.kill_on_close && !after.handle_inheritable);
+
+        let mut first = spec("allocate-hold", &root.join("granted.json"));
+        first.args.push("128".into());
+        let granted_process = job.spawn(&first).unwrap();
+        let granted = receipt(&root.join("granted.json"));
+        assert_eq!(granted["allocated_mib"], 128, "{granted}");
+        assert!(granted["error"].is_null(), "{granted}");
+
+        let mut second = spec("allocate", &root.join("denied.json"));
+        second.args.push("128".into());
+        let denied_process = job.spawn(&second).unwrap();
+        let denied = receipt(&root.join("denied.json"));
+        assert_eq!(
+            denied["error"], 1455,
+            "new aggregate limit remains enforced: {denied}"
+        );
+        let outcome = run(job, &denied_process);
+        assert_eq!(outcome.reason, StopReason::MemoryLimit);
+        assert!(granted_process.wait_for_exit(CLEANUP).unwrap());
+        assert_eq!(outcome.job.active_processes, 0);
+    }
+
+    #[test]
     fn cpu_hard_cap_reduces_actual_process_cpu_time() {
         let root = root("cpu");
         let capped_job = Job::new(Limits {

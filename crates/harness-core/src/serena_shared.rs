@@ -934,7 +934,7 @@ impl Pool {
             let elapsed = started.elapsed();
             // A live process can still have a permanently closed MCP pipe.
             // Retire the broken channel even for an uncertain edit; only the
-            // proxy's safe-read policy may replay the operation once.
+            // proxy's replay policy may retry an eligible operation once.
             if outcome
                 .as_ref()
                 .err()
@@ -1259,7 +1259,8 @@ impl SharedWorker for SerenaWorker {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "Serena worker {method} failed: {error}; stderr: {}",
+                    "Serena worker {method} failed: {error}; {}; stderr: {}",
+                    session.failure_context(),
                     session.stderr_path().display()
                 ),
             )
@@ -2170,6 +2171,51 @@ mod tests {
         let first = rpc(&pool, &Fixture::client(1), &alpha, "tools/list", json!({})).unwrap();
         assert_eq!(content(&first)["fixture"], 0);
         assert_eq!(fixture.starts.load(Ordering::SeqCst), 2);
+        pool.close(Fixture::deadline()).unwrap();
+    }
+
+    #[test]
+    fn activation_eof_preserves_route_and_replacement_is_isolated() {
+        let (fixture, pool) = Fixture::new("activation-eof", 3, 300);
+        let alpha = fixture.project("alpha");
+        let beta = fixture.project("beta");
+        let client = Fixture::client(1);
+        let other = Fixture::client(2);
+        let original = connect(&pool, &client, &alpha).unwrap()["route"].clone();
+        connect(&pool, &other, &alpha).unwrap();
+        fixture.plan(
+            &beta,
+            Plan {
+                pipe_failure: true,
+                ..Plan::default()
+            },
+        );
+        let activation = json!({"name":"activate_project", "arguments":{"project":beta}});
+        let error = rpc(&pool, &client, &alpha, "tools/call", activation.clone()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(fixture.closed(1));
+        assert_eq!(
+            fixture.requests(1).len(),
+            1,
+            "the pool itself never replays uncertain operations"
+        );
+        assert_eq!(
+            rpc(&pool, &client, &alpha, "tools/list", json!({})).unwrap()["route"],
+            original
+        );
+
+        fixture.plan(&beta, Plan::default());
+        let activated = rpc(&pool, &client, &alpha, "tools/call", activation).unwrap();
+        assert_eq!(
+            activated["route"]["project"],
+            json!(crate::dependency_package::resolved(&beta).unwrap())
+        );
+        assert_eq!(activated["tools_changed"], true);
+        assert_eq!(fixture.starts(), 3);
+        assert_eq!(
+            rpc(&pool, &other, &alpha, "tools/list", json!({})).unwrap()["route"],
+            original
+        );
         pool.close(Fixture::deadline()).unwrap();
     }
 

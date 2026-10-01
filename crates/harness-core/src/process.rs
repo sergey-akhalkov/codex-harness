@@ -737,6 +737,28 @@ mod windows {
             query_job(self.handle.as_raw_handle(), class)
         }
 
+        /// Adjust an owned job's aggregate allowance without changing CPU,
+        /// containment, process limits or completion-port ownership.
+        pub fn set_memory_limit(&self, bytes: usize) -> io::Result<()> {
+            if bytes == 0 {
+                return Err(invalid("memory limit must be positive"));
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                self.query(JobObjectExtendedLimitInformation)?;
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            limits.JobMemoryLimit = bytes;
+            self.set(JobObjectExtendedLimitInformation, &limits)?;
+            let actual: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                self.query(JobObjectExtendedLimitInformation)?;
+            if actual.JobMemoryLimit != bytes
+                || actual.BasicLimitInformation.LimitFlags
+                    != limits.BasicLimitInformation.LimitFlags
+            {
+                return Err(io::Error::other("job memory update was not observed"));
+            }
+            Ok(())
+        }
+
         pub fn snapshot(&self) -> io::Result<JobSnapshot> {
             let extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
                 self.query(JobObjectExtendedLimitInformation)?;

@@ -91,6 +91,9 @@ fn retry_allowed(
                     | "find_implementations"
                     | "get_diagnostics_for_file"
                     | "get_diagnostics_for_symbol"
+                    // Selecting the same project again is idempotent. The
+                    // pool commits the caller's route only after success.
+                    | "activate_project"
             )
         ),
         _ => false,
@@ -605,6 +608,18 @@ impl broker_service::Backend for Backend {
     }
 }
 
+fn allow_worker_memory(job: &crate::process::Job, capacity: usize) -> io::Result<usize> {
+    // The bootstrap allowance is for the service itself. A parent Windows Job
+    // also charges every nested worker, so it must include their allowances.
+    let bootstrap = job.snapshot()?.memory_limit_bytes;
+    let aggregate = serena::WORKER_JOB_MEMORY_BYTES
+        .checked_mul(capacity)
+        .and_then(|workers| workers.checked_add(bootstrap))
+        .ok_or_else(|| invalid("Serena aggregate memory limit overflow"))?;
+    job.set_memory_limit(aggregate)?;
+    Ok(job.snapshot()?.memory_limit_bytes)
+}
+
 pub fn serve(
     mut guard: ServiceGuard,
     expected: &str,
@@ -644,6 +659,15 @@ pub fn serve(
     let mut log = OpenOptions::new().append(true).open(&log_path)?;
     log.flush()?;
     guard.redirect_standard_streams(&log)?;
+    let aggregate = allow_worker_memory(guard.job(), policy.max_projects)?;
+    writeln!(
+        log,
+        "serena-broker: memory {}",
+        json!({"broker_limit_bytes": aggregate,
+            "worker_limit_bytes": serena::WORKER_JOB_MEMORY_BYTES,
+            "worker_capacity": policy.max_projects})
+    )?;
+    log.flush()?;
     let backend = Backend::start(policy, &configuration)?;
     broker_service::run(
         &root,
@@ -663,10 +687,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transport_replay_is_bounded_to_known_reads_and_live_deadlines() {
+    fn broker_job_includes_worker_allowances_without_removing_other_limits() {
+        let bootstrap = 2 * 1024 * 1024 * 1024;
+        let job = crate::process::Job::new(crate::process::Limits {
+            memory_bytes: Some(bootstrap),
+            cpu_percent: Some(25.0),
+        })
+        .unwrap();
+        assert_eq!(
+            allow_worker_memory(&job, 3).unwrap(),
+            bootstrap + 3 * serena::WORKER_JOB_MEMORY_BYTES
+        );
+        let snapshot = job.snapshot().unwrap();
+        assert!(snapshot.kill_on_close && snapshot.cpu_hard_cap && !snapshot.handle_inheritable);
+        assert_eq!(snapshot.cpu_rate, 2500);
+        assert!(allow_worker_memory(&job, usize::MAX).is_err());
+        assert_eq!(
+            job.snapshot().unwrap().memory_limit_bytes,
+            snapshot.memory_limit_bytes
+        );
+    }
+
+    #[test]
+    fn transport_replay_is_bounded_to_safe_operations_and_live_deadlines() {
         let cancel = Cancellation::default();
         let deadline = Deadline::after(Duration::from_secs(10)).unwrap();
         let read = json!({"method":"tools/call","params":{"name":"get_symbols_overview"}});
+        let activation = json!({"method":"tools/call","params":{
+            "name":"activate_project", "arguments":{"project":"C:/owned/project"}
+        }});
         for kind in [
             io::ErrorKind::ConnectionReset,
             io::ErrorKind::ConnectionAborted,
@@ -677,6 +726,7 @@ mod tests {
         ] {
             let error = io::Error::new(kind, "localized transport detail");
             assert!(retry_allowed("rpc", &read, &error, deadline, &cancel));
+            assert!(retry_allowed("rpc", &activation, &error, deadline, &cancel));
             assert!(retry_allowed(
                 "connect",
                 &json!({}),
@@ -690,7 +740,7 @@ mod tests {
                 "replace_in_files",
                 "rename_symbol",
                 "safe_delete_symbol",
-                "activate_project",
+                "remove_project",
                 "unknown_tool",
             ] {
                 assert!(
@@ -712,23 +762,39 @@ mod tests {
             io::ErrorKind::Interrupted,
             io::ErrorKind::Other,
         ] {
-            assert!(!retry_allowed(
-                "rpc",
-                &read,
-                &io::Error::new(kind, "error"),
-                deadline,
-                &cancel
-            ));
+            for payload in [&read, &activation] {
+                assert!(!retry_allowed(
+                    "rpc",
+                    payload,
+                    &io::Error::new(kind, "error"),
+                    deadline,
+                    &cancel
+                ));
+            }
         }
         let reset = io::Error::from_raw_os_error(10054);
         assert!(retry_allowed("rpc", &read, &reset, deadline, &cancel));
         cancel.cancel();
         assert!(!retry_allowed("rpc", &read, &reset, deadline, &cancel));
+        assert!(!retry_allowed(
+            "rpc",
+            &activation,
+            &reset,
+            deadline,
+            &cancel
+        ));
         let expired = Deadline::after(Duration::from_nanos(1)).unwrap();
         std::thread::sleep(Duration::from_millis(1));
         assert!(!retry_allowed(
             "rpc",
             &read,
+            &reset,
+            expired,
+            &Cancellation::default()
+        ));
+        assert!(!retry_allowed(
+            "rpc",
+            &activation,
             &reset,
             expired,
             &Cancellation::default()
