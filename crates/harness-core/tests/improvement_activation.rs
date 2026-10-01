@@ -10,6 +10,7 @@
 use harness_core::benefit_gate::{
     DecisionDraft, DecisionOutcome, Publication, QualityOutcome, publish_decision,
 };
+use harness_core::board_feedback;
 use harness_core::board_hypothesis::{
     self, Admission, BoundedHypothesis, BoundedRemovalDecision, BoundedRemovalProposal,
     HypothesisDraft, RemovalAction, RemovalDecisionDraft, RemovalDecisionKind,
@@ -274,27 +275,77 @@ fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {
 
 /// A real native checker: it writes declared output and exits with the
 /// declared code, so a passing and a failing combined-tree check are actual
-/// process outcomes, never asserted JSON.
+/// process outcomes, never asserted JSON. It can also write a file into the
+/// checked tree or run one child program in a declared directory before
+/// exiting, which is how the tests trigger board withdrawal or Git drift
+/// *during* a check.
 const CHECKER_SOURCE: &str = r##"
-use std::{env, process::exit};
+use std::{
+    env, fs,
+    process::{Command, exit},
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut code = 0i32;
     let mut out = String::new();
     let mut err = String::new();
+    let mut write: Option<String> = None;
+    let mut spawn_cwd: Option<String> = None;
+    let mut spawn: Option<(String, Vec<String>)> = None;
     let mut index = 0;
-    while index + 1 < args.len() {
+    while index < args.len() {
         match args[index].as_str() {
-            "--exit-code" => code = args[index + 1].parse().expect("exit code"),
-            "--stdout" => out = args[index + 1].clone(),
-            "--stderr" => err = args[index + 1].clone(),
-            _ => {}
+            "--exit-code" if index + 1 < args.len() => {
+                code = args[index + 1].parse().expect("exit code");
+                index += 2;
+            }
+            "--stdout" if index + 1 < args.len() => {
+                out = args[index + 1].clone();
+                index += 2;
+            }
+            "--stderr" if index + 1 < args.len() => {
+                err = args[index + 1].clone();
+                index += 2;
+            }
+            "--write-file" if index + 1 < args.len() => {
+                write = Some(args[index + 1].clone());
+                index += 2;
+            }
+            "--spawn-cwd" if index + 1 < args.len() => {
+                spawn_cwd = Some(args[index + 1].clone());
+                index += 2;
+            }
+            "--spawn" if index + 1 < args.len() => {
+                spawn = Some((args[index + 1].clone(), args[index + 2..].to_vec()));
+                break;
+            }
+            _ => index += 1,
         }
-        index += 2;
     }
     print!("{out}");
     eprint!("{err}");
+    if let Some(path) = write {
+        fs::write(path, "drift\n").expect("write drift file");
+    }
+    if let Some((program, rest)) = spawn {
+        let mut command = Command::new(&program);
+        command.args(&rest);
+        if let Some(cwd) = spawn_cwd {
+            command.current_dir(cwd);
+        }
+        match command.status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("checker child exited with {:?}", status.code());
+                exit(10);
+            }
+            Err(error) => {
+                eprintln!("checker child failed to start: {error}");
+                exit(9);
+            }
+        }
+    }
     exit(code);
 }
 "##;
@@ -778,6 +829,7 @@ fn run_spec(
         publication_scope: vec![PublicationStage::Experiment, PublicationStage::Integration],
         oracle: "oracle:fixture".into(),
         removal: None,
+        evidence_root: None,
     }
 }
 
@@ -822,6 +874,59 @@ fn check(exit_code: i32, stdout: &str, stderr: &str) -> CheckSpec {
             stdout.into(),
             "--stderr".into(),
             stderr.into(),
+        ],
+        timeout: Duration::from_secs(60),
+    }
+}
+
+/// A passing check at an explicit checker path, used where the checker bytes
+/// themselves are part of the case.
+fn passing_check_at(program: &Path) -> CheckSpec {
+    CheckSpec {
+        program: program.to_path_buf(),
+        args: vec![
+            "--exit-code".into(),
+            "0".into(),
+            "--stdout".into(),
+            "combined-tree check passed\n".into(),
+        ],
+        timeout: Duration::from_secs(60),
+    }
+}
+
+/// A passing check whose real child process mutates state in `cwd` while the
+/// combined-tree check is running: the declared board withdrawal or Git drift
+/// happens between the check and the effect, not only before `integrate`.
+fn check_spawning(program: &Path, cwd: &Path, child: &[&str]) -> CheckSpec {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--exit-code".into(),
+        "0".into(),
+        "--stdout".into(),
+        "combined-tree check passed\n".into(),
+        "--spawn-cwd".into(),
+        cwd.as_os_str().to_owned(),
+        "--spawn".into(),
+    ];
+    args.extend(child.iter().map(|argument| argument.into()));
+    CheckSpec {
+        program: program.to_path_buf(),
+        args,
+        timeout: Duration::from_secs(60),
+    }
+}
+
+/// A passing check that writes one file into the checked candidate tree while
+/// it runs, so the tree no longer matches the committed checked revision.
+fn check_writing_file(program: &Path, relative: &str) -> CheckSpec {
+    CheckSpec {
+        program: program.to_path_buf(),
+        args: vec![
+            "--write-file".into(),
+            relative.into(),
+            "--exit-code".into(),
+            "0".into(),
+            "--stdout".into(),
+            "combined-tree check passed\n".into(),
         ],
         timeout: Duration::from_secs(60),
     }
@@ -1259,6 +1364,285 @@ fn resume_confirms_observed_integration_without_replaying_effects() {
     );
 }
 
+/// The exact `removal-decision v1` text the board owner writes for one
+/// decision, captured from a real board round trip so a fixture never
+/// re-implements the owner's record format. The recorded decision is the
+/// caller's responsibility in the surrounding sequence.
+fn removal_decision_text(
+    bd: &Path,
+    board: &Path,
+    item: &str,
+    proposal: &BoundedRemovalProposal,
+    kind: RemovalDecisionKind,
+    actions: Vec<RemovalAction>,
+) -> String {
+    let bounded = BoundedRemovalDecision::try_from_draft(RemovalDecisionDraft {
+        decision: kind,
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+        actions,
+        loss: Some("loses-fixture".into()),
+        basis: Some("basis:fixture".into()),
+        detail: None,
+    })
+    .unwrap();
+    board_hypothesis::record_removal_decision(bd, board, item, &bounded).unwrap();
+    let prefix = format!("removal-decision v1 item={item} decision={}", kind.as_str());
+    board_feedback::list_comments(bd, board, item)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|text| text.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("the owner recorded no {} decision", kind.as_str()))
+}
+
+#[test]
+fn withdrawal_during_the_check_blocks_without_mutation() {
+    let mut scenario = fixture_scenario("improvement-activation-withdraw-", Fixture::Adopt);
+    let proposal = BoundedRemovalProposal::try_from_draft(RemovalProposalDraft {
+        proposal: "proposal:fixture".into(),
+        target: "skill:fixture".into(),
+        evidence: "evidence:fixture".into(),
+        loss: "loses-fixture".into(),
+        preview: None,
+        detail: None,
+    })
+    .unwrap();
+    scenario.spec.removal = Some(RemovalScope {
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+    });
+    board_hypothesis::record_removal_proposal(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &proposal,
+    )
+    .unwrap();
+    publish(&scenario);
+    let base = rev(&scenario.source);
+    let checker = fixtures().checker.clone();
+
+    let approve = || {
+        let bounded = BoundedRemovalDecision::try_from_draft(RemovalDecisionDraft {
+            decision: RemovalDecisionKind::Approve,
+            proposal: proposal.proposal.clone(),
+            target: proposal.target.clone(),
+            actions: vec![RemovalAction::Integration],
+            loss: Some("loses-fixture".into()),
+            basis: Some("basis:fixture".into()),
+            detail: None,
+        })
+        .unwrap();
+        board_hypothesis::record_removal_decision(
+            &scenario.bd,
+            &scenario.board,
+            &scenario.item,
+            &bounded,
+        )
+        .unwrap();
+    };
+    approve();
+    // The withdrawal text is captured through the owner, then the board is
+    // returned to the authorized state the check must start from.
+    let withdrawal = removal_decision_text(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &proposal,
+        RemovalDecisionKind::Withdraw,
+        Vec::new(),
+    );
+    assert!(withdrawal.contains("decision=withdraw"));
+    approve();
+
+    let child: Vec<&str> = vec![
+        scenario.bd.to_str().unwrap(),
+        "comment",
+        scenario.item.as_str(),
+        "--json",
+        withdrawal.as_str(),
+    ];
+    let check = check_spawning(&checker, &scenario.board, &child);
+    let blocked = blocked_of(integrate(&integration_request(&scenario, check, None)).unwrap());
+    assert!(blocked.reason.contains("withdrew"), "{}", blocked.reason);
+    assert!(!blocked.pending);
+    assert!(blocked.check.is_none(), "the declared check itself passed");
+    assert_eq!(
+        rev(&scenario.source),
+        base,
+        "a withdrawal during the check never integrates"
+    );
+    assert!(
+        !check_logs(&scenario.root.path().join("evidence")).is_empty(),
+        "the declared check actually ran before the effect was refused"
+    );
+
+    // The already-integrated path is reconciled just as conservatively: with
+    // the mainline observed at the candidate revision, a check that observes
+    // the withdrawal during its run blocks instead of confirming.
+    approve();
+    git(
+        &scenario.source,
+        &["merge", "--ff-only", &scenario.checkout.revision],
+    );
+    assert_eq!(rev(&scenario.source), scenario.checkout.revision);
+    let check = check_spawning(&checker, &scenario.board, &child);
+    let blocked = blocked_of(integrate(&integration_request(&scenario, check, None)).unwrap());
+    assert!(blocked.reason.contains("withdrew"), "{}", blocked.reason);
+    assert_eq!(
+        rev(&scenario.source),
+        scenario.checkout.revision,
+        "the observed integration is preserved"
+    );
+}
+
+#[test]
+fn candidate_and_mainline_drift_during_the_check_blocks_the_effect() {
+    let checker = fixtures().checker.clone();
+
+    // The candidate revision moves while the combined-tree check runs.
+    let scenario = fixture_scenario("improvement-activation-drift-candidate-", Fixture::Adopt);
+    publish(&scenario);
+    let base = rev(&scenario.source);
+    let candidate = scenario.checkout.path.clone();
+    let check = check_spawning(
+        &checker,
+        &candidate,
+        &["git", "commit", "--allow-empty", "-qm", "candidate drift"],
+    );
+    let blocked = blocked_of(integrate(&integration_request(&scenario, check, None)).unwrap());
+    assert!(
+        blocked.reason.contains("candidate revision changed"),
+        "{}",
+        blocked.reason
+    );
+    assert_eq!(
+        rev(&scenario.source),
+        base,
+        "the mainline stays at the base"
+    );
+    assert_ne!(
+        rev(&candidate),
+        scenario.checkout.revision,
+        "the drifted candidate work is preserved"
+    );
+
+    // The mainline moves while the combined-tree check runs.
+    let scenario = fixture_scenario("improvement-activation-drift-mainline-", Fixture::Adopt);
+    publish(&scenario);
+    let mainline = scenario.source.clone();
+    let check = check_spawning(
+        &checker,
+        &mainline,
+        &["git", "commit", "--allow-empty", "-qm", "mainline drift"],
+    );
+    let blocked = blocked_of(integrate(&integration_request(&scenario, check, None)).unwrap());
+    assert!(
+        blocked.reason.contains("mainline moved"),
+        "{}",
+        blocked.reason
+    );
+    assert_ne!(rev(&mainline), scenario.checkout.revision);
+    assert_ne!(rev(&mainline), scenario.bindings.base_revision);
+    assert_eq!(
+        fs::read_to_string(mainline.join("crates/one/src/lib.rs"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "pub fn one() {}\n",
+        "candidate content never reached the moved mainline"
+    );
+
+    // The candidate tree becomes dirty while the check runs.
+    let scenario = fixture_scenario("improvement-activation-drift-dirty-", Fixture::Adopt);
+    publish(&scenario);
+    let check = check_writing_file(&checker, "drift.txt");
+    let blocked = blocked_of(integrate(&integration_request(&scenario, check, None)).unwrap());
+    assert!(
+        blocked.reason.contains("candidate checkout"),
+        "{}",
+        blocked.reason
+    );
+    assert!(
+        scenario.checkout.path.join("drift.txt").is_file(),
+        "the drift is preserved"
+    );
+    assert_eq!(rev(&scenario.source), scenario.bindings.base_revision);
+}
+
+#[test]
+fn changed_checker_bytes_and_missing_output_reject_receipt_reuse() {
+    let scenario = fixture_scenario("improvement-activation-checkreuse-", Fixture::Adopt);
+    publish(&scenario);
+    let checker_path = scenario.root.path().join("checker-under-test.exe");
+    fs::copy(&fixtures().checker, &checker_path).unwrap();
+    let variant = compile_fixture(
+        scenario.root.path(),
+        "checker-variant",
+        &format!("{CHECKER_SOURCE}\n// different checker bytes, same contract\n"),
+    );
+    let evidence = scenario.root.path().join("evidence");
+    let IntegrationOutcome::Integrated(receipt) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        None,
+    ))
+    .unwrap() else {
+        panic!("the supported candidate integrates");
+    };
+    assert_eq!(
+        receipt.checks.program_sha256,
+        build_identity::hash_file(&checker_path).unwrap()
+    );
+    let logs = check_logs(&evidence);
+
+    // A changed checker binary invalidates the retained receipt: the check is
+    // re-derived with the current declared checker instead of being skipped.
+    fs::copy(&variant, &checker_path).unwrap();
+    let variant_digest = build_identity::hash_file(&checker_path).unwrap();
+    assert_ne!(variant_digest, receipt.checks.program_sha256);
+    let IntegrationOutcome::Confirmed(reused) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        Some(receipt.clone()),
+    ))
+    .unwrap() else {
+        panic!("the exact integration stays confirmed");
+    };
+    assert_eq!(reused.checks.program_sha256, variant_digest);
+    assert!(
+        check_logs(&evidence).len() > logs.len(),
+        "the check was re-derived, not skipped"
+    );
+
+    // A missing retained output cannot skip the check either.
+    fs::remove_file(&reused.checks.stdout.path).unwrap();
+    let before = check_logs(&evidence);
+    let IntegrationOutcome::Confirmed(rechecked) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        Some(reused.clone()),
+    ))
+    .unwrap() else {
+        panic!("the exact integration stays confirmed");
+    };
+    assert!(check_logs(&evidence).len() > before.len());
+    assert!(rechecked.checks.stdout.path.is_file());
+
+    // A modified retained output is likewise not reusable.
+    fs::write(&rechecked.checks.stdout.path, "tampered\n").unwrap();
+    let before = check_logs(&evidence);
+    let IntegrationOutcome::Confirmed(_) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        Some(rechecked.clone()),
+    ))
+    .unwrap() else {
+        panic!("the exact integration stays confirmed");
+    };
+    assert!(check_logs(&evidence).len() > before.len());
+}
+
 // ---------------------------------------------------------------------------
 // Activation: verified consumption and the checked integrated revision.
 // ---------------------------------------------------------------------------
@@ -1376,10 +1760,17 @@ fn activation_requires_verified_consumption_and_binds_the_integrated_revision() 
         runtime: variant.clone(),
     }];
 
+    // The heavy case uses its own checker copy so later cases can change the
+    // checker bytes without touching the shared fixtures.
+    let checker_path = scenario.root.path().join("checker-under-test.exe");
+    fs::copy(&fixtures.checker, &checker_path).unwrap();
     publish(&scenario);
-    let IntegrationOutcome::Integrated(integration) =
-        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
-    else {
+    let IntegrationOutcome::Integrated(integration) = integrate(&integration_request(
+        &scenario,
+        passing_check_at(&checker_path),
+        None,
+    ))
+    .unwrap() else {
         panic!("the supported candidate integrates");
     };
     assert_eq!(rev(&scenario.source), scenario.checkout.revision);
@@ -1479,7 +1870,7 @@ fn activation_requires_verified_consumption_and_binds_the_integrated_revision() 
         .unwrap(),
     );
     assert!(
-        blocked.reason.contains("stale receipt"),
+        blocked.reason.contains("stale or foreign receipt"),
         "{}",
         blocked.reason
     );
@@ -1512,6 +1903,64 @@ fn activation_requires_verified_consumption_and_binds_the_integrated_revision() 
         "{}",
         blocked.reason
     );
+
+    // A receipt whose check covered another revision cannot authorize
+    // activation, even while the decision and everything else still match.
+    let mut foreign_revision = integration.clone();
+    foreign_revision.checks.revision = "0".repeat(40);
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario,
+            &state,
+            &runtime,
+            &foreign_revision,
+            false,
+        ))
+        .unwrap(),
+    );
+    assert!(
+        blocked.reason.contains("covered another revision"),
+        "{}",
+        blocked.reason
+    );
+
+    // Missing retained check output cannot authorize activation.
+    fs::remove_file(&integration.checks.stdout.path).unwrap();
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario,
+            &state,
+            &runtime,
+            &integration,
+            false,
+        ))
+        .unwrap(),
+    );
+    assert!(blocked.reason.contains("unavailable"), "{}", blocked.reason);
+
+    // A changed checker binary cannot authorize activation either.
+    let variant = compile_fixture(
+        scenario.root.path(),
+        "checker-variant",
+        &format!("{CHECKER_SOURCE}\n// different checker bytes, same contract\n"),
+    );
+    fs::copy(&variant, &checker_path).unwrap();
+    let blocked = activation_blocked(
+        activate(&activation_request(
+            &scenario,
+            &state,
+            &runtime,
+            &integration,
+            false,
+        ))
+        .unwrap(),
+    );
+    assert!(
+        blocked.reason.contains("changed since the check"),
+        "{}",
+        blocked.reason
+    );
+    fs::copy(&fixtures.checker, &checker_path).unwrap();
 
     // A newer conflicting decision supersedes the decision the integration
     // was performed under.

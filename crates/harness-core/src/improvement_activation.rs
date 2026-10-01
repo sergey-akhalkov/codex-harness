@@ -24,7 +24,10 @@
 //!    `Integrated` means this call moved the mainline to the exact evaluated
 //!    revision, `Confirmed` means the exact effect was already observed and
 //!    nothing was replayed, and `Blocked` names the missing fact without
-//!    changing anything.
+//!    changing anything. The newest board decision and removal authority and
+//!    the exact clean Git identities are re-read after the declared check and
+//!    immediately before the effect, so a withdrawal, a moved mainline or a
+//!    changed candidate tree during a long check blocks without mutation.
 //! 3. [`activate`] with the returned [`IntegrationReceipt`], the installed
 //!    candidate [`ArmRuntime`] and the run's owned native state: it re-verifies
 //!    the consumed installation identity, re-reads the same decision and
@@ -133,6 +136,10 @@ pub struct CheckOutput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckReceipt {
     pub program: PathBuf,
+    /// Digest of the checker program at the time the check ran. Reusing this
+    /// receipt requires the same program bytes, so a changed checker cannot
+    /// authorize activation or skip a repeated check.
+    pub program_sha256: String,
     pub args: Vec<String>,
     /// The exact revision whose tree was checked.
     pub revision: String,
@@ -625,6 +632,12 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
                 checks
             }
         };
+        // A prior receipt or a repeated check is not enough: the current board
+        // evidence and the exact observed Git identities must still authorize
+        // this effect immediately before the receipt is returned.
+        if let Gate::Blocked(blocked) = revalidate(request, &evidence.candidate_revision)? {
+            return Ok(IntegrationOutcome::Blocked(*blocked));
+        }
         return Ok(IntegrationOutcome::Confirmed(IntegrationReceipt {
             schema: RECEIPT_SCHEMA,
             item: evidence.item,
@@ -673,6 +686,12 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
             ),
             check: Some(checks),
         }));
+    }
+    // The check can take minutes: re-read the board decision and removal
+    // authority and re-verify the exact clean Git identities before the
+    // mainline effect. Withdrawal or drift during the check blocks here.
+    if let Gate::Blocked(blocked) = revalidate(request, &evidence.base_revision)? {
+        return Ok(IntegrationOutcome::Blocked(*blocked));
     }
     if let Err(error) = git_merge_fast_forward(&request.mainline, &evidence.candidate_revision) {
         let observed = git_head(&request.mainline).unwrap_or_else(|_| "<unreadable>".to_owned());
@@ -735,10 +754,11 @@ pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome
         || integration.base_revision != evidence.base_revision
         || integration.candidate_revision != evidence.candidate_revision
         || integration.integrated_revision != evidence.candidate_revision
+        || integration.checks.revision != evidence.candidate_revision
     {
         return Ok(ActivationOutcome::Blocked(blocked(
             false,
-            "the retained integration receipt does not belong to the current decision and evaluated revisions; no stale receipt authorizes activation",
+            "the retained integration receipt does not belong to the current decision and evaluated revisions, or its check covered another revision; no stale or foreign receipt authorizes activation",
         )));
     }
     if !integration.checks.passed() {
@@ -747,6 +767,14 @@ pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome
             format!(
                 "the retained integration receipt records a failed combined-tree check ({})",
                 check_failure(&integration.checks)
+            ),
+        )));
+    }
+    if let Err(reason) = verify_check_evidence(&integration.checks) {
+        return Ok(ActivationOutcome::Blocked(blocked(
+            false,
+            format!(
+                "the retained combined-tree check evidence cannot authorize activation: {reason}"
             ),
         )));
     }
@@ -806,6 +834,18 @@ pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome
             )));
         }
     };
+    // Every deterministic precondition is resolved before the selection owner
+    // writes the active pointer: the consumed installation must already be the
+    // prepared candidate variant, and `select_variant` re-verifies the
+    // selected artifact against that same variant before any change.
+    if !same_path(&consumption.build, &request.runtime.variant.build)
+        || consumption.record_sha256 != request.runtime.variant.record_sha256
+    {
+        return Ok(ActivationOutcome::Blocked(blocked(
+            false,
+            "the consumed installed identity is not the prepared candidate variant of this experiment",
+        )));
+    }
     let selected = match improvement_experiment::select_variant(
         &request.state,
         &request.runtime.variant,
@@ -819,14 +859,6 @@ pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome
             )));
         }
     };
-    if !same_path(&consumption.build, &selected.build)
-        || consumption.record_sha256 != selected.record_sha256
-    {
-        return Ok(ActivationOutcome::Blocked(blocked(
-            false,
-            "the selected runtime identity is not the consumed installed candidate identity",
-        )));
-    }
     let applied = selected.changed;
     let receipt = ActivationReceipt {
         schema: RECEIPT_SCHEMA,
@@ -854,6 +886,8 @@ pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome
 /// Runs the declared check in the candidate's owned worktree, retaining its
 /// actual output under the caller's evidence directory. The check runs before
 /// any mainline effect, so a failed check cannot leave an integrated tree.
+/// Output is retained exactly as written; bounding its size is separate
+/// retention work (parent task 5.4), not part of this gate.
 fn run_check(request: &IntegrationRequest<'_>, revision: &str) -> io::Result<CheckReceipt> {
     let spec = &request.check;
     if !spec.program.is_absolute() {
@@ -864,6 +898,13 @@ fn run_check(request: &IntegrationRequest<'_>, revision: &str) -> io::Result<Che
     if spec.timeout.is_zero() {
         return Err(invalid("the declared check timeout must be positive"));
     }
+    build_identity::ordinary(&spec.program).map_err(|error| {
+        invalid(format!(
+            "the declared check program {} is missing or not an ordinary file: {error}",
+            spec.program.display()
+        ))
+    })?;
+    let program_sha256 = build_identity::hash_file(&spec.program)?;
     fs::create_dir_all(&request.evidence)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -889,6 +930,7 @@ fn run_check(request: &IntegrationRequest<'_>, revision: &str) -> io::Result<Che
     let duration_ms = started.elapsed().as_millis() as u64;
     Ok(CheckReceipt {
         program: spec.program.clone(),
+        program_sha256,
         args: declared_args(spec),
         revision: revision.to_owned(),
         cwd,
@@ -908,6 +950,65 @@ fn check_output(path: &Path) -> io::Result<CheckOutput> {
     })
 }
 
+/// Re-resolves the current benefit decision and removal authority and
+/// re-verifies the exact clean Git identities immediately before an effect.
+/// A long combined-tree check must not let a withdrawal, a moved mainline, a
+/// changed candidate revision or dirty work slip into the integration.
+fn revalidate(request: &IntegrationRequest<'_>, expected_head: &str) -> io::Result<Gate<()>> {
+    match resolve_evidence(&request.context())? {
+        Gate::Ready(_) => {}
+        Gate::Blocked(blocked) => return Ok(Gate::Blocked(blocked)),
+    }
+    let candidate = &request.bindings.candidate;
+    if let Err(error) = task_worktree::verify_candidate_checkout(candidate) {
+        return Ok(Gate::blocked(blocked(
+            false,
+            format!(
+                "the candidate revision changed while the combined-tree check ran ({error}); the effect is refused"
+            ),
+        )));
+    }
+    let candidate_repo = git_common_dir(&candidate.source)?;
+    let mainline_repo = git_common_dir(&request.mainline)?;
+    if !same_path(&candidate_repo, &mainline_repo) {
+        return Ok(Gate::blocked(blocked(
+            false,
+            format!(
+                "the mainline checkout {} is no longer the repository the candidate branch belongs to",
+                request.mainline.display()
+            ),
+        )));
+    }
+    if !git_clean(&request.mainline)? {
+        return Ok(Gate::blocked(blocked(
+            false,
+            format!(
+                "the mainline checkout {} gained uncommitted or untracked work while the combined-tree check ran; the effect is refused",
+                request.mainline.display()
+            ),
+        )));
+    }
+    if !git_clean(&candidate.path)? {
+        return Ok(Gate::blocked(blocked(
+            false,
+            format!(
+                "the candidate checkout {} gained uncommitted or untracked work while the combined-tree check ran; the effect is refused",
+                candidate.path.display()
+            ),
+        )));
+    }
+    let head = git_head(&request.mainline)?;
+    if head != expected_head {
+        return Ok(Gate::blocked(blocked(
+            false,
+            format!(
+                "the mainline moved to {head} while the combined-tree check ran; the effect on {expected_head} is refused"
+            ),
+        )));
+    }
+    Ok(Gate::Ready(()))
+}
+
 fn check_failure(check: &CheckReceipt) -> String {
     format!(
         "{} with exit code {} after {} ms",
@@ -922,6 +1023,51 @@ fn stop_reason(reason: process::StopReason) -> &'static str {
         process::StopReason::Cancelled => "cancelled",
         process::StopReason::MemoryLimit => "memory-limit",
     }
+}
+
+/// Verifies that one retained check receipt still names available, unchanged
+/// evidence: an ordinary checker program with the recorded bytes and both
+/// retained output streams present with the recorded digest and length. A
+/// missing or modified artifact reports the exact broken reference instead of
+/// authorizing activation or skipping a repeated check.
+fn verify_check_evidence(check: &CheckReceipt) -> Result<(), String> {
+    verify_retained(
+        "the declared checker",
+        &check.program,
+        &check.program_sha256,
+    )?;
+    for (name, output) in [
+        ("the retained check stdout", &check.stdout),
+        ("the retained check stderr", &check.stderr),
+    ] {
+        verify_retained(name, &output.path, &output.sha256)?;
+        let bytes = fs::metadata(&output.path)
+            .map_err(|error| format!("{name} {} is unreadable ({error})", output.path.display()))?
+            .len();
+        if bytes != output.bytes {
+            return Err(format!(
+                "{name} {} changed length since the check",
+                output.path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_retained(name: &str, path: &Path, sha256: &str) -> Result<(), String> {
+    build_identity::ordinary(path)
+        .map_err(|error| format!("{name} {} is unavailable ({error})", path.display()))?;
+    let actual = build_identity::hash_file(path)
+        .map_err(|error| format!("{name} {} is unreadable ({error})", path.display()))?;
+    if actual != sha256 {
+        return Err(format!("{name} {} changed since the check", path.display()));
+    }
+    Ok(())
+}
+
+fn declared_program_digest(check: &CheckSpec) -> Option<String> {
+    build_identity::ordinary(&check.program).ok()?;
+    build_identity::hash_file(&check.program).ok()
 }
 
 /// True only when a retained receipt describes exactly this decision,
@@ -945,6 +1091,9 @@ fn prior_matches(
         && prior.checks.passed()
         && prior.checks.program == request.check.program
         && prior.checks.args == declared_args(&request.check)
+        && declared_program_digest(&request.check)
+            .is_some_and(|digest| digest == prior.checks.program_sha256)
+        && verify_check_evidence(&prior.checks).is_ok()
         && same_path(&prior.mainline, &request.mainline)
 }
 
