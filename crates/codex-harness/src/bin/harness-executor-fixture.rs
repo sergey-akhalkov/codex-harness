@@ -13,6 +13,10 @@
 //! `child-hold` helper the descendant spawns. `HARNESS_EXECUTOR_FIXTURE_STARTED`
 //! records this process's identity immediately, and
 //! `HARNESS_EXECUTOR_FIXTURE_CHILD_MARKER` records the descendant's.
+//!
+//! The `watch-oracle` first argument runs the candidate-independent
+//! acceptance for the finalized `executor watch` contract instead of a
+//! fixture mode; see `harness_executor_fixture/watch_oracle.rs`.
 
 use serde_json::json;
 use std::{
@@ -24,11 +28,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "harness_executor_fixture/watch_oracle.rs"]
+mod watch_oracle;
+
 const DEFAULT_SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
 const FINAL_MESSAGE: &str =
     "FIXTURE_OUTCOME_DONE\nremaining: none\nchecks: fixture event stream verified";
 
 fn main() -> io::Result<()> {
+    // The acceptance checker owns its own arguments and never acts as a
+    // launcher double, whichever fixture environment it inherited.
+    let mut args = env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == "watch-oracle") {
+        let rest: Vec<_> = args.collect();
+        return exit(watch_oracle::run(&rest)?);
+    }
     // The installed-launcher shell preflight is a model-free diagnostic; the
     // fixture answers it so receipts without a recorded shell still exercise
     // the real preparation path.
