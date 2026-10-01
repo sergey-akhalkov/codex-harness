@@ -157,6 +157,82 @@ Control order, startup, hardware contention and cache policy within matched bloc
 
 Preserve replayable real tasks linked to their existing cards. Use applicable earlier tasks, with checks hidden from the optimizing executor as appropriate, when corroboration is required for the declared adoption scope. A first pair can establish a task-scoped result, not universal savings. Predeclare repetitions/stopping and repeated-selection treatment; do not run until the first favorable pair appears. Transfer beyond the measured local model remains unproven until exercised.
 
+#### Infrastructure waits and causal interpretation
+
+The ordinary case is an agent waiting for the shared `heavy` build slot while
+unrelated work occupies it. A longer queue does not establish worse agent work.
+Keep two views over the same attempts: observed time/cost through acceptance,
+including all waits and failures, and work metrics adjusted only for evidenced
+external blocking. Neither view replaces the other. State before the pair
+whether the claim concerns work efficiency or operational resource scheduling;
+do not choose the more favorable view after seeing results. Work-efficiency
+claims use the adjusted view with attribution coverage; operational claims
+about queueing require controlled relevant load and retain that waiting as the
+effect under test. Unknown currency or compute cost remains unknown.
+
+Extend the existing heavy-command/resource-admission and process/rollout
+owners, not a separate monitoring service. Admission evidence must identify
+the attempt, tool call, command and admission instance, parent/inherited
+admission, resource, verified owner and monotonic wait boundaries ending in
+grant, cancellation, timeout or failure. Correlate task activity and model
+request/usage identities through the existing evidence owner. Distinguish
+unrelated holders, work from this attempt or experiment, and unknown ownership
+without importing foreign command contents or machine paths into public
+records. The current waiting diagnostic and holder records do not by
+themselves provide this complete trace; missing historical boundaries cannot
+be reconstructed as measured durations from a final log line.
+
+For an attempt interval `A`, form `Q` from the union of verified externally
+blocked admission intervals clipped to `A`. Intersect `Q` with intervals `B`
+where the task lifecycle proves that progress awaited those admissions, then
+remove intervals `P` of useful concurrent activity from the same attempt.
+The deductible duration is `measure((Q intersect B) minus P)` and adjusted
+elapsed time is observed elapsed minus that duration. Use interval union, not
+a sum of tool durations; inherited/nested admission and shared work are
+counted once. Correlation across processes needs a verified common clock
+mapping; a wall-clock jump or unmapped timestamp degrades coverage. A queued
+tool alone does not prove that the agent was blocked. Model activity without
+a verified wait-only classification counts as possible useful activity, not
+as idle time. No negative result or deduction beyond the observed interval
+is permitted. For example, a 30-minute attempt with a 10-minute external wait
+and 4 minutes of useful work overlapping that wait has 6 deductible minutes
+and a 24-minute adjusted duration, while its observed duration stays 30.
+This is a defined normalization of observed work, not a prediction of the
+completion time on a hypothetical unloaded machine. A fully observed immediate
+grant proves zero queue delay; absent queue telemetry does not.
+
+Report blocked duration, queue exposure, polling requests/operations and
+waiting-related usage separately. Passive waiting consumes no model tokens
+by itself. Subtract token usage only for whole requests independently linked
+to that admission, contained in the evidenced blocking episode and structurally
+established as wait-only; mixed task/status requests and requests crossing an
+unresolved boundary remain included and their attribution is incomplete.
+Do not infer token quantities from seconds, response length or an agent's
+description. Preserve input/cache/output/reasoning subset relationships.
+Tool polling without a model request has operations but no invented model
+usage. Candidate-induced polling frequency, extra calls, self-contention,
+redundant builds, execution time after admission and delay after a slot is
+granted remain attributable work/operating costs. Removing verified wait-only
+usage from the adjusted view never hides those categories or establishes a
+net-cost gain. A treatment that reduces build demand keeps the reduced build
+work in adjusted metrics and its changed queue exposure in the operational
+view. A scheduler or waiting-policy treatment cannot normalize away its own
+declared mechanism.
+
+Freeze the attribution rule/version, eligible causes, claimed metric view,
+coverage requirements and material-uncertainty rule with the comparison
+policy. Apply them identically to both arms. Missing boundaries, unknown
+holder identity, mixed-request usage or slowdown while actually executing
+under contention do not authorize guessed subtraction. Keep the verified
+deduction and unresolved portion visible; unless sufficient comparable
+coverage or a conservative bound proves the decision unaffected, return
+`inconclusive`. Queue timeout remains a failed infrastructure attempt, not an
+incorrect solution attributed to the model. Retrying requires the existing
+predeclared stopping rule; preserve original failures and costs. Replay under
+controlled load is a targeted next check, not automatic repetition until a
+favorable result. Reports and Beads decisions reference the same raw and
+adjusted evidence, exclusions, uncertainty and policy identity.
+
 ### 9. Recover deterministic bookkeeping without replaying unknown effects
 
 Use a small persisted phase cursor referencing board/experiment/artifact identities. Natural phases are planning, candidate-ready, baseline-attempt, candidate-attempt, acceptance, decision-recorded and activation-confirmed, plus explicit idle/blocked/stopped conditions. These are operational receipts, not a second set of hypothesis statuses.

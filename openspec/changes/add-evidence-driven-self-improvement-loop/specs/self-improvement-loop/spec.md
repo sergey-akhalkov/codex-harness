@@ -128,6 +128,8 @@ Each hypothesis implementation SHALL have a dedicated branch from an explicit ac
 
 ### Requirement: Correctness and benefit remain independent decisions
 
+The declared comparison policy SHALL distinguish observed operational metrics from work metrics adjusted for attributable infrastructure waiting, using the rules and coverage gates in `harness-outcome-evaluation`. The loop SHALL NOT interpret unrelated queue imbalance as model/harness benefit or regression, or omit a treatment's own scheduling, polling or build-demand effects. Missing attribution that could change the decision SHALL hold that conclusion as inconclusive without discarding the attempt.
+
 Candidate implementation checks and task acceptance SHALL be independent of candidate-controlled claims. The loop SHALL use `harness-outcome-evaluation` to decide `adopt`, `reject` or `inconclusive`, enforce required correctness, and retain all attempts. A metric improvement SHALL NOT excuse weakened requirements, changed oracles or discarded failures. Adoption SHALL identify the exact tested candidate, its supported task/model scope and baseline; reworked or combined candidates SHALL be checked on their new identities before advancement. Live publication SHALL follow existing installation and skill lifecycles within its established authority rather than follow automatically from a task's closed status.
 
 #### Scenario: Faster output hides an incorrect implementation

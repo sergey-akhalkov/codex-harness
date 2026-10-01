@@ -60,6 +60,8 @@ Status SHALL distinguish pending approval, user-declined removal, unsupported be
 
 ### Requirement: Benefit decisions reuse the board evidence owner
 
+Each comparison decision SHALL identify its claimed metric view and attribution-policy identity, reference both observed and adjusted evidence with exclusions and coverage, and retain material infrastructure uncertainty. Resume or repeated publication SHALL preserve this binding; a newer normalization rule SHALL NOT silently rewrite an earlier decision. Public board summaries SHALL contain scoped conclusions and evidence references rather than private queue-holder details or raw traces.
+
 Hypothesis decisions SHALL reuse and, where needed, extend the existing benefit-gate/ledger contract with links to independently accepted experiment evidence. Each decision SHALL identify the hypothesis, experiment, evaluated revisions, scope, quality result, measured effects, coverage and reason. Retried publication of the same decision SHALL be idempotent; contradictory or incomplete newer evidence SHALL not silently restore an older adoption. An `inconclusive` result SHALL identify the missing observation and next action or deferral condition rather than immediately requeue identical work. Closed and deferred hypotheses SHALL participate in prior-result search, and reconsideration SHALL preserve the earlier result and record a new evidential basis before another implementation attempt.
 
 #### Scenario: Process recovery repeats decision publication

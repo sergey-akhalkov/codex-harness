@@ -632,6 +632,14 @@ or authorize a silent downgrade of a different run's identity policy.
 The active [change](../openspec/changes/add-evidence-driven-self-improvement-loop/proposal.md)
 owns the sequential experiments and remaining acceptance.
 
+**2026-10-01, confirmed:** improvement analysis must separate external
+infrastructure waiting from agent/harness work without losing observed user
+cost. Use native lifecycle evidence for automatic adjustment, retain both
+metric views and waiting-related usage, and make a decision inconclusive when
+unresolved contention could explain it. The active change's
+[measurement contract](../openspec/changes/add-evidence-driven-self-improvement-loop/specs/harness-outcome-evaluation/spec.md#requirement-infrastructure-noise-is-separated-through-attributable-lifecycle-evidence)
+owns the algorithm, causal limits and pending implementation checks.
+
 Each candidate and real evaluation workload has its own complete OpenSpec
 change before implementation, including instruction edits. Beads owns their
 hypotheses and evidence-backed decisions; the controller cursor owns only

@@ -17,6 +17,8 @@
 - [x] 2.7 Attach candidate-independent acceptance to the real task entry point; demonstrate a known correct solution passes and an incorrect, skipped or forged-success solution fails, while candidate writes cannot change acceptance inputs or outcomes.
 - [ ] 2.8 Execute one complete A-on-B comparison from attributable real hypotheses, with mandatory specifications, declared operating/decision policy and the actual supplied local model; retain independently checked B implementations and a supported adopt/reject/inconclusive result without claiming the continuous loop is complete.
 
+- [ ] 2.9 Extend existing heavy-command/resource-admission, process observation and rollout accounting with correlated queue lifecycle evidence and automatic work-metric adjustment. Verify real owned contention, grant/timeout/cancellation, same-attempt versus unrelated/unknown holders, concurrent useful work, overlapping/inherited waits, clock/trace gaps, tool-only polling, wait-only and mixed model requests. Retain observed totals and actual usage; prove deductions neither double count nor hide build work, self-contention or treatment-induced polling cost. Do not reconstruct missing historical telemetry as measured data.
+
 ## 3. Evidence-backed decisions and baseline advancement
 
 - [ ] 3.1 Extend the existing benefit-gate/ledger owner to bind decisions to experiment IDs, exact revisions, acceptance evidence, metric coverage, scope and reasons; verify actual Beads publication is idempotent and missing or contradictory evidence cannot authorize adoption, reusing the feedback CLI integration checks.
@@ -26,6 +28,8 @@
 - [ ] 3.5 Retain replayable completed real tasks under their Beads owners and support policy-required corroboration; verify mechanism-inapplicable workloads remain inconclusive for broader claims, prior-task selection does not reveal solutions to executors, and absent evidence cannot be replaced by a summary or synthetic savings claim.
 - [ ] 3.6 Reconcile hypothesis decisions with OpenSpec completion and supported retention/archive operations; verify a rejected experiment retains accessible artifacts without synchronizing unadopted deltas into main specs, and an unfinished required task cannot be closed through an experiment outcome.
 - [ ] 3.7 Extend outcome comparisons for subtractive treatments using existing accounting and independent acceptance; cover actual catalogue consumption despite zero invocations, stale context after removal, inapplicable workloads, manual/fallback cost displacement, indirect-caller/recovery failures and deleted-check false success. Verify no-effect or size-only results cannot pass the default efficiency policy and a maintenance-only basis must be explicitly agreed before comparison.
+
+- [ ] 3.8 Bind metric view, attribution rule/version, coverage and material-uncertainty gates to predeclared policy and durable decisions. Exercise a queue-only false gain/regression, a verdict-changing coverage gap, a conservative supported bound, and treatments affecting build demand or waiting itself. Verify raw/adjusted evidence and failed attempts survive resume, changed policy cannot inherit adoption, contaminated evidence is inconclusive, and actual-model comparisons use the declared view without selective retry or invented cost savings.
 
 ## 4. Grounded hypothesis generation and prior-result reuse
 
