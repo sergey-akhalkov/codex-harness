@@ -23,11 +23,18 @@
 //!   keeps observing to the declared timeout and leaves the run untouched;
 //! - `finalization-during-watch-text`/`-json`: the same call returns the actual
 //!   bounded result when the host finalizes the run while it observes;
-//! - `finalized-without-result-not-success`: a recorded successful exit
-//!   without a retained result is never reported as success.
+//! - `finalized-without-result-defect-text`/`-json`: a recorded successful
+//!   exit whose result was never retained is an explicit output defect: the
+//!   call returns the documented failure exit 1, names the missing or
+//!   unusable result and does not wait out its timeout.
 //!
 //! Exit code 0 means every case passed; 1 means the JSON report on stdout
 //! names at least one failed or skipped case.
+//!
+//! An executable named with `--exe` is treated as an explicitly supplied
+//! control: it must still be an ordinary file and prove its CLI identity,
+//! but its build timestamp is not compared with the workspace sources, so a
+//! retained or frozen specimen can be classified from outside its checkout.
 
 use harness_core::{
     build_identity,
@@ -60,7 +67,7 @@ const FINAL_RESULT: &str =
 const PENDING_TIMEOUT_SECS: u64 = 4;
 /// Declared watch timeout of the late-finalization cases.
 const FINALIZE_TIMEOUT_SECS: u64 = 20;
-/// Declared watch timeout of the finalized-without-result case.
+/// Declared watch timeout of the finalized-without-result defect cases.
 const DEFECT_TIMEOUT_SECS: u64 = 6;
 /// How long a late-finalization call observes before the host finalizes.
 const FINALIZE_AFTER: Duration = Duration::from_millis(800);
@@ -94,9 +101,10 @@ const CASE_PENDING_TEXT: &str = "pending-finalization-timeout-text";
 const CASE_PENDING_JSON: &str = "pending-finalization-timeout-json";
 const CASE_DURING_TEXT: &str = "finalization-during-watch-text";
 const CASE_DURING_JSON: &str = "finalization-during-watch-json";
-const CASE_DEFECT: &str = "finalized-without-result-not-success";
+const CASE_DEFECT_TEXT: &str = "finalized-without-result-defect-text";
+const CASE_DEFECT_JSON: &str = "finalized-without-result-defect-json";
 
-const SKIPPED_AFTER_IDENTITY: [&str; 8] = [
+const SKIPPED_AFTER_IDENTITY: [&str; 9] = [
     CASE_FAILED,
     CASE_FINALIZED_TEXT,
     CASE_FINALIZED_JSON,
@@ -104,7 +112,8 @@ const SKIPPED_AFTER_IDENTITY: [&str; 8] = [
     CASE_PENDING_JSON,
     CASE_DURING_TEXT,
     CASE_DURING_JSON,
-    CASE_DEFECT,
+    CASE_DEFECT_TEXT,
+    CASE_DEFECT_JSON,
 ];
 
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
@@ -177,7 +186,8 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             cases.push(pending_case(exe, OutputMode::Json));
             cases.push(during_watch_case(exe, OutputMode::Text));
             cases.push(during_watch_case(exe, OutputMode::Json));
-            cases.push(defect_case(exe));
+            cases.push(defect_case(exe, OutputMode::Text));
+            cases.push(defect_case(exe, OutputMode::Json));
         }
     }
     let passed = cases.iter().all(|case| case.passed());
@@ -295,7 +305,18 @@ fn resolve(workspace: &Path, explicit: Option<&Path>) -> Result<Resolved, String
                 .to_owned(),
         );
     };
-    if let Some((source, changed)) = newest_source(workspace)
+    let path = path.canonicalize().map_err(|error| {
+        format!(
+            "the candidate executable {} is unreadable: {error}",
+            path.display()
+        )
+    })?;
+    // An executable taken from the workspace must postdate the sources that
+    // build it. An explicitly named control executable is classified on its
+    // behavior alone: it may live outside the checkout it is checked against.
+    let inside = path.starts_with(workspace);
+    if inside
+        && let Some((source, changed)) = newest_source(workspace)
         && changed > built
     {
         return Err(format!(
@@ -304,20 +325,22 @@ fn resolve(workspace: &Path, explicit: Option<&Path>) -> Result<Resolved, String
             source.display()
         ));
     }
-    let path = path.canonicalize().map_err(|error| {
-        format!(
-            "the candidate executable {} is unreadable: {error}",
-            path.display()
-        )
-    })?;
     let sha256 = build_identity::hash_file(&path).map_err(|error| {
         format!(
             "the candidate executable {} is unreadable: {error}",
             path.display()
         )
     })?;
+    let detail = if inside {
+        format!("{} sha256 {sha256}", path.display())
+    } else {
+        format!(
+            "{} sha256 {sha256} (explicit control executable, not compared with the workspace sources)",
+            path.display()
+        )
+    };
     Ok(Resolved {
-        detail: format!("{} sha256 {sha256}", path.display()),
+        detail,
         path,
         sha256,
     })
@@ -762,53 +785,124 @@ fn during_watch_case(exe: &Path, mode: OutputMode) -> Case {
     Case::pass(id, "the same call returned the finalized bounded result")
 }
 
-/// A recorded successful exit without a retained result is not success: the
-/// host is gone, so no later finalization can supply the missing result.
-fn defect_case(exe: &Path) -> Case {
+/// A recorded successful exit without a retained result is a finalized
+/// output defect, not a success. The host is gone, so no later finalization
+/// can supply the missing result: the documented failure exit 1 must arrive
+/// promptly with a cause naming the missing or unusable final result. A call
+/// that merely waits out its timeout is not an explicit defect.
+fn defect_case(exe: &Path, mode: OutputMode) -> Case {
+    let id = match mode {
+        OutputMode::Text => CASE_DEFECT_TEXT,
+        OutputMode::Json => CASE_DEFECT_JSON,
+    };
     let mut fixture = match Fixture::start() {
         Ok(fixture) => fixture,
-        Err(error) => return Case::fail(CASE_DEFECT, format!("could not seed the run: {error}")),
+        Err(error) => return Case::fail(id, format!("could not seed the run: {error}")),
     };
     if let Err(error) = fixture.write("completed", Some(0), None) {
-        return Case::fail(CASE_DEFECT, format!("could not seed the receipt: {error}"));
+        return Case::fail(id, format!("could not seed the receipt: {error}"));
     }
     if let Err(error) = fixture.end_host() {
-        return Case::fail(
-            CASE_DEFECT,
-            format!("could not end the run's host: {error}"),
-        );
+        return Case::fail(id, format!("could not end the run's host: {error}"));
     }
     let outcome = match invoke(
         exe,
         fixture.directory(),
-        &watch_arguments(&fixture.receipt, DEFECT_TIMEOUT_SECS, OutputMode::Text),
+        &watch_arguments(&fixture.receipt, DEFECT_TIMEOUT_SECS, mode),
         Duration::from_secs(DEFECT_TIMEOUT_SECS + 10),
     ) {
         Ok(outcome) => outcome,
-        Err(error) => return Case::fail(CASE_DEFECT, format!("watch did not run: {error}")),
+        Err(error) => return Case::fail(id, format!("watch did not run: {error}")),
     };
     if !outcome.finished {
         return Case::fail(
-            CASE_DEFECT,
+            id,
             format!("watch did not return within its declared {DEFECT_TIMEOUT_SECS}s timeout"),
         );
     }
-    if outcome.code == Some(0) {
+    if outcome.code != Some(1) {
         return Case::fail(
-            CASE_DEFECT,
+            id,
             format!(
-                "a recorded exit 0 without a readable result must not be reported as success: {}",
+                "a finalized successful exit without a readable result is an output defect and must \
+                 return the documented failure exit 1 (0 success, 1 failure or defect, 2 timeout or \
+                 unavailable); observed exit {:?} after {:.1}s: {}",
+                outcome.code,
+                outcome.elapsed.as_secs_f64(),
                 excerpt(&outcome.output, 300)
             ),
         );
     }
+    let declared = Duration::from_secs(DEFECT_TIMEOUT_SECS);
+    if outcome.elapsed + Duration::from_millis(TIMEOUT_SLACK_MS) >= declared {
+        return Case::fail(
+            id,
+            format!(
+                "the call took {:.1}s and only ended with the declared {DEFECT_TIMEOUT_SECS}s timeout \
+                 instead of reporting the defect when it was established",
+                outcome.elapsed.as_secs_f64()
+            ),
+        );
+    }
+    let cause = match mode {
+        OutputMode::Text => text_cause(&outcome.output).unwrap_or_default().to_owned(),
+        OutputMode::Json => match parse_report(&outcome) {
+            Ok(report) => report["cause"].as_str().unwrap_or_default().to_owned(),
+            Err(cause) => return Case::fail(id, cause),
+        },
+    };
+    if cause.trim().is_empty() {
+        return Case::fail(
+            id,
+            format!(
+                "the defect report carries no cause: {}",
+                excerpt(&outcome.output, 300)
+            ),
+        );
+    }
+    if !cause_names_missing_result(&cause) {
+        return Case::fail(
+            id,
+            format!(
+                "the cause does not name the missing or unusable final result: {}",
+                excerpt(&cause, 300)
+            ),
+        );
+    }
     Case::pass(
-        CASE_DEFECT,
+        id,
         format!(
-            "reported exit {:?} instead of success for a finalized run without a result",
-            outcome.code
+            "reported the output defect with exit 1 and its cause: {}",
+            excerpt(&cause, 120)
         ),
     )
+}
+
+/// The human-readable cause of a text watch report, when it carries one.
+fn text_cause(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| line.strip_prefix("cause: "))
+}
+
+/// True when a cause names the problem instead of a generic failure: an
+/// output defect, or a final result that is missing, empty or unreadable.
+fn cause_names_missing_result(cause: &str) -> bool {
+    let cause = cause.to_ascii_lowercase();
+    if cause.contains("defect") {
+        return true;
+    }
+    let problem = [
+        "missing",
+        "no ",
+        "not ",
+        "without",
+        "unreadable",
+        "empty",
+        "absent",
+        "unavailable",
+    ];
+    let subject = ["result", "message", "answer", "output"];
+    problem.iter().any(|marker| cause.contains(marker))
+        && subject.iter().any(|marker| cause.contains(marker))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
