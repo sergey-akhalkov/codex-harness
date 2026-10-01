@@ -508,3 +508,198 @@ pub(super) fn run_program(
     runs.push(value.clone());
     Ok(value)
 }
+
+/// Execute the independent real-task check through the shared heavy resource
+/// owner instead of the short-lived regression case Job. A checker that
+/// prepares a source-only workspace needs the account budget, its own Job
+/// containment and a declared bound above the case runner's 600 seconds; the
+/// resource owner provides all three, and its nested-admission contract lets
+/// the checker's own fixed steps run under the same account slot.
+#[cfg(windows)]
+pub(super) fn run_admitted_program(
+    workspace: &Path,
+    evidence: &Path,
+    label: &str,
+    exe: &Path,
+    args: &[&str],
+    timeout: u64,
+    runs: &mut Vec<Value>,
+) -> io::Result<Value> {
+    use harness_core::{
+        heavy_command,
+        process::{Cancellation, CommandSpec, StopReason},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+    const CLEANUP: Duration = Duration::from_secs(10);
+    const POLL: Duration = Duration::from_millis(50);
+
+    let root = evidence.join(label);
+    fs::create_dir_all(&root)?;
+    let stdout_path = root.join("stdout.txt");
+    let stderr_path = root.join("stderr.txt");
+    let program = exe.to_owned();
+    let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let account = heavy_command::account_dir(None)?;
+    let budget = heavy_command::Budget::read(&account)?;
+    let declared = Duration::from_secs(timeout);
+    let started = Instant::now();
+    let cancellation = Cancellation::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let bound_hit = Arc::new(AtomicBool::new(false));
+    let output_hit = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let cancellation = cancellation.clone();
+        let stop = Arc::clone(&stop);
+        let bound_hit = Arc::clone(&bound_hit);
+        let output_hit = Arc::clone(&output_hit);
+        let stdout_path = stdout_path.clone();
+        let stderr_path = stderr_path.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let over = [&stdout_path, &stderr_path].iter().any(|path| {
+                    fs::metadata(path).is_ok_and(|metadata| metadata.len() > OUTPUT_LIMIT)
+                });
+                if over {
+                    output_hit.store(true, Ordering::Relaxed);
+                    cancellation.cancel();
+                    break;
+                }
+                if started.elapsed() >= declared {
+                    bound_hit.store(true, Ordering::Relaxed);
+                    cancellation.cancel();
+                    break;
+                }
+                thread::sleep(POLL);
+            }
+        })
+    };
+    let label_text = heavy_command::label(program.as_os_str(), &arguments);
+    let admission =
+        match heavy_command::Admission::acquire(&account, &budget, &label_text, &cancellation) {
+            Ok(admission) => admission,
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = watcher.join();
+                let cause = if bound_hit.load(Ordering::Relaxed) {
+                    "the declared deadline expired while waiting for the shared heavy-command slot"
+                } else {
+                    "the shared heavy-command slot could not be acquired"
+                };
+                return Err(io::Error::other(format!(
+                    "{cause}: {error}; elapsed {:.1}s",
+                    started.elapsed().as_secs_f64()
+                )));
+            }
+        };
+    let payload = (|| -> io::Result<harness_core::process::Outcome> {
+        let (job, marker) = admission.owned_job(&budget, &account)?;
+        eprintln!("{}", admission.job_line(&job)?);
+        let mut spec = CommandSpec::new(program);
+        spec.args = arguments;
+        spec.current_dir = Some(workspace.to_owned());
+        spec.stdout = Some(File::create(&stdout_path)?);
+        spec.stderr = Some(File::create(&stderr_path)?);
+        spec.env
+            .insert(OsString::from(heavy_command::LEASE_ENV), Some(marker));
+        let suspended = admission.spawn_in_envelope(&job, &spec)?;
+        let child = suspended.resume()?;
+        job.wait(&child, budget.deadline()?, &cancellation, CLEANUP)
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    let outcome = payload.map_err(|error| {
+        io::Error::other(format!(
+            "the admitted checker could not be started or cleaned: {error}; elapsed {:.1}s",
+            started.elapsed().as_secs_f64()
+        ))
+    })?;
+    let native_status = match outcome.reason {
+        StopReason::Exited => "exited",
+        StopReason::Timeout => "timeout",
+        StopReason::MemoryLimit => "memory-limit",
+        StopReason::Cancelled => "cancelled",
+    };
+    let status = match outcome.reason {
+        StopReason::Cancelled if output_hit.load(Ordering::Relaxed) => "output-limit",
+        StopReason::Cancelled if bound_hit.load(Ordering::Relaxed) => "timeout",
+        _ => native_status,
+    };
+    let stopped_by = match outcome.reason {
+        StopReason::Timeout => Some("machine-deadline"),
+        StopReason::MemoryLimit => Some("machine-memory-budget"),
+        StopReason::Cancelled if output_hit.load(Ordering::Relaxed) => Some("output-limit"),
+        StopReason::Cancelled if bound_hit.load(Ordering::Relaxed) => Some("declared-deadline"),
+        StopReason::Cancelled => Some("cancellation"),
+        StopReason::Exited => None,
+    };
+    let stream = |path: &Path| {
+        json!({
+            "path": path.to_string_lossy(),
+            "bytes": fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+        })
+    };
+    let stdout_bytes = fs::metadata(&stdout_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let stderr_bytes = fs::metadata(&stderr_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let output_over = stdout_bytes > OUTPUT_LIMIT || stderr_bytes > OUTPUT_LIMIT;
+    let value = json!({
+        "status": status,
+        "reason": format!("{:?}", outcome.reason),
+        "exit_code": outcome.exit_code,
+        "elapsed_seconds": started.elapsed().as_secs_f64(),
+        "declared_deadline_seconds": timeout,
+        "stopped_by": stopped_by,
+        "output_limit_reached": output_hit.load(Ordering::Relaxed) || output_over,
+        "admission": {
+            "route": "shared-heavy-command",
+            "account": account.to_string_lossy(),
+            "scope": admission.scope(),
+            "job": admission.job_name(),
+            "max_concurrent_trees": budget.max_concurrent_trees,
+            "queue_wait_seconds": budget.queue_wait_seconds,
+            "machine_deadline_seconds": budget.deadline_seconds,
+        },
+        "native": {
+            "Status": native_status,
+            "ExitCode": outcome.exit_code,
+            "ProcessExitCode": outcome.process_exit_code,
+            "MemoryLimitBytes": outcome.job.memory_limit_bytes,
+            "PeakJobMemoryBytes": outcome.job.peak_job_memory_bytes,
+            "CpuRate": outcome.job.cpu_rate,
+            "KillOnClose": outcome.job.kill_on_close,
+        },
+        "streams": {"stdout": stream(&stdout_path), "stderr": stream(&stderr_path)},
+        "root": root.to_string_lossy(),
+    });
+    runs.push(value.clone());
+    Ok(value)
+}
+
+#[cfg(not(windows))]
+pub(super) fn run_admitted_program(
+    workspace: &Path,
+    evidence: &Path,
+    label: &str,
+    exe: &Path,
+    args: &[&str],
+    timeout: u64,
+    runs: &mut Vec<Value>,
+) -> io::Result<Value> {
+    let _ = (workspace, evidence, label, exe, args, timeout, runs);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the admitted real-task route requires Windows Job Objects",
+    ))
+}

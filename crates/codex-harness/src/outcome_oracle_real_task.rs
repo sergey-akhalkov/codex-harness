@@ -1,7 +1,11 @@
 //! Run a host-owned native acceptance command against a real task checkout.
 //! Candidate reports are never inputs. The unchanged supervisor supplies this
 //! request and the frozen oracle identities, outside the candidate write scope.
-use super::{exited_zero, now, run_program};
+//! The independent check runs through the shared heavy resource owner, so a
+//! checker that prepares a source-only workspace gets the account budget, the
+//! resource owner's Job containment and the request's declared bounded deadline
+//! (the generic regression case keeps its own 512 MiB and 600-second contract).
+use super::{exited_zero, now, run_admitted_program};
 use crate::outcome_run::write_new;
 use harness_core::{build_identity, inventory};
 use serde::Deserialize;
@@ -124,6 +128,7 @@ pub(super) fn run(request_path: &Path, bytes: &[u8]) -> io::Result<i32> {
     let mut record = json!({
         "schema":1, "id":"outcome", "kind":"real-task", "executed":true,
         "checker_executed":false, "passed":false, "exit_code":1, "model_calls":0,
+        "checker_route":"shared-heavy-command",
         "started_at":now(), "ended_at":null, "evidence":evidence.join("oracle.json"),
         "task_contract_sha256":request.task_contract_sha256,
         "oracle_program_sha256":request.oracle.program_sha256,
@@ -131,7 +136,7 @@ pub(super) fn run(request_path: &Path, bytes: &[u8]) -> io::Result<i32> {
     });
     write_new(&evidence.join("oracle-started.json"), &record)?;
     let mut runs = Vec::new();
-    match run_program(
+    match run_admitted_program(
         &workspace,
         &evidence,
         "independent-check",
