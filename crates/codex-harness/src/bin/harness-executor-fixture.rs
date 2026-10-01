@@ -28,6 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "harness_executor_fixture/control_fixture.rs"]
+mod control_fixture;
 #[path = "harness_executor_fixture/watch_oracle.rs"]
 mod watch_oracle;
 
@@ -43,17 +45,42 @@ fn main() -> io::Result<()> {
         let rest: Vec<_> = args.collect();
         return exit(watch_oracle::run(&rest)?);
     }
+    // The ordinary control route spawns the installed launcher as
+    // `app-server --listen ws://127.0.0.1:PORT ...`; this fixture serves that
+    // exact child contract through the owned canned endpoint. The serving
+    // double is selected only by the explicit child-only mode the host
+    // forwards to the app-server, so every pre-existing mode keeps its
+    // documented behavior for the same argv.
+    if env::var("HARNESS_EXECUTOR_FIXTURE_MODE").is_ok_and(|mode| mode == "control-app-server")
+        && env::args().nth(1).is_some_and(|arg| arg == "app-server")
+    {
+        let rest: Vec<_> = env::args_os().skip(2).collect();
+        return exit(control_fixture::run_app_server(&rest)?);
+    }
     // The installed-launcher shell preflight is a model-free diagnostic; the
     // fixture answers it so receipts without a recorded shell still exercise
     // the real preparation path.
     if env::args().skip(1).any(|arg| arg == "prompt-input") {
-        let block = "<permissions instructions>\n`sandbox_mode` is `danger-full-access`\n</permissions instructions>";
+        // The full effective-permission block: the runtime check requires the
+        // shared Full Access defaults, and the executor shell preflight reads
+        // the single unambiguous sandbox declaration from the same text.
+        let block = "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`: No filesystem sandboxing - all commands are permitted.\nApproval policy is currently never.\n</permissions instructions>";
+        // The installation owner's runtime check requires the complete
+        // installed instruction source in the same diagnostic; the executor
+        // shell preflight reads only the permission block.
+        let instructions = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .and_then(|home| fs::read_to_string(home.join("AGENTS.md")).ok())
+            .unwrap_or_default();
         println!(
             "{}",
             json!([{
                 "type": "message",
                 "role": "developer",
-                "content": [{"type": "input_text", "text": block}]
+                "content": [
+                    {"type": "input_text", "text": instructions},
+                    {"type": "input_text", "text": block}
+                ]
             }])
         );
         return Ok(());

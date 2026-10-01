@@ -1776,7 +1776,18 @@ pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
     if let Some(configuration) = &runtime.configuration {
         let bytes = fs::read(&configuration.path)?;
         if build_identity::hash_bytes(&bytes) != configuration.sha256 {
-            return Err(invalid("the arm configuration changed since preparation"));
+            // The ordinary dispatch trusts its own bound workspace in this
+            // same file before the first model request
+            // (`executor_cli::ensure_workspace_trust` appends one
+            // `[projects.'<workspace>'] trust_level = "trusted"` block per
+            // slot), so a prepared arm legitimately gains exactly those
+            // trailing entries after preparation. Accept nothing else:
+            // removing them must reproduce the prepared bytes exactly.
+            let restored = strip_appended_trust(&bytes)
+                .filter(|stripped| build_identity::hash_bytes(stripped) == configuration.sha256);
+            if restored.is_none() {
+                return Err(invalid("the arm configuration changed since preparation"));
+            }
         }
         let document = parse_config_bytes(&bytes, "the arm configuration")?;
         declared_settings_present(&document, &configuration.settings)?;
@@ -1822,6 +1833,27 @@ pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
         model_ready: runtime.client_configured(),
         model_calls: 0,
     })
+}
+
+/// Removes the trailing trusted-project blocks the ordinary dispatch appends
+/// to an arm configuration (`executor_cli::ensure_workspace_trust` writes
+/// `\n[projects.'<workspace>']\ntrust_level = "trusted"\n` once per slot).
+/// Anything else - including an appended comment or another projects entry -
+/// keeps its bytes and therefore still fails the comparison.
+fn strip_appended_trust(bytes: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut current = text;
+    loop {
+        let Some(rest) = current.strip_suffix("\ntrust_level = \"trusted\"\n") else {
+            return Some(current.as_bytes().to_vec());
+        };
+        let section = rest.rsplit('\n').next()?;
+        let workspace = section.strip_prefix("[projects.'")?.strip_suffix("']")?;
+        if workspace.is_empty() || workspace.contains('\'') {
+            return None;
+        }
+        current = &rest[..rest.len() - section.len() - 1];
+    }
 }
 
 fn file_link_unchanged(link: &InstalledLink) -> io::Result<()> {

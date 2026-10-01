@@ -400,22 +400,36 @@ pub struct Server {
 
 impl Server {
     pub fn start(bearer: Bearer) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        Self::start_on_with(0, bearer, |_| {})
+    }
+
+    /// Serves one explicitly requested loopback port, exactly as the ordinary
+    /// control route spawns its app-server child with `--listen`. A port of 0
+    /// keeps the ephemeral behavior of [`Self::start`].
+    pub fn start_on(port: u16, bearer: Bearer) -> Self {
+        Self::start_on_with(port, bearer, |_| {})
+    }
+
+    /// Serves the requested port and configures every canned answer through
+    /// `configure` *before* the listener accepts its first client, so a
+    /// double that must answer the very first request has no startup race.
+    pub fn start_on_with(port: u16, bearer: Bearer, configure: impl FnOnce(&Server)) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(Canned::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let state = Arc::clone(&state);
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || serve(listener, &bearer, &state, &stop))
-        };
-        Self {
+        let mut server = Self {
             port,
-            state,
-            stop,
-            worker: Some(worker),
-        }
+            state: Arc::clone(&state),
+            stop: Arc::clone(&stop),
+            worker: None,
+        };
+        configure(&server);
+        server.worker = Some(thread::spawn(move || {
+            serve(listener, &bearer, &state, &stop)
+        }));
+        server
     }
 
     /// Answers one method with one answer, replacing every answer queued for it.

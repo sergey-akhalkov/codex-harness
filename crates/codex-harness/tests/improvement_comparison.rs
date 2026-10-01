@@ -115,6 +115,31 @@ fn home() -> PathBuf {
     PathBuf::from(env::var_os("CODEX_HOME").expect("CODEX_HOME"))
 }
 
+// The native frontend the host attaches is `codex --remote ... resume THREAD`.
+// A real TUI replaces its own console caption with `{title} | ` once the named
+// thread is loaded; this double does exactly that and then stays alive until
+// the owning host ends it.
+unsafe extern "system" {
+    fn GetConsoleTitleW(lp_console_title: *mut u16, n_size: u32) -> u32;
+    fn SetConsoleTitleW(lp_console_title: *const u16) -> u32;
+}
+
+fn frontend(caption_source: &str) -> ! {
+    let mut buffer = [0u16; 1024];
+    let count = unsafe { GetConsoleTitleW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    let mut title = String::from_utf16_lossy(&buffer[..count as usize]);
+    if title.is_empty() {
+        title = caption_source.to_owned();
+    }
+    let caption = format!("{title} | ");
+    let mut wide: Vec<u16> = caption.encode_utf16().collect();
+    wide.push(0);
+    unsafe { SetConsoleTitleW(wide.as_ptr()) };
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn set_hooks(text: &mut String, enabled: bool) {
     let mut replaced = String::new();
     let mut in_features = false;
@@ -162,6 +187,9 @@ fn hooks_state(text: &str) -> bool {
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--remote") {
+        frontend(env::args().next().as_deref().unwrap_or("codex"));
+    }
     match args.first().map(String::as_str) {
         Some("--version") => println!("codex-cli 0.160.0"),
         Some("--help") => println!(
@@ -739,8 +767,31 @@ impl Fixture {
     }
 
     fn improve(&self, args: &[&str]) -> Output {
+        self.improve_with_env(args, &[])
+    }
+
+    /// The controller is run as an ordinary operator process: the agent
+    /// session markers that would legitimately refuse nested executor
+    /// dispatch are removed, and only the explicitly declared environment
+    /// reaches the dispatched arm.
+    fn improve_with_env(&self, args: &[&str], environment: &[(&str, &str)]) -> Output {
         let mut command = Command::new(manager());
         command.arg("improve").args(args);
+        command.env_remove("HARNESS_EXECUTOR_SESSION");
+        command.env_remove("HARNESS_EXECUTOR_FIXTURE_MODE");
+        command.env_remove("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE");
+        // An operator process is not itself a dispatched executor run, so the
+        // session's own copied run marker and any lead id supplied by the
+        // surrounding session are not authority and must not reach the
+        // controller. CODEX_THREAD_ID stays: the operator thread id is the
+        // legitimate origination identity.
+        command.env_remove("HARNESS_EXECUTOR_RUN");
+        command.env_remove("HARNESS_ORIGINATING_LEAD");
+        command.env_remove("HARNESS_LEAD_THREAD");
+        command.env_remove("HARNESS_LEAD_RECIPIENT");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         command.output().expect("improve runs")
     }
 
@@ -756,6 +807,18 @@ impl Fixture {
 
     fn resume(&self) -> Output {
         self.improve(&["resume", "--run", self.run.to_str().unwrap()])
+    }
+
+    /// One resume that may dispatch a measured arm: the child-only fixture
+    /// mode reaches the installed launcher double through the host's explicit
+    /// forward, exactly as the arm's own settings do.
+    fn resume_dispatched(&self, extra: &[(&str, &str)]) -> Output {
+        let mut environment: Vec<(&str, &str)> = vec![CONTROL_CHILD_MODE];
+        environment.extend_from_slice(extra);
+        self.improve_with_env(
+            &["resume", "--run", self.run.to_str().unwrap()],
+            &environment,
+        )
     }
 
     fn status_json(&self) -> Value {
@@ -967,6 +1030,21 @@ impl Fixture {
         );
     }
 
+    /// The same two builds with the owned executor fixture as the installed
+    /// launcher, so the arm can serve the real control-backed app-server
+    /// contract instead of refusing before submission.
+    fn prepare_real_builds(&self, checkout: &task_worktree::CandidateCheckout) {
+        let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+        fixture_build(&self.state, "h-build", &self.proj, &launcher, "baseline");
+        fixture_build(
+            &self.state,
+            "ha-build",
+            &checkout.path,
+            &launcher,
+            "candidate",
+        );
+    }
+
     /// Start the run and replace the resulting idle cursor with the retained
     /// ready candidate the planning/implementation workflow reaches.
     fn start_with_ready_candidate(
@@ -1020,6 +1098,10 @@ impl Fixture {
         if slot.exists() {
             fs::remove_dir_all(&slot).unwrap();
         }
+        // A real dispatch attempt in this run may already have registered the
+        // pooled slot name; the simulated arm reuses the same pooled slot, so
+        // clear the stale registration of the removed directory first.
+        git(&checkout, &["worktree", "prune"]);
         git(
             &checkout,
             &[
@@ -2352,4 +2434,287 @@ fn rewrite_rollout(fixture: &Fixture, arm: &str, session: &str, model: &str, eff
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&rollout, format!("{rewritten}\n")).unwrap();
+}
+
+// ---------------------------------------------------------------- native path
+
+/// The explicit child-only fixture mode: the harness forwards
+/// `HARNESS_EXECUTOR_CHILD_FIXTURE_MODE` to the app-server child (never to the
+/// host or the native frontend), and the installed launcher double serves the
+/// ordinary control contract under it.
+const CONTROL_CHILD_MODE: (&str, &str) =
+    ("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE", "control-app-server");
+
+/// The exact dispatch receipt recorded for one attempt.
+fn attempt_receipt(fixture: &Fixture, attempt_id: &str) -> PathBuf {
+    let cursor = fixture.cursor();
+    let attempt = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == attempt_id)
+        .expect("the controller recorded the attempt");
+    PathBuf::from(
+        attempt["retained"]["receipt"]
+            .as_str()
+            .or_else(|| attempt["receipt"].as_str())
+            .expect("the attempt records a receipt"),
+    )
+}
+
+/// Bounded wait until the host's own observation record of one attempt reached
+/// a terminal state. The host writes it while the visible console runs.
+fn wait_for_terminal_receipt(receipt: &Path) -> Value {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        if let Ok(bytes) = fs::read(receipt)
+            && let Ok(record) = serde_json::from_slice::<Value>(&bytes)
+            && matches!(
+                record["observation"]["state"].as_str(),
+                Some("completed" | "failed" | "defect" | "interrupted" | "stopped")
+            )
+        {
+            return record;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the control-backed run produced no terminal observation record at {}",
+            receipt.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// One successful model-free measured pair through the ordinary control-backed
+/// dispatch route: real visible dispatch, native frontend attachment, the
+/// host's own lifecycle receipt, settlement from that receipt, independent
+/// acceptance and a published Beads decision - no seeded success receipt.
+#[test]
+fn one_real_control_backed_pair_settles_through_native_observation() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("native-pair");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_real_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    // First resume: preparation plus the real baseline dispatch.
+    let resume = fixture.resume_dispatched(&[]);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    let baseline = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["role"] == "baseline")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("the visible owner accepted the baseline attempt: {cursor}\n{output}")
+        });
+    let generation = baseline["binding"]["generation"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("the accepted dispatch recorded its generation: {baseline}\n{output}")
+        });
+    assert_eq!(baseline["state"], "started", "{cursor}");
+    let baseline_receipt = attempt_receipt(&fixture, "base-1");
+    let record = wait_for_terminal_receipt(&baseline_receipt);
+    assert_eq!(
+        record["observation"]["state"], "completed",
+        "the controlled conversation completed through the real host: {record}"
+    );
+    assert!(
+        !record["observation"]["session"].is_null(),
+        "the host recorded the native session: {record}"
+    );
+
+    // A stale generation is refused through the real receipt, then restored.
+    let real_bytes = fs::read(&baseline_receipt).unwrap();
+    let mut stale: Value = serde_json::from_slice(&real_bytes).unwrap();
+    stale["originatingLead"]["runGeneration"] = json!("stale-generation");
+    fs::write(
+        &baseline_receipt,
+        serde_json::to_vec_pretty(&stale).unwrap(),
+    )
+    .unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    let baseline_attempt = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == "base-1")
+        .unwrap();
+    assert!(
+        baseline_attempt["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("generation")),
+        "a stale generation is refused from the real receipt: {cursor}"
+    );
+    assert_eq!(
+        cursor["comparison"]["baseline"]["accepted"],
+        Value::Null,
+        "no comparison result is derived from the stale generation"
+    );
+    fs::write(&baseline_receipt, &real_bytes).unwrap();
+
+    // The harness's own trusted-project addition is accepted, but any further
+    // change to the consumed arm configuration still blocks the post-attempt
+    // consumption instead of entering the comparison.
+    let arm_config = fixture.arm_dir("baseline").join("home").join("config.toml");
+    let served = fs::read_to_string(&arm_config).unwrap();
+    assert!(
+        served.contains("trust_level = \"trusted\""),
+        "the real dispatch trusted its bound workspace: {served}"
+    );
+    fs::write(
+        &arm_config,
+        format!("{served}\n[fixture-drift]\nvalue = 1\n"),
+    )
+    .unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("the arm configuration changed since preparation"),
+        "an added arm configuration key still refuses consumption: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["comparison"]["baseline"]["accepted"],
+        Value::Null,
+        "a drifting arm configuration cannot enter the comparison"
+    );
+    fs::write(&arm_config, &served).unwrap();
+
+    // Restoring the accepted generation settles the baseline from its own
+    // receipt, runs the independent oracle, and dispatches the candidate.
+    let resume = fixture.resume_dispatched(&[]);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "the real baseline solution passed the frozen oracle: {status}\n{output}"
+    );
+    let candidate_receipt = attempt_receipt(&fixture, "cand-1");
+    let record = wait_for_terminal_receipt(&candidate_receipt);
+    assert_eq!(record["observation"]["state"], "completed", "{record}");
+
+    // The candidate settles, is independently checked and the frozen policy
+    // publishes its decision.
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], true,
+        "{status}"
+    );
+    let comments =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &fixture.card)
+            .unwrap();
+    let records = harness_core::benefit_gate::parse_gate_comments(&comments);
+    let assessment = harness_core::benefit_gate::assess(&records, &fixture.card)
+        .expect("a decision is published");
+    assert!(
+        assessment
+            .latest
+            .revisions
+            .as_deref()
+            .is_some_and(|revisions| revisions == format!("{base}..{}", checkout.revision)),
+        "the published decision carries the exact evaluated revisions: {comments:?}"
+    );
+    // Both arms settled from real host receipts, and each arm's committed
+    // solution was verified independently; nothing was seeded.
+    let cursor = fixture.cursor();
+    for (id, _role) in [("base-1", "baseline"), ("cand-1", "candidate")] {
+        let attempt = cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attempt| attempt["id"] == id)
+            .unwrap();
+        assert_eq!(attempt["state"], "completed", "{id}: {cursor}");
+        assert!(
+            attempt["retained"]["receipt_sha256"].is_string(),
+            "the attempt settled from its own retained receipt: {cursor}"
+        );
+    }
+    for arm in ["baseline", "candidate"] {
+        let oracle: Value =
+            serde_json::from_slice(&fs::read(fixture.arm_dir(arm).join("oracle.json")).unwrap())
+                .unwrap();
+        assert_eq!(oracle["executed"], true, "{arm}: {oracle}");
+        assert_eq!(oracle["checker_executed"], true, "{arm}: {oracle}");
+        assert_eq!(oracle["passed"], true, "{arm}: {oracle}");
+        assert!(
+            status["comparison"][arm]["revision"].is_string(),
+            "{arm}: the verified revision is retained: {status}"
+        );
+    }
+    assert!(!generation.is_empty());
+}
+
+/// Controlled protocol observations through the same real path: a rollout that
+/// records another model or effort refuses that arm, and nothing is adopted.
+#[test]
+fn real_control_dispatches_refuse_wrong_observed_model_and_effort() {
+    let _serial = INSTALL.lock().unwrap();
+    for (name, variable, wrong, declared) in [
+        (
+            "real-wrong-model",
+            "HARNESS_IMPROVEMENT_FIXTURE_MODEL",
+            "another-model",
+            "fixture-glyph-1",
+        ),
+        (
+            "real-wrong-effort",
+            "HARNESS_IMPROVEMENT_FIXTURE_EFFORT",
+            "xhigh",
+            "low",
+        ),
+    ] {
+        let fixture = Fixture::new(name);
+        let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+        fixture.prepare_real_builds(&checkout);
+        fixture.start_with_ready_candidate(&checkout, false);
+        let resume = fixture.resume_dispatched(&[]);
+        assert!(resume.status.success(), "{}", text(&resume));
+        let baseline_receipt = attempt_receipt(&fixture, "base-1");
+        wait_for_terminal_receipt(&baseline_receipt);
+        // Settle the baseline and dispatch the candidate under the wrong
+        // controlled observation.
+        let resume = fixture.resume_dispatched(&[(variable, wrong)]);
+        assert!(resume.status.success(), "{}", text(&resume));
+        let candidate_receipt = attempt_receipt(&fixture, "cand-1");
+        wait_for_terminal_receipt(&candidate_receipt);
+        let resume = fixture.resume();
+        let output = text(&resume);
+        assert!(resume.status.success(), "{output}");
+        assert!(
+            output.contains(&format!(
+                "recorded {} {wrong}",
+                if variable.ends_with("MODEL") {
+                    "model"
+                } else {
+                    "reasoning effort"
+                }
+            )) || output.contains(wrong),
+            "the wrong observed {declared} is refused: {output}"
+        );
+        assert_eq!(
+            fixture.cursor()["comparison"]["candidate"]["accepted"],
+            Value::Null
+        );
+        assert!(
+            !fixture
+                .bd_comments(&fixture.card)
+                .contains("benefit-gate v2"),
+            "no decision is published from a refused arm"
+        );
+    }
 }
