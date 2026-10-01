@@ -32,6 +32,8 @@ The retired script interface and its native equivalent. Selectors, preview
 | Instruction/source audit | Installed `harness-source-check --root CHECKOUT` |
 | Verification evidence | `harness-observe --scope TEXT --input FILE ... -- EXE ARGS` |
 | Feedback mechanics | `codex-harness feedback record|list|ledger|triage|candidates|promote` |
+| Hypothesis and removal records | `codex-harness feedback hypothesis-admit|search|trial|implement|decision` and `removal-propose|decide|check` |
+| Self-improvement controller | `codex-harness improve start|status|select|stop|resume` |
 | `tools/outcome_*.py` helpers | `codex-harness outcome-prepare` / `outcome-oracle` / `outcome-discover` / `outcome-arm` / `outcome-run` / `outcome-report` |
 | Subscription login / restore scripts | `codex-harness subscription-login xai` / `zai` (native restore in the service host) |
 | Skill evolution helpers | `codex-harness skills catalogue` / `isolate` / `usage` / `publish` / `identity` |
@@ -592,6 +594,62 @@ status, and retries preserve counted votes and promotion history. Grouping,
 consequence, authorization and acceptance remain agent decisions. Command
 examples and routing rules live in
 [board workflow](../.agents/skills/board-workflow/SKILL.md).
+
+The `hypothesis-*` verbs keep one durable hypothesis card on that board:
+admission searches open, closed and deferred cards first and requires a fresh
+recorded basis before reconsidering a same-condition conclusion, and trial,
+implementation and decision records reference the exact experiment, branch,
+revision, worktree, prepared runtime and acceptance evidence. The `removal-*`
+verbs record a reviewable proposal and the user's scoped approve, refuse or
+withdraw decision bound to that exact reviewed content, separate from any
+benefit result. These verbs write no votes and make no model call. Installed
+`feedback` help owns the exact fields; ownership and routing are in the
+[sequential comparison guide](../.agents/skills/board-workflow/references/self-improvement.md).
+
+## Improvement controller
+
+`codex-harness improve` runs at most one explicitly started, durable
+improvement run. Beads owns the hypothesis and its decisions, OpenSpec owns
+the planning change and the installed profile binding owns the effective
+model:
+
+```powershell
+codex-harness improve start  --run DIRECTORY --spec FILE
+codex-harness improve status --run DIRECTORY [--json]
+codex-harness improve select --run DIRECTORY --variant baseline|candidate
+codex-harness improve stop   --run DIRECTORY [--reason TEXT]
+codex-harness improve resume --run DIRECTORY
+```
+
+`start` validates the strict schema-1 run inputs (project, board, OpenSpec
+change, base revision, writable scope, runner profile, evidence root, oracle,
+publication scope and any removal scope), refuses duplicate run ownership,
+qualifies the linked OpenSpec change through the installed CLI, creates the
+private run directory and performs model-free preparation. It then advances
+the bounded investigation, planning and implementation workflow: a retained
+investigator report is consumed through grounded intake, the candidate's own
+OpenSpec change must qualify before any implementation, and only a validated
+committed candidate reaches candidate-ready. A missing evidence base records
+idle and a missing dispatch, qualification or removal gate records blocked;
+neither starts hidden model work.
+
+`status` prints the recoverable phase cursor with no model call. `select`
+activates an already prepared baseline or candidate runtime through the
+build-selection owner and refuses while a measured attempt is active or
+unreconciled; a candidate that removes a capability additionally needs the
+current experimental removal authority. `stop` preserves every attempt and
+marks in-flight attempts unknown so `resume` never replays them. `resume`
+reconciles recorded receipts, re-resolves removal authority and advances only
+settled work.
+
+Comparison execution and frozen runtime preparation remain separate owners:
+phases that need them stay explicitly pending until an actual effect records
+them, and the installed actual-model A-on-B/B-on-C acceptance is open rather
+than proven. The run directory, spec file and retained receipts are local
+private inputs. Read `improve --help` for the exact request contract and see
+the [self-improvement-loop skill](../.agents/skills/self-improvement-loop/SKILL.md)
+for operation and the [sequential comparison guide](../.agents/skills/board-workflow/references/self-improvement.md)
+for records.
 
 ## Native task-control contract
 

@@ -219,4 +219,6 @@ verification.
 For a requested continuous improvement loop, use `self-improvement-loop` and
 the [sequential comparison record guide](references/self-improvement.md).
 It keeps hypotheses and scoped removal decisions on this board while the
-native controller owns run recovery; ordinary feedback routing stays above.
+native controller owns run recovery. The experiment path counts no incubator
+votes and takes no `vote_threshold` promotion; the ordinary feedback routing
+above stays the only vote-based intake and promotion policy.

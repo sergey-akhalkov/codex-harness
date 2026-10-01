@@ -642,18 +642,25 @@ alone is no efficiency evidence. Removal needs a reviewable proposal and
 explicit consent covering the actual affected stages, independently of
 benefit. Experimental activation and live publication remain separate.
 
-**2026-09-19/20, confirmed:** the self-improvement loop runs on the consuming
-project's board, not in chat. Lead and executor observations become bounded
-`feedback` tasks; the lead batch-triages at safe boundaries; unique incubator
-items gain exactly one vote per distinct episode and reporter; `vote_threshold`
-(kit configuration, default promotion after more than two votes) promotes by
-consequence - small improvements to backlog tasks, behavior or requirement
-changes into OpenSpec, kit instruction or tool demand to the kit's own backlog
-with kit-level wording only, never with private consuming-project data.
-Material correctness, integrity or safety evidence promotes immediately under
-the lead's consequence override with a recorded reason, and incubator hygiene
-is lead-owned with two deterministic triggers: closing a stage or epic during
-acceptance, and a triage batch finding the incubator above `incubator_size_cap`.
+**2026-09-19/20, confirmed (scoped 2026-10-01 to the ordinary feedback loop):**
+the ordinary feedback loop runs on the consuming project's board, not in chat.
+Lead and executor observations become bounded `feedback` tasks; the lead
+batch-triages at safe boundaries; unique incubator items gain exactly one vote
+per distinct episode and reporter; `vote_threshold` (kit configuration, default
+promotion after more than two votes) promotes by consequence - small
+improvements to backlog tasks, behavior or requirement changes into OpenSpec,
+kit instruction or tool demand to the kit's own backlog with kit-level wording
+only, never with private consuming-project data. Material correctness,
+integrity or safety evidence promotes immediately under the lead's consequence
+override with a recorded reason, and incubator hygiene is lead-owned with two
+deterministic triggers: closing a stage or epic during acceptance, and a triage
+batch finding the incubator above `incubator_size_cap`. This entry owns the
+observation, vote and promotion policy only: it is the sole vote-based intake,
+it still confers planning eligibility rather than implementation authority, and
+the evidence-driven sequential experiment loop is the separate 2026-09-30
+decision. The experiment path admits its hypotheses and scoped removal
+decisions on the same board without incubator votes or `vote_threshold`
+promotion.
 
 **2026-09-20, confirmed:** orchestration spend is paced and gated rather than
 promised. Pacing adjusts only new assignments from fresh scoped observations:

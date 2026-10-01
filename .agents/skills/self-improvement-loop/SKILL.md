@@ -11,6 +11,9 @@ command contract. If unavailable, report the missing installed capability and
 use the kit installation/update owner; do not replace it with an ad hoc model
 driver. Keep endpoint details, raw traces and acceptance inputs in local run
 storage. The [native guide](../../../docs/rust-native.md) owns command details.
+Comparison execution and frozen-arm preparation stay separate owners: phases
+that need them remain pending in `status` until an actual effect records them,
+and that pending state is not an operative loop.
 
 ## Prepare a meaningful comparison
 
@@ -39,12 +42,13 @@ conversation uses the visible dispatcher and its own titled terminal surface.
 ## Operate and accept
 
 Use `improve start`, `status`, `select`, `stop` and `resume` with the installed
-contract. Freeze B's task, specification and source separately from baseline H
-and candidate H+A runtimes. Fresh task copies and executor contexts must not
-expose sibling solutions through files, Git history or conversation state.
-Prepared selection must identify the consumed runtime and refuse changes
-during a measured attempt. Keep the supervisor and independent oracle outside
-candidate writes.
+contract; a missing dispatch-visibility, qualification, evidence or removal
+gate records `blocked` or `idle` instead of starting hidden work. Freeze B's
+task, specification and source separately from baseline H and candidate H+A
+runtimes. Fresh task copies and executor contexts must not expose sibling
+solutions through files, Git history or conversation state. Prepared selection
+must identify the consumed runtime and refuse changes during a measured
+attempt. Keep the supervisor and independent oracle outside candidate writes.
 
 Declare correctness, meaningful time/resource effects, tolerances, stopping
 and selection policy before results. Include failures, retries, checking,
@@ -71,3 +75,5 @@ patches, required evidence and original errors; never replay an unknown model
 attempt. Reuse completed work only while its inputs and qualification remain
 valid. Report incomplete acceptance explicitly: wiring fixtures and finite
 observations cannot prove the full installed loop or indefinite reliability.
+The installed actual-model A-on-B/B-on-C acceptance remains open until it is
+genuinely exercised.

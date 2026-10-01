@@ -227,7 +227,11 @@ consequence override with the reason recorded. The lead sweeps the incubator
 when it closes a stage or epic and when a triage batch finds it above
 `incubator_size_cap`, archiving stale items with visible reasons instead of
 deleting evidence. The `board-workflow` skill owns the record formats; the
-`team-lead` skill owns the workflow.
+`team-lead` skill owns the workflow. The evidence-driven sequential experiment
+loop is a separate mechanism with its own hypotheses, candidate selection and
+removal gates: use the `self-improvement-loop` skill and the
+[`codex-harness improve` controller](rust-native.md#improvement-controller);
+it counts no incubator votes and does not change this promotion policy.
 
 Pacing uses three scoped sources only: the native Codex/GPT limit snapshot the
 CLI records for itself, actual provider refusals, and bounded dashboard

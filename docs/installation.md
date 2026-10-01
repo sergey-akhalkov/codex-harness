@@ -161,7 +161,12 @@ the portable global instruction text has one authoritative home under `global/`.
 
 Fixed Astra presets are retired in favor of direct model/effort selection; the
 compatible agent source directory and its link remain without agent TOMLs.
-User-owned agents and skill directories are preserved.
+User-owned agents and skill directories are preserved. Core skill linking
+delivers every top-level kit skill, including the loop guidance `team-lead`,
+`board-workflow` and `self-improvement-loop`, and the manager binary carries
+the matching `feedback` and `improve` verbs; an `update` after a skill is
+added or removed reconciles that set. The controller contract and its open
+acceptance are in [Rust native](rust-native.md#improvement-controller).
 
 Shared keys are declared in `global/kit.json` and live in
 `global/harness.config.toml`: the model/reasoning preference

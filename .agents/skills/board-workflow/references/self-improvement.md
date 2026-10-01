@@ -3,8 +3,11 @@
 Beads remains the sole owner of task, hypothesis and decision status. Native
 `codex-harness feedback hypothesis-*` commands retain investigation, trial and
 implementation references on the existing cards. Read the installed command
-help for request fields; do not maintain another hypothesis journal. A
-controller cursor records recovery position and references these owners.
+help for request fields; do not maintain another hypothesis journal. The
+`codex-harness improve start|status|select|stop|resume` cursor records
+recovery position only and references these owners; phases that need the
+separate comparison-execution or frozen-runtime owners stay pending until an
+actual effect records them.
 
 Search open, closed and deferred hypotheses before admission. A repeated trial
 uses the same hypothesis card. Reconsider an earlier rejection only with a new
