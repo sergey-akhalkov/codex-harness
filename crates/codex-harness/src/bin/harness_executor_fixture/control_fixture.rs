@@ -26,6 +26,11 @@
 //! - `HARNESS_IMPROVEMENT_FIXTURE_SOLUTION_FILE` / `..._SOLUTION_TEXT`: the
 //!   committed solution the controlled agent leaves in its bound slot
 //!   (default `solution.txt` = `solved`); an empty text skips the commit.
+//! - `tool-probes/<arm>.json` beside the comparison run, when present: the
+//!   controlled agent resolves each named unqualified command through the
+//!   host-supplied environment and executes it only when the hit is under the
+//!   request's allow prefix. It also runs the owner shell. Completion is
+//!   pushed after that work so the host cannot end the child first.
 
 #[path = "../../../tests/fixtures/control_endpoint.rs"]
 mod control_endpoint;
@@ -138,17 +143,9 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             "method": "turn/started",
             "params": {"threadId": session_for_thread.clone(), "turn": {"id": TURN, "status": "inProgress"}},
         }));
-            server.push(json!({
-                "method": "item/completed",
-                "params": {
-                    "threadId": session_for_thread.clone(),
-                    "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
-                },
-            }));
-            server.push(json!({
-            "method": "turn/completed",
-            "params": {"threadId": session_for_thread.clone(), "turn": {"id": TURN, "status": "completed"}},
-        }));
+            // Completion is pushed by the agent thread after its owned work,
+            // including command-resolution evidence. Pushing it here lets the
+            // host end the child before that work runs.
         },
     ));
 
@@ -163,8 +160,20 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             let until = Instant::now() + Duration::from_secs(120);
             while Instant::now() < until {
                 if !server.requests_for("turn/start").is_empty() {
+                    record_selected_tools();
                     let _ = commit_solution();
                     let _ = write_rollout(&session, &rollout_model, &rollout_effort);
+                    server.push(json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": session.clone(),
+                            "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
+                        },
+                    }));
+                    server.push(json!({
+                        "method": "turn/completed",
+                        "params": {"threadId": session.clone(), "turn": {"id": TURN, "status": "completed"}},
+                    }));
                     return;
                 }
                 thread::sleep(Duration::from_millis(20));
@@ -246,6 +255,128 @@ fn commit_solution() -> io::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Records unqualified command identity from the host-supplied environment.
+/// The request is tool-probes/<arm>.json in the comparison run directory,
+/// derived from CODEX_HOME, so it survives the host wrapper. Absent when the
+/// caller did not ask for it.
+fn record_selected_tools() {
+    let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from) else {
+        return;
+    };
+    let Some(arm_dir) = home.parent() else {
+        return;
+    };
+    let Some(arm) = arm_dir.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(run) = arm_dir.parent().and_then(|comparison| comparison.parent()) else {
+        return;
+    };
+    let request_path = run.join("tool-probes").join(format!("{arm}.json"));
+    let Ok(bytes) = fs::read(&request_path) else {
+        return;
+    };
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let Some(receipt) = request["receipt"].as_str() else {
+        return;
+    };
+    let allow = request["allow"].as_str().unwrap_or("");
+    let mut commands = serde_json::Map::new();
+    if let Some(names) = request["commands"].as_array() {
+        for name in names.iter().filter_map(|value| value.as_str()) {
+            commands.insert(name.to_owned(), probe_command(name, allow));
+        }
+    }
+    let record = json!({
+        "pid": std::process::id(),
+        "commands": commands,
+        "shell": probe_shell(),
+    });
+    if let Some(directory) = Path::new(receipt).parent() {
+        let _ = fs::create_dir_all(directory);
+    }
+    if let Ok(encoded) = serde_json::to_vec_pretty(&record) {
+        let _ = fs::write(receipt, encoded);
+    }
+}
+
+fn probe_command(name: &str, allow: &str) -> serde_json::Value {
+    let located = Command::new("where.exe").arg(name).output();
+    let (resolved, where_exit) = match &located {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let first = text.lines().next().unwrap_or("").trim().to_owned();
+            (
+                if first.is_empty() { None } else { Some(first) },
+                output.status.code(),
+            )
+        }
+        Err(error) => {
+            return json!({
+                "resolved": serde_json::Value::Null,
+                "executed": false,
+                "error": error.to_string(),
+            });
+        }
+    };
+    // A resolved path outside the fixture is already a foreign answer. Do not
+    // execute it. A name where.exe cannot see is still invoked, so an explicit
+    // suffix that PowerShell would accept cannot hide behind the lookup.
+    let outside = resolved.as_deref().is_some_and(|path| {
+        allow.is_empty()
+            || !path
+                .to_ascii_lowercase()
+                .starts_with(&allow.to_ascii_lowercase())
+    });
+    if outside {
+        return json!({
+            "resolved": resolved,
+            "whereExit": where_exit,
+            "executed": false,
+        });
+    }
+    match Command::new("pwsh")
+        .args(["-NoLogo", "-NoProfile", "-Command", name])
+        .output()
+    {
+        Ok(output) => json!({
+            "resolved": resolved,
+            "whereExit": where_exit,
+            "executed": true,
+            "exit": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }),
+        Err(error) => json!({
+            "resolved": resolved,
+            "whereExit": where_exit,
+            "executed": false,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn probe_shell() -> serde_json::Value {
+    match Command::new("pwsh")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString(); (Get-Command pwsh.exe).Source",
+        ])
+        .output()
+    {
+        Ok(output) => json!({
+            "exit": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(error) => json!({"error": error.to_string()}),
+    }
 }
 
 fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {

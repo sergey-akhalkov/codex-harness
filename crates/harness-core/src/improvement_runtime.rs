@@ -9,6 +9,10 @@
 //! retained as an [`ArmRuntime`] identity. [`verify_consumption`] re-verifies
 //! that identity read-only before an attempt, and [`retire_arm`] /
 //! [`discard_arm`] restore the homes through the existing disconnection owner.
+//! When the kit source advertises token workflow (`global/rtk.json`), that
+//! component is prepared through its own lifecycle owner and its adapter,
+//! vendor binary and state are part of the same identity. A required component
+//! that cannot be prepared refuses readiness; a global copy is never used.
 //!
 //! # Controller call order
 //!
@@ -458,9 +462,31 @@ pub struct ArmRuntime {
     pub skills: Vec<InstalledLink>,
     /// Native command links (`home/harness/bin`) excluding the launcher.
     pub commands: Vec<InstalledLink>,
+    /// Components prepared through their own lifecycle owners. Empty when the
+    /// source does not advertise one. Absent on an older receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<PreparedComponent>,
     pub configuration: Option<ConfigurationRecord>,
     pub private: Vec<PrivateRecord>,
     pub installation: InstallationFacts,
+    pub model_calls: u32,
+}
+
+/// One component prepared through its lifecycle owner and retained with the
+/// arm. The links are the consumed files; the state digest is the owner's
+/// record of that preparation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreparedComponent {
+    pub name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_version: Option<String>,
+    pub links: Vec<InstalledLink>,
+    pub state_path: PathBuf,
+    pub state_sha256: String,
     pub model_calls: u32,
 }
 
@@ -1414,6 +1440,10 @@ pub fn install_arm(request: &ArmRequest) -> io::Result<ArmRuntime> {
         runtime_executable_sha256: runtime.executable_sha256.clone(),
         runtime_evidence: runtime.evidence.clone(),
     };
+    if token_workflow_advertised(&plan.source)? {
+        prepare_token_workflow(&plan)?;
+        restore_declared_settings(&plan)?;
+    }
     let observed = observe(&plan, facts)?;
     verify_consumption(&observed).map_err(|error| {
         invalid(format!(
@@ -1456,6 +1486,354 @@ fn directory_link(name: &str, destination: &Path, source: &Path) -> io::Result<I
         source,
         sha256,
     })
+}
+
+const COMPONENT_FILE_LIMIT: u64 = 128 * 1024 * 1024;
+
+fn token_workflow_advertised(source: &Path) -> io::Result<bool> {
+    let path = source.join("global/rtk.json");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(invalid(
+            "the token-workflow selection record is not an ordinary file; readiness is refused",
+        )),
+    }
+}
+
+fn prepare_token_workflow(plan: &Plan) -> io::Result<()> {
+    let report = crate::token_workflow_lifecycle::install(&crate::token_workflow_lifecycle::Request {
+        source: plan.source.clone(),
+        codex_home: plan.home.clone(),
+        user_home: plan.user_home.clone(),
+        preview: false,
+    })
+    .map_err(|error| {
+        invalid(format!(
+            "the {} arm's advertised token-workflow component was not prepared ({error}); readiness is refused and no global copy is used",
+            plan.variant.label
+        ))
+    })?;
+    if report.model_calls != 0 || report.status != "Token workflow connected" {
+        return Err(invalid(
+            "token-workflow preparation did not report a model-free connection; readiness is refused",
+        ));
+    }
+    Ok(())
+}
+
+fn restore_declared_settings(plan: &Plan) -> io::Result<()> {
+    let Some(client) = &plan.client else {
+        return Ok(());
+    };
+    let path = plan.home.join("config.toml");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(
+                "token-workflow preparation removed the declared arm configuration; readiness is refused",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let mut document = parse_config_bytes(&bytes, "the arm configuration")?;
+    let mut changed = false;
+    for setting in &client.settings {
+        match lookup(&document, &setting.key) {
+            Some(value) if *value == setting.value => {}
+            _ => {
+                assign_declared_setting(&mut document, &setting.key, setting.value.clone())?;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let restored = toml::to_string(&document).map_err(io::Error::other)?;
+        if restored.len() > CONFIG_LIMIT {
+            return Err(invalid(
+                "the restored arm configuration exceeds its bound; readiness is refused",
+            ));
+        }
+        fs::write(&path, restored)?;
+    }
+    let bytes = fs::read(&path)?;
+    let document = parse_config_bytes(&bytes, "the arm configuration")?;
+    declared_settings_present(&document, &client.settings).map_err(|error| {
+        invalid(format!(
+            "declared client settings did not hold after token-workflow preparation ({error}); readiness is refused"
+        ))
+    })?;
+    verify_client_values(&document, &client.record)?;
+    Ok(())
+}
+
+fn assign_declared_setting(
+    table: &mut toml::Table,
+    key: &str,
+    value: toml::Value,
+) -> io::Result<()> {
+    let (head, tail) = key
+        .split_once('.')
+        .map(|(head, tail)| (head, Some(tail)))
+        .unwrap_or((key, None));
+    if head.is_empty() {
+        return Err(invalid("a declared client setting has an empty key"));
+    }
+    let Some(tail) = tail else {
+        table.insert(head.to_owned(), value);
+        return Ok(());
+    };
+    let child = table
+        .entry(head.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(child) = child.as_table_mut() else {
+        return Err(invalid(format!(
+            "the declared client setting {key} is not a table path"
+        )));
+    };
+    assign_declared_setting(child, tail, value)
+}
+
+fn observe_components(plan: &Plan) -> io::Result<Vec<PreparedComponent>> {
+    let advertised = token_workflow_advertised(&plan.source)?;
+    let state_path = plan.home.join("harness/token-workflow.json");
+    let state = match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+        Ok(_) => {
+            let bytes = fs::read(&state_path)?;
+            if bytes.len() > CONFIG_LIMIT {
+                return Err(invalid("the token-workflow record exceeds its bound"));
+            }
+            Some(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|_| invalid("the token-workflow record is not JSON"))?,
+            )
+        }
+    };
+    let enabled = state.as_ref().is_some_and(|value| value["enabled"] == true);
+    if !advertised {
+        if enabled {
+            return Err(invalid(
+                "token workflow is connected but this arm source does not advertise it; readiness is refused",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let Some(state) = state.filter(|_| enabled) else {
+        return Err(invalid(
+            "the advertised token-workflow component was not prepared; readiness is refused and no global copy is used",
+        ));
+    };
+    let links = component_links(plan, &state)?;
+    for name in ["rtk.exe", "harness-rtk.exe"] {
+        if links.iter().all(|link| link.name != name) {
+            return Err(invalid(
+                "the prepared token-workflow component is missing an owned command; readiness is refused",
+            ));
+        }
+    }
+    let identity = crate::token_workflow_lifecycle::component_source_identity(&plan.source).map_err(
+        |error| {
+            invalid(format!(
+                "the advertised token-workflow source identity is unavailable ({error}); readiness is refused"
+            ))
+        },
+    )?;
+    if state["sourceIdentity"].as_str() != Some(identity.as_str()) {
+        return Err(invalid(
+            "the token-workflow record does not name this arm's source identity; readiness is refused",
+        ));
+    }
+    let vendor = state["rtkVersion"]
+        .as_str()
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| invalid("the token-workflow record has no vendor version"))?
+        .to_owned();
+    Ok(vec![PreparedComponent {
+        name: "token-workflow".to_owned(),
+        status: "Token workflow connected".to_owned(),
+        source_identity: Some(identity),
+        vendor_version: Some(vendor),
+        links,
+        state_path: plain(&state_path)?,
+        state_sha256: hash_file(
+            "the token-workflow record",
+            &state_path,
+            CONFIG_LIMIT as u64,
+        )?,
+        model_calls: 0,
+    }])
+}
+
+fn component_links(plan: &Plan, state: &serde_json::Value) -> io::Result<Vec<InstalledLink>> {
+    let items = state["links"]
+        .as_array()
+        .ok_or_else(|| invalid("the token-workflow record has no links"))?;
+    let mut links = Vec::new();
+    for item in items {
+        let destination = PathBuf::from(
+            item["destination"]
+                .as_str()
+                .ok_or_else(|| invalid("a token-workflow link has no destination"))?,
+        );
+        let source = PathBuf::from(
+            item["source"]
+                .as_str()
+                .ok_or_else(|| invalid("a token-workflow link has no source"))?,
+        );
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("a token-workflow link has no file name"))?
+            .to_owned();
+        let link = component_file_link(&name, &destination, &source)?;
+        let recorded = item["sha256"].as_str().unwrap_or("");
+        if !link.sha256.eq_ignore_ascii_case(recorded) {
+            return Err(invalid(format!(
+                "the installed {name} does not match the token-workflow record"
+            )));
+        }
+        if !inside(&link.destination, &plan.home)
+            || (!inside(&link.source, &plan.home) && !inside(&link.source, &plan.source))
+        {
+            return Err(invalid(format!(
+                "the token-workflow link {name} does not stay inside this arm"
+            )));
+        }
+        links.push(link);
+    }
+    Ok(links)
+}
+
+fn component_file_link(name: &str, destination: &Path, source: &Path) -> io::Result<InstalledLink> {
+    let source = checked_link(destination, source, false)?;
+    let metadata = fs::metadata(&source)?;
+    if !metadata.is_file() || metadata.len() > COMPONENT_FILE_LIMIT {
+        return Err(invalid(format!(
+            "the prepared component file {name} is missing or exceeds its bound"
+        )));
+    }
+    let sha256 = build_identity::hash_file(&source)?;
+    Ok(InstalledLink {
+        name: name.to_owned(),
+        destination: plain(destination)?,
+        source,
+        sha256,
+    })
+}
+
+fn verify_prepared_components(runtime: &ArmRuntime) -> io::Result<()> {
+    let advertised = token_workflow_advertised(&runtime.source)?;
+    let recorded = runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow");
+    if !advertised {
+        if recorded.is_some() {
+            return Err(invalid(
+                "the arm records a token-workflow component its source does not advertise",
+            ));
+        }
+        return Ok(());
+    }
+    let Some(component) = recorded else {
+        return Err(invalid(
+            "the advertised token-workflow component is not in the arm record; readiness is refused",
+        ));
+    };
+    if component.model_calls != 0 || component.status != "Token workflow connected" {
+        return Err(invalid(
+            "the token-workflow record is not a model-free connection",
+        ));
+    }
+    let live_identity = crate::token_workflow_lifecycle::component_source_identity(&runtime.source)
+        .map_err(|error| {
+            invalid(format!(
+                "the token-workflow source identity changed since preparation ({error})"
+            ))
+        })?;
+    if component.source_identity.as_deref() != Some(live_identity.as_str()) {
+        return Err(invalid(
+            "the token-workflow source identity changed since preparation",
+        ));
+    }
+    if !inside(&component.state_path, &runtime.home) {
+        return Err(invalid("the token-workflow record escapes the arm home"));
+    }
+    let state_sha = hash_file(
+        "the token-workflow record",
+        &component.state_path,
+        CONFIG_LIMIT as u64,
+    )?;
+    if state_sha != component.state_sha256 {
+        return Err(invalid(
+            "the token-workflow record changed since preparation",
+        ));
+    }
+    for name in ["rtk.exe", "harness-rtk.exe"] {
+        if component.links.iter().all(|link| link.name != name) {
+            return Err(invalid("the token-workflow record lost an owned command"));
+        }
+    }
+    for link in &component.links {
+        if !inside(&link.destination, &runtime.home)
+            || (!inside(&link.source, &runtime.home) && !inside(&link.source, &runtime.source))
+        {
+            return Err(invalid(format!(
+                "the token-workflow link {} no longer comes from this arm",
+                link.name
+            )));
+        }
+        let source = checked_link(&link.destination, &link.source, false)?;
+        let metadata = fs::metadata(&source)?;
+        if !metadata.is_file() || metadata.len() > COMPONENT_FILE_LIMIT {
+            return Err(invalid(format!(
+                "the installed {} content changed since preparation",
+                link.name
+            )));
+        }
+        if build_identity::hash_file(&source)? != link.sha256 {
+            return Err(invalid(format!(
+                "the installed {} content changed since preparation",
+                link.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn disconnect_token_workflow_if_connected(home: &Path, user_home: &Path) -> io::Result<()> {
+    let state_path = home.join("harness/token-workflow.json");
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let bytes = fs::read(&state_path)?;
+    let state: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    if state["enabled"] != true {
+        return Ok(());
+    }
+    let source = state["sourceRoot"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.to_path_buf());
+    let report =
+        crate::token_workflow_lifecycle::disconnect(&crate::token_workflow_lifecycle::Request {
+            source,
+            codex_home: home.to_path_buf(),
+            user_home: user_home.to_path_buf(),
+            preview: false,
+        })?;
+    if report.model_calls != 0 {
+        return Err(invalid(
+            "token-workflow disconnection made a model call; the arm home is preserved",
+        ));
+    }
+    Ok(())
 }
 
 fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
@@ -1578,6 +1956,7 @@ fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
             sha256,
         });
     }
+    let components = observe_components(plan)?;
 
     Ok(ArmRuntime {
         schema: RUNTIME_SCHEMA,
@@ -1597,6 +1976,7 @@ fn observe(plan: &Plan, facts: InstallationFacts) -> io::Result<ArmRuntime> {
         agents,
         skills,
         commands,
+        components,
         configuration,
         private,
         installation: facts,
@@ -1779,6 +2159,7 @@ pub fn verify_consumption_with_trust(
         file_link_unchanged(command)?;
     }
     file_link_unchanged(&runtime.launcher)?;
+    verify_prepared_components(runtime)?;
     let expected_launcher = record
         .binaries
         .get("codex.exe")
@@ -2025,11 +2406,35 @@ pub fn retire_arm(runtime: &ArmRuntime) -> io::Result<Retirement> {
             "this home now carries another installation; preserving it",
         ));
     }
+    disconnect_prepared_components(runtime)?;
     disconnect_homes(
         &runtime.home,
         &runtime.user_home,
         &runtime.dependency_user_home,
     )
+}
+
+fn disconnect_prepared_components(runtime: &ArmRuntime) -> io::Result<()> {
+    if !runtime
+        .components
+        .iter()
+        .any(|component| component.name == "token-workflow")
+    {
+        return Ok(());
+    }
+    let report =
+        crate::token_workflow_lifecycle::disconnect(&crate::token_workflow_lifecycle::Request {
+            source: runtime.source.clone(),
+            codex_home: runtime.home.clone(),
+            user_home: runtime.user_home.clone(),
+            preview: false,
+        })?;
+    if report.model_calls != 0 {
+        return Err(invalid(
+            "token-workflow disconnection made a model call; the arm home is preserved",
+        ));
+    }
+    Ok(())
 }
 
 /// Restore the explicit homes of an arm whose preparation failed before a
@@ -2039,6 +2444,7 @@ pub fn discard_arm(
     user_home: &Path,
     dependency_user_home: &Path,
 ) -> io::Result<Retirement> {
+    disconnect_token_workflow_if_connected(home, user_home)?;
     disconnect_homes(home, user_home, dependency_user_home)
 }
 

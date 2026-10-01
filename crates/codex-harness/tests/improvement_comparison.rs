@@ -140,7 +140,7 @@ fn frontend(caption_source: &str) -> ! {
     }
 }
 
-fn set_hooks(text: &mut String, enabled: bool) {
+fn set_feature(text: &mut String, name: &str, enabled: bool) {
     let mut replaced = String::new();
     let mut in_features = false;
     let mut seen_features = false;
@@ -149,14 +149,14 @@ fn set_hooks(text: &mut String, enabled: bool) {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             if in_features && !done {
-                replaced.push_str(&format!("hooks = {enabled}\n"));
+                replaced.push_str(&format!("{name} = {enabled}\n"));
                 done = true;
             }
             in_features = trimmed == "[features]";
             seen_features |= in_features;
         }
-        if in_features && !done && trimmed.starts_with("hooks") && line.contains('=') {
-            replaced.push_str(&format!("hooks = {enabled}\n"));
+        if in_features && !done && trimmed.starts_with(name) && line.contains('=') {
+            replaced.push_str(&format!("{name} = {enabled}\n"));
             done = true;
             continue;
         }
@@ -164,22 +164,22 @@ fn set_hooks(text: &mut String, enabled: bool) {
         replaced.push('\n');
     }
     if in_features && !done {
-        replaced.push_str(&format!("hooks = {enabled}\n"));
+        replaced.push_str(&format!("{name} = {enabled}\n"));
         done = true;
     }
     *text = if done {
         replaced
     } else if seen_features {
-        format!("{replaced}hooks = {enabled}\n")
+        format!("{replaced}{name} = {enabled}\n")
     } else {
-        format!("{replaced}\n[features]\nhooks = {enabled}\n")
+        format!("{replaced}\n[features]\n{name} = {enabled}\n")
     };
 }
 
-fn hooks_state(text: &str) -> bool {
+fn feature_state(text: &str, name: &str) -> bool {
     text.lines()
         .rev()
-        .find(|line| line.trim_start().starts_with("hooks") && line.contains('='))
+        .find(|line| line.trim_start().starts_with(name) && line.contains('='))
         .and_then(|line| line.split('=').nth(1))
         .map(|value| value.trim() == "true")
         .unwrap_or(false)
@@ -199,17 +199,17 @@ fn main() {
             let config = home().join("config.toml");
             let mut text = fs::read_to_string(&config).unwrap_or_default();
             match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
-                (Some("disable"), Some("hooks")) => {
-                    set_hooks(&mut text, false);
+                (Some("disable"), Some(name @ ("hooks" | "code_mode"))) => {
+                    set_feature(&mut text, name, false);
                     fs::write(&config, text).unwrap();
                 }
-                (Some("enable"), Some("hooks")) => {
-                    set_hooks(&mut text, true);
+                (Some("enable"), Some(name @ ("hooks" | "code_mode"))) => {
+                    set_feature(&mut text, name, true);
                     fs::write(&config, text).unwrap();
                 }
                 (Some("list"), _) => {
-                    println!("hooks stable {}", hooks_state(&text));
-                    println!("code_mode experimental false");
+                    println!("hooks stable {}", feature_state(&text, "hooks"));
+                    println!("code_mode experimental {}", feature_state(&text, "code_mode"));
                 }
                 _ => exit(2),
             }
@@ -336,6 +336,49 @@ fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {
     executable
 }
 
+fn compile_identity(root: &Path, name: &str, id: &str) -> PathBuf {
+    let source = format!("fn main() {{ println!(\"arm-tool-identity:{id}\"); }}");
+    compile_fixture(root, name, &source)
+}
+
+fn compile_relative(root: &Path, name: &str, id: &str, data_name: &str) -> PathBuf {
+    let source = format!(
+        "fn main() {{ let exe = std::env::current_exe().expect(\"exe\"); let data = exe.parent().expect(\"parent\").join(\"{data_name}\"); let body = std::fs::read_to_string(&data).unwrap_or_else(|error| format!(\"missing:{{error}}\")); println!(\"arm-tool-identity:{id}\"); println!(\"relative-data:{{body}}\"); println!(\"executed-from:{{}}\", exe.display()); }}"
+    );
+    compile_fixture(root, name, &source)
+}
+
+fn prefixed_path(prefixes: &[&Path]) -> String {
+    let mut entries: Vec<PathBuf> = prefixes.iter().map(|path| path.to_path_buf()).collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(entries)
+        .unwrap()
+        .to_str()
+        .expect("PATH is Unicode")
+        .to_owned()
+}
+
+fn write_tool_probe(run: &Path, arm: &str, receipt: &Path, allow: &str) {
+    let dir = run.join("tool-probes");
+    fs::create_dir_all(&dir).unwrap();
+    let probe = json!({
+        "receipt": receipt,
+        "allow": allow,
+        "commands": [
+            "codex-harness",
+            "codex-harness.exe",
+            "marker-tool",
+        ],
+    });
+    fs::write(
+        dir.join(format!("{arm}.json")),
+        serde_json::to_vec_pretty(&probe).unwrap(),
+    )
+    .unwrap();
+}
+
 /// One published immutable build inside the owned state.
 fn fixture_build(
     state: &Path,
@@ -344,15 +387,29 @@ fn fixture_build(
     launcher: &Path,
     marker: &str,
 ) -> PathBuf {
+    fixture_build_with(state, name, source, launcher, marker, &[])
+}
+
+fn fixture_build_with(
+    state: &Path,
+    name: &str,
+    source: &Path,
+    launcher: &Path,
+    marker: &str,
+    replacements: &[(&str, &[u8])],
+) -> PathBuf {
     let build = state.join("builds").join(name);
     fs::create_dir_all(&build).unwrap();
     let mut binaries = BTreeMap::new();
     for binary in build_identity::BINARIES {
-        let bytes = if *binary == "codex.exe" {
-            fs::read(launcher).unwrap()
-        } else {
-            format!("{binary} fixture {marker}\n").into_bytes()
-        };
+        let bytes =
+            if let Some((_, custom)) = replacements.iter().find(|(name, _)| *name == *binary) {
+                custom.to_vec()
+            } else if *binary == "codex.exe" {
+                fs::read(launcher).unwrap()
+            } else {
+                format!("{binary} fixture {marker}\n").into_bytes()
+            };
         fs::write(build.join(binary), &bytes).unwrap();
         binaries.insert((*binary).to_string(), build_identity::hash_bytes(&bytes));
     }
@@ -834,6 +891,29 @@ impl Fixture {
         )
     }
 
+    /// Host the measured arm in this process. A terminal tab would not carry
+    /// the probe environment into the child, and would return before the child
+    /// recorded which command it executed.
+    fn resume_in_process(&self, extra: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(manager());
+        command
+            .arg("improve")
+            .args(["resume", "--run", self.run.to_str().unwrap()]);
+        command.env_remove("HARNESS_EXECUTOR_SESSION");
+        command.env_remove("HARNESS_EXECUTOR_FIXTURE_MODE");
+        command.env_remove("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE");
+        command.env_remove("HARNESS_EXECUTOR_RUN");
+        command.env_remove("HARNESS_ORIGINATING_LEAD");
+        command.env_remove("HARNESS_LEAD_THREAD");
+        command.env_remove("HARNESS_LEAD_RECIPIENT");
+        command.env_remove("WT_SESSION");
+        command.env(CONTROL_CHILD_MODE.0, CONTROL_CHILD_MODE.1);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        command.output().expect("improve runs")
+    }
+
     fn status_json(&self) -> Value {
         let status = self.improve(&["status", "--run", self.run.to_str().unwrap(), "--json"]);
         assert!(status.status.success(), "status: {}", text(&status));
@@ -1055,6 +1135,33 @@ impl Fixture {
             &checkout.path,
             &launcher,
             "candidate",
+        );
+    }
+
+    /// The same two builds, with a distinct executable identity for the
+    /// managed `codex-harness` command so a host can prove which arm ran.
+    fn prepare_identity_builds(
+        &self,
+        checkout: &task_worktree::CandidateCheckout,
+        baseline_tool: &[u8],
+        candidate_tool: &[u8],
+    ) {
+        let launcher = PathBuf::from(env!("CARGO_BIN_EXE_harness-executor-fixture"));
+        fixture_build_with(
+            &self.state,
+            "h-build",
+            &self.proj,
+            &launcher,
+            "baseline",
+            &[("codex-harness.exe", baseline_tool)],
+        );
+        fixture_build_with(
+            &self.state,
+            "ha-build",
+            &checkout.path,
+            &launcher,
+            "candidate",
+            &[("codex-harness.exe", candidate_tool)],
         );
     }
 
@@ -2768,6 +2875,601 @@ fn native_dispatch_uses_the_existing_executor_declaration() {
     let receipt = attempt_receipt(&fixture, "base-1");
     let record = wait_for_terminal_receipt(&receipt);
     assert_eq!(record["observation"]["state"], "completed", "{record}");
+}
+
+/// Ordinary managed commands in each comparison arm consume that arm's
+/// installation on the initial dispatch and on a later controller process,
+/// even when both inherit a conflicting PATH. Unqualified names and explicit
+/// `.exe` names are both executed. No model request is made.
+#[test]
+fn selected_arm_tools_resolve_on_dispatch_and_later_resume() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("arm-tools");
+    let baseline_tool = compile_identity(&fixture.root, "baseline-id", "baseline");
+    let candidate_tool = compile_identity(&fixture.root, "candidate-id", "candidate");
+    let foreign_initial = compile_identity(&fixture.root, "foreign-initial-id", "foreign-initial");
+    let foreign_resume = compile_identity(&fixture.root, "foreign-resume-id", "foreign-resume");
+    let foreign_rtk = compile_identity(&fixture.root, "foreign-rtk-id", "foreign-rtk");
+    let unrelated = compile_relative(
+        &fixture.root,
+        "unrelated-id",
+        "unrelated",
+        "marker-data.txt",
+    );
+    let foreign1 = fixture.root.join("foreign-initial");
+    let foreign2 = fixture.root.join("foreign-resume");
+    let unrelated_dir = fixture.root.join("unrelated-tools");
+    for directory in [&foreign1, &foreign2, &unrelated_dir] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::copy(&foreign_initial, foreign1.join("codex-harness.exe")).unwrap();
+    fs::copy(&foreign_rtk, foreign1.join("harness-rtk.exe")).unwrap();
+    fs::copy(&foreign_resume, foreign2.join("codex-harness.exe")).unwrap();
+    fs::copy(&foreign_rtk, foreign2.join("harness-rtk.exe")).unwrap();
+    fs::copy(&unrelated, unrelated_dir.join("marker-tool.exe")).unwrap();
+    fs::write(
+        unrelated_dir.join("marker-data.txt"),
+        "unrelated-sibling-sentinel",
+    )
+    .unwrap();
+
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_identity_builds(
+        &checkout,
+        &fs::read(&baseline_tool).unwrap(),
+        &fs::read(&candidate_tool).unwrap(),
+    );
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    let allow = fixture
+        .root
+        .to_str()
+        .expect("fixture root is Unicode")
+        .to_owned();
+    let baseline_receipt = fixture.root.join("baseline-tools.json");
+    let candidate_receipt = fixture.root.join("candidate-tools.json");
+    write_tool_probe(&fixture.run, "baseline", &baseline_receipt, &allow);
+    write_tool_probe(&fixture.run, "candidate", &candidate_receipt, &allow);
+    let initial_path = prefixed_path(&[&foreign1, &unrelated_dir]);
+    let resume = fixture.resume_in_process(&[("PATH", initial_path.as_str())]);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("PowerShell 7."),
+        "the dispatch prepared the owner shell: {output}"
+    );
+    assert!(
+        baseline_receipt.is_file(),
+        "the initial dispatch did not host the baseline tool probe: {}\n{output}",
+        fs::read_to_string(fixture.run.join("tool-probes").join("baseline-trace.txt"))
+            .unwrap_or_else(|error| format!("no trace: {error}"))
+    );
+    let baseline = tool_receipt(&baseline_receipt);
+    assert_tool(
+        &baseline,
+        "codex-harness",
+        "arm-tool-identity:baseline",
+        "foreign-initial",
+    );
+    assert_tool(
+        &baseline,
+        "codex-harness.exe",
+        "arm-tool-identity:baseline",
+        "foreign-initial",
+    );
+    assert_tool(
+        &baseline,
+        "marker-tool",
+        "arm-tool-identity:unrelated",
+        "foreign-initial",
+    );
+    assert_relative_tool(&baseline, "marker-tool", "unrelated-sibling-sentinel");
+    assert_shell(&baseline);
+
+    let resume_path = prefixed_path(&[&foreign2, &unrelated_dir]);
+    let resume = fixture.resume_in_process(&[("PATH", resume_path.as_str())]);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        candidate_receipt.is_file(),
+        "the later controller did not host the candidate tool probe: {output}"
+    );
+    let candidate = tool_receipt(&candidate_receipt);
+    assert_tool(
+        &candidate,
+        "codex-harness",
+        "arm-tool-identity:candidate",
+        "foreign-resume",
+    );
+    assert_tool(
+        &candidate,
+        "codex-harness.exe",
+        "arm-tool-identity:candidate",
+        "foreign-resume",
+    );
+    assert_tool(
+        &candidate,
+        "marker-tool",
+        "arm-tool-identity:unrelated",
+        "foreign-resume",
+    );
+    assert_relative_tool(&candidate, "marker-tool", "unrelated-sibling-sentinel");
+    assert_shell(&candidate);
+    assert_ne!(
+        baseline["pid"], candidate["pid"],
+        "resume must be a later controller process: baseline {baseline} candidate {candidate}"
+    );
+
+    // A selected command removed after the hosted turn is drift. The next
+    // resume must preserve that attempt and refuse a benefit decision.
+    fs::remove_file(
+        fixture
+            .arm_dir("candidate")
+            .join("home/harness/bin/codex-harness.exe"),
+    )
+    .unwrap();
+    let drifted = fixture.resume_in_process(&[]);
+    let output = text(&drifted);
+    assert!(drifted.status.success(), "{output}");
+    assert!(
+        output.contains("no longer consumes its prepared runtime")
+            || output.contains("changed since preparation")
+            || output.contains("does not point at its prepared source"),
+        "post-attempt command drift was accepted: {output}"
+    );
+    let status = fixture.status_json();
+    assert_ne!(status["phase"], "decision-recorded", "{status}");
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"],
+        Value::Null,
+        "drift must not authorize a benefit decision: {status}"
+    );
+}
+
+/// An advertised token-workflow component that the lifecycle owner cannot
+/// prepare refuses readiness before a hosted turn. A foreign copy on PATH is
+/// not consumed as a substitute.
+#[test]
+fn advertised_token_workflow_refuses_readiness_before_dispatch() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("arm-tools-unprepared");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fs::write(
+        fixture.proj.join("global/rtk.json"),
+        br#"{"version":"0.48.0","executableSha256":"abc"}"#,
+    )
+    .unwrap();
+    let foreign = fixture.root.join("foreign-rtk");
+    fs::create_dir_all(&foreign).unwrap();
+    let foreign_tool = compile_identity(&fixture.root, "foreign-rtk-tool", "foreign-rtk");
+    fs::copy(&foreign_tool, foreign.join("harness-rtk.exe")).unwrap();
+    fixture.start_with_ready_candidate(&checkout, false);
+    let receipt = fixture.root.join("should-not-run.json");
+    write_tool_probe(
+        &fixture.run,
+        "baseline",
+        &receipt,
+        fixture.root.to_str().unwrap(),
+    );
+    let path = prefixed_path(&[&foreign]);
+    let resume = fixture.resume_in_process(&[("PATH", path.as_str())]);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("token-workflow") && output.contains("readiness is refused"),
+        "an unprepared advertised component was treated as ready: {output}"
+    );
+    assert!(
+        !receipt.is_file(),
+        "readiness refusal still hosted a turn: {}",
+        fs::read_to_string(&receipt).unwrap_or_default()
+    );
+    let status = fixture.status_json();
+    assert_ne!(status["phase"], "decision-recorded", "{status}");
+    assert!(
+        status["comparison"]["baseline"]["accepted"] != true,
+        "an unprepared arm authorized a benefit: {status}"
+    );
+}
+
+fn load_json(path: &Path) -> Value {
+    serde_json::from_slice(
+        &fs::read(path).unwrap_or_else(|error| {
+            panic!("missing comparison evidence {}: {error}", path.display())
+        }),
+    )
+    .unwrap_or_else(|error| panic!("unreadable comparison evidence {}: {error}", path.display()))
+}
+
+fn comparison_reasons(report: &Value) -> Vec<String> {
+    report["comparisons"][0]["excluded_reasons"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the controller published no comparison: {report}"))
+        .iter()
+        .filter_map(|reason| reason.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn stage_token_workflow_package(home: &Path, identity: &str, vendor: &[u8], adapter: &[u8]) {
+    let vendor_path = home.join("harness/rtk/packages/0.48.0/rtk.exe");
+    if !vendor_path.is_file() {
+        fs::create_dir_all(vendor_path.parent().unwrap()).unwrap();
+        fs::write(&vendor_path, vendor).unwrap();
+    }
+    let adapter_dir = home.join(format!("harness/rtk/build/{identity}"));
+    let adapter_path = adapter_dir.join("harness-rtk.exe");
+    if !adapter_path.is_file() {
+        fs::create_dir_all(&adapter_dir).unwrap();
+        fs::write(&adapter_path, adapter).unwrap();
+    }
+    let record = adapter_dir.join("build.json");
+    if !record.is_file() {
+        fs::write(
+            &record,
+            serde_json::to_vec(&json!({
+                "sourceIdentity": identity,
+                "binarySha256": build_identity::hash_bytes(adapter),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn settle_dispatched_pair(fixture: &Fixture) {
+    let baseline = session_id(&format!("{}-baseline", fixture.card));
+    fixture.simulate_arm("baseline", "baseline", "solved", 20, 5.0, 2, 3, &baseline);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let candidate = session_id(&format!("{}-candidate", fixture.card));
+    fixture.simulate_arm(
+        "candidate",
+        "candidate",
+        "solved",
+        20,
+        1.0,
+        1,
+        1,
+        &candidate,
+    );
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+}
+
+/// Different prepared component inventories follow one recorded preparation
+/// method, so the controller does not report a preparation-policy mismatch.
+/// The component owner's installed-configuration edit remains a config-identity
+/// mismatch. A genuinely different recorded method remains incomparable, and
+/// independent acceptance still runs.
+#[test]
+fn different_component_inventories_share_one_preparation_method() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("component-method");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let mut checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    let vendor = b"staged-rtk-for-comparison-arm";
+    let adapter = b"staged-adapter-for-comparison-arm";
+    for (relative, bytes) in [
+        (
+            "crates/harness-rtk/Cargo.toml",
+            &b"[package]\nname = \"harness-rtk\"\nversion = \"0.0.0\"\n"[..],
+        ),
+        ("crates/harness-rtk/src/main.rs", &b"fn main() {}\n"[..]),
+    ] {
+        let path = checkout.path.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+    }
+    fs::write(
+        checkout.path.join("global/rtk.json"),
+        serde_json::to_vec(&json!({
+            "version": "0.48.0",
+            "executableSha256": build_identity::hash_bytes(vendor),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    git(&checkout.path, &["add", "."]);
+    git(
+        &checkout.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "advertise optional token workflow",
+        ],
+    );
+    checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
+    let identity =
+        harness_core::token_workflow_lifecycle::component_source_identity(&checkout.path)
+            .expect("the candidate source advertises a preparable token-workflow component");
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let home = fixture.arm_dir("candidate").join("home");
+    let staged_identity = identity.clone();
+    let watcher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+            && std::time::Instant::now() < deadline
+        {
+            if home.is_dir() {
+                stage_token_workflow_package(&home, &staged_identity, vendor, adapter);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    });
+    let installed = fixture.resume();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher
+        .join()
+        .expect("the component staging watcher finishes");
+    let output = text(&installed);
+    assert!(installed.status.success(), "{output}");
+    assert!(
+        fixture.arm_dir("candidate").join("runtime.json").is_file()
+            && fixture.arm_dir("baseline").join("runtime.json").is_file(),
+        "both arms were not prepared: {output}"
+    );
+
+    let baseline_runtime: harness_core::improvement_runtime::ArmRuntime = serde_json::from_slice(
+        &fs::read(fixture.arm_dir("baseline").join("runtime.json")).unwrap(),
+    )
+    .unwrap();
+    let candidate_runtime: harness_core::improvement_runtime::ArmRuntime = serde_json::from_slice(
+        &fs::read(fixture.arm_dir("candidate").join("runtime.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        baseline_runtime.components.is_empty(),
+        "the baseline source advertises no optional component: {baseline_runtime:?}"
+    );
+    let component = candidate_runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+        .expect("the candidate treatment's optional component was prepared");
+    assert_eq!(component.status, "Token workflow connected");
+    assert!(!component.state_sha256.is_empty());
+    for name in ["rtk.exe", "harness-rtk.exe"] {
+        let link = component
+            .links
+            .iter()
+            .find(|link| link.name == name)
+            .unwrap_or_else(|| panic!("{name} was not retained"));
+        assert_eq!(
+            build_identity::hash_file(&link.source).unwrap(),
+            link.sha256
+        );
+        assert!(!link.sha256.is_empty());
+    }
+    for arm in ["baseline", "candidate"] {
+        let receipt = load_json(&fixture.arm_dir(arm).join("preparation-method.json"));
+        assert_eq!(receipt["schema"], 1, "{arm} method receipt: {receipt}");
+        assert_eq!(
+            receipt["method"], "owner-install/v1",
+            "{arm} method receipt: {receipt}"
+        );
+        let config = fs::read_to_string(fixture.arm_dir(arm).join("home/config.toml")).unwrap();
+        assert!(
+            config.contains("fixture-glyph-1"),
+            "{arm} lost the declared model: {config}"
+        );
+    }
+
+    settle_dispatched_pair(&fixture);
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let reasons = comparison_reasons(&report);
+    assert!(
+        !reasons
+            .iter()
+            .any(|reason| reason.contains("preparation_policy")),
+        "different component inventories were treated as a preparation-policy mismatch: {reasons:?}\n{report}"
+    );
+    // The component owner enables its features in the installed configuration.
+    // That digest remains a matched field; this test must not bypass it.
+    assert_eq!(
+        reasons,
+        vec!["mismatch:config_identity".to_owned()],
+        "the shared method removed a gate other than preparation policy: {reasons:?}"
+    );
+    assert_eq!(report["comparisons"][0]["comparable"], false, "{reasons:?}");
+    assert_ne!(
+        baseline_runtime
+            .configuration
+            .as_ref()
+            .map(|item| &item.sha256),
+        candidate_runtime
+            .configuration
+            .as_ref()
+            .map(|item| &item.sha256),
+        "the config gate did not observe the component owner's feature edit"
+    );
+    let baseline_row = load_json(&fixture.arm_dir("baseline").join("row.json"));
+    let candidate_row = load_json(&fixture.arm_dir("candidate").join("row.json"));
+    assert_eq!(
+        baseline_row["matched"]["preparation_policy"],
+        "method:owner-install/v1"
+    );
+    assert_eq!(
+        baseline_row["matched"]["preparation_policy"],
+        candidate_row["matched"]["preparation_policy"]
+    );
+    assert_eq!(
+        baseline_row["treatment"]["components"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        candidate_row["treatment"]["components"][0]["name"],
+        "token-workflow"
+    );
+    let retained_links = candidate_row["treatment"]["components"][0]["links"]
+        .as_array()
+        .expect("the accounting row retains the prepared links");
+    assert_eq!(retained_links.len(), component.links.len());
+    for link in &component.links {
+        assert!(
+            retained_links.iter().any(|retained| {
+                retained["name"] == link.name && retained["sha256"] == link.sha256
+            }),
+            "the accounting row dropped prepared link {}: {retained_links:?}",
+            link.name
+        );
+    }
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}"
+    );
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], true,
+        "{status}"
+    );
+    let decision = status["comparison"]["decision"].as_str().unwrap_or("");
+    assert!(
+        !decision.contains("outcome=adopt"),
+        "a config mismatch still authorized adoption: {status}"
+    );
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), base);
+
+    let mut changed = candidate_row.clone();
+    changed["matched"]["preparation_policy"] = json!("method:owner-install/v0");
+    let changed_report = harness_core::outcome_report::summarize_attempts(&[baseline_row, changed])
+        .expect("the accounting owner still compares a changed method");
+    let changed_reasons = comparison_reasons(&changed_report);
+    assert!(
+        changed_reasons
+            .iter()
+            .any(|reason| reason == "mismatch:preparation_policy"),
+        "a changed preparation method stayed comparable: {changed_reasons:?}"
+    );
+    assert_eq!(changed_report["comparisons"][0]["comparable"], false);
+}
+
+/// An arm whose retained preparation method differs is incomparable even when
+/// both inventories were prepared by the same controller and independently
+/// accepted. The method receipt is not rewritten on resume.
+#[test]
+fn changed_preparation_method_remains_incomparable() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("changed-method");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let installed = fixture.resume();
+    assert!(installed.status.success(), "{}", text(&installed));
+    let receipt = fixture.arm_dir("candidate").join("preparation-method.json");
+    let mut method = load_json(&receipt);
+    assert_eq!(method["method"], "owner-install/v1", "{method}");
+    method["method"] = json!("owner-install/v0");
+    fs::write(&receipt, serde_json::to_vec_pretty(&method).unwrap()).unwrap();
+    settle_dispatched_pair(&fixture);
+    let retained = load_json(&receipt);
+    assert_eq!(
+        retained["method"], "owner-install/v0",
+        "resume rewrote the recorded preparation method: {retained}"
+    );
+    let report = load_json(&fixture.run.join("comparison/report.json"));
+    let reasons = comparison_reasons(&report);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason == "mismatch:preparation_policy"),
+        "a changed actual preparation method was comparable: {reasons:?}"
+    );
+    assert_eq!(report["comparisons"][0]["comparable"], false, "{reasons:?}");
+    assert_eq!(
+        load_json(&fixture.arm_dir("baseline").join("row.json"))["matched"]["preparation_policy"],
+        "method:owner-install/v1"
+    );
+    assert_eq!(
+        load_json(&fixture.arm_dir("candidate").join("row.json"))["matched"]["preparation_policy"],
+        "method:owner-install/v0"
+    );
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}"
+    );
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], true,
+        "{status}"
+    );
+    let decision = status["comparison"]["decision"].as_str().unwrap_or("");
+    assert!(
+        !decision.contains("outcome=adopt"),
+        "an incomparable method still authorized adoption: {status}"
+    );
+    assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), base);
+}
+
+fn tool_receipt(path: &Path) -> Value {
+    let bytes = fs::read(path).unwrap_or_else(|error| {
+        panic!(
+            "the hosted arm did not record command identity at {}: {error}",
+            path.display()
+        )
+    });
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("tool receipt is not JSON: {error}"))
+}
+
+fn assert_tool(receipt: &Value, command: &str, identity: &str, foreign: &str) {
+    let probe = &receipt["commands"][command];
+    let stdout = probe["stdout"].as_str().unwrap_or("");
+    let resolved = probe["resolved"].as_str().unwrap_or("");
+    assert!(
+        probe["executed"] == true,
+        "{command} was not executed from the selected installation: {probe}"
+    );
+    assert!(
+        stdout.contains(identity),
+        "{command} did not consume the selected binary: {probe}"
+    );
+    assert!(
+        !stdout.contains(foreign) && !resolved.to_ascii_lowercase().contains(foreign),
+        "{command} resolved a foreign copy: {probe}"
+    );
+}
+
+fn assert_shell(receipt: &Value) {
+    let stdout = receipt["shell"]["stdout"].as_str().unwrap_or("");
+    assert!(
+        stdout.starts_with("7"),
+        "the owner PowerShell 7 must remain usable: {}",
+        receipt["shell"]
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("path-view")
+            && !stdout.to_ascii_lowercase().contains("harness\\bin"),
+        "the owner PowerShell was relocated into the selected installation: {}",
+        receipt["shell"]
+    );
+}
+
+fn assert_relative_tool(receipt: &Value, command: &str, sentinel: &str) {
+    let probe = &receipt["commands"][command];
+    let stdout = probe["stdout"].as_str().unwrap_or("");
+    assert!(
+        stdout.contains(&format!("relative-data:{sentinel}")),
+        "{command} did not read data beside its original directory: {probe}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("path-view"),
+        "{command} was relocated: {probe}"
+    );
 }
 
 /// Controlled protocol observations through the same real path: a rollout that

@@ -89,7 +89,7 @@ fn home() -> PathBuf {
     PathBuf::from(env::var_os("CODEX_HOME").expect("CODEX_HOME"))
 }
 
-fn set_hooks(text: &mut String, enabled: bool) {
+fn set_hooks(text: &mut String, name: &str, enabled: bool) {
     let mut replaced = String::new();
     let mut in_features = false;
     let mut seen_features = false;
@@ -98,14 +98,14 @@ fn set_hooks(text: &mut String, enabled: bool) {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             if in_features && !done {
-                replaced.push_str(&format!("hooks = {enabled}\n"));
+                replaced.push_str(&format!("{name} = {enabled}\n"));
                 done = true;
             }
             in_features = trimmed == "[features]";
             seen_features |= in_features;
         }
-        if in_features && !done && trimmed.starts_with("hooks") && line.contains('=') {
-            replaced.push_str(&format!("hooks = {enabled}\n"));
+        if in_features && !done && trimmed.starts_with(name) && line.contains('=') {
+            replaced.push_str(&format!("{name} = {enabled}\n"));
             done = true;
             continue;
         }
@@ -113,22 +113,22 @@ fn set_hooks(text: &mut String, enabled: bool) {
         replaced.push('\n');
     }
     if in_features && !done {
-        replaced.push_str(&format!("hooks = {enabled}\n"));
+        replaced.push_str(&format!("{name} = {enabled}\n"));
         done = true;
     }
     *text = if done {
         replaced
     } else if seen_features {
-        format!("{replaced}hooks = {enabled}\n")
+        format!("{replaced}{name} = {enabled}\n")
     } else {
-        format!("{replaced}\n[features]\nhooks = {enabled}\n")
+        format!("{replaced}\n[features]\n{name} = {enabled}\n")
     };
 }
 
-fn hooks_state(text: &str) -> bool {
+fn hooks_state(text: &str, name: &str) -> bool {
     text.lines()
         .rev()
-        .find(|line| line.trim_start().starts_with("hooks") && line.contains('='))
+        .find(|line| line.trim_start().starts_with(name) && line.contains('='))
         .and_then(|line| line.split('=').nth(1))
         .map(|value| value.trim() == "true")
         .unwrap_or(false)
@@ -145,17 +145,17 @@ fn main() {
             let config = home().join("config.toml");
             let mut text = fs::read_to_string(&config).unwrap_or_default();
             match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
-                (Some("disable"), Some("hooks")) => {
-                    set_hooks(&mut text, false);
+                (Some("disable"), Some(name @ ("hooks" | "code_mode"))) => {
+                    set_hooks(&mut text, name, false);
                     fs::write(&config, text).unwrap();
                 }
-                (Some("enable"), Some("hooks")) => {
-                    set_hooks(&mut text, true);
+                (Some("enable"), Some(name @ ("hooks" | "code_mode"))) => {
+                    set_hooks(&mut text, name, true);
                     fs::write(&config, text).unwrap();
                 }
                 (Some("list"), _) => {
-                    println!("hooks stable {}", hooks_state(&text));
-                    println!("code_mode experimental false");
+                    println!("hooks stable {}", hooks_state(&text, "hooks"));
+                    println!("code_mode experimental {}", hooks_state(&text, "code_mode"));
                 }
                 _ => exit(2),
             }
@@ -1237,4 +1237,193 @@ fn refusals_guard_overlap_missing_inputs_and_partial_state() {
     assert!(fixture.request.home.join("AGENTS.md").exists());
     retire_arm(&runtime).unwrap();
     assert!(!fixture.request.home.join("AGENTS.md").exists());
+}
+
+/// Advertised token workflow is prepared through its lifecycle owner. Declared
+/// client settings still hold after that owner's feature edits, and a changed
+/// owned command refuses consumption. An advertised component with no vendor
+/// artifact refuses readiness instead of using another copy.
+#[test]
+fn advertised_token_workflow_is_prepared_and_drift_refuses_consumption() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-rtk-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let source = kit_source(root, "kit-token", "token");
+    for relative in [
+        "crates/harness-rtk/Cargo.toml",
+        "crates/harness-rtk/src/main.rs",
+    ] {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative.as_bytes()).unwrap();
+    }
+    let build = fixture_build(&state, "token", &source, &fixtures.launcher, "token");
+    let home = prepare_home(&root.join("homes/token")).unwrap();
+    let user_home = prepare_home(&root.join("homes/token-user")).unwrap();
+    let dependency_user_home = prepare_home(&root.join("homes/token-dep")).unwrap();
+    let vendor = home.join("harness/rtk/packages/0.48.0/rtk.exe");
+    fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    fs::write(&vendor, b"staged-rtk-for-arm").unwrap();
+    fs::write(
+        source.join("global/rtk.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": "0.48.0",
+            "executableSha256": build_identity::hash_file(&vendor).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let identity =
+        harness_core::token_workflow_lifecycle::component_source_identity(&source).unwrap();
+    let adapter = home.join(format!("harness/rtk/build/{identity}/harness-rtk.exe"));
+    fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+    fs::write(&adapter, b"staged-adapter-for-arm").unwrap();
+    fs::write(
+        adapter.parent().unwrap().join("build.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sourceIdentity": identity,
+            "binarySha256": build_identity::hash_file(&adapter).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    let overlay = root.join("qualified-client.config.toml");
+    fs::write(
+        &overlay,
+        "model_context_window = 65536\nweb_search = \"disabled\"\napproval_policy = \"never\"\n\n[features]\ncode_mode = false\n",
+    )
+    .unwrap();
+    let request = ArmRequest {
+        variant: prepare_variant(&state, Arm::Baseline, "H", &build).unwrap(),
+        home: home.clone(),
+        user_home: user_home.clone(),
+        dependency_user_home,
+        upstream: fixtures.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        client: Some(local_client(&catalogue, Some(&overlay))),
+        private_inputs: Vec::new(),
+        protected: Vec::new(),
+    };
+    let runtime = install_arm(&request).unwrap();
+    verify_consumption(&runtime).unwrap();
+    let component = runtime
+        .components
+        .iter()
+        .find(|component| component.name == "token-workflow")
+        .expect("token workflow identity is retained");
+    assert_eq!(component.status, "Token workflow connected");
+    assert_eq!(component.vendor_version.as_deref(), Some("0.48.0"));
+    assert_eq!(component.model_calls, 0);
+    assert_eq!(
+        component.source_identity.as_deref(),
+        Some(identity.as_str())
+    );
+    for name in ["rtk.exe", "harness-rtk.exe"] {
+        let link = component
+            .links
+            .iter()
+            .find(|link| link.name == name)
+            .unwrap_or_else(|| panic!("{name} was not recorded"));
+        let destination = link.destination.to_string_lossy().to_ascii_lowercase();
+        let destination = destination
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&destination)
+            .to_owned();
+        let expected = home
+            .join("harness/bin")
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let expected = expected
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&expected)
+            .to_owned();
+        assert!(
+            destination.starts_with(&expected),
+            "{name} destination {destination} is not under {expected}"
+        );
+        assert_eq!(
+            build_identity::hash_file(&link.source).unwrap(),
+            link.sha256
+        );
+    }
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(
+        config.contains("fixture-glyph-1"),
+        "local model selection did not survive component setup: {config}"
+    );
+    assert!(
+        config.contains("code_mode = false"),
+        "declared client feature did not hold after token-workflow setup: {config}"
+    );
+    let adapter_link = component
+        .links
+        .iter()
+        .find(|link| link.name == "harness-rtk.exe")
+        .unwrap();
+    let original = fs::read(&adapter_link.source).unwrap();
+    fs::write(&adapter_link.source, b"changed-adapter").unwrap();
+    let drifted = verify_consumption(&runtime).unwrap_err().to_string();
+    assert!(
+        drifted.contains("changed since preparation"),
+        "changed token-workflow command was accepted: {drifted}"
+    );
+    fs::write(&adapter_link.source, original).unwrap();
+    verify_consumption(&runtime).unwrap();
+    retire_arm(&runtime).unwrap();
+    assert!(!home.join("harness/bin/harness-rtk.exe").exists());
+    assert!(!home.join("harness/bin/rtk.exe").exists());
+
+    let missing = kit_source(root, "kit-missing-token", "missing");
+    for relative in [
+        "crates/harness-rtk/Cargo.toml",
+        "crates/harness-rtk/src/main.rs",
+    ] {
+        let path = missing.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative.as_bytes()).unwrap();
+    }
+    fs::write(
+        missing.join("global/rtk.json"),
+        br#"{"version":"0.48.0","executableSha256":"abc"}"#,
+    )
+    .unwrap();
+    let missing_build = fixture_build(
+        &state,
+        "missing-token",
+        &missing,
+        &fixtures.launcher,
+        "missing",
+    );
+    let missing_home = prepare_home(&root.join("homes/missing")).unwrap();
+    let missing_request = ArmRequest {
+        variant: prepare_variant(&state, Arm::Candidate, "H+A", &missing_build).unwrap(),
+        home: missing_home.clone(),
+        user_home: prepare_home(&root.join("homes/missing-user")).unwrap(),
+        dependency_user_home: prepare_home(&root.join("homes/missing-dep")).unwrap(),
+        upstream: fixtures.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        client: None,
+        private_inputs: Vec::new(),
+        protected: vec![home, source],
+    };
+    let refused = install_arm(&missing_request).unwrap_err().to_string();
+    assert!(
+        refused.contains("token-workflow") && refused.contains("readiness is refused"),
+        "unprepared token workflow was ready: {refused}"
+    );
+    assert!(
+        !missing_home.join("harness/bin/harness-rtk.exe").exists(),
+        "a missing component still published a command"
+    );
 }

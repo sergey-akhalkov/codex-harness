@@ -677,6 +677,14 @@ fn source_identity(source: &Path) -> io::Result<String> {
     Ok(build_identity::hash_bytes(hashes.join(":").as_bytes()))
 }
 
+/// Source identity the installer uses to reuse a verified adapter build at
+/// `harness/rtk/build/<identity>/`. Callers stage that build only when this
+/// identity and the recorded binary hash already match; they do not invent a
+/// second installer.
+pub fn component_source_identity(source: &Path) -> io::Result<String> {
+    source_identity(source)
+}
+
 struct Capture<'a> {
     input: &'a mut dyn Read,
     hash: Sha256,

@@ -964,6 +964,16 @@ fn ensure_arm_installs(
                     arm.as_str()
                 )
             })?;
+            // The method is recorded with the install that applied it. A later
+            // resume must not rewrite it to the current constant: an arm
+            // prepared under another method stays incomparable.
+            if let Err(error) = write_preparation_method(&runtime_path) {
+                let _ = fs::remove_file(&runtime_path);
+                return Err(format!(
+                    "the {} arm preparation method could not be retained: {error}",
+                    arm.as_str()
+                ));
+            }
             runtime
         };
         let trusted = dispatch_workspaces(run, comparison_arm);
@@ -2352,6 +2362,7 @@ fn build_row(
             "build_source_sha256": runtime.variant.source_sha256,
             "solution_revision": solution.revision,
             "solution_paths": solution.changed_paths,
+            "components": component_inventory(runtime),
         },
     }))
 }
@@ -2676,7 +2687,7 @@ fn matched_fields(
             "hook_revision" => Some(snapshot.hooks.clone()),
             "allowed_effects" => Some(format!("scope:{scope_digest}")),
             "cache_policy" => Some(workspace_preparation.to_owned()),
-            "preparation_policy" => Some(format!("install:{}", runtime.installation.status)),
+            "preparation_policy" => preparation_policy(run, runtime)?,
             "budget" => Some(format!(
                 "attempts:{}",
                 policy.policy.stopping.max_attempts_per_arm
@@ -2693,6 +2704,88 @@ fn matched_fields(
         }
     }
     Ok(Value::Object(matched))
+}
+
+/// Preparation rule both arms must share. Optional component names, statuses,
+/// links and hashes are observed treatment identity on the arm runtime, not
+/// part of this comparable method.
+const PREPARATION_METHOD: &str = "owner-install/v1";
+
+fn preparation_method_path(runtime_path: &Path) -> PathBuf {
+    runtime_path.with_file_name("preparation-method.json")
+}
+
+fn write_preparation_method(runtime_path: &Path) -> io::Result<()> {
+    write_json_atomic(
+        &preparation_method_path(runtime_path),
+        &json!({
+            "schema": 1,
+            "method": PREPARATION_METHOD,
+        }),
+    )
+}
+
+fn read_preparation_method(runtime_path: &Path) -> io::Result<Option<String>> {
+    let path = preparation_method_path(runtime_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let value: Value = read_json(&path, 4 * 1024)?;
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    if value.get("schema").and_then(Value::as_u64) == Some(1) && preparation_method_token(method) {
+        Ok(Some(format!("method:{method}")))
+    } else {
+        Ok(None)
+    }
+}
+
+fn preparation_method_token(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 64
+        && method
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.'))
+}
+
+/// Component inventory retained with the accounting row. The runtime receipt
+/// remains the consumption record; this copy is the observed treatment identity
+/// and is not a matched comparison field.
+fn component_inventory(runtime: &ArmRuntime) -> Value {
+    json!(
+        runtime
+            .components
+            .iter()
+            .map(|component| {
+                json!({
+                    "name": component.name,
+                    "status": component.status,
+                    "sourceIdentity": component.source_identity,
+                    "vendorVersion": component.vendor_version,
+                    "stateSha256": component.state_sha256,
+                    "links": component.links.iter().map(|link| json!({
+                        "name": link.name,
+                        "sha256": link.sha256,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+fn preparation_policy(run: &Run, runtime: &ArmRuntime) -> io::Result<Option<String>> {
+    let arm = match runtime.arm {
+        Arm::Baseline => ComparisonArm::Baseline,
+        Arm::Candidate => ComparisonArm::Candidate,
+    };
+    let Some(runtime_path) = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.arm(arm).runtime.clone())
+    else {
+        return Ok(None);
+    };
+    read_preparation_method(&runtime_path)
 }
 
 // ---------------------------------------------------------------------------
