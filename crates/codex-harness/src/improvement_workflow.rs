@@ -752,22 +752,40 @@ fn refused(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result
 }
 
 /// Binds the candidate branch/worktree to the admitted Beads card and the
-/// exact committed base. An existing recorded allocation is kept for this
-/// candidate; a pre-existing path is reused only through the worktree owner's
-/// read-only eligibility verdict and never forced.
+/// exact committed base. The worktree lives in the run's own candidate area
+/// beside the run root, never inside it: the run root is protected run state,
+/// and a candidate nested under it makes every declared source scope overlap
+/// that state, which the supervisor gate correctly refuses. An existing
+/// recorded allocation is kept for this candidate; a pre-existing path is
+/// reused only through the worktree owner's read-only eligibility verdict and
+/// never forced. A recorded legacy allocation that still nests inside the run
+/// state cannot reach its own planner, so an inactive, verified, preserved one
+/// is relocated through the worktree owner's own Git operation and anything
+/// else is refused without touching it.
 fn ensure_allocation(
     run: &mut Run,
     candidate: &mut CandidateState,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
-    if candidate.worktree.is_some() {
-        return Ok(());
+    let path = match candidate_checkout_root(run) {
+        Ok(root) => root.join(&candidate.hypothesis),
+        Err(reason) => return refused(run, notes, reason),
+    };
+    if let Some(checkout) = candidate.worktree.clone() {
+        // A recorded allocation is kept exactly as it stands; only the legacy
+        // geometry that nests it inside the protected run state is relocated,
+        // and only while this candidate still needs its planning conversation.
+        if candidate.planning_receipt.is_some() || !checkout.path.starts_with(run.store.root()) {
+            return Ok(());
+        }
+        if !run.cursor.attempts_requiring_reconciliation().is_empty() {
+            // An unresolved or unknown attempt keeps its allocation; the
+            // recorded planning state owns the exact reconciliation on this
+            // resume.
+            return Ok(());
+        }
+        return relocate_recorded_allocation(run, candidate, checkout, &path, notes);
     }
-    let path = run
-        .store
-        .root()
-        .join("candidates")
-        .join(&candidate.hypothesis);
     let branch = format!("improve/{}/{}", run.spec.run, candidate.hypothesis);
     let checkout = if path.exists() {
         let active = run
@@ -882,6 +900,149 @@ fn ensure_allocation(
         checkout.path.display()
     ));
     candidate.worktree = Some(checkout);
+    Ok(())
+}
+
+/// The owner-assigned candidate area of one run: a sibling directory named
+/// after the run root. Candidate worktrees are Git checkouts of the run's
+/// project, so they must stay outside the run root, which holds only the
+/// protected run state (spec, cursor, owner record, retained assignments and
+/// receipts).
+fn candidate_checkout_root(run: &Run) -> Result<PathBuf, String> {
+    let root = run.store.root();
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "the run directory {} names no candidate area; start the run in a named directory so its candidate worktrees stay outside the protected run state",
+                root.display()
+            )
+        })?;
+    let parent = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "the run directory {} has no parent directory for its candidate area",
+                root.display()
+            )
+        })?;
+    Ok(parent.join(format!("{name}-candidates")))
+}
+
+/// Relocates one recorded legacy allocation out of the protected run state
+/// into the owner-assigned candidate area, preserving its branch, revision and
+/// commits. The worktree owner's read-only verdict must first prove the
+/// allocation is registered to the run's project, clean and exactly at its
+/// recorded revision; Git's own `worktree move` then carries it over. Every
+/// refusal leaves the allocation, its branch and its scaffold commit exactly
+/// where they are and records the exact recovery reason.
+fn relocate_recorded_allocation(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    checkout: CandidateCheckout,
+    destination: &Path,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    match task_worktree::worktree_reuse(
+        &run.spec.project,
+        &checkout.path,
+        &run.spec.project,
+        &checkout.revision,
+        false,
+    )? {
+        WorktreeReuse::Eligible { .. } => {}
+        WorktreeReuse::Blocked { kind, reason } => {
+            let reason = format!(
+                "the recorded candidate worktree {} lies inside the protected run state and is not relocatable ({kind:?}): {reason}; the allocation and its commits are left untouched",
+                checkout.path.display()
+            );
+            return refused(run, notes, reason);
+        }
+    }
+    if destination.exists() {
+        let reason = format!(
+            "the recorded candidate worktree {} lies inside the protected run state and its owner-assigned location {} already exists; both are left untouched",
+            checkout.path.display(),
+            destination.display()
+        );
+        return refused(run, notes, reason);
+    }
+    let (Some(from), Some(to)) = (checkout.path.to_str(), destination.to_str()) else {
+        let reason = format!(
+            "the candidate worktree {} lies inside the protected run state and its path is not Unicode; it is left untouched",
+            checkout.path.display()
+        );
+        return refused(run, notes, reason);
+    };
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let output = Command::new("git")
+        .args(["worktree", "move", from, to])
+        .current_dir(&run.spec.project)
+        .output()
+        .map_err(|error| invalid(format!("git worktree move: {error}")))?;
+    if !output.status.success() {
+        let reason = format!(
+            "the recorded candidate worktree {} could not be relocated out of the protected run state: {}; the allocation and its commits are left untouched",
+            checkout.path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return refused(run, notes, reason);
+    }
+    let relocated = CandidateCheckout {
+        path: destination.to_path_buf(),
+        ..checkout
+    };
+    if let Err(error) = task_worktree::verify_candidate_checkout(&relocated) {
+        // The move itself completed, so the recorded allocation follows the
+        // worktree; dependent work still waits for a consistent allocation.
+        candidate.worktree = Some(relocated);
+        let reason = format!(
+            "the candidate worktree was moved out of the protected run state but does not verify: {error}; dependent work is refused until the allocation is consistent"
+        );
+        return refused(run, notes, reason);
+    }
+    board_hypothesis::record_implementation(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+        &BoundedImplementation {
+            role: board_hypothesis::HypothesisRole::Candidate,
+            branch: relocated.branch.clone(),
+            base: relocated.base.clone(),
+            revision: relocated.revision.clone(),
+            worktree: relocated.path.to_string_lossy().into_owned(),
+            runtime: None,
+            baseline_runtime: None,
+        },
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "the relocated candidate allocation could not be recorded on hypothesis card {}: {error}",
+            candidate.hypothesis
+        ))
+    })?;
+    run.cursor.effect(
+        EffectKind::CandidateAllocated,
+        format!(
+            "hypothesis={} branch={} base={} worktree={} relocated from the protected run state",
+            candidate.hypothesis,
+            relocated.branch,
+            relocated.base,
+            relocated.path.display()
+        ),
+    );
+    notes.push(format!(
+        "allocation: relocated branch {} at {} to {}",
+        relocated.branch,
+        relocated.revision,
+        relocated.path.display()
+    ));
+    candidate.worktree = Some(relocated);
     Ok(())
 }
 

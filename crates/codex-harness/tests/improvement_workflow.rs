@@ -210,7 +210,13 @@ impl Fixture {
     }
 
     fn admit(&self) -> String {
-        let spec = format!("openspec/changes/{}", self.change);
+        self.admit_change(&self.change)
+    }
+
+    /// One admitted hypothesis card naming a specific OpenSpec change, as
+    /// grounded intake admits a new card for a proposed change.
+    fn admit_change(&self, change: &str) -> String {
+        let spec = format!("openspec/changes/{change}");
         let out = self.feedback(&[
             "hypothesis-admit",
             "--mechanism",
@@ -359,6 +365,12 @@ impl Fixture {
 
     /// The candidate allocation the controller recorded for one hypothesis.
     fn candidate_worktree(&self, hypothesis: &str) -> PathBuf {
+        candidate_area(&self.run).join(hypothesis)
+    }
+
+    /// The pre-fix allocation geometry: a candidate worktree nested inside the
+    /// protected run state, as an older controller recorded it.
+    fn legacy_candidate_worktree(&self, hypothesis: &str) -> PathBuf {
         self.run.join("candidates").join(hypothesis)
     }
 
@@ -372,6 +384,19 @@ impl Fixture {
         assert!(out.status.success(), "bd comments: {}", text(&out));
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
+}
+
+/// The run's own candidate area: a sibling of the run root. The run root holds
+/// only protected run state, so no candidate worktree nests inside it.
+fn candidate_area(run: &Path) -> PathBuf {
+    let name = run
+        .file_name()
+        .expect("the fixture run directory is named")
+        .to_string_lossy()
+        .into_owned();
+    run.parent()
+        .expect("the fixture run directory has a parent")
+        .join(format!("{name}-candidates"))
 }
 
 fn write_change(proj: &Path, name: &str, proposal: &str, design: &str, tasks: &str) {
@@ -1319,24 +1344,7 @@ fn new_candidate_scaffolds_plans_and_implements_its_own_change() {
     let (root, locator) = write_evidence_root(&fixture);
     fixture.write_spec(&[("evidence_root", json!(root))]);
     fixture.start();
-    let report = json!({
-        "schema": 1,
-        "candidates": [{
-            "mechanism": "narrow-context",
-            "conditions": "cold-start",
-            "observation": locator,
-            "predicted": "smaller resident context",
-            "counterexample": "rare fallback needs the full context",
-            "acceptance": "the independent oracle passes",
-            "spec": "add-narrow-context",
-            "basis": locator,
-            "treatment": "addition",
-            "evidence": [{"locator": locator, "kind": "observed"}],
-            "next_check": null,
-        }],
-        "idle_reason": null,
-    });
-    seed_investigator_report(&fixture, &report);
+    seed_investigator_report(&fixture, &missing_change_report(&locator));
     // Readiness is per command: the launcher appears before the resume that
     // reaches planning, so the planning conversation is actually dispatched
     // and its attempt is recorded before its route fails.
@@ -1373,6 +1381,62 @@ fn new_candidate_scaffolds_plans_and_implements_its_own_change() {
         "the scaffold is its own commit on the candidate branch"
     );
     let scaffold_revision = head(&candidate_worktree);
+    assert_eq!(
+        git_output(&candidate_worktree, &["status", "--porcelain"]),
+        "",
+        "the model-free scaffold leaves the candidate worktree clean"
+    );
+
+    // The ordinary missing-change path reaches its own planner: the scaffold
+    // is committed and the bounded planning conversation is dispatched
+    // through the controller before any implementation. Its generated
+    // assignment passes the same native structured contract dispatch uses.
+    assert_eq!(
+        status["candidate"]["planner_attempt"], "planner-1",
+        "the standard missing-change scenario dispatches its planner: {status}"
+    );
+    assert!(
+        status["candidate"]["planning_receipt"].is_null(),
+        "no planning receipt exists before the planner settles: {status}"
+    );
+    let cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().unwrap();
+    let planner = attempts
+        .iter()
+        .find(|attempt| attempt["id"] == "planner-1")
+        .cloned()
+        .expect("the planning dispatch recorded its attempt");
+    assert_eq!(planner["role"], "planner", "{planner}");
+    assert_eq!(
+        planner["state"], "failed",
+        "the fixture launcher refuses only before submission: {planner}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt["role"] != "implementer"),
+        "no implementation conversation starts before the change qualifies: {cursor}"
+    );
+    let planner_assignment = fixture.run.join("assignments/planner-1.json");
+    assert!(
+        planner_assignment.is_file(),
+        "the planning dispatch wrote its bounded assignment: {planner_assignment:?}"
+    );
+    // The native model-free check loads that exact assignment through the
+    // same validator a dispatch uses; the slot is a registered worktree of
+    // the fixture project holding the scaffold revision the planner sees.
+    slot_worktree(
+        &candidate_worktree,
+        &fixture.root.join("proj-new-candidate-wt1"),
+        &scaffold_revision,
+    );
+    let check = fixture.assignment_check(1, &planner_assignment);
+    assert!(check.status.success(), "{}", text(&check));
+    assert!(
+        text(&check).contains("executor assignment valid"),
+        "{}",
+        text(&check)
+    );
 
     // Simulate the planning conversation: author the artifacts in a detached
     // slot worktree and commit them.
@@ -1877,4 +1941,285 @@ fn the_candidate_ready_receipt_hash_is_retained() {
         .and_then(|attempt| attempt["retained_receipt_sha256"].as_str())
         .expect("the terminal receipt is retained with its digest");
     assert_eq!(receipt_sha.len(), 64, "{status}");
+}
+
+/// The standard scenario's missing change, as the investigator report
+/// proposes it: a change that does not exist under the run's planning root.
+fn missing_change_report(locator: &str) -> Value {
+    json!({
+        "schema": 1,
+        "candidates": [{
+            "mechanism": "narrow-context",
+            "conditions": "cold-start",
+            "observation": locator,
+            "predicted": "smaller resident context",
+            "counterexample": "rare fallback needs the full context",
+            "acceptance": "the independent oracle passes",
+            "spec": "add-narrow-context",
+            "basis": locator,
+            "treatment": "addition",
+            "evidence": [{"locator": locator, "kind": "observed"}],
+            "next_check": null,
+        }],
+        "idle_reason": null,
+    })
+}
+
+#[test]
+fn a_scope_covering_its_own_planning_artifacts_still_refuses_and_keeps_the_scaffold() {
+    let fixture = Fixture::new("planning-overlap");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[
+        ("evidence_root", json!(root)),
+        ("writable_scope", json!(["openspec"])),
+    ]);
+    fixture.start();
+    seed_investigator_report(&fixture, &missing_change_report(&locator));
+    fake_launcher(&fixture);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let candidate = status["candidate"]["hypothesis"]
+        .as_str()
+        .expect("the missing change's card was admitted")
+        .to_owned();
+    assert_eq!(
+        status["candidate"]["change"], "add-narrow-context",
+        "{status}"
+    );
+    // A declared scope that covers the candidate's own planning change is
+    // still real control-state overlap: the planner is never dispatched.
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("planning artifacts"),
+        "the controller still refuses a scope over its own planning change: {status}"
+    );
+    assert!(status["candidate"]["planner_attempt"].is_null(), "{status}");
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["role"] != "planner"),
+        "no planner is dispatched while the overlap stands: {cursor}"
+    );
+    // The model-free scaffold is the controller's own committed work: the
+    // refusal never loses it.
+    let candidate_worktree = fixture.candidate_worktree(&candidate);
+    assert!(
+        candidate_worktree
+            .join("openspec/changes/add-narrow-context/.openspec.yaml")
+            .is_file(),
+        "the scaffolded change survives the refusal"
+    );
+    assert_ne!(
+        head(&candidate_worktree),
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        "the scaffold commit stays on the candidate branch"
+    );
+}
+
+#[test]
+fn an_oracle_root_covering_the_candidate_allocation_still_refuses() {
+    let fixture = Fixture::new("oracle-overlap");
+    let (root, locator) = write_evidence_root(&fixture);
+    // The declared independent acceptance input is an absolute directory that
+    // contains every candidate allocation of this run: candidate writes could
+    // reach it, so the gate must refuse instead of dispatching the planner.
+    fixture.write_spec(&[
+        ("evidence_root", json!(root)),
+        ("oracle", json!(candidate_area(&fixture.run))),
+    ]);
+    fixture.start();
+    seed_investigator_report(&fixture, &missing_change_report(&locator));
+    fake_launcher(&fixture);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let candidate = status["candidate"]["hypothesis"]
+        .as_str()
+        .expect("the missing change's card was admitted")
+        .to_owned();
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("independent oracle"),
+        "acceptance inputs stay unreachable from candidate scopes: {status}"
+    );
+    assert!(status["candidate"]["planner_attempt"].is_null(), "{status}");
+    let cursor = fixture.cursor();
+    assert!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["role"] != "planner"),
+        "no planner is dispatched while the oracle overlap stands: {cursor}"
+    );
+    assert!(
+        fixture
+            .candidate_worktree(&candidate)
+            .join("openspec/changes/add-narrow-context/.openspec.yaml")
+            .is_file(),
+        "the scaffolded change survives the refusal"
+    );
+}
+
+#[test]
+fn a_legacy_allocation_inside_the_run_state_is_relocated_for_its_planner() {
+    let fixture = Fixture::new("legacy-allocation");
+    fixture.start();
+    fake_launcher(&fixture);
+    let card = fixture.admit_change("add-narrow-context");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let branch = format!("improve/workflow-fixture/{card}");
+    // The pre-fix controller allocated the candidate inside the protected run
+    // state and committed the model-free scaffold there before its supervisor
+    // gate refused the planner.
+    let legacy = fixture.legacy_candidate_worktree(&card);
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    git(
+        &fixture.proj,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            legacy.to_str().unwrap(),
+            &base,
+        ],
+    );
+    let scaffold = openspec(
+        &legacy,
+        &[
+            "new",
+            "change",
+            "add-narrow-context",
+            "--schema",
+            "spec-driven",
+            "--json",
+        ],
+    );
+    assert!(
+        scaffold.status.success(),
+        "openspec new: {}",
+        text(&scaffold)
+    );
+    commit_all(&legacy, "scaffold OpenSpec change add-narrow-context");
+    let scaffold_revision = head(&legacy);
+    assert_ne!(scaffold_revision, base);
+
+    let mut cursor = fixture.cursor();
+    cursor["candidate"] = json!({
+        "hypothesis": card,
+        "change": "add-narrow-context",
+        "removal_required": false,
+        "removal_frozen": Value::Null,
+        "worktree": {
+            "source": fixture.proj,
+            "path": legacy,
+            "branch": branch,
+            "base": base,
+            "revision": scaffold_revision,
+        },
+        "planning_receipt": Value::Null,
+        "planner_attempt": Value::Null,
+        "implementer_attempt": Value::Null,
+        "revision": Value::Null,
+        "result": Value::Null,
+    });
+    // An unresolved planning attempt keeps its allocation: the legacy
+    // worktree and its scaffold commit are left exactly where they are.
+    cursor["attempts"]
+        .as_array_mut()
+        .unwrap()
+        .push(attempt_json(
+            "planner-1",
+            "planner",
+            "workflow-fixture-planner-1",
+            "gen-1",
+            &fixture.run.join("missing-planner-receipt.json"),
+            None,
+            Some(&legacy),
+            "started",
+        ));
+    cursor["candidate"]["planner_attempt"] = json!("planner-1");
+    fixture.write_cursor(&cursor);
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert!(
+        legacy.is_dir(),
+        "the unresolved allocation is left untouched: {status}"
+    );
+    assert!(
+        !fixture.candidate_worktree(&card).exists(),
+        "an unresolved attempt relocates nothing: {status}"
+    );
+    assert_eq!(head(&legacy), scaffold_revision, "{status}");
+
+    // With the attempt reconciled away, the inactive, clean allocation at its
+    // recorded revision is relocated through Git's own worktree move: the
+    // branch, revision and scaffold commit survive and the ordinary planner
+    // path proceeds from the owner-assigned location.
+    let mut cursor = fixture.cursor();
+    cursor["attempts"] = json!([]);
+    cursor["candidate"]["planner_attempt"] = Value::Null;
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let relocated = fixture.candidate_worktree(&card);
+    assert!(
+        !legacy.exists(),
+        "the legacy allocation was relocated out of the run state: {status}"
+    );
+    assert!(relocated.is_dir(), "{status}");
+    assert_eq!(
+        head(&relocated),
+        scaffold_revision,
+        "the scaffold commit survives the relocation: {status}"
+    );
+    assert!(
+        relocated
+            .join("openspec/changes/add-narrow-context/.openspec.yaml")
+            .is_file(),
+        "the scaffolded change moved with the allocation"
+    );
+    assert_eq!(
+        status["candidate"]["planner_attempt"], "planner-1",
+        "the relocated allocation reaches its own planner: {status}"
+    );
+    assert!(
+        status["candidate"]["planning_receipt"].is_null(),
+        "{status}"
+    );
+    let planner = fixture.cursor()["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == "planner-1")
+        .cloned()
+        .expect("the planning dispatch recorded its attempt");
+    assert_eq!(planner["role"], "planner", "{planner}");
+    assert_eq!(planner["state"], "failed", "{planner}");
+    assert!(
+        fixture.run.join("assignments/planner-1.json").is_file(),
+        "the planning dispatch wrote its assignment"
+    );
+    let relocated_text = relocated.to_string_lossy().into_owned();
+    let recorded = fixture.bd_comments(&card);
+    assert!(
+        recorded.contains(&relocated_text)
+            || recorded.contains(&relocated_text.replace('\\', "\\\\")),
+        "the admitted card records the relocated allocation: {recorded}"
+    );
 }
