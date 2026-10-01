@@ -1217,6 +1217,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
                 reasoning_effort: Some("low".to_owned()),
                 catalogue: None,
                 overlay: None,
+                executor_profile: None,
             },
         },
         policy,

@@ -16,7 +16,7 @@ use harness_core::{
     improvement_experiment::{Arm, prepare_home, prepare_variant, select_variant},
     improvement_runtime::{
         ArmRequest, ClientInputs, PrivateInput, discard_arm, install_arm, retire_arm,
-        verify_consumption,
+        verify_consumption, verify_consumption_with_trust,
     },
     outcome_qualification::{LocalRunner, MaterialIdentity},
 };
@@ -383,6 +383,7 @@ fn local_client(catalogue: &Path, overlay: Option<&Path>) -> ClientInputs {
         reasoning_effort: Some("low".into()),
         catalogue: Some(catalogue.to_path_buf()),
         overlay: overlay.map(Path::to_path_buf),
+        executor_profile: None,
     }
 }
 
@@ -843,6 +844,111 @@ fn arms_install_consume_their_own_runtime_and_retire_restores() {
 
     // Process-local PATH publication was fully withdrawn.
     assert_eq!(std::env::var_os("PATH"), original_path);
+}
+
+/// The measured dispatch's own trust write is the only configuration
+/// exception: exactly the workspaces an arm's own recorded dispatches
+/// allocated may carry a trusted-project entry, and only at trust_level
+/// "trusted". An unrecorded workspace, a changed trust level, an extra setting
+/// and ordinary model drift all keep refusing the arm.
+#[test]
+fn consumption_authorizes_only_recorded_dispatch_workspaces() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-trust-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+    let mut arm = arm_fixture(
+        root,
+        &state,
+        "trust",
+        Arm::Baseline,
+        "H",
+        "trust",
+        &fixtures.launcher,
+        &fixtures.upstream,
+    );
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    arm.request.client = Some(local_client(&catalogue, None));
+    arm.request.client.as_mut().unwrap().executor_profile = Some("workload-executor".into());
+    let runtime = install_arm(&arm.request).unwrap();
+    let config = runtime.configuration.as_ref().unwrap().path.clone();
+    let prepared = fs::read(&config).unwrap();
+    let text = String::from_utf8(prepared.clone()).unwrap();
+    assert!(
+        text.contains("[profiles.workload-executor]"),
+        "the declared executor profile mirrors the qualified route: {text}"
+    );
+
+    let workspace = root.join("checkout-wt1");
+    let owned = workspace.to_string_lossy().into_owned();
+    let with_trust = |workspace: &str| {
+        let mut text = String::from_utf8(prepared.clone()).unwrap();
+        text.push_str(&format!(
+            "\n[projects.'{}']\ntrust_level = \"trusted\"\n",
+            workspace.to_ascii_lowercase()
+        ));
+        text.into_bytes()
+    };
+
+    // The dispatch's own addition is not authority by itself: with no recorded
+    // dispatch workspace the strict check still refuses it.
+    let recorded = with_trust(&owned);
+    fs::write(&config, &recorded).unwrap();
+    assert!(verify_consumption(&runtime).is_err());
+
+    // The recorded workspace authorizes exactly its own trusted-project entry,
+    // under ordinary Windows path spelling.
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
+    let spelled = PathBuf::from(format!(
+        r"\\?\{}\",
+        owned.replace('\\', "/").to_ascii_uppercase()
+    ));
+    verify_consumption_with_trust(&runtime, &[spelled]).unwrap();
+
+    // Everything else keeps refusing: an unrelated trusted workspace, a
+    // changed trust level, an extra setting and ordinary model drift.
+    let unrelated = with_trust(r"c:\unrelated-workspace");
+    let changed_level = String::from_utf8(recorded.clone())
+        .unwrap()
+        .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"")
+        .into_bytes();
+    let mut extra = recorded.clone();
+    extra.extend_from_slice(b"\n[fixture-extra]\nvalue = 1\n");
+    let mut model_drift = recorded.clone();
+    let needle = b"model = \"fixture-glyph-1\"";
+    let at = model_drift
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("the prepared configuration declares the route model");
+    model_drift[at..at + b"fixture-glyph-1".len()].copy_from_slice(b"fixture-glyph-2");
+    for (name, mutated) in [
+        ("an unrelated trusted workspace", unrelated),
+        ("a changed trust level", changed_level),
+        ("an extra configuration setting", extra),
+        ("ordinary model drift", model_drift),
+    ] {
+        fs::write(&config, &mutated).unwrap();
+        let error = verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("configuration changed since preparation"),
+            "{name}: {error}"
+        );
+    }
+
+    // The recorded addition alone is accepted again after the counterexamples.
+    fs::write(&config, &recorded).unwrap();
+    verify_consumption_with_trust(&runtime, std::slice::from_ref(&workspace)).unwrap();
 }
 
 /// Refusals: overlap, missing or mismatched inputs, ambient homes and partial

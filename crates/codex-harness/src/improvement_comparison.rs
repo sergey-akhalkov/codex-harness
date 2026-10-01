@@ -663,13 +663,93 @@ fn verify_consumed_arm(
         .ok_or_else(|| format!("the {} arm runtime receipt is missing", arm.as_str()))?;
     let runtime: ArmRuntime =
         read_json(&runtime_path, MAX_RUN_SPEC_BYTES).map_err(|error| error.to_string())?;
-    improvement_runtime::verify_consumption(&runtime).map_err(|error| {
+    let trusted = dispatch_workspaces(run, arm);
+    improvement_runtime::verify_consumption_with_trust(&runtime, &trusted).map_err(|error| {
         format!(
             "the {phase} {} arm home no longer consumes its prepared runtime: {error}",
             arm.as_str()
         )
     })?;
     verify_client_binding(comparison, &runtime, phase)
+}
+
+/// The exact pooled workspaces this arm's own dispatcher can allocate: the
+/// deterministic sibling slots of the arm's dispatch checkout (the owned
+/// `task_worktree::slot_path` rule), sized by the frozen task tree's own
+/// executor declaration. A dispatch trusts its allocated slot before the
+/// model request even when it then fails before submission, so exactly those
+/// workspaces may carry a trusted-project entry in the arm configuration -
+/// and nothing else. A source without a declaration is dispatched through the
+/// owned default-only declaration of one slot; an unusable declaration leaves
+/// the single slot and the ordinary checks still refuse a foreign entry.
+fn dispatch_workspaces(run: &Run, arm: ComparisonArm) -> Vec<PathBuf> {
+    let source = run.store.comparison_arm_dir(arm).join("checkout");
+    let pool_size = dispatch_pool_size(run, arm);
+    let mut workspaces: Vec<PathBuf> = Vec::new();
+    for index in 1..=pool_size {
+        let Ok(workspace) = task_worktree::slot_path(&source, index) else {
+            continue;
+        };
+        if !workspaces.contains(&workspace) {
+            workspaces.push(workspace);
+        }
+    }
+    workspaces
+}
+
+/// The pool size of the arm's dispatch checkout, read from the frozen task
+/// tree's own executor declaration. A source without one is dispatched
+/// through the owned default-only declaration of one slot; an unreadable
+/// declaration keeps that same single slot, and the dispatch itself refuses
+/// the unusable source before any model request.
+fn dispatch_pool_size(run: &Run, arm: ComparisonArm) -> u32 {
+    let Some(bindings) = load_bindings(run).ok().flatten() else {
+        return 1;
+    };
+    let Ok(binding) = bindings.arm(arm_to_experiment(arm)) else {
+        return 1;
+    };
+    if !binding
+        .workload
+        .path
+        .join("global/orchestration.toml")
+        .is_file()
+    {
+        return 1;
+    }
+    orchestration_config::load(&binding.workload.path)
+        .map(|declaration| declaration.max_concurrent_executors)
+        .unwrap_or(1)
+}
+
+/// The executor profile the frozen task tree itself configures. The native
+/// dispatch may name only a profile the task source declares as an executor,
+/// and the prepared arm home mirrors the qualified route under that exact
+/// name. A source without the declaration keeps the dispatch checkout's own
+/// default-only declaration; a declaration that names no usable executor
+/// profile refuses the arm instead of falling back to another route.
+fn dispatch_profile(bindings: &ExperimentBindings, arm: Arm) -> Result<String, String> {
+    let binding = bindings.arm(arm).map_err(|error| error.to_string())?;
+    if !binding
+        .workload
+        .path
+        .join("global/orchestration.toml")
+        .is_file()
+    {
+        return Ok("default".to_owned());
+    }
+    let declaration = orchestration_config::load(&binding.workload.path).map_err(|error| {
+        format!(
+            "the {} frozen task tree declares an unusable orchestration: {error}",
+            arm.as_str()
+        )
+    })?;
+    orchestration_config::executor_profile(&declaration, None).map_err(|error| {
+        format!(
+            "the {} frozen task tree declares no executor profile: {error}",
+            arm.as_str()
+        )
+    })
 }
 
 /// Build or reuse the two frozen workload copies, the fresh homes, the
@@ -862,6 +942,8 @@ fn ensure_arm_installs(
                     protected.push(other.home.clone());
                 }
             }
+            let mut client = comparison.runtimes.client.clone();
+            client.executor_profile = Some(dispatch_profile(bindings, arm)?);
             let request = ArmRequest {
                 variant: binding.runtime.clone(),
                 home: binding.home.clone(),
@@ -869,7 +951,7 @@ fn ensure_arm_installs(
                 dependency_user_home: dir.join("home-dep"),
                 upstream: comparison.runtimes.upstream.clone(),
                 timeout: INSTALL_TIMEOUT,
-                client: Some(comparison.runtimes.client.clone()),
+                client: Some(client),
                 private_inputs: Vec::new(),
                 protected,
             };
@@ -884,12 +966,15 @@ fn ensure_arm_installs(
             })?;
             runtime
         };
-        improvement_runtime::verify_consumption(&runtime).map_err(|error| {
-            format!(
-                "the {} arm home no longer consumes its prepared runtime: {error}",
-                arm.as_str()
-            )
-        })?;
+        let trusted = dispatch_workspaces(run, comparison_arm);
+        improvement_runtime::verify_consumption_with_trust(&runtime, &trusted).map_err(
+            |error| {
+                format!(
+                    "the {} arm home no longer consumes its prepared runtime: {error}",
+                    arm.as_str()
+                )
+            },
+        )?;
         let mut state = run
             .cursor
             .comparison
@@ -1260,9 +1345,14 @@ fn verify_observations(
 // Dispatch of one measured arm.
 // ---------------------------------------------------------------------------
 
-fn facts_for_arm(run: &Run, runtime: &ArmRuntime, role: AttemptRole) -> io::Result<DispatchFacts> {
+fn facts_for_arm(
+    run: &Run,
+    runtime: &ArmRuntime,
+    role: AttemptRole,
+    profile: &str,
+) -> io::Result<DispatchFacts> {
     let launcher = runtime.home.join("harness/bin/codex.exe");
-    let binding_error = match orchestration_config::binding(&runtime.home, "default") {
+    let binding_error = match orchestration_config::binding(&runtime.home, profile) {
         Ok(binding) => {
             let expected_model = run
                 .spec
@@ -1463,7 +1553,11 @@ fn dispatch_next(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         {
             return block(run, notes, reason);
         }
-        let facts = facts_for_arm(run, &runtime, role)?;
+        let profile = match dispatch_profile(&bindings, arm_to_experiment(arm)) {
+            Ok(profile) => profile,
+            Err(reason) => return block(run, notes, reason),
+        };
+        let facts = facts_for_arm(run, &runtime, role, &profile)?;
         if let DispatchGate::Blocked { reason } = dispatch_gate(&run.cursor, role, &facts) {
             return block(
                 run,
@@ -1471,7 +1565,7 @@ fn dispatch_next(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
                 format!("the {} arm is not dispatchable: {reason}", arm.as_str()),
             );
         }
-        return dispatch_arm(run, &comparison, &bindings, arm, &runtime, notes);
+        return dispatch_arm(run, &comparison, &bindings, arm, &runtime, &profile, notes);
     }
     Ok(())
 }
@@ -1482,6 +1576,7 @@ fn dispatch_arm(
     bindings: &ExperimentBindings,
     arm: ComparisonArm,
     runtime: &ArmRuntime,
+    profile: &str,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
     let role = arm.role();
@@ -1507,7 +1602,7 @@ fn dispatch_arm(
     };
     let attempt_id = next_arm_attempt_id(&run.cursor, role);
     let owner = dispatch_owner(&run.spec.run, role, attempt_ordinal(&attempt_id));
-    let title = executor_title("default", &owner);
+    let title = executor_title(profile, &owner);
     let assignment = match arm_assignment(comparison, arm, bindings) {
         Ok(assignment) => assignment,
         Err(error) => return block(run, notes, error.to_string()),
@@ -1533,7 +1628,7 @@ fn dispatch_arm(
         retained: None,
         owner: owner.clone(),
         title: title.clone(),
-        profile: "default".to_owned(),
+        profile: profile.to_owned(),
         model: Some(comparison.runtimes.client.runner.model.clone()),
         model_provider: Some("local".to_owned()),
         reasoning_effort: comparison.runtimes.client.reasoning_effort.clone(),
@@ -1570,7 +1665,7 @@ fn dispatch_arm(
         codex_home: runtime.home.clone(),
         source: source.clone(),
         owner,
-        profile: "default".to_owned(),
+        profile: profile.to_owned(),
         base: Some(base),
         assignment: assignment_path,
     }) {

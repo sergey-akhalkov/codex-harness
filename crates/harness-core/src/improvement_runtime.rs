@@ -283,6 +283,13 @@ pub struct ClientInputs {
     pub catalogue: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<PathBuf>,
+    /// The executor profile name the frozen task tree itself declares. The
+    /// qualified route is mirrored under this name so a native dispatch that
+    /// selects the task's own configured executor profile binds exactly the
+    /// declared route; `None` (or `default`) adds no profile table because the
+    /// base configuration already loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_profile: Option<String>,
 }
 
 /// One explicit private runner file copied into the owned fresh home. The
@@ -866,6 +873,14 @@ fn validate_client(client: &ClientInputs) -> io::Result<ClientDraft> {
     if let Some(effort) = &effort {
         bounded_token("the declared reasoning effort", effort, 64)?;
     }
+    let declared_profile = client
+        .executor_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(profile) = declared_profile {
+        bounded_token("the declared executor profile", profile, 64)?;
+    }
 
     // Explicit overlay file: bounded ordinary TOML carrying the qualified
     // client settings beyond the route fields. Never ambient state.
@@ -1004,6 +1019,18 @@ fn validate_client(client: &ClientInputs) -> io::Result<ClientDraft> {
     let mut table = route_table(&client.runner, effort.as_deref(), catalogue.as_ref())?;
     if let Some(overlay_table) = overlay_table {
         deep_merge(&mut table, overlay_table);
+    }
+    // Mirror the fully declared client configuration under the executor
+    // profile the frozen task tree itself configures: a native dispatch that
+    // selects that profile then binds exactly the declared route instead of an
+    // ambient one. `default` adds nothing because the base configuration
+    // already loads.
+    if let Some(profile) = declared_profile
+        && profile != "default"
+    {
+        let mut profiles = toml::Table::new();
+        profiles.insert(profile.to_owned(), toml::Value::Table(table.clone()));
+        table.insert("profiles".into(), toml::Value::Table(profiles));
     }
     if toml::to_string(&table).map_err(io::Error::other)?.len() > CONFIG_LIMIT {
         return Err(invalid("the generated arm configuration exceeds its bound"));
@@ -1601,6 +1628,19 @@ fn verify_link_inside(
 /// runtime, instructions, skills, tools and configuration. Any missing,
 /// changed or redirected identity refuses the arm without falling back.
 pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
+    verify_consumption_with_trust(runtime, &[])
+}
+
+/// Consumption check for one prepared arm whose measured dispatches may have
+/// trusted exactly the workspaces they were allocated. Each entry of
+/// `trusted_workspaces` is the pooled slot path of one recorded dispatch
+/// receipt for this arm; the arm configuration may carry that workspace's
+/// trusted-project entry and nothing else. No receipt, no authorization: the
+/// prepared bytes must then match byte for byte.
+pub fn verify_consumption_with_trust(
+    runtime: &ArmRuntime,
+    trusted_workspaces: &[PathBuf],
+) -> io::Result<Consumption> {
     if runtime.schema != RUNTIME_SCHEMA {
         return Err(invalid("unsupported arm runtime schema"));
     }
@@ -1780,10 +1820,11 @@ pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
             // same file before the first model request
             // (`executor_cli::ensure_workspace_trust` appends one
             // `[projects.'<workspace>'] trust_level = "trusted"` block per
-            // slot), so a prepared arm legitimately gains exactly those
-            // trailing entries after preparation. Accept nothing else:
-            // removing them must reproduce the prepared bytes exactly.
-            let restored = strip_appended_trust(&bytes)
+            // slot), so a prepared arm legitimately gains exactly the
+            // trailing entries of the workspaces its own recorded dispatches
+            // allocated. Accept nothing else: removing exactly those blocks
+            // must reproduce the prepared bytes.
+            let restored = strip_appended_trust(&bytes, trusted_workspaces)
                 .filter(|stripped| build_identity::hash_bytes(stripped) == configuration.sha256);
             if restored.is_none() {
                 return Err(invalid("the arm configuration changed since preparation"));
@@ -1837,10 +1878,12 @@ pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
 
 /// Removes the trailing trusted-project blocks the ordinary dispatch appends
 /// to an arm configuration (`executor_cli::ensure_workspace_trust` writes
-/// `\n[projects.'<workspace>']\ntrust_level = "trusted"\n` once per slot).
-/// Anything else - including an appended comment or another projects entry -
-/// keeps its bytes and therefore still fails the comparison.
-fn strip_appended_trust(bytes: &[u8]) -> Option<Vec<u8>> {
+/// `\n[projects.'<workspace>']\ntrust_level = "trusted"\n` once per slot) for
+/// exactly the workspaces the arm's own recorded dispatches allocated.
+/// Anything else - an appended comment, another projects entry, another
+/// workspace or a changed trust level - keeps its bytes and therefore still
+/// fails the comparison.
+fn strip_appended_trust(bytes: &[u8], trusted_workspaces: &[PathBuf]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut current = text;
     loop {
@@ -1848,12 +1891,34 @@ fn strip_appended_trust(bytes: &[u8]) -> Option<Vec<u8>> {
             return Some(current.as_bytes().to_vec());
         };
         let section = rest.rsplit('\n').next()?;
-        let workspace = section.strip_prefix("[projects.'")?.strip_suffix("']")?;
-        if workspace.is_empty() || workspace.contains('\'') {
+        let named = section.strip_prefix("[projects.'")?.strip_suffix("']")?;
+        if named.is_empty()
+            || named.contains('\'')
+            || !trusted_workspaces
+                .iter()
+                .any(|workspace| same_trust_workspace(named, workspace))
+        {
             return None;
         }
         current = &rest[..rest.len() - section.len() - 1];
     }
+}
+
+/// The ordinary dispatch writes the allocated workspace path lowercased. Path
+/// spelling is not identity: separators, the extended-length prefix, trailing
+/// separators and case are compared through one normalized form.
+fn same_trust_workspace(named: &str, workspace: &Path) -> bool {
+    normalize_trust_workspace(named) == normalize_trust_workspace(&workspace.to_string_lossy())
+}
+
+fn normalize_trust_workspace(path: &str) -> String {
+    let mut text = path.replace('/', "\\");
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        text = format!(r"\\{rest}");
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        text = rest.to_owned();
+    }
+    text.trim_end_matches('\\').to_ascii_lowercase()
 }
 
 fn file_link_unchanged(link: &InstalledLink) -> io::Result<()> {

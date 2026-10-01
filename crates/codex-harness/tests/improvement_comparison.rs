@@ -402,6 +402,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        Self::with_workload_declaration(name, None)
+    }
+
+    /// The same owned synthetic run, with the frozen workload tree carrying
+    /// its own `global/orchestration.toml` executor declaration exactly as an
+    /// existing kit project does.
+    fn with_workload_declaration(name: &str, declaration: Option<&str>) -> Self {
         let cleanup = tempfile::tempdir().unwrap();
         let canonical = cleanup.path().canonicalize().unwrap();
         let root = canonical
@@ -573,6 +580,12 @@ impl Fixture {
         write_change(&wl, "add-workload", "workload", "Workload case");
         fs::write(wl.join("solution.txt"), "todo\n").unwrap();
         fs::write(wl.join("sleep_ms"), "0\n").unwrap();
+        if let Some(declaration) = declaration {
+            // Existing kit projects carry their own executor declaration; the
+            // dispatch must use it instead of assuming a native default.
+            fs::create_dir_all(wl.join("global")).unwrap();
+            fs::write(wl.join("global/orchestration.toml"), declaration).unwrap();
+        }
         git(&wl, &["add", "."]);
         git(&wl, &["commit", "-qm", "frozen workload snapshot"]);
 
@@ -2561,32 +2574,58 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
     );
     fs::write(&baseline_receipt, &real_bytes).unwrap();
 
-    // The harness's own trusted-project addition is accepted, but any further
-    // change to the consumed arm configuration still blocks the post-attempt
-    // consumption instead of entering the comparison.
+    // The harness's own trusted-project addition to the workspace this dispatch
+    // allocated is accepted, but every other change - including an unrelated
+    // trusted workspace - still blocks the post-attempt consumption instead of
+    // entering the comparison.
     let arm_config = fixture.arm_dir("baseline").join("home").join("config.toml");
     let served = fs::read_to_string(&arm_config).unwrap();
     assert!(
         served.contains("trust_level = \"trusted\""),
         "the real dispatch trusted its bound workspace: {served}"
     );
-    fs::write(
-        &arm_config,
-        format!("{served}\n[fixture-drift]\nvalue = 1\n"),
-    )
-    .unwrap();
-    let resume = fixture.resume();
-    let output = text(&resume);
-    assert!(resume.status.success(), "{output}");
+    // The trusted entry names exactly the workspace the accepted dispatch
+    // recorded on its own attempt, so the narrowed rule has real authority to
+    // check against.
+    let recorded_checkout = fixture.cursor()["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["role"] == "baseline")
+        .and_then(|attempt| attempt["checkout"].as_str())
+        .map(str::to_owned)
+        .unwrap_or_default();
     assert!(
-        output.contains("the arm configuration changed since preparation"),
-        "an added arm configuration key still refuses consumption: {output}"
+        served
+            .to_ascii_lowercase()
+            .contains(&recorded_checkout.to_ascii_lowercase()),
+        "the arm configuration carries the workspace the accepted dispatch recorded ({recorded_checkout}): {served}"
     );
-    assert_eq!(
-        fixture.cursor()["comparison"]["baseline"]["accepted"],
-        Value::Null,
-        "a drifting arm configuration cannot enter the comparison"
-    );
+    let unrelated_trust =
+        format!("{served}\n[projects.'c:\\unrelated-workspace']\ntrust_level = \"trusted\"\n");
+    let changed_level = served.replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"");
+    let extra_setting = format!("{served}\n[fixture-drift]\nvalue = 1\n");
+    let model_drift = served.replace("model = \"fixture-glyph-1\"", "model = \"fixture-glyph-2\"");
+    for (name, mutated) in [
+        ("an unrelated trusted-project workspace", unrelated_trust),
+        ("a changed trust level", changed_level),
+        ("an extra configuration key", extra_setting),
+        ("model drift in the arm configuration", model_drift),
+    ] {
+        fs::write(&arm_config, &mutated).unwrap();
+        let resume = fixture.resume();
+        let output = text(&resume);
+        assert!(resume.status.success(), "{name}: {output}");
+        assert!(
+            output.contains("the arm configuration changed since preparation"),
+            "{name} still refuses consumption: {output}"
+        );
+        assert_eq!(
+            fixture.cursor()["comparison"]["baseline"]["accepted"],
+            Value::Null,
+            "{name} cannot enter the comparison"
+        );
+    }
     fs::write(&arm_config, &served).unwrap();
 
     // Restoring the accepted generation settles the baseline from its own
@@ -2657,6 +2696,78 @@ fn one_real_control_backed_pair_settles_through_native_observation() {
         );
     }
     assert!(!generation.is_empty());
+}
+
+/// An existing kit workload already carries its own executor declaration; the
+/// native dispatch must select that configured profile, bind the qualified
+/// local route under it and leave the frozen task tree unchanged.
+#[test]
+fn native_dispatch_uses_the_existing_executor_declaration() {
+    let _serial = INSTALL.lock().unwrap();
+    let declaration = "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"workload-executor\"]\nmax_concurrent_executors = 1\nvote_threshold = 2\nincubator_size_cap = 32\nfeedback_batch_limit = 8\n";
+    let fixture = Fixture::with_workload_declaration("declared", Some(declaration));
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_real_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    let resume = fixture.resume_dispatched(&[]);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    let baseline = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["role"] == "baseline")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("the task tree's own executor profile dispatched: {cursor}\n{output}")
+        });
+    assert_eq!(
+        baseline["profile"], "workload-executor",
+        "the dispatch records the task tree's own executor profile: {baseline}\n{output}"
+    );
+    assert_eq!(baseline["state"], "started", "{cursor}\n{output}");
+
+    // The frozen declaration is consumed, never rewritten, and the prepared
+    // arm home mirrors the qualified local route under that exact profile.
+    let dispatch_checkout = fixture.arm_dir("baseline").join("checkout");
+    let status = git_output(&dispatch_checkout, &["status", "--porcelain"]);
+    assert_eq!(
+        status.trim(),
+        "",
+        "the frozen task tree stays unchanged: {status}"
+    );
+    assert_eq!(
+        fs::read_to_string(dispatch_checkout.join("global/orchestration.toml"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        declaration,
+        "the frozen executor declaration stays unchanged"
+    );
+    let config =
+        fs::read_to_string(fixture.arm_dir("baseline").join("home").join("config.toml")).unwrap();
+    let profile = config
+        .split("[profiles.workload-executor]")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the arm home binds the declared profile: {config}"));
+    assert!(
+        profile.contains("model = \"fixture-glyph-1\""),
+        "the profile binds the qualified model: {config}"
+    );
+    assert!(
+        profile.contains("model_provider = \"local\""),
+        "the profile binds the qualified provider: {config}"
+    );
+    assert!(
+        profile.contains("model_reasoning_effort = \"low\""),
+        "the profile binds the qualified effort: {config}"
+    );
+
+    // The real conversation still completes through the host's own receipt.
+    let receipt = attempt_receipt(&fixture, "base-1");
+    let record = wait_for_terminal_receipt(&receipt);
+    assert_eq!(record["observation"]["state"], "completed", "{record}");
 }
 
 /// Controlled protocol observations through the same real path: a rollout that
