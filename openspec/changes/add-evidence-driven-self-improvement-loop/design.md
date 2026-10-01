@@ -190,7 +190,8 @@ The deductible duration is `measure((Q intersect B) minus P)` and adjusted
 elapsed time is observed elapsed minus that duration. Use interval union, not
 a sum of tool durations; inherited/nested admission and shared work are
 counted once. Correlation across processes needs a verified common clock
-mapping; a wall-clock jump or unmapped timestamp degrades coverage. A queued
+domain or bounded mapping. When a mapping relies on wall time, a clock jump
+or unmapped timestamp degrades coverage. A queued
 tool alone does not prove that the agent was blocked. Model activity without
 a verified wait-only classification counts as possible useful activity, not
 as idle time. No negative result or deduction beyond the observed interval
@@ -200,6 +201,21 @@ and a 24-minute adjusted duration, while its observed duration stays 30.
 This is a defined normalization of observed work, not a prediction of the
 completion time on a hypothetical unloaded machine. A fully observed immediate
 grant proves zero queue delay; absent queue telemetry does not.
+
+For the delivered Windows path, reuse the existing QPC sample owner for
+controller and admission events in the same verified host/boot clock domain.
+This avoids converting those events through wall time; wall-only, foreign or
+older-clock-domain evidence still needs a verified mapping. Record the queried
+frequency and observed boundary brackets. QPC resolution does not bound event
+delivery or scheduling delay, and cross-thread ordering retains one-tick
+uncertainty. This choice follows [Microsoft's timing guidance](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)
+without requiring another timing service or hardware-specific clock reader.
+
+The existing raw executor detail stream is bounded and can fill before a
+substantial task finishes. Retain the compact facts needed for measurement in
+the existing observation lifecycle and expose overflow or gaps explicitly;
+do not infer inactivity from a full detail file or require unlimited payload
+retention. Usage-record timestamps alone do not establish request boundaries.
 
 Report blocked duration, queue exposure, polling requests/operations and
 waiting-related usage separately. Passive waiting consumes no model tokens
