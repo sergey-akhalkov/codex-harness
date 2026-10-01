@@ -51,6 +51,8 @@ use std::{
 /// name one.
 const DEFAULT_SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f5";
 const TURN: &str = "fixture-turn-1";
+/// Item id and function-call `call_id`. It is not passed to the heavy command.
+const HEAVY_CALL_ID: &str = "call_heavy_blocked_1";
 const FINAL_MESSAGE: &str = "fixture turn completed; the committed solution is in the bound slot";
 
 /// Serves one `app-server` invocation. Returns the process exit code; the
@@ -278,19 +280,25 @@ fn commit_solution() -> io::Result<()> {
     Ok(())
 }
 
+struct OwnedHeavy {
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    process_id: Option<u32>,
+}
+
 /// Runs one real heavy command under the controller-supplied account and
-/// evidence environment, and emits the matching command item so the host can
-/// correlate it. The command id is the item id. This is not a model call.
-fn run_owned_heavy(server: &Server, session: &str) -> (i64, i64) {
+/// evidence environment, and emits the command item the host can correlate.
+/// The item id is the function-call id. It is not supplied as a heavy-command
+/// label: the process id on the completed item is the spawned process.
+fn run_owned_heavy(server: &Server, session: &str) -> OwnedHeavy {
     let started_at_ms = unix_ms();
-    const COMMAND_ID: &str = "heavy-cmd-1";
     server.push(json!({
         "method": "item/started",
         "params": {
             "threadId": session,
             "startedAtMs": started_at_ms,
             "item": {
-                "id": COMMAND_ID,
+                "id": HEAVY_CALL_ID,
                 "type": "commandExecution",
                 "command": "codex-harness heavy",
                 "status": "inProgress",
@@ -307,18 +315,18 @@ fn run_owned_heavy(server: &Server, session: &str) -> (i64, i64) {
         .unwrap_or_else(|_| "cmd.exe".to_owned());
     let cli = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_CLI")
         .unwrap_or_else(|_| "codex-harness.exe".to_owned());
-    let output = Command::new(cli)
-        .args([
-            "heavy",
-            "--tool-call",
-            COMMAND_ID,
-            "--command-id",
-            COMMAND_ID,
-            "--",
-            &program,
-        ])
-        .output();
-    let exit = output.as_ref().ok().and_then(|output| output.status.code());
+    let spawned = Command::new(cli).args(["heavy", "--", &program]).spawn();
+    let (process_id, exit) = match spawned {
+        Ok(child) => {
+            let process_id = child.id();
+            let waited = child.wait_with_output();
+            (
+                Some(process_id),
+                waited.ok().and_then(|output| output.status.code()),
+            )
+        }
+        Err(_) => (None, None),
+    };
     let completed_at_ms = unix_ms();
     server.push(json!({
         "method": "item/completed",
@@ -327,15 +335,20 @@ fn run_owned_heavy(server: &Server, session: &str) -> (i64, i64) {
             "startedAtMs": started_at_ms,
             "completedAtMs": completed_at_ms,
             "item": {
-                "id": COMMAND_ID,
+                "id": HEAVY_CALL_ID,
                 "type": "commandExecution",
                 "command": "codex-harness heavy",
                 "status": if exit == Some(0) { "completed" } else { "failed" },
                 "exitCode": exit,
+                "processId": process_id.map(|pid| pid.to_string()),
             },
         },
     }));
-    (started_at_ms, completed_at_ms)
+    OwnedHeavy {
+        started_at_ms,
+        completed_at_ms,
+        process_id,
+    }
 }
 
 fn unix_ms() -> i64 {
@@ -494,7 +507,7 @@ fn write_rollout(
     model: &str,
     effort: &str,
     include_usage: bool,
-    command_bound: Option<(i64, i64)>,
+    command_bound: Option<OwnedHeavy>,
     message_ms: i64,
 ) -> io::Result<()> {
     let home = env::var_os("CODEX_HOME")
@@ -512,20 +525,29 @@ fn write_rollout(
             "payload": {"model": model, "effort": effort, "turn_id": TURN},
         }),
     ];
-    if let Some((started_at_ms, completed_at_ms)) = command_bound {
+    if let Some(command) = command_bound {
+        let mut item = json!({
+            "type": "CommandExecution",
+            "id": HEAVY_CALL_ID
+        });
+        if let Some(process_id) = command.process_id {
+            item["process_id"] = json!(process_id.to_string());
+        }
         lines.push(json!({
             "type": "event_msg",
             "payload": {
                 "type": "item_completed",
-                "started_at_ms": started_at_ms,
-                "completed_at_ms": completed_at_ms,
-                "item": {"type": "CommandExecution", "id": "heavy-cmd-1"}
+                "turn_id": TURN,
+                "started_at_ms": command.started_at_ms,
+                "completed_at_ms": command.completed_at_ms,
+                "item": item
             }
         }));
         lines.push(json!({
             "type": "event_msg",
             "payload": {
                 "type": "item_completed",
+                "turn_id": TURN,
                 "started_at_ms": message_ms,
                 "completed_at_ms": message_ms,
                 "item": {"type": "AgentMessage", "id": "message-1"}
@@ -535,16 +557,15 @@ fn write_rollout(
             "type": "response_item",
             "payload": {
                 "type": "function_call",
-                "call_id": "heavy-cmd-1",
-                "command_id": "heavy-cmd-1",
+                "call_id": HEAVY_CALL_ID,
                 "name": "exec_command",
-                "response_id": "response-heavy",
             },
         }));
         lines.push(json!({
             "type": "token_usage_record",
             "payload": {
                 "response_id": "response-heavy",
+                "turn_id": TURN,
                 "usage": {
                     "input_tokens": 12,
                     "cached_input_tokens": 0,

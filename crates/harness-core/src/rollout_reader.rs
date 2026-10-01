@@ -118,11 +118,16 @@ pub struct RecordedCall {
 ///
 /// `started_at_ms` and `completed_at_ms` are the producer fields on that
 /// event. They are not receipt time and they are not inferred. The item id is
-/// the tool-call identity for a command item; command text is not retained.
+/// the tool-call identity for a command item when a function call's `call_id`
+/// equals it. `turn_id` is the event's recorded turn, not a response join.
+/// `process_id` is set only when the item's process field is a numeric OS pid.
+/// Command text is not retained.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecordedLifecycle {
     pub id: String,
     pub kind: String,
+    pub turn_id: Option<String>,
+    pub process_id: Option<u32>,
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
 }
@@ -453,6 +458,17 @@ fn recorded_ms(value: &Value, snake: &str, camel: &str) -> Option<i64> {
         .get(snake)
         .or_else(|| value.get(camel))
         .and_then(Value::as_i64)
+}
+
+/// OS pid from a command item. Only a base-10 integer is a pid. A
+/// client-supplied connection id is a different contract and stays absent.
+fn numeric_process_id(item: &Value) -> Option<u32> {
+    let text = item
+        .get("process_id")
+        .or_else(|| item.get("processId"))
+        .and_then(Value::as_str)?;
+    let pid = text.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
 }
 
 fn lifecycle_kind(item_type: &str) -> &'static str {
@@ -870,6 +886,8 @@ impl Reader {
                 self.lifecycles.push(RecordedLifecycle {
                     id,
                     kind: lifecycle_kind(item_type).to_owned(),
+                    turn_id: identifier(&p["turn_id"]),
+                    process_id: numeric_process_id(&p["item"]),
                     started_at_ms: recorded_ms(p, "started_at_ms", "startedAtMs"),
                     completed_at_ms: recorded_ms(p, "completed_at_ms", "completedAtMs"),
                 });
@@ -1435,6 +1453,47 @@ mod tests {
             session.lifecycles[0].completed_at_ms,
             Some(1_790_000_002_000)
         );
+        assert!(!format!("{:?}", session.lifecycles).contains("secret"));
+    }
+
+    #[test]
+    fn command_process_identity_keeps_a_numeric_pid_and_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "process.jsonl",
+            &[
+                meta("thread_process"),
+                context(),
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed",
+                    "turn_id":"turn-1",
+                    "started_at_ms": 10_i64,
+                    "completed_at_ms": 20_i64,
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-1",
+                        "process_id": "4242",
+                        "command": "secret command text"
+                    }
+                }}),
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed",
+                    "turn_id":"turn-1",
+                    "started_at_ms": 10_i64,
+                    "completed_at_ms": 20_i64,
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "call-2",
+                        "processId": "not-a-pid"
+                    }
+                }}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.lifecycles[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(session.lifecycles[0].process_id, Some(4242));
+        assert_eq!(session.lifecycles[1].process_id, None);
         assert!(!format!("{:?}", session.lifecycles).contains("secret"));
     }
 

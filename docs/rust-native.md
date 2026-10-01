@@ -294,7 +294,8 @@ Optional queue evidence stays in this admission owner. It is not a second
 journal. `codex-harness heavy --queue-evidence DIRECTORY --attempt LABEL
 --tool-call LABEL --command-id LABEL -- PROGRAM ARGS` writes one JSON document
 per admission into that caller-owned directory. Labels are ascii tokens and
-are not paths. The same inputs can be supplied with
+are not paths. They are not proof that the process is a command item. The same
+inputs can be supplied with
 `CODEX_HARNESS_HEAVY_QUEUE_EVIDENCE`, `CODEX_HARNESS_HEAVY_ATTEMPT`,
 `CODEX_HARNESS_HEAVY_TOOL_CALL` and `CODEX_HARNESS_HEAVY_COMMAND`; explicit
 options take precedence. With no evidence directory from either source,
@@ -311,8 +312,15 @@ the notification carries no producer timestamp. Installed app-server item
 notifications carry `startedAtMs` and `completedAtMs` when the server emitted
 them, and a rollout `item_completed` event carries `started_at_ms` and
 `completed_at_ms`. Those fields are mapped through the attempt's paired QPC
-and filetime samples. A jumped or missing mapping stays a receipt. A receipt
-is an upper bound on delivery, not the work instant, and it cannot prove that
+and filetime samples. The mapping keeps the mapped points and a separate
+uncertainty: the sample bracket, the one-millisecond producer resolution, and
+the observed wall/QPC difference. A missing sample span stays unknown and is
+not stored as zero. A wall/QPC jump above the plausibility gate refuses the
+mapping; that gate is not itself the uncertainty. After a verified admission
+join, blocked coverage uses the inner interval and concurrent useful activity,
+including other commands, uses the outer interval. A jumped or missing mapping
+stays a receipt. A receipt is an upper bound on delivery, not the work instant,
+and it cannot prove that
 earlier queue time was idle. A measured endpoint bracket stays a range: the
 shrunk interval is the certain deduction and the bracket remains a possible
 deduction where the task was independently blocked. Unmeasured scheduling or
@@ -323,7 +331,12 @@ missing attempt tag stays unknown. The document separates queue time from
 post-grant delay and does not subtract time or tokens. A write failure is
 printed as `heavy: queue evidence was not recorded` and does not change the
 command result. Public documents contain no account paths or foreign command
-text. Interpret the document; a start/end timer or a missing file is not a
+text or pids. A collecting admission also writes a private
+`{admission_id}.ancestry` file with the pid and creation time of that process
+and verified ancestors. The collector binds the admission to a command item
+only when that item's numeric `process_id` is unique in the attempt, equals
+one of those processes, and the item id equals a function-call `call_id`.
+Interpret the document; a start/end timer or a missing file is not a
 deduction.
 
 The accounting owner clips verified external waits to the attempt, intersects

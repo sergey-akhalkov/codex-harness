@@ -59,12 +59,20 @@
 //! An unbound record (`bound_to_attempt: false`) does not prove anything about
 //! an attempt, even when the record itself measured zero. Caller labels are not
 //! provenance. Union episodes by `admission_id`. A shared `command_id` is a
-//! hint, not an episode key.
+//! hint, not an episode key, and it does not prove that this process is the
+//! command item that carries that label.
+//!
+//! When collection is on, the admission owner also writes
+//! `{admission_id}.ancestry`: the pid and creation time of this process and
+//! the ancestors it could verify while the admission ran. That file is private
+//! evidence for a later process/lifecycle join. It is not part of the public
+//! document, and `read_directory` does not load it.
 //!
 //! Public documents contain no account paths, command lines, pids or foreign
-//! holder text. Private holder records in the account directory remain the
-//! bounded private evidence. Optional collection does not read holder identity
-//! or the admission clock on the opted-out queue path.
+//! holder text. Private holder records in the account directory, and the
+//! ancestry file above, remain the bounded private evidence. Optional
+//! collection does not read holder identity or the admission clock on the
+//! opted-out queue path.
 #![cfg(windows)]
 
 use serde::{Deserialize, Serialize};
@@ -592,6 +600,97 @@ pub fn write_episode(directory: &Path, draft: &EpisodeDraft) -> io::Result<std::
     }
     replace_file(&temporary, &path)?;
     Ok(path)
+}
+
+/// Private schema for `{admission_id}.ancestry`. A different value is unusable.
+pub const ANCESTRY_SCHEMA: &str = "codex-harness.heavy-process-ancestry.v1";
+const MAX_ANCESTORS: usize = 8;
+
+/// One process verified while this admission was running. A pid without a
+/// creation time is not recorded. This is not a public evidence field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessAncestor {
+    pub pid: u32,
+    pub creation_time: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProcessAncestryDocument {
+    schema: String,
+    admission_id: String,
+    processes: Vec<ProcessAncestor>,
+}
+
+/// Writes the verified process chain for one admission. The public episode
+/// document is unchanged. An empty or unverified chain is not written as a
+/// zero-pid match.
+pub fn write_process_ancestry(
+    directory: &Path,
+    admission_id: &str,
+    processes: &[ProcessAncestor],
+) -> io::Result<()> {
+    let admission_id = validate_token(admission_id)
+        .map_err(|_| io::Error::other("admission identity is not a token"))?;
+    if processes.is_empty() || processes.len() > MAX_ANCESTORS {
+        return Err(io::Error::other(
+            "process ancestry must name one to eight verified processes",
+        ));
+    }
+    let mut seen = Vec::new();
+    for process in processes {
+        if process.pid == 0
+            || process.creation_time == 0
+            || seen.iter().any(|pid| pid == &process.pid)
+        {
+            return Err(io::Error::other(
+                "process ancestry contains an unverified or repeated process",
+            ));
+        }
+        seen.push(process.pid);
+    }
+    let document = ProcessAncestryDocument {
+        schema: ANCESTRY_SCHEMA.to_owned(),
+        admission_id: admission_id.clone(),
+        processes: processes.to_vec(),
+    };
+    let path = directory.join(format!("{admission_id}.ancestry"));
+    let temporary = directory.join(format!("{admission_id}.ancestry.tmp"));
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|_| io::Error::other("process ancestry could not be serialized"))?;
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return Err(io::Error::other("process ancestry is too large"));
+    }
+    fs::write(&temporary, bytes)?;
+    replace_file(&temporary, &path)
+}
+
+/// Reads a private ancestry file. Missing, malformed and contradictory files
+/// are absence, not a process match.
+pub fn read_process_ancestry(directory: &Path, admission_id: &str) -> Option<Vec<ProcessAncestor>> {
+    let admission_id = validate_token(admission_id).ok()?;
+    let path = directory.join(format!("{admission_id}.ancestry"));
+    let bytes = fs::read(&path).ok()?;
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return None;
+    }
+    let document: ProcessAncestryDocument = serde_json::from_slice(&bytes).ok()?;
+    if document.schema != ANCESTRY_SCHEMA || document.admission_id != admission_id {
+        return None;
+    }
+    if document.processes.is_empty() || document.processes.len() > MAX_ANCESTORS {
+        return None;
+    }
+    let mut seen = Vec::new();
+    for process in &document.processes {
+        if process.pid == 0
+            || process.creation_time == 0
+            || seen.iter().any(|pid| pid == &process.pid)
+        {
+            return None;
+        }
+        seen.push(process.pid);
+    }
+    Some(document.processes)
 }
 
 pub fn note_command_started(directory: &Path, admission_id: &str) -> io::Result<()> {
@@ -1276,6 +1375,44 @@ mod tests {
             boot: None,
             payload_started: Some(false),
         }
+    }
+
+    #[test]
+    fn private_ancestry_is_not_a_public_episode() {
+        let root = tempfile::tempdir().unwrap();
+        write_process_ancestry(
+            root.path(),
+            "admission-1",
+            &[ProcessAncestor {
+                pid: 4242,
+                creation_time: 99,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            read_process_ancestry(root.path(), "admission-1").unwrap(),
+            vec![ProcessAncestor {
+                pid: 4242,
+                creation_time: 99
+            }]
+        );
+        assert!(read_process_ancestry(root.path(), "other-admission").is_none());
+        assert!(
+            write_process_ancestry(
+                root.path(),
+                "admission-1",
+                &[ProcessAncestor {
+                    pid: 0,
+                    creation_time: 1
+                }]
+            )
+            .is_err()
+        );
+        let views = read_directory(root.path()).unwrap();
+        assert!(
+            views.is_empty(),
+            "ancestry must not be loaded as a public episode: {views:?}"
+        );
     }
 
     #[test]

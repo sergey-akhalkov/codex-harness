@@ -57,7 +57,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
-    Foundation::{FILETIME, HANDLE, WAIT_TIMEOUT},
+    Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_TIMEOUT},
     System::{
         Console::SetConsoleCtrlHandler,
         JobObjects::{AssignProcessToJobObject, IsProcessInJob, OpenJobObjectW},
@@ -1854,6 +1854,18 @@ fn record_episode(
     };
     if let Err(error) = heavy_command_trace::write_episode(&link.directory, &draft) {
         heavy_command_trace::expose_write(&error);
+    } else {
+        let ancestry = observed_process_ancestry();
+        if ancestry.is_empty() {
+            return;
+        }
+        if let Err(error) = heavy_command_trace::write_process_ancestry(
+            &link.directory,
+            &link.admission_id,
+            &ancestry,
+        ) {
+            heavy_command_trace::expose_write(&error);
+        }
     }
 }
 
@@ -2130,6 +2142,108 @@ fn current_identity() -> io::Result<ProcessIdentity> {
         pid: unsafe { GetCurrentProcessId() },
         creation_time,
     })
+}
+
+/// This process and the ancestors whose pid and creation time could be read
+/// while the admission was running. A parent that cannot be opened stops the
+/// walk; skipping it would guess a further ancestor. The chain is not a
+/// command line and is not written into the public episode document.
+fn observed_process_ancestry() -> Vec<heavy_command_trace::ProcessAncestor> {
+    const MAX_ANCESTORS: usize = 8;
+    let mut found = Vec::new();
+    let Ok(current) = current_identity() else {
+        return found;
+    };
+    if current.pid == 0 || current.creation_time == 0 {
+        return found;
+    }
+    found.push(heavy_command_trace::ProcessAncestor {
+        pid: current.pid,
+        creation_time: current.creation_time,
+    });
+    let table = process_parent_table();
+    let mut pid = parent_pid(&table, current.pid);
+    while let Some(parent) = pid {
+        if parent <= 4
+            || found.len() >= MAX_ANCESTORS
+            || found.iter().any(|item| item.pid == parent)
+        {
+            break;
+        }
+        let Some(created) = creation_time_of_pid(parent) else {
+            break;
+        };
+        found.push(heavy_command_trace::ProcessAncestor {
+            pid: parent,
+            creation_time: created,
+        });
+        pid = parent_pid(&table, parent);
+    }
+    found
+}
+
+fn creation_time_of_pid(pid: u32) -> Option<u64> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    creation_time(handle.as_raw_handle())
+}
+
+fn parent_pid(table: &[(u32, u32)], pid: u32) -> Option<u32> {
+    table
+        .iter()
+        .find(|(child, _)| *child == pid)
+        .map(|(_, parent)| *parent)
+}
+
+/// `(pid, parent pid)` from one bounded process snapshot. Image names are not
+/// retained. ToolHelp is declared locally; this crate's selected windows-sys
+/// features do not expose it.
+fn process_parent_table() -> Vec<(u32, u32)> {
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_ENTRY_LIMIT: usize = 20_000;
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> *mut core::ffi::c_void;
+        fn Process32FirstW(snapshot: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return Vec::new();
+    }
+    let mut entry: ProcessEntry32W = unsafe { zeroed() };
+    entry.dw_size = u32::try_from(std::mem::size_of::<ProcessEntry32W>()).unwrap_or(0);
+    let mut table = Vec::new();
+    let mut present = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while present != 0 && table.len() < PROCESS_ENTRY_LIMIT {
+        table.push((entry.th32_process_id, entry.th32_parent_process_id));
+        present = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    table
 }
 
 /// Read-only liveness: never grants cleanup authority over the process.

@@ -589,6 +589,112 @@ fn an_endpoint_bracket_stays_a_range_and_a_task_call_keeps_its_tokens() {
 }
 
 #[test]
+fn concurrent_useful_commands_use_the_outer_bound() {
+    let capture = json!({
+        "window": {"start_ns": 0, "end_ns": 20_000_000_u64},
+        "admissions": [{
+            "id": "adm",
+            "class": "unrelated_wait",
+            "domain_match": true,
+            "start_ns": 0,
+            "end_ns": 10_000_000_u64,
+            "endpoint_start_ns": 0,
+            "endpoint_end_ns": 0,
+            "tick_ns": 0,
+            "tool_call_id": "tool-blocked",
+            "command_id": "tool-blocked",
+            "started": true,
+            "terminal": "waited_grant"
+        }],
+        "activity": [
+            {
+                "id": "tool-blocked",
+                "kind": "command",
+                "placement": "source",
+                "start_ns": 0,
+                "end_ns": 10_000_000_u64,
+                "mapping_uncertainty_ns": 1_000_000_u64,
+                "tool_call_id": "tool-blocked",
+                "command_id": "tool-blocked"
+            },
+            {
+                "id": "tool-useful",
+                "kind": "command",
+                "placement": "source",
+                "start_ns": 9_200_000_u64,
+                "end_ns": 15_000_000_u64,
+                "mapping_uncertainty_ns": 1_000_000_u64,
+                "tool_call_id": "tool-useful",
+                "command_id": "tool-useful"
+            }
+        ],
+        "requests": []
+    });
+    let adjusted = adjust(&capture, Some(20_000_000));
+    // Inner blocked is 1ms..9ms. Outer useful starts at 8.2ms, so 0.8ms of
+    // the inner interval is not idle. Shrinking the useful command would miss
+    // that overlap and deduct 8ms.
+    assert_eq!(adjusted["deductible_ns"], 7_200_000_u64, "{adjusted}");
+}
+
+#[test]
+fn a_sub_millisecond_source_interval_cannot_prove_blocking() {
+    let mut capture = point_capture(400_000, 2_000_000);
+    capture["activity"][0]["placement"] = json!("source");
+    capture["activity"][0]["mapping_uncertainty_ns"] = json!(1_000_000_u64);
+    capture["activity"][0]["end_ns"] = json!(400_000_u64);
+    capture["admissions"][0]["end_ns"] = json!(400_000_u64);
+    let adjusted = adjust(&capture, Some(2_000_000));
+    assert_eq!(adjusted["deductible_ns"], 0, "{adjusted}");
+    assert!(
+        adjusted["gaps"].as_array().is_some_and(|gaps| gaps
+            .iter()
+            .any(|gap| gap == "blocked_interval_consumed_by_uncertainty")),
+        "{adjusted}"
+    );
+}
+
+#[test]
+fn missing_source_uncertainty_is_not_zero() {
+    let mut capture = point_capture(10_000_000_000, 30_000_000_000);
+    capture["activity"][0]["placement"] = json!("source");
+    let adjusted = adjust(&capture, Some(30_000_000_000));
+    assert_eq!(adjusted["deductible_ns"], 0, "{adjusted}");
+    assert!(
+        adjusted["gaps"]
+            .as_array()
+            .is_some_and(|gaps| gaps.iter().any(|gap| gap == "source_uncertainty_unknown")),
+        "{adjusted}"
+    );
+}
+
+#[test]
+fn a_point_source_message_is_outer_uncertainty_not_unplaced() {
+    let mut capture = point_capture(10_000_000_000, 30_000_000_000);
+    capture["activity"][0]["placement"] = json!("source");
+    capture["activity"][0]["mapping_uncertainty_ns"] = json!(1_000_000_u64);
+    capture["activity"].as_array_mut().unwrap().push(json!({
+        "id": "message-1",
+        "kind": "message",
+        "placement": "source",
+        "start_ns": 20_000_000_000_u64,
+        "end_ns": 20_000_000_000_u64,
+        "mapping_uncertainty_ns": 1_000_000_u64
+    }));
+    let adjusted = adjust(&capture, Some(30_000_000_000));
+    assert!(
+        adjusted["deductible_ns"].as_u64().unwrap_or(0) > 0,
+        "{adjusted}"
+    );
+    assert!(
+        adjusted["gaps"].as_array().is_some_and(|gaps| gaps
+            .iter()
+            .all(|gap| gap != "unplaced_activity" && gap != "possible_useful_overlap_unplaced")),
+        "{adjusted}"
+    );
+}
+
+#[test]
 fn a_bracket_that_crosses_the_threshold_is_inconclusive() {
     let declared = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None))
         .declare()

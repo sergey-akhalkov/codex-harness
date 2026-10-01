@@ -469,15 +469,71 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
         if matches_admission {
             polling_operations = polling_operations.saturating_add(1);
         }
-        let placed = interval_of(item).map(|interval| clip(&[interval], window));
-        let Some(placed) = placed else {
-            if kind != "command" || !matches_admission {
-                unplaced_useful = true;
+        // A source point (equal mapped milliseconds) is still an interval once
+        // its uncertainty is applied. Dropping it first treats a known point
+        // as unplaced useful work and erases the deduction.
+        let placed = if placement == "source" {
+            let Some(uncertainty) = u64_field(item, "mapping_uncertainty_ns") else {
+                gaps.push("source_uncertainty_unknown".to_owned());
+                if !matches_admission {
+                    unplaced_useful = true;
+                }
+                continue;
+            };
+            let Some(start) = u64_field(item, "start_ns") else {
+                if kind != "command" || !matches_admission {
+                    unplaced_useful = true;
+                    gaps.push("unplaced_activity".to_owned());
+                } else {
+                    gaps.push("blocked_interval_unobserved".to_owned());
+                }
+                continue;
+            };
+            let Some(end) = u64_field(item, "end_ns") else {
+                if kind != "command" || !matches_admission {
+                    unplaced_useful = true;
+                    gaps.push("unplaced_activity".to_owned());
+                } else {
+                    gaps.push("blocked_interval_unobserved".to_owned());
+                }
+                continue;
+            };
+            if end < start {
                 gaps.push("unplaced_activity".to_owned());
-            } else {
-                gaps.push("blocked_interval_unobserved".to_owned());
+                unplaced_useful = true;
+                continue;
             }
-            continue;
+            let role = if matches_admission {
+                let start = start.saturating_add(uncertainty);
+                let end = end.saturating_sub(uncertainty);
+                (end > start).then_some(Interval { start, end })
+            } else {
+                let start = start.saturating_sub(uncertainty);
+                let end = end.saturating_add(uncertainty);
+                (end > start).then_some(Interval { start, end })
+            };
+            let Some(role) = role else {
+                if matches_admission {
+                    gaps.push("blocked_interval_consumed_by_uncertainty".to_owned());
+                }
+                continue;
+            };
+            let clipped = clip(&[role], window);
+            if clipped.is_empty() {
+                continue;
+            }
+            clipped
+        } else {
+            let Some(placed) = interval_of(item).map(|interval| clip(&[interval], window)) else {
+                if kind != "command" || !matches_admission {
+                    unplaced_useful = true;
+                    gaps.push("unplaced_activity".to_owned());
+                } else {
+                    gaps.push("blocked_interval_unobserved".to_owned());
+                }
+                continue;
+            };
+            placed
         };
         // Receipt time is an upper bound on notification delivery, not the
         // work instant. It cannot prove blocked coverage and cannot exclude

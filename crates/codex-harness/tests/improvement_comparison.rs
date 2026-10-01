@@ -3691,22 +3691,45 @@ fn owned_heavy_contention_reaches_the_native_report() {
     assert!(
         requests.iter().any(|request| {
             request["structural_single_tool"] == true
-                && request["tool_call_id"] == "heavy-cmd-1"
-                && request["command_id"] == "heavy-cmd-1"
+                && request["tool_call_id"] == "call_heavy_blocked_1"
+                && request["command_id"] == "call_heavy_blocked_1"
                 && request["start_ns"].is_null()
                 && request["end_ns"].is_null()
                 && request["wait_only"].is_null()
         }),
-        "the native rollout was not correlated to the blocked command without inventing an interval: {requests:?}"
+        "the native rollout was not correlated through call_id and turn_id: {requests:?}"
     );
     let activity = &row["infrastructure_capture"]["activity"];
     assert!(
         activity.as_array().is_some_and(|items| {
             items
                 .iter()
-                .any(|item| item["id"] == "heavy-cmd-1" && item["placement"] == "source")
+                .any(|item| item["id"] == "call_heavy_blocked_1" && item["placement"] == "source")
         }),
         "the blocked command must use the producer timestamp, not a receipt: {activity}"
+    );
+    let admissions = &row["infrastructure_capture"]["admissions"];
+    assert!(
+        admissions.as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["tool_call_id"] == "call_heavy_blocked_1"
+                    && item["command_id"] == "call_heavy_blocked_1"
+                    && item["class"] == "unrelated_wait"
+            })
+        }),
+        "process ownership did not bind the admission to the command item: {admissions}"
+    );
+    let unlabeled = documents.iter().any(|view| {
+        matches!(
+            view,
+            harness_core::heavy_command_trace::EvidenceView::Record(document)
+                if document.correlation.command_id.is_none()
+                    && document.correlation.tool_call_id.is_none()
+        )
+    });
+    assert!(
+        unlabeled,
+        "the public admission must not depend on a seeded command label"
     );
     let infra = &summarized["attempts"][0]["infrastructure"];
     assert!(infra["observed_seconds"].as_f64().is_some(), "{infra}");
