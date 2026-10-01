@@ -690,6 +690,130 @@ fn head_of(comment: &str) -> &str {
         .map_or(comment, |(head, _)| head)
 }
 
+/// One supported non-adoption whose matched measurements are absent or
+/// incomplete. The record binds the verdict to the experiment, the exact
+/// evaluated revisions, the acceptance evidence, the measured metric
+/// coverage, the scope and the reason; it never fabricates a matched count,
+/// arm seconds, tolerance or regression the accounting did not produce, and
+/// it can never state an adoption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonAdoptionDraft {
+    pub item: String,
+    pub experiment: String,
+    pub outcome: DecisionOutcome,
+    pub quality: QualityOutcome,
+    /// Recorded attempt and task counts, for example
+    /// `attempts:2 tasks:1 accepted:0 per_success:undefined`.
+    pub accounting: String,
+    /// The exact baseline revision evaluated (the accepted Git base).
+    pub baseline_revision: String,
+    /// The exact candidate revision evaluated (the candidate checkout).
+    pub candidate_revision: String,
+    /// The independently accepted evidence reference.
+    pub acceptance: String,
+    /// The measured metric coverage actually recorded.
+    pub coverage: String,
+    /// The decision scope.
+    pub scope: String,
+    /// The recorded decision reason.
+    pub reason: String,
+    /// Bounded prose detail; the board record stays a reference.
+    pub detail: Option<String>,
+}
+
+impl NonAdoptionDraft {
+    /// Builds the `benefit-gate v2` non-adoption record text. Every binding
+    /// field is required: an incomplete binding is refused instead of being
+    /// written as a weaker decision.
+    pub fn record(&self) -> io::Result<String> {
+        match self.outcome {
+            DecisionOutcome::Adopt => {
+                return Err(board_hypothesis::invalid(
+                    "a non-adoption record cannot state an adoption; an adoption needs matched, independently accepted arm evidence",
+                ));
+            }
+            DecisionOutcome::Reject | DecisionOutcome::Inconclusive => {}
+        }
+        let item = require_token("item", &self.item, 64)?;
+        let experiment = require_token("experiment", &self.experiment, 128)?;
+        let baseline_revision = require_token("baseline revision", &self.baseline_revision, 128)?;
+        let candidate_revision =
+            require_token("candidate revision", &self.candidate_revision, 128)?;
+        if baseline_revision == candidate_revision {
+            return Err(board_hypothesis::invalid(
+                "baseline and candidate revisions are identical: there is no treatment to compare",
+            ));
+        }
+        let acceptance = require_token("acceptance", &self.acceptance, 160)?;
+        let coverage = require_token("coverage", &self.coverage, 160)?;
+        let scope = require_token("scope", &self.scope, 160)?;
+        let reason = require_token("reason", &self.reason, 160)?;
+        let accounting = require_token("accounting", &self.accounting, 160)?;
+        let quality = require_token("quality", self.quality.as_str(), 32)?;
+        let mut text = format!(
+            "{GATE_PREFIX_V2} item={item} experiment={experiment} revisions={baseline_revision}..{candidate_revision} acceptance={acceptance} coverage={coverage} scope={scope} reason={reason} outcome={} quality={quality} accounting={accounting}",
+            self.outcome.as_str(),
+        );
+        if let Some(detail) = &self.detail {
+            let detail = require_line("detail", detail, MAX_DETAIL)?;
+            text.push_str(&format!(" detail={detail}"));
+        }
+        Ok(text)
+    }
+}
+
+/// Publishes one supported non-adoption as a `benefit-gate v2` comment on the
+/// hypothesis card under the same rules as [`publish_decision`]:
+///
+/// - the rendered record must classify as a non-adoption (a record missing or
+///   contradicting its v2 bindings is refused);
+/// - the item must be an existing hypothesis card;
+/// - publication is idempotent and a different decision for the same
+///   experiment is a deliberate new record controlled by the newest comment.
+///
+/// A non-adoption authorizes no integration or activation: the activation
+/// owner requires the newest record to be a consistent adoption.
+pub fn publish_non_adoption(
+    bd: &Path,
+    project: &Path,
+    draft: &NonAdoptionDraft,
+) -> io::Result<Publication> {
+    let text = draft.record()?;
+    let head = head_of(&text);
+    let parsed = parse_gate_comments(std::slice::from_ref(&text));
+    let (verdict, limitations) = parsed.first().map_or(
+        (Verdict::Unreadable, vec![Limitation::OutcomeAbsent]),
+        classify,
+    );
+    if verdict != Verdict::NonAdoption {
+        let reasons: Vec<&str> = limitations
+            .iter()
+            .map(|limitation| limitation.as_str())
+            .collect();
+        return Err(board_hypothesis::invalid(format!(
+            "the recorded {} non-adoption is not supported by its own bindings: {}",
+            draft.outcome.as_str(),
+            if reasons.is_empty() {
+                "the record is unreadable".to_owned()
+            } else {
+                reasons.join("; ")
+            }
+        )));
+    }
+    board_hypothesis::require_hypothesis_card(bd, project, &draft.item)?;
+    let comments = board_feedback::list_comments(bd, project, &draft.item)?;
+    if comments.iter().any(|comment| head_of(comment) == head) {
+        return Ok(Publication::Confirmed { text });
+    }
+    json_ok_actor(
+        bd,
+        project,
+        ACTOR,
+        &["comment", &draft.item, "--json", &text],
+    )?;
+    Ok(Publication::Recorded { text })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,5 +1411,75 @@ mod tests {
             vec![Limitation::ToleratedRegressionNotBenefit],
             "an unchanged-quality adoption that is slower is not a positive effect"
         );
+    }
+
+    fn non_adoption() -> NonAdoptionDraft {
+        NonAdoptionDraft {
+            item: "codex-harness-pvr.5".to_owned(),
+            experiment: "exp-1".to_owned(),
+            outcome: DecisionOutcome::Reject,
+            quality: QualityOutcome::Unmeasurable,
+            accounting: "attempts:2,tasks:1,accepted:0,per_success:undefined".to_owned(),
+            baseline_revision: "base123".to_owned(),
+            candidate_revision: "cand456".to_owned(),
+            acceptance: "outcome-oracle:private-request".to_owned(),
+            coverage: "time".to_owned(),
+            scope: "task:workload-b.model:local".to_owned(),
+            reason: "independent_acceptance_failed:cand-1".to_owned(),
+            detail: Some("the candidate solution failed the frozen checker".to_owned()),
+        }
+    }
+
+    #[test]
+    fn non_adoptions_bind_their_verdict_without_fabricated_measurements() {
+        let draft = non_adoption();
+        let text = draft.record().expect("a bounded non-adoption record");
+        assert!(text.starts_with(GATE_PREFIX_V2));
+        assert!(!text.contains("matched="), "{text}");
+        assert!(!text.contains("baseline_seconds="), "{text}");
+        assert!(!text.contains("regression_percent="), "{text}");
+        let records = parse_gate_comments(std::slice::from_ref(&text));
+        let assessment = assess(&records, "codex-harness-pvr.5").expect("attributable");
+        assert_eq!(assessment.verdict, Verdict::NonAdoption);
+        assert!(assessment.limitations.is_empty());
+        assert!(!default_allowed(&records, "codex-harness-pvr.5"));
+
+        let mut inconclusive = draft.clone();
+        inconclusive.outcome = DecisionOutcome::Inconclusive;
+        let records = parse_gate_comments(&[inconclusive.record().unwrap()]);
+        assert_eq!(
+            assess(&records, "codex-harness-pvr.5").unwrap().verdict,
+            Verdict::NonAdoption
+        );
+
+        // A non-adoption can never be rendered as an adoption, and every
+        // binding field stays required.
+        let mut adopting = draft.clone();
+        adopting.outcome = DecisionOutcome::Adopt;
+        assert!(adopting.record().is_err());
+        for mutate in [
+            |draft: &mut NonAdoptionDraft| draft.experiment.clear(),
+            |draft: &mut NonAdoptionDraft| draft.acceptance.clear(),
+            |draft: &mut NonAdoptionDraft| draft.coverage.clear(),
+            |draft: &mut NonAdoptionDraft| draft.scope.clear(),
+            |draft: &mut NonAdoptionDraft| draft.reason.clear(),
+            |draft: &mut NonAdoptionDraft| draft.accounting.clear(),
+            |draft: &mut NonAdoptionDraft| {
+                draft.candidate_revision = draft.baseline_revision.clone()
+            },
+        ] {
+            let mut broken = draft.clone();
+            mutate(&mut broken);
+            assert!(
+                broken.record().is_err(),
+                "an incomplete non-adoption must be refused"
+            );
+        }
+
+        // The newest non-adoption supersedes an older adoption: an item with a
+        // rejected experiment is not adoptable.
+        let records =
+            parse_gate_comments(&[publication().record().unwrap(), draft.record().unwrap()]);
+        assert!(!default_allowed(&records, "codex-harness-pvr.5"));
     }
 }

@@ -830,6 +830,7 @@ fn run_spec(
         oracle: "oracle:fixture".into(),
         removal: None,
         evidence_root: None,
+        comparison: None,
     }
 }
 

@@ -1193,6 +1193,8 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
             planning_root: project,
         },
         contract: experiment(),
+        workload_card: "bdct-workload".to_owned(),
+        workload_removal: None,
         task: TaskInputs {
             source: task,
             revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),

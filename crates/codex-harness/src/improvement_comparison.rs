@@ -71,13 +71,6 @@ fn sha16(value: &str) -> String {
     value.chars().take(16).collect()
 }
 
-fn digest16_of(value: &Value) -> String {
-    match serde_json::to_vec(value) {
-        Ok(bytes) => sha16(&build_identity::hash_bytes(&bytes)),
-        Err(_) => "unavailable".to_owned(),
-    }
-}
-
 fn block(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result<()> {
     // The reason is retained durably: `resume` unwinds a stale block to the
     // suspended phase, so the bounded effect history is what keeps the refusal
@@ -230,9 +223,23 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
         block(run, notes, reason)?;
         return Ok(false);
     }
+    // Every declared API observation input must be one of the declared client
+    // files the arms actually consume; an unconsumed template is refused
+    // before any preparation.
+    if let Err(reason) = verify_observation_inputs(&comparison) {
+        block(run, notes, reason)?;
+        return Ok(false);
+    }
     // The workload's own complete OpenSpec change must qualify separately
     // from the candidate's before the frozen copy is accepted.
     if let Err(reason) = ensure_workload_planning(run, &comparison) {
+        block(run, notes, reason)?;
+        return Ok(false);
+    }
+    // Workload B is its own durable hypothesis owner; its card, its spec
+    // reference and its frozen removal proposal identity are validated here,
+    // before any copy, installation or measured attempt.
+    if let Err(reason) = ensure_workload_owner(run, &comparison) {
         block(run, notes, reason)?;
         return Ok(false);
     }
@@ -246,9 +253,25 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
             return Ok(false);
         }
     };
+    // Exact build provenance through the existing build/source owners: the
+    // baseline runtime must be the frozen base source and the candidate
+    // runtime the ready candidate checkout. A swapped, unrelated or
+    // changed-source build is refused before any installation or dispatch.
+    if let Err(reason) = verify_build_provenance(run, &bindings) {
+        block(run, notes, reason)?;
+        return Ok(false);
+    }
     if let Err(reason) = ensure_arm_installs(run, &comparison, &bindings) {
         block(run, notes, reason)?;
         return Ok(false);
+    }
+    // The declared client inputs must be the ones the arms actually consume;
+    // an unused template cannot stand in for an installed configuration.
+    for arm in [ComparisonArm::Baseline, ComparisonArm::Candidate] {
+        if let Err(reason) = verify_consumed_arm(run, &comparison, arm, "preparation") {
+            block(run, notes, reason)?;
+            return Ok(false);
+        }
     }
     if let Err(reason) = ensure_task_workspace(run, &comparison, &bindings) {
         block(run, notes, reason)?;
@@ -313,6 +336,342 @@ fn ensure_workload_planning(run: &Run, comparison: &ComparisonInputs) -> Result<
         .map_err(|error| format!("the workload planning inputs changed: {error}"))
 }
 
+/// Workload B's own durable owner: the card must exist, be a hypothesis, not
+/// closed or deferred, and its recorded spec reference must resolve to the
+/// declared workload change. Its removal proposal digest, when the workload
+/// declares a removal, is frozen here so a changed reviewed proposal needs a
+/// fresh decision.
+fn ensure_workload_owner(run: &mut Run, comparison: &ComparisonInputs) -> Result<(), String> {
+    let card = board_hypothesis::load_card(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &comparison.workload_card,
+    )
+    .map_err(|error| {
+        format!(
+            "the workload's own hypothesis card {} is unavailable: {error}",
+            comparison.workload_card
+        )
+    })?;
+    if !card.labels.iter().any(|label| label == "hypothesis") {
+        return Err(format!(
+            "board item {} is not a hypothesis card: the hypothesis label is missing",
+            comparison.workload_card
+        ));
+    }
+    if matches!(card.status.as_str(), "closed" | "deferred") {
+        return Err(format!(
+            "workload card {} is {}; a closed or deferred workload needs a recorded reconsideration basis",
+            comparison.workload_card, card.status
+        ));
+    }
+    let Some(admission) = board_hypothesis::parse_admission(&card.description) else {
+        return Err(format!(
+            "workload card {} carries no recognized admission record; admit it before a run measures it",
+            comparison.workload_card
+        ));
+    };
+    let declared = admission.spec.unwrap_or_default().replace('\\', "/");
+    if !declared.ends_with(&comparison.specification.change) {
+        return Err(format!(
+            "workload card {} references spec '{declared}' instead of the declared workload change '{}'",
+            comparison.workload_card, comparison.specification.change
+        ));
+    }
+    let comments = board_feedback::list_comments(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &comparison.workload_card,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut state = run
+        .cursor
+        .comparison
+        .clone()
+        .unwrap_or_else(|| ComparisonState::new("unset".to_owned()));
+    state.workload_card = Some(comparison.workload_card.clone());
+    if comparison.workload_removal.is_some() && state.workload_removal_frozen.is_none() {
+        state.workload_removal_frozen =
+            harness_core::improvement_loop::frozen_candidate_removal_digest(
+                &comparison.workload_card,
+                &comments,
+            );
+    }
+    run.cursor.comparison = Some(state);
+    Ok(())
+}
+
+/// The current experimental removal authority for workload B, resolved
+/// against the live card comments and the digest frozen at preparation. It
+/// applies to both measured arms: running B at all is the removal effect when
+/// B retires a capability.
+fn workload_removal_gate(
+    run: &Run,
+    comparison: &ComparisonInputs,
+) -> io::Result<Option<RemovalGate>> {
+    let Some(removal) = &comparison.workload_removal else {
+        return Ok(None);
+    };
+    let comments = board_feedback::list_comments(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &comparison.workload_card,
+    )?;
+    let frozen = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.workload_removal_frozen.clone());
+    let request = board_hypothesis::AuthorityRequest {
+        proposal: removal.proposal.clone(),
+        target: removal.target.clone(),
+        action: board_hypothesis::RemovalAction::Experiment,
+    };
+    Ok(Some(harness_core::improvement_loop::removal_gate_at(
+        &comparison.workload_card,
+        &request,
+        &comments,
+        frozen.as_deref(),
+    )))
+}
+
+/// The frozen baseline source checkout: the run project at the declared base
+/// revision, in a detached worktree owned by the run. It is the only source
+/// identity the baseline runtime may have been built from.
+fn ensure_baseline_source(run: &Run) -> Result<PathBuf, String> {
+    let path = run.store.root().join("baseline-source");
+    if !path.exists() {
+        let plain = path.to_string_lossy().into_owned();
+        git(
+            &run.spec.project,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &plain,
+                &run.spec.base_revision,
+            ],
+        )
+        .map_err(|error| {
+            format!(
+                "the frozen baseline source checkout could not be materialized at {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    if !git_ok(&path, &["rev-parse", "--is-inside-work-tree"]) {
+        return Err(format!(
+            "the frozen baseline source checkout {} is not a Git checkout",
+            path.display()
+        ));
+    }
+    let head = git(&path, &["rev-parse", "HEAD"]).map_err(|error| error.to_string())?;
+    if head.trim() != run.spec.base_revision {
+        return Err(format!(
+            "the frozen baseline source checkout {} is at {} instead of the declared base {}",
+            path.display(),
+            head.trim(),
+            run.spec.base_revision
+        ));
+    }
+    Ok(path)
+}
+
+/// Exact provenance of both prepared runtimes through the existing build
+/// identity owner: the baseline build must record the frozen base source and
+/// the candidate build the ready candidate checkout. This is re-verified
+/// before every measured dispatch and on reuse, so a swapped, unrelated or
+/// changed-source build can never enter a comparison or adoption record.
+fn verify_build_provenance(run: &Run, bindings: &ExperimentBindings) -> Result<(), String> {
+    let baseline_source = ensure_baseline_source(run)?;
+    let candidate_source = bindings.candidate.path.clone();
+    for (arm, source) in [
+        (Arm::Baseline, &baseline_source),
+        (Arm::Candidate, &candidate_source),
+    ] {
+        let binding = bindings.arm(arm).map_err(|error| error.to_string())?;
+        let check = build_identity::check(&binding.runtime.build, Some(source));
+        if check.status != build_identity::Health::Healthy {
+            return Err(format!(
+                "the prepared {} runtime does not match the frozen {} source ({}); the explicit build inputs are refused before any measured dispatch",
+                binding.runtime.label,
+                match arm {
+                    Arm::Baseline => "baseline",
+                    Arm::Candidate => "candidate",
+                },
+                check.action
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Bind the declared client inputs to the client settings an installed arm
+/// actually consumes. The retained consumption receipt names the exact
+/// runner, effort, catalogue and overlay files, and every declared
+/// API-observed input must be one of those consumed files: a qualified but
+/// unconsumed template cannot mask a differently configured arm.
+fn verify_client_binding(
+    comparison: &ComparisonInputs,
+    runtime: &ArmRuntime,
+    phase: &str,
+) -> Result<(), String> {
+    let declared = &comparison.runtimes.client;
+    let Some(configuration) = &runtime.configuration else {
+        return Err(format!(
+            "the {} arm retains no consumed configuration record for the declared client inputs",
+            runtime.label
+        ));
+    };
+    let Some(client) = &configuration.client else {
+        return Err(format!(
+            "the {} arm consumed no client configuration although the comparison declares an explicit local route",
+            runtime.label
+        ));
+    };
+    if client.runner.endpoint != declared.runner.endpoint
+        || client.runner.model != declared.runner.model
+    {
+        return Err(format!(
+            "the {phase} {} arm consumption names {}/{} instead of the declared {}/{}",
+            runtime.label,
+            client.runner.endpoint,
+            client.runner.model,
+            declared.runner.endpoint,
+            declared.runner.model
+        ));
+    }
+    for name in harness_core::outcome_qualification::MATERIAL_FIELDS {
+        if let Some(declared_value) = declared.runner.identity.declared(name)
+            && client.runner.identity.declared(name) != Some(declared_value)
+        {
+            return Err(format!(
+                "the {phase} {} arm consumption does not confirm the declared material fact {name}",
+                runtime.label
+            ));
+        }
+    }
+    if client.reasoning_effort != declared.reasoning_effort {
+        return Err(format!(
+            "the {phase} {} arm consumed reasoning effort {:?} instead of the declared {:?}",
+            runtime.label, client.reasoning_effort, declared.reasoning_effort
+        ));
+    }
+    verify_consumed_file(
+        phase,
+        &runtime.label,
+        "catalogue",
+        declared.catalogue.as_deref(),
+        client.catalogue.as_ref(),
+    )?;
+    verify_consumed_file(
+        phase,
+        &runtime.label,
+        "overlay",
+        declared.overlay.as_deref(),
+        configuration.overlay.as_ref(),
+    )?;
+    verify_observation_inputs(comparison)?;
+    Ok(())
+}
+
+/// Every declared API observation input must be exactly one of the declared
+/// client files the arms consume (overlay or catalogue). A qualified but
+/// unconsumed template cannot stand in for the installed configuration.
+fn verify_observation_inputs(comparison: &ComparisonInputs) -> Result<(), String> {
+    let client = &comparison.runtimes.client;
+    for input in &comparison.observation_inputs {
+        let consumed = same_file_path(&input.path, client.overlay.as_deref())
+            || same_file_path(&input.path, client.catalogue.as_deref());
+        if !consumed {
+            return Err(format!(
+                "the declared API observation input {} is not one of the client files the arms actually consume (overlay or catalogue); an unconsumed template cannot authorize measured arms",
+                input.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_consumed_file(
+    phase: &str,
+    label: &str,
+    name: &str,
+    declared: Option<&Path>,
+    recorded: Option<&harness_core::improvement_runtime::FileIdentity>,
+) -> Result<(), String> {
+    match (declared, recorded) {
+        (None, None) => Ok(()),
+        (Some(path), Some(identity)) => {
+            if !same_file_path(path, Some(identity.path.as_path())) {
+                return Err(format!(
+                    "the {phase} {label} arm consumes {name} {} instead of the declared {}",
+                    identity.path.display(),
+                    path.display()
+                ));
+            }
+            let digest = build_identity::hash_file(path)
+                .map_err(|error| format!("the declared {name} is unreadable: {error}"))?;
+            if digest != identity.sha256 {
+                return Err(format!(
+                    "the {phase} {label} arm consumed a different {name} digest than the declared file"
+                ));
+            }
+            Ok(())
+        }
+        (Some(path), None) => Err(format!(
+            "the declared {name} {} was not consumed by the {phase} {label} arm",
+            path.display()
+        )),
+        (None, Some(identity)) => Err(format!(
+            "the {phase} {label} arm consumed an undeclared {name} at {}",
+            identity.path.display()
+        )),
+    }
+}
+
+/// Path equality after canonicalization (case-insensitive on Windows), for
+/// files that exist.
+fn same_file_path(left: &Path, right: Option<&Path>) -> bool {
+    let Some(right) = right else {
+        return false;
+    };
+    let key = |path: &Path| -> String {
+        fs::canonicalize(path)
+            .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    !left.as_os_str().is_empty() && key(left) == key(right)
+}
+
+/// Re-verify one installed arm's runtime consumption and client binding; the
+/// same check runs before and after every measured attempt.
+fn verify_consumed_arm(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    arm: ComparisonArm,
+    phase: &str,
+) -> Result<(), String> {
+    let runtime_path = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.arm(arm).runtime.clone())
+        .ok_or_else(|| format!("the {} arm runtime receipt is missing", arm.as_str()))?;
+    let runtime: ArmRuntime =
+        read_json(&runtime_path, MAX_RUN_SPEC_BYTES).map_err(|error| error.to_string())?;
+    improvement_runtime::verify_consumption(&runtime).map_err(|error| {
+        format!(
+            "the {phase} {} arm home no longer consumes its prepared runtime: {error}",
+            arm.as_str()
+        )
+    })?;
+    verify_client_binding(comparison, &runtime, phase)
+}
+
 /// Build or reuse the two frozen workload copies, the fresh homes, the
 /// prepared runtime identities and the experiment bindings receipt.
 fn ensure_bindings(
@@ -322,7 +681,9 @@ fn ensure_bindings(
     declared: &DeclaredComparison,
 ) -> Result<ExperimentBindings, String> {
     let bindings_path = run.store.comparison_bindings_path();
-    let policy_digest = sha16(&declared.digest);
+    // The binding carries the full policy digest: the integration/activation
+    // owner compares it against the retained evaluation's digest.
+    let policy_digest = declared.digest.clone();
     if bindings_path.is_file() {
         let bindings: ExperimentBindings = read_json(&bindings_path, MAX_RUN_SPEC_BYTES)
             .map_err(|error| format!("the retained comparison bindings are unreadable: {error}"))?;
@@ -432,7 +793,10 @@ fn ensure_bindings(
         base_revision: checkout.base.clone(),
         candidate: checkout,
         oracle: run.spec.oracle.clone(),
-        acceptance: run.spec.experiment.independent_acceptance.clone(),
+        // The decision's acceptance binding is the declared independent
+        // acceptance reference (token-shaped), which is also the reference the
+        // integration/activation owner re-derives its expected record from.
+        acceptance: run.spec.oracle.clone(),
         policy_digest,
         arms,
     };
@@ -1050,12 +1414,50 @@ fn dispatch_next(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
                     arm.as_str()
                 ))
             })?;
-        improvement_runtime::verify_consumption(&runtime).map_err(|error| {
-            invalid(format!(
-                "the {} arm home no longer consumes its prepared runtime: {error}",
-                arm.as_str()
-            ))
-        })?;
+        // Exact build provenance and actual consumed client settings are
+        // re-verified before the dispatch.
+        if let Err(reason) = verify_build_provenance(run, &bindings) {
+            return block(run, notes, reason);
+        }
+        if let Err(reason) = verify_consumed_arm(run, &comparison, arm, "pre-attempt") {
+            return block(run, notes, reason);
+        }
+        // Workload B's own informed removal decision gates both measured arms.
+        match workload_removal_gate(run, &comparison) {
+            Ok(None) | Ok(Some(RemovalGate::Authorized { .. })) => {}
+            Ok(Some(gate @ RemovalGate::Pending { .. })) => {
+                return block(
+                    run,
+                    notes,
+                    format!(
+                        "workload {} removal approval is pending: {}",
+                        comparison.workload_card,
+                        super::removal_text(&Some(gate))
+                    ),
+                );
+            }
+            Ok(Some(gate @ (RemovalGate::Refused { .. } | RemovalGate::Withdrawn { .. }))) => {
+                return block(
+                    run,
+                    notes,
+                    format!(
+                        "workload {} removal authority is {}; the dependent measured arms stay blocked and the request is not repeated without a new evidential basis",
+                        comparison.workload_card,
+                        super::removal_text(&Some(gate))
+                    ),
+                );
+            }
+            Err(error) => {
+                return block(
+                    run,
+                    notes,
+                    format!(
+                        "workload {} removal authority could not be resolved: {error}",
+                        comparison.workload_card
+                    ),
+                );
+            }
+        }
         if let Some(qualification) = api_observed(run)?
             && let Err(reason) = verify_observations(&comparison, &qualification, "pre-attempt")
         {
@@ -1399,12 +1801,16 @@ fn consume_settled_arm(
                 attempt.id
             ));
         }
-        improvement_runtime::verify_consumption(&runtime).map_err(|error| {
-            format!(
-                "the {} arm home no longer consumes its prepared runtime: {error}",
-                arm.as_str()
-            )
-        })?;
+        verify_consumed_arm(run, &comparison, arm, "post-attempt")?;
+        // The observed conversation must carry the declared model and effort
+        // through the real rollout owner; a wrong or missing observation is
+        // refused instead of entering the comparison unverified.
+        let sessions = discovery_sessions(run, &attempt).map_err(|error| error.to_string())?;
+        if !sessions.verified {
+            return Err(sessions.reason.unwrap_or_else(|| {
+                "the observed conversation did not verify the declared model and effort".to_owned()
+            }));
+        }
         if let Some(qualification) = api_observed(run).map_err(|error| error.to_string())? {
             verify_observations(&comparison, &qualification, "post-attempt")?;
         }
@@ -1430,6 +1836,20 @@ fn consume_settled_arm(
             );
         }
     };
+    // The verified workload implementation is retained under its own durable
+    // owner (B's card) with the exact arm and revision; B's later benefit
+    // verdict is a separate decision and is not required for this reference.
+    if let Err(reason) = record_workload_implementation(run, &comparison, arm, &solution) {
+        return block(
+            run,
+            notes,
+            format!(
+                "the verified {} arm implementation could not be retained on workload card {}: {reason}",
+                arm.as_str(),
+                comparison.workload_card
+            ),
+        );
+    }
     let acceptance = match run_oracle(run, &comparison, arm, &solution) {
         Ok(acceptance) => acceptance,
         Err(reason) => {
@@ -1523,6 +1943,41 @@ fn refuse_arm(
             arm.as_str()
         ),
     )
+}
+
+/// Retain one verified workload implementation under B's own card. The record
+/// names the frozen base, the exact verified solution revision, the owned
+/// worktree and the arm runtime actually consumed; it does not depend on B's
+/// later benefit verdict.
+fn record_workload_implementation(
+    run: &Run,
+    comparison: &ComparisonInputs,
+    arm: ComparisonArm,
+    solution: &Solution,
+) -> Result<(), String> {
+    let runtime_reference = run
+        .cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.arm(arm).runtime.clone())
+        .map(|path| path.to_string_lossy().into_owned());
+    let implementation = board_hypothesis::BoundedImplementation {
+        role: board_hypothesis::HypothesisRole::Workload,
+        branch: format!("workload-{}", arm.as_str()),
+        base: comparison.task.revision.clone(),
+        revision: solution.revision.clone(),
+        worktree: solution.checkout.to_string_lossy().into_owned(),
+        runtime: runtime_reference,
+        baseline_runtime: Some(comparison.runtimes.baseline_label.clone()),
+    };
+    board_hypothesis::record_implementation(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &comparison.workload_card,
+        &implementation,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 /// The verified committed solution of one measured arm.
@@ -1620,6 +2075,12 @@ struct Acceptance {
     record_path: PathBuf,
     started_at: f64,
     ended_at: f64,
+    /// Observed result of preparing the acceptance workspace: the committed
+    /// solution was materialized and the workspace cleaned, so both arms are
+    /// checked from the same fresh source-only state. Any build products an
+    /// acceptance checker needs are prepared by the checker itself and their
+    /// time is part of this check's accounted span.
+    workspace_preparation: String,
 }
 
 /// Materialize the committed solution into the frozen acceptance workspace
@@ -1668,6 +2129,7 @@ fn run_oracle(
     .map_err(|error| format!("the acceptance workspace could not be checked out: {error}"))?;
     git(&workspace, &["clean", "-fdxq"])
         .map_err(|error| format!("the acceptance workspace could not be cleaned: {error}"))?;
+    let workspace_preparation = "source-only-fresh-workspace".to_owned();
 
     let started_at = now_seconds();
     let supervisor = std::env::current_exe()
@@ -1706,6 +2168,7 @@ fn run_oracle(
         record_path,
         started_at,
         ended_at,
+        workspace_preparation,
     })
 }
 
@@ -1724,7 +2187,21 @@ fn build_row(
     let started_at = attempt.started_ms as f64 / 1000.0;
     let observation = retained_observation(attempt);
     let sessions = discovery_sessions(run, attempt)?;
-    let matched = matched_fields(run, comparison, attempt)?;
+    let bindings =
+        load_bindings(run)?.ok_or_else(|| invalid("the comparison bindings are missing"))?;
+    let snapshot = snapshot_facts(
+        &bindings
+            .arm(Arm::Baseline)
+            .map_err(|error| invalid(error.to_string()))?
+            .workload,
+    )?;
+    let matched = matched_fields(
+        run,
+        comparison,
+        runtime,
+        &snapshot,
+        &acceptance.workspace_preparation,
+    )?;
     let mut native = json!({
         "started_at": started_at,
         "ended_at": acceptance.started_at,
@@ -1774,10 +2251,13 @@ fn build_row(
         "children": [],
         "interventions": [],
         "retry_of": null,
-        "harness_build": runtime.variant.build.display().to_string(),
-        "harness_label": runtime.label,
-        "solution_revision": solution.revision,
-        "solution_paths": solution.changed_paths,
+        "treatment": {
+            "label": runtime.label,
+            "build": runtime.variant.build.display().to_string(),
+            "build_source_sha256": runtime.variant.source_sha256,
+            "solution_revision": solution.revision,
+            "solution_paths": solution.changed_paths,
+        },
     }))
 }
 
@@ -1795,21 +2275,30 @@ fn retained_observation(attempt: &Attempt) -> Option<Value> {
 struct Sessions {
     paths: Vec<PathBuf>,
     verified: bool,
+    /// Why the observation is unverified; named for the arm refusal.
+    reason: Option<String>,
 }
 
 /// Discover this attempt's own rollout files under the arm home and verify
-/// the observed model identity through the rollout owner. A missing or
-/// mismatched session stays unverified instead of being inferred.
+/// the observed model and reasoning effort through the rollout owner. A
+/// missing or mismatched session stays unverified with a named reason instead
+/// of being inferred.
 fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
-    let unverified = || Sessions {
+    let unverified = |reason: String| Sessions {
         paths: Vec::new(),
         verified: false,
+        reason: Some(reason),
     };
     let Some(binding) = &attempt.binding else {
-        return Ok(unverified());
+        return Ok(unverified(
+            "the attempt records no dispatch identity".to_owned(),
+        ));
     };
     let Some(expected) = binding.session.clone() else {
-        return Ok(unverified());
+        return Ok(unverified(
+            "the accepted dispatch recorded no native session, so no rollout can be attributed to it"
+                .to_owned(),
+        ));
     };
     let runtime_path = run
         .cursor
@@ -1817,7 +2306,7 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
         .as_ref()
         .and_then(|state| state.arm(arm_of_role(attempt.role)).runtime.clone());
     let Some(runtime_path) = runtime_path else {
-        return Ok(unverified());
+        return Ok(unverified("the arm runtime receipt is missing".to_owned()));
     };
     let runtime: ArmRuntime = read_json(&runtime_path, MAX_RUN_SPEC_BYTES)?;
     let sessions = runtime.home.join("sessions");
@@ -1829,7 +2318,10 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
             for entry in fs::read_dir(&directory)? {
                 entries += 1;
                 if entries > MAX_ROLLOUT_ENTRIES {
-                    return Ok(unverified());
+                    return Ok(unverified(
+                        "the arm home holds more rollout files than the bounded scan allows"
+                            .to_owned(),
+                    ));
                 }
                 let entry = entry?;
                 let path = entry.path();
@@ -1846,20 +2338,34 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
     }
     paths.sort();
     paths.dedup();
-    let declared_model = run
+    let (declared_model, declared_effort) = run
         .spec
         .comparison
         .as_ref()
-        .map(|comparison| comparison.runtimes.client.runner.model.clone())
+        .map(|comparison| {
+            (
+                comparison.runtimes.client.runner.model.clone(),
+                comparison.runtimes.client.reasoning_effort.clone(),
+            )
+        })
         .unwrap_or_default();
-    let mut verified = !paths.is_empty();
+    if paths.is_empty() {
+        return Ok(unverified(format!(
+            "no rollout was observed for the attempt's recorded session {expected}; the measured model and effort cannot be verified"
+        )));
+    }
+    let mut observed_model = None;
     for path in &paths {
         let summary = rollout_reader::read(path);
         let id = summary.row["id"].as_str().unwrap_or("");
         let model = summary.row["model"].as_str().unwrap_or("");
+        let effort = summary.row["reasoning"].as_str().unwrap_or("");
         let model_matches = model == declared_model
             || model == format!("openai/{declared_model}")
             || model == format!("xai/{declared_model}");
+        let effort_matches = declared_effort
+            .as_deref()
+            .is_none_or(|declared| effort == declared);
         // Identity conflicts disqualify the observation. Provider attribution
         // for a local alias stays a disclosed limit of the accounting, not a
         // reason to drop the measured rollout.
@@ -1872,12 +2378,42 @@ fn discovery_sessions(run: &Run, attempt: &Attempt) -> io::Result<Sessions> {
                     | "mixed_model_attribution"
             )
         });
-        if id != expected || !model_matches || disqualified {
-            verified = false;
-            break;
+        if id != expected {
+            return Ok(unverified(format!(
+                "the observed rollout {} names session {id} instead of the accepted session {expected}",
+                path.display()
+            )));
         }
+        if disqualified {
+            return Ok(unverified(format!(
+                "the observed rollout {} has conflicting identity facts ({}); the measured model cannot be attributed",
+                path.display(),
+                summary
+                    .warnings
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )));
+        }
+        if !model_matches {
+            return Ok(unverified(format!(
+                "the observation recorded model {model} instead of the declared {declared_model}"
+            )));
+        }
+        if !effort_matches {
+            return Ok(unverified(format!(
+                "the observation recorded reasoning effort {effort} instead of the declared {}",
+                declared_effort.as_deref().unwrap_or("default")
+            )));
+        }
+        observed_model = Some(model.to_owned());
     }
-    Ok(Sessions { paths, verified })
+    Ok(Sessions {
+        paths,
+        verified: observed_model.is_some(),
+        reason: None,
+    })
 }
 
 fn arm_of_role(role: AttemptRole) -> ComparisonArm {
@@ -1926,64 +2462,140 @@ fn usage_totals(paths: &[PathBuf]) -> Option<Value> {
     Some(Value::Object(result))
 }
 
-/// The invariant comparison identities the authoritative accounting requires.
-/// Each value is fixed by the frozen comparison declaration and identical on
-/// both arms; the treatment difference is recorded outside `matched`.
+/// The frozen workload snapshot's own instruction, skill and hook identities,
+/// read from the frozen revision through the Git owner. An absent path is an
+/// observed absence (`absent`), never an assumed constant.
+struct SnapshotFacts {
+    instructions: String,
+    skills: String,
+    hooks: String,
+}
+
+fn snapshot_facts(workload: &harness_core::task_worktree::FrozenCopy) -> io::Result<SnapshotFacts> {
+    let listing = |pathspec: &[&str]| -> Option<String> {
+        let mut args = vec!["ls-tree", "-r", workload.revision.as_str(), "--"];
+        args.extend_from_slice(pathspec);
+        let text = git(&workload.path, &args).ok()?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| sha16(&build_identity::hash_bytes(text.as_bytes())))
+    };
+    let absent = || "absent".to_owned();
+    let instructions = match git(
+        &workload.path,
+        &[
+            "cat-file",
+            "-e",
+            &format!("{}:AGENTS.md", workload.revision),
+        ],
+    ) {
+        Ok(_) => {
+            let bytes = git(
+                &workload.path,
+                &["show", &format!("{}:AGENTS.md", workload.revision)],
+            )
+            .map_err(invalid)?
+            .into_bytes();
+            sha16(&build_identity::hash_bytes(&bytes))
+        }
+        Err(_) => absent(),
+    };
+    Ok(SnapshotFacts {
+        instructions,
+        skills: listing(&[".agents/skills"]).unwrap_or_else(absent),
+        hooks: listing(&["hooks.json", ".codex/hooks.json"]).unwrap_or_else(absent),
+    })
+}
+
+/// The invariant comparison identities the authoritative accounting requires,
+/// derived from the frozen declaration and from verified per-arm consumption.
+/// A fact that cannot be observed stays absent from the map so the accounting
+/// reports it as unknown and refuses the pair instead of accepting a plausible
+/// constant. The declared treatment (the harness build and its source) is
+/// recorded outside `matched`.
 fn matched_fields(
     run: &Run,
     comparison: &ComparisonInputs,
-    attempt: &Attempt,
+    runtime: &ArmRuntime,
+    snapshot: &SnapshotFacts,
+    workspace_preparation: &str,
 ) -> io::Result<Value> {
-    let _ = attempt;
     let bindings =
         load_bindings(run)?.ok_or_else(|| invalid("the comparison bindings are missing"))?;
     let baseline = bindings
         .arm(Arm::Baseline)
         .map_err(|error| invalid(error.to_string()))?;
-    let frozen = digest16_of(&json!({
-        "task_revision": baseline.workload.source_revision,
-        "tree": baseline.workload.tree_sha256,
-        "acceptance": comparison.acceptance.request_sha256,
-        "client": serde_json::to_value(&comparison.runtimes.client).unwrap_or(Value::Null),
-    }));
-    let upstream = build_identity::hash_file(&comparison.runtimes.upstream)
-        .map(|digest| sha16(&digest))
-        .unwrap_or_else(|_| "unavailable".to_owned());
     let policy = comparison.declared_policy().map_err(|error| {
         invalid(format!(
             "the declared comparison policy is unusable: {error}"
         ))
     })?;
+    let planning: PlanningReceipt =
+        read_json(&run.store.comparison_planning_path(), MAX_RUN_SPEC_BYTES)?;
+    let request = read_acceptance_request(&comparison.acceptance).map_err(invalid)?;
+    let program_sha = request["oracle"]["program_sha256"]
+        .as_str()
+        .unwrap_or_default();
+    let scope_digest = sha16(&build_identity::hash_bytes(
+        comparison.task.writable_scope.join(",").as_bytes(),
+    ));
+    let frozen_task = sha16(&build_identity::hash_bytes(
+        format!(
+            "{}:{}",
+            baseline.workload.revision, baseline.workload.tree_sha256
+        )
+        .as_bytes(),
+    ));
+    let client = runtime
+        .configuration
+        .as_ref()
+        .and_then(|configuration| configuration.client.as_ref());
     let mut matched = serde_json::Map::new();
     for key in MATCH_FIELDS {
-        let value = match *key {
-            "case_revision" => baseline.workload.revision.clone(),
-            "source_state" => baseline.workload.tree_sha256.clone(),
-            "input_identity" => format!("task:{frozen}"),
-            "runtime" => format!("client:{upstream}+local-responses"),
-            "model" => comparison.runtimes.client.runner.model.clone(),
-            "effort" => comparison
-                .runtimes
-                .client
-                .reasoning_effort
-                .clone()
-                .unwrap_or_else(|| "default".to_owned()),
-            "provider" => "local".to_owned(),
-            "config_identity" => format!("client:{frozen}"),
-            "tool_identity" => format!("frozen-task:{}", sha16(&baseline.workload.tree_sha256)),
-            "hook_revision" => "none".to_owned(),
-            "allowed_effects" => "task-write".to_owned(),
-            "cache_policy" => "fresh-workspace".to_owned(),
-            "preparation_policy" => "fresh-home-install".to_owned(),
-            "budget" => format!("attempts:{}", policy.policy.stopping.max_attempts_per_arm),
-            "oracle_identity" => format!("sha256:{}", sha16(&comparison.acceptance.request_sha256)),
-            "instructions_identity" => format!("contract:{frozen}"),
-            "other_skills" => format!("declared-kit:{frozen}"),
-            "stop_conditions" => "single-attempt-per-arm".to_owned(),
-            "criterion" => sha16(&run.spec.experiment.independent_acceptance),
-            other => format!("{other}:{frozen}"),
+        let value: Option<String> = match *key {
+            "case_revision" => Some(baseline.workload.revision.clone()),
+            "source_state" => Some(baseline.workload.tree_sha256.clone()),
+            "input_identity" => Some(format!("task:{frozen_task}")),
+            "runtime" => client.map(|client| {
+                format!(
+                    "client:{}:{}",
+                    sha16(&runtime.upstream_sha256),
+                    client.runner.wire_api
+                )
+            }),
+            "model" => client.map(|client| client.runner.model.clone()),
+            "effort" => client.map(|client| {
+                client
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned())
+            }),
+            "provider" => client.map(|client| client.runner.kind.clone()),
+            "config_identity" => runtime
+                .configuration
+                .as_ref()
+                .map(|configuration| format!("sha256:{}", sha16(&configuration.sha256))),
+            "tool_identity" => Some(format!(
+                "accept:{program_sha}:frozen:{}",
+                sha16(&baseline.workload.tree_sha256)
+            )),
+            "hook_revision" => Some(snapshot.hooks.clone()),
+            "allowed_effects" => Some(format!("scope:{scope_digest}")),
+            "cache_policy" => Some(workspace_preparation.to_owned()),
+            "preparation_policy" => Some(format!("install:{}", runtime.installation.status)),
+            "budget" => Some(format!(
+                "attempts:{}",
+                policy.policy.stopping.max_attempts_per_arm
+            )),
+            "oracle_identity" => Some(format!("sha256:{}", comparison.acceptance.request_sha256)),
+            "instructions_identity" => Some(snapshot.instructions.clone()),
+            "other_skills" => Some(snapshot.skills.clone()),
+            "stop_conditions" => Some(policy.policy.stopping_text()),
+            "criterion" => Some(format!("contract:{}", sha16(&planning.contract_digest))),
+            _ => None,
         };
-        matched.insert((*key).to_owned(), Value::String(value));
+        if let Some(value) = value {
+            matched.insert((*key).to_owned(), Value::String(value));
+        }
     }
     Ok(Value::Object(matched))
 }
@@ -2025,73 +2637,120 @@ fn publish_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
     write_json_atomic(&evaluation_path, &evaluation)?;
     let bindings =
         load_bindings(run)?.ok_or_else(|| invalid("the comparison bindings are missing"))?;
-    let baseline_revision = format!(
-        "harness:{}:{}",
-        comparison.runtimes.baseline_label,
-        sha16(
-            &bindings
-                .arm(Arm::Baseline)
-                .map_err(|error| invalid(error.to_string()))?
-                .runtime
-                .source_sha256
-        )
-    );
-    let candidate_revision = format!(
-        "harness:{}:{}",
-        comparison.runtimes.candidate_label,
-        sha16(
-            &bindings
-                .arm(Arm::Candidate)
-                .map_err(|error| invalid(error.to_string()))?
-                .runtime
-                .source_sha256
-        )
-    );
+    // One lineage identity everywhere: the exact raw Git revisions of the
+    // frozen experiment binding and its acceptance reference. The existing
+    // integration/activation owner re-derives the expected decision record
+    // from exactly these values, so a comparison-produced adoption is
+    // consumable without a translation step.
+    let baseline_revision = bindings.candidate.base.clone();
+    let candidate_revision = bindings.candidate.revision.clone();
+    let acceptance = bindings.acceptance.clone();
     let item = run
         .cursor
         .candidate
         .as_ref()
         .map(|candidate| candidate.hypothesis.clone())
         .unwrap_or_else(|| run.spec.hypothesis_item.clone());
-    let draft = match evaluation.decision_draft(
+    let experiment = run.cursor.experiment.clone();
+    let publication = match evaluation.decision_draft(
         &item,
-        &run.cursor.experiment,
+        &experiment,
         &baseline_revision,
         &candidate_revision,
-        &run.spec.oracle,
+        &acceptance,
     ) {
-        Ok(draft) => draft,
-        Err(error) => {
+        Ok(draft) => {
+            benefit_gate::publish_decision(&run.spec.board.bd, &run.spec.board.project, &draft)
+                .map_err(|error| {
+                    invalid(format!("the decision publication was refused: {error}"))
+                })?
+        }
+        Err(_)
+            if evaluation.decision != harness_core::improvement_policy::PolicyDecision::Adopt =>
+        {
             // A comparison whose arms did not both produce a comparable,
-            // independently accepted result has no matched arm seconds. The
-            // frozen policy still records its operational verdict, but the
-            // decision owner's record requires measured matched evidence, so
-            // no board decision is fabricated and the failure stays retained.
-            let reason = format!(
-                "the recorded comparison cannot support a board decision record ({error}); the verdict {} and its retained accounting stay local",
-                evaluation.decision.as_str()
+            // independently accepted result has no matched arm seconds and no
+            // defined per-success cost. The frozen policy's reject or
+            // inconclusive verdict is published as a supported non-adoption
+            // that binds the same experiment, revisions and acceptance; no
+            // matched count, arm seconds or zero cost is fabricated, and the
+            // newest non-adoption authorizes no integration or activation.
+            let draft = benefit_gate::NonAdoptionDraft {
+                item: item.clone(),
+                experiment: experiment.clone(),
+                outcome: match evaluation.decision {
+                    harness_core::improvement_policy::PolicyDecision::Reject => {
+                        benefit_gate::DecisionOutcome::Reject
+                    }
+                    _ => benefit_gate::DecisionOutcome::Inconclusive,
+                },
+                quality: match evaluation.quality {
+                    harness_core::improvement_policy::Quality::Unchanged => {
+                        benefit_gate::QualityOutcome::Unchanged
+                    }
+                    harness_core::improvement_policy::Quality::Improved => {
+                        benefit_gate::QualityOutcome::Improved
+                    }
+                    harness_core::improvement_policy::Quality::Regressed => {
+                        benefit_gate::QualityOutcome::Regressed
+                    }
+                    harness_core::improvement_policy::Quality::Unmeasurable => {
+                        benefit_gate::QualityOutcome::Unmeasurable
+                    }
+                },
+                accounting: harness_core::improvement_policy::board_token(
+                    &format!(
+                        "attempts:{} tasks:{} accepted:{} per_success:{}",
+                        evaluation.attempts,
+                        evaluation.tasks,
+                        evaluation.accepted_tasks,
+                        match evaluation.per_success.status {
+                            harness_core::improvement_policy::PerSuccessStatus::Complete =>
+                                "complete",
+                            harness_core::improvement_policy::PerSuccessStatus::Incomplete =>
+                                "incomplete",
+                            harness_core::improvement_policy::PerSuccessStatus::Undefined =>
+                                "undefined",
+                        }
+                    ),
+                    160,
+                ),
+                baseline_revision: baseline_revision.clone(),
+                candidate_revision: candidate_revision.clone(),
+                acceptance: acceptance.clone(),
+                coverage: harness_core::improvement_policy::board_token(
+                    if evaluation.coverage.is_empty() {
+                        "none"
+                    } else {
+                        &evaluation.coverage
+                    },
+                    160,
+                ),
+                scope: harness_core::improvement_policy::board_token(&evaluation.scope, 160),
+                reason: harness_core::improvement_policy::board_token(
+                    &evaluation.reasons.join(";"),
+                    160,
+                ),
+                detail: (!evaluation.reasons.is_empty()
+                    && evaluation.reasons.join("; ").len() <= 512
+                    && !evaluation.reasons.join("; ").contains(['\n', '\r']))
+                .then(|| evaluation.reasons.join("; ")),
+            };
+            benefit_gate::publish_non_adoption(&run.spec.board.bd, &run.spec.board.project, &draft)
+                .map_err(|error| {
+                    invalid(format!("the non-adoption publication was refused: {error}"))
+                })?
+        }
+        Err(error) => {
+            return block(
+                run,
+                notes,
+                format!(
+                    "the adopted comparison cannot produce a decision record ({error}); nothing was published"
+                ),
             );
-            let mut state = run.cursor.comparison.clone().unwrap_or(state);
-            state.report = Some(report_path.clone());
-            state.evaluation = Some(evaluation_path.clone());
-            state.decision = Some(format!(
-                "unrecorded:{}: {}",
-                evaluation.decision.as_str(),
-                sha16(&build_identity::hash_bytes(reason.as_bytes()))
-            ));
-            run.cursor.comparison = Some(state);
-            run.cursor.effect(
-                EffectKind::ComparisonArmRefused,
-                format!("comparison verdict retained without a board decision: {reason}"),
-            );
-            run.store.save_cursor(&run.cursor)?;
-            notes.push(format!("comparison: {reason}"));
-            return Ok(());
         }
     };
-    let publication =
-        benefit_gate::publish_decision(&run.spec.board.bd, &run.spec.board.project, &draft)
-            .map_err(|error| invalid(format!("the decision publication was refused: {error}")))?;
     let (status, text) = match publication {
         benefit_gate::Publication::Recorded { text } => ("recorded", text),
         benefit_gate::Publication::Confirmed { text } => ("already-recorded", text),
@@ -2107,16 +2766,18 @@ fn publish_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
             "head": head,
             "sha256": build_identity::hash_bytes(text.as_bytes()),
             "decision": evaluation.decision.as_str(),
+            "experiment": experiment,
+            "baseline_revision": baseline_revision,
+            "candidate_revision": candidate_revision,
+            "acceptance": acceptance,
         }),
     )?;
     let mut state = run.cursor.comparison.clone().unwrap_or(state);
     state.report = Some(report_path);
     state.evaluation = Some(evaluation_path);
     state.decision = Some(format!(
-        "benefit-gate v2 item={} experiment={} outcome={} status={status}",
-        draft.item,
-        draft.experiment,
-        draft.outcome.as_str()
+        "benefit-gate v2 item={item} experiment={experiment} revisions={baseline_revision}..{candidate_revision} outcome={} status={status}",
+        evaluation.decision.as_str()
     ));
     run.cursor.comparison = Some(state);
     run.cursor.effect(

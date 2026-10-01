@@ -1249,8 +1249,10 @@ impl PolicyEvaluation {
 }
 
 /// Reduce free prose to the token form the board record accepts, keeping the
-/// stable field boundary: unsupported characters become `_`.
-fn token_text(value: &str, limit: usize) -> String {
+/// stable field boundary: unsupported characters become `_`. Shared with the
+/// comparison controller so a published decision and the record the
+/// activation owner re-derives from the retained evaluation render identically.
+pub fn board_token(value: &str, limit: usize) -> String {
     value
         .chars()
         .map(|character| {
@@ -1262,6 +1264,10 @@ fn token_text(value: &str, limit: usize) -> String {
         })
         .take(limit)
         .collect()
+}
+
+fn token_text(value: &str, limit: usize) -> String {
+    board_token(value, limit)
 }
 
 /// Refuse a speed-trend claim built from absolute durations of different

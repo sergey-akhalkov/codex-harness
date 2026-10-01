@@ -308,55 +308,6 @@ fn compile_fixture(root: &Path, name: &str, source: &str) -> PathBuf {
     executable
 }
 
-/// Synthetic kit source: the layout the installation owner reads, plus the
-/// minimal compiled-input tree the build identity records.
-fn kit_source(root: &Path, name: &str, marker: &str) -> PathBuf {
-    let source = root.join(name);
-    for directory in [
-        "crates/one/src",
-        "global/agents",
-        ".agents/skills/arm-skill",
-    ] {
-        fs::create_dir_all(source.join(directory)).unwrap();
-    }
-    fs::write(source.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
-    fs::write(source.join("Cargo.lock"), "").unwrap();
-    fs::write(source.join("crates/one/src/lib.rs"), "pub fn one() {}\n").unwrap();
-    fs::write(
-        source.join("global/kit.json"),
-        serde_json::to_vec(&json!({
-            "schema": 1,
-            "profile_name": "harness",
-            "profile": "global/harness.config.toml",
-            "instructions": "global/principles-of-work.md",
-            "skills": ".agents/skills",
-            "agents": "global/agents",
-            "hooks": "global/hooks.json",
-            "token_hooks": "global/rtk-hooks.json",
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        source.join("global/harness.config.toml"),
-        "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[features]\ncode_mode = true\napps = false\n",
-    )
-    .unwrap();
-    fs::write(
-        source.join("global/principles-of-work.md"),
-        format!("# Principles\n{marker} arm instructions\n"),
-    )
-    .unwrap();
-    fs::write(source.join("global/hooks.json"), "{}\n").unwrap();
-    fs::write(source.join("global/rtk-hooks.json"), "{}\n").unwrap();
-    fs::write(
-        source.join(".agents/skills/arm-skill/SKILL.md"),
-        format!("---\nname: arm-skill\ndescription: Fixture skill.\n---\n\n{marker} skill body\n"),
-    )
-    .unwrap();
-    source
-}
-
 /// One published immutable build inside the owned state.
 fn fixture_build(
     state: &Path,
@@ -409,9 +360,9 @@ struct Fixture {
     spec: PathBuf,
     bd: PathBuf,
     card: String,
+    /// Workload B's own durable hypothesis card.
+    workload_card: String,
     state: PathBuf,
-    baseline_build: PathBuf,
-    candidate_build: PathBuf,
     upstream: PathBuf,
     launcher: PathBuf,
     request: PathBuf,
@@ -452,6 +403,10 @@ impl Fixture {
         );
         git(&proj, &["config", "user.email", "fixture@example.test"]);
         git(&proj, &["config", "user.name", "Fixture"]);
+        // Ownership-neutral line endings: a worktree of the same commit must
+        // record the same source identity as the working tree it was built
+        // from, whatever the ambient Git configuration does.
+        git(&proj, &["config", "core.autocrlf", "false"]);
         fs::create_dir_all(proj.join("crates/one/src")).unwrap();
         fs::write(proj.join("crates/one/src/lib.rs"), "// synthetic\n").unwrap();
         fs::create_dir_all(proj.join("global")).unwrap();
@@ -461,6 +416,53 @@ impl Fixture {
         )
         .unwrap();
         fs::write(proj.join("README.md"), "synthetic\n").unwrap();
+        // The candidate project is also the harness kit source: the prepared
+        // builds record its compiled inputs, and the arm installation reads
+        // its manifest, profile, instructions, hooks and skills.
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("Cargo.lock"), "# fixture lock\n").unwrap();
+        for directory in ["global/agents", ".agents/skills/arm-skill"] {
+            fs::create_dir_all(proj.join(directory)).unwrap();
+        }
+        // Git does not track empty directories: keep the agents directory
+        // present in every worktree of this commit.
+        fs::write(proj.join("global/agents/.gitkeep"), "\n").unwrap();
+        fs::write(
+            proj.join("global/kit.json"),
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "profile_name": "harness",
+                "profile": "global/harness.config.toml",
+                "instructions": "global/principles-of-work.md",
+                "skills": ".agents/skills",
+                "agents": "global/agents",
+                "hooks": "global/hooks.json",
+                "token_hooks": "global/rtk-hooks.json",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/harness.config.toml"),
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\nweb_search = \"disabled\"\n\n[features]\ncode_mode = true\napps = false\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/principles-of-work.md"),
+            "# Principles\nfixture arm instructions\n",
+        )
+        .unwrap();
+        fs::write(proj.join("global/hooks.json"), "{}\n").unwrap();
+        fs::write(proj.join("global/rtk-hooks.json"), "{}\n").unwrap();
+        fs::write(
+            proj.join(".agents/skills/arm-skill/SKILL.md"),
+            "---\nname: arm-skill\ndescription: Fixture skill.\n---\n\nfixture skill body\n",
+        )
+        .unwrap();
         let init = openspec(
             &proj,
             &["init", "--tools", "none", "--no-animation", "--force"],
@@ -502,7 +504,7 @@ impl Fixture {
         );
         fs::write(
             home.join("config.toml"),
-            "[profiles.ds]\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\nmodel_reasoning_effort = 'max'\n",
+            "[profiles.ds]\nmodel = 'fixture-glyph-1'\nmodel_provider = 'local'\nmodel_reasoning_effort = 'low'\n",
         )
         .unwrap();
 
@@ -514,6 +516,7 @@ impl Fixture {
         );
         git(&wl, &["config", "user.email", "fixture@example.test"]);
         git(&wl, &["config", "user.name", "Fixture"]);
+        git(&wl, &["config", "core.autocrlf", "false"]);
         let init = openspec(
             &wl,
             &["init", "--tools", "none", "--no-animation", "--force"],
@@ -545,27 +548,13 @@ impl Fixture {
         git(&wl, &["add", "."]);
         git(&wl, &["commit", "-qm", "frozen workload snapshot"]);
 
-        // The two prepared builds over two distinct kit sources.
+        // The owned native state the two prepared builds are published into;
+        // the builds themselves are created from the frozen baseline source
+        // and the ready candidate checkout by `prepare_builds`.
         let state = root.join("state");
         fs::create_dir_all(state.join("builds")).unwrap();
         fs::write(state.join("owner"), "codex-harness-native-state-v1\n").unwrap();
         let programs = programs();
-        let baseline_source = kit_source(&root, "kit-h", "baseline");
-        let candidate_source = kit_source(&root, "kit-ha", "candidate");
-        let baseline_build = fixture_build(
-            &state,
-            "h-build",
-            &baseline_source,
-            &programs.launcher,
-            "baseline",
-        );
-        let candidate_build = fixture_build(
-            &state,
-            "ha-build",
-            &candidate_source,
-            &programs.launcher,
-            "candidate",
-        );
 
         // The frozen acceptance request: one host-owned checker program, one
         // frozen contract input and the workspace the controller materializes
@@ -653,9 +642,8 @@ impl Fixture {
             spec: PathBuf::new(),
             bd,
             card: String::new(),
+            workload_card: String::new(),
             state,
-            baseline_build,
-            candidate_build,
             upstream: programs.upstream.clone(),
             launcher: programs.launcher.clone(),
             request,
@@ -665,9 +653,43 @@ impl Fixture {
             workload_revision,
         };
         fixture.card = fixture.admit();
+        fixture.workload_card = fixture.admit_workload();
         fixture.spec = fixture.root.join(format!("run-spec-{name}.json"));
         fixture.write_spec(&[], None);
         fixture
+    }
+
+    /// Workload B's own admitted card on the same board, referencing B's own
+    /// OpenSpec change in the frozen workload project.
+    fn admit_workload(&self) -> String {
+        let out = self.feedback(&[
+            "hypothesis-admit",
+            "--mechanism",
+            "frozen-workload",
+            "--conditions",
+            "frozen-task-snapshot",
+            "--observation",
+            "workload:fixture",
+            "--predicted",
+            "the workload is solved within the declared conditions",
+            "--counterexample",
+            "the task snapshot changed between arms",
+            "--acceptance",
+            "the frozen checker program passes",
+            "--spec",
+            "openspec/changes/add-workload",
+            "--basis",
+            "workload-basis-1",
+        ]);
+        assert!(out.status.success(), "workload admit: {}", text(&out));
+        let text = text(&out);
+        let id = text
+            .strip_prefix("hypothesis ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!id.is_empty(), "workload admission named no card: {text}");
+        id
     }
 
     fn admit(&self) -> String {
@@ -833,7 +855,7 @@ impl Fixture {
             "local_runner": client_runner.clone(),
             "qualification": self.qualification,
             "evidence_root": Value::Null,
-            "publication_scope": ["experiment"],
+            "publication_scope": ["experiment", "integration"],
             "oracle": "outcome-oracle:fixture-request",
             "removal": Value::Null,
             "comparison": {
@@ -856,6 +878,7 @@ impl Fixture {
                     "comparison_policy": "matched pairs",
                     "stopping_rule": "one predeclared pair",
                 },
+                "workload_card": self.workload_card,
                 "task": {
                     "source": self.wl,
                     "revision": self.workload_revision,
@@ -864,8 +887,8 @@ impl Fixture {
                 },
                 "runtimes": {
                     "state": self.state,
-                    "baseline_build": self.baseline_build,
-                    "candidate_build": self.candidate_build,
+                    "baseline_build": self.state.join("builds").join("h-build"),
+                    "candidate_build": self.state.join("builds").join("ha-build"),
                     "baseline_label": "H",
                     "candidate_label": "H+A",
                     "upstream": self.upstream,
@@ -894,17 +917,65 @@ impl Fixture {
         fs::write(&self.spec, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 
-    /// Start the run and replace the resulting idle cursor with the retained
-    /// ready candidate the planning/implementation workflow reaches.
-    fn start_with_ready_candidate(&self, removal_required: bool) -> PathBuf {
-        let start = self.start();
-        assert!(start.status.success(), "{}", text(&start));
+    /// Allocate the ready candidate's owned worktree before the run starts and
+    /// optionally commit the candidate treatment on its branch, so the
+    /// prepared builds can be created from an exact source identity.
+    fn prepare_candidate(&self, change: Option<&str>) -> task_worktree::CandidateCheckout {
         let base = git_output(&self.proj, &["rev-parse", "HEAD"]);
         let worktree = self.root.join("candidate-worktree");
         let branch = format!("improve/comparison-fixture/{}", self.card);
-        let checkout =
+        let mut checkout =
             task_worktree::allocate_candidate_checkout(&self.proj, &worktree, &branch, &base)
                 .expect("the candidate allocation is created");
+        if let Some(change) = change {
+            fs::write(checkout.path.join("crates/one/src/lib.rs"), change).unwrap();
+            // A combined-tree artifact the integration owner's declared check
+            // reads, so a real fast-forward can be verified on the fixture.
+            fs::write(checkout.path.join("answer.txt"), "integrated\n").unwrap();
+            git(&checkout.path, &["add", "."]);
+            git(
+                &checkout.path,
+                &[
+                    "-c",
+                    "user.email=fixture@example.test",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "candidate implementation",
+                ],
+            );
+            checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
+        }
+        checkout
+    }
+
+    /// Publish the two explicit builds: the baseline runtime from the frozen
+    /// baseline source (the project at its declared base) and the candidate
+    /// runtime from the ready candidate checkout.
+    fn prepare_builds(&self, checkout: &task_worktree::CandidateCheckout) {
+        let launcher = &programs().launcher;
+        fixture_build(&self.state, "h-build", &self.proj, launcher, "baseline");
+        fixture_build(
+            &self.state,
+            "ha-build",
+            &checkout.path,
+            launcher,
+            "candidate",
+        );
+    }
+
+    /// Start the run and replace the resulting idle cursor with the retained
+    /// ready candidate the planning/implementation workflow reaches.
+    fn start_with_ready_candidate(
+        &self,
+        checkout: &task_worktree::CandidateCheckout,
+        removal_required: bool,
+    ) {
+        let start = self.start();
+        assert!(start.status.success(), "{}", text(&start));
         let mut cursor = self.cursor();
         cursor["phase"] = json!("candidate-ready");
         cursor["condition"] = Value::Null;
@@ -913,15 +984,14 @@ impl Fixture {
             "change": "add-synthetic",
             "removal_required": removal_required,
             "removal_frozen": Value::Null,
-            "worktree": serde_json::to_value(&checkout).unwrap(),
+            "worktree": serde_json::to_value(checkout).unwrap(),
             "planning_receipt": self.run.join("planning.json").display().to_string(),
             "planner_attempt": Value::Null,
             "implementer_attempt": Value::Null,
-            "revision": base,
+            "revision": checkout.revision,
             "result": Value::Null,
         });
         self.write_cursor(&cursor);
-        checkout.path
     }
 
     fn arm_dir(&self, arm: &str) -> PathBuf {
@@ -1193,7 +1263,9 @@ fn comparison_preparation_requires_policy_qualification_and_workload_planning() 
         )],
         None,
     );
-    fixture.start_with_ready_candidate(false);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let resume = fixture.resume();
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
@@ -1208,7 +1280,9 @@ fn comparison_preparation_requires_policy_qualification_and_workload_planning() 
     // An unreadable declaration is refused instead of being reinterpreted.
     let fixture = Fixture::new("bad-policy");
     fs::write(&fixture.policy, "{\"schema\": 9}\n").unwrap();
-    fixture.start_with_ready_candidate(false);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let resume = fixture.resume();
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
@@ -1221,7 +1295,9 @@ fn comparison_preparation_requires_policy_qualification_and_workload_planning() 
     // even when the run inputs are otherwise complete.
     let fixture = Fixture::new("unplanned-workload");
     fs::remove_dir_all(fixture.wl.join("openspec/changes/add-workload")).unwrap();
-    fixture.start_with_ready_candidate(false);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let resume = fixture.resume();
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
@@ -1232,7 +1308,9 @@ fn comparison_preparation_requires_policy_qualification_and_workload_planning() 
 
     // Changed frozen acceptance bytes are refused instead of being re-frozen.
     let fixture = Fixture::new("changed-request");
-    fixture.start_with_ready_candidate(false);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let mut request: Value = serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
     request["timeout_seconds"] = json!(30);
     fs::write(
@@ -1259,7 +1337,9 @@ fn a_forged_candidate_result_is_rejected_and_never_integrated() {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("forged");
     let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
-    fixture.start_with_ready_candidate(false);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let resume = fixture.resume();
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
@@ -1361,9 +1441,10 @@ fn a_forged_candidate_result_is_rejected_and_never_integrated() {
         status["comparison"]["decision"]
             .as_str()
             .unwrap()
-            .contains("unrecorded:reject"),
+            .contains("outcome=reject"),
         "{status}"
     );
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
     let evaluation: Value =
         serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
             .unwrap();
@@ -1379,11 +1460,75 @@ fn a_forged_candidate_result_is_rejected_and_never_integrated() {
                 .contains("independent acceptance failed")),
         "{evaluation}"
     );
+    // The supported non-adoption is published on the real board, parses as a
+    // complete non-adoption, and carries the same exact lineage the
+    // integration owner re-derives: raw base and candidate revisions plus the
+    // declared acceptance reference.
+    let comments =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &fixture.card)
+            .unwrap();
+    let records = harness_core::benefit_gate::parse_gate_comments(&comments);
+    let joined = comments.join("\n");
+    assert!(joined.contains("benefit-gate v2"), "{joined}");
+    assert!(joined.contains("outcome=reject"), "{joined}");
+    let assessment =
+        harness_core::benefit_gate::assess(&records, &fixture.card).expect("attributable");
+    assert_eq!(
+        assessment.verdict,
+        harness_core::benefit_gate::Verdict::NonAdoption
+    );
+    assert!(!harness_core::benefit_gate::default_allowed(
+        &records,
+        &fixture.card
+    ));
+    let expected_revisions = format!("{}..{}", checkout.base, checkout.revision);
     assert!(
-        !fixture
-            .bd_comments(&fixture.card)
-            .contains("benefit-gate v2"),
-        "a forged result never produces an adoptable board decision"
+        assessment
+            .latest
+            .revisions
+            .as_deref()
+            .is_some_and(|revisions| revisions == expected_revisions),
+        "{joined}"
+    );
+    assert!(
+        !joined.contains("matched="),
+        "the non-adoption never fabricates a matched count: {joined}"
+    );
+    // The newest non-adoption authorizes no integration.
+    let bindings: harness_core::improvement_experiment::ExperimentBindings =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/bindings.json")).unwrap())
+            .unwrap();
+    let reject_evaluation: harness_core::improvement_policy::PolicyEvaluation =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    let spec: harness_core::improvement_loop::RunSpec =
+        serde_json::from_slice(&fs::read(fixture.run.join("spec.json")).unwrap()).unwrap();
+    let experiment = fixture.cursor()["experiment"].as_str().unwrap().to_owned();
+    fs::create_dir_all(fixture.root.join("integration-evidence")).unwrap();
+    let outcome = harness_core::improvement_activation::integrate(
+        &harness_core::improvement_activation::IntegrationRequest {
+            spec: &spec,
+            bindings: &bindings,
+            evaluation: &reject_evaluation,
+            experiment,
+            frozen_removal: None,
+            mainline: fixture.proj.clone(),
+            check: harness_core::improvement_activation::CheckSpec {
+                program: fixture.proj.join("Cargo.toml"),
+                args: Vec::new(),
+                timeout: std::time::Duration::from_secs(30),
+            },
+            evidence: fixture.root.join("integration-evidence"),
+            prior: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            harness_core::improvement_activation::IntegrationOutcome::Blocked(_)
+        ),
+        "a reject decision must not authorize integration"
     );
     assert_eq!(
         git_output(&fixture.proj, &["rev-parse", "HEAD"]),
@@ -1420,7 +1565,9 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         None,
     );
     let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
-    fixture.start_with_ready_candidate(true);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, true);
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
     let session = session_id("adopt-baseline");
@@ -1554,6 +1701,89 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     // The verdict is not an integration or an activation.
     assert_eq!(git_output(&fixture.proj, &["rev-parse", "HEAD"]), base);
     assert_eq!(status["selected_variant"], Value::Null, "{status}");
+
+    // The published adoption is consumable by the existing integration owner:
+    // it re-derives the expected record from the exact raw revisions and the
+    // binding acceptance, so the comparison-produced decision must match it
+    // byte-for-field, and the declared combined-tree check then fast-forwards
+    // the exact evaluated revision into the accepted mainline.
+    let integration_approval = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "proposal-alpha",
+        "--target",
+        "target-beta",
+        "--actions",
+        "experiment,integration",
+        "--loss",
+        "synthetic-loss",
+    ]);
+    assert!(
+        integration_approval.status.success(),
+        "{}",
+        text(&integration_approval)
+    );
+    let expected_answer = fixture.root.join("answer-expected.txt");
+    fs::write(&expected_answer, "integrated\n").unwrap();
+    fs::create_dir_all(fixture.root.join("integration-evidence")).unwrap();
+    let bindings: harness_core::improvement_experiment::ExperimentBindings =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/bindings.json")).unwrap())
+            .unwrap();
+    let evaluation: harness_core::improvement_policy::PolicyEvaluation =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    let spec: harness_core::improvement_loop::RunSpec =
+        serde_json::from_slice(&fs::read(fixture.run.join("spec.json")).unwrap()).unwrap();
+    let experiment = fixture.cursor()["experiment"].as_str().unwrap().to_owned();
+    let frozen_removal = fixture.cursor()["removal_frozen"]
+        .as_str()
+        .map(str::to_owned);
+    let outcome = harness_core::improvement_activation::integrate(
+        &harness_core::improvement_activation::IntegrationRequest {
+            spec: &spec,
+            bindings: &bindings,
+            evaluation: &evaluation,
+            experiment,
+            frozen_removal,
+            mainline: fixture.proj.clone(),
+            check: harness_core::improvement_activation::CheckSpec {
+                program: PathBuf::from(env!("CARGO_BIN_EXE_harness-improvement-fixture")),
+                args: vec![
+                    "check".into(),
+                    checkout.path.as_os_str().to_owned(),
+                    expected_answer.as_os_str().to_owned(),
+                ],
+                timeout: std::time::Duration::from_secs(120),
+            },
+            evidence: fixture.root.join("integration-evidence"),
+            prior: None,
+        },
+    )
+    .unwrap();
+    match &outcome {
+        harness_core::improvement_activation::IntegrationOutcome::Integrated(receipt) => {
+            assert_eq!(receipt.candidate_revision, checkout.revision);
+            assert_eq!(receipt.acceptance, bindings.acceptance);
+        }
+        harness_core::improvement_activation::IntegrationOutcome::Confirmed(receipt) => {
+            assert_eq!(receipt.candidate_revision, checkout.revision);
+        }
+        harness_core::improvement_activation::IntegrationOutcome::Blocked(blocked) => {
+            panic!(
+                "the comparison-produced adoption must be consumable by the integration owner: {blocked:?}"
+            );
+        }
+    }
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        checkout.revision,
+        "the declared check and fast-forward integrated the exact evaluated revision"
+    );
+
     let before = fixture.cursor();
     let comments_before = fixture.bd_comments(&fixture.card);
     let resume = fixture.resume();
@@ -1569,7 +1799,9 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
 fn missing_counter_evidence_stays_inconclusive() {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("missing-counters");
-    fixture.start_with_ready_candidate(false);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
     let session = session_id("counter-baseline");
@@ -1607,21 +1839,17 @@ fn missing_counter_evidence_stays_inconclusive() {
     assert!(comments.contains("outcome=inconclusive"), "{comments}");
 }
 
-/// The selected API-observed qualification is validated through its own owner
-/// and its declared facts are re-collected before the measured arm: an
-/// inconsistent record or an observed drift blocks the arm without a model
-/// call.
-#[test]
-fn api_observed_qualification_drift_blocks_the_measured_arm() {
-    let _serial = INSTALL.lock().unwrap();
+/// Write one API-observed qualification produced by the owner against the
+/// local observation fixture, and declare the same explicit client inputs in
+/// the run spec: the observed client file is the overlay the arms consume.
+fn install_api_observed_qualification(fixture: &Fixture, server: &ObservationServer) -> PathBuf {
     use harness_core::outcome_qualification::{
         ApiObservationPlan, ApiObservedPolicy, ClientInput, DeclaredObservation, LocalRunner,
         MaterialIdentity, ObservationBinding, ObservationRequest, QualificationAttempt,
         RepeatabilityPolicy, RunnerRecord, collect_observations, qualify_api_observed,
     };
-
-    let fixture = Fixture::new("api-observed");
-    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    let overlay = fixture.root.join("client-overlay.toml");
+    fs::write(&overlay, "model_context_window = 262144\n").unwrap();
     let runner = LocalRunner {
         endpoint: server.endpoint(),
         model: "fixture-glyph-1".to_owned(),
@@ -1646,12 +1874,12 @@ fn api_observed_qualification_drift_blocks_the_measured_arm() {
                     binding: ObservationBinding::Value,
                 }],
             }],
-            required_client_inputs: vec!["profile".to_owned()],
+            required_client_inputs: vec!["overlay".to_owned()],
         },
     };
     let inputs = vec![ClientInput {
-        name: "profile".to_owned(),
-        path: fixture.home.join("config.toml"),
+        name: "overlay".to_owned(),
+        path: overlay.clone(),
     }];
     let observations = collect_observations(&runner, &policy.plan, &inputs)
         .expect("the local observation fixture answers the declared facts");
@@ -1683,16 +1911,29 @@ fn api_observed_qualification_drift_blocks_the_measured_arm() {
         &[("local_runner", serde_json::to_value(&runner).unwrap())],
         None,
     );
-    // The dynamic endpoint and the explicit observation inputs are patched in
-    // after the shared fixture spec is written.
     let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
     spec["comparison"]["runtimes"]["client"]["runner"] = serde_json::to_value(&runner).unwrap();
+    spec["comparison"]["runtimes"]["client"]["overlay"] = json!(overlay);
     spec["comparison"]["observation_inputs"] = json!([
-        {"name": "profile", "path": fixture.home.join("config.toml")},
+        {"name": "overlay", "path": overlay},
     ]);
     fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    overlay
+}
 
-    fixture.start_with_ready_candidate(false);
+/// A qualified API-observed record and an unconsumed observation template are
+/// both handled through the real controller entry point: the record is
+/// accepted, and an observation input that is not a consumed client file is
+/// refused before any preparation.
+#[test]
+fn api_observed_qualification_drift_blocks_the_measured_arm() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("api-observed");
+    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    install_api_observed_qualification(&fixture, &server);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
     let resume = fixture.resume();
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
@@ -1748,4 +1989,367 @@ fn api_observed_qualification_drift_blocks_the_measured_arm() {
         fixture.cursor()["comparison"]["baseline"]["accepted"],
         Value::Null
     );
+
+    // An observation input that is not one of the consumed client files is
+    // refused before any preparation: an unused qualified template cannot
+    // stand in for the arm's actual configuration.
+    let unconsumed = Fixture::new("api-unconsumed-input");
+    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    install_api_observed_qualification(&unconsumed, &server);
+    let mut spec: Value = serde_json::from_slice(&fs::read(&unconsumed.spec).unwrap()).unwrap();
+    spec["comparison"]["observation_inputs"] = json!([
+        {"name": "profile", "path": unconsumed.home.join("config.toml")},
+    ]);
+    fs::write(&unconsumed.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let checkout = unconsumed.prepare_candidate(Some("// candidate implementation\n"));
+    unconsumed.prepare_builds(&checkout);
+    unconsumed.start_with_ready_candidate(&checkout, false);
+    let resume = unconsumed.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("not one of the client files"), "{output}");
+    assert_eq!(
+        unconsumed.cursor()["attempts"].as_array().unwrap().len(),
+        0,
+        "no measured attempt is even prepared from an unconsumed template"
+    );
+    assert!(!unconsumed.run.join("comparison").exists());
+}
+
+/// The selected API-observed policy reaches the planning/implementation
+/// dispatch through the real controller: a qualified API record lets the
+/// bounded investigator conversation start, while a blocked full-material
+/// record keeps its refusal and starts nothing.
+#[test]
+fn api_observed_qualification_reaches_planning_and_implementation() {
+    // Qualified API-observed identity: the investigator dispatch is attempted.
+    let fixture = Fixture::new("api-planning");
+    let server = ObservationServer::start("{\"build\":\"b-1\"}\n");
+    let overlay = install_api_observed_qualification(&fixture, &server);
+    let evidence = fixture.root.join("evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    fs::write(evidence.join("observation.txt"), "retained observation\n").unwrap();
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    spec["evidence_root"] = json!(evidence);
+    fs::write(&fixture.spec, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let launcher = fixture.home.join("harness/bin/codex.exe");
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::copy(programs().launcher.as_path(), &launcher).unwrap();
+    let start = fixture.start();
+    let output = text(&start);
+    assert!(start.status.success(), "{output}");
+    assert!(
+        !output.contains("qualification"),
+        "the qualified API record must not block planning work: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        1,
+        "the bounded investigator conversation is dispatched: {output}"
+    );
+    assert_eq!(fixture.cursor()["attempts"][0]["role"], "investigator");
+    assert!(
+        overlay.is_file(),
+        "the observed client overlay stays the explicit private input"
+    );
+
+    // A blocked full-material record keeps its refusal for the measured pair:
+    // no comparison preparation, no dispatch, the owner's reasons retained.
+    let fixture = Fixture::new("legacy-blocked");
+    fs::write(
+        &fixture.qualification,
+        serde_json::to_vec_pretty(&json!({
+            "status": "blocked",
+            "policy": {
+                "repeats": 2,
+                "required_outputs": ["solution.txt"],
+                "ignored_metadata": [],
+            },
+            "missing_identity": ["weights"],
+            "unfinished_attempts": [],
+            "unverified_attempts": [],
+            "tool_exchange_missing": [],
+            "runner_mismatch": [],
+            "missing_outputs": ["solution.txt"],
+            "divergent_outputs": [],
+            "observed_repeats": 1,
+            "required_repeats": 2,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("qualification") && output.contains("missing required outputs"),
+        "a blocked full-material record keeps its refusal: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        0,
+        "an unqualified record starts no model work: {output}"
+    );
+    assert!(!fixture.run.join("comparison").exists());
+}
+
+/// Unrelated or swapped runtime builds cannot authorize a measured arm: the
+/// explicit build inputs are refused before any installation or dispatch.
+#[test]
+fn unrelated_or_swapped_builds_cannot_authorize_a_measured_arm() {
+    // Swapped sources: the baseline build records the candidate checkout and
+    // the candidate build the project working tree.
+    let fixture = Fixture::new("swapped-builds");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture_build(
+        &fixture.state,
+        "h-build",
+        &checkout.path,
+        &programs().launcher,
+        "baseline",
+    );
+    fixture_build(
+        &fixture.state,
+        "ha-build",
+        &fixture.proj,
+        &programs().launcher,
+        "candidate",
+    );
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("does not match the frozen baseline source"),
+        "a swapped baseline build is refused before any dispatch: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        0,
+        "{output}"
+    );
+    assert!(
+        !fixture
+            .run
+            .join("comparison/baseline/runtime.json")
+            .exists(),
+        "the refused build is never installed"
+    );
+
+    // An unrelated source: the candidate build is a valid build of a
+    // different checkout and must not enter the comparison.
+    let fixture = Fixture::new("unrelated-build");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    let unrelated = fixture.root.join("unrelated-kit");
+    for directory in ["crates/one/src", "global/agents"] {
+        fs::create_dir_all(unrelated.join(directory)).unwrap();
+    }
+    fs::write(
+        unrelated.join("Cargo.toml"),
+        "[package]\nname = \"unrelated\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(unrelated.join("Cargo.lock"), "# unrelated lock\n").unwrap();
+    fs::write(unrelated.join("crates/one/src/lib.rs"), "// unrelated\n").unwrap();
+    fixture_build(
+        &fixture.state,
+        "h-build",
+        &fixture.proj,
+        &programs().launcher,
+        "baseline",
+    );
+    fixture_build(
+        &fixture.state,
+        "ha-build",
+        &unrelated,
+        &programs().launcher,
+        "candidate",
+    );
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("does not match the frozen candidate source"),
+        "an unrelated candidate build is refused before any dispatch: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        0,
+        "{output}"
+    );
+    assert!(
+        !fixture
+            .run
+            .join("comparison/candidate/runtime.json")
+            .exists(),
+        "the refused build is never installed"
+    );
+}
+
+/// Workload B has its own durable card and its own removal authority: a
+/// refusal blocks both measured arms before either dispatch, and the informed
+/// approval unblocks them.
+#[test]
+fn workload_removal_decision_gates_both_measured_arms() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("workload-removal");
+    let mut spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    spec["comparison"]["workload_removal"] =
+        json!({"proposal": "workload-alpha", "target": "workload-target"});
+    let comparison = spec["comparison"].take();
+    fixture.write_spec(&[("comparison", comparison)], None);
+    let proposed = fixture.feedback(&[
+        "removal-propose",
+        "--item",
+        &fixture.workload_card,
+        "--proposal",
+        "workload-alpha",
+        "--target",
+        "workload-target",
+        "--evidence",
+        "evidence-b",
+        "--loss",
+        "workload-loss",
+    ]);
+    assert!(proposed.status.success(), "{}", text(&proposed));
+    let refused = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.workload_card,
+        "--decision",
+        "refuse",
+        "--proposal",
+        "workload-alpha",
+        "--target",
+        "workload-target",
+        "--loss",
+        "workload-loss",
+    ]);
+    assert!(refused.status.success(), "{}", text(&refused));
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("workload")
+            && (output.contains("refused by the user") || output.contains("declined")),
+        "the workload removal refusal gates both arms: {output}"
+    );
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+    assert_eq!(attempts, 0, "neither measured arm starts: {output}");
+
+    // The informed approval unblocks the baseline arm first.
+    let approved = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.workload_card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "workload-alpha",
+        "--target",
+        "workload-target",
+        "--actions",
+        "experiment",
+        "--loss",
+        "workload-loss",
+    ]);
+    assert!(approved.status.success(), "{}", text(&approved));
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{output}");
+    assert_eq!(attempts[0]["role"], "baseline");
+}
+
+/// The observed conversation must carry the declared model and effort: a
+/// rollout that records a different model or effort refuses that arm instead
+/// of entering the comparison as unverified evidence.
+#[test]
+fn wrong_observed_model_or_effort_refuses_the_arm() {
+    let _serial = INSTALL.lock().unwrap();
+    // Wrong observed model.
+    let fixture = Fixture::new("wrong-model");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("wrong-model-session");
+    fixture.simulate_arm("baseline", "baseline", "solved", 50, 5.0, 2, 3, &session);
+    rewrite_rollout(&fixture, "baseline", &session, "another-model", "low");
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("recorded model another-model instead of the declared fixture-glyph-1"),
+        "a wrong observed model refuses the arm: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["comparison"]["baseline"]["accepted"],
+        Value::Null
+    );
+    assert!(
+        fixture.cursor()["comparison"]["baseline"]["condition"]
+            .as_str()
+            .is_some_and(|condition| condition.contains("another-model")),
+        "the refusal is retained on the arm"
+    );
+
+    // Wrong observed reasoning effort.
+    let fixture = Fixture::new("wrong-effort");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("wrong-effort-session");
+    fixture.simulate_arm("baseline", "baseline", "solved", 50, 5.0, 2, 3, &session);
+    rewrite_rollout(&fixture, "baseline", &session, "fixture-glyph-1", "xhigh");
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("recorded reasoning effort xhigh instead of the declared low"),
+        "a wrong observed effort refuses the arm: {output}"
+    );
+    assert_eq!(
+        fixture.cursor()["comparison"]["baseline"]["accepted"],
+        Value::Null
+    );
+}
+
+/// Rewrite the model and effort facts of one seeded arm rollout, exactly as a
+/// differently configured client would have recorded them.
+fn rewrite_rollout(fixture: &Fixture, arm: &str, session: &str, model: &str, effort: &str) {
+    let rollout = fixture
+        .arm_dir(arm)
+        .join("home/sessions/2026/10/01")
+        .join(format!("rollout-{session}.jsonl"));
+    let text = fs::read_to_string(&rollout).unwrap();
+    let mut lines: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for line in &mut lines {
+        if line["type"] == "turn_context" {
+            line["payload"]["model"] = json!(model);
+            line["payload"]["effort"] = json!(effort);
+        }
+    }
+    let rewritten = lines
+        .iter()
+        .map(|line| serde_json::to_string(line).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&rollout, format!("{rewritten}\n")).unwrap();
 }

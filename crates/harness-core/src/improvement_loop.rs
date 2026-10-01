@@ -377,6 +377,15 @@ pub struct ComparisonInputs {
     pub specification: Specification,
     /// B's own frozen experiment contract the planning receipt qualifies.
     pub contract: ExperimentContract,
+    /// B's own durable hypothesis card. It is a distinct owner from the
+    /// candidate card: its OpenSpec reference must resolve to the workload
+    /// change, and its recorded implementation references are retained there.
+    pub workload_card: String,
+    /// The workload's own removal treatment, when B retires a capability: the
+    /// same informed-decision gate applies to both measured arms before any
+    /// workload dispatch.
+    #[serde(default)]
+    pub workload_removal: Option<RemovalScope>,
     pub task: TaskInputs,
     pub runtimes: RuntimeInputs,
     /// The predeclared comparison policy file, fixed before any result.
@@ -406,6 +415,11 @@ impl ComparisonInputs {
             token("workload store", store, MAX_TOKEN)?;
         }
         self.contract.validate()?;
+        token("workload card", &self.workload_card, MAX_TOKEN)?;
+        if let Some(removal) = &self.workload_removal {
+            token("workload removal proposal", &removal.proposal, MAX_TOKEN)?;
+            token("workload removal target", &removal.target, MAX_TOKEN)?;
+        }
         self.task.validate()?;
         self.runtimes.validate()?;
         if !self.policy.is_absolute() {
@@ -562,6 +576,11 @@ impl RunSpec {
             if self.runner.is_none() {
                 return Err(invalid(
                     "a declared comparison requires the runner profile that opens its visible conversations",
+                ));
+            }
+            if comparison.workload_card == self.hypothesis_item {
+                return Err(invalid(
+                    "the workload's hypothesis card must be a distinct durable owner from the candidate card",
                 ));
             }
             if let Some(local) = &self.local_runner {
@@ -1403,6 +1422,13 @@ pub struct ComparisonState {
     /// The retained workload OpenSpec planning receipt.
     #[serde(default)]
     pub planning: Option<PathBuf>,
+    /// The workload's own durable hypothesis card.
+    #[serde(default)]
+    pub workload_card: Option<String>,
+    /// The reviewed workload removal proposal digest frozen when the
+    /// comparison was prepared; a changed proposal needs a fresh decision.
+    #[serde(default)]
+    pub workload_removal_frozen: Option<String>,
     /// The frozen acceptance workspace the oracle checks per arm.
     #[serde(default)]
     pub task_workspace: Option<PathBuf>,
@@ -1430,6 +1456,8 @@ impl ComparisonState {
             policy_digest,
             bindings: None,
             planning: None,
+            workload_card: None,
+            workload_removal_frozen: None,
             task_workspace: None,
             baseline: ArmComparisonState::default(),
             candidate: ArmComparisonState::default(),
