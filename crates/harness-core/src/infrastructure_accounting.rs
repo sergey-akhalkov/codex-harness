@@ -347,6 +347,7 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
     let mut external = Vec::new();
     let mut unresolved = Vec::new();
     let mut queue_exposure = Vec::new();
+    let mut bracket_possible = Vec::new();
     let mut failed = Vec::new();
     let mut saw_measured_zero = false;
     let mut saw_queue = false;
@@ -418,15 +419,31 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
         let mut usable = Vec::new();
         for interval in &recorded {
             let shrink = end_late.saturating_add(tick);
-            if interval.end.saturating_sub(interval.start) <= shrink.saturating_add(tick) {
+            let certain_start = interval.start.saturating_add(tick);
+            let certain_end = interval.end.saturating_sub(shrink);
+            if certain_end <= certain_start
+                || interval.end.saturating_sub(interval.start) <= shrink.saturating_add(tick)
+            {
                 unresolved.push(*interval);
                 gaps.push(format!("admission_{id}_bracket_consumes_interval"));
                 continue;
             }
             usable.push(Interval {
-                start: interval.start.saturating_add(tick),
-                end: interval.end.saturating_sub(shrink),
+                start: certain_start,
+                end: certain_end,
             });
+            if certain_start > interval.start {
+                bracket_possible.push(Interval {
+                    start: interval.start,
+                    end: certain_start,
+                });
+            }
+            if interval.end > certain_end {
+                bracket_possible.push(Interval {
+                    start: certain_end,
+                    end: interval.end,
+                });
+            }
         }
         external.extend(usable);
     }
@@ -436,6 +453,7 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
     let mut useful = Vec::new();
     let mut receipt_possible = Vec::new();
     let mut unplaced_useful = false;
+    let mut sourced_commands: Vec<(Option<String>, Option<String>)> = Vec::new();
     for item in &activity {
         let kind = text_field(item, "kind").unwrap_or("other");
         let tool = text_field(item, "tool_call_id");
@@ -493,6 +511,9 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
                 })
                 .and_then(|admission| u64_field(admission, "tick_ns"))
                 .unwrap_or(1);
+            if placement == "exact" || placement == "source" {
+                sourced_commands.push((tool.map(str::to_owned), command.map(str::to_owned)));
+            }
             for interval in placed {
                 if interval.end.saturating_sub(interval.start) <= tick.saturating_mul(2) {
                     continue;
@@ -519,8 +540,15 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
             continue;
         }
         if interval_of(request).is_none() {
-            unplaced_useful = true;
-            gaps.push("unplaced_model_request".to_owned());
+            // A structural single-tool launch has no request interval of its
+            // own. That does not make the named command interval model work,
+            // and it does not authorize excluding the request's tokens.
+            if names_sourced_command(request, &sourced_commands) {
+                gaps.push("request_interval_not_observed".to_owned());
+            } else {
+                unplaced_useful = true;
+                gaps.push("unplaced_model_request".to_owned());
+            }
         } else if let Some(interval) = interval_of(request) {
             useful.extend(clip(&[interval], window));
         }
@@ -548,6 +576,18 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
             unresolved.extend(hidden);
         }
         deductible_region = subtract(&deductible_region, &receipt_possible);
+    }
+    // A measured endpoint bracket is not a discarded point. The shrunk
+    // interval is the certain deduction; the bracket remains a possible
+    // deduction where the task was independently blocked, counted once.
+    let bracket_hold = subtract(
+        &subtract(&intersect(&normalize(bracket_possible), &blocked), &useful),
+        &receipt_possible,
+    );
+    let bracket_hold = subtract(&bracket_hold, &deductible_region);
+    if !bracket_hold.is_empty() {
+        unresolved.extend(bracket_hold);
+        gaps.push("endpoint_bracket_unresolved".to_owned());
     }
     let deductible = measure(&deductible_region);
     let unresolved_ns = measure(&normalize(unresolved));
@@ -706,9 +746,37 @@ fn correlated_admission<'a>(request: &Value, admissions: &'a [Value]) -> Option<
 }
 
 fn correlated_wait(request: &Value, admissions: &[Value]) -> bool {
-    let structural = bool_field(request, "wait_only") == Some(true)
-        || bool_field(request, "structural_single_tool") == Some(true);
-    structural && correlated_admission(request, admissions).is_some()
+    bool_field(request, "wait_only") == Some(true)
+        && correlated_admission(request, admissions).is_some()
+}
+
+/// A structural single-tool request that names one source or exact command is
+/// the launch of that command, not work inside it. Missing request bounds do
+/// not become the admission interval and do not exclude tokens.
+fn names_sourced_command(request: &Value, sourced: &[(Option<String>, Option<String>)]) -> bool {
+    if bool_field(request, "structural_single_tool") != Some(true)
+        || bool_field(request, "wait_only") == Some(true)
+    {
+        return false;
+    }
+    let tool = text_field(request, "tool_call_id");
+    let command = text_field(request, "command_id");
+    if tool.is_none() && command.is_none() {
+        return false;
+    }
+    let mut matched =
+        sourced
+            .iter()
+            .filter(|(stored_tool, stored_command)| match (tool, command) {
+                (Some(tool), Some(command)) => {
+                    stored_tool.as_deref() == Some(tool)
+                        && stored_command.as_deref() == Some(command)
+                }
+                (Some(tool), None) => stored_tool.as_deref() == Some(tool),
+                (None, Some(command)) => stored_command.as_deref() == Some(command),
+                (None, None) => false,
+            });
+    matched.next().is_some() && matched.next().is_none()
 }
 
 fn usage_adjustment(
@@ -809,14 +877,9 @@ fn usage_adjustment(
         let placed = interval_of(request);
         let contained_blocked = placed.is_some_and(|interval| contained(interval, blocked));
         let contained_deductible = placed.is_some_and(|interval| contained(interval, deductible));
-        // A correlated wait with no interval of its own is the admission interval.
-        // Exclude only when that whole request is inside the deductible region,
-        // or when its own interval is wholly inside it. Never split a request.
-        let admission_covers = placed.is_none()
-            && correlated_admission(request, admissions).is_some_and(|admission| {
-                interval_of(admission).is_some_and(|interval| contained(interval, deductible))
-            });
-        if contained_deductible || admission_covers {
+        // Exclude only a whole observed request whose own interval sits inside
+        // the deductible region. An admission interval is not a request interval.
+        if contained_deductible {
             add_option(&mut excluded.input, tokens.input);
             add_option(&mut excluded.cached, tokens.cached);
             add_option(&mut excluded.output, tokens.output);

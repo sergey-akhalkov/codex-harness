@@ -241,10 +241,19 @@ pub(crate) struct ActivityMark {
     pub span_ticks: Option<u64>,
     /// `receipt`: `qpc` is when the host received the notification, an upper
     /// bound on the phase, not the work instant. Native item events carry no
-    /// producer timestamp, so this is the supported bound. It is not a poll
-    /// interval and not a scheduling estimate.
+    /// producer timestamp in the exec JSONL shape. App-server notifications
+    /// carry `startedAtMs` / `completedAtMs` when the installed server emits
+    /// them; those are recorded and are not invented from receipt time. Absent
+    /// producer fields keep this receipt bound. It is not a poll interval and
+    /// not a scheduling estimate.
     #[serde(default = "receipt_bound")]
     pub bound: String,
+    /// Producer start from the notification, when that event carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    /// Producer completion from the notification, when that event carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
 }
 
 fn receipt_bound() -> String {
@@ -264,6 +273,12 @@ pub(crate) struct ObservationClock {
     pub started_span: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_span: Option<u64>,
+    /// Wall sample paired with `started_qpc`. Absent on older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_filetime: Option<u64>,
+    /// Wall sample paired with `ended_qpc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_filetime: Option<u64>,
 }
 
 impl RunObservation {
@@ -1534,6 +1549,8 @@ pub(crate) fn begin_clock(observation: &mut RunObservation) {
         ended_qpc: None,
         started_span: sample.sample_span_ticks,
         ended_span: None,
+        started_filetime: Some(sample.filetime),
+        ended_filetime: None,
     });
 }
 
@@ -1552,10 +1569,24 @@ pub(crate) fn end_clock(observation: &mut RunObservation) {
     }
     clock.ended_qpc = Some(sample.qpc);
     clock.ended_span = sample.sample_span_ticks;
+    clock.ended_filetime = Some(sample.filetime);
 }
 
 /// Retains one compact boundary. A full raw detail file does not stop this.
 pub(crate) fn note_activity(observation: &mut RunObservation, id: &str, kind: &str, phase: &str) {
+    note_sourced_activity(observation, id, kind, phase, None, None);
+}
+
+/// Records one activity boundary. Producer milliseconds are kept only when the
+/// notification carried them; receipt QPC is always the delivery sample.
+pub(crate) fn note_sourced_activity(
+    observation: &mut RunObservation,
+    id: &str,
+    kind: &str,
+    phase: &str,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+) {
     if observation.activity.len() >= MAX_ACTIVITY_MARKS {
         observation.activity_truncated = true;
         return;
@@ -1597,6 +1628,8 @@ pub(crate) fn note_activity(observation: &mut RunObservation, id: &str, kind: &s
         boot,
         span_ticks: sample.sample_span_ticks,
         bound: receipt_bound(),
+        started_at_ms,
+        completed_at_ms,
     });
     observation.updated_ms = now_ms();
 }

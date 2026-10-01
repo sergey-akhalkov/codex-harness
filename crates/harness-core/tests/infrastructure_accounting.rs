@@ -524,6 +524,115 @@ fn a_missing_admission_boundary_is_not_an_exact_point() {
 }
 
 #[test]
+fn an_endpoint_bracket_stays_a_range_and_a_task_call_keeps_its_tokens() {
+    let mut bracket = point_capture(10_000_000_000, 30_000_000_000);
+    bracket["admissions"][0]["endpoint_end_ns"] = json!(2_000_000_000_u64);
+    let adjusted = adjust(&bracket, Some(30_000_000_000));
+    assert_eq!(
+        adjusted["deductible_ns"],
+        json!(8_000_000_000_u64),
+        "{adjusted}"
+    );
+    assert_eq!(
+        adjusted["adjusted_high_ns"],
+        json!(22_000_000_000_u64),
+        "{adjusted}"
+    );
+    assert_eq!(
+        adjusted["adjusted_low_ns"],
+        json!(20_000_000_000_u64),
+        "{adjusted}"
+    );
+    assert_ne!(adjusted["coverage"], "measured", "{adjusted}");
+    assert!(
+        adjusted["gaps"]
+            .as_array()
+            .is_some_and(|gaps| gaps.iter().any(|gap| gap == "endpoint_bracket_unresolved")),
+        "{adjusted}"
+    );
+
+    let mut task = point_capture(10_000_000_000, 30_000_000_000);
+    task["requests"] = json!([{
+        "id": "response-build",
+        "wait_only": false,
+        "structural_single_tool": true,
+        "tool_call_id": "tool-1",
+        "command_id": "cmd-1",
+        "start_ns": Value::Null,
+        "end_ns": Value::Null,
+        "input_tokens": 100,
+        "cached_input_tokens": 20,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 120
+    }]);
+    let adjusted = adjust(&task, Some(30_000_000_000));
+    assert_eq!(adjusted["usage"]["raw"]["total_tokens"], 120, "{adjusted}");
+    assert_eq!(
+        adjusted["usage"]["excluded"]["total_tokens"], 0,
+        "{adjusted}"
+    );
+    assert_eq!(
+        adjusted["usage"]["adjusted"]["total_tokens"], 120,
+        "{adjusted}"
+    );
+    assert!(
+        adjusted["excluded_requests"]
+            .as_array()
+            .is_some_and(|ids| ids.is_empty()),
+        "{adjusted}"
+    );
+    assert!(
+        adjusted["deductible_ns"].as_u64().unwrap_or(0) > 0,
+        "the named command interval is still a blocked wait: {adjusted}"
+    );
+}
+
+#[test]
+fn a_bracket_that_crosses_the_threshold_is_inconclusive() {
+    let declared = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None))
+        .declare()
+        .unwrap();
+    let mut bracket = point_capture(10_000_000_000, 40_000_000_000);
+    bracket["admissions"][0]["endpoint_end_ns"] = json!(8_000_000_000_u64);
+    let report = summarize_attempts(&[
+        row("base", "baseline", 40.0, bracket),
+        row(
+            "cand",
+            "candidate",
+            30.0,
+            json!({
+                "window": {"start_ns": 0, "end_ns": 30_000_000_000_u64},
+                "admissions": [{"id": "now", "class": "measured_zero", "domain_match": true}],
+                "activity": [],
+                "requests": []
+            }),
+        ),
+    ])
+    .unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{evaluation:?}\n{report}"
+    );
+}
+
+#[test]
+fn a_receipt_after_the_wait_still_cannot_prove_the_wait_was_idle() {
+    let mut capture = wait_capture(0, 0);
+    capture["activity"][1] = json!({
+        "id": "message-1",
+        "kind": "message",
+        "placement": "receipt",
+        "start_ns": 12 * MINUTE,
+        "end_ns": 13 * MINUTE
+    });
+    let adjusted = adjust(&capture, Some(30 * MINUTE));
+    assert_eq!(adjusted["deductible_ns"], 0, "{adjusted}");
+}
+
+#[test]
 fn usage_matches_the_blocked_admission_once_and_reconciles() {
     let mut capture = wait_capture(11 * MINUTE, 12 * MINUTE);
     capture["requests"] = json!([

@@ -3704,16 +3704,27 @@ fn owned_heavy_contention_reaches_the_native_report() {
         activity.as_array().is_some_and(|items| {
             items
                 .iter()
-                .any(|item| item["id"] == "message-1" && item["placement"] == "receipt")
+                .any(|item| item["id"] == "heavy-cmd-1" && item["placement"] == "source")
         }),
-        "useful activity must keep the receipt bound, not an exact work instant: {activity}"
+        "the blocked command must use the producer timestamp, not a receipt: {activity}"
     );
     let infra = &summarized["attempts"][0]["infrastructure"];
     assert!(infra["observed_seconds"].as_f64().is_some(), "{infra}");
     assert_ne!(infra["proven_zero_queue"], true);
-    assert_eq!(
-        infra["deductible_ns"], 0,
-        "a receipt-bounded message after the wait is not proof the wait was idle: {infra}"
+    assert!(
+        infra["deductible_ns"].as_u64().unwrap_or(0) > 0,
+        "a serial agent blocked only on the unrelated holder must keep a conservative deduction: {infra}"
+    );
+    assert!(
+        infra["adjusted_low_ns"].as_u64().unwrap_or(0)
+            <= infra["adjusted_high_ns"].as_u64().unwrap_or(0),
+        "{infra}"
+    );
+    assert!(
+        infra["excluded_requests"]
+            .as_array()
+            .is_some_and(|ids| ids.is_empty()),
+        "the task launch is not a wait-only request: {infra}"
     );
     assert!(
         infra["unresolved_ns"].as_u64().unwrap_or(0) > 0
@@ -3721,9 +3732,11 @@ fn owned_heavy_contention_reaches_the_native_report() {
                 .as_array()
                 .is_some_and(|gaps| gaps.iter().any(|gap| {
                     gap.as_str().is_some_and(|gap| {
-                        gap.contains("receipt_bound") || gap.contains("unplaced")
+                        gap.contains("bracket")
+                            || gap.contains("request_interval")
+                            || gap.contains("endpoint")
                     })
                 })),
-        "missing useful-work delivery evidence must stay unresolved: {infra}"
+        "boundary uncertainty must stay visible: {infra}"
     );
 }

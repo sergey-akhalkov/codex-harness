@@ -50,7 +50,9 @@ pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 /// Any change to recognised events, aggregation or the checkpointed state
 /// shape must bump this value: stored checkpoints that do not match are
 /// discarded and the file is fully parsed again.
-pub const PARSER_VERSION: u32 = 1;
+/// Item lifecycle timestamps are part of the parser state. A checkpoint from
+/// the previous parser cannot be reused or those fields would be missing.
+pub const PARSER_VERSION: u32 = 2;
 
 /// Per-file counters for malformed, unknown or skipped records.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +112,19 @@ pub struct RecordedCall {
     pub name: String,
     pub response_id: Option<String>,
     pub command_id: Option<String>,
+}
+
+/// One item lifecycle from a recorded `item_completed` event.
+///
+/// `started_at_ms` and `completed_at_ms` are the producer fields on that
+/// event. They are not receipt time and they are not inferred. The item id is
+/// the tool-call identity for a command item; command text is not retained.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedLifecycle {
+    pub id: String,
+    pub kind: String,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
 }
 
 /// One recorded usage amount with the recorded event timestamp beside it.
@@ -300,6 +315,8 @@ pub struct SessionSummary {
     /// Response identities that carried a message item. Those responses are
     /// not structurally a single tool call.
     pub message_responses: BTreeSet<String>,
+    /// Item lifecycles in recorded order. A missing timestamp stays missing.
+    pub lifecycles: Vec<RecordedLifecycle>,
 }
 
 /// One reader pass over one rollout file.
@@ -431,6 +448,26 @@ fn identifier(value: &Value) -> Option<String> {
     .then(|| text.to_owned())
 }
 
+fn recorded_ms(value: &Value, snake: &str, camel: &str) -> Option<i64> {
+    value
+        .get(snake)
+        .or_else(|| value.get(camel))
+        .and_then(Value::as_i64)
+}
+
+fn lifecycle_kind(item_type: &str) -> &'static str {
+    match item_type {
+        "commandExecution" | "command_execution" | "CommandExecution" => "command",
+        "agentMessage" | "agent_message" | "AgentMessage" | "userMessage" | "UserMessage" => {
+            "message"
+        }
+        "mcpToolCall" | "mcp_tool_call" | "McpToolCall" | "webSearch" | "web_search"
+        | "WebSearch" | "fileChange" | "file_change" | "FileChange" => "tool",
+        "reasoning" | "Reasoning" => "reasoning",
+        _ => "other",
+    }
+}
+
 /// Extracts recorded text from a string or a list of text parts.
 fn text_parts(value: &Value) -> String {
     if let Some(text) = value.as_str() {
@@ -539,6 +576,8 @@ struct Reader {
     calls: Vec<RecordedCall>,
     #[serde(default)]
     message_responses: BTreeSet<String>,
+    #[serde(default)]
+    lifecycles: Vec<RecordedLifecycle>,
     tool_output_bytes: BTreeMap<String, u64>,
     usage: Usage,
     previous: Option<Usage>,
@@ -826,6 +865,15 @@ impl Reader {
                     self.children.insert(id);
                 }
             }
+            if let Some(id) = identifier(&p["item"]["id"]) {
+                let item_type = p["item"]["type"].as_str().unwrap_or("other");
+                self.lifecycles.push(RecordedLifecycle {
+                    id,
+                    kind: lifecycle_kind(item_type).to_owned(),
+                    started_at_ms: recorded_ms(p, "started_at_ms", "startedAtMs"),
+                    completed_at_ms: recorded_ms(p, "completed_at_ms", "completedAtMs"),
+                });
+            }
         }
     }
 
@@ -857,6 +905,7 @@ impl Reader {
             self.cumulative.clear();
             self.unidentified.clear();
             self.conflicts.clear();
+            self.lifecycles.clear();
         }
         if self.parents.len() > 1 {
             self.warn("conflicting_parent_ids");
@@ -954,6 +1003,7 @@ impl Reader {
             source: None,
             calls: self.calls,
             message_responses: self.message_responses,
+            lifecycles: self.lifecycles,
         }
     }
 }
@@ -1352,6 +1402,40 @@ mod tests {
         );
         assert!(session.message_responses.contains("response-mixed"));
         assert!(!session.message_responses.contains("response-heavy"));
+    }
+
+    #[test]
+    fn item_completed_keeps_producer_timestamps_without_command_text() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "lifecycle.jsonl",
+            &[
+                meta("thread_life"),
+                context(),
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed",
+                    "started_at_ms": 1_790_000_000_000_i64,
+                    "completed_at_ms": 1_790_000_002_000_i64,
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-1",
+                        "command": "secret command text",
+                        "aggregated_output": "secret output"
+                    }
+                }}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.lifecycles.len(), 1);
+        assert_eq!(session.lifecycles[0].id, "call-1");
+        assert_eq!(session.lifecycles[0].kind, "command");
+        assert_eq!(session.lifecycles[0].started_at_ms, Some(1_790_000_000_000));
+        assert_eq!(
+            session.lifecycles[0].completed_at_ms,
+            Some(1_790_000_002_000)
+        );
+        assert!(!format!("{:?}", session.lifecycles).contains("secret"));
     }
 
     #[test]

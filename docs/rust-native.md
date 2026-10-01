@@ -306,11 +306,18 @@ configured 20 ms poll is not a bound on late start or late end. The successful
 `try_lock` is bracketed by an earlier counter sample and the clock sample taken
 immediately after the lock is observed held; a delay between acquisition and
 that later sample is inside the bracket. Two samples taken after the lock, or
-the poll period, are not that bound. Host activity marks are receipt times:
-native item notifications carry no producer timestamp, so a receipt is an upper
-bound on delivery, not the work instant, and it cannot prove that earlier queue
-time was idle. Unmeasured scheduling or sampling error stays unknown. A
-nested heavy command records inherited admission and does not add a queue
+the poll period, are not that bound. Host activity marks are receipt times when
+the notification carries no producer timestamp. Installed app-server item
+notifications carry `startedAtMs` and `completedAtMs` when the server emitted
+them, and a rollout `item_completed` event carries `started_at_ms` and
+`completed_at_ms`. Those fields are mapped through the attempt's paired QPC
+and filetime samples. A jumped or missing mapping stays a receipt. A receipt
+is an upper bound on delivery, not the work instant, and it cannot prove that
+earlier queue time was idle. A measured endpoint bracket stays a range: the
+shrunk interval is the certain deduction and the bracket remains a possible
+deduction where the task was independently blocked. Unmeasured scheduling or
+sampling error stays unknown. A nested heavy command records inherited
+admission and does not add a queue
 interval. Holder identity is `same_attempt`, `other_attempt` or `unknown`; a
 missing attempt tag stays unknown. The document separates queue time from
 post-grant delay and does not subtract time or tokens. A write failure is

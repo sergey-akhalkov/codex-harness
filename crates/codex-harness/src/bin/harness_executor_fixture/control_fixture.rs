@@ -37,6 +37,7 @@ mod control_endpoint;
 
 use control_endpoint::{Answer, Bearer, Server};
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -160,23 +161,24 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             let until = Instant::now() + Duration::from_secs(120);
             while Instant::now() < until {
                 if !server.requests_for("turn/start").is_empty() {
-                    if env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok() {
-                        run_owned_heavy(&server, &session);
-                    }
                     record_selected_tools();
                     let _ = commit_solution();
                     let heavy = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok();
+                    let command_bound = heavy.then(|| run_owned_heavy(&server, &session));
+                    let message_ms = unix_ms();
                     let _ = write_rollout(
                         &session,
                         &rollout_model,
                         &rollout_effort,
                         !heavy,
-                        heavy.then_some("heavy-cmd-1"),
+                        command_bound,
+                        message_ms,
                     );
                     server.push(json!({
                         "method": "item/started",
                         "params": {
                             "threadId": session.clone(),
+                            "startedAtMs": message_ms,
                             "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
                         },
                     }));
@@ -184,6 +186,8 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                         "method": "item/completed",
                         "params": {
                             "threadId": session.clone(),
+                            "startedAtMs": message_ms,
+                            "completedAtMs": message_ms,
                             "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
                         },
                     }));
@@ -277,12 +281,14 @@ fn commit_solution() -> io::Result<()> {
 /// Runs one real heavy command under the controller-supplied account and
 /// evidence environment, and emits the matching command item so the host can
 /// correlate it. The command id is the item id. This is not a model call.
-fn run_owned_heavy(server: &Server, session: &str) {
+fn run_owned_heavy(server: &Server, session: &str) -> (i64, i64) {
+    let started_at_ms = unix_ms();
     const COMMAND_ID: &str = "heavy-cmd-1";
     server.push(json!({
         "method": "item/started",
         "params": {
             "threadId": session,
+            "startedAtMs": started_at_ms,
             "item": {
                 "id": COMMAND_ID,
                 "type": "commandExecution",
@@ -313,10 +319,13 @@ fn run_owned_heavy(server: &Server, session: &str) {
         ])
         .output();
     let exit = output.as_ref().ok().and_then(|output| output.status.code());
+    let completed_at_ms = unix_ms();
     server.push(json!({
         "method": "item/completed",
         "params": {
             "threadId": session,
+            "startedAtMs": started_at_ms,
+            "completedAtMs": completed_at_ms,
             "item": {
                 "id": COMMAND_ID,
                 "type": "commandExecution",
@@ -326,6 +335,14 @@ fn run_owned_heavy(server: &Server, session: &str) {
             },
         },
     }));
+    (started_at_ms, completed_at_ms)
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Records unqualified command identity from the host-supplied environment.
@@ -477,7 +494,8 @@ fn write_rollout(
     model: &str,
     effort: &str,
     include_usage: bool,
-    wait_call: Option<&str>,
+    command_bound: Option<(i64, i64)>,
+    message_ms: i64,
 ) -> io::Result<()> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -494,13 +512,31 @@ fn write_rollout(
             "payload": {"model": model, "effort": effort, "turn_id": TURN},
         }),
     ];
-    if let Some(call) = wait_call {
+    if let Some((started_at_ms, completed_at_ms)) = command_bound {
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "started_at_ms": started_at_ms,
+                "completed_at_ms": completed_at_ms,
+                "item": {"type": "CommandExecution", "id": "heavy-cmd-1"}
+            }
+        }));
+        lines.push(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "started_at_ms": message_ms,
+                "completed_at_ms": message_ms,
+                "item": {"type": "AgentMessage", "id": "message-1"}
+            }
+        }));
         lines.push(json!({
             "type": "response_item",
             "payload": {
                 "type": "function_call",
-                "call_id": call,
-                "command_id": call,
+                "call_id": "heavy-cmd-1",
+                "command_id": "heavy-cmd-1",
                 "name": "exec_command",
                 "response_id": "response-heavy",
             },
