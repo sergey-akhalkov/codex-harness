@@ -943,9 +943,16 @@ impl Holder {
             || {
                 eprintln!("{}", queue_diagnostic(account, slot_count));
             },
-            || observe_wait(&mut wait, account, slot_count, attempt),
+            || {
+                if observation.collecting() {
+                    observe_wait(&mut wait, account, slot_count, attempt);
+                }
+            },
         );
-        let ended = heavy_command_trace::sample_clock().ok();
+        let ended = observation
+            .collecting()
+            .then(|| heavy_command_trace::sample_clock().ok())
+            .flatten();
         let admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
@@ -1445,16 +1452,32 @@ struct EvidenceLink {
     tool_call_id: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PrivateHolder {
+    pid: u32,
+    creation_time: u64,
+}
+
 #[derive(Default)]
 struct WaitTrace {
     frequency: u64,
     first_busy: Option<heavy_command_trace::ClockSample>,
+    last_sample: Option<heavy_command_trace::ClockSample>,
+    observed_poll_gap_ns: Option<u64>,
     holders_last: Vec<heavy_command_trace::HolderFinding>,
+    identity_last: Vec<PrivateHolder>,
+    gap_findings: Vec<heavy_command_trace::HolderFinding>,
     samples: u32,
     changed: bool,
     clock_failed: bool,
-    saw_live: bool,
+    /// A tagged holder has been observed. Leading lock-only samples are not this.
+    saw_known: bool,
+    /// A gap or unreadable record was retained after, or beside, a known holder.
+    observation_gap: bool,
 }
+
+#[cfg(test)]
+static OBSERVE_WAIT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct UnstartedNote<'a> {
     admission: &'a Admission,
@@ -1499,32 +1522,46 @@ fn parent_admission_from_env() -> Option<String> {
 }
 
 fn observe_wait(wait: &mut WaitTrace, account: &Path, slot_count: u32, attempt: Option<&str>) {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        OBSERVE_WAIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     match heavy_command_trace::sample_clock() {
         Ok((frequency, sample)) => {
             if wait.frequency == 0 {
                 wait.frequency = frequency;
             } else if wait.frequency != frequency {
                 wait.clock_failed = true;
+                wait.observed_poll_gap_ns = None;
+            }
+            if wait.frequency == frequency
+                && let Some(previous) = wait.last_sample
+            {
+                match heavy_command_trace::monotonic_ns(frequency, previous.qpc, sample.qpc) {
+                    Some(gap) => {
+                        wait.observed_poll_gap_ns = Some(
+                            wait.observed_poll_gap_ns
+                                .map_or(gap, |current| current.max(gap)),
+                        );
+                    }
+                    None => {
+                        wait.clock_failed = true;
+                        wait.observed_poll_gap_ns = None;
+                    }
+                }
             }
             if wait.first_busy.is_none() {
                 wait.first_busy = Some(sample);
             }
+            wait.last_sample = Some(sample);
         }
         Err(_) => wait.clock_failed = true,
     }
-    let (live, unreadable) = live_holder_tags(account, slot_count);
-    let findings = heavy_command_trace::classify_holders(attempt, &live, unreadable);
-    // The holder record is written after the lock is taken. Leading samples
-    // that only see the lock are not an ownership change.
-    if !holder_not_yet_recorded(&findings) {
-        if wait.saw_live && findings != wait.holders_last {
-            wait.changed = true;
-        }
-        wait.holders_last = findings;
-        wait.saw_live = true;
-    } else if wait.holders_last.is_empty() {
-        wait.holders_last = findings;
-    }
+    let scan = live_holder_tags(account, slot_count);
+    let findings =
+        heavy_command_trace::classify_holders(attempt, &scan.live, &scan.unreadable_slots);
+    note_holders(wait, findings, scan.identities);
     wait.samples += 1;
 }
 
@@ -1539,10 +1576,13 @@ fn holder_not_yet_recorded(findings: &[heavy_command_trace::HolderFinding]) -> b
     })
 }
 
-fn live_holder_tags(
-    account: &Path,
-    slot_count: u32,
-) -> (Vec<heavy_command_trace::LiveHolder>, bool) {
+struct HolderScan {
+    live: Vec<heavy_command_trace::LiveHolder>,
+    identities: Vec<PrivateHolder>,
+    unreadable_slots: Vec<Option<u32>>,
+}
+
+fn live_holder_tags(account: &Path, slot_count: u32) -> HolderScan {
     let mut paths = vec![
         (account.join(HOLDER_FILE), None),
         (account.join(HOLDER_EXCLUSIVE_FILE), None),
@@ -1551,12 +1591,13 @@ fn live_holder_tags(
         paths.push((holder_record_path(account, Some(index)), Some(index)));
     }
     let mut live = Vec::new();
+    let mut identities = Vec::new();
     let mut seen = Vec::new();
-    let mut saw_unreadable = false;
+    let mut unreadable_slots = Vec::new();
     for (path, slot) in paths {
         match read_live_holder(&path, slot) {
             HolderRead::Absent => {}
-            HolderRead::Unreadable => saw_unreadable = true,
+            HolderRead::Unreadable => unreadable_slots.push(slot),
             HolderRead::Live {
                 pid,
                 creation_time,
@@ -1566,12 +1607,80 @@ fn live_holder_tags(
                     continue;
                 }
                 seen.push((pid, creation_time));
+                identities.push(PrivateHolder { pid, creation_time });
                 live.push(holder);
             }
         }
     }
-    let unreadable = saw_unreadable && live.is_empty();
-    (live, unreadable)
+    HolderScan {
+        live,
+        identities,
+        unreadable_slots,
+    }
+}
+
+fn note_holders(
+    wait: &mut WaitTrace,
+    findings: Vec<heavy_command_trace::HolderFinding>,
+    mut identities: Vec<PrivateHolder>,
+) {
+    identities.sort();
+    if holder_not_yet_recorded(&findings) {
+        // The holder file is written after the lock is taken. Only a leading
+        // lock-only sample is publication lag. The same sample after a known
+        // holder is a retained gap, not proof that the previous owner continued.
+        if wait.saw_known {
+            wait.observation_gap = true;
+            wait.gap_findings = findings;
+            wait.identity_last.clear();
+        } else if wait.holders_last.is_empty() {
+            wait.holders_last = findings;
+        }
+        return;
+    }
+    if findings.iter().any(|finding| {
+        finding.classification == heavy_command_trace::HolderClass::Unknown
+            && finding.reason == heavy_command_trace::HolderReason::Unreadable
+    }) {
+        wait.observation_gap = true;
+        wait.gap_findings = findings
+            .iter()
+            .filter(|finding| finding.classification == heavy_command_trace::HolderClass::Unknown)
+            .cloned()
+            .collect();
+    }
+    if wait.saw_known
+        && (wait.observation_gap
+            || identities != wait.identity_last
+            || findings != wait.holders_last)
+    {
+        wait.changed = true;
+    }
+    wait.holders_last = findings;
+    wait.identity_last = identities;
+    wait.saw_known = true;
+}
+
+fn published_holders(wait: &WaitTrace) -> Vec<heavy_command_trace::HolderFinding> {
+    let mut holders = wait.holders_last.clone();
+    if wait.observation_gap {
+        for finding in &wait.gap_findings {
+            if !holders.contains(finding) {
+                holders.push(finding.clone());
+            }
+        }
+        if !holders
+            .iter()
+            .any(|finding| finding.classification == heavy_command_trace::HolderClass::Unknown)
+        {
+            holders.push(heavy_command_trace::HolderFinding {
+                classification: heavy_command_trace::HolderClass::Unknown,
+                reason: heavy_command_trace::HolderReason::LegacyLock,
+                slot: None,
+            });
+        }
+    }
+    holders
 }
 
 enum HolderRead {
@@ -1710,13 +1819,14 @@ fn record_episode(
         queue_end: waited.then_some(admitted).flatten(),
         waited,
         holders: if waited {
-            wait.holders_last.clone()
+            published_holders(wait)
         } else {
             Vec::new()
         },
         holder_samples: wait.samples,
-        holder_changed: wait.changed,
+        holder_changed: wait.changed || wait.observation_gap,
         poll_resolution_ns: POLL_INTERVAL.as_nanos() as u64,
+        observed_poll_gap_ns: wait.observed_poll_gap_ns,
         payload_started,
     };
     if let Err(error) = heavy_command_trace::write_episode(&link.directory, &draft) {
@@ -2520,6 +2630,196 @@ mod tests {
         );
         drop(held);
         assert!(!account.join(HOLDER_EXCLUSIVE_FILE).exists());
+    }
+
+    #[test]
+    fn opted_out_wait_does_not_collect_and_requested_tagging_remains() {
+        let (temp, account) = owned_account();
+        let budget = test_budget(1, 1);
+        let before = OBSERVE_WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let tagged = heavy_command_trace::Observation {
+            directory: None,
+            correlation: heavy_command_trace::Correlation {
+                attempt_id: Some("attempt-tagged".to_owned()),
+                ..Default::default()
+            },
+        };
+        let held = Admission::acquire_observed(
+            &account,
+            &budget,
+            "tagged",
+            &Cancellation::default(),
+            &tagged,
+        )
+        .unwrap();
+        let record = fs::read_to_string(account.join(HOLDER_EXCLUSIVE_FILE)).unwrap();
+        assert!(record.contains("attempt-tagged"), "{record}");
+        assert_eq!(
+            OBSERVE_WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+        drop(held);
+
+        let held =
+            Admission::acquire(&account, &budget, "holder", &Cancellation::default()).unwrap();
+        let started = Instant::now();
+        let timed_out = expect_admission_err(Admission::acquire(
+            &account,
+            &budget,
+            "opt-out",
+            &Cancellation::default(),
+        ));
+        assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut, "{timed_out}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(
+            OBSERVE_WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "opted-out polling must not read holder identity or the admission clock"
+        );
+        drop(held);
+
+        let held =
+            Admission::acquire(&account, &budget, "holder", &Cancellation::default()).unwrap();
+        let evidence = temp.path().join("evidence");
+        fs::create_dir_all(&evidence).unwrap();
+        let observation = heavy_command_trace::Observation {
+            directory: Some(evidence.clone()),
+            correlation: heavy_command_trace::Correlation {
+                attempt_id: Some("attempt-waiter".to_owned()),
+                ..Default::default()
+            },
+        };
+        let collecting = OBSERVE_WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let timed_out = expect_admission_err(Admission::acquire_observed(
+            &account,
+            &budget,
+            "collect",
+            &Cancellation::default(),
+            &observation,
+        ));
+        assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut, "{timed_out}");
+        assert!(
+            OBSERVE_WAIT_CALLS.load(std::sync::atomic::Ordering::Relaxed) > collecting,
+            "collection must still observe a busy queue"
+        );
+        let views = heavy_command_trace::read_directory(&evidence).unwrap();
+        assert_eq!(views.len(), 1);
+        assert!(
+            matches!(
+                heavy_command_trace::interpret(&views[0]).delay,
+                heavy_command_trace::QueueDelay::FailedAdmission {
+                    terminal: heavy_command_trace::TerminalKind::Timeout,
+                    ..
+                }
+            ),
+            "{:?}",
+            heavy_command_trace::interpret(&views[0]).delay
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn holder_gaps_and_private_identity_are_not_erased() {
+        let (_temp, account) = owned_account();
+        let identity = current_identity().unwrap();
+        write_holder(
+            &account.join(HOLDER_FILE),
+            identity,
+            "holder",
+            "job",
+            Some("attempt-holder"),
+        )
+        .unwrap();
+        fs::write(holder_record_path(&account, Some(1)), b"{").unwrap();
+        let scan = live_holder_tags(&account, 2);
+        assert_eq!(
+            scan.live.len(),
+            1,
+            "a readable holder must still be reported"
+        );
+        assert_eq!(scan.unreadable_slots, vec![Some(1)]);
+        let findings = heavy_command_trace::classify_holders(
+            Some("attempt-waiter"),
+            &scan.live,
+            &scan.unreadable_slots,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.classification == heavy_command_trace::HolderClass::OtherAttempt
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.classification == heavy_command_trace::HolderClass::Unknown
+                && finding.reason == heavy_command_trace::HolderReason::Unreadable
+                && finding.slot == Some(1)
+        }));
+
+        let known = vec![heavy_command_trace::HolderFinding {
+            classification: heavy_command_trace::HolderClass::OtherAttempt,
+            reason: heavy_command_trace::HolderReason::Tagged,
+            slot: Some(0),
+        }];
+        let mut gapped = WaitTrace::default();
+        note_holders(
+            &mut gapped,
+            known.clone(),
+            vec![PrivateHolder {
+                pid: identity.pid,
+                creation_time: identity.creation_time,
+            }],
+        );
+        note_holders(
+            &mut gapped,
+            vec![heavy_command_trace::HolderFinding {
+                classification: heavy_command_trace::HolderClass::Unknown,
+                reason: heavy_command_trace::HolderReason::LegacyLock,
+                slot: None,
+            }],
+            Vec::new(),
+        );
+        note_holders(
+            &mut gapped,
+            known.clone(),
+            vec![PrivateHolder {
+                pid: identity.pid,
+                creation_time: identity.creation_time,
+            }],
+        );
+        assert!(gapped.observation_gap);
+        let published = published_holders(&gapped);
+        assert!(
+            published
+                .iter()
+                .any(|finding| finding.classification == heavy_command_trace::HolderClass::Unknown),
+            "a later tag must not erase the gap: {published:?}"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|finding| format!("{finding:?}").contains("pid")),
+            "{published:?}"
+        );
+
+        let mut replaced = WaitTrace::default();
+        note_holders(
+            &mut replaced,
+            known.clone(),
+            vec![PrivateHolder {
+                pid: 7,
+                creation_time: 8,
+            }],
+        );
+        note_holders(
+            &mut replaced,
+            known,
+            vec![PrivateHolder {
+                pid: 9,
+                creation_time: 8,
+            }],
+        );
+        assert!(
+            replaced.changed,
+            "the same public classification is not a stable process identity"
+        );
+        assert!(!replaced.observation_gap);
     }
 
     #[test]

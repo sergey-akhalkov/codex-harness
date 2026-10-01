@@ -9,7 +9,7 @@
 #![cfg(windows)]
 use harness_core::{
     heavy_command::{Budget, LEASE_ENV},
-    heavy_command_trace::{self, QueueDelay, TerminalKind},
+    heavy_command_trace::{self, QueueDelay, TerminalKind, TimingBound},
     process::SHARED_CPU_PERCENT,
 };
 use serde_json::Value;
@@ -2375,7 +2375,16 @@ fn queue_evidence_covers_grant_wait_identity_release_and_ordinary_operation() {
         let delay = heavy_command_trace::interpret(&view[0]).delay;
         if expect_unrelated {
             assert!(
-                matches!(delay, QueueDelay::UnrelatedWait { monotonic_ns, .. } if monotonic_ns > 0),
+                matches!(
+                    delay,
+                    QueueDelay::UnrelatedWait { timing }
+                        if timing.monotonic_ns > 0
+                            && timing.endpoint == TimingBound::Unknown
+                            && !matches!(
+                                timing.endpoint,
+                                TimingBound::Measured(bound) if bound == timing.configured_poll_ns
+                            )
+                ),
                 "{waiter_attempt}: {delay:?}"
             );
         } else if holder_attempt == Some("attempt-same") {

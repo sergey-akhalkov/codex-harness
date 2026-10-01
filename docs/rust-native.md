@@ -296,7 +296,10 @@ journal. `codex-harness heavy --queue-evidence DIRECTORY --attempt LABEL
 per admission into that caller-owned directory. Labels are ascii tokens and
 are not paths. Omitting `--queue-evidence` is ordinary operation and writes
 nothing. A missing, malformed or partial document is unknown, never a measured
-zero. An immediate grant with a complete paired clock is measured zero. A
+zero. An immediate grant with a positive frequency and equal monotonic and wall
+samples is measured zero. A paired mapping is not exact wall alignment, and the
+configured 20 ms poll is not a bound on late start or late end; unmeasured
+scheduling or sampling error stays unknown. A
 nested heavy command records inherited admission and does not add a queue
 interval. Holder identity is `same_attempt`, `other_attempt` or `unknown`; a
 missing attempt tag stays unknown. The document separates queue time from
