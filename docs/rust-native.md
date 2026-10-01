@@ -294,9 +294,13 @@ Optional queue evidence stays in this admission owner. It is not a second
 journal. `codex-harness heavy --queue-evidence DIRECTORY --attempt LABEL
 --tool-call LABEL --command-id LABEL -- PROGRAM ARGS` writes one JSON document
 per admission into that caller-owned directory. Labels are ascii tokens and
-are not paths. Omitting `--queue-evidence` is ordinary operation and writes
-nothing. A missing, malformed or partial document is unknown, never a measured
-zero. An immediate grant with a positive frequency and equal monotonic and wall
+are not paths. The same inputs can be supplied with
+`CODEX_HARNESS_HEAVY_QUEUE_EVIDENCE`, `CODEX_HARNESS_HEAVY_ATTEMPT`,
+`CODEX_HARNESS_HEAVY_TOOL_CALL` and `CODEX_HARNESS_HEAVY_COMMAND`; explicit
+options take precedence. With no evidence directory from either source,
+ordinary operation writes no evidence. A missing, malformed or partial
+document is unknown, never a measured zero. An immediate grant with a positive
+frequency and equal monotonic and wall
 samples is measured zero. A paired mapping is not exact wall alignment, and the
 configured 20 ms poll is not a bound on late start or late end; unmeasured
 scheduling or sampling error stays unknown. A

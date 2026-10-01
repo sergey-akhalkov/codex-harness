@@ -743,6 +743,13 @@ fn boundary_coherent(document: &QueueEvidence) -> Result<(), &'static str> {
             if !terminal_matches {
                 return Err("inconsistent_queue");
             }
+            if matches!(
+                document.terminal,
+                TerminalKind::ImmediateGrant | TerminalKind::WaitedGrant
+            ) && document.admitted_at.is_none()
+            {
+                return Err("inconsistent_boundary");
+            }
             if let (Some(admitted), Some(end)) = (document.admitted_at, document.clock.end)
                 && (admitted.qpc != end.qpc || admitted.filetime != end.filetime)
             {
@@ -1514,6 +1521,20 @@ mod tests {
         let zero_path = write_episode(root.path(), &zero).unwrap();
         let mut value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&zero_path).unwrap()).unwrap();
+        let mut missing_admission = value.clone();
+        missing_admission["admitted_at"] = serde_json::Value::Null;
+        let missing_admission_path = root.path().join("admission-missing-boundary.json");
+        fs::write(
+            &missing_admission_path,
+            serde_json::to_vec(&missing_admission).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            interpret(&read_evidence(&missing_admission_path)).delay,
+            QueueDelay::Unknown {
+                reason: "inconsistent_boundary"
+            }
+        ));
         value["clock"]["frequency"] = serde_json::json!(0);
         value["clock"]["mapping"] = serde_json::json!("paired");
         value["clock"]["end"]["filetime"] = serde_json::json!(10_000_000_001_u64);

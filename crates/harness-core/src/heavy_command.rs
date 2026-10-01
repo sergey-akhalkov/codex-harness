@@ -1470,9 +1470,9 @@ struct WaitTrace {
     samples: u32,
     changed: bool,
     clock_failed: bool,
-    /// A tagged holder has been observed. Leading lock-only samples are not this.
+    /// A tagged holder has been observed.
     saw_known: bool,
-    /// A gap or unreadable record was retained after, or beside, a known holder.
+    /// A gap or unreadable record was retained anywhere in the interval.
     observation_gap: bool,
 }
 
@@ -1626,16 +1626,11 @@ fn note_holders(
 ) {
     identities.sort();
     if holder_not_yet_recorded(&findings) {
-        // The holder file is written after the lock is taken. Only a leading
-        // lock-only sample is publication lag. The same sample after a known
-        // holder is a retained gap, not proof that the previous owner continued.
-        if wait.saw_known {
-            wait.observation_gap = true;
-            wait.gap_findings = findings;
-            wait.identity_last.clear();
-        } else if wait.holders_last.is_empty() {
-            wait.holders_last = findings;
-        }
+        // A later holder tag cannot identify an earlier unobserved owner.
+        // Even a leading gap may span another admission, not publication lag.
+        wait.observation_gap = true;
+        wait.gap_findings = findings;
+        wait.identity_last.clear();
         return;
     }
     if findings.iter().any(|finding| {
@@ -2757,6 +2752,36 @@ mod tests {
             reason: heavy_command_trace::HolderReason::Tagged,
             slot: Some(0),
         }];
+        for reason in [
+            heavy_command_trace::HolderReason::LegacyLock,
+            heavy_command_trace::HolderReason::Unreadable,
+        ] {
+            let mut leading_gap = WaitTrace::default();
+            note_holders(
+                &mut leading_gap,
+                vec![heavy_command_trace::HolderFinding {
+                    classification: heavy_command_trace::HolderClass::Unknown,
+                    reason,
+                    slot: None,
+                }],
+                Vec::new(),
+            );
+            note_holders(
+                &mut leading_gap,
+                known.clone(),
+                vec![PrivateHolder {
+                    pid: identity.pid,
+                    creation_time: identity.creation_time,
+                }],
+            );
+            let published = published_holders(&leading_gap);
+            assert!(
+                published.iter().any(|finding| {
+                    finding.classification == heavy_command_trace::HolderClass::Unknown
+                }),
+                "a later tag cannot identify an earlier unobserved holder: {published:?}"
+            );
+        }
         let mut gapped = WaitTrace::default();
         note_holders(
             &mut gapped,
