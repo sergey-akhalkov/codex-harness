@@ -29,8 +29,8 @@
 
 ## 4. Grounded hypothesis generation and prior-result reuse
 
-- [ ] 4.1 Produce bounded attributable observations from existing outcome/token-audit/tool evidence with drill-down references; verify observation, inference and prediction remain distinct and changed file/context identity prevents false repeated-read findings.
-- [ ] 4.2 Implement investigator intake that requires mechanism, predicted effect, counterexample, applicability and acceptance, including initial seeds from existing evidence or authorized real work; exercise rejection of unsupported ideas and trace a proposed actual hypothesis back to its evidence and relevant source/tool constraints.
+- [x] 4.1 Produce bounded attributable observations from existing outcome/token-audit/tool evidence with drill-down references; verify observation, inference and prediction remain distinct and changed file/context identity prevents false repeated-read findings.
+- [x] 4.2 Implement investigator intake that requires mechanism, predicted effect, counterexample, applicability and acceptance, including initial seeds from existing evidence or authorized real work; exercise rejection of unsupported ideas and trace a proposed actual hypothesis back to its evidence and relevant source/tool constraints.
 - [x] 4.3 Search open, closed and deferred Beads hypotheses before admission, preserving earlier conclusions and requiring a new basis for reconsideration; verify same-condition rejection is reused, fresh evidence is linked visibly, and repeated trials do not create duplicate hypothesis cards.
 - [ ] 4.4 Drive automatic planning, implementation and evaluation phases for eligible candidates under established run authority, including the owned skill-evolution path where applicable; demonstrate a newly selected hypothesis receives validated OpenSpec artifacts before candidate edits and that material scope/access changes stop only dependent work.
 - [ ] 4.5 Expose idle and deferred states when evidence or a meaningful next check is missing; verify the loop does not generate arbitrary modifications, repeated identical inconclusive experiments or model calls solely to stay busy.
