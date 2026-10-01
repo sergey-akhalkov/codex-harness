@@ -79,7 +79,7 @@
 //! ```
 
 use crate::{board_hypothesis, build_identity, rollout_reader};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use std::{io, path::Path};
 
 /// Version of the bounded investigator report this intake reads.
@@ -627,9 +627,67 @@ pub struct InvestigatorReport {
     pub idle_reason: Option<String>,
 }
 
-/// Reads one bounded investigator report from a file.
+/// Reads one bounded investigator report from a file. This is the strict
+/// reader contract: the whole file is one JSON document. A retained terminal
+/// message that frames the report in prose goes through
+/// [`parse_terminal_report`] instead.
 pub fn read_report(path: &Path) -> io::Result<InvestigatorReport> {
     crate::improvement_loop::read_json(path, MAX_REPORT_BYTES)
+}
+
+/// Parses one investigator report from a retained terminal message: either
+/// the strict whole-message JSON document, or prose framing followed by
+/// exactly one complete JSON report as the message's final payload. The
+/// payload must start a line; a message with no parseable payload, with
+/// trailing non-framing text after it, with more than one complete JSON
+/// payload or with a payload that is not the schema-1 report shape is
+/// refused as a whole. Nothing is salvaged from the framing prose, and the
+/// payload is deserialized by the same strict contract as [`read_report`].
+pub fn parse_terminal_report(bytes: &[u8]) -> io::Result<InvestigatorReport> {
+    if bytes.len() as u64 > MAX_REPORT_BYTES {
+        return Err(board_hypothesis::invalid(format!(
+            "the terminal message is {} bytes, beyond the {MAX_REPORT_BYTES} byte investigator report bound",
+            bytes.len()
+        )));
+    }
+    // The strict reader contract stays first: a whole-message JSON document
+    // needs no framing, and trailing non-whitespace still fails it.
+    if let Ok(report) = serde_json::from_slice::<InvestigatorReport>(bytes) {
+        return Ok(report);
+    }
+    // Terminal framing: the payload is the one complete JSON object that
+    // begins a line in the message. Any other complete JSON object (even a
+    // non-report one) makes the message ambiguous and is never skipped.
+    let mut payloads = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'{' || (index > 0 && bytes[index - 1] != b'\n') {
+            continue;
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes[index..]);
+        if IgnoredAny::deserialize(&mut deserializer).is_err() {
+            continue;
+        }
+        payloads.push((index, deserializer.end().is_ok()));
+    }
+    match payloads.as_slice() {
+        [] => Err(board_hypothesis::invalid(
+            "the terminal message carries no complete JSON payload that starts a line; a missing, malformed or incomplete investigator report is not consumed",
+        )),
+        [(index, true)] => {
+            serde_json::from_slice::<InvestigatorReport>(&bytes[*index..]).map_err(|error| {
+                board_hypothesis::invalid(format!(
+                    "the terminal JSON payload is not a schema-1 investigator report: {error}"
+                ))
+            })
+        }
+        [(_, false)] => Err(board_hypothesis::invalid(
+            "the terminal message carries non-whitespace after its JSON payload; trailing non-framing text makes the report ambiguous and nothing is consumed",
+        )),
+        _ => Err(board_hypothesis::invalid(format!(
+            "the terminal message carries {} complete JSON payloads; a multiple or ambiguous investigator report is not consumed",
+            payloads.len()
+        ))),
+    }
 }
 
 /// The recorded outcome of one candidate or one empty intake round.
@@ -1478,6 +1536,84 @@ mod tests {
             candidates: vec![candidate],
             idle_reason: None,
         }
+    }
+
+    fn serialized(candidate: Proposal, pretty: bool) -> Vec<u8> {
+        let report = report(candidate);
+        if pretty {
+            serde_json::to_vec_pretty(&report).unwrap()
+        } else {
+            serde_json::to_vec(&report).unwrap()
+        }
+    }
+
+    #[test]
+    fn terminal_reports_accept_strict_json_and_one_framed_payload() {
+        // The strict whole-message contract stays accepted, compact or pretty.
+        for pretty in [false, true] {
+            let message = serialized(addition("bounded-output"), pretty);
+            assert_eq!(parse_terminal_report(&message).unwrap().candidates.len(), 1);
+        }
+        // Investigator prose framing around exactly one final payload is
+        // consumed through the same strict report contract.
+        for pretty in [false, true] {
+            let mut message =
+                b"First paragraph of investigator prose.\n\nSecond paragraph.\n\n".to_vec();
+            message.extend_from_slice(&serialized(addition("bounded-output"), pretty));
+            message.push(b'\n');
+            assert_eq!(parse_terminal_report(&message).unwrap().candidates.len(), 1);
+        }
+    }
+
+    #[test]
+    fn terminal_reports_refuse_absent_ambiguous_or_trailing_payloads() {
+        assert!(
+            parse_terminal_report(b"prose only\n").is_err(),
+            "no payload"
+        );
+        let payload = serialized(addition("bounded-output"), false);
+
+        let mut malformed = b"prose\n\n{\"schema\":1,".to_vec();
+        malformed.extend_from_slice(&payload);
+        assert!(parse_terminal_report(&malformed).is_err(), "malformed");
+
+        let mut truncated = b"prose\n\n".to_vec();
+        truncated.extend_from_slice(&payload[..payload.len() - 3]);
+        assert!(parse_terminal_report(&truncated).is_err(), "incomplete");
+
+        let mut ambiguous = b"prose\n\n".to_vec();
+        ambiguous.extend_from_slice(&payload);
+        ambiguous.push(b'\n');
+        ambiguous.extend_from_slice(&payload);
+        ambiguous.push(b'\n');
+        let error = parse_terminal_report(&ambiguous).unwrap_err();
+        assert!(
+            error.to_string().contains("complete JSON payloads"),
+            "{error}"
+        );
+
+        let mut trailing = b"prose\n\n".to_vec();
+        trailing.extend_from_slice(&payload);
+        trailing.extend_from_slice(b"\nnot framing\n");
+        let error = parse_terminal_report(&trailing).unwrap_err();
+        assert!(error.to_string().contains("trailing"), "{error}");
+
+        assert!(
+            parse_terminal_report(b"prose\n\n{\"not\":\"a report\"}\n").is_err(),
+            "a JSON object that is not the report is refused"
+        );
+    }
+
+    #[test]
+    fn terminal_payload_with_wrong_schema_is_refused_by_intake() {
+        let mut message = b"prose\n\n".to_vec();
+        let mut document = report(addition("bounded-output"));
+        document.schema = INTAKE_SCHEMA + 1;
+        message.extend_from_slice(&serde_json::to_vec(&document).unwrap());
+        let parsed = parse_terminal_report(&message).unwrap();
+        let (bd, project) = unowned_board();
+        let error = intake(bd, project, &parsed, &EvidenceIndex::default()).unwrap_err();
+        assert!(error.to_string().contains("declares schema"), "{error}");
     }
 
     #[test]

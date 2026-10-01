@@ -167,9 +167,12 @@ fn advance_selection(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
 }
 
 /// Consumes one retained completed investigator result that differs from the
-/// already-consumed one. Returns whether a result was handled (consumed or
-/// explicitly blocked), so the caller never falls through to a new dispatch
-/// while unconsumed evidence exists.
+/// already-consumed one. The retained terminal message may frame the report
+/// in investigator prose; only its single unambiguous final JSON payload is
+/// parsed (`improvement_intake::parse_terminal_report`) and the raw message
+/// digest stays the authoritative identity. Returns whether a result was
+/// handled (consumed or explicitly blocked), so the caller never falls
+/// through to a new dispatch while unconsumed evidence exists.
 fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
     let latest = run
         .cursor
@@ -221,7 +224,7 @@ fn consume_investigator_result(run: &mut Run, notes: &mut Vec<String>) -> io::Re
     {
         return Ok(false);
     }
-    let report = match improvement_intake::read_report(&result) {
+    let report = match improvement_intake::parse_terminal_report(&bytes) {
         Ok(report) => report,
         Err(error) => {
             let reason = format!(
@@ -1443,9 +1446,9 @@ fn dispatch_investigator(
         "inputs": [],
         "outputs": [],
         "invariants": [
-            "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"add-<short-name>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates",
+            "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"<own OpenSpec change reference>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates",
             "every candidate cites at least one observed retained locator; intake refuses an ungrounded or prediction-only citation",
-            "the spec field names the candidate's own OpenSpec change (add-<short-name>); the controller creates and validates that change before any implementation",
+            "the spec field names the candidate's own OpenSpec change under the run's openspec/changes planning root; an existing linked change is valid as it stands, and the controller qualifies it - preparing and authoring a missing change - before any implementation",
             "this conversation edits no file and dispatches no other model work",
         ],
         "acceptance": [

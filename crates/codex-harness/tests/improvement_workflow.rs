@@ -516,11 +516,11 @@ fn fake_launcher(fixture: &Fixture) {
     fs::write(&launcher, "fixture launcher").unwrap();
 }
 
-/// Writes one retained investigator report beside the run and seeds the
-/// completed investigator attempt that produced it.
-fn seed_investigator_report(fixture: &Fixture, report: &Value) -> PathBuf {
+/// Writes one retained investigator terminal message beside the run and seeds
+/// the completed investigator attempt that produced it.
+fn seed_investigator_message(fixture: &Fixture, message: &[u8]) -> PathBuf {
     let result = fixture.run.join("investigator-result.json");
-    fs::write(&result, serde_json::to_vec_pretty(report).unwrap()).unwrap();
+    fs::write(&result, message).unwrap();
     let receipt = fixture.run.join("investigator-receipt.json");
     seed_bound_receipt(
         &receipt,
@@ -543,6 +543,12 @@ fn seed_investigator_report(fixture: &Fixture, report: &Value) -> PathBuf {
         ),
     );
     result
+}
+
+/// Writes one retained investigator report beside the run and seeds the
+/// completed investigator attempt that produced it.
+fn seed_investigator_report(fixture: &Fixture, report: &Value) -> PathBuf {
+    seed_investigator_message(fixture, &serde_json::to_vec_pretty(report).unwrap())
 }
 
 /// One anchored report: the proposal matches the fixture's admitted card, so
@@ -699,6 +705,123 @@ fn unsupported_citations_are_refused_without_model_churn() {
     assert_eq!(
         fixture.cursor()["attempts"].as_array().unwrap().len(),
         baseline_attempts + 1
+    );
+}
+
+/// An actual investigator conversation returns prose paragraphs plus its
+/// schema-1 report as the final payload; the controller consumes that
+/// terminal framing without replaying the model, and the digest of the raw
+/// message (prose included) stays the recorded identity.
+#[test]
+fn prose_framed_terminal_result_is_consumed_and_never_replayed() {
+    let fixture = Fixture::new("prose-framed");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    let baseline = fixture.cursor()["attempts"].as_array().unwrap().len();
+
+    let payload = serde_json::to_string(&anchored_report(&locator)).unwrap();
+    let message = format!(
+        "The investigation inspected the retained evidence and found no source change to make.\nThe bounded report follows as the final line.\n\n{payload}\n"
+    );
+    let result = seed_investigator_message(&fixture, message.as_bytes());
+
+    // Resume consumes the framed report through grounded intake with no new
+    // investigator dispatch: the anchor card is reused as the candidate and
+    // the raw result digest is the recorded intake identity.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["candidate"]["hypothesis"], fixture.card, "{report}");
+    assert_eq!(report["candidate"]["change"], "add-synthetic", "{report}");
+    assert_eq!(
+        report["intake"]["outcomes"][0]["outcome"], "existing",
+        "{report}"
+    );
+    assert_eq!(
+        report["intake"]["result_sha256"],
+        json!(hash_bytes(message.as_bytes())),
+        "{report}"
+    );
+    assert_eq!(
+        fs::read(&result).unwrap().as_slice(),
+        message.as_bytes(),
+        "the raw terminal result is never edited"
+    );
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+    assert_eq!(
+        attempts,
+        baseline + 1,
+        "only the settled investigator attempt exists; no replay was dispatched: {}",
+        fixture.cursor()
+    );
+
+    // A repeated resume waits on the same retained decision: no second
+    // intake, no duplicate outcome and no new model attempt.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["intake"]["result_sha256"],
+        json!(hash_bytes(message.as_bytes())),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["intake"]["outcomes"].as_array().unwrap().len(),
+        1,
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        attempts,
+        "{cursor}"
+    );
+}
+
+/// Two complete payloads in one terminal message are ambiguous: the intake
+/// refuses the whole message and admits no candidate from either payload.
+#[test]
+fn an_ambiguous_terminal_message_is_refused_without_model_churn() {
+    let fixture = Fixture::new("ambiguous-report");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    let baseline = fixture.cursor()["attempts"].as_array().unwrap().len();
+
+    let payload = serde_json::to_string(&anchored_report(&locator)).unwrap();
+    let message = format!("Investigator prose.\n\n{payload}\n{payload}\n");
+    seed_investigator_message(&fixture, message.as_bytes());
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "idle", "{report}");
+    assert!(report["candidate"].is_null(), "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap()
+            .contains("not a bounded schema-1 investigator report"),
+        "{report}"
+    );
+    let cursor = fixture.cursor();
+    assert!(cursor["intake"].is_null(), "{cursor}");
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        baseline + 1,
+        "ambiguity starts no model work: {cursor}"
+    );
+
+    // A repeated resume keeps refusing the same ambiguous message without
+    // admitting anything or dispatching a fresh round.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert!(fixture.status_json()["candidate"].is_null());
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        baseline + 1
     );
 }
 
