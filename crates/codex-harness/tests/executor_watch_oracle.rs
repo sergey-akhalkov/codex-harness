@@ -19,6 +19,12 @@
 //! Both are supplied explicitly and live outside shared history; when they
 //! are absent only the product-neutral checks and the private control
 //! evidence apply.
+//!
+//! The opt-in source-only preparation is covered by the refusal checks below
+//! and, when `HARNESS_WATCH_ORACLE_PREPARE_WORKSPACE`,
+//! `HARNESS_WATCH_ORACLE_PREPARE_CARGO` and
+//! `HARNESS_WATCH_ORACLE_PREPARE_OWNER` name a clean source-only checkout and
+//! the pinned programs outside it, by one real prepared acceptance run.
 #![cfg(windows)]
 
 use serde_json::Value;
@@ -61,6 +67,14 @@ fn checker(workspace: &Path, executable: Option<&Path>) -> Output {
     if let Some(executable) = executable {
         command.arg("--exe").arg(executable);
     }
+    command.output().unwrap()
+}
+
+/// Run the checker directly with raw arguments, for spellings the typed
+/// helper above cannot express.
+fn run_watch_oracle(args: &[&str]) -> Output {
+    let mut command = Command::new(fixture());
+    command.arg("watch-oracle").args(args);
     command.output().unwrap()
 }
 
@@ -281,4 +295,154 @@ fn fixture_modes_stay_compatible() {
         .output()
         .unwrap();
     assert_ne!(invalid.status.code(), Some(0), "{}", text(&invalid));
+}
+
+/// The opt-in preparation is explicit: incomplete or conflicting spellings
+/// are refused before anything runs, so a half-configured preparation can
+/// never fall back to the default prebuilt path or an ambient compiler.
+#[test]
+fn preparation_options_are_refused_when_incomplete_or_conflicting() {
+    let workspace = workspace().to_string_lossy().into_owned();
+    let manager = manager().to_string_lossy().into_owned();
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["--prepare"], "--cargo"),
+        (
+            vec!["--prepare", "--cargo", manager.as_str()],
+            "--resource-owner",
+        ),
+        (
+            vec![
+                "--workspace",
+                workspace.as_str(),
+                "--cargo",
+                manager.as_str(),
+            ],
+            "only valid together with --prepare",
+        ),
+        (
+            vec![
+                "--workspace",
+                workspace.as_str(),
+                "--resource-owner",
+                manager.as_str(),
+            ],
+            "only valid together with --prepare",
+        ),
+        (
+            vec![
+                "--workspace",
+                workspace.as_str(),
+                "--prepare",
+                "--cargo",
+                manager.as_str(),
+                "--resource-owner",
+                manager.as_str(),
+                "--exe",
+                manager.as_str(),
+            ],
+            "cannot be combined with --exe",
+        ),
+    ];
+    for (args, expected) in cases {
+        let out = run_watch_oracle(&args);
+        assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+        let printed = text(&out);
+        assert!(
+            printed.contains(expected),
+            "expected {expected:?} in: {printed}"
+        );
+    }
+}
+
+/// Preparation accepts only absolute, existing, candidate-external programs:
+/// neither PATH lookup nor a candidate-writable program may stand in for the
+/// pinned tools.
+#[test]
+fn preparation_tools_must_be_absolute_ordinary_files_outside_the_checkout() {
+    let workspace = workspace();
+    let manager = manager();
+    let workspace_text = workspace.to_string_lossy().into_owned();
+    let manager_text = manager.to_string_lossy().into_owned();
+    let missing = workspace.join("no-such-preparation-cargo.exe");
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (
+            vec![
+                "--workspace",
+                workspace_text.as_str(),
+                "--prepare",
+                "--cargo",
+                "cargo",
+                "--resource-owner",
+                manager_text.as_str(),
+            ],
+            "absolute",
+        ),
+        (
+            vec![
+                "--workspace",
+                workspace_text.as_str(),
+                "--prepare",
+                "--cargo",
+                missing.to_str().unwrap(),
+                "--resource-owner",
+                manager_text.as_str(),
+            ],
+            "not an existing program",
+        ),
+        (
+            vec![
+                "--workspace",
+                workspace_text.as_str(),
+                "--prepare",
+                "--cargo",
+                manager_text.as_str(),
+                "--resource-owner",
+                manager_text.as_str(),
+            ],
+            "inside the workspace",
+        ),
+    ];
+    for (args, expected) in cases {
+        let out = run_watch_oracle(&args);
+        assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+        let printed = text(&out);
+        assert!(
+            printed.contains(expected),
+            "expected {expected:?} in: {printed}"
+        );
+    }
+}
+
+/// The opt-in preparation of a source-only workspace: when the three
+/// variables name a clean checkout and the pinned programs outside it, the
+/// checker must build that workspace, run its fixed checks and accept the
+/// built CLI in all 11 behavioral cases.
+#[test]
+fn prepared_source_only_workspace_is_built_and_accepted() {
+    let (Some(workspace), Some(cargo), Some(owner)) = (
+        std::env::var_os("HARNESS_WATCH_ORACLE_PREPARE_WORKSPACE"),
+        std::env::var_os("HARNESS_WATCH_ORACLE_PREPARE_CARGO"),
+        std::env::var_os("HARNESS_WATCH_ORACLE_PREPARE_OWNER"),
+    ) else {
+        println!("preparation variables are not set; private evidence covers this");
+        return;
+    };
+    let out = Command::new(fixture())
+        .arg("watch-oracle")
+        .arg("--workspace")
+        .arg(workspace)
+        .arg("--prepare")
+        .arg("--cargo")
+        .arg(cargo)
+        .arg("--resource-owner")
+        .arg(owner)
+        .output()
+        .unwrap();
+    let report = report(&out);
+    assert_eq!(report["preparation"]["passed"], true, "{}", text(&out));
+    assert_eq!(report["preparation"]["executedBy"], "checker");
+    assert_eq!(report["preparation"]["steps"].as_array().unwrap().len(), 4);
+    assert_eq!(report["cases"].as_array().unwrap().len(), 11);
+    assert_eq!(report["passed"], true, "{}", text(&out));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }

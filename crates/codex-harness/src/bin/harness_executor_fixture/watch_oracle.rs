@@ -2,6 +2,8 @@
 //! contract, driven through the workspace's own built CLI.
 //!
 //! `harness-executor-fixture watch-oracle --workspace DIR [--exe PROGRAM]`
+//! `harness-executor-fixture watch-oracle --workspace DIR --prepare
+//!   --cargo PROGRAM --resource-owner PROGRAM`
 //! seeds private native receipts and a live host stand-in, then runs the real
 //! `executor watch` entry point of the workspace's `codex-harness` executable
 //! against them. The verdict comes from observed exit status, the printed
@@ -10,6 +12,17 @@
 //! or a success marker. The executable must be an ordinary file newer than
 //! every Rust source of the workspace, so a missing or skipped build is
 //! rejected before any behavior check.
+//!
+//! With `--prepare`, the same call first prepares a source-only workspace: the
+//! checker itself runs the fixed native workload checks - a locked `cargo
+//! build` of the workspace CLI, `cargo fmt --check`, scoped `cargo clippy` and
+//! the `executor_observation` regression - through caller-supplied absolute
+//! Cargo and resource-owner programs, and only then resolves the freshly built
+//! CLI. Preparation is part of the measured call and runs only when every step
+//! succeeds; a failed or skipped step is refused, never reported as success.
+//! The report marks this work as checker-owned, with the pinned tool
+//! identities and the retained step output, so it cannot be confused with a
+//! model-side build or check claim.
 //!
 //! Cases:
 //! - `built-executable`: ordinary workspace executable, newer than its sources;
@@ -53,10 +66,17 @@ use std::{
 
 const USAGE: &str = "\
 harness-executor-fixture watch-oracle [--workspace DIRECTORY] [--exe PROGRAM]
+                                      [--prepare --cargo PROGRAM --resource-owner PROGRAM]
   Candidate-independent acceptance for the finalized executor watch contract.
   Runs the workspace's built codex-harness through the real `executor watch`
   entry point against private controlled receipts and a live host stand-in.
-  Exit 0 only when every case passed; the JSON report names each case.";
+  Exit 0 only when every case passed; the JSON report names each case.
+  --prepare, with absolute existing --cargo and --resource-owner programs,
+  prepares a source-only workspace first: the checker itself runs the fixed
+  native build, formatting, scoped clippy and executor_observation checks
+  through the shared resource owner, then the behavior cases against the CLI
+  it built. No program is resolved through PATH, and --prepare cannot be
+  combined with --exe.";
 
 /// Exact native session identity the controlled receipts record.
 const SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f3f10";
@@ -75,6 +95,20 @@ const FINALIZE_AFTER: Duration = Duration::from_millis(800);
 const POLL_MS: &str = "50";
 /// Clock tolerance when asserting a call reached its declared timeout.
 const TIMEOUT_SLACK_MS: u64 = 500;
+/// Step ids of the opt-in native preparation.
+const STEP_BUILD: &str = "build";
+const STEP_FORMAT: &str = "format";
+const STEP_CLIPPY: &str = "clippy";
+const STEP_OBSERVATION: &str = "executor-observation";
+/// `cargo fmt --check` only reads sources; this bound covers a cold rustfmt.
+const FORMAT_WATCHDOG: Duration = Duration::from_secs(600);
+/// Compiled steps run under the shared heavy resource owner, whose documented
+/// default worst case is a 3600s queue wait plus a 1800s command deadline and
+/// bounded cleanup; the checker's own backstop must not preempt that owner.
+const COMPILED_WATCHDOG: Duration = Duration::from_secs(6000);
+/// Retained output of one preparation step, taken from the end of the stream
+/// where a compiler or test error summary lives.
+const PREPARATION_EXCERPT_LIMIT: usize = 4000;
 /// Session identity of the surrounding caller must not leak to the CLI.
 const CLEARED_ENV: [&str; 13] = [
     "HARNESS_EXECUTOR_SESSION",
@@ -119,6 +153,9 @@ const SKIPPED_AFTER_IDENTITY: [&str; 9] = [
 pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
     let mut workspace: Option<PathBuf> = None;
     let mut executable: Option<PathBuf> = None;
+    let mut prepare = false;
+    let mut cargo: Option<PathBuf> = None;
+    let mut resource_owner: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         let key = args[index]
@@ -129,20 +166,63 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
                 println!("{USAGE}");
                 return Ok(0);
             }
-            "--workspace" | "--exe" => {
+            "--prepare" => {
+                if prepare {
+                    return Err(invalid("duplicate watch-oracle --prepare"));
+                }
+                prepare = true;
+                index += 1;
+            }
+            "--workspace" | "--exe" | "--cargo" | "--resource-owner" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| invalid(&format!("watch-oracle {key} needs a path")))?;
-                if key == "--workspace" {
-                    workspace = Some(PathBuf::from(value));
-                } else {
-                    executable = Some(PathBuf::from(value));
+                match key {
+                    "--workspace" => workspace = Some(PathBuf::from(value)),
+                    "--exe" => executable = Some(PathBuf::from(value)),
+                    "--cargo" => {
+                        if cargo.replace(PathBuf::from(value)).is_some() {
+                            return Err(invalid("duplicate watch-oracle --cargo"));
+                        }
+                    }
+                    _ => {
+                        if resource_owner.replace(PathBuf::from(value)).is_some() {
+                            return Err(invalid("duplicate watch-oracle --resource-owner"));
+                        }
+                    }
                 }
                 index += 2;
             }
             _ => return Err(invalid(&format!("invalid watch-oracle option: {key}"))),
         }
     }
+    if prepare && executable.is_some() {
+        return Err(invalid(
+            "watch-oracle --prepare builds the workspace's own CLI and cannot be combined with --exe (an explicit control executable)",
+        ));
+    }
+    // Tool presence is refused before the workspace is inspected: an
+    // incomplete or conflicting preparation spelling must not be judged by
+    // whatever directory happens to be the default workspace.
+    let requested_tools = match (prepare, cargo, resource_owner) {
+        (false, None, None) => None,
+        (false, _, _) => {
+            return Err(invalid(
+                "watch-oracle --cargo and --resource-owner are only valid together with --prepare",
+            ));
+        }
+        (true, None, _) => {
+            return Err(invalid(
+                "watch-oracle --prepare needs --cargo with the absolute path of an existing Cargo executable",
+            ));
+        }
+        (true, _, None) => {
+            return Err(invalid(
+                "watch-oracle --prepare needs --resource-owner with the absolute path of the installed codex-harness executable that owns the shared heavy command slot",
+            ));
+        }
+        (true, Some(cargo), Some(resource_owner)) => Some((cargo, resource_owner)),
+    };
     let workspace = match workspace {
         Some(path) => path,
         None => env::current_dir()?,
@@ -158,12 +238,33 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             "watch-oracle --workspace must be the root of a codex-harness checkout",
         ));
     }
-    let (resolved, mut cases) = match resolve(&workspace, executable.as_deref()) {
-        Ok(resolved) => {
-            let detail = resolved.detail.clone();
-            (Some(resolved), vec![Case::pass(CASE_BUILD, detail)])
+    let tools = match requested_tools {
+        Some((cargo, resource_owner)) => {
+            Some(preparation_tools(&workspace, cargo, resource_owner)?)
         }
-        Err(cause) => (None, vec![Case::fail(CASE_BUILD, cause)]),
+        None => None,
+    };
+    let (resolved, mut cases, preparation) = match &tools {
+        Some(tools) => {
+            let preparation = prepare_workspace(&workspace, tools);
+            if preparation.passed {
+                // The prepared path tests exactly the debug CLI this call
+                // built, not a stale artifact found beside it.
+                let built = workspace
+                    .join("target")
+                    .join("debug")
+                    .join("codex-harness.exe");
+                let (resolved, cases) = workspace_executable_cases(&workspace, Some(&built));
+                (resolved, cases, Some(preparation))
+            } else {
+                let cause = preparation.failure_cause();
+                (None, preparation_skipped_cases(&cause), Some(preparation))
+            }
+        }
+        None => {
+            let (resolved, cases) = workspace_executable_cases(&workspace, executable.as_deref());
+            (resolved, cases, None)
+        }
     };
     if let Some(exe) = resolved.as_ref().map(|resolved| &resolved.path) {
         if let Some(cause) = identity_case(exe) {
@@ -190,13 +291,17 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
             cases.push(defect_case(exe, OutputMode::Json));
         }
     }
-    let passed = cases.iter().all(|case| case.passed());
+    let passed = cases.iter().all(|case| case.passed())
+        && preparation
+            .as_ref()
+            .is_none_or(|preparation| preparation.passed);
     let report = json!({
         "schema": 1,
         "kind": "executor-watch-oracle",
         "workspace": workspace.to_string_lossy(),
         "executable": resolved.as_ref().map(|resolved| resolved.path.to_string_lossy().into_owned()),
         "executableSha256": resolved.as_ref().map(|resolved| resolved.sha256.clone()),
+        "preparation": preparation.as_ref().map_or(Value::Null, Preparation::json),
         "cases": cases.iter().map(Case::json).collect::<Vec<_>>(),
         "passed": passed,
     });
@@ -205,6 +310,408 @@ pub(crate) fn run(args: &[OsString]) -> io::Result<i32> {
         serde_json::to_string_pretty(&report).map_err(io::Error::other)?
     );
     Ok(if passed { 0 } else { 1 })
+}
+
+/// The workspace executable resolution as acceptance cases: either the built
+/// executable was found (and reported by its detail), or the reason it could
+/// not be accepted. The default prebuilt path resolves the workspace's own
+/// candidates; the prepared path names the exact debug build this call made.
+fn workspace_executable_cases(
+    workspace: &Path,
+    explicit: Option<&Path>,
+) -> (Option<Resolved>, Vec<Case>) {
+    match resolve(workspace, explicit) {
+        Ok(resolved) => {
+            let detail = resolved.detail.clone();
+            (Some(resolved), vec![Case::pass(CASE_BUILD, detail)])
+        }
+        Err(cause) => (None, vec![Case::fail(CASE_BUILD, cause)]),
+    }
+}
+
+/// Caller-supplied programs for the opt-in preparation: Cargo and the
+/// installed codex-harness executable that owns the shared heavy command
+/// slot. Both are absolute ordinary files outside the workspace, and their
+/// digests are reported so a frozen caller can bind exactly the pinned tools.
+struct PreparationTools {
+    cargo: PathBuf,
+    cargo_sha256: String,
+    owner: PathBuf,
+    owner_sha256: String,
+}
+
+/// Verify the preparation programs. Nothing is resolved through PATH, so an
+/// ambient compiler or runner can never stand in for what the caller pinned.
+fn preparation_tools(
+    workspace: &Path,
+    cargo: PathBuf,
+    owner: PathBuf,
+) -> io::Result<PreparationTools> {
+    let cargo_sha256 = preparation_program(workspace, &cargo, "--cargo")?;
+    let owner_sha256 = preparation_program(workspace, &owner, "--resource-owner")?;
+    if cargo == owner {
+        return Err(invalid(
+            "watch-oracle --cargo and --resource-owner must name different programs",
+        ));
+    }
+    Ok(PreparationTools {
+        cargo,
+        cargo_sha256,
+        owner,
+        owner_sha256,
+    })
+}
+
+/// One pinned preparation program: an absolute existing ordinary file
+/// outside the workspace, so the candidate cannot supply the tools that
+/// check it.
+fn preparation_program(workspace: &Path, path: &Path, option: &str) -> io::Result<String> {
+    if !path.is_absolute() {
+        return Err(invalid(&format!(
+            "watch-oracle {option} must be an absolute path to an existing program: {}",
+            path.display()
+        )));
+    }
+    let path = path.canonicalize().map_err(|error| {
+        invalid(&format!(
+            "watch-oracle {option} {} is not an existing program: {error}",
+            path.display()
+        ))
+    })?;
+    build_identity::ordinary(&path).map_err(|error| {
+        invalid(&format!(
+            "watch-oracle {option} {} is not an ordinary file: {error}",
+            path.display()
+        ))
+    })?;
+    if !path.is_file() {
+        return Err(invalid(&format!(
+            "watch-oracle {option} {} is not a file",
+            path.display()
+        )));
+    }
+    if path.starts_with(workspace) {
+        return Err(invalid(&format!(
+            "watch-oracle {option} {} is inside the workspace; preparation tools are pinned outside the candidate's write scope",
+            path.display()
+        )));
+    }
+    build_identity::hash_file(&path).map_err(|error| {
+        invalid(&format!(
+            "watch-oracle {option} {} is unreadable: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// The fixed, task-specific preparation commands. Compiled steps run through
+/// the caller's resource owner (`<owner> heavy -- <cargo> ...`), which queues
+/// them against the shared account budget and its bounded Job; the formatting
+/// step only reads sources and runs directly. No step is configurable and no
+/// program is resolved through PATH.
+fn preparation_steps(tools: &PreparationTools) -> Vec<(&'static str, Vec<OsString>, Duration)> {
+    let cargo = &tools.cargo;
+    let owner = &tools.owner;
+    vec![
+        (
+            STEP_BUILD,
+            heavy_arguments(
+                owner,
+                cargo,
+                &[
+                    "build",
+                    "--locked",
+                    "-p",
+                    "codex-harness",
+                    "--bin",
+                    "codex-harness",
+                    "--jobs",
+                    "1",
+                ],
+            ),
+            COMPILED_WATCHDOG,
+        ),
+        (
+            STEP_FORMAT,
+            argv(cargo, &["fmt", "-p", "codex-harness", "--", "--check"]),
+            FORMAT_WATCHDOG,
+        ),
+        (
+            STEP_CLIPPY,
+            heavy_arguments(
+                owner,
+                cargo,
+                &[
+                    "clippy",
+                    "--locked",
+                    "-p",
+                    "codex-harness",
+                    "--all-targets",
+                    "--jobs",
+                    "1",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            ),
+            COMPILED_WATCHDOG,
+        ),
+        (
+            STEP_OBSERVATION,
+            heavy_arguments(
+                owner,
+                cargo,
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "codex-harness",
+                    "--test",
+                    "executor_observation",
+                    "--jobs",
+                    "1",
+                    "--",
+                    "--test-threads=1",
+                ],
+            ),
+            COMPILED_WATCHDOG,
+        ),
+    ]
+}
+
+fn argv(program: &Path, arguments: &[&str]) -> Vec<OsString> {
+    std::iter::once(program.as_os_str().to_owned())
+        .chain(arguments.iter().map(|part| OsString::from(*part)))
+        .collect()
+}
+
+fn heavy_arguments(owner: &Path, cargo: &Path, command: &[&str]) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = vec![
+        owner.as_os_str().to_owned(),
+        OsString::from("heavy"),
+        OsString::from("--"),
+        cargo.as_os_str().to_owned(),
+    ];
+    arguments.extend(command.iter().map(|part| OsString::from(*part)));
+    arguments
+}
+
+/// One executed preparation step with its bounded retained output.
+struct PreparationStep {
+    id: &'static str,
+    argv: Vec<String>,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    seconds: f64,
+    deadline_seconds: u64,
+    error: Option<String>,
+    output: String,
+}
+
+impl PreparationStep {
+    fn passed(&self) -> bool {
+        self.error.is_none() && !self.timed_out && self.exit_code == Some(0)
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "command": self.argv,
+            "exitCode": self.exit_code,
+            "timedOut": self.timed_out,
+            "seconds": self.seconds,
+            "deadlineSeconds": self.deadline_seconds,
+            "error": self.error,
+            "output": self.output,
+        })
+    }
+}
+
+/// The checker-owned preparation outcome: pinned tool identities, the exact
+/// commands and every step's retained output.
+struct Preparation {
+    cargo: PathBuf,
+    cargo_sha256: String,
+    owner: PathBuf,
+    owner_sha256: String,
+    target_dir: PathBuf,
+    steps: Vec<PreparationStep>,
+    passed: bool,
+}
+
+impl Preparation {
+    fn failure_cause(&self) -> String {
+        let Some(step) = self.steps.iter().find(|step| !step.passed()) else {
+            return "preparation did not complete".to_owned();
+        };
+        match (&step.error, step.exit_code) {
+            (Some(error), _) => format!("preparation step '{}' could not run: {error}", step.id),
+            (None, Some(code)) if step.timed_out => format!(
+                "preparation step '{}' was ended after its {}s bound (exit {code})",
+                step.id, step.deadline_seconds
+            ),
+            (None, Some(code)) => format!("preparation step '{}' exited {code}", step.id),
+            (None, None) => format!(
+                "preparation step '{}' ended without an exit status",
+                step.id
+            ),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "schema": 1,
+            "mode": "native-cargo",
+            "executedBy": "checker",
+            "cargo": {
+                "path": self.cargo.to_string_lossy(),
+                "sha256": self.cargo_sha256,
+            },
+            "resourceOwner": {
+                "path": self.owner.to_string_lossy(),
+                "sha256": self.owner_sha256,
+            },
+            "environment": {"CARGO_TARGET_DIR": self.target_dir.to_string_lossy()},
+            "steps": self.steps.iter().map(PreparationStep::json).collect::<Vec<_>>(),
+            "passed": self.passed,
+        })
+    }
+}
+
+/// Checker-owned preparation of a source-only workspace: the fixed steps run
+/// in order and stop at the first failure. Steps not reached stay absent, so
+/// nothing skipped is ever reported as success.
+fn prepare_workspace(workspace: &Path, tools: &PreparationTools) -> Preparation {
+    let target_dir = workspace.join("target");
+    let mut steps = Vec::new();
+    let mut passed = true;
+    for (id, argv, watchdog) in preparation_steps(tools) {
+        let step = run_preparation_step(workspace, &target_dir, id, argv, watchdog);
+        let ok = step.passed();
+        steps.push(step);
+        if !ok {
+            passed = false;
+            break;
+        }
+    }
+    Preparation {
+        cargo: tools.cargo.clone(),
+        cargo_sha256: tools.cargo_sha256.clone(),
+        owner: tools.owner.clone(),
+        owner_sha256: tools.owner_sha256.clone(),
+        target_dir,
+        steps,
+        passed,
+    }
+}
+
+/// Run one preparation command with the step's bounded deadline and retain
+/// its output. The workspace's own `target` directory receives Cargo's build
+/// output: an ambient `CARGO_TARGET_DIR` must not move the prepared artifact
+/// out of the workspace the checker then resolves and tests.
+fn run_preparation_step(
+    workspace: &Path,
+    target_dir: &Path,
+    id: &'static str,
+    argv: Vec<OsString>,
+    watchdog: Duration,
+) -> PreparationStep {
+    let command: Vec<String> = argv
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    let deadline_seconds = watchdog.as_secs();
+    let record = |exit_code, timed_out, seconds, error, output| PreparationStep {
+        id,
+        argv: command.clone(),
+        exit_code,
+        timed_out,
+        seconds,
+        deadline_seconds,
+        error,
+        output,
+    };
+    let Some((program, arguments)) = argv.split_first() else {
+        return record(
+            None,
+            false,
+            0.0,
+            Some("the step has no program".to_owned()),
+            String::new(),
+        );
+    };
+    let started = Instant::now();
+    let child = Command::new(program)
+        .args(arguments)
+        .current_dir(workspace)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return record(
+                None,
+                false,
+                started.elapsed().as_secs_f64(),
+                Some(error.to_string()),
+                String::new(),
+            );
+        }
+    };
+    match wait(child, started, watchdog) {
+        Ok(outcome) => record(
+            outcome.code,
+            !outcome.finished,
+            outcome.elapsed.as_secs_f64(),
+            None,
+            tail_excerpt(&outcome.output, PREPARATION_EXCERPT_LIMIT),
+        ),
+        Err(error) => record(
+            None,
+            false,
+            started.elapsed().as_secs_f64(),
+            Some(error.to_string()),
+            String::new(),
+        ),
+    }
+}
+
+/// The end of a command's retained output, where a compiler or test error
+/// summary lives, bounded for the report.
+fn tail_excerpt(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    let total = trimmed.chars().count();
+    if total <= limit {
+        return trimmed.to_owned();
+    }
+    let mut excerpt = String::from("…");
+    excerpt.extend(trimmed.chars().skip(total - limit));
+    excerpt
+}
+
+/// Failed preparation runs no behavior case: every case is reported as
+/// skipped with the failing step, and the report is not a success.
+fn preparation_skipped_cases(cause: &str) -> Vec<Case> {
+    let detail = format!("not run: {cause}");
+    [
+        CASE_BUILD,
+        CASE_IDENTITY,
+        CASE_FAILED,
+        CASE_FINALIZED_TEXT,
+        CASE_FINALIZED_JSON,
+        CASE_PENDING_TEXT,
+        CASE_PENDING_JSON,
+        CASE_DURING_TEXT,
+        CASE_DURING_JSON,
+        CASE_DEFECT_TEXT,
+        CASE_DEFECT_JSON,
+    ]
+    .into_iter()
+    .map(|id| Case::skip(id, detail.clone()))
+    .collect()
 }
 
 /// One acceptance case: its verdict and the observed cause when it failed.
