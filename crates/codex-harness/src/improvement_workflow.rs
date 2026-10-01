@@ -92,7 +92,18 @@ fn retain_candidate_ready(
     candidate: &CandidateState,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
-    if run.cursor.phase == Phase::CandidateReady {
+    // A later advance must not turn a recorded decision or confirmed
+    // activation back into candidate-ready. Idle, blocked and stopped are
+    // conditions of the current evidence, not a request to re-enter planning.
+    if matches!(
+        run.cursor.phase,
+        Phase::CandidateReady
+            | Phase::DecisionRecorded
+            | Phase::ActivationConfirmed
+            | Phase::Idle
+            | Phase::Blocked
+            | Phase::Stopped
+    ) {
         return Ok(());
     }
     run.cursor.phase = Phase::CandidateReady;

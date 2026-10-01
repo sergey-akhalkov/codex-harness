@@ -326,6 +326,18 @@ impl Fixture {
         ])
     }
 
+    fn start_continuous(&self) -> Output {
+        self.improve(&[
+            "start",
+            "--run",
+            self.run.to_str().unwrap(),
+            "--spec",
+            self.spec.to_str().unwrap(),
+            "--supervision",
+            "continuous",
+        ])
+    }
+
     fn resume(&self) -> Output {
         self.improve(&["resume", "--run", self.run.to_str().unwrap()])
     }
@@ -2656,5 +2668,42 @@ fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
     assert!(
         comments.contains(&format!("revision={scaffold_revision} ")),
         "recovery did not publish the preserved scaffold revision: {comments}"
+    );
+}
+
+#[test]
+fn continuous_start_idles_without_a_model_call() {
+    let fixture = Fixture::new("continuous-idle");
+    fake_launcher(&fixture);
+    let start = fixture.start_continuous();
+    assert!(start.status.success(), "{}", text(&start));
+    assert!(
+        text(&start).contains("continuous supervision"),
+        "{}",
+        text(&start)
+    );
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "idle", "{report}");
+    assert_eq!(report["supervision"], "continuous", "{report}");
+    assert_eq!(report["attempts"].as_array().unwrap().len(), 0, "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap()
+            .contains("no retained evidence"),
+        "{report}"
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert_eq!(fixture.status_json()["phase"], "idle");
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 0);
+    assert!(
+        !fixture
+            .run
+            .join("assignments")
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry.is_ok()),
+        "an idle continuous loop writes no assignment"
     );
 }
