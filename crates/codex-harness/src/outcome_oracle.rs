@@ -22,6 +22,24 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+use harness_core::{
+    cancellable_pipe::{self, CancellablePipe, PIPE_BUFFER, PipeIoError, READ_CHUNK},
+    heavy_command,
+    process::{Cancellation, CommandSpec, Deadline, StopReason},
+};
+#[cfg(windows)]
+use std::{
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -515,6 +533,11 @@ pub(super) fn run_program(
 /// containment and a declared bound above the case runner's 600 seconds; the
 /// resource owner provides all three, and its nested-admission contract lets
 /// the checker's own fixed steps run under the same account slot.
+/// Output is drained through owned byte pipes and retained up to a hard cap
+/// per stream, so the retained files obey the reported bound even when a fast
+/// writer exits before the observer reacts; the verdict uses the observed
+/// facts, not only the stop reason, and keeps the original native exit
+/// recorded beside the limit cause.
 #[cfg(windows)]
 pub(super) fn run_admitted_program(
     workspace: &Path,
@@ -525,32 +548,20 @@ pub(super) fn run_admitted_program(
     timeout: u64,
     runs: &mut Vec<Value>,
 ) -> io::Result<Value> {
-    use harness_core::{
-        heavy_command,
-        process::{Cancellation, CommandSpec, StopReason},
-    };
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::sync::atomic::AtomicBool;
 
-    const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
     const CLEANUP: Duration = Duration::from_secs(10);
     const POLL: Duration = Duration::from_millis(50);
 
     let root = evidence.join(label);
     fs::create_dir_all(&root)?;
-    let stdout_path = root.join("stdout.txt");
-    let stderr_path = root.join("stderr.txt");
+    let declared = Duration::from_secs(timeout);
+    let mut stdout = start_admitted_capture(root.join("stdout.txt"), declared)?;
+    let mut stderr = start_admitted_capture(root.join("stderr.txt"), declared)?;
     let program = exe.to_owned();
     let arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
     let account = heavy_command::account_dir(None)?;
     let budget = heavy_command::Budget::read(&account)?;
-    let declared = Duration::from_secs(timeout);
     let started = Instant::now();
     let cancellation = Cancellation::default();
     let stop = Arc::new(AtomicBool::new(false));
@@ -561,13 +572,12 @@ pub(super) fn run_admitted_program(
         let stop = Arc::clone(&stop);
         let bound_hit = Arc::clone(&bound_hit);
         let output_hit = Arc::clone(&output_hit);
-        let stdout_path = stdout_path.clone();
-        let stderr_path = stderr_path.clone();
+        let stdout_total = Arc::clone(&stdout.original);
+        let stderr_total = Arc::clone(&stderr.original);
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let over = [&stdout_path, &stderr_path].iter().any(|path| {
-                    fs::metadata(path).is_ok_and(|metadata| metadata.len() > OUTPUT_LIMIT)
-                });
+                let over = stdout_total.load(Ordering::Relaxed) > ADMITTED_OUTPUT_LIMIT
+                    || stderr_total.load(Ordering::Relaxed) > ADMITTED_OUTPUT_LIMIT;
                 if over {
                     output_hit.store(true, Ordering::Relaxed);
                     cancellation.cancel();
@@ -582,6 +592,8 @@ pub(super) fn run_admitted_program(
             }
         })
     };
+    let mut stdout_write = stdout.write.take();
+    let mut stderr_write = stderr.write.take();
     let label_text = heavy_command::label(program.as_os_str(), &arguments);
     let admission =
         match heavy_command::Admission::acquire(&account, &budget, &label_text, &cancellation) {
@@ -589,6 +601,10 @@ pub(super) fn run_admitted_program(
             Err(error) => {
                 stop.store(true, Ordering::Relaxed);
                 let _ = watcher.join();
+                drop(stdout_write.take());
+                drop(stderr_write.take());
+                finish_admitted_capture(stdout);
+                finish_admitted_capture(stderr);
                 let cause = if bound_hit.load(Ordering::Relaxed) {
                     "the declared deadline expired while waiting for the shared heavy-command slot"
                 } else {
@@ -606,20 +622,29 @@ pub(super) fn run_admitted_program(
         let mut spec = CommandSpec::new(program);
         spec.args = arguments;
         spec.current_dir = Some(workspace.to_owned());
-        spec.stdout = Some(File::create(&stdout_path)?);
-        spec.stderr = Some(File::create(&stderr_path)?);
+        spec.stdout = stdout_write.take();
+        spec.stderr = stderr_write.take();
         spec.env
             .insert(OsString::from(heavy_command::LEASE_ENV), Some(marker));
         let suspended = admission.spawn_in_envelope(&job, &spec)?;
+        // The payload owns its duplicated handles now; close ours so the
+        // drains observe EOF as soon as the owned tree is gone.
+        spec.stdout = None;
+        spec.stderr = None;
         let child = suspended.resume()?;
         job.wait(&child, budget.deadline()?, &cancellation, CLEANUP)
     })();
+    let elapsed = started.elapsed();
     stop.store(true, Ordering::Relaxed);
     let _ = watcher.join();
+    drop(stdout_write.take());
+    drop(stderr_write.take());
+    let stdout_summary = finish_admitted_capture(stdout);
+    let stderr_summary = finish_admitted_capture(stderr);
     let outcome = payload.map_err(|error| {
         io::Error::other(format!(
             "the admitted checker could not be started or cleaned: {error}; elapsed {:.1}s",
-            started.elapsed().as_secs_f64()
+            elapsed.as_secs_f64()
         ))
     })?;
     let native_status = match outcome.reason {
@@ -628,40 +653,30 @@ pub(super) fn run_admitted_program(
         StopReason::MemoryLimit => "memory-limit",
         StopReason::Cancelled => "cancelled",
     };
-    let status = match outcome.reason {
-        StopReason::Cancelled if output_hit.load(Ordering::Relaxed) => "output-limit",
-        StopReason::Cancelled if bound_hit.load(Ordering::Relaxed) => "timeout",
-        _ => native_status,
-    };
-    let stopped_by = match outcome.reason {
-        StopReason::Timeout => Some("machine-deadline"),
-        StopReason::MemoryLimit => Some("machine-memory-budget"),
-        StopReason::Cancelled if output_hit.load(Ordering::Relaxed) => Some("output-limit"),
-        StopReason::Cancelled if bound_hit.load(Ordering::Relaxed) => Some("declared-deadline"),
-        StopReason::Cancelled => Some("cancellation"),
-        StopReason::Exited => None,
-    };
-    let stream = |path: &Path| {
+    let output_breach = output_hit.load(Ordering::Relaxed)
+        || stdout_summary.original > ADMITTED_OUTPUT_LIMIT
+        || stderr_summary.original > ADMITTED_OUTPUT_LIMIT;
+    let deadline_breach = bound_hit.load(Ordering::Relaxed);
+    let (status, stopped_by) = admitted_verdict(outcome.reason, output_breach, deadline_breach);
+    let stream = |summary: &AdmittedStreamSummary| {
         json!({
-            "path": path.to_string_lossy(),
-            "bytes": fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+            "path": summary.path.to_string_lossy(),
+            "bytes": summary.retained,
+            "originalBytes": summary.original,
+            "truncated": summary.truncated,
+            "limit": ADMITTED_OUTPUT_LIMIT,
+            "finalized": summary.finalized,
+            "error": summary.error,
         })
     };
-    let stdout_bytes = fs::metadata(&stdout_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let stderr_bytes = fs::metadata(&stderr_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let output_over = stdout_bytes > OUTPUT_LIMIT || stderr_bytes > OUTPUT_LIMIT;
     let value = json!({
         "status": status,
         "reason": format!("{:?}", outcome.reason),
         "exit_code": outcome.exit_code,
-        "elapsed_seconds": started.elapsed().as_secs_f64(),
+        "elapsed_seconds": elapsed.as_secs_f64(),
         "declared_deadline_seconds": timeout,
         "stopped_by": stopped_by,
-        "output_limit_reached": output_hit.load(Ordering::Relaxed) || output_over,
+        "output_limit_reached": output_breach,
         "admission": {
             "route": "shared-heavy-command",
             "account": account.to_string_lossy(),
@@ -680,7 +695,7 @@ pub(super) fn run_admitted_program(
             "CpuRate": outcome.job.cpu_rate,
             "KillOnClose": outcome.job.kill_on_close,
         },
-        "streams": {"stdout": stream(&stdout_path), "stderr": stream(&stderr_path)},
+        "streams": {"stdout": stream(&stdout_summary), "stderr": stream(&stderr_summary)},
         "root": root.to_string_lossy(),
     });
     runs.push(value.clone());
@@ -702,4 +717,231 @@ pub(super) fn run_admitted_program(
         io::ErrorKind::Unsupported,
         "the admitted real-task route requires Windows Job Objects",
     ))
+}
+
+/// Hard per-stream retention bound of the admitted real-task check.
+#[cfg(windows)]
+const ADMITTED_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// One stream of the admitted check: the payload's write end plus the drain
+/// thread that retains at most [`ADMITTED_OUTPUT_LIMIT`] bytes and counts the
+/// original total, so retained output obeys the reported bound even when a
+/// fast writer exits before the observer reacts.
+#[cfg(windows)]
+struct AdmittedCapture {
+    path: PathBuf,
+    write: Option<File>,
+    cancel: Cancellation,
+    original: Arc<AtomicU64>,
+    done: mpsc::Receiver<AdmittedStreamSummary>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+struct AdmittedStreamSummary {
+    path: PathBuf,
+    original: u64,
+    retained: u64,
+    truncated: bool,
+    finalized: bool,
+    error: Option<String>,
+}
+
+#[cfg(windows)]
+fn start_admitted_capture(path: PathBuf, declared: Duration) -> io::Result<AdmittedCapture> {
+    let (read, write) = cancellable_pipe::anonymous_pipe(PIPE_BUFFER).map_err(io::Error::from)?;
+    let cancel = Cancellation::default();
+    let original = Arc::new(AtomicU64::new(0));
+    let (done, received) = mpsc::channel();
+    let worker = {
+        let cancel = cancel.clone();
+        let original = Arc::clone(&original);
+        let path = path.clone();
+        thread::Builder::new()
+            .name("oracle-stream-capture".into())
+            .spawn(move || {
+                let summary = drain_admitted_stream(read, path, original, cancel, declared);
+                let _ = done.send(summary);
+            })?
+    };
+    Ok(AdmittedCapture {
+        path,
+        write: Some(write),
+        cancel,
+        original,
+        done: received,
+        worker: Some(worker),
+    })
+}
+
+#[cfg(windows)]
+fn drain_admitted_stream(
+    read: File,
+    path: PathBuf,
+    original: Arc<AtomicU64>,
+    cancel: Cancellation,
+    declared: Duration,
+) -> AdmittedStreamSummary {
+    let mut summary = AdmittedStreamSummary {
+        path: path.clone(),
+        original: 0,
+        retained: 0,
+        truncated: false,
+        finalized: false,
+        error: None,
+    };
+    let result = (|| -> Result<(), String> {
+        let mut pipe =
+            CancellablePipe::reader(read, cancel.clone()).map_err(|error| error.to_string())?;
+        let mut file = File::create(&path).map_err(|error| error.to_string())?;
+        // One bounded read deadline for the whole drain: an expired read is
+        // terminal for the I/O owner (it stops its worker), so a shorter poll
+        // must never stand in for the call's declared bound.
+        let read_deadline = Deadline::after(declared).map_err(|error| error.to_string())?;
+        loop {
+            match pipe.read(READ_CHUNK, read_deadline, &cancel) {
+                Ok(bytes) => {
+                    let total = original.fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                        + bytes.len() as u64;
+                    let take = if summary.retained >= ADMITTED_OUTPUT_LIMIT {
+                        0
+                    } else {
+                        (ADMITTED_OUTPUT_LIMIT - summary.retained).min(bytes.len() as u64) as usize
+                    };
+                    if take > 0 {
+                        file.write_all(&bytes[..take])
+                            .map_err(|error| error.to_string())?;
+                        summary.retained += take as u64;
+                    }
+                    if total > ADMITTED_OUTPUT_LIMIT {
+                        summary.truncated = true;
+                    }
+                }
+                Err(PipeIoError::EndOfFile) => break,
+                Err(PipeIoError::DeadlineExpired { .. } | PipeIoError::Cancelled { .. }) => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        file.flush().map_err(|error| error.to_string())?;
+        drop(file);
+        let close = Deadline::after(Duration::from_secs(2)).map_err(|error| error.to_string())?;
+        pipe.close(close).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        summary.error = Some(error);
+    }
+    summary.original = original.load(Ordering::Relaxed);
+    summary.finalized = summary.error.is_none();
+    summary
+}
+
+/// Wait for one drain to finalize; a drain that cannot finalize within its
+/// bound is cancelled and reported with partial counts instead of blocking the
+/// acceptance result.
+#[cfg(windows)]
+fn finish_admitted_capture(capture: AdmittedCapture) -> AdmittedStreamSummary {
+    let AdmittedCapture {
+        path,
+        write,
+        cancel,
+        original,
+        done,
+        worker,
+    } = capture;
+    drop(write);
+    match done.recv_timeout(Duration::from_secs(10)) {
+        Ok(summary) => {
+            if let Some(worker) = worker {
+                let _ = worker.join();
+            }
+            summary
+        }
+        Err(_) => {
+            cancel.cancel();
+            if let Ok(summary) = done.recv_timeout(Duration::from_secs(2)) {
+                if let Some(worker) = worker {
+                    let _ = worker.join();
+                }
+                return summary;
+            }
+            // The payload tree is gone; leave the unjoined drain to the
+            // process exit instead of blocking the acceptance result.
+            drop(worker);
+            let retained = fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            AdmittedStreamSummary {
+                path,
+                original: original.load(Ordering::Relaxed),
+                retained,
+                truncated: retained >= ADMITTED_OUTPUT_LIMIT,
+                finalized: false,
+                error: Some(
+                    "the stream capture did not finalize within its bound; retained output is partial"
+                        .to_owned(),
+                ),
+            }
+        }
+    }
+}
+
+/// The acceptance verdict after the owned tree is cleaned: a measured output
+/// overrun or a watchdog-observed deadline breach fails the run even when the
+/// payload exited first, while `native` keeps the original stop status and
+/// exit code recorded for both causes.
+#[cfg(windows)]
+fn admitted_verdict(
+    reason: StopReason,
+    output_breach: bool,
+    deadline_breach: bool,
+) -> (&'static str, Option<&'static str>) {
+    match reason {
+        StopReason::MemoryLimit => ("memory-limit", Some("machine-memory-budget")),
+        StopReason::Timeout => ("timeout", Some("machine-deadline")),
+        _ if output_breach => ("output-limit", Some("output-limit")),
+        _ if deadline_breach => ("timeout", Some("declared-deadline")),
+        StopReason::Exited => ("exited", None),
+        StopReason::Cancelled => ("cancelled", Some("cancellation")),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod admitted_verdict_tests {
+    use super::admitted_verdict;
+    use harness_core::process::StopReason;
+
+    #[test]
+    fn observed_limit_breaches_fail_even_after_a_zero_exit() {
+        assert_eq!(
+            admitted_verdict(StopReason::Exited, true, false),
+            ("output-limit", Some("output-limit")),
+            "a measured output overrun after a zero exit must not pass"
+        );
+        assert_eq!(
+            admitted_verdict(StopReason::Exited, false, true),
+            ("timeout", Some("declared-deadline")),
+            "an observed deadline breach after a zero exit must not pass"
+        );
+        assert_eq!(
+            admitted_verdict(StopReason::Exited, false, false),
+            ("exited", None)
+        );
+        assert_eq!(
+            admitted_verdict(StopReason::Cancelled, true, false),
+            ("output-limit", Some("output-limit"))
+        );
+        assert_eq!(
+            admitted_verdict(StopReason::Cancelled, false, false),
+            ("cancelled", Some("cancellation"))
+        );
+        assert_eq!(
+            admitted_verdict(StopReason::Timeout, false, false),
+            ("timeout", Some("machine-deadline"))
+        );
+        assert_eq!(
+            admitted_verdict(StopReason::MemoryLimit, true, true),
+            ("memory-limit", Some("machine-memory-budget"))
+        );
+    }
 }

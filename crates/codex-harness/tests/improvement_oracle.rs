@@ -361,3 +361,61 @@ fn reparse_program_parents_are_refused() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A fast writer that exits zero after overflowing the declared output bound
+/// cannot pass, and the retained stream obeys its reported hard bound while
+/// the original outcome stays recorded beside the limit cause.
+#[test]
+fn fast_output_overrun_cannot_pass_and_retention_is_bounded() {
+    const FLOOD: u64 = 16 * 1024 * 1024;
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    let program = PathBuf::from(env!("CARGO_BIN_EXE_harness-process-fixture"));
+    let artifacts = tempfile::tempdir().unwrap();
+    let marker = artifacts.path().join("flood.json");
+    let case = RequestCase::new(
+        &program,
+        vec![
+            "flood".to_owned(),
+            marker.to_string_lossy().into_owned(),
+            FLOOD.to_string(),
+        ],
+        60,
+    );
+    let output = case.run(&[]);
+    let record = record(&output);
+    assert!(!output.status.success(), "{record}");
+    assert_eq!(record["passed"], false);
+    assert_eq!(record["checker_executed"], true);
+    let run = &record["runs"][0];
+    assert_eq!(run["status"], "output-limit", "{run}");
+    assert_eq!(run["stopped_by"], "output-limit");
+    assert_eq!(run["output_limit_reached"], true);
+    // The original observation stays recorded separately from the limit cause:
+    // either the payload's own zero exit, or the watchdog cancelling a tree
+    // still writing when it observed the overrun.
+    match run["native"]["Status"].as_str().unwrap() {
+        "exited" => {
+            assert_eq!(run["native"]["ExitCode"], 0, "{run}");
+            assert_eq!(run["exit_code"], 0);
+        }
+        "cancelled" => {
+            assert_eq!(run["native"]["ExitCode"], 130, "{run}");
+            assert_eq!(run["exit_code"], 130);
+        }
+        other => panic!("unexpected original status {other}: {run}"),
+    }
+    let stdout = &run["streams"]["stdout"];
+    assert_eq!(stdout["originalBytes"], json!(FLOOD));
+    assert_eq!(stdout["truncated"], true);
+    assert_eq!(stdout["finalized"], true);
+    assert_eq!(stdout["bytes"], json!(LIMIT));
+    let retained = fs::metadata(stdout["path"].as_str().unwrap())
+        .unwrap()
+        .len();
+    assert_eq!(
+        retained, LIMIT,
+        "the retained stream exceeds its reported bound"
+    );
+    let marker: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(marker["flooded_bytes"], json!(FLOOD));
+}

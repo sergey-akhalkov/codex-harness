@@ -89,6 +89,37 @@ mod fixture {
                 record(artifact, json!({"pid": std::process::id(), "exit": code}))?;
                 std::process::exit(code as i32);
             }
+            "flood" => {
+                // Deterministic fast output overrun: write exactly the
+                // requested byte count to stdout and exit zero without
+                // waiting, so a metadata poll cannot be what bounds it.
+                use std::io::Write;
+                let requested: u64 = args
+                    .get(2)
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("16777216")
+                    .parse()
+                    .map_err(io::Error::other)?;
+                if requested == 0 || requested > 64 * 1024 * 1024 {
+                    return Err(io::Error::other(
+                        "flood size is outside 1..=64 MiB in bytes",
+                    ));
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut stdout = std::io::stdout().lock();
+                let mut written = 0_u64;
+                while written < requested {
+                    let take = chunk.len().min((requested - written) as usize);
+                    stdout.write_all(&chunk[..take])?;
+                    written += take as u64;
+                }
+                stdout.flush()?;
+                record(
+                    artifact,
+                    json!({"pid": std::process::id(), "flooded_bytes": written}),
+                )?;
+                std::process::exit(0);
+            }
             "stdio-kind" => {
                 const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
                 let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
