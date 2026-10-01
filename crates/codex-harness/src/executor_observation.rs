@@ -239,6 +239,16 @@ pub(crate) struct ActivityMark {
     pub boot: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_ticks: Option<u64>,
+    /// `receipt`: `qpc` is when the host received the notification, an upper
+    /// bound on the phase, not the work instant. Native item events carry no
+    /// producer timestamp, so this is the supported bound. It is not a poll
+    /// interval and not a scheduling estimate.
+    #[serde(default = "receipt_bound")]
+    pub bound: String,
+}
+
+fn receipt_bound() -> String {
+    "receipt".to_owned()
 }
 
 /// Attempt window in the host's QPC domain. Receipt time is not this window.
@@ -1586,6 +1596,7 @@ pub(crate) fn note_activity(observation: &mut RunObservation, id: &str, kind: &s
         frequency,
         boot,
         span_ticks: sample.sample_span_ticks,
+        bound: receipt_bound(),
     });
     observation.updated_ms = now_ms();
 }
@@ -2104,6 +2115,21 @@ mod tests {
                 .is_some_and(|clock| clock.ended_qpc.is_some())
         );
         assert!(!observation.activity_truncated);
+    }
+
+    #[test]
+    fn activity_receipt_is_not_the_work_instant() {
+        let mut observation =
+            RunObservation::accepted(PathBuf::from("result.txt"), PathBuf::from("detail.jsonl"));
+        let before = harness_core::heavy_command_trace::qpc_now().expect("qpc");
+        std::thread::sleep(Duration::from_millis(30));
+        note_activity(&mut observation, "message-1", "agentMessage", "completed");
+        let mark = &observation.activity[0];
+        assert_eq!(mark.bound, "receipt");
+        assert!(
+            mark.qpc >= before,
+            "the mark must be the receipt sample, not an earlier work instant"
+        );
     }
 
     #[test]

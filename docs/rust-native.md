@@ -302,8 +302,14 @@ ordinary operation writes no evidence. A missing, malformed or partial
 document is unknown, never a measured zero. An immediate grant with a positive
 frequency and equal monotonic and wall
 samples is measured zero. A paired mapping is not exact wall alignment, and the
-configured 20 ms poll is not a bound on late start or late end; unmeasured
-scheduling or sampling error stays unknown. A
+configured 20 ms poll is not a bound on late start or late end. The successful
+`try_lock` is bracketed by an earlier counter sample and the clock sample taken
+immediately after the lock is observed held; a delay between acquisition and
+that later sample is inside the bracket. Two samples taken after the lock, or
+the poll period, are not that bound. Host activity marks are receipt times:
+native item notifications carry no producer timestamp, so a receipt is an upper
+bound on delivery, not the work instant, and it cannot prove that earlier queue
+time was idle. Unmeasured scheduling or sampling error stays unknown. A
 nested heavy command records inherited admission and does not add a queue
 interval. Holder identity is `same_attempt`, `other_attempt` or `unknown`; a
 missing attempt tag stays unknown. The document separates queue time from

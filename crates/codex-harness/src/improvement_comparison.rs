@@ -2495,6 +2495,7 @@ fn activity_capture(observation: &Value, relative: &impl Fn(u64) -> Option<u64>)
         kind: String,
         tool: Option<String>,
         command: Option<String>,
+        bound: String,
     }
     let mut by_id: BTreeMap<String, Placed> = BTreeMap::new();
     for mark in marks {
@@ -2505,14 +2506,25 @@ fn activity_capture(observation: &Value, relative: &impl Fn(u64) -> Option<u64>)
         let ns = qpc.and_then(relative);
         let kind = mark.get("kind").and_then(Value::as_str).unwrap_or("other");
         let phase = mark.get("phase").and_then(Value::as_str).unwrap_or("");
+        let bound = mark
+            .get("bound")
+            .and_then(Value::as_str)
+            .unwrap_or("receipt");
         let entry = by_id.entry(id.to_owned()).or_insert(Placed {
             start: None,
             end: None,
             kind: kind.to_owned(),
             tool: None,
             command: None,
+            bound: bound.to_owned(),
         });
         entry.kind = kind.to_owned();
+        // A receipt bound is the weaker supported bound. Do not upgrade it.
+        if bound == "receipt" || entry.bound != "receipt" && bound != "source" && bound != "exact" {
+            entry.bound = "receipt".to_owned();
+        } else if entry.bound != "receipt" {
+            entry.bound = bound.to_owned();
+        }
         if phase == "started" {
             entry.start = ns;
         } else if phase == "completed" {
@@ -2536,6 +2548,7 @@ fn activity_capture(observation: &Value, relative: &impl Fn(u64) -> Option<u64>)
             json!({
                 "id": id,
                 "kind": kind,
+                "placement": placed.bound,
                 "start_ns": placed.start,
                 "end_ns": placed.end,
                 "tool_call_id": placed.tool,
@@ -2562,9 +2575,23 @@ fn request_capture(run: &Run, attempt: &Attempt) -> Vec<Value> {
                 Some(Some(value)) => json!(value),
                 _ => Value::Null,
             };
+            let response_id = turn.response_id.as_deref();
+            let calls: Vec<_> = summary
+                .calls
+                .iter()
+                .filter(|call| response_id.is_some() && call.response_id.as_deref() == response_id)
+                .collect();
+            let structural = calls.len() == 1
+                && response_id.is_some_and(|id| !summary.message_responses.contains(id));
+            let call = structural.then_some(calls[0]);
+            // Publication time is not a request interval. wait_only stays unset
+            // until the accounting owner matches this call to one blocked admission.
             requests.push(json!({
                 "id": id,
                 "wait_only": Value::Null,
+                "structural_single_tool": structural,
+                "tool_call_id": call.map(|call| call.call_id.clone()),
+                "command_id": call.and_then(|call| call.command_id.clone()),
                 "start_ns": Value::Null,
                 "end_ns": Value::Null,
                 "input_tokens": token("input_tokens"),

@@ -475,6 +475,10 @@ struct UnitFacts {
     positive_effect: bool,
     evidence_complete: bool,
     does_not_repay: bool,
+    /// Adjusted time range could move the declared threshold. Not a point estimate.
+    time_uncertain: bool,
+    /// Candidate token increase over baseline, when both totals were observed.
+    token_regression: Option<f64>,
     limitations: Vec<String>,
 }
 
@@ -522,6 +526,100 @@ fn usage_measured(row: &Value) -> bool {
 
 fn percent_regression(baseline: f64, candidate: f64) -> Option<f64> {
     (baseline > 0.0).then(|| (candidate - baseline) / baseline * 100.0)
+}
+
+struct SelectedTime {
+    baseline_seconds: Option<f64>,
+    candidate_seconds: Option<f64>,
+    positive_effect: bool,
+    uncertain: bool,
+    token_regression: Option<f64>,
+}
+
+fn observed_tokens(row: &Value) -> Option<u64> {
+    let usage = row.get("infrastructure")?.get("usage")?;
+    let incomplete = usage
+        .get("incomplete")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let side = if incomplete { "raw" } else { "adjusted" };
+    usage
+        .get(side)
+        .and_then(|value| value.get("total_tokens"))
+        .and_then(Value::as_u64)
+}
+
+/// Work-efficiency time is selected before the decision tree. Other objectives
+/// keep their own primary metric. `None` means this policy does not substitute
+/// adjusted time.
+fn selected_time_view(
+    policy: &ComparisonPolicy,
+    baseline: Option<&Value>,
+    candidate: Option<&Value>,
+) -> Option<SelectedTime> {
+    let binding = crate::infrastructure_accounting::parse_binding(&policy.uncertainty).ok()??;
+    if binding.view != crate::infrastructure_accounting::MetricView::WorkEfficiency
+        || binding.mechanism.owns_queue()
+        || policy.objective != Objective::Time
+    {
+        return None;
+    }
+    let threshold = policy.meaningful_effect_percent.unwrap_or(0.0);
+    let token_regression = baseline.zip(candidate).and_then(|(baseline, candidate)| {
+        percent_regression(
+            observed_tokens(baseline)? as f64,
+            observed_tokens(candidate)? as f64,
+        )
+    });
+    let Some((baseline_low, baseline_high)) =
+        baseline.and_then(crate::infrastructure_accounting::arm_bounds)
+    else {
+        return Some(SelectedTime {
+            baseline_seconds: None,
+            candidate_seconds: None,
+            positive_effect: false,
+            uncertain: true,
+            token_regression,
+        });
+    };
+    let Some((candidate_low, candidate_high)) =
+        candidate.and_then(crate::infrastructure_accounting::arm_bounds)
+    else {
+        return Some(SelectedTime {
+            baseline_seconds: None,
+            candidate_seconds: None,
+            positive_effect: false,
+            uncertain: true,
+            token_regression,
+        });
+    };
+    let Some((min_reduction, max_reduction)) = crate::infrastructure_accounting::reduction_range(
+        baseline_low,
+        baseline_high,
+        candidate_low,
+        candidate_high,
+    ) else {
+        return Some(SelectedTime {
+            baseline_seconds: None,
+            candidate_seconds: None,
+            positive_effect: false,
+            uncertain: true,
+            token_regression,
+        });
+    };
+    let worst_regression = percent_regression(baseline_low, candidate_high).unwrap_or(0.0);
+    let best_regression = percent_regression(baseline_high, candidate_low).unwrap_or(0.0);
+    let straddles_effect = min_reduction < threshold && max_reduction >= threshold;
+    let straddles_tolerance =
+        worst_regression > policy.tolerance_percent && best_regression <= policy.tolerance_percent;
+    let uncertain = straddles_effect || straddles_tolerance;
+    Some(SelectedTime {
+        baseline_seconds: Some(baseline_high),
+        candidate_seconds: Some(candidate_high),
+        positive_effect: !uncertain && min_reduction >= threshold && min_reduction > 0.0,
+        uncertain,
+        token_regression,
+    })
 }
 
 /// Evaluate the declared policy against the authoritative outcome summary.
@@ -682,26 +780,40 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             (Some(a), Some(b)) => usage_measured(a) && usage_measured(b),
             _ => false,
         };
+        let selected = selected_time_view(policy, baseline_row, candidate_row);
+        let mut baseline_seconds = number(&unit["effect"]["baseline_seconds"]);
+        let mut candidate_seconds = number(&unit["effect"]["candidate_seconds"]);
+        let mut positive_effect = unit.get("positive_effect") == Some(&Value::Bool(true));
+        let mut time_uncertain = false;
+        let token_regression = selected.as_ref().and_then(|view| view.token_regression);
+        if let Some(view) = selected.as_ref() {
+            baseline_seconds = view.baseline_seconds;
+            candidate_seconds = view.candidate_seconds;
+            positive_effect = view.positive_effect;
+            time_uncertain = view.uncertain;
+        }
         facts.push(UnitFacts {
             case_id: unit
                 .get("case_id")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned(),
-            baseline_seconds: number(&unit["effect"]["baseline_seconds"]),
-            candidate_seconds: number(&unit["effect"]["candidate_seconds"]),
+            baseline_seconds,
+            candidate_seconds,
             baseline_steps: baseline_row.and_then(steps),
             candidate_steps: candidate_row.and_then(steps),
             usage_measured: usages,
             baseline_accepted: baseline_row.is_some_and(accepted),
             candidate_accepted: candidate_row.is_some_and(accepted),
-            positive_effect: unit.get("positive_effect") == Some(&Value::Bool(true)),
+            positive_effect,
             evidence_complete: unit.get("evidence_complete") == Some(&Value::Bool(true)),
             does_not_repay: unit
                 .get("net_saving")
                 .and_then(|saving| saving.get("verdict"))
                 .and_then(Value::as_str)
                 == Some("does_not_repay"),
+            time_uncertain,
+            token_regression,
             limitations: unit_limitations(unit),
             name,
         });
@@ -963,7 +1075,17 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             .iter()
             .filter(|fact| !fact.evidence_complete)
             .collect();
-        if !incomplete.is_empty() {
+        let token_regressed = facts.iter().any(|fact| {
+            fact.token_regression
+                .is_some_and(|percent| percent > policy.tolerance_percent)
+        });
+        if facts.iter().any(|fact| fact.time_uncertain) {
+            reasons.push(
+                "infrastructure attribution gaps could move the declared effect across its threshold; raw and adjusted evidence are retained and the result is inconclusive"
+                    .to_owned(),
+            );
+            decision = PolicyDecision::Inconclusive;
+        } else if !incomplete.is_empty() {
             reasons.push(format!(
                 "comparison evidence is incomplete for {} unit(s); unknown evidence is not a decision basis",
                 incomplete.len()
@@ -1074,6 +1196,29 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                         blocked = true;
                     }
                 }
+                if policy.objective == Objective::Time && token_regressed && !blocked {
+                    let worst_tokens = facts
+                        .iter()
+                        .filter_map(|fact| fact.token_regression)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if covers(worst_tokens) {
+                        trade_off_used = true;
+                        reasons.push(format!(
+                            "adopted under the predeclared trade-off: {}",
+                            policy
+                                .trade_off
+                                .as_ref()
+                                .map(|trade_off| trade_off.basis.as_str())
+                                .unwrap_or("")
+                        ));
+                    } else {
+                        reasons.push(
+                            "adjusted time improved but measured tokens regressed beyond the declared tolerance; excluded wait usage is not a waiver"
+                                .to_owned(),
+                        );
+                        blocked = true;
+                    }
+                }
                 if policy.objective == Objective::Resource
                     && !time_regressions.is_empty()
                     && !blocked
@@ -1177,8 +1322,8 @@ fn apply_infrastructure_gate(
     report: &Value,
     decision: &mut PolicyDecision,
     reasons: &mut Vec<String>,
-    baseline_seconds: &mut Option<f64>,
-    candidate_seconds: &mut Option<f64>,
+    _baseline_seconds: &mut Option<f64>,
+    _candidate_seconds: &mut Option<f64>,
     coverage: &mut String,
 ) {
     let binding = match crate::infrastructure_accounting::parse_binding(&policy.uncertainty) {
@@ -1208,6 +1353,13 @@ fn apply_infrastructure_gate(
     if binding.view == crate::infrastructure_accounting::MetricView::Operational {
         reasons.push(
             "operational view retains observed waiting and cost; adjusted figures are not the decision metric"
+                .to_owned(),
+        );
+        return;
+    }
+    if policy.objective != Objective::Time {
+        reasons.push(
+            "the declared primary metric is not adjusted time; a favorable time range cannot waive acceptance, resource or trade-off gates"
                 .to_owned(),
         );
         return;
@@ -1294,23 +1446,13 @@ fn apply_infrastructure_gate(
         if min < threshold {
             above = false;
         }
-        if let Some(point) = baseline.and_then(|row| {
-            row.get("infrastructure")
-                .and_then(|value| value.get("adjusted_seconds"))
-                .and_then(Value::as_f64)
-        }) {
-            *baseline_seconds = Some(point);
-        }
-        if let Some(point) = candidate.and_then(|row| {
-            row.get("infrastructure")
-                .and_then(|value| value.get("adjusted_seconds"))
-                .and_then(Value::as_f64)
-        }) {
-            *candidate_seconds = Some(point);
-        }
     }
     if !saw || missing || straddles {
-        *decision = PolicyDecision::Inconclusive;
+        // A rejected acceptance, resource or trade-off gate stays rejected.
+        // Uncertainty does not soften it, and it does not become adoption.
+        if *decision != PolicyDecision::Reject {
+            *decision = PolicyDecision::Inconclusive;
+        }
         reasons.push(
             "infrastructure attribution gaps could move the declared effect across its threshold; raw and adjusted evidence are retained and the result is inconclusive"
                 .to_owned(),
@@ -1327,24 +1469,15 @@ fn apply_infrastructure_gate(
         return;
     }
     if above {
-        let acceptance_reject = reasons
-            .iter()
-            .any(|reason| reason.contains("independent acceptance failed"));
-        let time_reject = reasons.iter().any(|reason| {
-            reason.contains("materially regressed the primary time metric")
-                || reason.contains("does not meet the predeclared meaningful threshold")
-        });
-        if *decision == PolicyDecision::Reject && time_reject && !acceptance_reject {
-            *decision = PolicyDecision::Adopt;
+        // The decision tree already evaluated acceptance, resource, token and
+        // trade-off gates on the selected view. A cleared time range does not
+        // waive any of them and does not rewrite a rejection into adoption.
+        if *decision == PolicyDecision::Adopt {
             reasons.push(
-                "raw time regression does not survive the adjusted range; external waiting is not a model regression"
+                "the adjusted range stays above the declared effect; external waiting alone is not the measured improvement"
                     .to_owned(),
             );
         }
-        reasons.push(
-            "the adjusted range stays above the declared effect; external waiting alone is not the measured improvement"
-                .to_owned(),
-        );
         return;
     }
     if below {

@@ -3684,12 +3684,46 @@ fn owned_heavy_contention_reaches_the_native_report() {
     );
     let summarized = harness_core::outcome_report::summarize_attempts(std::slice::from_ref(&row))
         .expect("native report");
+    let requests = row["infrastructure_capture"]["requests"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        requests.iter().any(|request| {
+            request["structural_single_tool"] == true
+                && request["tool_call_id"] == "heavy-cmd-1"
+                && request["command_id"] == "heavy-cmd-1"
+                && request["start_ns"].is_null()
+                && request["end_ns"].is_null()
+                && request["wait_only"].is_null()
+        }),
+        "the native rollout was not correlated to the blocked command without inventing an interval: {requests:?}"
+    );
+    let activity = &row["infrastructure_capture"]["activity"];
+    assert!(
+        activity.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["id"] == "message-1" && item["placement"] == "receipt")
+        }),
+        "useful activity must keep the receipt bound, not an exact work instant: {activity}"
+    );
     let infra = &summarized["attempts"][0]["infrastructure"];
     assert!(infra["observed_seconds"].as_f64().is_some(), "{infra}");
     assert_ne!(infra["proven_zero_queue"], true);
+    assert_eq!(
+        infra["deductible_ns"], 0,
+        "a receipt-bounded message after the wait is not proof the wait was idle: {infra}"
+    );
     assert!(
-        infra["deductible_seconds"].as_f64().unwrap_or(0.0) > 0.0
-            || infra["unresolved_seconds"].as_f64().unwrap_or(0.0) > 0.0,
-        "the report neither deducted nor retained the unresolved wait: {infra}"
+        infra["unresolved_ns"].as_u64().unwrap_or(0) > 0
+            || infra["gaps"]
+                .as_array()
+                .is_some_and(|gaps| gaps.iter().any(|gap| {
+                    gap.as_str().is_some_and(|gap| {
+                        gap.contains("receipt_bound") || gap.contains("unplaced")
+                    })
+                })),
+        "missing useful-work delivery evidence must stay unresolved: {infra}"
     );
 }

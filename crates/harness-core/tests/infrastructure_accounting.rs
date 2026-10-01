@@ -36,6 +36,7 @@ fn wait_capture(useful_start: u64, useful_end: u64) -> Value {
             {
                 "id": "tool-1",
                 "kind": "command",
+                "placement": "exact",
                 "start_ns": 0,
                 "end_ns": 10 * MINUTE,
                 "tool_call_id": "tool-1",
@@ -44,6 +45,7 @@ fn wait_capture(useful_start: u64, useful_end: u64) -> Value {
             {
                 "id": "message-1",
                 "kind": "message",
+                "placement": "exact",
                 "start_ns": useful_start,
                 "end_ns": useful_end
             }
@@ -278,6 +280,7 @@ fn point_capture(wait_ns: u64, total_ns: u64) -> Value {
         "activity": [{
             "id": "tool-1",
             "kind": "command",
+            "placement": "exact",
             "start_ns": 0,
             "end_ns": wait_ns,
             "tool_call_id": "tool-1",
@@ -478,5 +481,253 @@ fn queue_timeout_is_not_an_incorrect_solution() {
             .iter()
             .any(|reason| reason.contains("not an incorrect model solution")),
         "{evaluation:?}"
+    );
+}
+
+#[test]
+fn a_delayed_receipt_cannot_hide_useful_overlap() {
+    let mut capture = wait_capture(0, 0);
+    capture["activity"][1] = json!({
+        "id": "message-1",
+        "kind": "message",
+        "placement": "receipt",
+        "start_ns": 12 * MINUTE,
+        "end_ns": 13 * MINUTE
+    });
+    let adjusted = adjust(&capture, Some(30 * MINUTE));
+    assert_eq!(
+        adjusted["deductible_ns"], 0,
+        "notification delivery after the queue is not proof the overlap was idle: {adjusted}"
+    );
+    assert!(
+        adjusted["unresolved_ns"].as_u64().unwrap_or(0) > 0,
+        "{adjusted}"
+    );
+}
+
+#[test]
+fn a_missing_admission_boundary_is_not_an_exact_point() {
+    let mut capture = point_capture(10_000_000_000, 40_000_000_000);
+    capture["admissions"][0]["start_ns"] = Value::Null;
+    capture["admissions"][0]["end_ns"] = Value::Null;
+    let adjusted = adjust(&capture, Some(40_000_000_000));
+    assert_ne!(
+        adjusted["adjusted_low_ns"], adjusted["adjusted_high_ns"],
+        "a missing boundary must not collapse to a point: {adjusted}"
+    );
+    let row = json!({"infrastructure": adjusted});
+    let bounds = harness_core::infrastructure_accounting::arm_bounds(&row);
+    assert!(
+        bounds.is_none_or(|(low, high)| high - low > 1.0),
+        "arm bounds must withhold a collapsed point or return a real range: {bounds:?}"
+    );
+}
+
+#[test]
+fn usage_matches_the_blocked_admission_once_and_reconciles() {
+    let mut capture = wait_capture(11 * MINUTE, 12 * MINUTE);
+    capture["requests"] = json!([
+        {
+            "id": "wait-1",
+            "wait_only": true,
+            "start_ns": MINUTE,
+            "end_ns": 2 * MINUTE,
+            "tool_call_id": "tool-1",
+            "command_id": "cmd-1",
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "output_tokens": 2,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 12
+        },
+        {
+            "id": "wait-1",
+            "wait_only": true,
+            "start_ns": MINUTE,
+            "end_ns": 2 * MINUTE,
+            "tool_call_id": "tool-1",
+            "command_id": "cmd-1",
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "output_tokens": 2,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 12
+        },
+        {
+            "id": "other",
+            "wait_only": true,
+            "start_ns": MINUTE,
+            "end_ns": 2 * MINUTE,
+            "tool_call_id": "not-the-admission",
+            "command_id": "not-the-admission",
+            "input_tokens": 7,
+            "cached_input_tokens": 0,
+            "output_tokens": 1,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 8
+        }
+    ]);
+    let adjusted = adjust(&capture, Some(30 * MINUTE));
+    assert_eq!(adjusted["usage"]["raw"]["total_tokens"], 20, "{adjusted}");
+    assert_eq!(
+        adjusted["usage"]["excluded"]["total_tokens"], 0,
+        "{adjusted}"
+    );
+    assert_eq!(
+        adjusted["usage"]["adjusted"]["total_tokens"], 20,
+        "{adjusted}"
+    );
+    assert!(
+        adjusted["excluded_requests"]
+            .as_array()
+            .is_some_and(|ids| ids.is_empty()),
+        "duplicate and unmatched requests are not a fractional saving: {adjusted}"
+    );
+    assert_eq!(adjusted["usage"]["incomplete"], true, "{adjusted}");
+}
+
+fn immediate(total_ns: u64) -> Value {
+    json!({
+        "window": {"start_ns": 0, "end_ns": total_ns},
+        "admissions": [{"id": "now", "class": "measured_zero", "domain_match": true}],
+        "activity": [],
+        "requests": []
+    })
+}
+
+#[test]
+fn adjusted_time_does_not_waive_operation_token_or_acceptance_gates() {
+    let mut declared_policy = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None));
+    declared_policy.stopping.required_units = 1;
+    let declared = declared_policy.declare().unwrap();
+    let baseline = row("base", "baseline", 40.0, immediate(40_000_000_000));
+    let mut candidate = row("cand", "candidate", 20.0, immediate(20_000_000_000));
+    candidate["native_runs"][0]["tool_operations"] = json!(8);
+    candidate["native_runs"][0]["usage"] = json!({"total_tokens": 50});
+    let mut baseline = baseline;
+    baseline["native_runs"][0]["usage"] = json!({"total_tokens": 10});
+    let report = summarize_attempts(&[baseline, candidate]).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "operation regression must survive an adjusted time improvement: {evaluation:?}"
+    );
+
+    let accepted = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None));
+    let declared = accepted.declare().unwrap();
+    let baseline = row("base", "baseline", 40.0, immediate(40_000_000_000));
+    let mut candidate = row("cand", "candidate", 20.0, immediate(20_000_000_000));
+    candidate["checks"][0]["passed"] = json!(false);
+    candidate["checks"][0]["exit_code"] = json!(1);
+    candidate["native_runs"][0]["status"] = json!("failed");
+    let report = summarize_attempts(&[baseline, candidate]).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "failed acceptance is not waived by adjusted time: {evaluation:?}"
+    );
+    let _ = accepted;
+
+    let mut baseline_capture = immediate(40_000_000_000);
+    let mut candidate_capture = immediate(20_000_000_000);
+    let tokens = |total| {
+        json!({
+            "id": "task",
+            "wait_only": false,
+            "placement": "exact",
+            "start_ns": 1,
+            "end_ns": 2,
+            "input_tokens": total,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": total
+        })
+    };
+    baseline_capture["requests"] = json!([tokens(10)]);
+    candidate_capture["requests"] = json!([tokens(40)]);
+    let declared = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None))
+        .declare()
+        .unwrap();
+    let report = summarize_attempts(&[
+        row("base", "baseline", 40.0, baseline_capture),
+        row("cand", "candidate", 20.0, candidate_capture),
+    ])
+    .unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "token regression must survive an adjusted time improvement: {evaluation:?}"
+    );
+}
+
+#[test]
+fn a_non_time_primary_metric_is_not_rewritten_by_adjusted_time() {
+    let mut resource = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None));
+    resource.objective = Objective::Resource;
+    let declared = resource.declare().unwrap();
+    let mut baseline = row("base", "baseline", 40.0, immediate(40_000_000_000));
+    let mut candidate = row("cand", "candidate", 20.0, immediate(20_000_000_000));
+    baseline["native_runs"][0]["usage"] = json!({"total_tokens": 10});
+    candidate["native_runs"][0]["usage"] = json!({"total_tokens": 10});
+    baseline["declaration"] = resource.declaration();
+    candidate["declaration"] = resource.declaration();
+    let report = summarize_attempts(&[baseline, candidate]).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "resource objective must not adopt because adjusted time cleared a threshold: {evaluation:?}"
+    );
+}
+
+#[test]
+fn complete_pairs_are_summed_and_incomplete_evidence_is_not_adopted() {
+    let mut summed = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None));
+    summed.stopping.required_units = 2;
+    let declared = summed.declare().unwrap();
+    let mut first_base = row("b1", "baseline", 40.0, immediate(40_000_000_000));
+    let mut first_cand = row("c1", "candidate", 20.0, immediate(20_000_000_000));
+    let mut second_base = row("b2", "baseline", 30.0, immediate(30_000_000_000));
+    let mut second_cand = row("c2", "candidate", 10.0, immediate(10_000_000_000));
+    for row in [&mut first_base, &mut first_cand] {
+        row["case_id"] = json!("case-a");
+        row["declaration"] = summed.declaration();
+    }
+    for row in [&mut second_base, &mut second_cand] {
+        row["case_id"] = json!("case-b");
+        row["declaration"] = summed.declaration();
+    }
+    let report = summarize_attempts(&[first_base, first_cand, second_base, second_cand]).unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Adopt, "{evaluation:?}");
+    assert!(
+        (evaluation.baseline_seconds.unwrap_or(0.0) - 70.0).abs() < 0.01,
+        "complete pairs must be summed, not replaced by the last unit: {evaluation:?}"
+    );
+    assert!(
+        (evaluation.candidate_seconds.unwrap_or(0.0) - 30.0).abs() < 0.01,
+        "{evaluation:?}"
+    );
+
+    let declared = policy(&binding_clause(MetricView::WorkEfficiency, Mechanism::None))
+        .declare()
+        .unwrap();
+    let mut broken = point_capture(10_000_000_000, 40_000_000_000);
+    broken["admissions"][0]["start_ns"] = Value::Null;
+    broken["admissions"][0]["end_ns"] = Value::Null;
+    let report = summarize_attempts(&[
+        row("base", "baseline", 40.0, broken),
+        row("cand", "candidate", 20.0, immediate(20_000_000_000)),
+    ])
+    .unwrap();
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "incomplete admission evidence must not adopt: {evaluation:?}"
     );
 }

@@ -926,7 +926,7 @@ impl Holder {
         let slot_count = budget.max_concurrent_trees;
         let attempt = observation.correlation.attempt_id.as_deref();
         let mut wait = WaitTrace::default();
-        let mut bracket = crate::resource_admission::AdmissionBracket { grant_qpc: None };
+        let mut bracket = crate::resource_admission::AdmissionBracket::new();
         let collecting = observation.collecting();
         let queue_deadline = match budget.queue_deadline() {
             Ok(deadline) => deadline,
@@ -952,12 +952,15 @@ impl Holder {
             },
             collecting.then_some(&mut bracket),
         );
-        let ended = observation
-            .collecting()
-            .then(|| heavy_command_trace::sample_clock().ok())
-            .flatten();
-        if let (Some(grant), Some((frequency, sample))) = (bracket.grant_qpc, ended) {
-            wait.endpoint_end_ns = heavy_command_trace::monotonic_ns(frequency, grant, sample.qpc);
+        // The admission owner already bracketed try_lock. The later sample of that
+        // bracket is the grant observation. Measuring from it to a second later
+        // sample would omit the delay between lock acquisition and the first
+        // observation, so that gap is not the endpoint bound.
+        let ended = bracket
+            .after_sample
+            .map(|sample| (bracket.after_frequency, sample));
+        if let (Some(before), Some((frequency, sample))) = (bracket.before_qpc, ended) {
+            wait.endpoint_end_ns = heavy_command_trace::monotonic_ns(frequency, before, sample.qpc);
             if wait.boot.is_none() {
                 wait.boot = heavy_command_trace::boot_filetime();
             }

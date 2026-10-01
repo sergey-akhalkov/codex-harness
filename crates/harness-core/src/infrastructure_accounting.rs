@@ -6,6 +6,7 @@
 //! unbracketed evidence stays unknown. A queued label alone is not blocking.
 
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Attribution rule the report and policy pin before either arm.
 pub const RULE_VERSION: &str = "infrastructure-attribution.v1";
@@ -373,16 +374,29 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
             }
             continue;
         }
-        let Some(recorded) = interval_of(admission) else {
+        let Some(raw_interval) = interval_of(admission) else {
             gaps.push(format!("admission_{id}_boundary_incomplete"));
+            unresolved.push(window);
             continue;
         };
-        let recorded = clip(&[recorded], window);
+        let recorded = clip(&[raw_interval], window);
+        if recorded.is_empty() {
+            gaps.push(format!("admission_{id}_clipped_away"));
+            if !domain_match {
+                unresolved.push(window);
+            }
+            continue;
+        }
         if class == "self_contention" && domain_match {
             queue_exposure.extend(recorded);
             continue;
         }
-        if class != "unrelated_wait" || !domain_match {
+        if !domain_match {
+            unresolved.push(window);
+            gaps.push(format!("admission_{id}_wrong_domain"));
+            continue;
+        }
+        if class != "unrelated_wait" {
             unresolved.extend(recorded);
             gaps.push(format!("admission_{id}_not_external"));
             continue;
@@ -420,11 +434,13 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
     let external = normalize(external);
     let mut blocked = Vec::new();
     let mut useful = Vec::new();
+    let mut receipt_possible = Vec::new();
     let mut unplaced_useful = false;
     for item in &activity {
         let kind = text_field(item, "kind").unwrap_or("other");
         let tool = text_field(item, "tool_call_id");
         let command = text_field(item, "command_id");
+        let placement = text_field(item, "placement").unwrap_or("unplaced");
         let matches_admission = admissions.iter().any(|admission| {
             text_field(admission, "class") == Some("unrelated_wait")
                 && tool.is_some()
@@ -445,6 +461,29 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
             }
             continue;
         };
+        // Receipt time is an upper bound on notification delivery, not the
+        // work instant. It cannot prove blocked coverage and cannot exclude
+        // earlier useful overlap. A source or exact placement is a supported
+        // bound; anything else stays unplaced.
+        if placement == "receipt" {
+            if matches_admission {
+                gaps.push("blocked_receipt_not_coverage_bound".to_owned());
+            } else {
+                for interval in placed {
+                    receipt_possible.push(Interval {
+                        start: window.start,
+                        end: interval.end,
+                    });
+                }
+                gaps.push("receipt_bound_not_work_instant".to_owned());
+            }
+            continue;
+        }
+        if placement != "exact" && placement != "source" {
+            unplaced_useful = true;
+            gaps.push("unplaced_activity".to_owned());
+            continue;
+        }
         if matches_admission {
             let tick = admissions
                 .iter()
@@ -471,16 +510,18 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
         unplaced_useful = true;
     }
     for request in &requests {
-        let wait_only = bool_field(request, "wait_only");
-        if wait_only == Some(true) && interval_of(request).is_some() {
+        let correlated = correlated_wait(request, &admissions);
+        if correlated && interval_of(request).is_some() {
+            continue;
+        }
+        if correlated {
+            gaps.push("wait_request_interval_unobserved".to_owned());
             continue;
         }
         if interval_of(request).is_none() {
             unplaced_useful = true;
             gaps.push("unplaced_model_request".to_owned());
-        } else if wait_only != Some(true)
-            && let Some(interval) = interval_of(request)
-        {
+        } else if let Some(interval) = interval_of(request) {
             useful.extend(clip(&[interval], window));
         }
     }
@@ -493,13 +534,21 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
         gaps.push("queue_not_independently_blocked".to_owned());
     }
     unresolved.extend(uncovered);
-    let deductible_region = if unplaced_useful {
+    let mut deductible_region = if unplaced_useful {
         unresolved.extend(covered.clone());
         gaps.push("possible_useful_overlap_unplaced".to_owned());
         Vec::new()
     } else {
         subtract(&covered, &useful)
     };
+    let receipt_possible = normalize(receipt_possible);
+    if !receipt_possible.is_empty() {
+        let hidden = intersect(&deductible_region, &receipt_possible);
+        if !hidden.is_empty() {
+            unresolved.extend(hidden);
+        }
+        deductible_region = subtract(&deductible_region, &receipt_possible);
+    }
     let deductible = measure(&deductible_region);
     let unresolved_ns = measure(&normalize(unresolved));
     let observed = observed_ns.unwrap_or(0);
@@ -521,7 +570,7 @@ pub fn adjust(capture: &Value, observed_ns: Option<u64>) -> Value {
     let proven_zero = saw_measured_zero && !saw_queue && unresolved_ns == 0 && gaps.is_empty();
 
     let (raw_usage, excluded_usage, adjusted_usage, excluded_ids, usage_incomplete) =
-        usage_adjustment(&requests, &deductible_region, &covered);
+        usage_adjustment(&requests, &admissions, &deductible_region, &blocked);
 
     gaps.sort();
     gaps.dedup();
@@ -618,8 +667,53 @@ fn contained(interval: Interval, region: &[Interval]) -> bool {
     subtract(&[interval], region).is_empty()
 }
 
+fn subset_holds(excluded: &Tokens, raw: &Tokens) -> bool {
+    let within = |part: Option<u64>, whole: Option<u64>| match (part, whole) {
+        (Some(part), Some(whole)) => part <= whole,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    within(excluded.input, raw.input)
+        && within(excluded.cached, raw.cached)
+        && within(excluded.output, raw.output)
+        && within(excluded.reasoning, raw.reasoning)
+        && within(excluded.total, raw.total)
+}
+
+/// The one unrelated admission this request actually names. Any nonempty id
+/// is not correlation, and two admissions with the same id are ambiguous.
+fn correlated_admission<'a>(request: &Value, admissions: &'a [Value]) -> Option<&'a Value> {
+    let tool = text_field(request, "tool_call_id");
+    let command = text_field(request, "command_id");
+    if tool.is_none() && command.is_none() {
+        return None;
+    }
+    let mut matched = admissions.iter().filter(|admission| {
+        text_field(admission, "class") == Some("unrelated_wait")
+            && bool_field(admission, "domain_match") == Some(true)
+            && match (tool, command) {
+                (Some(tool), Some(command)) => {
+                    text_field(admission, "tool_call_id") == Some(tool)
+                        && text_field(admission, "command_id") == Some(command)
+                }
+                (Some(tool), None) => text_field(admission, "tool_call_id") == Some(tool),
+                (None, Some(command)) => text_field(admission, "command_id") == Some(command),
+                (None, None) => false,
+            }
+    });
+    let first = matched.next()?;
+    matched.next().is_none().then_some(first)
+}
+
+fn correlated_wait(request: &Value, admissions: &[Value]) -> bool {
+    let structural = bool_field(request, "wait_only") == Some(true)
+        || bool_field(request, "structural_single_tool") == Some(true);
+    structural && correlated_admission(request, admissions).is_some()
+}
+
 fn usage_adjustment(
     requests: &[Value],
+    admissions: &[Value],
     deductible: &[Interval],
     blocked: &[Interval],
 ) -> (Tokens, Tokens, Tokens, Vec<String>, bool) {
@@ -666,8 +760,26 @@ fn usage_adjustment(
             false,
         );
     }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for request in requests {
+        if let Some(id) = text_field(request, "id") {
+            *seen.entry(id).or_default() += 1;
+        }
+    }
+    let mut counted: BTreeSet<&str> = BTreeSet::new();
     for request in requests {
         let tokens = Tokens::from_value(request);
+        let id = text_field(request, "id");
+        let duplicate = id.is_some_and(|id| seen.get(id).copied().unwrap_or(0) > 1);
+        if duplicate {
+            incomplete = true;
+        }
+        if let Some(id) = id
+            && !counted.insert(id)
+        {
+            // A repeated request id is one request, not two savings.
+            continue;
+        }
         if !tokens.consistent()
             || tokens.input.is_none()
             || tokens.output.is_none()
@@ -686,29 +798,50 @@ fn usage_adjustment(
         add_option(&mut raw.output, tokens.output);
         add_option(&mut raw.reasoning, tokens.reasoning);
         add_option(&mut raw.total, tokens.total);
-        let correlated = text_field(request, "tool_call_id").is_some()
-            && text_field(request, "command_id").is_some();
-        let wait_only = bool_field(request, "wait_only");
-        let placed = interval_of(request);
-        if wait_only == Some(true)
-            && correlated
-            && placed.is_some_and(|interval| contained(interval, blocked))
-        {
-            if placed.is_some_and(|interval| contained(interval, deductible)) {
-                add_option(&mut excluded.input, tokens.input);
-                add_option(&mut excluded.cached, tokens.cached);
-                add_option(&mut excluded.output, tokens.output);
-                add_option(&mut excluded.reasoning, tokens.reasoning);
-                add_option(&mut excluded.total, tokens.total);
-                if let Some(id) = text_field(request, "id") {
-                    excluded_ids.push(id.to_owned());
-                }
-            } else {
+        if duplicate || !correlated_wait(request, admissions) {
+            if bool_field(request, "wait_only") != Some(false)
+                && bool_field(request, "structural_single_tool") != Some(false)
+            {
                 incomplete = true;
             }
-        } else if wait_only != Some(false) {
+            continue;
+        }
+        let placed = interval_of(request);
+        let contained_blocked = placed.is_some_and(|interval| contained(interval, blocked));
+        let contained_deductible = placed.is_some_and(|interval| contained(interval, deductible));
+        // A correlated wait with no interval of its own is the admission interval.
+        // Exclude only when that whole request is inside the deductible region,
+        // or when its own interval is wholly inside it. Never split a request.
+        let admission_covers = placed.is_none()
+            && correlated_admission(request, admissions).is_some_and(|admission| {
+                interval_of(admission).is_some_and(|interval| contained(interval, deductible))
+            });
+        if contained_deductible || admission_covers {
+            add_option(&mut excluded.input, tokens.input);
+            add_option(&mut excluded.cached, tokens.cached);
+            add_option(&mut excluded.output, tokens.output);
+            add_option(&mut excluded.reasoning, tokens.reasoning);
+            add_option(&mut excluded.total, tokens.total);
+            if let Some(id) = id {
+                excluded_ids.push(id.to_owned());
+            }
+        } else if contained_blocked
+            || placed.is_none()
+            || bool_field(request, "wait_only") != Some(false)
+        {
             incomplete = true;
         }
+    }
+    if !subset_holds(&excluded, &raw) {
+        incomplete = true;
+        excluded = Tokens {
+            input: Some(0),
+            cached: Some(0),
+            output: Some(0),
+            reasoning: Some(0),
+            total: Some(0),
+        };
+        excluded_ids.clear();
     }
     let adjusted = Tokens {
         input: sub_option(raw.input, excluded.input),
@@ -793,12 +926,28 @@ pub fn attach(row: &mut Value) {
     row["infrastructure"] = adjust(&capture, observed_ns);
 }
 
-/// Bounds the policy uses for one arm. Missing evidence is not a zero.
+/// Bounds the policy uses for one arm. Missing evidence is not a zero, and a
+/// collapsed point with an open boundary is not a supported estimate.
 pub fn arm_bounds(row: &Value) -> Option<(f64, f64)> {
     let infra = row.get("infrastructure")?;
     let low = infra.get("adjusted_low_seconds").and_then(Value::as_f64)?;
     let high = infra.get("adjusted_high_seconds").and_then(Value::as_f64)?;
-    (low.is_finite() && high.is_finite() && high >= low).then_some((low, high))
+    if !(low.is_finite() && high.is_finite() && high >= low) {
+        return None;
+    }
+    let coverage = infra
+        .get("coverage")
+        .and_then(Value::as_str)
+        .unwrap_or("unresolved");
+    let unresolved = infra
+        .get("unresolved_seconds")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let point = (high - low) <= f64::EPSILON;
+    if point && coverage != "measured" && unresolved <= f64::EPSILON {
+        return None;
+    }
+    Some((low, high))
 }
 
 pub fn failed_before_start(row: &Value) -> bool {

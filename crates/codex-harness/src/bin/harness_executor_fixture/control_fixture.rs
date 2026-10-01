@@ -165,11 +165,13 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
                     }
                     record_selected_tools();
                     let _ = commit_solution();
+                    let heavy = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok();
                     let _ = write_rollout(
                         &session,
                         &rollout_model,
                         &rollout_effort,
-                        env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_err(),
+                        !heavy,
+                        heavy.then_some("heavy-cmd-1"),
                     );
                     server.push(json!({
                         "method": "item/started",
@@ -466,7 +468,17 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {
 
 /// Writes the native rollout the observation owner reads for this session,
 /// with the installed route (or the explicitly overridden facts).
-fn write_rollout(session: &str, model: &str, effort: &str, include_usage: bool) -> io::Result<()> {
+///
+/// `wait_call` names a single tool call that is the whole response. It is not
+/// assumed idle: the accounting owner still has to match it to one blocked
+/// admission. Publication time is not written as a request interval.
+fn write_rollout(
+    session: &str,
+    model: &str,
+    effort: &str,
+    include_usage: bool,
+    wait_call: Option<&str>,
+) -> io::Result<()> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("the fixture rollout requires CODEX_HOME"))?;
@@ -482,7 +494,31 @@ fn write_rollout(session: &str, model: &str, effort: &str, include_usage: bool) 
             "payload": {"model": model, "effort": effort, "turn_id": TURN},
         }),
     ];
-    if include_usage {
+    if let Some(call) = wait_call {
+        lines.push(json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": call,
+                "command_id": call,
+                "name": "exec_command",
+                "response_id": "response-heavy",
+            },
+        }));
+        lines.push(json!({
+            "type": "token_usage_record",
+            "payload": {
+                "response_id": "response-heavy",
+                "usage": {
+                    "input_tokens": 12,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 2,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 14,
+                },
+            },
+        }));
+    } else if include_usage {
         lines.push(json!({
             "type": "token_usage_record",
             "payload": {

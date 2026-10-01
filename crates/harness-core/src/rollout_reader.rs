@@ -103,6 +103,15 @@ pub struct TurnUsage {
     pub effort: Option<String>,
 }
 
+/// One recorded tool call. A missing response identity is not a join key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedCall {
+    pub call_id: String,
+    pub name: String,
+    pub response_id: Option<String>,
+    pub command_id: Option<String>,
+}
+
 /// One recorded usage amount with the recorded event timestamp beside it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
@@ -285,6 +294,12 @@ pub struct SessionSummary {
     pub conflicts: BTreeSet<String>,
     /// Open source handle retained for caller-side identity checks.
     pub source: Option<File>,
+    /// Function calls in recorded order. Response identity is present only when
+    /// the item carried one; it is not inferred from a neighbouring usage row.
+    pub calls: Vec<RecordedCall>,
+    /// Response identities that carried a message item. Those responses are
+    /// not structurally a single tool call.
+    pub message_responses: BTreeSet<String>,
 }
 
 /// One reader pass over one rollout file.
@@ -520,6 +535,10 @@ struct Reader {
     turns: Vec<Value>,
     users: Vec<Value>,
     tool_calls: BTreeMap<String, String>,
+    #[serde(default)]
+    calls: Vec<RecordedCall>,
+    #[serde(default)]
+    message_responses: BTreeSet<String>,
     tool_output_bytes: BTreeMap<String, u64>,
     usage: Usage,
     previous: Option<Usage>,
@@ -731,6 +750,12 @@ impl Reader {
             if p["type"] == "function_call" {
                 if let (Some(call), Some(name)) = (p["call_id"].as_str(), p["name"].as_str()) {
                     self.tool_calls.insert(call.to_owned(), name.to_owned());
+                    self.calls.push(RecordedCall {
+                        call_id: call.to_owned(),
+                        name: name.to_owned(),
+                        response_id: identifier(&p["response_id"]),
+                        command_id: identifier(&p["command_id"]),
+                    });
                 }
             } else if p["type"] == "function_call_output" {
                 if let Some(call) = p["call_id"].as_str() {
@@ -743,6 +768,9 @@ impl Reader {
                     *self.tool_output_bytes.entry(name).or_default() += bytes;
                 }
             } else if p["type"] == "message" {
+                if let Some(response) = identifier(&p["response_id"]) {
+                    self.message_responses.insert(response);
+                }
                 let text = message_text(p);
                 if p["role"] == "developer" {
                     self.instructions.developer_bytes = self
@@ -924,6 +952,8 @@ impl Reader {
             unidentified: self.unidentified,
             conflicts: self.conflicts,
             source: None,
+            calls: self.calls,
+            message_responses: self.message_responses,
         }
     }
 }
@@ -1294,6 +1324,34 @@ mod tests {
         assert_eq!(session.tool_output_bytes["exec_command"], 10);
         assert!(session.tool_output_bytes.contains_key("unmatched_call"));
         assert!(session.tool_output_bytes["unmatched_call"] > 0);
+    }
+
+    #[test]
+    fn a_response_tool_call_keeps_its_identity_without_inventing_a_join() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "correlated.jsonl",
+            &[
+                meta("thread_calls"),
+                context(),
+                json!({"type":"response_item","payload":{"type":"function_call",
+                    "call_id":"heavy-cmd-1","command_id":"heavy-cmd-1","name":"exec_command",
+                    "response_id":"response-heavy"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "response_id":"response-mixed","content":[{"type":"output_text","text":"task"}]}}),
+            ],
+        );
+        let session = read(&path);
+        assert_eq!(session.calls.len(), 1);
+        assert_eq!(session.calls[0].call_id, "heavy-cmd-1");
+        assert_eq!(session.calls[0].command_id.as_deref(), Some("heavy-cmd-1"));
+        assert_eq!(
+            session.calls[0].response_id.as_deref(),
+            Some("response-heavy")
+        );
+        assert!(session.message_responses.contains("response-mixed"));
+        assert!(!session.message_responses.contains("response-heavy"));
     }
 
     #[test]
