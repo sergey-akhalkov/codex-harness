@@ -9,6 +9,7 @@
 
 use harness_core::{
     heavy_command,
+    heavy_command_trace::{self, Correlation, Observation},
     process::{Cancellation, SHARED_CPU_PERCENT, StopReason},
 };
 use serde_json::json;
@@ -39,6 +40,13 @@ codex-harness heavy [--account DIRECTORY] [--uncapped] -- PROGRAM [ARGS...]
   124 deadline or queue wait expired; 125 memory budget exceeded; 126 the
   command tree could not be cleaned; 127 the command could not be resolved or
   started; 130 interrupted.
+  --queue-evidence DIRECTORY writes one admission document per invocation into
+  that caller-owned directory. --attempt, --tool-call and --command-id are
+  optional ascii correlation labels with no paths. Omitting the directory is
+  ordinary operation and writes nothing; a missing document is unknown, not
+  zero queue delay. A write failure is printed and does not change the command
+  result. A nested heavy command that inherits the lease records that
+  inheritance and does not add a second queue interval.
   --uncapped runs this one command outside the shared account CPU allowance.
   It is not saved, does not raise the allowance for other sessions or shared
   services, and the next command without it is capped by default. Combined
@@ -70,6 +78,56 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+fn take_token(args: &[OsString], index: usize, flag: &str, seen: bool) -> io::Result<String> {
+    if seen {
+        return Err(invalid(&format!("duplicate {flag}")));
+    }
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| invalid(&format!("{flag} requires a label")))?;
+    let text = value
+        .to_str()
+        .ok_or_else(|| invalid("correlation label must be utf-8"))?;
+    heavy_command_trace::validate_token(text).map_err(invalid)
+}
+
+fn env_token(name: &str) -> Option<String> {
+    let Ok(value) = std::env::var(name) else {
+        return None;
+    };
+    if value.is_empty() {
+        return None;
+    }
+    match heavy_command_trace::validate_token(&value) {
+        Ok(token) => Some(token),
+        Err(_) => {
+            heavy_command_trace::expose("correlation label was rejected");
+            None
+        }
+    }
+}
+
+fn observation_from(
+    evidence: Option<PathBuf>,
+    attempt: Option<String>,
+    tool_call: Option<String>,
+    command_id: Option<String>,
+) -> Observation {
+    let directory = evidence.or_else(|| {
+        std::env::var_os(heavy_command_trace::EVIDENCE_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    Observation {
+        directory,
+        correlation: Correlation {
+            attempt_id: attempt.or_else(|| env_token(heavy_command_trace::ATTEMPT_ENV)),
+            tool_call_id: tool_call.or_else(|| env_token(heavy_command_trace::TOOL_CALL_ENV)),
+            command_id: command_id.or_else(|| env_token(heavy_command_trace::COMMAND_ENV)),
+        },
+    }
+}
+
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     let Some(first) = args.first() else {
         eprintln!("{USAGE}");
@@ -84,6 +142,10 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     }
     let mut option = None;
     let mut uncapped = false;
+    let mut evidence = None;
+    let mut attempt = None;
+    let mut tool_call = None;
+    let mut command_id = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_str() {
@@ -94,6 +156,32 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
                 if option.replace(PathBuf::from(value)).is_some() {
                     return Err(invalid("duplicate --account"));
                 }
+                index += 2;
+            }
+            Some("--queue-evidence") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| invalid("--queue-evidence requires a directory"))?;
+                if evidence.replace(PathBuf::from(value)).is_some() {
+                    return Err(invalid("duplicate --queue-evidence"));
+                }
+                index += 2;
+            }
+            Some("--attempt") => {
+                attempt = Some(take_token(args, index, "--attempt", attempt.is_some())?);
+                index += 2;
+            }
+            Some("--tool-call") => {
+                tool_call = Some(take_token(args, index, "--tool-call", tool_call.is_some())?);
+                index += 2;
+            }
+            Some("--command-id") => {
+                command_id = Some(take_token(
+                    args,
+                    index,
+                    "--command-id",
+                    command_id.is_some(),
+                )?);
                 index += 2;
             }
             Some("--uncapped") => {
@@ -147,11 +235,13 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
     eprintln!("heavy: command={label}");
     let cancellation = Cancellation::default();
     let _interrupt = heavy_command::Interrupt::install(&cancellation)?;
-    let admission = match heavy_command::Admission::acquire(
+    let observation = observation_from(evidence, attempt, tool_call, command_id);
+    let admission = match heavy_command::Admission::acquire_observed(
         &account,
         &budget,
         &label,
         &cancellation,
+        &observation,
     ) {
         Ok(admission) => admission,
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -257,27 +347,44 @@ fn run_uncapped(
             cpu_percent: None,
         },
         admission.job_name(),
-    )?;
-    let snapshot = job.snapshot()?;
+    )
+    .inspect_err(|_| admission.note_command_not_started())?;
+    let snapshot = job
+        .snapshot()
+        .inspect_err(|_| admission.note_command_not_started())?;
     if snapshot.cpu_rate != 0 {
+        admission.note_command_not_started();
         eprintln!("heavy: uncapped command job carries a CPU rate; refusing to start");
         return Ok(EXIT_STARTUP);
     }
-    eprintln!("{}", admission.job_line(&job)?);
+    eprintln!(
+        "{}",
+        admission.job_line(&job).inspect_err(|_| {
+            admission.note_command_not_started();
+        })?
+    );
     let mut spec = CommandSpec::new(program.to_owned());
     spec.args = args.to_vec();
-    spec.inherit_standard_streams()?;
+    spec.inherit_standard_streams()
+        .inspect_err(|_| admission.note_command_not_started())?;
     spec.env.insert(
         OsString::from(heavy_command::LEASE_ENV),
-        Some(admission.marker(account)?),
+        Some(
+            admission
+                .marker(account)
+                .inspect_err(|_| admission.note_command_not_started())?,
+        ),
     );
+    admission.bind_child_env(&mut spec.env);
     let launch = match native_launcher::spawn_uncapped(admission.job_name(), &spec, "command") {
         Ok(launch) => launch,
         Err(error) => {
+            admission.note_command_not_started();
             eprintln!("heavy: {error}");
             return Ok(EXIT_STARTUP);
         }
     };
+    admission.note_command_started();
     let started = std::time::Instant::now();
     let outcome = match launch.wrapper_job.wait(
         &launch.process,
@@ -527,6 +634,8 @@ mod tests {
         assert!(USAGE.contains("policy-file"));
         assert!(USAGE.contains("busy-slot count"));
         assert!(USAGE.contains("available holder descriptions"));
+        assert!(USAGE.contains("--queue-evidence"));
+        assert!(USAGE.contains("missing document is unknown, not"));
         assert!(!USAGE.contains("--max-concurrent-trees"));
         assert!(!USAGE.contains("--aggregate-memory"));
         assert_eq!(run(&[OsString::from("--help")]).unwrap(), 0);

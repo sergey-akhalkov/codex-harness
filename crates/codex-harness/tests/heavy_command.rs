@@ -9,6 +9,7 @@
 #![cfg(windows)]
 use harness_core::{
     heavy_command::{Budget, LEASE_ENV},
+    heavy_command_trace::{self, QueueDelay, TerminalKind},
     process::SHARED_CPU_PERCENT,
 };
 use serde_json::Value;
@@ -16,6 +17,7 @@ use std::{
     ffi::OsStr,
     fs,
     os::windows::ffi::OsStrExt,
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread::sleep,
@@ -77,6 +79,11 @@ fn heavy(account: &Path, current_dir: &Path) -> Command {
         .current_dir(current_dir)
         .env(CPU_ACCOUNT_ENV, cpu_account(account))
         .env_remove(CPU_PERCENT_ENV)
+        .env_remove(heavy_command_trace::EVIDENCE_ENV)
+        .env_remove(heavy_command_trace::ATTEMPT_ENV)
+        .env_remove(heavy_command_trace::TOOL_CALL_ENV)
+        .env_remove(heavy_command_trace::COMMAND_ENV)
+        .env_remove(heavy_command_trace::PARENT_ADMISSION_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
@@ -1312,6 +1319,11 @@ fn nested_call_inherits_one_aggregate_budget_and_proves_membership() {
         .current_dir(&work)
         .env(CPU_ACCOUNT_ENV, cpu_account(&account))
         .env_remove(CPU_PERCENT_ENV)
+        .env_remove(heavy_command_trace::EVIDENCE_ENV)
+        .env_remove(heavy_command_trace::ATTEMPT_ENV)
+        .env_remove(heavy_command_trace::TOOL_CALL_ENV)
+        .env_remove(heavy_command_trace::COMMAND_ENV)
+        .env_remove(heavy_command_trace::PARENT_ADMISSION_ENV)
         .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
         .env("HARNESS_HEAVY_FIXTURE_MS", "2500")
         .env("HARNESS_HEAVY_FIXTURE_STARTED", &nested_started)
@@ -2207,4 +2219,447 @@ fn malformed_policy_warns_without_substituting_heavy_ceiling() {
         fs::read(cpu_account(&account).join("shared-cpu-policy.json")).unwrap(),
         body
     );
+}
+
+fn observed(account: &Path, work: &Path, evidence: &Path, attempt: Option<&str>) -> Command {
+    let mut command = Command::new(manager());
+    command
+        .arg("heavy")
+        .arg("--account")
+        .arg(account)
+        .arg("--queue-evidence")
+        .arg(evidence);
+    if let Some(attempt) = attempt {
+        command.arg("--attempt").arg(attempt);
+        command.arg("--tool-call").arg("tool-1");
+        command.arg("--command-id").arg("cmd-1");
+    }
+    command
+        .arg("--")
+        .arg(fixture_target())
+        .current_dir(work)
+        .env(CPU_ACCOUNT_ENV, cpu_account(account))
+        .env_remove(CPU_PERCENT_ENV)
+        .env_remove(heavy_command_trace::EVIDENCE_ENV)
+        .env_remove(heavy_command_trace::ATTEMPT_ENV)
+        .env_remove(heavy_command_trace::TOOL_CALL_ENV)
+        .env_remove(heavy_command_trace::COMMAND_ENV)
+        .env_remove(heavy_command_trace::PARENT_ADMISSION_ENV)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn tagged_holder(account: &Path, work: &Path, attempt: Option<&str>) -> Command {
+    let mut command = Command::new(manager());
+    command.arg("heavy").arg("--account").arg(account);
+    if let Some(attempt) = attempt {
+        command.arg("--attempt").arg(attempt);
+    }
+    command
+        .arg("--")
+        .arg(fixture_target())
+        .current_dir(work)
+        .env(CPU_ACCOUNT_ENV, cpu_account(account))
+        .env_remove(CPU_PERCENT_ENV)
+        .env_remove(heavy_command_trace::EVIDENCE_ENV)
+        .env_remove(heavy_command_trace::ATTEMPT_ENV)
+        .env_remove(heavy_command_trace::TOOL_CALL_ENV)
+        .env_remove(heavy_command_trace::COMMAND_ENV)
+        .env_remove(heavy_command_trace::PARENT_ADMISSION_ENV)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn hold(command: &mut Command, millis: &str, started: &Path) {
+    command
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", millis)
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", started);
+}
+
+fn public_evidence(dir: &Path) -> Vec<String> {
+    let mut texts = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            texts.push(fs::read_to_string(&path).unwrap());
+        }
+    }
+    texts.sort();
+    texts
+}
+
+fn assert_public(texts: &[String], forbidden: &str) {
+    for text in texts {
+        assert!(!text.contains('\\') && !text.contains('/'), "{text}");
+        assert!(!text.contains("command="), "{text}");
+        assert!(!text.contains(forbidden), "{text}");
+    }
+}
+
+#[test]
+fn queue_evidence_covers_grant_wait_identity_release_and_ordinary_operation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    let evidence = root.join("evidence");
+    fs::create_dir_all(&work).unwrap();
+    fs::create_dir_all(&evidence).unwrap();
+    exclusive_slots(&account);
+
+    let started = root.join("immediate.started");
+    let mut immediate = observed(&account, &work, &evidence, Some("attempt-immediate"));
+    hold(&mut immediate, "10", &started);
+    let immediate = run(&mut immediate, Duration::from_secs(60));
+    let err = stderr(&immediate);
+    assert_eq!(immediate.status.code(), Some(0), "{err}");
+    assert!(
+        !err.contains("waiting for a free heavy-command slot"),
+        "{err}"
+    );
+    assert!(
+        !err.contains(heavy_command_trace::EVIDENCE_FAILURE_PREFIX),
+        "{err}"
+    );
+    let views = heavy_command_trace::read_directory(&evidence).unwrap();
+    assert_eq!(views.len(), 1, "{:?}", public_evidence(&evidence));
+    let interpreted = heavy_command_trace::interpret(&views[0]);
+    assert_eq!(interpreted.delay, QueueDelay::MeasuredZero);
+    assert!(interpreted.bound_to_attempt);
+    assert!(matches!(
+        interpreted.post_grant,
+        heavy_command_trace::PostGrant::Started { delay_ns: Some(_) }
+    ));
+    assert_public(&public_evidence(&evidence), &account.display().to_string());
+
+    let before = public_evidence(&evidence).len();
+    let mut ordinary = heavy(&account, &work);
+    ordinary
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let ordinary = run(&mut ordinary, Duration::from_secs(60));
+    assert_eq!(ordinary.status.code(), Some(0), "{}", stderr(&ordinary));
+    assert!(!stderr(&ordinary).contains(heavy_command_trace::EVIDENCE_FAILURE_PREFIX));
+    assert_eq!(public_evidence(&evidence).len(), before);
+
+    for (holder_attempt, waiter_attempt, expect_unrelated) in [
+        (Some("attempt-holder"), "attempt-waiter", true),
+        (Some("attempt-same"), "attempt-same", false),
+        (None, "attempt-unknown", false),
+    ] {
+        let holder_started = root.join(format!("{waiter_attempt}.holder"));
+        let mut holder = tagged_holder(&account, &work, holder_attempt);
+        hold(&mut holder, "4000", &holder_started);
+        let holder = holder.spawn().unwrap();
+        wait_for_path(&holder_started, Duration::from_secs(30));
+        let waiter_evidence = root.join(format!("{waiter_attempt}-evidence"));
+        fs::create_dir_all(&waiter_evidence).unwrap();
+        let mut waiter = observed(&account, &work, &waiter_evidence, Some(waiter_attempt));
+        waiter
+            .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+            .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+        let waiter = run(&mut waiter, Duration::from_secs(60));
+        let holder = finish(holder, Duration::from_secs(60));
+        let waiter_err = stderr(&waiter);
+        assert_eq!(holder.status.code(), Some(0), "{}", stderr(&holder));
+        assert_eq!(waiter.status.code(), Some(0), "{waiter_err}");
+        assert!(
+            waiter_err.contains("waiting for a free heavy-command slot"),
+            "{waiter_err}"
+        );
+        let view = heavy_command_trace::read_directory(&waiter_evidence).unwrap();
+        assert_eq!(view.len(), 1, "{waiter_attempt}");
+        let delay = heavy_command_trace::interpret(&view[0]).delay;
+        if expect_unrelated {
+            assert!(
+                matches!(delay, QueueDelay::UnrelatedWait { monotonic_ns, .. } if monotonic_ns > 0),
+                "{waiter_attempt}: {delay:?}"
+            );
+        } else if holder_attempt == Some("attempt-same") {
+            assert!(
+                matches!(delay, QueueDelay::SelfContention { monotonic_ns } if monotonic_ns > 0),
+                "{delay:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    delay,
+                    QueueDelay::Unknown {
+                        reason: "holder_identity_unknown"
+                    }
+                ),
+                "{delay:?}"
+            );
+            let text = public_evidence(&waiter_evidence).join("\n");
+            assert!(!text.contains("other_attempt"), "{text}");
+        }
+        assert_public(
+            &public_evidence(&waiter_evidence),
+            &account.display().to_string(),
+        );
+        assert!(matches!(
+            heavy_command_trace::interpret(&view[0]).post_grant,
+            heavy_command_trace::PostGrant::Started { delay_ns: Some(_) }
+        ));
+    }
+}
+
+#[test]
+fn queue_evidence_covers_timeout_cancellation_failure_and_incomplete_collection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    exclusive_slots(&account);
+    let mut budget = Budget::read(&account).unwrap();
+    budget.queue_wait_seconds = 1;
+    Budget::write(&account, &budget).unwrap();
+
+    let holder_started = root.join("timeout.holder");
+    let mut holder = tagged_holder(&account, &work, Some("attempt-holder"));
+    hold(&mut holder, "8000", &holder_started);
+    let mut holder = holder.spawn().unwrap();
+    wait_for_path(&holder_started, Duration::from_secs(30));
+
+    let evidence = root.join("timeout-evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    let waiter_started = root.join("timeout.waiter");
+    let mut waiter = observed(&account, &work, &evidence, Some("attempt-waiter"));
+    hold(&mut waiter, "10", &waiter_started);
+    let waiter = run(&mut waiter, Duration::from_secs(30));
+    let err = stderr(&waiter);
+    assert_eq!(waiter.status.code(), Some(124), "{err}");
+    assert!(
+        !waiter_started.exists(),
+        "a timed-out waiter must not start the command"
+    );
+    assert!(err.contains("queue wait limit"), "{err}");
+    let delay =
+        heavy_command_trace::interpret(&heavy_command_trace::read_directory(&evidence).unwrap()[0])
+            .delay;
+    assert!(
+        matches!(
+            delay,
+            QueueDelay::FailedAdmission {
+                terminal: TerminalKind::Timeout,
+                ..
+            }
+        ),
+        "{delay:?}"
+    );
+    assert_public(&public_evidence(&evidence), &account.display().to_string());
+
+    fs::write(evidence.join("partial.json"), b"{").unwrap();
+    let views = heavy_command_trace::read_directory(&evidence).unwrap();
+    assert!(views.iter().any(|view| matches!(
+        heavy_command_trace::interpret(view).delay,
+        QueueDelay::Unknown {
+            reason: "malformed_json"
+        }
+    )));
+    assert!(views.iter().any(|view| matches!(
+        heavy_command_trace::interpret(view).delay,
+        QueueDelay::FailedAdmission { .. }
+    )));
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    // Restore a long queue wait for cancellation, which must observe the wait.
+    budget.queue_wait_seconds = 3600;
+    Budget::write(&account, &budget).unwrap();
+    let cancel_holder_started = root.join("cancel.holder");
+    let mut cancel_holder = tagged_holder(&account, &work, Some("attempt-holder"));
+    hold(&mut cancel_holder, "8000", &cancel_holder_started);
+    let mut cancel_holder = cancel_holder.spawn().unwrap();
+    wait_for_path(&cancel_holder_started, Duration::from_secs(30));
+    let cancel_evidence = root.join("cancel-evidence");
+    fs::create_dir_all(&cancel_evidence).unwrap();
+    let log = root.join("cancel.log");
+    let mut cancel = observed(&account, &work, &cancel_evidence, Some("attempt-cancel"));
+    cancel
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10")
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()))
+        .creation_flags(0x0000_0200);
+    let cancel = cancel.spawn().unwrap();
+    wait_for_log(
+        &log,
+        "waiting for a free heavy-command slot",
+        Duration::from_secs(30),
+    );
+    let sent = unsafe {
+        windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+            windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+            cancel.id(),
+        )
+    };
+    assert_ne!(sent, 0, "{}", std::io::Error::last_os_error());
+    let cancelled = finish(cancel, Duration::from_secs(20));
+    assert_eq!(cancelled.status.code(), Some(130), "{}", stderr(&cancelled));
+    let delay = heavy_command_trace::interpret(
+        &heavy_command_trace::read_directory(&cancel_evidence).unwrap()[0],
+    )
+    .delay;
+    assert!(
+        matches!(
+            delay,
+            QueueDelay::FailedAdmission {
+                terminal: TerminalKind::Cancelled,
+                ..
+            }
+        ),
+        "{delay:?}"
+    );
+    let _ = cancel_holder.kill();
+    let _ = cancel_holder.wait();
+    let mut released = heavy(&account, &work);
+    released
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let released = run(&mut released, Duration::from_secs(60));
+    assert_eq!(released.status.code(), Some(0), "{}", stderr(&released));
+
+    let failure_holder_started = root.join("failure.holder");
+    let mut failure_holder = tagged_holder(&account, &work, Some("attempt-holder"));
+    hold(&mut failure_holder, "8000", &failure_holder_started);
+    let mut failure_holder = failure_holder.spawn().unwrap();
+    wait_for_path(&failure_holder_started, Duration::from_secs(30));
+    std::fs::hard_link(
+        account.join("heavy-command.lock"),
+        account.join("heavy-command.lock.alias"),
+    )
+    .unwrap();
+    let failure_evidence = root.join("failure-evidence");
+    fs::create_dir_all(&failure_evidence).unwrap();
+    let failure_started = root.join("failure.started");
+    let mut failure = observed(&account, &work, &failure_evidence, Some("attempt-failure"));
+    hold(&mut failure, "10", &failure_started);
+    let failure = run(&mut failure, Duration::from_secs(30));
+    let err = stderr(&failure);
+    assert_eq!(failure.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("resource lock is not an unaliased ordinary file"),
+        "{err}"
+    );
+    assert!(!failure_started.exists());
+    let delay = heavy_command_trace::interpret(
+        &heavy_command_trace::read_directory(&failure_evidence).unwrap()[0],
+    )
+    .delay;
+    assert!(
+        matches!(
+            delay,
+            QueueDelay::FailedAdmission {
+                terminal: TerminalKind::Failure,
+                ..
+            }
+        ),
+        "{delay:?}"
+    );
+    assert_public(
+        &public_evidence(&failure_evidence),
+        &account.display().to_string(),
+    );
+    let _ = failure_holder.kill();
+    let _ = failure_holder.wait();
+    let _ = fs::remove_file(account.join("heavy-command.lock.alias"));
+
+    let missing = root.join("missing-parent").join("evidence");
+    let mut incomplete = observed(&account, &work, &missing, Some("attempt-incomplete"));
+    incomplete
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "10");
+    let incomplete = run(&mut incomplete, Duration::from_secs(60));
+    let err = stderr(&incomplete);
+    assert_eq!(incomplete.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains(heavy_command_trace::EVIDENCE_FAILURE_PREFIX),
+        "{err}"
+    );
+    assert!(!root.join("missing-parent").exists());
+}
+
+#[test]
+fn queue_evidence_inherited_admission_is_not_a_second_queue_episode() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let account = root.join("account");
+    let work = root.join("work");
+    let evidence = root.join("evidence");
+    fs::create_dir_all(&work).unwrap();
+    fs::create_dir_all(&evidence).unwrap();
+    exclusive_slots(&account);
+    let log = root.join("nested.log");
+    let started = root.join("nested.started");
+    let mut nested = Command::new(manager());
+    nested
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--queue-evidence")
+        .arg(&evidence)
+        .arg("--attempt")
+        .arg("attempt-nested")
+        .arg("--tool-call")
+        .arg("tool-nested")
+        .arg("--command-id")
+        .arg("cmd-outer")
+        .arg("--")
+        .arg(manager())
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--")
+        .arg(fixture_target())
+        .current_dir(&work)
+        .env(CPU_ACCOUNT_ENV, cpu_account(&account))
+        .env_remove(CPU_PERCENT_ENV)
+        .env_remove(heavy_command_trace::EVIDENCE_ENV)
+        .env_remove(heavy_command_trace::ATTEMPT_ENV)
+        .env_remove(heavy_command_trace::TOOL_CALL_ENV)
+        .env_remove(heavy_command_trace::COMMAND_ENV)
+        .env_remove(heavy_command_trace::PARENT_ADMISSION_ENV)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "1500")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()));
+    let nested = finish(nested.spawn().unwrap(), Duration::from_secs(60));
+    let text = log_text(&log);
+    assert_eq!(nested.status.code(), Some(0), "{text}");
+    assert!(text.contains("this process is a verified member"), "{text}");
+    assert!(started.exists());
+    let views = heavy_command_trace::read_directory(&evidence).unwrap();
+    assert_eq!(views.len(), 2, "{:?}", public_evidence(&evidence));
+    let interpreted: Vec<_> = views.iter().map(heavy_command_trace::interpret).collect();
+    let parent = interpreted
+        .iter()
+        .find(|item| item.delay == QueueDelay::MeasuredZero);
+    let inherited = interpreted
+        .iter()
+        .find(|item| item.delay == QueueDelay::Inherited);
+    let parent = parent.expect("outer admission should be an immediate grant");
+    let inherited = inherited.expect("nested admission should not be a queue episode");
+    assert_eq!(
+        inherited.parent_admission_id.as_deref(),
+        parent.admission_id.as_deref()
+    );
+    assert!(
+        interpreted
+            .iter()
+            .filter(|item| matches!(
+                item.delay,
+                QueueDelay::UnrelatedWait { .. }
+                    | QueueDelay::SelfContention { .. }
+                    | QueueDelay::MeasuredZero
+            ))
+            .count()
+            == 1
+    );
+    assert_public(&public_evidence(&evidence), &account.display().to_string());
 }

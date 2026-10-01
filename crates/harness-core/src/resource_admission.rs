@@ -103,7 +103,7 @@ fn check_stop(deadline: Deadline, cancellation: &Cancellation) -> io::Result<()>
     }
 }
 
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const HEAVY_COMMAND_LOCK: &str = "heavy-command.lock";
 
 fn note_busy(reported: &mut bool, waiting: &mut impl FnMut(), deadline: Deadline) {
@@ -176,7 +176,28 @@ impl HeavyAdmission {
         slot_count: u32,
         deadline: Deadline,
         cancellation: &Cancellation,
+        waiting: impl FnMut(),
+    ) -> io::Result<Self> {
+        Self::acquire_observing(
+            directory,
+            slot_count,
+            deadline,
+            cancellation,
+            waiting,
+            || {},
+        )
+    }
+
+    /// Same lock order and poll as [`Self::acquire`]. `tick` runs once per busy
+    /// poll, before the sleep, so a caller can record holder identity without
+    /// holding the slot. It does not acquire, release or rewrite a lock.
+    pub fn acquire_observing(
+        directory: &Path,
+        slot_count: u32,
+        deadline: Deadline,
+        cancellation: &Cancellation,
         mut waiting: impl FnMut(),
+        mut tick: impl FnMut(),
     ) -> io::Result<Self> {
         if slot_count == 0 {
             return Err(io::Error::new(
@@ -199,6 +220,7 @@ impl HeavyAdmission {
                         });
                     }
                     Err(TryLockError::WouldBlock) => {
+                        tick();
                         note_busy(&mut reported, &mut waiting, deadline);
                     }
                     Err(TryLockError::Error(error)) => return Err(error),
@@ -212,6 +234,7 @@ impl HeavyAdmission {
             match legacy.file.try_lock_shared() {
                 Ok(()) => {}
                 Err(TryLockError::WouldBlock) => {
+                    tick();
                     note_busy(&mut reported, &mut waiting, deadline);
                     continue;
                 }
@@ -245,6 +268,7 @@ impl HeavyAdmission {
             // it before the queue poll keeps a full slot set from blocking a
             // legacy exclusive lock for the whole deadline.
             legacy.file.unlock()?;
+            tick();
             note_busy(&mut reported, &mut waiting, deadline);
         }
     }

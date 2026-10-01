@@ -36,6 +36,7 @@
 //! and the payload it created really belong to the account budget object.
 #![cfg(windows)]
 
+use crate::heavy_command_trace::{self, EpisodeDraft, EpisodeKind, Observation, TerminalKind};
 use crate::{
     build_identity,
     native_build::{directory, ordinary_ancestors, resolve_tool},
@@ -43,7 +44,7 @@ use crate::{
         Cancellation, CommandSpec, Deadline, HeavyAggregate, Job, Limits, Outcome, ProcessIdentity,
         SHARED_CPU_PERCENT, SharedCpuBudget, cpu_budget_directory,
     },
-    resource_admission::HeavyAdmission,
+    resource_admission::{HeavyAdmission, POLL_INTERVAL},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -700,6 +701,10 @@ struct HolderRecord {
     started_unix_ms: u128,
     command: String,
     job: String,
+    /// Present only when the holder was admitted with an attempt label. A missing
+    /// tag is unknown ownership, never proof of unrelated work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<String>,
 }
 
 /// The account-wide shared CPU budget as this process verified it: the
@@ -902,6 +907,7 @@ pub struct Holder {
     identity: ProcessIdentity,
     job: String,
     cpu: SharedCpu,
+    evidence: Option<EvidenceLink>,
 }
 
 impl Holder {
@@ -910,34 +916,61 @@ impl Holder {
         budget: &Budget,
         label: &str,
         cancellation: &Cancellation,
+        observation: &Observation,
+        link: Option<EvidenceLink>,
     ) -> io::Result<Self> {
         let identity = current_identity()?;
         // The same OS-random key source the broker endpoint uses; the name is
         // unguessable so it cannot be squatted by an unrelated caller.
         let job = format!("{JOB_NAME_PREFIX}{}", crate::broker_endpoint::random_key()?);
         let slot_count = budget.max_concurrent_trees;
+        let attempt = observation.correlation.attempt_id.as_deref();
+        let mut wait = WaitTrace::default();
+        let queue_deadline = match budget.queue_deadline() {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                record_terminal(&link, observation, &wait, None, &error);
+                return Err(error);
+            }
+        };
         // Slot first. The waiting callback runs before this returns, so a waiter
         // holds no CPU budget lock and no aggregate Job handle.
-        let admission = HeavyAdmission::acquire(
+        let admission = HeavyAdmission::acquire_observing(
             account,
             slot_count,
-            budget.queue_deadline()?,
+            queue_deadline,
             cancellation,
             || {
                 eprintln!("{}", queue_diagnostic(account, slot_count));
             },
-        )?;
+            || observe_wait(&mut wait, account, slot_count, attempt),
+        );
+        let ended = heavy_command_trace::sample_clock().ok();
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                record_terminal(&link, observation, &wait, ended, &error);
+                return Err(error);
+            }
+        };
         let cpu = SharedCpu::join(cancellation);
-        let aggregate = HeavyAggregate::acquire_within(
+        let aggregate = match HeavyAggregate::acquire_within(
             account,
             budget.aggregate_memory_limit_bytes,
             Deadline::after(CPU_BUDGET_LOCK_WAIT)?,
             cancellation,
-        )?;
+        ) {
+            Ok(aggregate) => aggregate,
+            Err(error) => {
+                record_terminal(&link, observation, &wait, ended, &error);
+                return Err(error);
+            }
+        };
         let record = holder_record_path(account, admission.slot_index());
-        if let Err(error) = write_holder(&record, identity, label, &job) {
+        if let Err(error) = write_holder(&record, identity, label, &job, attempt) {
             eprintln!("heavy: holder record not written: {error}");
         }
+        record_grant(&link, observation, &wait, ended);
         Ok(Self {
             slot_index: admission.slot_index(),
             _admission: admission,
@@ -946,6 +979,7 @@ impl Holder {
             identity,
             job,
             cpu,
+            evidence: link,
         })
     }
 }
@@ -963,13 +997,14 @@ pub struct Inherited {
     job: String,
     holder: ProcessIdentity,
     cpu: SharedCpu,
+    evidence: Option<EvidenceLink>,
 }
 
 /// Account admission for one native operation.
 pub enum Admission {
     /// This process holds the account slot and releases it when dropped.
     Held(Box<Holder>),
-    Inherited(Inherited),
+    Inherited(Box<Inherited>),
 }
 
 impl Admission {
@@ -984,22 +1019,118 @@ impl Admission {
         label: &str,
         cancellation: &Cancellation,
     ) -> io::Result<Self> {
+        Self::acquire_observed(
+            account,
+            budget,
+            label,
+            cancellation,
+            &Observation::default(),
+        )
+    }
+
+    /// Queue for the account slot, recording one optional evidence document.
+    /// Evidence failure does not change admission, cancellation or the command.
+    pub fn acquire_observed(
+        account: &Path,
+        budget: &Budget,
+        label: &str,
+        cancellation: &Cancellation,
+        observation: &Observation,
+    ) -> io::Result<Self> {
         budget.validate("heavy-command budget")?;
-        prepare(account)?;
+        let link = evidence_link(observation);
+        if let Err(error) = prepare(account) {
+            record_terminal(&link, observation, &WaitTrace::default(), None, &error);
+            return Err(error);
+        }
         if let Some(marker) = inherited(std::env::var_os(LEASE_ENV).as_deref(), account) {
             eprintln!(
                 "heavy: inheriting the aggregate heavy-command budget through admitted Job \"{}\" (holder pid={}); this process is a verified member",
                 marker.job, marker.holder.pid
             );
-            return Ok(Self::Inherited(Inherited {
+            if let Some(link) = &link {
+                record_inherited(link, observation);
+            }
+            return Ok(Self::Inherited(Box::new(Inherited {
                 job: marker.job,
                 holder: marker.holder,
                 cpu: SharedCpu::join(cancellation),
-            }));
+                evidence: link,
+            })));
         }
         Ok(Self::Held(
-            Holder::acquire(account, budget, label, cancellation)?.into(),
+            Holder::acquire(account, budget, label, cancellation, observation, link)?.into(),
         ))
+    }
+
+    fn evidence_link(&self) -> Option<&EvidenceLink> {
+        match self {
+            Self::Held(holder) => holder.evidence.as_ref(),
+            Self::Inherited(inherited) => inherited.evidence.as_ref(),
+        }
+    }
+
+    /// Passes the evidence directory and parent admission to a nested heavy
+    /// command. The nested command must not inherit this command's command id:
+    /// that id is not an episode key. Ordinary admission removes the variables
+    /// so a leaked parent environment cannot start collection.
+    pub fn bind_child_env(&self, env: &mut std::collections::BTreeMap<OsString, Option<OsString>>) {
+        let clear = |env: &mut std::collections::BTreeMap<OsString, Option<OsString>>, name| {
+            env.insert(OsString::from(name), None);
+        };
+        let Some(link) = self.evidence_link() else {
+            for name in [
+                heavy_command_trace::EVIDENCE_ENV,
+                heavy_command_trace::ATTEMPT_ENV,
+                heavy_command_trace::TOOL_CALL_ENV,
+                heavy_command_trace::COMMAND_ENV,
+                heavy_command_trace::PARENT_ADMISSION_ENV,
+            ] {
+                clear(env, name);
+            }
+            return;
+        };
+        env.insert(
+            OsString::from(heavy_command_trace::EVIDENCE_ENV),
+            Some(link.directory.as_os_str().to_owned()),
+        );
+        env.insert(
+            OsString::from(heavy_command_trace::PARENT_ADMISSION_ENV),
+            Some(link.admission_id.clone().into()),
+        );
+        insert_env(
+            env,
+            heavy_command_trace::ATTEMPT_ENV,
+            link.attempt_id.as_deref(),
+        );
+        insert_env(
+            env,
+            heavy_command_trace::TOOL_CALL_ENV,
+            link.tool_call_id.as_deref(),
+        );
+        clear(env, heavy_command_trace::COMMAND_ENV);
+    }
+
+    pub fn note_command_started(&self) {
+        self.note_post_grant(true);
+    }
+
+    pub fn note_command_not_started(&self) {
+        self.note_post_grant(false);
+    }
+
+    fn note_post_grant(&self, started: bool) {
+        let Some(link) = self.evidence_link() else {
+            return;
+        };
+        let result = if started {
+            heavy_command_trace::note_command_started(&link.directory, &link.admission_id)
+        } else {
+            heavy_command_trace::note_command_not_started(&link.directory, &link.admission_id)
+        };
+        if let Err(error) = result {
+            heavy_command_trace::expose_write(&error);
+        }
     }
 
     fn cpu(&self) -> &SharedCpu {
@@ -1307,7 +1438,310 @@ fn same_directory(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn write_holder(path: &Path, identity: ProcessIdentity, label: &str, job: &str) -> io::Result<()> {
+struct EvidenceLink {
+    directory: PathBuf,
+    admission_id: String,
+    attempt_id: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+#[derive(Default)]
+struct WaitTrace {
+    frequency: u64,
+    first_busy: Option<heavy_command_trace::ClockSample>,
+    holders_last: Vec<heavy_command_trace::HolderFinding>,
+    samples: u32,
+    changed: bool,
+    clock_failed: bool,
+    saw_live: bool,
+}
+
+struct UnstartedNote<'a> {
+    admission: &'a Admission,
+    pending: bool,
+}
+
+impl Drop for UnstartedNote<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.admission.note_command_not_started();
+        }
+    }
+}
+
+fn evidence_link(observation: &Observation) -> Option<EvidenceLink> {
+    let directory = observation.directory.clone()?;
+    match crate::broker_endpoint::random_key() {
+        Ok(admission_id) => Some(EvidenceLink {
+            directory,
+            admission_id,
+            attempt_id: observation.correlation.attempt_id.clone(),
+            tool_call_id: observation.correlation.tool_call_id.clone(),
+        }),
+        Err(_) => {
+            heavy_command_trace::expose("admission identity could not be generated");
+            None
+        }
+    }
+}
+
+fn insert_env(
+    env: &mut std::collections::BTreeMap<OsString, Option<OsString>>,
+    name: &str,
+    value: Option<&str>,
+) {
+    env.insert(OsString::from(name), value.map(OsString::from));
+}
+
+fn parent_admission_from_env() -> Option<String> {
+    let value = std::env::var(heavy_command_trace::PARENT_ADMISSION_ENV).ok()?;
+    heavy_command_trace::validate_token(&value).ok()
+}
+
+fn observe_wait(wait: &mut WaitTrace, account: &Path, slot_count: u32, attempt: Option<&str>) {
+    match heavy_command_trace::sample_clock() {
+        Ok((frequency, sample)) => {
+            if wait.frequency == 0 {
+                wait.frequency = frequency;
+            } else if wait.frequency != frequency {
+                wait.clock_failed = true;
+            }
+            if wait.first_busy.is_none() {
+                wait.first_busy = Some(sample);
+            }
+        }
+        Err(_) => wait.clock_failed = true,
+    }
+    let (live, unreadable) = live_holder_tags(account, slot_count);
+    let findings = heavy_command_trace::classify_holders(attempt, &live, unreadable);
+    // The holder record is written after the lock is taken. Leading samples
+    // that only see the lock are not an ownership change.
+    if !holder_not_yet_recorded(&findings) {
+        if wait.saw_live && findings != wait.holders_last {
+            wait.changed = true;
+        }
+        wait.holders_last = findings;
+        wait.saw_live = true;
+    } else if wait.holders_last.is_empty() {
+        wait.holders_last = findings;
+    }
+    wait.samples += 1;
+}
+
+fn holder_not_yet_recorded(findings: &[heavy_command_trace::HolderFinding]) -> bool {
+    findings.iter().all(|finding| {
+        finding.classification == heavy_command_trace::HolderClass::Unknown
+            && matches!(
+                finding.reason,
+                heavy_command_trace::HolderReason::LegacyLock
+                    | heavy_command_trace::HolderReason::Unreadable
+            )
+    })
+}
+
+fn live_holder_tags(
+    account: &Path,
+    slot_count: u32,
+) -> (Vec<heavy_command_trace::LiveHolder>, bool) {
+    let mut paths = vec![
+        (account.join(HOLDER_FILE), None),
+        (account.join(HOLDER_EXCLUSIVE_FILE), None),
+    ];
+    for index in 0..slot_count {
+        paths.push((holder_record_path(account, Some(index)), Some(index)));
+    }
+    let mut live = Vec::new();
+    let mut seen = Vec::new();
+    let mut saw_unreadable = false;
+    for (path, slot) in paths {
+        match read_live_holder(&path, slot) {
+            HolderRead::Absent => {}
+            HolderRead::Unreadable => saw_unreadable = true,
+            HolderRead::Live {
+                pid,
+                creation_time,
+                holder,
+            } => {
+                if seen.contains(&(pid, creation_time)) {
+                    continue;
+                }
+                seen.push((pid, creation_time));
+                live.push(holder);
+            }
+        }
+    }
+    let unreadable = saw_unreadable && live.is_empty();
+    (live, unreadable)
+}
+
+enum HolderRead {
+    Absent,
+    Unreadable,
+    Live {
+        pid: u32,
+        creation_time: u64,
+        holder: heavy_command_trace::LiveHolder,
+    },
+}
+
+fn read_live_holder(path: &Path, slot: Option<u32>) -> HolderRead {
+    let bytes = match read_bounded(path) {
+        Ok(None) => return HolderRead::Absent,
+        Ok(Some(bytes)) => bytes,
+        Err(_) => return HolderRead::Unreadable,
+    };
+    let Ok(record) = serde_json::from_slice::<HolderRecord>(&bytes) else {
+        return HolderRead::Unreadable;
+    };
+    let identity = ProcessIdentity {
+        pid: record.pid,
+        creation_time: record.creation_time,
+    };
+    if record.schema != SCHEMA || !live_process(identity) {
+        return HolderRead::Absent;
+    }
+    HolderRead::Live {
+        pid: record.pid,
+        creation_time: record.creation_time,
+        holder: heavy_command_trace::LiveHolder {
+            attempt_id: record.attempt_id,
+            slot,
+        },
+    }
+}
+
+fn record_grant(
+    link: &Option<EvidenceLink>,
+    observation: &Observation,
+    wait: &WaitTrace,
+    ended: Option<(u64, heavy_command_trace::ClockSample)>,
+) {
+    let waited = wait.samples > 0;
+    record_episode(
+        link,
+        observation,
+        wait,
+        ended,
+        if waited {
+            TerminalKind::WaitedGrant
+        } else {
+            TerminalKind::ImmediateGrant
+        },
+        None,
+        None,
+    );
+}
+
+fn record_terminal(
+    link: &Option<EvidenceLink>,
+    observation: &Observation,
+    wait: &WaitTrace,
+    ended: Option<(u64, heavy_command_trace::ClockSample)>,
+    error: &io::Error,
+) {
+    let terminal = heavy_command_trace::terminal_of(error);
+    let failure = (terminal == TerminalKind::Failure)
+        .then(|| heavy_command_trace::failure_token(error).to_owned());
+    record_episode(
+        link,
+        observation,
+        wait,
+        ended,
+        terminal,
+        failure,
+        Some(false),
+    );
+}
+
+fn record_inherited(link: &EvidenceLink, observation: &Observation) {
+    let ended = heavy_command_trace::sample_clock().ok();
+    record_episode(
+        &Some(link.clone_link()),
+        observation,
+        &WaitTrace::default(),
+        ended,
+        TerminalKind::Inherited,
+        None,
+        None,
+    );
+}
+
+fn record_episode(
+    link: &Option<EvidenceLink>,
+    observation: &Observation,
+    wait: &WaitTrace,
+    ended: Option<(u64, heavy_command_trace::ClockSample)>,
+    terminal: TerminalKind,
+    failure: Option<String>,
+    payload_started: Option<bool>,
+) {
+    let Some(link) = link else {
+        return;
+    };
+    let inherited = terminal == TerminalKind::Inherited;
+    let waited = !inherited && wait.samples > 0;
+    let (frequency, admitted) = if wait.clock_failed {
+        (0, None)
+    } else {
+        match ended {
+            Some((frequency, sample)) => (frequency, Some(sample)),
+            None => (wait.frequency, None),
+        }
+    };
+    let parent = if inherited {
+        parent_admission_from_env()
+    } else {
+        None
+    };
+    let draft = EpisodeDraft {
+        admission_id: link.admission_id.clone(),
+        parent_admission_id: parent,
+        correlation: observation.correlation.clone(),
+        episode: if inherited {
+            EpisodeKind::Inherited
+        } else {
+            EpisodeKind::Queue
+        },
+        terminal,
+        failure,
+        frequency,
+        admitted_at: admitted,
+        queue_start: waited.then_some(wait.first_busy).flatten(),
+        queue_end: waited.then_some(admitted).flatten(),
+        waited,
+        holders: if waited {
+            wait.holders_last.clone()
+        } else {
+            Vec::new()
+        },
+        holder_samples: wait.samples,
+        holder_changed: wait.changed,
+        poll_resolution_ns: POLL_INTERVAL.as_nanos() as u64,
+        payload_started,
+    };
+    if let Err(error) = heavy_command_trace::write_episode(&link.directory, &draft) {
+        heavy_command_trace::expose_write(&error);
+    }
+}
+
+impl EvidenceLink {
+    fn clone_link(&self) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            admission_id: self.admission_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+        }
+    }
+}
+
+fn write_holder(
+    path: &Path,
+    identity: ProcessIdentity,
+    label: &str,
+    job: &str,
+    attempt_id: Option<&str>,
+) -> io::Result<()> {
     let record = HolderRecord {
         schema: SCHEMA,
         pid: identity.pid,
@@ -1315,6 +1749,7 @@ fn write_holder(path: &Path, identity: ProcessIdentity, label: &str, job: &str) 
         started_unix_ms: unix_millis(),
         command: label.to_owned(),
         job: job.to_owned(),
+        attempt_id: attempt_id.map(str::to_owned),
     };
     let file_name = path
         .file_name()
@@ -1470,6 +1905,10 @@ pub fn execute(
     admission: &Admission,
     cancellation: &Cancellation,
 ) -> Result<Run, RunError> {
+    let mut unstarted = UnstartedNote {
+        admission,
+        pending: admission.evidence_link().is_some(),
+    };
     let deadline = budget.deadline().map_err(RunError::Start)?;
     let mut command = CommandSpec::new(program.to_owned());
     command.args = args.to_vec();
@@ -1480,6 +1919,7 @@ pub fn execute(
         .owned_job(budget, account)
         .map_err(RunError::Start)?;
     command.env.insert(OsString::from(LEASE_ENV), Some(marker));
+    admission.bind_child_env(&mut command.env);
     eprintln!("{}", admission.job_line(&job).map_err(RunError::Start)?);
     eprintln!("{}", admission.cpu_report(budget));
     let suspended = admission
@@ -1505,6 +1945,8 @@ pub fn execute(
         None => {}
     }
     let child = suspended.resume().map_err(RunError::Start)?;
+    admission.note_command_started();
+    unstarted.pending = false;
     eprintln!(
         "heavy: started pid={} memory_limit_bytes={} cpu_percent={} deadline_seconds={}",
         child.identity().pid,

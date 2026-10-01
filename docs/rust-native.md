@@ -290,6 +290,22 @@ outside this entry point are not in the heavy queue. Descendants of an admitted
 agent route still share the account CPU allowance; the queue does not cover
 arbitrary processes started outside those routes.
 
+Optional queue evidence stays in this admission owner. It is not a second
+journal. `codex-harness heavy --queue-evidence DIRECTORY --attempt LABEL
+--tool-call LABEL --command-id LABEL -- PROGRAM ARGS` writes one JSON document
+per admission into that caller-owned directory. Labels are ascii tokens and
+are not paths. Omitting `--queue-evidence` is ordinary operation and writes
+nothing. A missing, malformed or partial document is unknown, never a measured
+zero. An immediate grant with a complete paired clock is measured zero. A
+nested heavy command records inherited admission and does not add a queue
+interval. Holder identity is `same_attempt`, `other_attempt` or `unknown`; a
+missing attempt tag stays unknown. The document separates queue time from
+post-grant delay and does not subtract time or tokens. A write failure is
+printed as `heavy: queue evidence was not recorded` and does not change the
+command result. Public documents contain no account paths or foreign command
+text. Interpret the document; a start/end timer or a missing file is not a
+deduction.
+
 ```powershell
 codex-harness heavy --uncapped -- cargo test --locked --jobs 1 -- --test-threads=1
 ```
