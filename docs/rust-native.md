@@ -313,6 +313,21 @@ command result. Public documents contain no account paths or foreign command
 text. Interpret the document; a start/end timer or a missing file is not a
 deduction.
 
+The accounting owner clips verified external waits to the attempt, intersects
+them with independently observed blocked intervals, and removes useful overlap
+before subtracting that duration once from observed elapsed time. Raw time,
+requests, tool operations, token categories, failures and cancellation stay.
+Only a whole request correlated with the wait, contained in that blocked
+interval and structurally wait-only can leave the adjusted usage; mixed and
+unknown requests stay. A full raw detail file is not inactivity: compact QPC
+facts continue through the observation receipt, and overflow stays a gap.
+Adjusted time is not a prediction of an unloaded host. A new comparison that
+uses this view must declare `infrastructure-attribution.v1` in its uncertainty
+policy before either arm, keep `config_identity` comparability, and measure
+both arms again. Reviewed candidate revisions can be reused. Attempts recorded
+before this telemetry are not a measured zero and are not a comparable
+adjusted baseline. The lineage is `infrastructure-attribution.v1`.
+
 ```powershell
 codex-harness heavy --uncapped -- cargo test --locked --jobs 1 -- --test-threads=1
 ```

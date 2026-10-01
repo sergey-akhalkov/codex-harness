@@ -160,9 +160,24 @@ pub fn run_app_server(args: &[std::ffi::OsString]) -> io::Result<i32> {
             let until = Instant::now() + Duration::from_secs(120);
             while Instant::now() < until {
                 if !server.requests_for("turn/start").is_empty() {
+                    if env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_ok() {
+                        run_owned_heavy(&server, &session);
+                    }
                     record_selected_tools();
                     let _ = commit_solution();
-                    let _ = write_rollout(&session, &rollout_model, &rollout_effort);
+                    let _ = write_rollout(
+                        &session,
+                        &rollout_model,
+                        &rollout_effort,
+                        env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY").is_err(),
+                    );
+                    server.push(json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": session.clone(),
+                            "item": {"id": "message-1", "type": "agentMessage", "text": FINAL_MESSAGE},
+                        },
+                    }));
                     server.push(json!({
                         "method": "item/completed",
                         "params": {
@@ -255,6 +270,60 @@ fn commit_solution() -> io::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Runs one real heavy command under the controller-supplied account and
+/// evidence environment, and emits the matching command item so the host can
+/// correlate it. The command id is the item id. This is not a model call.
+fn run_owned_heavy(server: &Server, session: &str) {
+    const COMMAND_ID: &str = "heavy-cmd-1";
+    server.push(json!({
+        "method": "item/started",
+        "params": {
+            "threadId": session,
+            "item": {
+                "id": COMMAND_ID,
+                "type": "commandExecution",
+                "command": "codex-harness heavy",
+                "status": "inProgress",
+            },
+        },
+    }));
+    // The host polls the control stream. Give it time to record the start
+    // before the admission interval begins.
+    thread::sleep(Duration::from_millis(800));
+    if let Some(marker) = env::var_os("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_MARKER") {
+        let _ = fs::write(marker, b"waiting\n");
+    }
+    let program = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_PROGRAM")
+        .unwrap_or_else(|_| "cmd.exe".to_owned());
+    let cli = env::var("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_CLI")
+        .unwrap_or_else(|_| "codex-harness.exe".to_owned());
+    let output = Command::new(cli)
+        .args([
+            "heavy",
+            "--tool-call",
+            COMMAND_ID,
+            "--command-id",
+            COMMAND_ID,
+            "--",
+            &program,
+        ])
+        .output();
+    let exit = output.as_ref().ok().and_then(|output| output.status.code());
+    server.push(json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": session,
+            "item": {
+                "id": COMMAND_ID,
+                "type": "commandExecution",
+                "command": "codex-harness heavy",
+                "status": if exit == Some(0) { "completed" } else { "failed" },
+                "exitCode": exit,
+            },
+        },
+    }));
 }
 
 /// Records unqualified command identity from the host-supplied environment.
@@ -397,13 +466,13 @@ fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {
 
 /// Writes the native rollout the observation owner reads for this session,
 /// with the installed route (or the explicitly overridden facts).
-fn write_rollout(session: &str, model: &str, effort: &str) -> io::Result<()> {
+fn write_rollout(session: &str, model: &str, effort: &str, include_usage: bool) -> io::Result<()> {
     let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("the fixture rollout requires CODEX_HOME"))?;
     let sessions = home.join("sessions").join("2026").join("10").join("01");
     fs::create_dir_all(&sessions)?;
-    let lines = [
+    let mut lines = vec![
         json!({
             "type": "session_meta",
             "payload": {"id": session, "base_instructions": "fixture"},
@@ -412,7 +481,9 @@ fn write_rollout(session: &str, model: &str, effort: &str) -> io::Result<()> {
             "type": "turn_context",
             "payload": {"model": model, "effort": effort, "turn_id": TURN},
         }),
-        json!({
+    ];
+    if include_usage {
+        lines.push(json!({
             "type": "token_usage_record",
             "payload": {
                 "response_id": "response-1",
@@ -424,8 +495,8 @@ fn write_rollout(session: &str, model: &str, effort: &str) -> io::Result<()> {
                     "total_tokens": 120,
                 },
             },
-        }),
-    ];
+        }));
+    }
     let text = lines
         .iter()
         .map(|line| serde_json::to_string(line).map_err(io::Error::other))

@@ -926,6 +926,8 @@ impl Holder {
         let slot_count = budget.max_concurrent_trees;
         let attempt = observation.correlation.attempt_id.as_deref();
         let mut wait = WaitTrace::default();
+        let mut bracket = crate::resource_admission::AdmissionBracket { grant_qpc: None };
+        let collecting = observation.collecting();
         let queue_deadline = match budget.queue_deadline() {
             Ok(deadline) => deadline,
             Err(error) => {
@@ -943,16 +945,23 @@ impl Holder {
             || {
                 eprintln!("{}", queue_diagnostic(account, slot_count));
             },
-            || {
-                if observation.collecting() {
-                    observe_wait(&mut wait, account, slot_count, attempt);
+            |decision| {
+                if collecting {
+                    observe_wait(&mut wait, account, slot_count, attempt, decision);
                 }
             },
+            collecting.then_some(&mut bracket),
         );
         let ended = observation
             .collecting()
             .then(|| heavy_command_trace::sample_clock().ok())
             .flatten();
+        if let (Some(grant), Some((frequency, sample))) = (bracket.grant_qpc, ended) {
+            wait.endpoint_end_ns = heavy_command_trace::monotonic_ns(frequency, grant, sample.qpc);
+            if wait.boot.is_none() {
+                wait.boot = heavy_command_trace::boot_filetime();
+            }
+        }
         let admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
@@ -1464,6 +1473,9 @@ struct WaitTrace {
     first_busy: Option<heavy_command_trace::ClockSample>,
     last_sample: Option<heavy_command_trace::ClockSample>,
     observed_poll_gap_ns: Option<u64>,
+    endpoint_start_ns: Option<u64>,
+    endpoint_end_ns: Option<u64>,
+    boot: Option<u64>,
     holders_last: Vec<heavy_command_trace::HolderFinding>,
     identity_last: Vec<PrivateHolder>,
     gap_findings: Vec<heavy_command_trace::HolderFinding>,
@@ -1521,7 +1533,13 @@ fn parent_admission_from_env() -> Option<String> {
     heavy_command_trace::validate_token(&value).ok()
 }
 
-fn observe_wait(wait: &mut WaitTrace, account: &Path, slot_count: u32, attempt: Option<&str>) {
+fn observe_wait(
+    wait: &mut WaitTrace,
+    account: &Path,
+    slot_count: u32,
+    attempt: Option<&str>,
+    decision_qpc: Option<u64>,
+) {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering;
@@ -1553,6 +1571,10 @@ fn observe_wait(wait: &mut WaitTrace, account: &Path, slot_count: u32, attempt: 
             }
             if wait.first_busy.is_none() {
                 wait.first_busy = Some(sample);
+                wait.boot = heavy_command_trace::boot_filetime();
+                wait.endpoint_start_ns = decision_qpc.and_then(|decision| {
+                    heavy_command_trace::monotonic_ns(frequency, decision, sample.qpc)
+                });
             }
             wait.last_sample = Some(sample);
         }
@@ -1822,6 +1844,9 @@ fn record_episode(
         holder_changed: wait.changed || wait.observation_gap,
         poll_resolution_ns: POLL_INTERVAL.as_nanos() as u64,
         observed_poll_gap_ns: wait.observed_poll_gap_ns,
+        endpoint_start_ns: wait.endpoint_start_ns,
+        endpoint_end_ns: wait.endpoint_end_ns,
+        boot: wait.boot,
         payload_started,
     };
     if let Err(error) = heavy_command_trace::write_episode(&link.directory, &draft) {

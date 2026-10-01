@@ -106,6 +106,12 @@ fn check_stop(deadline: Deadline, cancellation: &Cancellation) -> io::Result<()>
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const HEAVY_COMMAND_LOCK: &str = "heavy-command.lock";
 
+/// Optional QPC grant sample. Present only when the caller is recording
+/// evidence; the opted-out path passes `None` and does not read the clock.
+pub struct AdmissionBracket {
+    pub grant_qpc: Option<u64>,
+}
+
 fn note_busy(reported: &mut bool, waiting: &mut impl FnMut(), deadline: Deadline) {
     if !*reported {
         *reported = true;
@@ -184,7 +190,8 @@ impl HeavyAdmission {
             deadline,
             cancellation,
             waiting,
-            || {},
+            |_| {},
+            None,
         )
     }
 
@@ -197,8 +204,10 @@ impl HeavyAdmission {
         deadline: Deadline,
         cancellation: &Cancellation,
         mut waiting: impl FnMut(),
-        mut tick: impl FnMut(),
+        mut tick: impl FnMut(Option<u64>),
+        mut bracket: Option<&mut AdmissionBracket>,
     ) -> io::Result<Self> {
+        let measure = bracket.is_some();
         if slot_count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -213,6 +222,9 @@ impl HeavyAdmission {
                 check_stop(deadline, cancellation)?;
                 match legacy.file.try_lock() {
                     Ok(()) => {
+                        if measure && let Some(bracket) = bracket.as_mut() {
+                            bracket.grant_qpc = crate::heavy_command_trace::qpc_now();
+                        }
                         return Ok(Self {
                             _slot: None,
                             _legacy: legacy,
@@ -220,7 +232,7 @@ impl HeavyAdmission {
                         });
                     }
                     Err(TryLockError::WouldBlock) => {
-                        tick();
+                        tick(measure.then(crate::heavy_command_trace::qpc_now).flatten());
                         note_busy(&mut reported, &mut waiting, deadline);
                     }
                     Err(TryLockError::Error(error)) => return Err(error),
@@ -234,7 +246,7 @@ impl HeavyAdmission {
             match legacy.file.try_lock_shared() {
                 Ok(()) => {}
                 Err(TryLockError::WouldBlock) => {
-                    tick();
+                    tick(measure.then(crate::heavy_command_trace::qpc_now).flatten());
                     note_busy(&mut reported, &mut waiting, deadline);
                     continue;
                 }
@@ -258,6 +270,9 @@ impl HeavyAdmission {
             }
             if let Some(index) = chosen {
                 let slot = slots.swap_remove(index as usize);
+                if measure && let Some(bracket) = bracket.as_mut() {
+                    bracket.grant_qpc = crate::heavy_command_trace::qpc_now();
+                }
                 return Ok(Self {
                     _slot: Some(slot),
                     _legacy: legacy,
@@ -268,7 +283,7 @@ impl HeavyAdmission {
             // it before the queue poll keeps a full slot set from blocking a
             // legacy exclusive lock for the whole deadline.
             legacy.file.unlock()?;
-            tick();
+            tick(measure.then(crate::heavy_command_trace::qpc_now).flatten());
             note_busy(&mut reported, &mut waiting, deadline);
         }
     }

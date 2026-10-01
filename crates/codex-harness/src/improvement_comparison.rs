@@ -47,6 +47,7 @@ use harness_core::rollout_reader;
 use harness_core::task_worktree;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -1663,6 +1664,21 @@ fn dispatch_arm(
         ),
     );
     write_json_atomic(&assignment_path, &assignment)?;
+    let evidence = run
+        .store
+        .comparison_dir()
+        .join("queue-evidence")
+        .join(&attempt_id);
+    fs::create_dir_all(&evidence)?;
+    // The run store owns the evidence directory. A caller-supplied path is not
+    // accepted: candidate writes must not choose the measurement input.
+    // The hosted child inherits this process environment. These two variables
+    // are set only for that inheritance; set_var is unsafe because a concurrent
+    // environment read in another thread would race.
+    unsafe {
+        std::env::set_var(harness_core::heavy_command_trace::EVIDENCE_ENV, &evidence);
+        std::env::set_var(harness_core::heavy_command_trace::ATTEMPT_ENV, &attempt_id);
+    }
     let mut state = run
         .cursor
         .comparison
@@ -2328,6 +2344,7 @@ fn build_row(
         native["usage"] = usage;
     }
     let declaration = comparison.declared_policy()?.policy.declaration();
+    let infrastructure_capture = infrastructure_capture(run, attempt);
     Ok(json!({
         "attempt_id": format!("{}-{}", run.cursor.experiment, attempt.id),
         "case_id": comparison.task.name,
@@ -2356,6 +2373,7 @@ fn build_row(
         "children": [],
         "interventions": [],
         "retry_of": null,
+        "infrastructure_capture": infrastructure_capture,
         "treatment": {
             "label": runtime.label,
             "build": runtime.variant.build.display().to_string(),
@@ -2365,6 +2383,199 @@ fn build_row(
             "components": component_inventory(runtime),
         },
     }))
+}
+
+fn infrastructure_capture(run: &Run, attempt: &Attempt) -> Value {
+    let directory = run
+        .store
+        .comparison_dir()
+        .join("queue-evidence")
+        .join(&attempt.id);
+    let observation = retained_observation(attempt).unwrap_or(Value::Null);
+    let clock = observation.get("clock").cloned().unwrap_or(Value::Null);
+    let frequency = clock.get("frequency").and_then(Value::as_u64).unwrap_or(0);
+    let boot = clock.get("boot").and_then(Value::as_u64).unwrap_or(0);
+    let origin = clock.get("startedQpc").and_then(Value::as_u64);
+    let ended = clock.get("endedQpc").and_then(Value::as_u64);
+    let window = origin.zip(ended).and_then(|(start, end)| {
+        harness_core::heavy_command_trace::monotonic_ns(frequency, start, end)
+            .map(|end_ns| json!({"start_ns": 0, "end_ns": end_ns}))
+    });
+    let relative = |qpc: u64| -> Option<u64> {
+        let origin = origin?;
+        harness_core::heavy_command_trace::monotonic_ns(frequency, origin, qpc)
+    };
+    let tick_ns = (frequency > 0).then(|| (1_000_000_000 / frequency).max(1));
+    let mut admissions = Vec::new();
+    if directory.is_dir()
+        && let Ok(views) = harness_core::heavy_command_trace::read_directory(&directory)
+    {
+        for view in views {
+            admissions.push(admission_capture(
+                &view, frequency, boot, tick_ns, &relative,
+            ));
+        }
+    }
+    let activity = activity_capture(&observation, &relative);
+    let requests = request_capture(run, attempt);
+    json!({
+        "lineage": harness_core::infrastructure_accounting::MEASUREMENT_LINEAGE,
+        "window": window,
+        "detail_overflow": observation.get("detailTruncated").and_then(Value::as_bool).unwrap_or(false),
+        "activity_overflow": observation.get("activityTruncated").and_then(Value::as_bool).unwrap_or(false)
+            || observation.get("activityGap").and_then(Value::as_bool).unwrap_or(false),
+        "admissions": admissions,
+        "activity": activity,
+        "requests": requests,
+    })
+}
+
+fn admission_capture(
+    view: &harness_core::heavy_command_trace::EvidenceView,
+    frequency: u64,
+    boot: u64,
+    tick_ns: Option<u64>,
+    relative: &impl Fn(u64) -> Option<u64>,
+) -> Value {
+    let harness_core::heavy_command_trace::EvidenceView::Record(document) = view else {
+        return json!({"id": "unreadable", "class": "unknown", "domain_match": false});
+    };
+    let interpreted = harness_core::heavy_command_trace::interpret(view);
+    let class = match &interpreted.delay {
+        harness_core::heavy_command_trace::QueueDelay::MeasuredZero => "measured_zero",
+        harness_core::heavy_command_trace::QueueDelay::UnrelatedWait { .. } => "unrelated_wait",
+        harness_core::heavy_command_trace::QueueDelay::SelfContention { .. } => "self_contention",
+        harness_core::heavy_command_trace::QueueDelay::Inherited => "inherited",
+        harness_core::heavy_command_trace::QueueDelay::FailedAdmission { .. } => "failed",
+        harness_core::heavy_command_trace::QueueDelay::Unknown { .. } => "unknown",
+    };
+    let (endpoint_start, endpoint_end) = document
+        .queue
+        .as_ref()
+        .map(|queue| (queue.endpoint_start_ns, queue.endpoint_end_ns))
+        .unwrap_or((None, None));
+    let start_ns = document.clock.start.and_then(|sample| relative(sample.qpc));
+    let end_ns = document.clock.end.and_then(|sample| relative(sample.qpc));
+    let domain_match = document.clock.frequency == frequency
+        && document.clock.boot == Some(boot)
+        && frequency > 0
+        && boot > 0;
+    let terminal = match document.terminal {
+        harness_core::heavy_command_trace::TerminalKind::Timeout => "timeout",
+        harness_core::heavy_command_trace::TerminalKind::Cancelled => "cancelled",
+        harness_core::heavy_command_trace::TerminalKind::Failure => "failure",
+        harness_core::heavy_command_trace::TerminalKind::WaitedGrant => "waited_grant",
+        harness_core::heavy_command_trace::TerminalKind::ImmediateGrant => "immediate_grant",
+        harness_core::heavy_command_trace::TerminalKind::Inherited => "inherited",
+    };
+    json!({
+        "id": document.admission_id,
+        "parent_id": document.parent_admission_id,
+        "class": class,
+        "domain_match": domain_match,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "endpoint_start_ns": endpoint_start,
+        "endpoint_end_ns": endpoint_end,
+        "tick_ns": tick_ns,
+        "tool_call_id": document.correlation.tool_call_id,
+        "command_id": document.correlation.command_id,
+        "started": document.post_grant.started,
+        "terminal": terminal,
+    })
+}
+
+fn activity_capture(observation: &Value, relative: &impl Fn(u64) -> Option<u64>) -> Vec<Value> {
+    let Some(marks) = observation.get("activity").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    struct Placed {
+        start: Option<u64>,
+        end: Option<u64>,
+        kind: String,
+        tool: Option<String>,
+        command: Option<String>,
+    }
+    let mut by_id: BTreeMap<String, Placed> = BTreeMap::new();
+    for mark in marks {
+        let Some(id) = mark.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let qpc = mark.get("qpc").and_then(Value::as_u64);
+        let ns = qpc.and_then(relative);
+        let kind = mark.get("kind").and_then(Value::as_str).unwrap_or("other");
+        let phase = mark.get("phase").and_then(Value::as_str).unwrap_or("");
+        let entry = by_id.entry(id.to_owned()).or_insert(Placed {
+            start: None,
+            end: None,
+            kind: kind.to_owned(),
+            tool: None,
+            command: None,
+        });
+        entry.kind = kind.to_owned();
+        if phase == "started" {
+            entry.start = ns;
+        } else if phase == "completed" {
+            entry.end = ns;
+        }
+        if kind == "commandExecution" || kind == "command_execution" {
+            entry.tool = Some(id.to_owned());
+            entry.command = Some(id.to_owned());
+        }
+    }
+    by_id
+        .into_iter()
+        .map(|(id, placed)| {
+            let kind = match placed.kind.as_str() {
+                "commandExecution" | "command_execution" => "command",
+                "agentMessage" | "agent_message" => "message",
+                "mcpToolCall" | "mcp_tool_call" | "webSearch" | "web_search" | "fileChange"
+                | "file_change" => "tool",
+                other => other,
+            };
+            json!({
+                "id": id,
+                "kind": kind,
+                "start_ns": placed.start,
+                "end_ns": placed.end,
+                "tool_call_id": placed.tool,
+                "command_id": placed.command,
+            })
+        })
+        .collect()
+}
+
+fn request_capture(run: &Run, attempt: &Attempt) -> Vec<Value> {
+    let Ok(sessions) = discovery_sessions(run, attempt) else {
+        return Vec::new();
+    };
+    let mut requests = Vec::new();
+    for path in sessions.paths {
+        let summary = harness_core::rollout_reader::read(&path);
+        for (index, turn) in summary.turns.iter().enumerate() {
+            let id = turn
+                .response_id
+                .clone()
+                .unwrap_or_else(|| format!("response-{index}"));
+            let usage = &turn.usage;
+            let token = |key: &str| match usage.get(key) {
+                Some(Some(value)) => json!(value),
+                _ => Value::Null,
+            };
+            requests.push(json!({
+                "id": id,
+                "wait_only": Value::Null,
+                "start_ns": Value::Null,
+                "end_ns": Value::Null,
+                "input_tokens": token("input_tokens"),
+                "cached_input_tokens": token("cached_input_tokens"),
+                "output_tokens": token("output_tokens"),
+                "reasoning_output_tokens": token("reasoning_output_tokens"),
+                "total_tokens": token("total_tokens"),
+            }));
+        }
+    }
+    requests
 }
 
 fn retained_observation(attempt: &Attempt) -> Option<Value> {

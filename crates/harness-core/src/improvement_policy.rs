@@ -334,6 +334,9 @@ impl ComparisonPolicy {
                 )));
             }
         }
+        if let Err(error) = crate::infrastructure_accounting::parse_binding(&self.uncertainty) {
+            return Err(invalid(error));
+        }
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(self).map_err(io::Error::other)?)
@@ -712,7 +715,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 .unwrap_or(0)
         })
         .sum();
-    let baseline_seconds = (facts.iter().all(|fact| fact.baseline_seconds.is_some())
+    let mut baseline_seconds = (facts.iter().all(|fact| fact.baseline_seconds.is_some())
         && !facts.is_empty())
     .then(|| {
         facts
@@ -720,7 +723,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             .filter_map(|fact| fact.baseline_seconds)
             .sum::<f64>()
     });
-    let candidate_seconds = (facts.iter().all(|fact| fact.candidate_seconds.is_some())
+    let mut candidate_seconds = (facts.iter().all(|fact| fact.candidate_seconds.is_some())
         && !facts.is_empty())
     .then(|| {
         facts
@@ -824,7 +827,7 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             coverage_parts.push("usage");
         }
     }
-    let coverage = if coverage_parts.is_empty() {
+    let mut coverage = if coverage_parts.is_empty() {
         "none".to_owned()
     } else {
         coverage_parts.join("+")
@@ -1137,6 +1140,16 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         ));
     }
 
+    apply_infrastructure_gate(
+        policy,
+        report,
+        &mut decision,
+        &mut reasons,
+        &mut baseline_seconds,
+        &mut candidate_seconds,
+        &mut coverage,
+    );
+
     Ok(PolicyEvaluation {
         schema: POLICY_SCHEMA,
         policy_digest: declared.digest.clone(),
@@ -1157,6 +1170,192 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         acceptance_rate,
         trade_off_used,
     })
+}
+
+fn apply_infrastructure_gate(
+    policy: &ComparisonPolicy,
+    report: &Value,
+    decision: &mut PolicyDecision,
+    reasons: &mut Vec<String>,
+    baseline_seconds: &mut Option<f64>,
+    candidate_seconds: &mut Option<f64>,
+    coverage: &mut String,
+) {
+    let binding = match crate::infrastructure_accounting::parse_binding(&policy.uncertainty) {
+        Ok(Some(binding)) => binding,
+        Ok(None) => return,
+        Err(error) => {
+            *decision = PolicyDecision::Inconclusive;
+            reasons.push(format!("the infrastructure binding is not usable: {error}"));
+            return;
+        }
+    };
+    if binding.mechanism.owns_queue() {
+        if binding.view == crate::infrastructure_accounting::MetricView::WorkEfficiency {
+            *decision = PolicyDecision::Inconclusive;
+            reasons.push(
+                "the treatment changes admission, scheduling or waiting; evaluate that operational effect under controlled load instead of subtracting it"
+                    .to_owned(),
+            );
+        } else {
+            reasons.push(
+                "operational view retains the waiting change; it is not subtracted from either arm"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
+    if binding.view == crate::infrastructure_accounting::MetricView::Operational {
+        reasons.push(
+            "operational view retains observed waiting and cost; adjusted figures are not the decision metric"
+                .to_owned(),
+        );
+        return;
+    }
+    let Some(threshold) = policy.meaningful_effect_percent else {
+        return;
+    };
+    let units = report
+        .get("units")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let attempts = report
+        .get("attempts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if attempts
+        .iter()
+        .any(crate::infrastructure_accounting::failed_before_start)
+        && *decision == PolicyDecision::Reject
+    {
+        *decision = PolicyDecision::Inconclusive;
+        reasons.push(
+            "a queue timeout or cancellation before the command started is a failed infrastructure attempt, not an incorrect model solution"
+                .to_owned(),
+        );
+        return;
+    }
+    let row = |id: Option<&str>| {
+        id.and_then(|id| {
+            attempts
+                .iter()
+                .find(|row| row.get("attempt_id").and_then(Value::as_str) == Some(id))
+        })
+    };
+    let mut missing = false;
+    let mut straddles = false;
+    let mut below = true;
+    let mut above = true;
+    let mut failed_infra = false;
+    let mut saw = false;
+    for unit in units.iter().filter(|unit| {
+        unit.get("one_to_one").and_then(Value::as_bool) == Some(true)
+            && unit
+                .get("comparable_pairs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+    }) {
+        saw = true;
+        let baseline = row(unit.get("baseline_result").and_then(Value::as_str));
+        let candidate = row(unit.get("candidate_result").and_then(Value::as_str));
+        if candidate.is_some_and(crate::infrastructure_accounting::failed_before_start) {
+            failed_infra = true;
+        }
+        let Some((baseline_low, baseline_high)) =
+            baseline.and_then(crate::infrastructure_accounting::arm_bounds)
+        else {
+            missing = true;
+            continue;
+        };
+        let Some((candidate_low, candidate_high)) =
+            candidate.and_then(crate::infrastructure_accounting::arm_bounds)
+        else {
+            missing = true;
+            continue;
+        };
+        let Some((min, max)) = crate::infrastructure_accounting::reduction_range(
+            baseline_low,
+            baseline_high,
+            candidate_low,
+            candidate_high,
+        ) else {
+            missing = true;
+            continue;
+        };
+        if min < threshold && max >= threshold {
+            straddles = true;
+        }
+        if max >= threshold {
+            below = false;
+        }
+        if min < threshold {
+            above = false;
+        }
+        if let Some(point) = baseline.and_then(|row| {
+            row.get("infrastructure")
+                .and_then(|value| value.get("adjusted_seconds"))
+                .and_then(Value::as_f64)
+        }) {
+            *baseline_seconds = Some(point);
+        }
+        if let Some(point) = candidate.and_then(|row| {
+            row.get("infrastructure")
+                .and_then(|value| value.get("adjusted_seconds"))
+                .and_then(Value::as_f64)
+        }) {
+            *candidate_seconds = Some(point);
+        }
+    }
+    if !saw || missing || straddles {
+        *decision = PolicyDecision::Inconclusive;
+        reasons.push(
+            "infrastructure attribution gaps could move the declared effect across its threshold; raw and adjusted evidence are retained and the result is inconclusive"
+                .to_owned(),
+        );
+        coverage.push_str("; infrastructure-gap");
+        return;
+    }
+    if failed_infra && *decision == PolicyDecision::Reject {
+        *decision = PolicyDecision::Inconclusive;
+        reasons.push(
+            "a queue timeout or cancellation before the command started is a failed infrastructure attempt, not an incorrect model solution"
+                .to_owned(),
+        );
+        return;
+    }
+    if above {
+        let acceptance_reject = reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed"));
+        let time_reject = reasons.iter().any(|reason| {
+            reason.contains("materially regressed the primary time metric")
+                || reason.contains("does not meet the predeclared meaningful threshold")
+        });
+        if *decision == PolicyDecision::Reject && time_reject && !acceptance_reject {
+            *decision = PolicyDecision::Adopt;
+            reasons.push(
+                "raw time regression does not survive the adjusted range; external waiting is not a model regression"
+                    .to_owned(),
+            );
+        }
+        reasons.push(
+            "the adjusted range stays above the declared effect; external waiting alone is not the measured improvement"
+                .to_owned(),
+        );
+        return;
+    }
+    if below {
+        if *decision == PolicyDecision::Adopt {
+            *decision = PolicyDecision::Reject;
+        }
+        reasons.push(
+            "adjusted bounds stay below the declared effect; external waiting is not a model or harness improvement"
+                .to_owned(),
+        );
+    }
 }
 
 impl PolicyEvaluation {

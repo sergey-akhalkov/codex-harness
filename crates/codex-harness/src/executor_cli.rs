@@ -3860,6 +3860,7 @@ fn host_control_conversation(
     let mut tracker = RunTracker::new(run);
     tracker.observation.host = Some(observation::host_identity()?);
     tracker.observation.updated_ms = observation::now_ms();
+    observation::begin_clock(&mut tracker.observation);
     let detail = tracker.observation.detail.clone();
     if let Some(detail) = &detail {
         if let Some(parent) = detail.parent() {
@@ -4322,6 +4323,7 @@ fn drive_control(
                     Ok(true) => {}
                     Ok(false) if !truncation_noted => {
                         truncation_noted = true;
+                        tracker.observation.detail_truncated = true;
                         let note = "note: the raw record detail reached its byte bound; the detail file stops here while the readable surface continues";
                         if show_terminal {
                             writeln!(stdout, "{note}")?;
@@ -4338,6 +4340,19 @@ fn drive_control(
                     }
                 }
             }
+            if let Some(method) = event.method.as_deref()
+                && method.starts_with("item/")
+            {
+                let item = &event.raw["params"]["item"];
+                if let (Some(id), Some(kind)) = (item["id"].as_str(), item["type"].as_str()) {
+                    observation::note_activity(
+                        &mut tracker.observation,
+                        id,
+                        kind,
+                        method.trim_start_matches("item/"),
+                    );
+                }
+            }
             if show_terminal {
                 event.render(stdout)?;
             }
@@ -4348,7 +4363,11 @@ fn drive_control(
             let completed = (event.method.as_deref() == Some("item/completed"))
                 .then(|| event.raw["params"]["item"]["type"].as_str())
                 .flatten();
-            if tracker.apply_control(state, completed, conversation.thread_id()) {
+            let changed = tracker.apply_control(state, completed, conversation.thread_id());
+            if changed
+                || !tracker.observation.activity.is_empty()
+                || tracker.observation.activity_gap
+            {
                 observation::update_receipt(receipt, &tracker.observation)?;
             }
         }

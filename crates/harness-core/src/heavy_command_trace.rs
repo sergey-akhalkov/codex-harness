@@ -23,8 +23,10 @@
 //!   private process identity did not change across the retained samples. It is
 //!   not yet eligible to subtract: the accounting owner must still clip it to
 //!   the attempt, intersect verified task-blocked intervals and remove useful
-//!   overlap. [`WaitTiming`] is what was actually observed. `endpoint: Unknown`
-//!   means late start and late end were not measured. The configured poll, a
+//!   overlap. [`WaitTiming`] is what was actually observed. `endpoint` is the
+//!   sum of the measured start and end observation lateness when both brackets
+//!   were read, and [`TimingBound::Unknown`] when either bracket was not. The
+//!   configured poll, a
 //!   paired mapping, and a small clock disagreement are not substitutes for
 //!   that bound. Do not place the interval on a wall-clock timeline unless
 //!   `endpoint`, `clock_disagreement` and `clock_sample` are all `Measured` and
@@ -101,6 +103,56 @@ const JUMP_RATIO: u64 = 10;
 unsafe extern "system" {
     fn QueryPerformanceCounter(lp_performance_count: *mut i64) -> i32;
     fn QueryPerformanceFrequency(lp_frequency: *mut i64) -> i32;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(
+        class: u32,
+        info: *mut core::ffi::c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
+/// One QPC read. `None` when the counter cannot be read. Not a poll bound.
+pub fn qpc_now() -> Option<u64> {
+    let mut counter = 0_i64;
+    (unsafe { QueryPerformanceCounter(&mut counter) } != 0 && counter >= 0)
+        .then_some(counter as u64)
+}
+
+/// Boot time in 100-nanosecond ticks since 1601-01-01 UTC. Same value for the
+/// life of this boot; a different value is a different clock domain.
+pub fn boot_filetime() -> Option<u64> {
+    #[repr(C)]
+    struct TimeOfDay {
+        boot_time: i64,
+        current_time: i64,
+        time_zone_bias: i64,
+        time_zone_id: u32,
+        reserved: u32,
+        boot_time_bias: u64,
+        sleep_time_bias: u64,
+    }
+    let mut info = TimeOfDay {
+        boot_time: 0,
+        current_time: 0,
+        time_zone_bias: 0,
+        time_zone_id: 0,
+        reserved: 0,
+        boot_time_bias: 0,
+        sleep_time_bias: 0,
+    };
+    let status = unsafe {
+        NtQuerySystemInformation(
+            3,
+            (&mut info as *mut TimeOfDay).cast(),
+            core::mem::size_of::<TimeOfDay>() as u32,
+            core::ptr::null_mut(),
+        )
+    };
+    (status == 0 && info.boot_time > 0).then_some(info.boot_time as u64)
 }
 
 /// Labels that join this admission to existing attempt evidence.
@@ -214,6 +266,12 @@ pub struct QueueBody {
     /// the gap was not observed, not that it was zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_poll_gap_ns: Option<u64>,
+    /// Measured lateness of the recorded start. Absent means it was not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_start_ns: Option<u64>,
+    /// Measured lateness of the recorded end. Absent means it was not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_end_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +284,8 @@ pub struct PostGrantBody {
 pub struct ClockBody {
     pub source: String,
     pub frequency: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<u64>,
     pub start: Option<ClockSample>,
     pub end: Option<ClockSample>,
     pub mapping: ClockMapping,
@@ -363,6 +423,9 @@ pub struct EpisodeDraft {
     pub holder_changed: bool,
     pub poll_resolution_ns: u64,
     pub observed_poll_gap_ns: Option<u64>,
+    pub endpoint_start_ns: Option<u64>,
+    pub endpoint_end_ns: Option<u64>,
+    pub boot: Option<u64>,
     pub payload_started: Option<bool>,
 }
 
@@ -791,7 +854,13 @@ fn wait_timing(document: &QueueEvidence, queue: &QueueBody, monotonic_ns: u64) -
         },
         clock_disagreement: clock_disagreement(document),
         clock_sample: clock_sample_uncertainty(document),
-        endpoint: TimingBound::Unknown,
+        endpoint: match (queue.endpoint_start_ns, queue.endpoint_end_ns) {
+            (Some(start), Some(end)) => start
+                .checked_add(end)
+                .map(TimingBound::Measured)
+                .unwrap_or(TimingBound::Unknown),
+            _ => TimingBound::Unknown,
+        },
     }
 }
 
@@ -987,6 +1056,8 @@ fn document_from(draft: &EpisodeDraft) -> QueueEvidence {
             holder_samples: draft.holder_samples,
             poll_resolution_ns: draft.poll_resolution_ns,
             observed_poll_gap_ns: draft.observed_poll_gap_ns,
+            endpoint_start_ns: draft.endpoint_start_ns,
+            endpoint_end_ns: draft.endpoint_end_ns,
         })
     };
     let boundary = if inherited {
@@ -1014,6 +1085,7 @@ fn document_from(draft: &EpisodeDraft) -> QueueEvidence {
         clock: ClockBody {
             source: "qpc+filetime".to_owned(),
             frequency: draft.frequency,
+            boot: draft.boot,
             start,
             end,
             mapping,
@@ -1102,7 +1174,7 @@ fn mapping_of(frequency: u64, start: ClockSample, end: ClockSample) -> ClockMapp
     }
 }
 
-pub(crate) fn monotonic_ns(frequency: u64, start: u64, end: u64) -> Option<u64> {
+pub fn monotonic_ns(frequency: u64, start: u64, end: u64) -> Option<u64> {
     let ticks = end.checked_sub(start)?;
     u64::try_from(elapsed_ns(ticks, frequency)?).ok()
 }
@@ -1199,6 +1271,9 @@ mod tests {
             holder_changed: false,
             poll_resolution_ns: 20_000_000,
             observed_poll_gap_ns: None,
+            endpoint_start_ns: None,
+            endpoint_end_ns: None,
+            boot: None,
             payload_started: Some(false),
         }
     }

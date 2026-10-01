@@ -3531,3 +3531,165 @@ fn real_control_dispatches_refuse_wrong_observed_model_and_effort() {
         );
     }
 }
+
+/// Owned heavy contention plus the visible fixture conversation. The controller
+/// captures the admission, the host observation and the report. This is not an
+/// actual-model comparison.
+#[test]
+fn owned_heavy_contention_reaches_the_native_report() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("heavy-noise");
+    let policy_text = fs::read_to_string(&fixture.policy).unwrap();
+    let mut policy: Value = serde_json::from_str(&policy_text).unwrap();
+    policy["uncertainty"] = json!(harness_core::infrastructure_accounting::binding_clause(
+        harness_core::infrastructure_accounting::MetricView::WorkEfficiency,
+        harness_core::infrastructure_accounting::Mechanism::None,
+    ));
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_real_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    let account = fixture.root.join("isolated-heavy-account");
+    harness_core::heavy_command::prepare(&account).unwrap();
+    let mut budget = harness_core::heavy_command::Budget::read(&account).unwrap();
+    budget.max_concurrent_trees = 1;
+    harness_core::heavy_command::Budget::write(&account, &budget).unwrap();
+    let started = fixture.root.join("holder-started.txt");
+    let launch = env!("CARGO_BIN_EXE_harness-launch-fixture");
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    holder
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--attempt")
+        .arg("holder-other")
+        .arg("--")
+        .arg(launch)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "180000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started);
+    let mut holder = holder.spawn().expect("isolated holder starts");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "holder did not acquire the isolated slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let account_text = account.display().to_string();
+    let marker = fixture.root.join("heavy-started.txt");
+    let marker_text = marker.display().to_string();
+    let release = std::thread::spawn({
+        let marker = marker.clone();
+        move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(240);
+            while !marker.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if marker.exists() {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            let _ = holder.kill();
+            let _ = holder.wait();
+        }
+    });
+    let mut command = Command::new(manager());
+    command
+        .arg("improve")
+        .args(["resume", "--run", fixture.run.to_str().unwrap()])
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+        .env_remove("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE")
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .env_remove("WT_SESSION")
+        .env(CONTROL_CHILD_MODE.0, CONTROL_CHILD_MODE.1)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY", "1")
+        .env("CODEX_HARNESS_HEAVY_ACCOUNT", &account_text)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_MARKER", &marker_text)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_PROGRAM", launch)
+        .env(
+            "HARNESS_IMPROVEMENT_FIXTURE_HEAVY_CLI",
+            env!("CARGO_BIN_EXE_codex-harness"),
+        )
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "1000");
+    let resume = command.output().expect("baseline resume");
+    let output = text(&resume);
+    assert!(
+        marker.exists(),
+        "the fixture did not reach the owned heavy command: {output}"
+    );
+    assert!(resume.status.success(), "{output}");
+    let _ = release.join();
+    let receipt = attempt_receipt(&fixture, "base-1");
+    let record = wait_for_terminal_receipt(&receipt);
+    assert_eq!(
+        record["observation"]["state"], "completed",
+        "the visible fixture conversation did not complete: {record}"
+    );
+    let settle = fixture.resume_in_process(&[]);
+    let settle_output = text(&settle);
+    assert!(
+        settle.status.success(),
+        "settlement resume failed: {settle_output}\nfirst resume: {output}"
+    );
+
+    let evidence = fixture.run.join("comparison").join("queue-evidence");
+    let mut documents = Vec::new();
+    if evidence.is_dir() {
+        for entry in fs::read_dir(&evidence).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                documents.extend(harness_core::heavy_command_trace::read_directory(&path).unwrap());
+            }
+        }
+    }
+    assert!(
+        documents.iter().any(|view| matches!(
+            harness_core::heavy_command_trace::interpret(view).delay,
+            harness_core::heavy_command_trace::QueueDelay::UnrelatedWait { timing }
+                if matches!(timing.endpoint, harness_core::heavy_command_trace::TimingBound::Measured(_))
+        )),
+        "the native admission did not record a measured unrelated wait: {documents:?}\n{output}"
+    );
+    let cursor = fixture.cursor();
+    let row_path = cursor["comparison"]["baseline"]["row"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            fixture
+                .run
+                .join("comparison")
+                .join("baseline")
+                .join("row.json")
+        });
+    let row = fs::read(&row_path).unwrap_or_else(|error| {
+        panic!(
+            "the controller wrote no baseline row at {}: {error}; cursor={cursor}",
+            row_path.display()
+        )
+    });
+    let row: Value = serde_json::from_slice(&row).unwrap();
+    assert!(
+        row["infrastructure_capture"]["admissions"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "the controller did not attach the captured admission: {row}"
+    );
+    let summarized = harness_core::outcome_report::summarize_attempts(std::slice::from_ref(&row))
+        .expect("native report");
+    let infra = &summarized["attempts"][0]["infrastructure"];
+    assert!(infra["observed_seconds"].as_f64().is_some(), "{infra}");
+    assert_ne!(infra["proven_zero_queue"], true);
+    assert!(
+        infra["deductible_seconds"].as_f64().unwrap_or(0.0) > 0.0
+            || infra["unresolved_seconds"].as_f64().unwrap_or(0.0) > 0.0,
+        "the report neither deducted nor retained the unresolved wait: {infra}"
+    );
+}

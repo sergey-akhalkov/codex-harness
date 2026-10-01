@@ -324,6 +324,7 @@ pub fn finish_attempt(record: &Value) -> io::Result<Value> {
     row["rounds"] = counter_total(native, "rounds");
     row["unit"] = json!(unit_of(record));
     row["excluded_reasons"] = json!(reasons);
+    crate::infrastructure_accounting::attach(&mut row);
     Ok(row)
 }
 
@@ -937,6 +938,10 @@ pub fn summarize_attempts(attempts: &[Value]) -> io::Result<Value> {
             "effect": effect,
             "net_saving": net_saving,
             "limitations": limitations,
+            "infrastructure_effect": crate::infrastructure_accounting::unit_effect(
+                baseline_result,
+                candidate_result,
+            ),
         }));
     }
 
