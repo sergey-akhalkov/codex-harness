@@ -2223,3 +2223,419 @@ fn a_legacy_allocation_inside_the_run_state_is_relocated_for_its_planner() {
         "the admitted card records the relocated allocation: {recorded}"
     );
 }
+
+fn move_registered_worktree(project: &Path, from: &Path, to: &Path) {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    git(
+        project,
+        &[
+            "worktree",
+            "move",
+            from.to_str().unwrap(),
+            to.to_str().unwrap(),
+        ],
+    );
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn cursor_worktree_key(cursor: &Value) -> String {
+    path_key(Path::new(
+        cursor["candidate"]["worktree"]["path"]
+            .as_str()
+            .unwrap_or_default(),
+    ))
+}
+
+fn assignment_files(run: &Path) -> Vec<String> {
+    let dir = run.join("assignments");
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let mut names = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn comments_record(comments: &str, path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    comments.contains(text.as_ref()) || comments.contains(&text.replace('\\', "\\\\"))
+}
+
+/// The Git move can finish before the board publication and cursor save. Resume
+/// must adopt only that exact registered identity, and must leave every
+/// ambiguous state unmodified without replaying a model attempt.
+#[test]
+fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
+    let fixture = Fixture::new("reloc-gap");
+    fixture.start();
+    fake_launcher(&fixture);
+    let card = fixture.admit_change("add-narrow-context");
+    let spec: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    let base = spec["base_revision"]
+        .as_str()
+        .expect("the run spec records its frozen base")
+        .to_owned();
+    let branch = format!("improve/workflow-fixture/{card}");
+    let legacy = fixture.legacy_candidate_worktree(&card);
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    git(
+        &fixture.proj,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            legacy.to_str().unwrap(),
+            &base,
+        ],
+    );
+    let scaffold = openspec(
+        &legacy,
+        &[
+            "new",
+            "change",
+            "add-narrow-context",
+            "--schema",
+            "spec-driven",
+            "--json",
+        ],
+    );
+    assert!(
+        scaffold.status.success(),
+        "openspec new: {}",
+        text(&scaffold)
+    );
+    commit_all(&legacy, "scaffold OpenSpec change add-narrow-context");
+    let scaffold_revision = head(&legacy);
+    assert_ne!(scaffold_revision, base);
+    let destination = fixture.candidate_worktree(&card);
+    let held = fixture.root.join("held-worktree");
+    let original_error = "publication-stopped-before-cursor-save";
+
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("planning");
+    cursor["condition"] = json!(original_error);
+    cursor["candidate"] = json!({
+        "hypothesis": card,
+        "change": "add-narrow-context",
+        "removal_required": false,
+        "removal_frozen": Value::Null,
+        "worktree": {
+            "source": fixture.proj,
+            "path": legacy,
+            "branch": branch,
+            "base": base,
+            "revision": scaffold_revision,
+        },
+        "planning_receipt": Value::Null,
+        "planner_attempt": Value::Null,
+        "implementer_attempt": Value::Null,
+        "revision": Value::Null,
+        "result": Value::Null,
+    });
+    cursor["attempts"]
+        .as_array_mut()
+        .unwrap()
+        .push(attempt_json(
+            "planner-1",
+            "planner",
+            "workflow-fixture-planner-1",
+            "gen-1",
+            &fixture.run.join("missing-planner-receipt.json"),
+            None,
+            Some(&legacy),
+            "started",
+        ));
+    cursor["candidate"]["planner_attempt"] = json!("planner-1");
+    fixture.write_cursor(&cursor);
+    let recorded = fixture.feedback(&[
+        "hypothesis-implement",
+        "--item",
+        &card,
+        "--role",
+        "candidate",
+        "--branch",
+        &branch,
+        "--base",
+        &base,
+        "--revision",
+        &scaffold_revision,
+        "--worktree",
+        legacy.to_str().unwrap(),
+    ]);
+    assert!(
+        recorded.status.success(),
+        "pre-move board record: {}",
+        text(&recorded)
+    );
+    move_registered_worktree(&fixture.proj, &legacy, &destination);
+    assert!(
+        !legacy.exists(),
+        "the fault state has already moved the worktree"
+    );
+    assert_eq!(head(&destination), scaffold_revision);
+
+    // An in-flight attempt keeps the stale cursor and does not adopt the move
+    // or open another model attempt.
+    let before_active = git_output(&fixture.proj, &["worktree", "list", "--porcelain"]);
+    let before_assignments = assignment_files(&fixture.run);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor_worktree_key(&cursor), path_key(&legacy), "{cursor}");
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        1,
+        "the unresolved attempt was replayed: {cursor}"
+    );
+    assert_eq!(cursor["attempts"][0]["id"], "planner-1", "{cursor}");
+    assert_eq!(
+        assignment_files(&fixture.run),
+        before_assignments,
+        "an unresolved attempt must not dispatch"
+    );
+    assert_eq!(head(&destination), scaffold_revision);
+    assert_eq!(
+        git_output(&fixture.proj, &["worktree", "list", "--porcelain"]),
+        before_active
+    );
+    assert!(
+        !comments_record(&fixture.bd_comments(&card), &destination),
+        "an unresolved attempt must not publish the destination"
+    );
+
+    let mut cursor = fixture.cursor();
+    cursor["attempts"] = json!([]);
+    cursor["candidate"]["planner_attempt"] = Value::Null;
+    cursor["condition"] = Value::Null;
+    cursor["phase"] = json!("planning");
+    fixture.write_cursor(&cursor);
+
+    // A dirty destination is preserved and not adopted.
+    fs::write(destination.join("dirty-preserved.txt"), "keep\n").unwrap();
+    let before_dirty = git_output(&fixture.proj, &["worktree", "list", "--porcelain"]);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        destination.join("dirty-preserved.txt").is_file(),
+        "dirty work was reset or deleted: {}",
+        text(&resume)
+    );
+    assert_eq!(head(&destination), scaffold_revision);
+    assert_eq!(
+        cursor_worktree_key(&fixture.cursor()),
+        path_key(&legacy),
+        "{}",
+        text(&resume)
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["worktree", "list", "--porcelain"]),
+        before_dirty
+    );
+    assert!(text(&resume).contains("not adopted"), "{}", text(&resume));
+    fs::remove_file(destination.join("dirty-preserved.txt")).unwrap();
+
+    // Identity mismatches are refused without resetting the registered tree.
+    for (field, wrong) in [
+        ("revision", base.as_str()),
+        ("branch", "improve/not-recorded"),
+        ("base", "not-a-recorded-base"),
+    ] {
+        let mut cursor = fixture.cursor();
+        cursor["candidate"]["worktree"]["path"] = json!(legacy);
+        cursor["candidate"]["worktree"]["branch"] = json!(branch);
+        cursor["candidate"]["worktree"]["base"] = json!(base);
+        cursor["candidate"]["worktree"]["revision"] = json!(scaffold_revision);
+        cursor["candidate"]["worktree"][field] = json!(wrong);
+        cursor["candidate"]["planner_attempt"] = Value::Null;
+        cursor["attempts"] = json!([]);
+        cursor["phase"] = json!("planning");
+        cursor["condition"] = Value::Null;
+        fixture.write_cursor(&cursor);
+        let before = git_output(&fixture.proj, &["worktree", "list", "--porcelain"]);
+        let resume = fixture.resume();
+        assert!(resume.status.success(), "{field}: {}", text(&resume));
+        assert_eq!(head(&destination), scaffold_revision, "{field}");
+        assert_eq!(
+            cursor_worktree_key(&fixture.cursor()),
+            path_key(&legacy),
+            "{field}: {}",
+            text(&resume)
+        );
+        assert_eq!(
+            git_output(&fixture.proj, &["worktree", "list", "--porcelain"]),
+            before,
+            "{field}"
+        );
+        assert!(
+            text(&resume).contains("not adopted") || text(&resume).contains("not the recorded"),
+            "{field}: {}",
+            text(&resume)
+        );
+    }
+
+    // Both paths present stay untouched: the controller must not choose one.
+    move_registered_worktree(&fixture.proj, &destination, &legacy);
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("both-present.txt"), "keep\n").unwrap();
+    let mut cursor = fixture.cursor();
+    cursor["candidate"]["worktree"]["path"] = json!(legacy);
+    cursor["candidate"]["worktree"]["branch"] = json!(branch);
+    cursor["candidate"]["worktree"]["base"] = json!(base);
+    cursor["candidate"]["worktree"]["revision"] = json!(scaffold_revision);
+    cursor["candidate"]["planner_attempt"] = Value::Null;
+    cursor["attempts"] = json!([]);
+    cursor["phase"] = json!("planning");
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        destination.join("both-present.txt").is_file(),
+        "{}",
+        text(&resume)
+    );
+    assert!(legacy.join(".git").exists() || legacy.join(".git").is_file());
+    assert_eq!(head(&legacy), scaffold_revision);
+    assert_eq!(cursor_worktree_key(&fixture.cursor()), path_key(&legacy));
+    fs::remove_file(destination.join("both-present.txt")).unwrap();
+    fs::remove_dir(&destination).unwrap();
+
+    // A foreign directory at the owned destination is not adopted, and the
+    // real worktree held elsewhere is not moved or deleted.
+    move_registered_worktree(&fixture.proj, &legacy, &held);
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("foreign-marker.txt"), "keep\n").unwrap();
+    let before_foreign = git_output(&fixture.proj, &["worktree", "list", "--porcelain"]);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        destination.join("foreign-marker.txt").is_file(),
+        "{}",
+        text(&resume)
+    );
+    assert_eq!(head(&held), scaffold_revision);
+    assert_eq!(cursor_worktree_key(&fixture.cursor()), path_key(&legacy));
+    assert_eq!(
+        git_output(&fixture.proj, &["worktree", "list", "--porcelain"]),
+        before_foreign
+    );
+    assert!(text(&resume).contains("not adopted"), "{}", text(&resume));
+    fs::remove_file(destination.join("foreign-marker.txt")).unwrap();
+    fs::remove_dir(&destination).unwrap();
+    move_registered_worktree(&fixture.proj, &held, &destination);
+
+    // The verified move is reconciled without another move, a lost commit or
+    // a replay of the already failed model attempt.
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("planning");
+    cursor["condition"] = json!(original_error);
+    cursor["attempts"] = json!([]);
+    cursor["candidate"]["planner_attempt"] = Value::Null;
+    cursor["candidate"]["worktree"]["path"] = json!(legacy);
+    cursor["candidate"]["worktree"]["branch"] = json!(branch);
+    cursor["candidate"]["worktree"]["base"] = json!(base);
+    cursor["candidate"]["worktree"]["revision"] = json!(scaffold_revision);
+    fixture.write_cursor(&cursor);
+    let mut failed = attempt_json(
+        "planner-failed",
+        "planner",
+        "workflow-fixture-planner-failed",
+        "gen-1",
+        &fixture.run.join("missing-planner-receipt.json"),
+        None,
+        Some(&destination),
+        "failed",
+    );
+    failed["reason"] = json!("model attempt already failed; do not replay");
+    push_attempt(&fixture, failed);
+    let before_recovery = git_output(&fixture.proj, &["worktree", "list", "--porcelain"]);
+    let before_assignments = assignment_files(&fixture.run);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert_eq!(
+        git_output(&fixture.proj, &["worktree", "list", "--porcelain"]),
+        before_recovery,
+        "recovery moved or added a worktree: {}",
+        text(&resume)
+    );
+    assert_eq!(head(&destination), scaffold_revision, "{}", text(&resume));
+    assert!(
+        destination
+            .join("openspec/changes/add-narrow-context/.openspec.yaml")
+            .is_file(),
+        "the scaffold commit was lost"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor_worktree_key(&cursor),
+        path_key(&destination),
+        "{cursor}"
+    );
+    assert_eq!(
+        cursor["candidate"]["worktree"]["branch"], branch,
+        "{cursor}"
+    );
+    assert_eq!(cursor["candidate"]["worktree"]["base"], base, "{cursor}");
+    assert_eq!(
+        cursor["candidate"]["worktree"]["revision"], scaffold_revision,
+        "{cursor}"
+    );
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "a model attempt was replayed: {attempts:?}"
+    );
+    assert_eq!(attempts[0]["id"], "planner-failed");
+    assert_eq!(attempts[0]["state"], "failed");
+    assert_eq!(
+        attempts[0]["reason"],
+        "model attempt already failed; do not replay"
+    );
+    assert_eq!(
+        assignment_files(&fixture.run),
+        before_assignments,
+        "recovery dispatched a model assignment"
+    );
+    assert!(text(&resume).contains(original_error), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("never resubmit"),
+        "the failed model attempt was not retained as a blocked replay: {}",
+        text(&resume)
+    );
+    let effects = cursor["effects"].as_array().unwrap();
+    assert!(
+        effects.iter().any(|effect| {
+            effect["kind"] == "candidate-allocated"
+                && effect["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(original_error)
+                && effect["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("reconciled interrupted relocation")
+        }),
+        "the original error is not inspectable in the cursor effects: {effects:?}"
+    );
+    let comments = fixture.bd_comments(&card);
+    assert!(
+        comments_record(&comments, &legacy),
+        "the pre-move board identity disappeared: {comments}"
+    );
+    assert!(
+        comments_record(&comments, &destination),
+        "the board was not repaired through its owner: {comments}"
+    );
+}

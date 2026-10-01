@@ -716,7 +716,12 @@ fn advance_candidate(
     ensure_allocation(run, &mut candidate, notes)?;
     run.cursor.candidate = Some(candidate.clone());
     run.store.save_cursor(&run.cursor)?;
-    if candidate.worktree.is_none() {
+    // A legacy allocation that was not reconciled still names a missing path
+    // inside the protected run state. Planning there would scaffold or dispatch
+    // against the wrong checkout, so dependent work waits without a model replay.
+    if candidate.worktree.as_ref().is_none_or(|checkout| {
+        checkout.path.starts_with(run.store.root()) && !checkout.path.is_dir()
+    }) {
         return Ok(());
     }
     if candidate.planning_receipt.is_none() {
@@ -761,7 +766,10 @@ fn refused(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result
 /// never forced. A recorded legacy allocation that still nests inside the run
 /// state cannot reach its own planner, so an inactive, verified, preserved one
 /// is relocated through the worktree owner's own Git operation and anything
-/// else is refused without touching it.
+/// else is refused without touching it. A move whose board publication or
+/// cursor save was interrupted is reconciled on the next resume only when Git
+/// registers that same branch, base and revision at the owner-assigned
+/// destination; ambiguous, dirty, active or mismatched state is not adopted.
 fn ensure_allocation(
     run: &mut Run,
     candidate: &mut CandidateState,
@@ -936,9 +944,10 @@ fn candidate_checkout_root(run: &Run) -> Result<PathBuf, String> {
 /// into the owner-assigned candidate area, preserving its branch, revision and
 /// commits. The worktree owner's read-only verdict must first prove the
 /// allocation is registered to the run's project, clean and exactly at its
-/// recorded revision; Git's own `worktree move` then carries it over. Every
-/// refusal leaves the allocation, its branch and its scaffold commit exactly
-/// where they are and records the exact recovery reason.
+/// recorded revision; Git's own `worktree move` then carries it over. A move
+/// that already finished, while the cursor and board still name the old path,
+/// is reconciled only when that same identity is registered at the destination.
+/// Every other state is refused without another move, reset or deletion.
 fn relocate_recorded_allocation(
     run: &mut Run,
     candidate: &mut CandidateState,
@@ -946,6 +955,16 @@ fn relocate_recorded_allocation(
     destination: &Path,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
+    if !checkout.path.exists() {
+        return reconcile_interrupted_relocation(
+            run,
+            candidate,
+            &checkout,
+            destination,
+            notes,
+            None,
+        );
+    }
     match task_worktree::worktree_reuse(
         &run.spec.project,
         &checkout.path,
@@ -986,12 +1005,8 @@ fn relocate_recorded_allocation(
         .output()
         .map_err(|error| invalid(format!("git worktree move: {error}")))?;
     if !output.status.success() {
-        let reason = format!(
-            "the recorded candidate worktree {} could not be relocated out of the protected run state: {}; the allocation and its commits are left untouched",
-            checkout.path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return refused(run, notes, reason);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return settle_failed_worktree_move(run, candidate, &checkout, destination, &stderr, notes);
     }
     let relocated = CandidateCheckout {
         path: destination.to_path_buf(),
@@ -1006,7 +1021,319 @@ fn relocate_recorded_allocation(
         );
         return refused(run, notes, reason);
     }
-    board_hypothesis::record_implementation(
+    publish_relocated_allocation(
+        run,
+        candidate,
+        relocated,
+        notes,
+        RelocationPublication::Moved,
+    )
+}
+
+/// Why a failed `git worktree move` is not treated as success, an evidenced
+/// non-move, or an ambiguous partial effect.
+struct FailedMoveObservation {
+    old_exists: bool,
+    old_registered: bool,
+    destination_exists: bool,
+    destination_registered: bool,
+    destination_matches_identity: bool,
+}
+
+enum FailedMoveClassification {
+    /// Git reported failure, but the registered destination is the requested move.
+    Completed,
+    /// The recorded allocation is still registered at the old path.
+    Unmoved { reason: String },
+    /// The observed paths do not prove the allocation was unchanged.
+    Ambiguous { reason: String },
+}
+
+/// Classifies a failed Git move from what is actually registered afterwards.
+/// A partial effect is never described as untouched: that word is reserved
+/// for the pre-move refusal, which has not invoked Git.
+fn classify_failed_worktree_move(
+    old: &Path,
+    stderr: &str,
+    observed: &FailedMoveObservation,
+) -> FailedMoveClassification {
+    if !observed.old_exists
+        && !observed.old_registered
+        && observed.destination_exists
+        && observed.destination_registered
+        && observed.destination_matches_identity
+    {
+        return FailedMoveClassification::Completed;
+    }
+    if observed.old_exists && observed.old_registered && !observed.destination_registered {
+        return FailedMoveClassification::Unmoved {
+            reason: format!(
+                "the recorded candidate worktree {} could not be relocated out of the protected run state: {stderr}; it is still registered at that path and its commits were not moved",
+                old.display()
+            ),
+        };
+    }
+    FailedMoveClassification::Ambiguous {
+        reason: format!(
+            "the recorded candidate worktree {} could not be relocated out of the protected run state: {stderr}; observed old_exists={} old_registered={} destination_exists={} destination_registered={} destination_identity_matches={}; this failure is not claimed to have left the allocation unchanged, because that was not established, and nothing was reset or deleted",
+            old.display(),
+            observed.old_exists,
+            observed.old_registered,
+            observed.destination_exists,
+            observed.destination_registered,
+            observed.destination_matches_identity
+        ),
+    }
+}
+
+struct RegisteredWorktree {
+    path: PathBuf,
+    head: String,
+    branch: Option<String>,
+    prunable: bool,
+}
+
+fn registered_worktrees(project: &Path) -> Result<Vec<RegisteredWorktree>, String> {
+    let output = git_text(project, &["worktree", "list", "--porcelain"])?;
+    let mut trees = Vec::new();
+    let mut current: Option<RegisteredWorktree> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(tree) = current.take() {
+                trees.push(tree);
+            }
+            current = Some(RegisteredWorktree {
+                path: normalize_git_path(path)?,
+                head: String::new(),
+                branch: None,
+                prunable: false,
+            });
+            continue;
+        }
+        let Some(tree) = current.as_mut() else {
+            continue;
+        };
+        if let Some(head) = line.strip_prefix("HEAD ") {
+            tree.head = head.trim().to_owned();
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            tree.branch = Some(
+                branch
+                    .trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch.trim())
+                    .to_owned(),
+            );
+        } else if line == "detached" {
+            tree.branch = None;
+        } else if line.starts_with("prunable") {
+            tree.prunable = true;
+        }
+    }
+    if let Some(tree) = current {
+        if tree.head.is_empty() {
+            return Err(format!(
+                "git worktree list omitted HEAD for {}",
+                tree.path.display()
+            ));
+        }
+        trees.push(tree);
+    }
+    Ok(trees)
+}
+
+fn registered_at<'a>(
+    trees: &'a [RegisteredWorktree],
+    path: &Path,
+) -> Option<&'a RegisteredWorktree> {
+    trees
+        .iter()
+        .find(|tree| same_allocation_path(&tree.path, path))
+}
+
+fn normalize_git_path(path: &str) -> Result<PathBuf, String> {
+    let path = path.trim();
+    let text = if let Some(quoted) = path.strip_prefix('"') {
+        let Some(quoted) = quoted.strip_suffix('"') else {
+            return Err(format!("git worktree path {path} is not a closed quote"));
+        };
+        unescape_git_path(quoted)?
+    } else {
+        path.to_owned()
+    };
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if cfg!(windows) {
+        Ok(PathBuf::from(text.replace('/', "\\")))
+    } else {
+        Ok(PathBuf::from(text))
+    }
+}
+
+fn unescape_git_path(text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => {
+                return Err(format!(
+                    "git worktree path has an unsupported escape \\{other}"
+                ));
+            }
+            None => return Err("git worktree path has a trailing escape".to_owned()),
+        }
+    }
+    Ok(out)
+}
+
+fn same_allocation_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) if left == right => true,
+        _ => allocation_path_key(left) == allocation_path_key(right),
+    }
+}
+
+fn allocation_path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let normalized = text.replace('/', "\\");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+struct RecordedAllocation {
+    branch: String,
+    base: String,
+    revision: String,
+    worktree: String,
+}
+
+fn recorded_candidate_allocations(
+    comments: &[String],
+    item: &str,
+) -> Result<Vec<RecordedAllocation>, String> {
+    let marker = format!(
+        "{} item={item} role=candidate ",
+        board_hypothesis::IMPLEMENTATION_PREFIX
+    );
+    let mut records = Vec::new();
+    for comment in comments {
+        if !comment.starts_with(&marker) {
+            continue;
+        }
+        records.push(parse_recorded_allocation(&comment[marker.len()..])?);
+    }
+    Ok(records)
+}
+
+fn parse_recorded_allocation(rest: &str) -> Result<RecordedAllocation, String> {
+    Ok(RecordedAllocation {
+        branch: allocation_field(rest, "branch=")?,
+        base: allocation_field(rest, "base=")?,
+        revision: allocation_field(rest, "revision=")?,
+        worktree: allocation_worktree(rest)?,
+    })
+}
+
+fn allocation_field(text: &str, key: &str) -> Result<String, String> {
+    let Some(start) = text.find(key) else {
+        return Err(format!(
+            "the board implementation record has no {key} field"
+        ));
+    };
+    text[start + key.len()..]
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("the board implementation record has an empty {key} field"))
+}
+
+fn allocation_worktree(text: &str) -> Result<String, String> {
+    let Some(start) = text.find("worktree=") else {
+        return Err("the board implementation record has no worktree field".to_owned());
+    };
+    let value = &text[start + "worktree=".len()..];
+    let end = value.find(" runtime=").unwrap_or(value.len());
+    let worktree = value[..end].trim();
+    if worktree.is_empty() {
+        return Err("the board implementation record has an empty worktree field".to_owned());
+    }
+    Ok(worktree.to_owned())
+}
+
+fn board_records_same_allocation(
+    run: &Run,
+    candidate: &CandidateState,
+    checkout: &CandidateCheckout,
+    destination: &Path,
+) -> Result<(), String> {
+    let comments = harness_core::board_feedback::list_comments(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+    )
+    .map_err(|error| {
+        format!(
+            "the hypothesis card {} comments could not be read: {error}",
+            candidate.hypothesis
+        )
+    })?;
+    for record in recorded_candidate_allocations(&comments, &candidate.hypothesis)? {
+        if record.branch != checkout.branch
+            || record.base != checkout.base
+            || record.revision != checkout.revision
+        {
+            return Err(format!(
+                "the board records branch {} base {} revision {} but the cursor records branch {} base {} revision {}; the destination was not adopted",
+                record.branch,
+                record.base,
+                record.revision,
+                checkout.branch,
+                checkout.base,
+                checkout.revision
+            ));
+        }
+        let recorded = PathBuf::from(&record.worktree);
+        if !same_allocation_path(&recorded, &checkout.path)
+            && !same_allocation_path(&recorded, destination)
+        {
+            return Err(format!(
+                "the board records worktree {} which is neither the cursor path {} nor the owner-assigned destination {}; the destination was not adopted",
+                record.worktree,
+                checkout.path.display(),
+                destination.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+enum RelocationPublication {
+    Moved,
+    Reconciled { retained_error: String },
+}
+
+fn publish_relocated_allocation(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    relocated: CandidateCheckout,
+    notes: &mut Vec<String>,
+    publication: RelocationPublication,
+) -> io::Result<()> {
+    if let Err(error) = board_hypothesis::record_implementation(
         &run.spec.board.bd,
         &run.spec.board.project,
         &candidate.hypothesis,
@@ -1019,31 +1346,309 @@ fn relocate_recorded_allocation(
             runtime: None,
             baseline_runtime: None,
         },
-    )
-    .map_err(|error| {
-        invalid(format!(
+    ) {
+        let reason = format!(
             "the relocated candidate allocation could not be recorded on hypothesis card {}: {error}",
             candidate.hypothesis
-        ))
-    })?;
-    run.cursor.effect(
-        EffectKind::CandidateAllocated,
-        format!(
-            "hypothesis={} branch={} base={} worktree={} relocated from the protected run state",
-            candidate.hypothesis,
-            relocated.branch,
-            relocated.base,
-            relocated.path.display()
-        ),
-    );
-    notes.push(format!(
-        "allocation: relocated branch {} at {} to {}",
-        relocated.branch,
-        relocated.revision,
-        relocated.path.display()
-    ));
+        );
+        let prior = match &publication {
+            RelocationPublication::Reconciled { retained_error } if retained_error != "none" => {
+                Some(retained_error.clone())
+            }
+            _ => run.cursor.condition.clone(),
+        };
+        retain_publication_error(run, &reason, prior.as_deref())?;
+        return Err(invalid(reason));
+    }
+    match publication {
+        RelocationPublication::Moved => {
+            run.cursor.effect(
+                EffectKind::CandidateAllocated,
+                format!(
+                    "hypothesis={} branch={} base={} worktree={} relocated from the protected run state",
+                    candidate.hypothesis,
+                    relocated.branch,
+                    relocated.base,
+                    relocated.path.display()
+                ),
+            );
+            notes.push(format!(
+                "allocation: relocated branch {} at {} to {}",
+                relocated.branch,
+                relocated.revision,
+                relocated.path.display()
+            ));
+        }
+        RelocationPublication::Reconciled { retained_error } => {
+            run.cursor.effect(
+                EffectKind::CandidateAllocated,
+                format!(
+                    "hypothesis={} branch={} base={} revision={} worktree={} reconciled interrupted relocation; original error retained: {retained_error}",
+                    candidate.hypothesis,
+                    relocated.branch,
+                    relocated.base,
+                    relocated.revision,
+                    relocated.path.display()
+                ),
+            );
+            notes.push(format!(
+                "allocation: reconciled interrupted relocation of branch {} at {} to {}; original error retained: {retained_error}",
+                relocated.branch,
+                relocated.revision,
+                relocated.path.display()
+            ));
+        }
+    }
     candidate.worktree = Some(relocated);
     Ok(())
+}
+
+/// Persists a publication failure without rewriting the recorded worktree
+/// path, so the next resume can reconcile the completed Git move and the
+/// error remains inspectable after this command returns.
+fn retain_publication_error(run: &mut Run, reason: &str, prior: Option<&str>) -> io::Result<()> {
+    let detail = match prior.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(existing) if !reason.contains(existing) => {
+            format!("{reason}; original error retained: {existing}")
+        }
+        _ => reason.to_owned(),
+    };
+    run.cursor.phase = Phase::Idle;
+    run.cursor.condition = Some(detail.clone());
+    run.cursor.effect(EffectKind::IdleRecorded, &detail);
+    run.store.save_cursor(&run.cursor)?;
+    Ok(())
+}
+
+fn relocation_refusal(
+    run: &mut Run,
+    notes: &mut Vec<String>,
+    command_error: Option<&str>,
+    reason: String,
+) -> io::Result<()> {
+    let reason = match command_error.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(error) if !reason.contains(error) => {
+            format!("{reason}; git worktree move had reported: {error}")
+        }
+        _ => reason,
+    };
+    refused(run, notes, reason)
+}
+
+/// Reconciles a Git move that finished while the cursor and board still name
+/// the old path. Recovery publishes the recorded branch, base and revision at
+/// the owner-assigned destination only when Git's registration proves that
+/// identity. It never moves, resets, deletes or replays a model attempt.
+fn reconcile_interrupted_relocation(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    checkout: &CandidateCheckout,
+    destination: &Path,
+    notes: &mut Vec<String>,
+    command_error: Option<&str>,
+) -> io::Result<()> {
+    let trees = match registered_worktrees(&run.spec.project) {
+        Ok(trees) => trees,
+        Err(error) => {
+            return relocation_refusal(
+                run,
+                notes,
+                command_error,
+                format!(
+                    "the recorded candidate worktree {} is absent and its Git registration could not be read: {error}; the destination was not adopted and this resume did not move, reset or delete a worktree",
+                    checkout.path.display()
+                ),
+            );
+        }
+    };
+    if registered_at(&trees, &checkout.path).is_some() {
+        return relocation_refusal(
+            run,
+            notes,
+            command_error,
+            format!(
+                "the recorded candidate worktree {} is absent on disk but Git still registers it; the owner-assigned destination was not adopted and this resume did not move, reset or delete a worktree",
+                checkout.path.display()
+            ),
+        );
+    }
+    if !destination.exists() {
+        return relocation_refusal(
+            run,
+            notes,
+            command_error,
+            format!(
+                "the recorded candidate worktree {} is absent and the owner-assigned destination {} does not exist; the move is not recovered and this resume did not move, reset or delete a worktree",
+                checkout.path.display(),
+                destination.display()
+            ),
+        );
+    }
+    let Some(registered) = registered_at(&trees, destination) else {
+        return relocation_refusal(
+            run,
+            notes,
+            command_error,
+            format!(
+                "the recorded candidate worktree {} is absent and {} is not a registered worktree of {}; it is not adopted and was not modified",
+                checkout.path.display(),
+                destination.display(),
+                run.spec.project.display()
+            ),
+        );
+    };
+    if registered.prunable
+        || registered.head != checkout.revision
+        || registered.branch.as_deref() != Some(checkout.branch.as_str())
+    {
+        return relocation_refusal(
+            run,
+            notes,
+            command_error,
+            format!(
+                "the registered destination {} is at revision {} on branch {}, not the recorded revision {} on branch {}; it is not adopted and was not reset or checked out",
+                destination.display(),
+                registered.head,
+                registered.branch.as_deref().unwrap_or("detached HEAD"),
+                checkout.revision,
+                checkout.branch
+            ),
+        );
+    }
+    match task_worktree::worktree_reuse(
+        &run.spec.project,
+        destination,
+        &run.spec.project,
+        &checkout.revision,
+        false,
+    )? {
+        WorktreeReuse::Eligible { revision } if revision == checkout.revision => {}
+        WorktreeReuse::Eligible { revision } => {
+            return relocation_refusal(
+                run,
+                notes,
+                command_error,
+                format!(
+                    "the registered destination {} resolved revision {revision} instead of the recorded revision {}; it is not adopted and was not modified",
+                    destination.display(),
+                    checkout.revision
+                ),
+            );
+        }
+        WorktreeReuse::Blocked { kind, reason } => {
+            return relocation_refusal(
+                run,
+                notes,
+                command_error,
+                format!(
+                    "the registered destination {} is not the exact preserved allocation ({kind:?}): {reason}; it is not adopted and was not modified",
+                    destination.display()
+                ),
+            );
+        }
+    }
+    if let Err(reason) = board_records_same_allocation(run, candidate, checkout, destination) {
+        return relocation_refusal(
+            run,
+            notes,
+            command_error,
+            format!("the interrupted relocation is not adopted: {reason}"),
+        );
+    }
+    let relocated = CandidateCheckout {
+        path: destination.to_path_buf(),
+        ..checkout.clone()
+    };
+    if let Err(error) = verify_candidate_base(run, &relocated) {
+        return relocation_refusal(
+            run,
+            notes,
+            command_error,
+            format!(
+                "the interrupted relocation is not adopted: {error}; the destination was not modified"
+            ),
+        );
+    }
+    let retained = match (
+        command_error.map(str::trim).filter(|text| !text.is_empty()),
+        run.cursor
+            .condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty()),
+    ) {
+        (Some(command), Some(existing)) => format!("{command}; {existing}"),
+        (Some(command), None) => command.to_owned(),
+        (None, Some(existing)) => existing.to_owned(),
+        (None, None) => "none".to_owned(),
+    };
+    publish_relocated_allocation(
+        run,
+        candidate,
+        relocated,
+        notes,
+        RelocationPublication::Reconciled {
+            retained_error: retained,
+        },
+    )
+}
+
+fn observe_failed_move(
+    project: &Path,
+    checkout: &CandidateCheckout,
+    destination: &Path,
+) -> Result<FailedMoveObservation, String> {
+    let trees = registered_worktrees(project)?;
+    let old = registered_at(&trees, &checkout.path);
+    let dest = registered_at(&trees, destination);
+    let destination_matches_identity = dest.is_some_and(|tree| {
+        !tree.prunable
+            && tree.head == checkout.revision
+            && tree.branch.as_deref() == Some(checkout.branch.as_str())
+    });
+    Ok(FailedMoveObservation {
+        old_exists: checkout.path.exists(),
+        old_registered: old.is_some(),
+        destination_exists: destination.exists(),
+        destination_registered: dest.is_some(),
+        destination_matches_identity,
+    })
+}
+
+fn settle_failed_worktree_move(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    checkout: &CandidateCheckout,
+    destination: &Path,
+    stderr: &str,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let observed = match observe_failed_move(&run.spec.project, checkout, destination) {
+        Ok(observed) => observed,
+        Err(error) => {
+            return relocation_refusal(
+                run,
+                notes,
+                Some(stderr),
+                format!(
+                    "the recorded candidate worktree {} could not be relocated out of the protected run state: {stderr}; the resulting registration could not be read: {error}; this failure is not claimed to have left the allocation unchanged, because that was not established, and nothing was reset or deleted",
+                    checkout.path.display()
+                ),
+            );
+        }
+    };
+    match classify_failed_worktree_move(&checkout.path, stderr, &observed) {
+        FailedMoveClassification::Completed => reconcile_interrupted_relocation(
+            run,
+            candidate,
+            checkout,
+            destination,
+            notes,
+            Some(stderr),
+        ),
+        FailedMoveClassification::Unmoved { reason }
+        | FailedMoveClassification::Ambiguous { reason } => refused(run, notes, reason),
+    }
 }
 
 /// The candidate allocation must descend from the run's exact committed base;
@@ -2274,5 +2879,61 @@ mod assignment_tests {
         }
         assert!(brief.contains(" show bdcw-card --json"), "{brief}");
         assert!(brief.contains("the oracle checker executes"), "{brief}");
+    }
+
+    #[test]
+    fn a_partial_git_move_failure_is_not_described_as_untouched_without_evidence() {
+        let old = Path::new("run/candidates/card");
+        let ambiguous = classify_failed_worktree_move(
+            old,
+            "fatal: boom",
+            &FailedMoveObservation {
+                old_exists: false,
+                old_registered: false,
+                destination_exists: true,
+                destination_registered: false,
+                destination_matches_identity: false,
+            },
+        );
+        let FailedMoveClassification::Ambiguous { reason } = ambiguous else {
+            panic!("a partial destination was not classified as ambiguous");
+        };
+        assert!(!reason.contains("untouched"), "{reason}");
+        assert!(reason.contains("fatal: boom"), "{reason}");
+        assert!(
+            reason.contains("not claimed to have left the allocation unchanged"),
+            "{reason}"
+        );
+
+        let unmoved = classify_failed_worktree_move(
+            old,
+            "fatal: destination missing",
+            &FailedMoveObservation {
+                old_exists: true,
+                old_registered: true,
+                destination_exists: false,
+                destination_registered: false,
+                destination_matches_identity: false,
+            },
+        );
+        let FailedMoveClassification::Unmoved { reason } = unmoved else {
+            panic!("a still-registered allocation was not classified as unmoved");
+        };
+        assert!(reason.contains("still registered"), "{reason}");
+        assert!(reason.contains("commits were not moved"), "{reason}");
+        assert!(!reason.contains("untouched"), "{reason}");
+
+        let completed = classify_failed_worktree_move(
+            old,
+            "fatal: reported after the move",
+            &FailedMoveObservation {
+                old_exists: false,
+                old_registered: false,
+                destination_exists: true,
+                destination_registered: true,
+                destination_matches_identity: true,
+            },
+        );
+        assert!(matches!(completed, FailedMoveClassification::Completed));
     }
 }
