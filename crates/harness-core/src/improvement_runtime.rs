@@ -1632,11 +1632,11 @@ pub fn verify_consumption(runtime: &ArmRuntime) -> io::Result<Consumption> {
 }
 
 /// Consumption check for one prepared arm whose measured dispatches may have
-/// trusted exactly the workspaces they were allocated. Each entry of
-/// `trusted_workspaces` is the pooled slot path of one recorded dispatch
-/// receipt for this arm; the arm configuration may carry that workspace's
-/// trusted-project entry and nothing else. No receipt, no authorization: the
-/// prepared bytes must then match byte for byte.
+/// trusted exactly the workspaces authorized by the owning dispatcher. The
+/// caller supplies the owned slot paths from its frozen pool declaration,
+/// including slots trusted before a refused model submission. The arm
+/// configuration may carry those trusted-project entries and nothing else;
+/// an empty authority list requires the prepared bytes to match exactly.
 pub fn verify_consumption_with_trust(
     runtime: &ArmRuntime,
     trusted_workspaces: &[PathBuf],
@@ -1821,8 +1821,8 @@ pub fn verify_consumption_with_trust(
             // (`executor_cli::ensure_workspace_trust` appends one
             // `[projects.'<workspace>'] trust_level = "trusted"` block per
             // slot), so a prepared arm legitimately gains exactly the
-            // trailing entries of the workspaces its own recorded dispatches
-            // allocated. Accept nothing else: removing exactly those blocks
+            // trailing entries of the workspaces its owner authorized for
+            // dispatch. Accept nothing else: removing exactly those blocks
             // must reproduce the prepared bytes.
             let restored = strip_appended_trust(&bytes, trusted_workspaces)
                 .filter(|stripped| build_identity::hash_bytes(stripped) == configuration.sha256);
@@ -1879,7 +1879,7 @@ pub fn verify_consumption_with_trust(
 /// Removes the trailing trusted-project blocks the ordinary dispatch appends
 /// to an arm configuration (`executor_cli::ensure_workspace_trust` writes
 /// `\n[projects.'<workspace>']\ntrust_level = "trusted"\n` once per slot) for
-/// exactly the workspaces the arm's own recorded dispatches allocated.
+/// exactly the workspaces authorized for the arm's own dispatcher.
 /// Anything else - an appended comment, another projects entry, another
 /// workspace or a changed trust level - keeps its bytes and therefore still
 /// fails the comparison.
