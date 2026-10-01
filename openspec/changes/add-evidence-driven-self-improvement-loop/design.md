@@ -157,6 +157,45 @@ Control order, startup, hardware contention and cache policy within matched bloc
 
 Preserve replayable real tasks linked to their existing cards. Use applicable earlier tasks, with checks hidden from the optimizing executor as appropriate, when corroboration is required for the declared adoption scope. A first pair can establish a task-scoped result, not universal savings. Predeclare repetitions/stopping and repeated-selection treatment; do not run until the first favorable pair appears. Transfer beyond the measured local model remains unproven until exercised.
 
+#### Control nuisance factors while preserving paired comparison
+
+The confirmed method remains the old and new harness solving the same frozen
+task. Diagnostic counters, component benchmarks and comparisons of different
+tasks cannot substitute for its real-agent acceptance. Extend the existing
+comparison policy and preflight receipts with the nuisance-control plan before
+either arm starts; reuse it unchanged on resume.
+
+Record the task/runtime/acceptance identities, selected model observations,
+owned cache snapshots or preparation recipe, cold/warm mode, permitted shared
+resources and ordering rule. Check the resulting state, rather than treating a
+configured reset or warm-up command as proof. Reset only owned state. Do not
+assume an OS, shared compiler or inference cache was reset when it was not
+observed. Keep each arm's own cache evolution and model decisions as outcomes.
+Required input or qualification mismatches still fail their existing gates;
+uncertainty bounds apply only to residual variation allowed by the plan.
+For a caching or recovery treatment, equivalent starting conditions must not
+erase the mechanism under test. Preparation and warm-up costs remain visible
+under the declared one-time or recurring cost basis.
+
+Choose and record arm order before outcomes, using randomized order or a
+balanced schedule across declared repetitions. A single pair cannot balance
+both orders, so retain its exposure to time/order drift. Keep non-treatment
+load comparable where practical; record uncontrolled conditions and their
+consequences without multiplying elapsed time by CPU/GPU-utilization factors.
+The existing API-observed identity boundary remains unchanged: unavailable
+hardware or weight identity stays a disclosed limitation, not a new access
+prerequisite.
+
+Classify faults by their observed effect. A verified transport-only idle wait
+may qualify for the existing blocking adjustment; ordinary inference/tool
+execution or an unattributed request duration does not. A lost response,
+retry, changed context or different execution path
+cannot be repaired by subtracting its wall duration. Preserve the original
+attempt and usage, apply the frozen retry/stopping rule, and withhold a causal
+claim when the remaining effect can change its verdict. Treatments of network
+recovery or scheduling retain those effects under controlled relevant faults
+or load. Required solution-repeatability qualification remains a separate gate.
+
 #### Infrastructure waits and causal interpretation
 
 The ordinary case is an agent waiting for the shared `heavy` build slot while
@@ -202,6 +241,18 @@ This is a defined normalization of observed work, not a prediction of the
 completion time on a hypothetical unloaded machine. A fully observed immediate
 grant proves zero queue delay; absent queue telemetry does not.
 
+Implement the adjustment as deterministic reduction of retained native events
+under the frozen policy. Correlate and validate identities and boundaries,
+classify each interval/request as eligible external waiting, attributable work
+or unresolved, then perform the interval operations above. Keep the evidence
+reference and rule/reason for every exclusion and unresolved classification.
+Replaying the same complete evidence and policy must reproduce the same
+deductions and decision inputs without a model call or a manual per-run label.
+For each measured quantity eligible for subtraction, reconcile observed total
+as adjusted total plus excluded amount; unresolved usage remains included.
+Do not apply a time deduction proportionally to tokens, energy or currency.
+Reject inconsistent totals or duplicate request usage as accounting gaps.
+
 For the delivered Windows path, reuse the existing QPC sample owner for
 controller and admission events in the same verified host/boot clock domain.
 This avoids converting those events through wall time; wall-only, foreign or
@@ -235,6 +286,15 @@ work in adjusted metrics and its changed queue exposure in the operational
 view. A scheduler or waiting-policy treatment cannot normalize away its own
 declared mechanism.
 
+Even an external queue can cause downstream context growth, compaction,
+deadline expiry, retries or a changed plan. Removing its idle interval or a
+whole wait-only request does not remove those consequences. Retain later
+mixed-request usage, including repeated waiting context, rather than guessing
+what part of its input or reasoning would disappear. Expose such effects and
+apply the material-uncertainty gate to the causal conclusion. This does not
+require identical tool sequences across arms: strategy changes caused by the
+treatment remain outcomes.
+
 Freeze the attribution rule/version, eligible causes, claimed metric view,
 coverage requirements and material-uncertainty rule with the comparison
 policy. Apply them identically to both arms. Missing boundaries, unknown
@@ -248,6 +308,43 @@ predeclared stopping rule; preserve original failures and costs. Replay under
 controlled load is a targeted next check, not automatic repetition until a
 favorable result. Reports and Beads decisions reference the same raw and
 adjusted evidence, exclusions, uncertainty and policy identity.
+
+#### Separate uncertainty sources and validate the measurement path
+
+Keep measurement/attribution bounds separate from empirical variation between
+complete paired attempts. Record a bound's evidence and assumptions; do not
+assume missing components are zero or independent. Evaluate every decision
+gate, including quality, resource regressions and declared trade-offs, over
+the supported range. For example, with a 10% meaningful-effect threshold, a
+12-18% supported measurement range clears that threshold, while a -3-18%
+range does not. Neither range alone establishes statistical confidence about
+future agent runs.
+
+Use complete paired task attempts as the units for estimating run-to-run
+variation; requests, tools and tokens within one attempt are dependent
+observations. A statistical claim needs a predeclared analysis method,
+confidence level, assumptions and adequate repetitions for that claim. A
+single pair may report its observed task-scoped difference and measurement
+bounds, but cannot establish zero model variability or universal savings.
+Seed settings and successful qualification do not supply a timing variance
+estimate. Apply the existing stopping and repeated-selection policy; when the
+allowed evidence is insufficient, retain an inconclusive result rather than
+repeat until a favorable result or impose an invented universal sample count.
+For evaluating uncertainty, NIST describes [statistical methods](https://physics.nist.gov/cuu/Uncertainty/typea.html)
+and [methods using other evidence and assumptions](https://physics.nist.gov/cuu/Uncertainty/typeb.html).
+Those classify evaluation methods; they do not make measurement uncertainty
+and run variability synonymous with Type B and Type A respectively.
+
+Exercise the same controller/report/decision path with owned independent
+controls: identical runtimes with a known external idle delay must retain
+the raw delay and neutralize only its evidenced eligible portion; extra build
+work, polling, cache benefits and quality failures must remain visible.
+Missing boundaries, truncated detail, wrong ownership or unaligned clocks
+must widen uncertainty or withhold the conclusion. Retain calibration version,
+inputs and results with the existing evidence owner; reuse them only while
+the relevant collector, accounting, policy and clock contracts remain valid.
+Model-free controls prove the measurement path, not real-model repeatability
+or the required A-on-B/B-on-C acceptance.
 
 ### 9. Recover deterministic bookkeeping without replaying unknown effects
 

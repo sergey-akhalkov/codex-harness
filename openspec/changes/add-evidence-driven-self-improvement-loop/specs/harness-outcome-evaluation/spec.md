@@ -62,6 +62,18 @@ The algorithm SHALL clip eligible waits to the attempt, union overlapping and ne
 
 Waiting-related model requests, tool operations and measured usage SHALL be reported separately from passive wait duration. Only whole requests independently correlated with a wait and structurally verified to perform waiting alone MAY be excluded from adjusted usage. Mixed task/status requests SHALL remain included with incomplete attribution; token categories SHALL preserve their subset relationships. Duration, bytes or prose SHALL NOT be converted into token or currency measurements. Candidate-controlled polling, redundant work, self-contention and execution after admission SHALL retain attributable cost. Changes in build demand, queue exposure or waiting strategy SHALL remain visible in the benefit analysis even where an adjusted view excludes verified external waiting.
 
+Attribution SHALL run automatically as a deterministic reduction of retained native evidence under the frozen policy, without model-based classification or manual per-attempt labels. Every exclusion and unresolved classification SHALL identify its evidence and rule/reason. Replaying the same complete evidence and policy SHALL reproduce the deductions and decision inputs without model execution. Each measured quantity eligible for subtraction SHALL reconcile as observed total equals adjusted total plus excluded amount; unresolved usage SHALL remain included. Duplicate request usage or inconsistent totals SHALL degrade accounting coverage, not create savings. A time deduction SHALL NOT imply proportional token, energy or currency deductions.
+
+An externally caused wait SHALL NOT imply that its downstream effects are removable. Context growth, compaction, deadline expiry, retries and changed work SHALL remain visible. Subsequent mixed-request usage, including repeated waiting context, SHALL remain included rather than being fractionally reconstructed as a hypothetical wait-free request. Material unresolved effects on the work trajectory SHALL apply the comparability and uncertainty gates even if the idle interval itself is fully measured. This SHALL NOT require identical tool sequences across arms or remove strategy changes caused by the treatment.
+
+#### Scenario: Attribution is replayed after recovery
+- **WHEN** the same complete native evidence is evaluated again with the same policy
+- **THEN** exclusions and decision inputs match, observed totals reconcile with adjusted and excluded amounts, and no model call or operator classification is needed
+
+#### Scenario: External waiting changes the context or plan
+- **WHEN** verified queue delay induces additional conversation context, compaction, a deadline or a changed execution path
+- **THEN** the report retains those consequences and later mixed-request usage, and subtracting the measured idle duration alone cannot establish comparable wait-free work or authorize an unsupported benefit claim
+
 #### Scenario: One arm encounters an unrelated occupied build slot
 - **WHEN** equivalent task work differs only by a verified external queue delay under the same predeclared attribution rule
 - **THEN** observed elapsed times differ while adjusted work metrics do not report a model or harness improvement solely from that delay, and the waiting cost remains in the operational view
@@ -111,6 +123,62 @@ If unresolved infrastructure effects could change whether the declared meaningfu
 #### Scenario: A report is resumed or the attribution rule changes
 - **WHEN** an experiment is recovered or a newer analysis rule becomes available
 - **THEN** its original policy and evidence remain identifiable, and a changed rule cannot silently replace the measured view or inherit an earlier benefit decision
+
+### Requirement: Paired experiments control non-treatment operating conditions
+
+The evaluator SHALL preserve comparison of both harness versions on the same frozen real task. Before either arm starts, its existing policy SHALL bind initial cache and warm-up conditions, arm ordering, relevant load controls, observed environment identity, fault classification and retry/stopping rules. Preflight SHALL verify available task, runtime, model/client and acceptance identities and the resulting owned cache state or preparation recipe. Unknown shared/OS/inference-cache state SHALL remain explicit; a reset command alone SHALL NOT prove equivalent conditions. Resets SHALL affect only owned state. Preparation costs SHALL remain accounted under the declared operating mode. Randomized arm order or a balanced repetition schedule SHALL be fixed before results, with single-pair order exposure retained. No proxy metric or comparison of different task durations SHALL replace paired real-task acceptance.
+
+Equivalent initial conditions SHALL preserve the treatment's subsequent caching, build demand, scheduling, recovery and model-strategy effects. Required solution-repeatability qualification and the selected identity policy SHALL remain enforced without adding unavailable hardware access as an API-observed prerequisite. Uncertainty bounds SHALL NOT waive required identity, input-state or qualification gates. Uncontrolled execution load SHALL NOT authorize a guessed utilization-based time correction. Ordinary inference/tool execution and unattributed request latency SHALL NOT be classified as external idle waiting. A network fault affecting response delivery, retries, context or subsequent work SHALL retain the original attempt, errors and usage; elapsed subtraction alone SHALL NOT make its trajectory comparable. Material unresolved operating differences SHALL make the causal conclusion inconclusive, and further attempts SHALL follow the predeclared policy without selecting favorable failures or load.
+
+#### Scenario: The second arm inherits a warmer cache
+- **WHEN** an arm violates the declared initial owned cache or warm-up conditions
+- **THEN** the evaluator preserves the attempt and refuses that comparison until corrected conditions are exercised; only residual cache variation permitted by the plan may be assessed through uncertainty bounds, without clearing unrelated state
+
+#### Scenario: The treatment improves caching or recovery
+- **WHEN** both arms satisfy the initial conditions and the candidate subsequently avoids work or handles the declared fault more effectively
+- **THEN** that changed behavior remains an attributable result rather than an excluded nuisance factor
+
+#### Scenario: A timeout changes the agent's next actions
+- **WHEN** a response is lost or a retry changes context or work performed
+- **THEN** the report preserves failures and actual usage, does not reconstruct a hypothetical fault-free trajectory, and applies the comparability and stopping gates
+
+#### Scenario: Order or background load favors one arm
+- **WHEN** time/order drift or uncontrolled contention could explain the observed effect
+- **THEN** the evaluator retains the predetermined order and available load evidence, uses only supported uncertainty bounds, and withholds an unsupported verdict rather than inventing a speed correction
+
+### Requirement: Measurement bounds and run variability support distinct claims
+
+The evaluator SHALL retain measurement/attribution uncertainty separately from empirical run-to-run variation. Every numerical bound SHALL identify its evidence and assumptions; missing uncertainty SHALL NOT become zero, and unknown dependence SHALL NOT be treated as independence. A bounded decision SHALL hold across the supported range of all decision-driving metrics, including acceptance, resource regressions and declared trade-offs, not merely the preferred time metric. Threshold-crossing uncertainty SHALL yield an inconclusive causal conclusion. A measurement bound SHALL NOT be labeled a statistical confidence interval without a valid statistical basis.
+
+A statistical claim SHALL declare its analysis method, confidence level, assumptions, complete paired experimental units, repetition/stopping rule and treatment of repeated selection before comparative outcomes. Requests, tokens, tool calls and repeated readings within one task SHALL NOT count as independent task replications. Fixed sampling parameters and qualification success SHALL NOT establish zero timing or trajectory variance. One pair MAY support a limited description of its observed task result and measurement bounds, but SHALL NOT establish repeatable/general savings or an unsupported confidence percentage. Material uncertainty about the declared claim SHALL remain inconclusive when permitted evidence is insufficient; no universal repetition count or favorable-result stopping rule SHALL be invented. The existing API-observed identity limits SHALL remain visible in that claim.
+
+#### Scenario: A bounded effect clears the declared threshold
+- **WHEN** the supported measurement range lies wholly beyond the meaningful-effect threshold and every other decision gate holds across its range
+- **THEN** the evaluator may report the scoped supported result while separately identifying unresolved run variability and without assigning that bound a statistical confidence level
+
+#### Scenario: The effect range crosses a decision threshold
+- **WHEN** admissible uncertainty can change a quality, benefit, regression or trade-off decision
+- **THEN** a favorable midpoint cannot authorize adoption and the causal result remains inconclusive
+
+#### Scenario: One pair contains thousands of tool events
+- **WHEN** many within-attempt observations accompany only one complete baseline/candidate pair
+- **THEN** the report retains one paired experimental unit, does not manufacture confidence from event count, and does not interpret an undetected gain as equivalence or general uselessness
+
+### Requirement: Independent controls verify noise accounting
+
+The existing controller, report and decision path SHALL be exercised with owned independent calibration inputs and retained expected properties. Identical runtimes with a known eligible external idle delay SHALL show that delay in raw accounting and exclude only its verified blocked portion from adjusted metrics within observed error bounds. Controls adding real work or changing quality SHALL preserve their effect and applicable rejection gates. Missing or inconsistent evidence SHALL reduce coverage or yield inconclusive analysis rather than false precision. Calibration identity and results SHALL remain tied to the relevant collector, algorithm, policy and clock contracts; changed relevant inputs SHALL invalidate unsupported reuse. These controls SHALL NOT replace actual local-model or installed-loop acceptance.
+
+#### Scenario: Only an external idle delay is injected
+- **WHEN** a controlled comparison adds an attributable external blocked interval with no useful-work overlap or trajectory change
+- **THEN** raw cost retains the delay, adjusted elapsed excludes the evidenced interval once, and the filter does not create a false gain or regression
+
+#### Scenario: Extra work or a quality failure is injected
+- **WHEN** a control adds a redundant build, treatment-induced polling or an independently detected incorrect result
+- **THEN** accounting preserves the attributable cost or acceptance failure and normalization cannot turn it into an adopted improvement
+
+#### Scenario: Calibration evidence loses coverage
+- **WHEN** a control removes a boundary, supplies wrong ownership, breaks clock alignment or overflows retained event detail
+- **THEN** the real report/decision path exposes the gap and cannot claim complete correction, zero missing cost or unsupported confidence
 
 ### Requirement: Rolling evidence retains applicability and exact candidate lineage
 
