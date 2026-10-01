@@ -10,9 +10,11 @@
 //!
 //! Comparison execution and frozen runtime preparation are separate owners.
 //! Phases that need them (`baseline-attempt`, `candidate-attempt`, acceptance,
-//! decision, activation) are reachable only by recording an actual effect; a
-//! controller slice that cannot perform that effect reports the phase as
-//! explicitly pending instead of advancing.
+//! decision, activation) are reached only by their owner recording an actual
+//! effect: a run that declares the explicit comparison inputs is driven
+//! through the measured pair and the evidence-bound decision, while a run
+//! without them stays at `candidate-ready` and integration, activation and
+//! live publication always remain pending separate owners.
 //!
 //! The planning/implementation portion of the loop is controller-owned: a
 //! retained investigator result is consumed through
@@ -22,6 +24,10 @@
 //! The cursor records those references as recovery data only; the board and
 //! OpenSpec remain the decision and planning owners.
 
+use crate::improvement_policy::ComparisonPolicy;
+use crate::improvement_runtime::ClientInputs;
+use crate::improvement_spec::{ExperimentContract, Specification};
+use crate::outcome_qualification::ClientInput;
 use crate::process::{Cancellation, Deadline, ExclusiveFileLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -58,6 +64,10 @@ pub const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// overwritten by a later dispatch into the same slot.
 pub const MAX_RETAINED_RECEIPT_BYTES: u64 = 1024 * 1024;
 pub const MAX_RETAINED_RESULT_BYTES: u64 = 256 * 1024;
+/// Schema of the explicit comparison inputs one run may declare.
+pub const COMPARISON_SCHEMA: u32 = 1;
+/// Schema of the retained comparison recovery state.
+pub const COMPARISON_STATE_SCHEMA: u32 = 1;
 
 const MAX_TOKEN: usize = 200;
 const MAX_REASON: usize = 1024;
@@ -229,6 +239,198 @@ pub struct RemovalScope {
     pub target: String,
 }
 
+/// The frozen workload B one comparison runs the two harness arms against.
+/// The task snapshot is materialized from an existing committed Git revision;
+/// nothing here is discovered from a neighboring project.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskInputs {
+    /// The Git checkout holding the committed task revision.
+    pub source: PathBuf,
+    /// The exact committed task revision every arm copies.
+    pub revision: String,
+    /// Bounded workload identity; the accounting case id.
+    pub name: String,
+    /// The workload's own writable scope, relative to the frozen task copy.
+    pub writable_scope: Vec<String>,
+}
+
+impl TaskInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        absolute_directory("the frozen task source", &self.source)?;
+        if self.revision.len() < 7
+            || self.revision.len() > 64
+            || !self.revision.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "task revision must be a 7-64 character hexadecimal commit revision",
+            ));
+        }
+        token("task name", &self.name, MAX_TOKEN)?;
+        if self.writable_scope.is_empty() || self.writable_scope.len() > MAX_SCOPE_ENTRIES {
+            return Err(invalid(
+                "the task writable_scope must name 1-32 relative paths inside the frozen copy",
+            ));
+        }
+        for entry in &self.writable_scope {
+            relative_scope_entry(entry)?;
+        }
+        Ok(())
+    }
+}
+
+/// The two prepared immutable harness runtimes of one comparison and the
+/// explicit client inputs both arms share. Preparation publishes the builds;
+/// this receipt only declares them, so a stale or missing build is refused
+/// instead of being rebuilt silently.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeInputs {
+    /// The owned native build state publishing both immutable builds.
+    pub state: PathBuf,
+    /// The prepared baseline (H) build inside that state.
+    pub baseline_build: PathBuf,
+    /// The prepared candidate (H+A) build inside that state.
+    pub candidate_build: PathBuf,
+    pub baseline_label: String,
+    pub candidate_label: String,
+    /// The explicit original Codex client; never a PATH lookup or fallback.
+    pub upstream: PathBuf,
+    /// The accepted shared client inputs (local route, overlay, catalogue).
+    pub client: ClientInputs,
+}
+
+impl RuntimeInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        absolute_directory("the prepared runtime state", &self.state)?;
+        for (name, build) in [
+            ("baseline build", &self.baseline_build),
+            ("candidate build", &self.candidate_build),
+        ] {
+            if !build.is_absolute() {
+                return Err(invalid(format!(
+                    "the prepared {name} must be an absolute path inside its owned state"
+                )));
+            }
+        }
+        line("baseline label", &self.baseline_label, MAX_REASON)?;
+        line("candidate label", &self.candidate_label, MAX_REASON)?;
+        if self.baseline_label == self.candidate_label {
+            return Err(invalid(
+                "baseline and candidate runtime labels must be distinct",
+            ));
+        }
+        if !self.upstream.is_absolute() || !self.upstream.is_file() {
+            return Err(invalid(format!(
+                "the explicit upstream client is missing at {}",
+                self.upstream.display()
+            )));
+        }
+        let endpoint = self.client.runner.endpoint.trim();
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(invalid(
+                "the declared local client endpoint must be an explicit http(s) URL",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The frozen real-task acceptance request the unchanged supervisor supplies.
+/// The controller runs the oracle entry point with these exact bytes; it never
+/// authors or edits the request.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceInputs {
+    /// The frozen real-task oracle request file.
+    pub request: PathBuf,
+    /// The supervisor's digest of the request bytes.
+    pub request_sha256: String,
+}
+
+impl AcceptanceInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        if !self.request.is_absolute() {
+            return Err(invalid(
+                "the frozen acceptance request must be an absolute path",
+            ));
+        }
+        if self.request_sha256.len() != 64
+            || !self.request_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "the acceptance request digest must be a 64 character hexadecimal sha256",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The explicit private inputs of one sequential baseline/candidate
+/// comparison. Every field is supplied by the operator; the workload's own
+/// OpenSpec change and frozen contract are separate from the candidate's.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonInputs {
+    pub schema: u32,
+    /// B's own complete OpenSpec planning target.
+    pub specification: Specification,
+    /// B's own frozen experiment contract the planning receipt qualifies.
+    pub contract: ExperimentContract,
+    pub task: TaskInputs,
+    pub runtimes: RuntimeInputs,
+    /// The predeclared comparison policy file, fixed before any result.
+    pub policy: PathBuf,
+    pub acceptance: AcceptanceInputs,
+    /// Explicit effective client inputs the declared API-observed plan
+    /// observes; empty for a full-material qualification.
+    #[serde(default)]
+    pub observation_inputs: Vec<ClientInput>,
+}
+
+impl ComparisonInputs {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != COMPARISON_SCHEMA {
+            return Err(invalid(format!(
+                "comparison inputs declare schema {}; this controller reads schema {COMPARISON_SCHEMA}",
+                self.schema
+            )));
+        }
+        absolute_directory("the workload project", &self.specification.project)?;
+        absolute_directory(
+            "the workload planning root",
+            &self.specification.planning_root,
+        )?;
+        token("workload change", &self.specification.change, MAX_TOKEN)?;
+        if let Some(store) = &self.specification.store {
+            token("workload store", store, MAX_TOKEN)?;
+        }
+        self.contract.validate()?;
+        self.task.validate()?;
+        self.runtimes.validate()?;
+        if !self.policy.is_absolute() {
+            return Err(invalid(
+                "the comparison policy file must be an absolute path",
+            ));
+        }
+        self.acceptance.validate()?;
+        for input in &self.observation_inputs {
+            token("observed client input name", &input.name, MAX_TOKEN)?;
+            if !input.path.is_absolute() {
+                return Err(invalid("every observed client input path must be absolute"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The declared predeclared policy file parsed through its owner. A
+    /// missing, unreadable or invalid declaration blocks dependent work.
+    pub fn declared_policy(&self) -> io::Result<crate::improvement_policy::DeclaredComparison> {
+        let policy: ComparisonPolicy = read_json(&self.policy, MAX_RUN_SPEC_BYTES)?;
+        policy.declare()
+    }
+}
+
 /// The explicit local run inputs. Every field is supplied by the operator as
 /// private run data; nothing here is a checked-in endpoint or machine path.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -258,6 +460,11 @@ pub struct RunSpec {
     pub local_runner: Option<crate::outcome_qualification::LocalRunner>,
     /// The local qualification record produced by the qualification owner.
     pub qualification: Option<PathBuf>,
+    /// The explicit sequential baseline/candidate comparison inputs. Absent
+    /// means the run stops at `candidate-ready`; the comparison owner is not
+    /// engaged and no measured attempt is dispatched.
+    #[serde(default)]
+    pub comparison: Option<ComparisonInputs>,
     /// The stages this run's authority permits.
     pub publication_scope: Vec<PublicationStage>,
     /// The independent acceptance/oracle reference, outside candidate writes.
@@ -349,6 +556,26 @@ impl RunSpec {
             && !path.is_absolute()
         {
             return Err(invalid("the qualification record path must be absolute"));
+        }
+        if let Some(comparison) = &self.comparison {
+            comparison.validate()?;
+            if self.runner.is_none() {
+                return Err(invalid(
+                    "a declared comparison requires the runner profile that opens its visible conversations",
+                ));
+            }
+            if let Some(local) = &self.local_runner {
+                let client = &comparison.runtimes.client.runner;
+                if client.endpoint != local.endpoint || client.model != local.model {
+                    return Err(invalid(
+                        "the comparison client route must be the run's declared local runner: endpoint and model cannot differ",
+                    ));
+                }
+            } else {
+                return Err(invalid(
+                    "a declared comparison requires the explicit local runner it measures",
+                ));
+            }
         }
         let mut stages = self.publication_scope.clone();
         stages.sort_unstable();
@@ -627,8 +854,8 @@ impl Phase {
     }
 
     /// A phase that needs the comparison/runtime-preparation owners. This
-    /// controller slice never advances into one without a recorded effect.
-    /// `CandidateReady` is *not* listed: the controller's own validated
+    /// controller never advances into one without a recorded effect from that
+    /// owner. `CandidateReady` is *not* listed: the controller's own validated
     /// committed candidate reaches it, while every measured or activated
     /// phase still needs the comparison and activation owners.
     pub fn requires_comparison_owner(self) -> bool {
@@ -961,6 +1188,18 @@ pub enum EffectKind {
     /// One validated committed candidate implementation reached the retained
     /// candidate-ready state.
     ImplementationValidated,
+    /// The isolated baseline/candidate runtimes, frozen workload copies and
+    /// fresh homes were prepared and verified model-free.
+    ComparisonPrepared,
+    /// One measured arm completed and passed (or failed) the frozen
+    /// independent acceptance entry point.
+    ComparisonArmAccepted,
+    /// One measured arm was refused before its result entered the comparison;
+    /// the cause is recorded and the arm is never replayed automatically.
+    ComparisonArmRefused,
+    /// The frozen comparison policy produced one evidence-bound decision that
+    /// was published through the benefit-gate owner.
+    ComparisonDecisionRecorded,
     DispatchPrepared,
     DispatchAccepted,
     DispatchRefused,
@@ -1087,6 +1326,135 @@ impl CandidateState {
     }
 }
 
+/// One arm of a declared comparison.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComparisonArm {
+    Baseline,
+    Candidate,
+}
+
+impl ComparisonArm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Candidate => "candidate",
+        }
+    }
+
+    /// The measured attempt role that drives this arm.
+    pub fn role(self) -> AttemptRole {
+        match self {
+            Self::Baseline => AttemptRole::Baseline,
+            Self::Candidate => AttemptRole::Candidate,
+        }
+    }
+}
+
+/// The retained recovery state of one comparison arm. The prepared runtime
+/// receipt, the verified solution revision and the retained acceptance record
+/// are recovery data; the durable evidence lives in the run store files this
+/// state points at.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArmComparisonState {
+    /// The retained `ArmRuntime` receipt of this arm's installation.
+    #[serde(default)]
+    pub runtime: Option<PathBuf>,
+    /// The measured attempt recorded for this arm.
+    #[serde(default)]
+    pub attempt: Option<String>,
+    /// The independently verified committed solution revision.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// The retained real-task oracle record of this arm.
+    #[serde(default)]
+    pub oracle: Option<PathBuf>,
+    /// The oracle outcome, once the frozen entry point actually ran.
+    #[serde(default)]
+    pub accepted: Option<bool>,
+    /// The retained accounting row of this arm.
+    #[serde(default)]
+    pub row: Option<PathBuf>,
+    /// Why this arm produced no usable result; a refused arm is never
+    /// replayed automatically and the refusal stays visible.
+    #[serde(default)]
+    pub condition: Option<String>,
+    /// The prepared runtime label actually consumed.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The prepared immutable build this arm consumed.
+    #[serde(default)]
+    pub build: Option<PathBuf>,
+}
+
+/// The retained comparison recovery state: the frozen policy identity, the
+/// prepared bindings, the per-arm results and the published decision. It never
+/// becomes a decision ledger or a hypothesis journal; Beads keeps those.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonState {
+    pub schema: u32,
+    /// Digest of the predeclared policy; a changed declaration refuses reuse.
+    pub policy_digest: String,
+    /// The retained experiment bindings of the prepared comparison.
+    #[serde(default)]
+    pub bindings: Option<PathBuf>,
+    /// The retained workload OpenSpec planning receipt.
+    #[serde(default)]
+    pub planning: Option<PathBuf>,
+    /// The frozen acceptance workspace the oracle checks per arm.
+    #[serde(default)]
+    pub task_workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub baseline: ArmComparisonState,
+    #[serde(default)]
+    pub candidate: ArmComparisonState,
+    /// The retained authoritative outcome summary.
+    #[serde(default)]
+    pub report: Option<PathBuf>,
+    /// The retained policy evaluation.
+    #[serde(default)]
+    pub evaluation: Option<PathBuf>,
+    /// Locator of the published board decision.
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub prepared_ms: Option<u64>,
+}
+
+impl ComparisonState {
+    pub fn new(policy_digest: String) -> Self {
+        Self {
+            schema: COMPARISON_STATE_SCHEMA,
+            policy_digest,
+            bindings: None,
+            planning: None,
+            task_workspace: None,
+            baseline: ArmComparisonState::default(),
+            candidate: ArmComparisonState::default(),
+            report: None,
+            evaluation: None,
+            decision: None,
+            prepared_ms: None,
+        }
+    }
+
+    pub fn arm(&self, arm: ComparisonArm) -> &ArmComparisonState {
+        match arm {
+            ComparisonArm::Baseline => &self.baseline,
+            ComparisonArm::Candidate => &self.candidate,
+        }
+    }
+
+    pub fn arm_mut(&mut self, arm: ComparisonArm) -> &mut ArmComparisonState {
+        match arm {
+            ComparisonArm::Baseline => &mut self.baseline,
+            ComparisonArm::Candidate => &mut self.candidate,
+        }
+    }
+}
+
 /// The durable cursor: bounded recovery data referencing the board, planning
 /// and runtime identities. It never records a hypothesis decision.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1122,6 +1490,9 @@ pub struct Cursor {
     /// The hypothesis selected for planning/implementation in this run.
     #[serde(default)]
     pub candidate: Option<CandidateState>,
+    /// The declared sequential comparison and its retained recovery state.
+    #[serde(default)]
+    pub comparison: Option<ComparisonState>,
     pub updated_ms: u64,
 }
 
@@ -1146,6 +1517,7 @@ impl Cursor {
             selected_identity: None,
             intake: None,
             candidate: None,
+            comparison: None,
             updated_ms: now_ms(),
         }
     }
@@ -1410,6 +1782,11 @@ pub const CURSOR_FILE: &str = "cursor.json";
 pub const OWNER_FILE: &str = "owner.json";
 pub const VARIANTS_FILE: &str = "variants.json";
 pub const ASSIGNMENTS_DIR: &str = "assignments";
+/// The private comparison workspace: frozen copies, per-arm installations and
+/// retained acceptance evidence. It never holds hypothesis state.
+pub const COMPARISON_DIR: &str = "comparison";
+pub const COMPARISON_BINDINGS_FILE: &str = "bindings.json";
+pub const COMPARISON_PLANNING_FILE: &str = "planning.json";
 /// The stable lock file for the exclusive run-mutation guard. Every mutating
 /// operation acquires it *before* reading run state, so two commands can
 /// neither create duplicate run ownership nor overwrite each other's cursor
@@ -1551,6 +1928,22 @@ impl RunStore {
 
     pub fn variants_path(&self) -> PathBuf {
         self.root.join(VARIANTS_FILE)
+    }
+
+    pub fn comparison_dir(&self) -> PathBuf {
+        self.root.join(COMPARISON_DIR)
+    }
+
+    pub fn comparison_bindings_path(&self) -> PathBuf {
+        self.comparison_dir().join(COMPARISON_BINDINGS_FILE)
+    }
+
+    pub fn comparison_planning_path(&self) -> PathBuf {
+        self.comparison_dir().join(COMPARISON_PLANNING_FILE)
+    }
+
+    pub fn comparison_arm_dir(&self, arm: ComparisonArm) -> PathBuf {
+        self.comparison_dir().join(arm.as_str())
     }
 
     pub fn assignments_dir(&self) -> PathBuf {

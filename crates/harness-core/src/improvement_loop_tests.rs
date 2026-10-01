@@ -55,6 +55,7 @@ fn spec_fixture(root: &Path, name: &str) -> RunSpec {
         runner: None,
         local_runner: None,
         qualification: None,
+        comparison: None,
         publication_scope: vec![PublicationStage::Experiment],
         oracle: "outcome-oracle:private-request".to_owned(),
         removal: None,
@@ -1134,4 +1135,267 @@ fn evidence_root_must_be_absolute_when_declared() {
     assert!(spec.validate().is_ok());
     spec.evidence_root = None;
     assert!(spec.validate().is_ok());
+}
+
+/// One complete declared comparison over the synthetic fixture project: a
+/// runner, the explicit local runner, a qualification record, the workload's
+/// own planning target and the frozen acceptance request.
+fn comparison_spec(root: &Path, name: &str) -> RunSpec {
+    let mut spec = spec_fixture(root, name);
+    let project = root.join(format!("proj-{name}"));
+    let state = root.join("state");
+    fs::create_dir_all(state.join("builds")).unwrap();
+    for build in ["baseline-build", "candidate-build"] {
+        fs::create_dir_all(state.join("builds").join(build)).unwrap();
+    }
+    let task = root.join("task");
+    fs::create_dir_all(&task).unwrap();
+    let upstream = root.join("upstream.exe");
+    fs::write(&upstream, "client").unwrap();
+    let request = root.join("acceptance-request.json");
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "kind": "real-task",
+        "case_root": root.join("task-workspace"),
+        "task_contract_sha256": "a".repeat(64),
+        "oracle": {
+            "program": root.join("checker.exe"),
+            "program_sha256": "b".repeat(64),
+            "arguments": ["{workspace}"],
+            "inputs": {},
+        },
+        "timeout_seconds": 60,
+    }))
+    .unwrap();
+    fs::write(&request, &request_bytes).unwrap();
+    let policy = root.join("policy.json");
+    fs::write(&policy, "{}").unwrap();
+    let qualification = root.join("qualification.json");
+    fs::write(&qualification, "{}").unwrap();
+    spec.runner = Some(RunnerInputs {
+        profile: "ds".to_owned(),
+        model: None,
+        model_provider: None,
+        reasoning_effort: None,
+    });
+    spec.local_runner = Some(crate::outcome_qualification::LocalRunner {
+        endpoint: "http://127.0.0.1:45999/v1".to_owned(),
+        model: "fixture-glyph-1".to_owned(),
+        identity: crate::outcome_qualification::MaterialIdentity::default(),
+    });
+    spec.qualification = Some(qualification);
+    spec.comparison = Some(ComparisonInputs {
+        schema: COMPARISON_SCHEMA,
+        specification: crate::improvement_spec::Specification {
+            project: project.clone(),
+            change: "add-workload".to_owned(),
+            store: None,
+            planning_root: project,
+        },
+        contract: experiment(),
+        task: TaskInputs {
+            source: task,
+            revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            name: "workload-b".to_owned(),
+            writable_scope: vec!["crates/one".to_owned()],
+        },
+        runtimes: RuntimeInputs {
+            state: state.clone(),
+            baseline_build: state.join("builds/baseline-build"),
+            candidate_build: state.join("builds/candidate-build"),
+            baseline_label: "H".to_owned(),
+            candidate_label: "H+A".to_owned(),
+            upstream,
+            client: crate::improvement_runtime::ClientInputs {
+                runner: crate::outcome_qualification::LocalRunner {
+                    endpoint: "http://127.0.0.1:45999/v1".to_owned(),
+                    model: "fixture-glyph-1".to_owned(),
+                    identity: crate::outcome_qualification::MaterialIdentity::default(),
+                },
+                reasoning_effort: Some("low".to_owned()),
+                catalogue: None,
+                overlay: None,
+            },
+        },
+        policy,
+        acceptance: AcceptanceInputs {
+            request,
+            request_sha256: format!("{:x}", Sha256::digest(&request_bytes)),
+        },
+        observation_inputs: Vec::new(),
+    });
+    spec
+}
+
+#[test]
+fn comparison_inputs_are_validated_before_preparation() {
+    let root = fixture_root("comparison-inputs");
+    let spec = comparison_spec(root.path(), "comparison-inputs");
+    spec.validate()
+        .expect("complete comparison inputs validate");
+
+    // A comparison without the runner profile cannot open a visible
+    // conversation, and one without the local runner has no measured route.
+    let mut without_runner = spec.clone();
+    without_runner.runner = None;
+    assert!(without_runner.validate().is_err());
+    let mut without_local = spec.clone();
+    without_local.local_runner = None;
+    assert!(without_local.validate().is_err());
+
+    // The measured client route cannot silently differ from the declared
+    // local runner.
+    let mut rerouted = spec.clone();
+    rerouted
+        .comparison
+        .as_mut()
+        .unwrap()
+        .runtimes
+        .client
+        .runner
+        .model = "another-model".to_owned();
+    assert!(rerouted.validate().is_err());
+
+    let mutate = |f: &dyn Fn(&mut ComparisonInputs)| {
+        let mut changed = spec.clone();
+        f(changed.comparison.as_mut().unwrap());
+        changed
+    };
+    assert!(
+        mutate(&|c| c.task.writable_scope.clear())
+            .validate()
+            .is_err(),
+        "an empty workload scope has no writable task"
+    );
+    assert!(
+        mutate(&|c| c.task.revision = "not-hex".to_owned())
+            .validate()
+            .is_err()
+    );
+    assert!(
+        mutate(&|c| c.runtimes.candidate_label = c.runtimes.baseline_label.clone())
+            .validate()
+            .is_err(),
+        "arms must stay distinguishable"
+    );
+    assert!(
+        mutate(&|c| c.acceptance.request_sha256 = "nope".to_owned())
+            .validate()
+            .is_err()
+    );
+    assert!(
+        mutate(&|c| c.acceptance.request = PathBuf::from("relative.json"))
+            .validate()
+            .is_err()
+    );
+    assert!(
+        mutate(&|c| c.policy = PathBuf::from("policy.json"))
+            .validate()
+            .is_err(),
+        "the policy is an explicit absolute private input"
+    );
+    assert!(
+        mutate(&|c| c.runtimes.upstream = root.path().join("missing.exe"))
+            .validate()
+            .is_err()
+    );
+    assert!(
+        mutate(&|c| c.schema = COMPARISON_SCHEMA + 1)
+            .validate()
+            .is_err()
+    );
+
+    // A declared policy file that is not the owner's declaration is refused
+    // rather than reinterpreted.
+    assert!(spec.comparison.as_ref().unwrap().declared_policy().is_err());
+    let policy = crate::improvement_policy::ComparisonPolicy {
+        schema: 1,
+        objective: crate::improvement_policy::Objective::Time,
+        basis: crate::improvement_policy::Basis::Efficiency,
+        meaningful_effect_percent: Some(10.0),
+        tolerance_percent: 5.0,
+        require_acceptance: true,
+        task_mix: "one frozen task".to_owned(),
+        stopping: crate::improvement_policy::StoppingRule {
+            max_attempts_per_arm: 1,
+            required_units: 1,
+        },
+        repeated_selection: crate::improvement_policy::RepeatedSelection::Predeclared,
+        trade_off: None,
+        uncertainty: "unknown evidence stays inconclusive".to_owned(),
+        horizon_tasks: 1.0,
+        overhead: crate::improvement_policy::Overhead {
+            implementation_seconds: 1.0,
+            evaluation_seconds: 1.0,
+            maintenance_seconds_per_task: 0.0,
+        },
+    };
+    let policy_path = spec.comparison.as_ref().unwrap().policy.clone();
+    fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let declared = spec
+        .comparison
+        .as_ref()
+        .unwrap()
+        .declared_policy()
+        .expect("a complete owner declaration is accepted");
+    assert!(declared.digest_matches(&declared.digest));
+}
+
+#[test]
+fn comparison_state_round_trips_and_defaults_without_legacy_state() {
+    // A cursor written before the comparison owner knew its state stays
+    // readable: the new field defaults to absent.
+    let root = fixture_root("comparison-state");
+    let spec = comparison_spec(root.path(), "state");
+    let mut cursor = Cursor::new(
+        &spec.run,
+        "digest".to_owned(),
+        root.path().join("openspec"),
+        &spec.hypothesis_item,
+    );
+    assert!(cursor.comparison.is_none());
+    let mut state = ComparisonState::new("policy-digest".to_owned());
+    state.arm_mut(ComparisonArm::Baseline).accepted = Some(true);
+    state.arm_mut(ComparisonArm::Candidate).condition =
+        Some("wrong generation; not replayed".to_owned());
+    cursor.comparison = Some(state);
+    let bytes = serde_json::to_vec(&cursor).unwrap();
+    let parsed: Cursor = serde_json::from_slice(&bytes).unwrap();
+    let comparison = parsed.comparison.expect("comparison state round-trips");
+    assert_eq!(comparison.schema, COMPARISON_STATE_SCHEMA);
+    assert_eq!(comparison.policy_digest, "policy-digest");
+    assert_eq!(comparison.arm(ComparisonArm::Baseline).accepted, Some(true));
+    assert!(
+        comparison
+            .arm(ComparisonArm::Candidate)
+            .condition
+            .as_deref()
+            .unwrap()
+            .contains("not replayed")
+    );
+    assert_eq!(ComparisonArm::Baseline.role(), AttemptRole::Baseline);
+    assert_eq!(ComparisonArm::Candidate.role(), AttemptRole::Candidate);
+    assert_eq!(ComparisonArm::Candidate.as_str(), "candidate");
+
+    let legacy = serde_json::json!({
+        "schema": CURSOR_SCHEMA,
+        "run": spec.run,
+        "spec_digest": "digest",
+        "change_root": root.path().join("openspec"),
+        "phase": "candidate-ready",
+        "previous_phase": null,
+        "condition": null,
+        "hypothesis_item": spec.hypothesis_item,
+        "experiment": "exp-1",
+        "removal_frozen": null,
+        "attempts": [],
+        "effects": [],
+        "selected_variant": null,
+        "selected_runtime": null,
+        "selected_identity": null,
+        "updated_ms": 1,
+    });
+    let parsed: Cursor = serde_json::from_value(legacy).unwrap();
+    assert!(parsed.comparison.is_none());
+    assert!(parsed.intake.is_none());
 }

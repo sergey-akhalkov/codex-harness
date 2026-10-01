@@ -17,6 +17,8 @@
 //! committed candidate reaches the retained `candidate-ready` state.
 #![cfg(windows)]
 
+#[path = "improvement_comparison.rs"]
+mod improvement_comparison;
 #[path = "improvement_workflow.rs"]
 mod improvement_workflow;
 
@@ -38,7 +40,6 @@ use harness_core::improvement_loop::{
 };
 use harness_core::improvement_spec::OpenSpec;
 use harness_core::orchestration_config;
-use harness_core::outcome_qualification::Qualification;
 use serde_json::json;
 use std::{ffi::OsString, io, path::Path, path::PathBuf, time::Duration};
 
@@ -67,6 +68,17 @@ change must qualify before any implementation, and a validated committed
 candidate reaches candidate-ready. Each model conversation uses the visible
 owner; a missing evidence base records idle, a missing gate records blocked,
 and neither starts hidden model work.
+
+A run that declares the explicit comparison inputs also prepares and drives
+the sequential measured pair from candidate-ready: the workload's own OpenSpec
+change and the two frozen task copies are qualified, the prepared baseline and
+candidate runtimes are installed into fresh homes from the declared client
+inputs and verified, one visible baseline conversation and then one visible
+candidate conversation run the frozen workload, the unchanged supervisor's
+real-task oracle checks each committed solution, and the predeclared policy
+publishes an evidence-bound decision to the hypothesis card. Missing
+preparation, qualification or consumption proof prevents any model dispatch,
+and the published verdict never integrates, activates or publishes anything.
 
 status prints the recoverable phase cursor: current phase and condition, the
 hypothesis card, the qualified planning change, the effective runner binding,
@@ -98,6 +110,7 @@ The run inputs are strict schema 1 JSON: {\"schema\":1,\"run\":\"ID\",
 \"model\":null,\"model_provider\":null,\"reasoning_effort\":null},
 \"local_runner\":null,\"qualification\":null,
 \"evidence_root\":null,
+\"comparison\":null,
 \"publication_scope\":[\"experiment\"],\"oracle\":\"REFERENCE\",
 \"removal\":null}. Private run data stays outside tracked source: the run
 directory, the spec file and every retained receipt are local inputs.
@@ -326,80 +339,10 @@ fn surface(spec: &RunSpec) -> Surface {
 /// The qualification owner's refusal, when strict comparison inputs are
 /// missing or unqualified. It blocks measured arms, not bounded research.
 fn qualification_block(spec: &RunSpec) -> io::Result<Option<String>> {
-    if spec.local_runner.is_none() {
-        return Ok(None);
-    }
-    let Some(path) = &spec.qualification else {
-        return Ok(Some(
-            "no local qualification record path is declared".to_owned(),
-        ));
-    };
-    if !path.is_file() {
-        return Ok(Some(format!(
-            "the local qualification record is not available at {}",
-            path.display()
-        )));
-    }
-    let qualification: Qualification = match read_json(path, 256 * 1024) {
-        Ok(qualification) => qualification,
-        Err(error) => {
-            return Ok(Some(format!(
-                "the local qualification record is unreadable: {error}"
-            )));
-        }
-    };
-    if qualification.qualified() {
-        return Ok(None);
-    }
-    let mut parts = Vec::new();
-    if !qualification.missing_identity.is_empty() {
-        parts.push(format!(
-            "missing material identity: {}",
-            qualification.missing_identity.join(", ")
-        ));
-    }
-    if !qualification.unfinished_attempts.is_empty() {
-        parts.push(format!(
-            "unfinished attempts: {}",
-            qualification.unfinished_attempts.join(", ")
-        ));
-    }
-    if !qualification.unverified_attempts.is_empty() {
-        parts.push(format!(
-            "unverified model metadata: {}",
-            qualification.unverified_attempts.join(", ")
-        ));
-    }
-    if !qualification.tool_exchange_missing.is_empty() {
-        parts.push(format!(
-            "missing tool exchange: {}",
-            qualification.tool_exchange_missing.join(", ")
-        ));
-    }
-    if !qualification.runner_mismatch.is_empty() {
-        parts.push("the recorded runner identity drifted across attempts".to_owned());
-    }
-    if !qualification.missing_outputs.is_empty() {
-        parts.push(format!(
-            "missing required outputs: {}",
-            qualification.missing_outputs.join(", ")
-        ));
-    }
-    if !qualification.divergent_outputs.is_empty() {
-        parts.push(format!(
-            "divergent outputs: {}",
-            qualification.divergent_outputs.join(", ")
-        ));
-    }
-    if parts.is_empty() {
-        parts.push("the qualification is blocked".to_owned());
-    }
-    Ok(Some(format!(
-        "{} ({} of {} repeats observed)",
-        parts.join("; "),
-        qualification.observed_repeats,
-        qualification.required_repeats
-    )))
+    // The qualification owner's own validation: full-material records are
+    // consumed unchanged, API-observed records are checked for internal
+    // consistency and required declared facts before any dependent dispatch.
+    improvement_comparison::qualification_block(spec)
 }
 
 /// A surface loss recorded without a later explicit stop suspends new model
@@ -496,7 +439,7 @@ fn stage_role(cursor: &Cursor) -> AttemptRole {
 }
 
 fn pending_phases() -> &'static str {
-    "baseline-attempt -> candidate-attempt -> acceptance -> decision-recorded -> activation-confirmed (candidate-ready is reached by the controller's own planning/implementation path; the sequential measured-pair driver and frozen runtime preparation are separate owners and stay pending until an actual effect exists)"
+    "baseline-attempt -> candidate-attempt -> acceptance -> decision-recorded -> activation-confirmed (candidate-ready is reached by the controller's own planning/implementation path; a run that declares the explicit comparison inputs is driven through the measured pair and the evidence-bound decision, while integration, activation and live publication stay with their separate owners)"
 }
 
 fn next_action(cursor: &Cursor, gate: &DispatchGate, removal: &Option<RemovalGate>) -> String {
@@ -511,6 +454,20 @@ fn next_action(cursor: &Cursor, gate: &DispatchGate, removal: &Option<RemovalGat
                 .as_deref()
                 .unwrap_or("no grounded candidate remains")
         );
+    }
+    if let Some(decision) = cursor
+        .comparison
+        .as_ref()
+        .and_then(|state| state.decision.as_deref())
+    {
+        return match decision.strip_prefix("unrecorded:") {
+            Some(rest) => format!(
+                "the measured comparison retained its verdict without a board decision ({rest}); the retained accounting records the failure and integration or activation stays with their separate owners"
+            ),
+            None => format!(
+                "the evidence-bound decision is published ({decision}); integration, baseline activation and live publication remain separate owners"
+            ),
+        };
     }
     let base = match gate {
         DispatchGate::Blocked { reason } => format!("resolve before dispatch: {reason}"),
@@ -735,6 +692,36 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
         "selected_identity": run.cursor.selected_identity,
         "stage": stage.as_str(),
         "evidence_root": run.spec.evidence_root.as_ref().map(|path| path.display().to_string()),
+        "comparison": run.cursor.comparison.as_ref().map(|state| json!({
+            "declared": run.spec.comparison.is_some(),
+            "policy_digest": state.policy_digest,
+            "bindings": state.bindings.as_ref().map(|path| path.display().to_string()),
+            "planning": state.planning.as_ref().map(|path| path.display().to_string()),
+            "task_workspace": state.task_workspace.as_ref().map(|path| path.display().to_string()),
+            "baseline": {
+                "label": state.baseline.label,
+                "build": state.baseline.build.as_ref().map(|path| path.display().to_string()),
+                "runtime": state.baseline.runtime.as_ref().map(|path| path.display().to_string()),
+                "attempt": state.baseline.attempt,
+                "revision": state.baseline.revision,
+                "oracle": state.baseline.oracle.as_ref().map(|path| path.display().to_string()),
+                "accepted": state.baseline.accepted,
+                "condition": state.baseline.condition,
+            },
+            "candidate": {
+                "label": state.candidate.label,
+                "build": state.candidate.build.as_ref().map(|path| path.display().to_string()),
+                "runtime": state.candidate.runtime.as_ref().map(|path| path.display().to_string()),
+                "attempt": state.candidate.attempt,
+                "revision": state.candidate.revision,
+                "oracle": state.candidate.oracle.as_ref().map(|path| path.display().to_string()),
+                "accepted": state.candidate.accepted,
+                "condition": state.candidate.condition,
+            },
+            "report": state.report.as_ref().map(|path| path.display().to_string()),
+            "evaluation": state.evaluation.as_ref().map(|path| path.display().to_string()),
+            "decision": state.decision,
+        })),
         "intake": run.cursor.intake.as_ref().map(|intake| json!({
             "result_sha256": intake.result_sha256,
             "evidence_digest": intake.evidence_digest,
@@ -886,6 +873,48 @@ fn print_report(run: &Run) -> io::Result<()> {
         None => println!("candidate: none selected"),
     }
     println!("attempts:\n{}", print_attempts(&run.cursor));
+    match &run.cursor.comparison {
+        Some(state) => {
+            println!(
+                "comparison: policy={} baseline={} accepted={} candidate={} accepted={}",
+                &state.policy_digest[..16.min(state.policy_digest.len())],
+                state.baseline.label.as_deref().unwrap_or("baseline"),
+                match state.baseline.accepted {
+                    Some(true) => "accepted",
+                    Some(false) => "rejected",
+                    None => "pending",
+                },
+                state.candidate.label.as_deref().unwrap_or("candidate"),
+                match state.candidate.accepted {
+                    Some(true) => "accepted",
+                    Some(false) => "rejected",
+                    None => "pending",
+                },
+            );
+            for (name, arm) in [
+                ("baseline", &state.baseline),
+                ("candidate", &state.candidate),
+            ] {
+                if let Some(condition) = &arm.condition {
+                    println!("  {name} condition: {condition}");
+                }
+                if let Some(revision) = &arm.revision {
+                    println!("  {name} solution: {revision}");
+                }
+            }
+            if let Some(decision) = &state.decision {
+                println!("  decision: {decision}");
+            }
+        }
+        None => println!(
+            "comparison: {}",
+            if run.spec.comparison.is_some() {
+                "declared (preparation has not run yet or is blocked)"
+            } else {
+                "not declared; the run stops at candidate-ready"
+            }
+        ),
+    }
     println!(
         "variants: {}",
         if run.store.variants_path().is_file() {

@@ -65,6 +65,9 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
     if let Some(candidate) = run.cursor.candidate.clone() {
         if candidate.is_ready() {
             retain_candidate_ready(run, &candidate, &mut notes)?;
+            if run.spec.comparison.is_some() {
+                super::improvement_comparison::advance(run, &mut notes)?;
+            }
             return Ok(notes);
         }
         advance_candidate(run, &candidate, &mut notes)?;
@@ -76,6 +79,9 @@ pub(super) fn advance(run: &mut Run) -> io::Result<Vec<String>> {
             advance_candidate(run, &candidate, &mut notes)?;
         } else {
             retain_candidate_ready(run, &candidate, &mut notes)?;
+            if run.spec.comparison.is_some() {
+                super::improvement_comparison::advance(run, &mut notes)?;
+            }
         }
     }
     Ok(notes)
