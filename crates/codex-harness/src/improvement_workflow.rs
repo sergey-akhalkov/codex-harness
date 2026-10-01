@@ -1292,9 +1292,16 @@ fn board_records_same_allocation(
         )
     })?;
     for record in recorded_candidate_allocations(&comments, &candidate.hypothesis)? {
+        // ensure_allocation publishes the checkout base. ensure_planning then
+        // commits the scaffold and advances the cursor revision without
+        // republishing. That older record is history of this allocation, not a
+        // current competing claim, and it must not veto recovery. A different
+        // branch, base, or revision still does.
+        let same_allocation_revision =
+            record.revision == checkout.revision || record.revision == checkout.base;
         if record.branch != checkout.branch
             || record.base != checkout.base
-            || record.revision != checkout.revision
+            || !same_allocation_revision
         {
             return Err(format!(
                 "the board records branch {} base {} revision {} but the cursor records branch {} base {} revision {}; the destination was not adopted",

@@ -2271,8 +2271,10 @@ fn comments_record(comments: &str, path: &Path) -> bool {
     comments.contains(text.as_ref()) || comments.contains(&text.replace('\\', "\\\\"))
 }
 
-/// The Git move can finish before the board publication and cursor save. Resume
-/// must adopt only that exact registered identity, and must leave every
+/// The Git move can finish before the board publication and cursor save.
+/// Allocation has already published the pre-scaffold base revision; planning
+/// advanced the cursor to the scaffold commit without republishing. Resume
+/// must adopt that registered scaffold identity, and must leave every
 /// ambiguous state unmodified without replaying a model attempt.
 #[test]
 fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
@@ -2369,7 +2371,7 @@ fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
         "--base",
         &base,
         "--revision",
-        &scaffold_revision,
+        &base,
         "--worktree",
         legacy.to_str().unwrap(),
     ]);
@@ -2377,6 +2379,15 @@ fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
         recorded.status.success(),
         "pre-move board record: {}",
         text(&recorded)
+    );
+    let allocation_record = fixture.bd_comments(&card);
+    assert!(
+        allocation_record.contains(&format!("revision={base} ")),
+        "allocation publishes the pre-scaffold base revision: {allocation_record}"
+    );
+    assert!(
+        !allocation_record.contains(&format!("revision={scaffold_revision}")),
+        "the board must still be the allocation publication, not the scaffold revision: {allocation_record}"
     );
     move_registered_worktree(&fixture.proj, &legacy, &destination);
     assert!(
@@ -2635,7 +2646,15 @@ fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
         "the pre-move board identity disappeared: {comments}"
     );
     assert!(
+        comments.contains(&format!("revision={base} ")),
+        "recovery rewrote the allocation-time board record: {comments}"
+    );
+    assert!(
         comments_record(&comments, &destination),
         "the board was not repaired through its owner: {comments}"
+    );
+    assert!(
+        comments.contains(&format!("revision={scaffold_revision} ")),
+        "recovery did not publish the preserved scaffold revision: {comments}"
     );
 }
