@@ -17,6 +17,10 @@
 //! The `watch-oracle` first argument runs the candidate-independent
 //! acceptance for the finalized `executor watch` contract instead of a
 //! fixture mode; see `harness_executor_fixture/watch_oracle.rs`.
+//! `claim-oracle` is the candidate-independent acceptance for exclusive
+//! dispatch claims; see `harness_executor_fixture/claim_oracle.rs`.
+//! `claim-oracle-cleanup` exercises that checker's capture and termination
+//! helpers. It is not a claim-oracle case and does not broaden the checker.
 
 use serde_json::json;
 use std::{
@@ -28,6 +32,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "harness_executor_fixture/claim_oracle.rs"]
+mod claim_oracle;
 #[path = "harness_executor_fixture/control_fixture.rs"]
 mod control_fixture;
 #[path = "harness_executor_fixture/watch_oracle.rs"]
@@ -37,13 +43,43 @@ const DEFAULT_SESSION: &str = "01a0c719-f4d4-7880-a9d2-1a96ee0f23f4";
 const FINAL_MESSAGE: &str =
     "FIXTURE_OUTCOME_DONE\nremaining: none\nchecks: fixture event stream verified";
 
+fn claim_oracle_git_stand_in() -> bool {
+    if env::var_os("HARNESS_CLAIM_ORACLE_GIT_REAL").is_none() {
+        return false;
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("git.exe") || name.eq_ignore_ascii_case("git")
+        })
+}
+
 fn main() -> io::Result<()> {
+    // Set only on the checker's gated `git` stand-in. The same image is also
+    // the model-free launcher, and that child inherits the gate environment,
+    // so only an invocation whose file name is git forwards the real git.
+    if claim_oracle_git_stand_in() {
+        return exit(claim_oracle::forward_git()?);
+    }
     // The acceptance checker owns its own arguments and never acts as a
     // launcher double, whichever fixture environment it inherited.
     let mut args = env::args_os().skip(1);
-    if args.next().is_some_and(|arg| arg == "watch-oracle") {
+    let first = args.next();
+    if first.as_ref().is_some_and(|arg| arg == "watch-oracle") {
         let rest: Vec<_> = args.collect();
         return exit(watch_oracle::run(&rest)?);
+    }
+    if first.as_ref().is_some_and(|arg| arg == "claim-oracle") {
+        let rest: Vec<_> = args.collect();
+        return exit(claim_oracle::run(&rest)?);
+    }
+    if first
+        .as_ref()
+        .is_some_and(|arg| arg == "claim-oracle-cleanup")
+    {
+        let rest: Vec<_> = args.collect();
+        return exit(claim_oracle::prove_cleanup(&rest)?);
     }
     // The ordinary control route spawns the installed launcher as
     // `app-server --listen ws://127.0.0.1:PORT ...`; this fixture serves that
@@ -56,6 +92,14 @@ fn main() -> io::Result<()> {
     {
         let rest: Vec<_> = env::args_os().skip(2).collect();
         return exit(control_fixture::run_app_server(&rest)?);
+    }
+    // Claim-oracle handoff holds the conversation open until the checker
+    // releases it. It is not a Codex TUI and does not replace control-app-server.
+    if env::var("HARNESS_EXECUTOR_FIXTURE_MODE").is_ok_and(|mode| mode == claim_oracle::HOST_MODE)
+        && env::args().nth(1).is_some_and(|arg| arg == "app-server")
+    {
+        let rest: Vec<_> = env::args_os().skip(2).collect();
+        return exit(claim_oracle::serve_held_app_server(&rest)?);
     }
     // The installed-launcher shell preflight is a model-free diagnostic; the
     // fixture answers it so receipts without a recorded shell still exercise
