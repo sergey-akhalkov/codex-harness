@@ -1,5 +1,5 @@
 //! Native cancellable anonymous-pipe I/O. Peer handles stay in the test.
-//! cargo test --locked -p harness-core --test cancellable_pipe -- --test-threads=1 --nocapture
+//! cargo test --locked -p harness-core --test integration cancellable_pipe:: -- --test-threads=1 --nocapture
 #![cfg(windows)]
 
 use harness_core::cancellable_pipe::{

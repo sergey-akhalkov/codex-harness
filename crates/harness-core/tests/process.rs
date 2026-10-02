@@ -1,6 +1,6 @@
 //! Native acceptance. Build the workspace fixture first:
 //! cargo build --locked -p codex-harness --bin harness-process-fixture
-//! cargo test --locked -p harness-core --test process -- --test-threads=1 --nocapture
+//! cargo test --locked -p harness-core --test integration process:: -- --test-threads=1 --nocapture
 //! HARNESS_PROCESS_FIXTURE may select an explicitly built fixture executable.
 //! Artifacts are retained under the printed owned temporary directories.
 
@@ -1380,8 +1380,10 @@ mod native {
     }
 
     fn spawn_controller(account: &Path, ready: &Path, release: &Path, stderr: &Path) -> Child {
+        // The consolidated target prefixes this module path; the child must
+        // still run exactly the controller case below.
         Command::new(std::env::current_exe().unwrap())
-            .arg("native::shared_cpu_budget_controller")
+            .arg("process::native::shared_cpu_budget_controller")
             .arg("--exact")
             .arg("--test-threads=1")
             .env("HARNESS_SHARED_CPU_CONTROLLER", account)

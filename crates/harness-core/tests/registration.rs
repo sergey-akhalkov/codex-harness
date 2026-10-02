@@ -976,7 +976,8 @@ fn interrupted_registration_process_is_recoverable() {
             .args([
                 "--ignored",
                 "--exact",
-                "registration_process_fixture",
+                // The consolidated target prefixes this module path.
+                "registration::registration_process_fixture",
                 "--nocapture",
             ])
             .env("HARNESS_REGISTRATION_PROCESS_ROOT", root)
