@@ -275,6 +275,14 @@ Spawn, resume and restart present the managed conversation in the native Codex T
 
 The host owns one app-server child in a Windows Job. Startup, identity, observation and receipt writes fail closed; abnormal host death reaps the owned child tree, while ordinary completion preserves unrelated background work. Losing the only frontend suspends dispatch, but an unfocused tab does not. Receipt writes are locked and atomic. After the result is persisted the owned frontend/backend end and the terminal closes; cleanup failures name survivors without changing the outcome. Closure is not acceptance, merge or release, and an unresolved reply keeps the surface open.
 
+The frontend relay drains ready traffic in both directions and waits only while
+both are idle. A quiet user does not throttle streamed progress or heartbeat
+traffic. A frontend reconnect attaches to the running conversation without
+replaying the assignment. A stalled or reconnecting TUI alone does not prove
+the executor stopped: use its receipt/watch result before choosing recovery.
+Installing a relay fix applies to new hosts; already running hosts keep their
+loaded binary and should not be interrupted merely to update presentation.
+
 Wait through the record, never model polling or rollout searches:
 
 ```powershell

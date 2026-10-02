@@ -2,6 +2,9 @@
 #![cfg(windows)]
 #[path = "fixtures/control_responses.rs"]
 mod control_responses;
+#[path = "../src/executor_warning.rs"]
+#[allow(dead_code)] // This native contract exercises the relay; queue APIs have their own target.
+mod executor_warning;
 
 use harness_core::{
     broker_state::BrokerRoot,
@@ -330,7 +333,8 @@ fn native_two_clients_reconnect_tool_result_and_tui() {
     assert_eq!(spawned["params"]["threadId"], parent, "{spawned}");
     let thread = spawned["params"]["item"]["agentThreadId"].as_str().unwrap();
     assert_ne!(thread, parent);
-    let mut second = Client::connect(port, &token, root, "second");
+    let mut relay = executor_warning::Relay::start(port, &token, thread).unwrap();
+    let mut second = Client::connect(relay.port(), &token, root, "second");
     let resumed = second.request("thread/resume", json!({"threadId":thread}));
     assert_eq!(resumed["thread"]["id"], thread);
     assert_eq!(resumed["thread"]["parentThreadId"], parent);
@@ -365,7 +369,7 @@ fn native_two_clients_reconnect_tool_result_and_tui() {
         value["method"] == "thread/goal/updated" && value["params"]["threadId"] == parent
     });
     drop(first);
-    let mut third = Client::connect(port, &token, root, "reconnected");
+    let mut third = Client::connect(relay.port(), &token, root, "reconnected");
     let reconnected = third.request("thread/resume", json!({"threadId":thread}));
     assert_eq!(reconnected["thread"]["status"]["type"], "active");
     for client in [&mut second, &mut third] {
@@ -419,7 +423,7 @@ fn native_two_clients_reconnect_tool_result_and_tui() {
     let mut tui = command(&exe, &home, &workspace);
     tui.args = vec![
         "--remote".into(),
-        format!("ws://127.0.0.1:{port}").into(),
+        format!("ws://127.0.0.1:{}", relay.port()).into(),
         "--remote-auth-token-env".into(),
         "HARNESS_CONTROL_TOKEN".into(),
         "--no-alt-screen".into(),
@@ -444,6 +448,7 @@ fn native_two_clients_reconnect_tool_result_and_tui() {
     drop(session);
     drop(third);
     drop(second);
+    relay.close();
     drop(job);
 }
 struct NativeFixture {

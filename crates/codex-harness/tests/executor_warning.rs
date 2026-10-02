@@ -623,6 +623,129 @@ fn a_missing_or_wrong_capability_token_is_refused_at_the_handshake() {
     relay.close();
 }
 
+/// A quiet user must not impose one idle read timeout on every progress event.
+/// Run twice through the same relay to cover native frontend reconnect as well.
+#[test]
+fn unsolicited_bursts_and_heartbeats_survive_frontend_reconnect() {
+    const COUNT: usize = 256;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        for generation in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            stream.set_write_timeout(Some(WAIT)).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            for index in 0..COUNT {
+                socket
+                    .send(Message::Text(format!("{generation}:{index}").into()))
+                    .unwrap();
+            }
+            let payload = format!("heartbeat-{generation}");
+            socket
+                .send(Message::Ping(payload.clone().into_bytes().into()))
+                .unwrap();
+            loop {
+                match socket.read().unwrap() {
+                    Message::Pong(bytes) if bytes.as_ref() == payload.as_bytes() => break,
+                    Message::Close(_) => panic!("frontend closed before heartbeat"),
+                    _ => {}
+                }
+            }
+            socket
+                .send(Message::Text(format!("alive-{generation}").into()))
+                .unwrap();
+            // Close only this attachment; the relay remains available.
+            let _ = socket.close(None);
+        }
+    });
+    let mut relay = Relay::start(port, TOKEN, THREAD).unwrap();
+    for generation in 0..2 {
+        let mut frontend = Frontend::attach(relay.port(), TOKEN);
+        let started = Instant::now();
+        for index in 0..COUNT {
+            assert_eq!(
+                frontend.receive(WAIT).text(),
+                format!("{generation}:{index}")
+            );
+        }
+        assert_eq!(frontend.receive(WAIT).text(), format!("alive-{generation}"));
+        let elapsed = started.elapsed();
+        eprintln!("generation {generation}: {COUNT} ordered events and heartbeat in {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "idle frontend throttled progress: {elapsed:?}"
+        );
+        frontend.close();
+    }
+    relay.close();
+    server.join().unwrap();
+}
+
+/// An app-server scheduled later than one idle poll still has the full
+/// connection deadline. This matters when reconnecting under local CPU load.
+#[test]
+fn upstream_handshake_uses_connection_bound_instead_of_idle_poll() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        stream.set_write_timeout(Some(WAIT)).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let mut socket = tungstenite::accept(stream).unwrap();
+        socket
+            .send(Message::Text("ready-after-delayed-handshake".into()))
+            .unwrap();
+    });
+    let mut relay = Relay::start(port, TOKEN, THREAD).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+    assert_eq!(
+        frontend.receive(WAIT).text(),
+        "ready-after-delayed-handshake"
+    );
+    frontend.close();
+    relay.close();
+    server.join().unwrap();
+}
+
+#[test]
+fn frontend_request_burst_does_not_wait_for_server_output() {
+    const COUNT: usize = 256;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        stream.set_write_timeout(Some(WAIT)).unwrap();
+        let mut socket = tungstenite::accept(stream).unwrap();
+        for index in 0..COUNT {
+            assert_eq!(
+                socket.read().unwrap().into_text().unwrap(),
+                index.to_string()
+            );
+        }
+        socket.send(Message::Text("all-received".into())).unwrap();
+    });
+    let mut relay = Relay::start(port, TOKEN, THREAD).unwrap();
+    let mut frontend = Frontend::attach(relay.port(), TOKEN);
+    let started = Instant::now();
+    for index in 0..COUNT {
+        frontend.send_text(&index.to_string());
+    }
+    assert_eq!(
+        frontend.receive(Duration::from_secs(3)).text(),
+        "all-received"
+    );
+    eprintln!(
+        "{COUNT} requests reached idle server in {:?}",
+        started.elapsed()
+    );
+    frontend.close();
+    relay.close();
+    server.join().unwrap();
+}
+
 #[test]
 fn forwarding_preserves_bytes_in_both_directions() {
     let echo = Echo::start();

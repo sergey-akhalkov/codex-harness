@@ -55,9 +55,8 @@ const WARNING_THREAD: &str = "threadId";
 
 /// Bound on the relay's upstream connect and on one socket write.
 const WRITE: Duration = Duration::from_secs(5);
-/// Read timeout of one relay step. It bounds both how long an idle step waits
-/// and how long relay shutdown waits for a session.
-const POLL: Duration = Duration::from_millis(50);
+/// Wait only when both relay directions are idle; never delay ready traffic.
+const POLL: Duration = Duration::from_millis(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// Bound on waiting for relayed sessions to end after the listener stopped.
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
@@ -627,10 +626,9 @@ impl Transport {
     // response type; a refused handshake cannot return a smaller one.
     #[allow(clippy::result_large_err)]
     fn serve(&self, stream: TcpStream) {
-        // A stream accepted from the nonblocking listener inherits that mode on
-        // Windows; the handshake needs a bounded blocking stream. The handshake
-        // gets the write bound, and the relayed session tightens to its own
-        // read poll so a shutdown never waits on an idle frontend.
+        // Windows accepted streams inherit the listener's nonblocking mode.
+        // Handshakes and writes use a bounded blocking stream; only reads in
+        // the relay loop are nonblocking.
         if stream.set_nonblocking(false).is_err()
             || stream.set_read_timeout(Some(WRITE)).is_err()
             || stream.set_write_timeout(Some(WRITE)).is_err()
@@ -644,13 +642,9 @@ impl Transport {
             Some(config()),
         ) {
             Ok(frontend) => frontend,
-            // An invalid or missing capability token is refused at the
-            // handshake, before the app-server is touched.
+            // Refuse invalid capabilities before touching the app-server.
             Err(_) => return,
         };
-        if frontend.get_mut().set_read_timeout(Some(POLL)).is_err() {
-            return;
-        }
         let mut upstream = match connect_upstream(self.upstream_port, &self.token) {
             Ok(upstream) => upstream,
             Err(_) => {
@@ -660,8 +654,10 @@ impl Transport {
         };
         let mut frontend_state = FrontendState::default();
         while !self.stop.load(Ordering::SeqCst) {
-            match frontend.read() {
+            let mut active = false;
+            match read_ready(&mut frontend) {
                 Ok(message) => {
+                    active = true;
                     observe_request(&message, &self.thread_id, &mut frontend_state.awaiting);
                     if upstream.send(message).is_err() {
                         break;
@@ -670,8 +666,9 @@ impl Transport {
                 Err(error) if would_block(&error) => {}
                 Err(_) => break,
             }
-            match upstream.read() {
+            match read_ready(&mut upstream) {
                 Ok(message) => {
+                    active = true;
                     observe_response(&message, &mut frontend_state);
                     if frontend.send(message).is_err() {
                         break;
@@ -680,9 +677,8 @@ impl Transport {
                 Err(error) if would_block(&error) => {}
                 Err(_) => break,
             }
-            // The exact thread exists on this connection by now, so a queued
-            // diagnostic is appended here: after the record that initialized
-            // the thread and before anything read later from the app-server.
+            // Append warnings after exact-thread initialization and before
+            // later upstream records, preserving the existing delivery state.
             if frontend_state.initialized {
                 deliver(
                     &mut frontend,
@@ -690,6 +686,11 @@ impl Transport {
                     &self.thread_id,
                     &mut frontend_state.buffered,
                 );
+            }
+            // A quiet peer must never impose a timeout on each event from the
+            // busy peer. Alternate ready reads fairly; sleep only when idle.
+            if !active {
+                thread::sleep(POLL);
             }
         }
         let _ = frontend.close(None);
@@ -762,10 +763,20 @@ fn capability_token(token: &str) -> bool {
     token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
+/// Keep incomplete frames in tungstenite while probing for ready traffic.
+/// Restore blocking mode even on read failure: send/flush must retain WRITE's
+/// bounded completion semantics, including partially buffered warning writes.
+fn read_ready(socket: &mut WebSocket<TcpStream>) -> Result<Message, WsError> {
+    socket.get_mut().set_nonblocking(true)?;
+    let result = socket.read();
+    socket.get_mut().set_nonblocking(false)?;
+    result
+}
+
 fn connect_upstream(port: u16, token: &str) -> io::Result<WebSocket<TcpStream>> {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let stream = TcpStream::connect_timeout(&address, WRITE)?;
-    stream.set_read_timeout(Some(POLL))?;
+    stream.set_read_timeout(Some(WRITE))?;
     stream.set_write_timeout(Some(WRITE))?;
     let mut request = format!("ws://{address}")
         .into_client_request()

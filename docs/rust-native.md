@@ -54,6 +54,55 @@ codex-harness heavy -- cargo test --workspace --locked --jobs 1 -- --test-thread
 cargo run -p codex-harness --bin harness-source-check -- --root .
 ```
 
+### Development profiles and build storage
+
+Ordinary `dev` and `test` builds use source-location debug information for
+workspace members and omit dependency debug information. Incremental reuse,
+debug assertions and overflow checks retain their usual development settings.
+For a debugger session needing variables and dependency types, select the
+separate profile:
+
+```powershell
+codex-harness heavy -- cargo build --locked -p harness-core --profile debugging --jobs 1
+```
+
+This creates `target/debugging`; both workspace and dependency compilation use
+full debug information. Returning to ordinary Cargo commands reuses the compact
+`target/debug` artifacts. The release profile is unchanged.
+
+A matched Windows MSVC/Rust 1.98.1 comparison on the real `harness-core`
+`config_file` integration target, under the same heavy budget and `--jobs 1`,
+gave the following scoped results. Fresh target roots were used for each arm;
+the edit changed one test fixture value, then restored the original bytes.
+
+| Workload or retained output | Previous full-debug default | Compact default |
+| --- | ---: | ---: |
+| Cold test compilation, heavy payload | 126.79 s | 99.36 s |
+| Unchanged compile, median of three payloads | 0.182 s | 0.182 s |
+| Test edit, rebuild and four tests | 2.054 s | 1.056 s |
+| Logical artifact size after the same edit | 1.223 GiB | 0.766 GiB |
+| PDB files within that total | 121.9 MiB | 52.8 MiB |
+| Cold peak job memory | 1.64 GiB | 1.39 GiB |
+
+This is one cold pair and a small warm sample, not a whole-workspace speedup
+claim. Queue waiting is excluded from payload times; it can dominate elapsed
+time while another admitted command runs. Both arms passed the same four tests.
+A controlled panic verified a source-location stack frame under the compact
+profile, followed by restoration and a passing run. Verbose compilation of the
+debugging profile verified `-C debuginfo=2` for both the workspace library and a
+registry dependency.
+
+Keep the active development root warm. Inspect effective target and intermediate
+build directories, including local Cargo configuration, before estimating disk
+usage. At worktree retirement or actual disk pressure, resolve the exact owned
+root, check running compiler/test/executable use and retained evidence, then
+preview a scoped `cargo clean --dry-run` before applying it. `--profile dev`
+retires old development artifacts without selecting nested independent target
+roots. Preserve unfinished worktrees and uncertain ownership. Cargo's global
+download-cache GC does not collect target artifacts; repeatedly cleaning the
+active root trades disk space for a new cold build. The portable diagnosis and
+comparison procedure belongs to [cargo-fast](../.agents/skills/cargo-fast/SKILL.md).
+
 ### Development feedback without a publication build
 
 The installed OpenSpec planning prerequisite is exercised without model calls:
@@ -569,6 +618,22 @@ receipt's `diagnosticDelivery` records `native-sent`, `undelivered` or
 opened the viewer, and the compatibility fixture renderer records
 `no-native-consumer` instead of claiming native warning presentation.
 
+The same target checks unsolicited bursts in both directions, heartbeat
+delivery and a second frontend connection through the same relay. On Windows
+with Rust 1.98.1, the old 50 ms idle-peer read per event made a 256-event burst
+miss the fixture's 10-second heartbeat deadline; the corrected relay delivered
+the ordered burst and heartbeat in 15-18 ms. These are local fixture results,
+not provider latency guarantees. Partial frames stay in the WebSocket reader,
+and writes retain their five-second bound. The native frontend initialization
+check also passed against Codex 0.159.3.
+
+After immutable deployment, the installed manager also passed
+`installed_native_frontend_shows_the_assignment_and_watch_keeps_the_result`
+from outside this checkout with Codex 0.159.3. That check exercises the host,
+native TUI tool/final visibility, one tool effect and the persisted watch
+result using local canned Responses. Supply `HARNESS_OBSERVATION_MANAGER_EXE`
+and `HARNESS_CONTROL_CODEX_EXE` to select those installed artifacts explicitly.
+
 ## Bounded token reports
 
 Use `token-audit report --format text` and `token-audit findings --format text`
@@ -712,6 +777,11 @@ schema, request/event evidence and terminal output in the printed private root.
 It exercises a native child assignment, one actual tool mutation, two-client
 event delivery, reconnect while the child remains active, final-result retrieval
 and visibility in the native TUI. The mutation must occur exactly once.
+
+The observing/reconnected clients and native TUI now use the executor frontend
+relay. This complete path passed on Codex 0.159.3 with the relay correction;
+the earlier direct connection did not cover relay throughput. No controlled
+0.157.1 versus 0.159.3 comparison establishes an upstream regression.
 
 Verified on Codex 0.154.0: the app-server exposes child identities through
 `subAgentActivity.agentThreadId`, with `parentThreadId` and `sessionId` available
