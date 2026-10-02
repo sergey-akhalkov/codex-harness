@@ -19,6 +19,8 @@ Match the command to the current question; do not run a fixed fmt/check/clippy/t
 - Do edits span members or a shared type? Widen `-p` to `--workspace` for that step.
 - At the completion boundary? Run the project's full gates (workspace tests, doctests, everything the project requires).
 
+Plain `cargo test` does not serialize test functions: Cargo runs each test target's executable serially, while libtest runs the `#[test]` functions inside one binary on parallel threads. Where tests share an exclusive resource (service, port, database, fixture directory), keep the project's verified locking, scope `-- --test-threads=1` to the affected target, or use equivalent scoped scheduling; keep the parallel default and doctests everywhere else. Nextest schedules with its own limits - [references/workflows.md](references/workflows.md) covers both levels and the nextest equivalent.
+
 Formatting belongs in the loop only where the project gates on it. Keep `--locked` when a lockfile exists, and use `--manifest-path PATH` for invocations outside the workspace root. Package-scoped runs beat whole-workspace rebuilds; reserve the broad runs for their required boundary.
 
 ## Measure before claiming an improvement
@@ -55,7 +57,7 @@ debug = true
 
 ## Optional tools are gated
 
-sccache, nextest and alternative linkers come only after measurement shows the remaining bottleneck and platform/compatibility checks pass. Decision-relevant limits: sccache cannot cache incremental crates (so it forces incremental off) or crates that link (bin, dylib, cdylib, proc-macro) and adds its own disk cache; nextest runs each test in a separate process and does not run doctests, so keep `cargo test --doc` in the gates; the official linker suggestions are Linux-specific - do not transplant them to Windows. Commands and checks for all three: [references/workflows.md](references/workflows.md).
+sccache, nextest and alternative linkers come only after measurement shows the remaining bottleneck and platform/compatibility checks pass. Decision-relevant limits: sccache cannot cache incremental crates (so it forces incremental off) or crates that link (bin, dylib, cdylib, proc-macro) and adds its own disk cache; nextest runs each test in a separate process, schedules with its own `-j`/test-group limits (a `max-threads = 1` group serializes the tests sharing a resource) and does not run doctests, so keep `cargo test --doc` in the gates; the official linker suggestions are Linux-specific - do not transplant them to Windows. Commands and checks for all three: [references/workflows.md](references/workflows.md).
 
 ## Manifest and feature hygiene
 

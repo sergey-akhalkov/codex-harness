@@ -35,6 +35,21 @@ Get-ChildItem "$root\debug\deps" -Filter *.exe -ErrorAction SilentlyContinue | M
 - When the intermediate build directory is relocated, measure it separately and add it to the total (section 5); with the default layout it is already inside the target root.
 - One cold pair plus a few warm observations is a scoped measurement - say so instead of implying a population claim. An apparent regression worth acting on deserves one cause-driven confirmation before changing defaults.
 
+### Test scheduling: serial targets, parallel functions
+
+`cargo test` schedules at two levels, and only the target level is serial by default:
+
+- **Targets**: each rustc-built test target compiles to its own executable (one unit-test binary per crate target, one per file under `tests/`, plus bench/example targets when selected), and Cargo runs those executables serially ([cargo test](https://doc.rust-lang.org/cargo/commands/cargo-test.html)).
+- **Functions**: inside one executable, libtest runs the `#[test]` functions on multiple threads in parallel by default; the thread count comes from `--test-threads` or `RUST_TEST_THREADS` ([the rustc book on tests](https://doc.rust-lang.org/rustc/tests/index.html)).
+
+A plain `cargo test` run therefore does not serialize test functions: two tests in the same unit-test or integration binary can race for one exclusive resource (a service, port, database, fixture directory). Wherever tests share such a resource, establish one of:
+
+- `cargo test -p CRATE FILTER --locked -- --test-threads=1` (or `RUST_TEST_THREADS=1`) serializes the test functions of the libtest binaries the run selects - scope it to the target or filter that needs exclusivity instead of making it the project's running mode.
+- The project's own verified locking or synchronization of the resource, with evidence that every access path uses it.
+- An equivalent scoped scheduling control with evidence - for nextest, a test group with `max-threads = 1` (section 6).
+
+Keep the parallel default and doctests everywhere no shared resource requires otherwise. Doctests are their own case: rustdoc builds doctest executables that run in parallel in separate processes, and Cargo documents that execution model as not guaranteed, so a doctest that needs exclusivity needs the same explicit evidence rather than an assumption.
+
 ## 2. Effective configuration: profiles, target dirs, toolchain, features
 
 - The authoritative stable check is a verbose build: `cargo build -v -p CRATE` (or `cargo check -v`) prints each rustc invocation with the applied `-C debuginfo=...`, `-C incremental=...`, `--out-dir` and `--crate-name`. What appears there is what actually runs; when the intermediate build directory is relocated (section 5), its intermediate paths point there rather than into the target root.
@@ -83,6 +98,7 @@ For all three below: adopt only when the section 1 workloads show the remaining 
 ### nextest (test runner)
 
 - External runner; executes each test in its own process, which adds isolation and enables retries (`--retries`, `.config/nextest.toml`) but increases process spawns - measure execution time, especially on Windows where process creation is relatively expensive.
+- Scheduling is nextest's own, not libtest's: `-j`/`--test-threads N` on `cargo nextest run` sets how many tests run simultaneously (default `num-cpus`), and only a small set of libtest arguments is emulated after `--`, so a Cargo/libtest `-- --test-threads=1` is not the control here. For tests that share an exclusive resource, keep the project's verified locking or assign exactly those tests to a [test group](https://nexte.st/docs/configuration/test-groups/) with `max-threads = 1` (or the needed limit); tests outside the group keep global concurrency.
 - `cargo nextest run` accepts the usual cargo test options (package/target selection); keep the project's selectors, ignored/platform conditions and required gates equivalent.
 - Doctests are not supported on stable Rust: keep `cargo test --doc` as a separate, required step in the project's gates.
 - Consider it when a large suite's execution time or retry/isolation behavior dominates; it does not reduce compilation.
@@ -114,4 +130,8 @@ For all three below: adopt only when the section 1 workloads show the remaining 
 - Build cache (target-dir vs build-dir split, final vs intermediate artifacts): https://doc.rust-lang.org/cargo/reference/build-cache.html
 - Global cache GC announcement: https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/
 - sccache cache gaps for Rust: https://github.com/mozilla/sccache#known-caveats
+- Cargo test scheduling (serial target executables, parallel libtest functions, doctests): https://doc.rust-lang.org/cargo/commands/cargo-test.html
+- Rust test harness (parallel default, `--test-threads`, `RUST_TEST_THREADS`): https://doc.rust-lang.org/rustc/tests/index.html
+- Rustdoc documentation tests: https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html
+- nextest test groups (shared-resource concurrency limits): https://nexte.st/docs/configuration/test-groups/
 - nextest running and doctest policy: https://nexte.st/docs/running/
