@@ -316,6 +316,88 @@ fn cli_build_reuse_source_staleness_integrity_and_failed_update() {
     );
 }
 
+/// Publication compiles the declared delivery programs and nothing beside
+/// them. The added file is an auto-discovered binary target of a selected
+/// package whose body cannot compile: a `--bins` selection would fail on it,
+/// while the real CLI build succeeds and publishes every declared binary.
+#[test]
+fn publication_ignores_test_only_binaries_that_cannot_compile() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let state = temp.path().join("state");
+    fixture(&source);
+    fs::write(
+        source.join("crates/manager/src/bin/harness-test-only-fixture.rs"),
+        "fn main() { this fixture binary must never be selected }\n",
+    )
+    .unwrap();
+    // Establish the counterexample mechanically: Cargo still discovers the
+    // file as a binary target of the selected manager package.
+    let metadata = Command::new("cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(&source)
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let discovered = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|package| {
+            package["targets"].as_array().unwrap().iter().any(|target| {
+                target["name"] == "harness-test-only-fixture"
+                    && target["kind"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|kind| kind.as_str() == Some("bin"))
+            })
+        });
+    assert!(
+        discovered,
+        "the failing file is an auto-discovered bin target"
+    );
+
+    let built = cli(&[
+        "build",
+        "--source",
+        source.to_str().unwrap(),
+        "--state",
+        state.to_str().unwrap(),
+    ]);
+    if !built.status.success() {
+        let retained = temp.keep();
+        panic!(
+            "{}; retained {}",
+            String::from_utf8_lossy(&built.stderr),
+            retained.display()
+        );
+    }
+    let built: Value = serde_json::from_slice(&built.stdout).unwrap();
+    let build = Path::new(built["build"].as_str().unwrap());
+    let record = harness_core::build_identity::read_record(build).unwrap();
+    let mut published: Vec<&str> = record.binaries.keys().map(String::as_str).collect();
+    published.sort_unstable();
+    let mut declared: Vec<&str> = harness_core::build_identity::BINARIES.to_vec();
+    declared.sort_unstable();
+    assert_eq!(published, declared);
+    for name in harness_core::build_identity::BINARIES {
+        assert!(build.join(name).is_file(), "missing published {name}");
+    }
+    assert!(!build.join("harness-test-only-fixture.exe").exists());
+}
+
 #[test]
 fn missing_prerequisite_and_foreign_state_do_not_mutate_installation() {
     let temp = tempfile::tempdir().unwrap();
@@ -708,6 +790,26 @@ fn older_producer_finalizes_expanded_consumer_with_new_input_rules() {
             "    collect(&root, &root.join(INSPECTION_SCHEMA), &mut files)?;\n    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);", 1);
     assert_ne!(old_identity, current_identity);
     fs::write(&identity_path, old_identity).unwrap();
+    // The older producer selected every binary target of the selected packages
+    // (`--bins`), so it over-built whenever the consumer's delivery set grew.
+    // Keep that selection behavior in the fixture producer as well: a producer
+    // with the current explicit selection publishes exactly its own compiled
+    // delivery set and cannot finalize an expanded consumer.
+    let native_build_path = source.join("crates/harness-core/src/native_build.rs");
+    let current_native_build = fs::read_to_string(&native_build_path)
+        .unwrap()
+        .replace("\r\n", "\n");
+    let explicit_selection = "    for binary in BINARIES {\n        command.args.push(\"--bin\".into());\n        command\n            .args\n            .push(binary.strip_suffix(\".exe\").unwrap_or(binary).into());\n    }\n";
+    assert!(
+        current_native_build.contains(explicit_selection),
+        "the fixture depends on the publication selection shape"
+    );
+    let old_selection = current_native_build.replacen(
+        explicit_selection,
+        "    command.args.push(\"--bins\".into());\n",
+        1,
+    );
+    fs::write(&native_build_path, old_selection).unwrap();
     let target = tempfile::Builder::new().prefix("hct-").tempdir().unwrap();
     let log = fs::File::create(root.join("bridge-bootstrap.log")).unwrap();
     let cargo = Command::new("where.exe").arg("cargo.exe").output().unwrap();

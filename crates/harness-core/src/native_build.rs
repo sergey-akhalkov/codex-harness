@@ -997,13 +997,22 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
         "harness-rtk",
         "-p",
         "token-audit",
-        "--bins",
-        "--manifest-path",
     ]
     .into_iter()
     .map(Into::into)
     .collect();
+    // Compile exactly the declared delivery programs. `--bins` would also
+    // build every test-only fixture binary beside them, which the publication
+    // identity does not cover; a producer whose compiled delivery set predates
+    // a source-side expansion cannot publish that expanded source.
+    for binary in BINARIES {
+        command.args.push("--bin".into());
+        command
+            .args
+            .push(binary.strip_suffix(".exe").unwrap_or(binary).into());
+    }
     command.args.extend([
+        "--manifest-path".into(),
         source.join("Cargo.toml").into_os_string(),
         "--target-dir".into(),
         target.as_os_str().to_owned(),
