@@ -998,21 +998,66 @@ fn probe_delivery(target: &Path, staging: &Path, source: &Path) -> io::Result<Op
     let mut command = CommandSpec::new(target.join(TARGET).join("release/codex-harness.exe"));
     command.args = vec!["finalize-build-v1".into(), request.as_os_str().to_owned()];
     command.current_dir = Some(source.to_owned());
+    let log = staging.join("delivery-probe.log");
     let response = staging.join("delivery-probe.json");
-    let outcome = handoff::invoke(
-        command,
-        &staging.join("delivery-probe.log"),
-        Some(&response),
-        Duration::from_secs(60),
-    )?;
-    if outcome.reason != StopReason::Exited || outcome.exit_code != 0 {
-        return Ok(None);
-    }
-    match serde_json::from_slice::<DeliveryProbeResponse>(&handoff::bounded_bytes(&response)?) {
-        Ok(parsed) if parsed.schema == 1 && !parsed.delivery.is_empty() => {
-            Ok(Some(parsed.delivery))
+    let outcome = handoff::invoke(command, &log, Some(&response), Duration::from_secs(60))?;
+    classify_delivery_probe(outcome.reason, outcome.exit_code, &log, &response)
+}
+
+/// Classify one delivery-query outcome. An ordinary nonzero exit is a manager
+/// that predates the query and keeps the compatibility fallback with its log
+/// retained; a timeout, kill, or unusable successful answer is a real failure
+/// and must not be mistaken for an unsupported protocol.
+fn classify_delivery_probe(
+    reason: StopReason,
+    exit_code: u32,
+    log: &Path,
+    response: &Path,
+) -> io::Result<Option<Vec<String>>> {
+    match (reason, exit_code) {
+        (StopReason::Exited, 0) => {
+            let bytes = match handoff::bounded_bytes(response) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "Fresh manager delivery query produced no readable response ({error}); see {} and {}",
+                        log.display(),
+                        response.display()
+                    )));
+                }
+            };
+            match serde_json::from_slice::<DeliveryProbeResponse>(&bytes) {
+                Ok(parsed) if parsed.schema == 1 && !parsed.delivery.is_empty() => {
+                    Ok(Some(parsed.delivery))
+                }
+                Ok(parsed) => Err(io::Error::other(format!(
+                    "Fresh manager delivery query answered an unusable set (schema {}, {} entries); see {} and {}",
+                    parsed.schema,
+                    parsed.delivery.len(),
+                    log.display(),
+                    response.display()
+                ))),
+                Err(error) => Err(io::Error::other(format!(
+                    "Fresh manager delivery query answered an unreadable response ({error}); see {} and {}",
+                    log.display(),
+                    response.display()
+                ))),
+            }
         }
-        _ => Ok(None),
+        // A manager built before the query rejects the request with an ordinary
+        // nonzero exit; its log stays next to the retained staging directory.
+        (StopReason::Exited, _) => {
+            eprintln!(
+                "native build: the freshly compiled manager rejected the delivery query (exit {exit_code}); completing with the pre-query whole-package selection. See {}",
+                log.display()
+            );
+            Ok(None)
+        }
+        (reason, exit_code) => Err(io::Error::other(format!(
+            "Fresh manager delivery query did not complete ({reason:?}, exit {exit_code}); an incomplete query does not establish a pre-query manager. See {} and {}",
+            log.display(),
+            response.display()
+        ))),
     }
 }
 
@@ -1801,5 +1846,47 @@ mod tests {
         let other = temp.path().join("other.json");
         fs::write(&other, br#"{"schema":1,"source":"x"}"#).unwrap();
         assert!(!answer_delivery_probe(&other).unwrap());
+    }
+
+    #[test]
+    fn delivery_probe_classification_distinguishes_legacy_from_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("probe.log");
+        fs::write(&log, "probe").unwrap();
+        let response = temp.path().join("probe.json");
+        fs::write(
+            &response,
+            br#"{"schema":1,"delivery":["codex-harness.exe","token-audit.exe"]}"#,
+        )
+        .unwrap();
+        let names = classify_delivery_probe(StopReason::Exited, 0, &log, &response)
+            .unwrap()
+            .unwrap();
+        assert_eq!(names, ["codex-harness.exe", "token-audit.exe"]);
+        // An ordinary nonzero exit is the pre-query manager signature.
+        assert!(
+            classify_delivery_probe(StopReason::Exited, 2, &log, &response)
+                .unwrap()
+                .is_none()
+        );
+        // An incomplete query is a failure, not a legacy signature.
+        let failed = classify_delivery_probe(StopReason::Timeout, 124, &log, &response)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failed.contains("Timeout") && failed.contains("probe.log"),
+            "{failed}"
+        );
+        // A successful answer must still be a usable delivery set.
+        fs::write(&response, br#"{"schema":1,"delivery":[]}"#).unwrap();
+        let empty = classify_delivery_probe(StopReason::Exited, 0, &log, &response)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("unusable set"), "{empty}");
+        fs::write(&response, b"not json").unwrap();
+        let unreadable = classify_delivery_probe(StopReason::Exited, 0, &log, &response)
+            .unwrap_err()
+            .to_string();
+        assert!(unreadable.contains("unreadable response"), "{unreadable}");
     }
 }
