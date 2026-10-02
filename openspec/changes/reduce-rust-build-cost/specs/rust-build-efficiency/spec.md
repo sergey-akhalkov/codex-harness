@@ -28,6 +28,10 @@ Native publication SHALL compile the declared delivery programs without selectin
 - **WHEN** source bytes change while timestamps are preserved
 - **THEN** publication continues to refuse reuse of an artifact for a different source identity
 
+#### Scenario: Source expands the delivery set
+- **WHEN** an installed producer using optimized target selection builds newer source with additional delivery binaries and updated input rules
+- **THEN** the source-owned delivery set is compiled and finalized through the existing explicit update path without selecting unrelated helper binaries or requiring a manual bootstrap for that expansion
+
 ### Requirement: Measured optimization preserves test coverage and operating limits
 
 Build/test optimization SHALL distinguish compilation, warm reuse, edited-code feedback and test execution. Consolidation or concurrency changes SHALL preserve selected test coverage, ignored-test policy, failure reporting and resource isolation. Adoption SHALL use a matched comparison under unchanged CPU/memory limits, with no unexplained correctness regression. A rejected or inconclusive candidate SHALL leave the accepted behavior intact and retain its reason.
