@@ -1,6 +1,6 @@
 ---
 name: cargo-fast
-description: Diagnose and reduce Cargo build, test and disk cost - the narrowest sufficient command for the current question, debug-info and incremental trade-offs, target/test multiplicity, safe owner-bound cleanup, workload-specific measurement, and platform-gated optional caches, runners and linkers. Use when building, testing or optimizing Rust compile/test feedback or reclaiming build storage. Skip generic verification policy and non-Cargo ecosystems.
+description: Diagnose and reduce Cargo build, test and disk cost for Rust projects - command selection, debug-info and incremental trade-offs, artifact footprint and safe cleanup, plus platform-gated optional tools. Use when building, testing or optimizing Rust compile/test feedback or reclaiming build storage. Skip generic verification policy and non-Cargo ecosystems.
 ---
 
 # Fast Cargo workflows
@@ -19,7 +19,7 @@ Match the command to the current question; do not run a fixed fmt/check/clippy/t
 - Do edits span members or a shared type? Widen `-p` to `--workspace` for that step.
 - At the completion boundary? Run the project's full gates (workspace tests, doctests, everything the project requires).
 
-Formatting belongs in the loop only where the project gates on it. Keep `--locked` when a lockfile exists, and `-m PATH` (short for `--manifest-path`) for invocations outside the workspace root. Package-scoped runs beat whole-workspace rebuilds; reserve the broad runs for their required boundary.
+Formatting belongs in the loop only where the project gates on it. Keep `--locked` when a lockfile exists, and use `--manifest-path PATH` for invocations outside the workspace root. Package-scoped runs beat whole-workspace rebuilds; reserve the broad runs for their required boundary.
 
 ## Measure before claiming an improvement
 
@@ -45,12 +45,12 @@ debug = true
 debug = true
 ```
 
-`line-tables-only` keeps filename/line backtraces (panic messages stay useful) without variable or parameter info. `--profile debugging` is the explicit full-debug route for workspace members and dependencies; it builds into its own `target/debugging` directory, so it costs one full rebuild - keep it out of routine loops. `cargo test` inherits dev, so tests get compact info too. String debug values need Rust >= 1.71; on older MSRV use a numeric form (`debug = 1`) or leave the default. Never weaken debug assertions, overflow checks or test coverage to save time.
+`line-tables-only` keeps filename/line backtraces (panic messages stay useful) without variable or parameter info. `--profile debugging` is the explicit full-debug route for workspace members and dependencies; it builds in its own profile directory (`target/debugging` by default), so it costs one full rebuild - keep it out of routine loops. `cargo test` inherits dev, so tests get compact info too. String debug values need Rust >= 1.71; on older MSRV use a numeric form (`debug = 1`) or leave the default. Never weaken debug assertions, overflow checks or test coverage to save time.
 
 ## Reuse and storage lifecycle
 
-- Keep incremental compilation for local edit loops (dev/test enable it for workspace members and path dependencies). Cargo defaults it off when the `CI` environment variable is set; set `CARGO_INCREMENTAL=0` explicitly for disposable or reproducible builds.
-- Target roots multiply: the default `target`, `--target-dir`/`CARGO_TARGET_DIR` experiment roots, per-profile directories, and one linked executable per test/bench/example target. Count before concluding what dominates.
+- Keep incremental compilation for local edit loops (dev/test enable it for workspace members and path dependencies). The `CI` environment variable makes Cargo default it off; for packaging or reproducible builds, pass `CARGO_INCREMENTAL=0` explicitly for that invocation - it drops incremental state and its disk growth without disabling ordinary unchanged-output reuse, and the edit-loop cost is a per-workload trade-off to measure.
+- Target and build roots multiply: the default `target`, `--target-dir`/`CARGO_TARGET_DIR` experiment roots, per-profile directories, one linked executable per test/bench/example target, and any relocated intermediate build directory (`build.build-dir`/`CARGO_BUILD_BUILD_DIR`, stable since Cargo 1.91, defaulting to the target directory). Count before concluding what dominates.
 - Cargo's global cache self-cleans (automatic GC since 1.88; `cache.auto-clean-frequency` defaults to 1 day; not run in offline mode) and it never removes target directories. Target cleanup is explicit: `cargo clean` scoped by `-p`, `--profile`, `--target` or `--target-dir`, with `--dry-run` to preview. Retire only whole roots you own and have verified inactive; keep the active root warm and never hand-delete fingerprint or incremental internals.
 
 ## Optional tools are gated
