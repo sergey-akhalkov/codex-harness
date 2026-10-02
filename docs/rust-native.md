@@ -96,9 +96,12 @@ Keep the active development root warm. Inspect effective target and intermediate
 build directories, including local Cargo configuration, before estimating disk
 usage. At worktree retirement or actual disk pressure, resolve the exact owned
 root, check running compiler/test/executable use and retained evidence, then
-preview a scoped `cargo clean --dry-run` before applying it. `--profile dev`
-retires old development artifacts without selecting nested independent target
-roots. Preserve unfinished worktrees and uncertain ownership. Cargo's global
+preview a scoped `cargo clean --dry-run --verbose` before applying it. With a
+separate `build.build-dir`, Cargo 1.98.1's clean preview included both that
+directory and the selected target directory: `--target-dir` alone does not
+confine cleanup to one root. Preserve active or shared intermediate directories,
+unfinished worktrees and uncertain ownership. `--profile dev` selects development
+artifacts within the effective roots. Cargo's global
 download-cache GC does not collect target artifacts; repeatedly cleaning the
 active root trades disk space for a new cold build. The portable diagnosis and
 comparison procedure belongs to [cargo-fast](../.agents/skills/cargo-fast/SKILL.md).

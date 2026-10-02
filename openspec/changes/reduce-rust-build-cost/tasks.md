@@ -12,8 +12,8 @@
 ## 3. Reuse, reclamation and transferable guidance
 
 - [x] 3.1 Establish the active/inactive target inventory, reclaim only verified inactive owned build artifacts, and record before/after scope while preserving unfinished work and evidence.
-- [ ] 3.2 Draft the cargo-fast update outside discovery using skill-creator; include portable disk diagnosis, workload comparisons, cache lifecycle and verified platform/tool limitations, and pass package/link/source validation.
-- [ ] 3.3 Execute the fixed skill baseline/candidate acceptance batch including intended, negative, boundary and held-out transfer cases; publish only an accepted revision through the existing Registration owner and verify its identity outside this checkout.
+- [x] 3.2 Draft the cargo-fast update outside discovery using skill-creator; include portable disk diagnosis, workload comparisons, cache lifecycle and verified platform/tool limitations, and pass package/link/source validation.
+- [x] 3.3 Execute the fixed skill baseline/candidate acceptance batch including intended, negative, boundary and held-out transfer cases; publish only an accepted revision through the existing Registration owner and verify its identity outside this checkout.
 - [ ] 3.4 Update the native guide and existing decision record with accepted commands, concise measurements, cleanup conditions and rejected alternatives; verify links and public-source hygiene.
 
 ## 4. Integration and delivery
