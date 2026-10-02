@@ -8,7 +8,7 @@ proposals keep their own status. Task work belongs in the owning OpenSpec
 change. Do not record conversation quotes, local incidents or machine identities
 here.
 
-Last updated: **2026-09-27**.
+Last updated: **2026-10-02**.
 
 ## Public pack
 
@@ -25,6 +25,20 @@ credentials and session/runtime data. Public names needed for dependency
 identification and attribution remain accurate. A checked-in denylist must not
 reproduce private identifiers. Private evidence, recovery copies and locally
 supplied acceptance inputs stay outside Git.
+
+## Rust development cost
+
+**2026-10-02, confirmed:** ordinary development and test builds prioritize
+short feedback and a smaller artifact footprint, retaining source-location
+backtraces. Full debugger information, including dependency types and variables,
+is an explicit separate profile. Required tests, assertions, publication
+integrity and the existing machine resource budgets remain intact.
+
+Use the existing `cargo-fast` skill to carry measured, portable practices to
+other Rust projects. Optional caches, test runners, target consolidation and
+concurrency changes need evidence for their workload; no universal savings are
+implied. Implementation and acceptance belong to
+[reduce Rust build cost](../openspec/changes/reduce-rust-build-cost/proposal.md).
 
 ## Local-only runtime state
 

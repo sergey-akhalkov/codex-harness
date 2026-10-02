@@ -1,7 +1,7 @@
 ## 1. Baseline and compact profiles
 
-- [ ] 1.1 Capture source/toolchain/budget identity and matched cold, warm and edited-source baseline measurements on a real test target; retain commands, timings and logical artifact sizes in local evidence.
-- [ ] 1.2 Implement compact dev/test defaults and a full debugging profile; verify inherited settings, source-location backtraces, full-debug compiler flags and matched candidate size/time against task 1.1.
+- [x] 1.1 Capture source/toolchain/budget identity and matched cold, warm and edited-source baseline measurements on a real test target; retain commands, timings and logical artifact sizes in local evidence.
+- [x] 1.2 Implement compact dev/test defaults and a full debugging profile; verify inherited settings, source-location backtraces, full-debug compiler flags and matched candidate size/time against task 1.1.
 
 ## 2. Generate less build and test work
 
@@ -11,7 +11,7 @@
 
 ## 3. Reuse, reclamation and transferable guidance
 
-- [ ] 3.1 Establish the active/inactive target inventory, reclaim only verified inactive owned build artifacts, and record before/after scope while preserving unfinished work and evidence.
+- [x] 3.1 Establish the active/inactive target inventory, reclaim only verified inactive owned build artifacts, and record before/after scope while preserving unfinished work and evidence.
 - [ ] 3.2 Draft the cargo-fast update outside discovery using skill-creator; include portable disk diagnosis, workload comparisons, cache lifecycle and verified platform/tool limitations, and pass package/link/source validation.
 - [ ] 3.3 Execute the fixed skill baseline/candidate acceptance batch including intended, negative, boundary and held-out transfer cases; publish only an accepted revision through the existing Registration owner and verify its identity outside this checkout.
 - [ ] 3.4 Update the native guide and existing decision record with accepted commands, concise measurements, cleanup conditions and rejected alternatives; verify links and public-source hygiene.
