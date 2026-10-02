@@ -5,9 +5,9 @@ use crate::heavy_command;
 use crate::process::{
     Cancellation, CommandSpec, Deadline, ExclusiveFileLock, Job, Limits, StopReason,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -38,7 +38,48 @@ pub(crate) use handoff::invoke as invoke_management;
 
 /// Versioned internal command executed only by the fresh compiler output.
 pub fn finalize(request: &Path) -> io::Result<()> {
+    if answer_delivery_probe(request)? {
+        return Ok(());
+    }
     handoff::finalize(request)
+}
+
+/// Internal delivery query answered by a freshly compiled manager. The request
+/// shape is deliberately distinct from a finalization request, so a manager
+/// built before this protocol rejects it and the caller completes the build the
+/// pre-query way instead.
+const DELIVERY_PROBE_KIND: &str = "delivery-binaries-v1";
+
+#[derive(Deserialize)]
+struct DeliveryProbe {
+    schema: u32,
+    kind: String,
+}
+
+#[derive(Deserialize)]
+struct DeliveryProbeResponse {
+    schema: u32,
+    delivery: Vec<String>,
+}
+
+/// Answer a delivery query from a producer, or report that this is a normal
+/// finalization request. Read-only: no state is read or written either way.
+fn answer_delivery_probe(request: &Path) -> io::Result<bool> {
+    let bytes = handoff::bounded_bytes(request)?;
+    let Ok(probe) = serde_json::from_slice::<DeliveryProbe>(&bytes) else {
+        return Ok(false);
+    };
+    if probe.schema != 1 || probe.kind != DELIVERY_PROBE_KIND {
+        return Ok(false);
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": 1,
+            "delivery": BINARIES,
+        }))?
+    );
+    Ok(true)
 }
 
 fn verify_compiled_inputs(
@@ -887,6 +928,140 @@ pub fn activate_candidate(
     })
 }
 
+/// Base publication Cargo command. Both phases share source, target and
+/// limits; only the binary selection differs.
+fn publication_cargo(source: &Path, target: &Path, cargo: &OsStr) -> io::Result<CommandSpec> {
+    let mut command = CommandSpec::new(resolve_tool(cargo)?);
+    command.args = [
+        "build",
+        "--release",
+        "--locked",
+        // Cargo otherwise scales rustc concurrency to host CPU count, which
+        // does not reflect the fixed memory budget of the compiler job.
+        "--jobs",
+        "1",
+        "--target",
+        TARGET,
+        "-p",
+        "codex-harness",
+        "-p",
+        "harness-rtk",
+        "-p",
+        "token-audit",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    command.args.extend([
+        "--manifest-path".into(),
+        source.join("Cargo.toml").into_os_string(),
+        "--target-dir".into(),
+        target.as_os_str().to_owned(),
+    ]);
+    command.current_dir = Some(source.to_owned());
+    Ok(command)
+}
+
+/// Cargo selection for the completion phase: exactly the source-owned delivery
+/// set, or the pre-query whole-package selection when the compiled manager
+/// predates the delivery query.
+fn publication_bin_selection(delivery: Option<&[String]>) -> Vec<OsString> {
+    match delivery {
+        Some(names) => names
+            .iter()
+            .flat_map(|name| {
+                [
+                    OsString::from("--bin"),
+                    OsString::from(name.strip_suffix(".exe").unwrap_or(name)),
+                ]
+            })
+            .collect(),
+        None => vec![OsString::from("--bins")],
+    }
+}
+
+/// Ask the freshly compiled manager for the delivery programs its own source
+/// declares. `None` means the compiled manager predates the query.
+fn probe_delivery(target: &Path, staging: &Path, source: &Path) -> io::Result<Option<Vec<String>>> {
+    let request = staging.join("delivery-probe-request.json");
+    ordinary_ancestors(&request)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&request)?;
+    file.write_all(&serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "kind": DELIVERY_PROBE_KIND,
+    }))?)?;
+    file.sync_all()?;
+    drop(file);
+    let mut command = CommandSpec::new(target.join(TARGET).join("release/codex-harness.exe"));
+    command.args = vec!["finalize-build-v1".into(), request.as_os_str().to_owned()];
+    command.current_dir = Some(source.to_owned());
+    let response = staging.join("delivery-probe.json");
+    let outcome = handoff::invoke(
+        command,
+        &staging.join("delivery-probe.log"),
+        Some(&response),
+        Duration::from_secs(60),
+    )?;
+    if outcome.reason != StopReason::Exited || outcome.exit_code != 0 {
+        return Ok(None);
+    }
+    match serde_json::from_slice::<DeliveryProbeResponse>(&handoff::bounded_bytes(&response)?) {
+        Ok(parsed) if parsed.schema == 1 && !parsed.delivery.is_empty() => {
+            Ok(Some(parsed.delivery))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Run one bounded Cargo phase in the admitted compiler tree. Phases reuse the
+/// same fresh target, so the completion phase only adds what the bootstrap
+/// phase still lacks.
+fn run_publication_phase(
+    admission: &heavy_command::Admission,
+    budget: &heavy_command::Budget,
+    account: &Path,
+    deadline: Deadline,
+    log: &fs::File,
+    log_path: &Path,
+    command: &mut CommandSpec,
+) -> io::Result<()> {
+    // One owned lifecycle Job per phase: the Job is consumed by its wait, no
+    // compiler tree survives between phases, and its name is released for the
+    // completion phase. The admitted aggregate and CPU policy stay unchanged.
+    let (job, marker) = admission.owned_job(budget, account)?;
+    eprintln!("{}", admission.job_line(&job)?);
+    command.stdout = Some(log.try_clone()?);
+    command.stderr = Some(log.try_clone()?);
+    command
+        .env
+        .insert(heavy_command::LEASE_ENV.into(), Some(marker));
+    let child = start_admitted_compiler(admission, &job, command)
+        .map_err(|e| io::Error::other(format!("Starting bounded Cargo failed: {e}")))?;
+    let status = job.wait(
+        &child,
+        // A cold release build includes optimized manager variants and native
+        // dependencies. Keep it finite without applying an indexing deadline
+        // to compilation; the compiler Job still bounds memory and CPU.
+        deadline,
+        &Cancellation::default(),
+        Duration::from_secs(5),
+    )?;
+    command.stdout = None;
+    command.stderr = None;
+    if status.reason != StopReason::Exited || status.exit_code != 0 {
+        return Err(io::Error::other(format!(
+            "Candidate build failed (exit {}, {:?}); active installation preserved. See {}",
+            status.exit_code,
+            status.reason,
+            log_path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Build into installation-owned state, then publish an immutable candidate.
 /// No Cargo command is reachable from `build_identity::check`.
 pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<PreparedBuild> {
@@ -980,46 +1155,6 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     let scratch = owned_scratch()?;
     let target = scratch.path().to_owned();
     ordinary_ancestors(&target)?;
-    let mut command = CommandSpec::new(resolve_tool(cargo)?);
-    command.args = [
-        "build",
-        "--release",
-        "--locked",
-        // Cargo otherwise scales rustc concurrency to host CPU count, which
-        // does not reflect the fixed memory budget of the compiler job.
-        "--jobs",
-        "1",
-        "--target",
-        TARGET,
-        "-p",
-        "codex-harness",
-        "-p",
-        "harness-rtk",
-        "-p",
-        "token-audit",
-    ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
-    // Compile exactly the declared delivery programs. `--bins` would also
-    // build every test-only fixture binary beside them, which the publication
-    // identity does not cover; a producer whose compiled delivery set predates
-    // a source-side expansion cannot publish that expanded source.
-    for binary in BINARIES {
-        command.args.push("--bin".into());
-        command
-            .args
-            .push(binary.strip_suffix(".exe").unwrap_or(binary).into());
-    }
-    command.args.extend([
-        "--manifest-path".into(),
-        source.join("Cargo.toml").into_os_string(),
-        "--target-dir".into(),
-        target.as_os_str().to_owned(),
-    ]);
-    command.current_dir = Some(source.clone());
-    command.stdout = Some(log.try_clone()?);
-    command.stderr = Some(log);
     // Release LTO of every manager binary exceeds a 4 GiB Job. The compiler Job
     // is the lifecycle job inside the admitted envelope. A held admission places
     // the compiler in the shared CPU job when present, then the account
@@ -1027,31 +1162,42 @@ pub fn prepare(source: &Path, state: &Path, cargo: &OsStr) -> io::Result<Prepare
     // path and does not acquire a second slot or aggregate limit. The compilation
     // tree inherits the same marker, so a nested native consumer reuses this
     // admission instead of queueing on it.
-    let (job, marker) = admission.owned_job(&budget, &account)?;
-    command
-        .env
-        .insert(heavy_command::LEASE_ENV.into(), Some(marker));
-    eprintln!("{}", admission.job_line(&job)?);
-    let child = start_admitted_compiler(&admission, &job, &command)
-        .map_err(|e| io::Error::other(format!("Starting bounded Cargo failed: {e}")))?;
-    let status = job.wait(
-        &child,
-        // A cold release build includes optimized manager variants and native
-        // dependencies. Keep it finite without applying an indexing deadline
-        // to compilation; the compiler Job still bounds memory and CPU.
+    // The bootstrap phase compiles only the manager that owns the delivery
+    // definition; the completion phase then adds exactly the programs that
+    // manager's own source declares, in the same fresh target. A manager that
+    // predates the delivery query is completed with the pre-query whole-package
+    // selection instead, so older sources and producers keep publishing. The
+    // delivery programs are therefore compiled without unrelated test-only
+    // fixture binaries and without a second maintained list of names.
+    let mut command = publication_cargo(&source, &target, cargo)?;
+    command.args.push("--bin".into());
+    command.args.push("codex-harness".into());
+    run_publication_phase(
+        &admission,
+        &budget,
+        &account,
         deadline,
-        &Cancellation::default(),
-        Duration::from_secs(5),
+        &log,
+        &log_path,
+        &mut command,
     )?;
-    drop(command);
-    if status.reason != StopReason::Exited || status.exit_code != 0 {
-        return Err(io::Error::other(format!(
-            "Candidate build failed (exit {}, {:?}); active installation preserved. See {}",
-            status.exit_code,
-            status.reason,
-            log_path.display()
-        )));
-    }
+    let delivery = probe_delivery(&target, &staging, &source)?;
+    let mut command = publication_cargo(&source, &target, cargo)?;
+    command
+        .args
+        .extend(publication_bin_selection(delivery.as_deref()));
+    run_publication_phase(
+        &admission,
+        &budget,
+        &account,
+        deadline,
+        &log,
+        &log_path,
+        &mut command,
+    )?;
+    // Both phases are done; closing the shared log before finalization keeps
+    // the staging directory renamable on Windows.
+    drop(log);
     if build_identity::source_identity(&source)? != before {
         return Err(io::Error::other(
             "Native sources changed during the build; candidate not accepted. Retry explicit build with stable inputs.",
@@ -1612,11 +1758,48 @@ mod tests {
         );
 
         let source = include_str!("native_build.rs");
-        let start = source
-            .find("let (job, marker) = admission.owned_job")
-            .expect("compiler spawn site");
-        let window = &source[start..start + 700];
+        let phase = source
+            .find("fn run_publication_phase(")
+            .expect("publication phase runner");
+        let window = &source[phase..phase + 1600];
+        assert!(
+            window.contains("let (job, marker) = admission.owned_job"),
+            "{window}"
+        );
         assert!(window.contains("start_admitted_compiler("), "{window}");
         assert!(!window.contains(".spawn("), "{window}");
+        let prepare = source
+            .find("pub fn prepare(")
+            .expect("publication entry point");
+        assert!(
+            source[prepare..].contains("run_publication_phase("),
+            "publication compiles through the admitted phase runner"
+        );
+    }
+
+    #[test]
+    fn completion_selection_is_exact_or_falls_back_to_whole_package_bins() {
+        let delivery = vec!["codex-harness.exe".to_owned(), "token-audit.exe".to_owned()];
+        let args: Vec<String> = publication_bin_selection(Some(&delivery))
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--bin", "codex-harness", "--bin", "token-audit"]);
+        let fallback: Vec<String> = publication_bin_selection(None)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(fallback, ["--bins"]);
+    }
+
+    #[test]
+    fn delivery_probe_answers_only_its_own_request_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe.json");
+        fs::write(&probe, br#"{"schema":1,"kind":"delivery-binaries-v1"}"#).unwrap();
+        assert!(answer_delivery_probe(&probe).unwrap());
+        let other = temp.path().join("other.json");
+        fs::write(&other, br#"{"schema":1,"source":"x"}"#).unwrap();
+        assert!(!answer_delivery_probe(&other).unwrap());
     }
 }

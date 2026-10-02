@@ -790,26 +790,6 @@ fn older_producer_finalizes_expanded_consumer_with_new_input_rules() {
             "    collect(&root, &root.join(INSPECTION_SCHEMA), &mut files)?;\n    let sha256 = hash_bytes(&serde_json::to_vec(&files)?);", 1);
     assert_ne!(old_identity, current_identity);
     fs::write(&identity_path, old_identity).unwrap();
-    // The older producer selected every binary target of the selected packages
-    // (`--bins`), so it over-built whenever the consumer's delivery set grew.
-    // Keep that selection behavior in the fixture producer as well: a producer
-    // with the current explicit selection publishes exactly its own compiled
-    // delivery set and cannot finalize an expanded consumer.
-    let native_build_path = source.join("crates/harness-core/src/native_build.rs");
-    let current_native_build = fs::read_to_string(&native_build_path)
-        .unwrap()
-        .replace("\r\n", "\n");
-    let explicit_selection = "    for binary in BINARIES {\n        command.args.push(\"--bin\".into());\n        command\n            .args\n            .push(binary.strip_suffix(\".exe\").unwrap_or(binary).into());\n    }\n";
-    assert!(
-        current_native_build.contains(explicit_selection),
-        "the fixture depends on the publication selection shape"
-    );
-    let old_selection = current_native_build.replacen(
-        explicit_selection,
-        "    command.args.push(\"--bins\".into());\n",
-        1,
-    );
-    fs::write(&native_build_path, old_selection).unwrap();
     let target = tempfile::Builder::new().prefix("hct-").tempdir().unwrap();
     let log = fs::File::create(root.join("bridge-bootstrap.log")).unwrap();
     let cargo = Command::new("where.exe").arg("cargo.exe").output().unwrap();
@@ -948,7 +928,10 @@ fn older_producer_finalizes_expanded_consumer_with_new_input_rules() {
             .is_some()
     );
     let cargo_log = fs::read_to_string(new_build.join("cargo.log")).unwrap();
-    assert_eq!(cargo_log.matches("Finished `release`").count(), 1);
+    // Two phases in one fresh target: the manager bootstrap that owns the
+    // delivery definition, then the completion phase that adds exactly the
+    // programs the expanded consumer's own source declares.
+    assert_eq!(cargo_log.matches("Finished `release`").count(), 2);
     let healthy = Command::new(new_build.join("codex-harness.exe"))
         .args(["check", "--build", new_build.to_str().unwrap()])
         .output()
