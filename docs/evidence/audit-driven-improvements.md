@@ -126,10 +126,12 @@ and the launcher/diagnostic test owners.
 
 Verified 2026-09-30 on this tree (heavy-command route, `--jobs 1`):
 
-- `cargo test --locked -p harness-core --lib --test launcher -- --test-threads=1`:
+- The full `harness-core` library suite and launcher integration area:
   726 lib tests and 11 launcher tests passed, including the new
   `per_model_effort_yields_to_applicable_native_configuration`,
   layer-resolution, worktree-boundary, error and shield unit tests.
+  Current rerun selectors are `cargo test --locked -p harness-core --lib -- --test-threads=1`
+  and `cargo test --locked -p harness-core --test integration launcher:: -- --test-threads=1`.
 - `cargo test --locked -p codex-harness --test native_launcher --test source_diagnostics --test mcp_cli -- --test-threads=1`:
   27 native-launcher tests (including the saved model/low-effort
   counterexample, trusted-project preference, fallback-only injection and

@@ -40,6 +40,14 @@ concurrency changes need evidence for their workload; no universal savings are
 implied. Implementation and acceptance belong to
 [reduce Rust build cost](../openspec/changes/reduce-rust-build-cost/proposal.md).
 
+The measured implementation consolidates `harness-core` integration tests into
+one executable while preserving their cases and serial execution policy.
+Ordinary local commands use two Cargo jobs within the existing heavy budget;
+CI and release publication retain one. Publication obtains the delivery set
+from the freshly compiled source manager so upgrades can add programs without
+building unrelated fixtures. Measurements, limitations and current selectors
+belong to the [native guide](rust-native.md#development-profiles-and-build-storage).
+
 ## Local-only runtime state
 
 **2026-09-10, confirmed:** machine-specific native TUI settings persist locally.

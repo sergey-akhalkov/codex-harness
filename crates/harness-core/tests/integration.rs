@@ -1,13 +1,7 @@
-//! Pilot consolidation: one integration executable for the former harness-core
-//! integration targets. Each original file is included as a module without
-//! being moved, so test bodies, ignored cases and platform gates are
-//! unchanged; test names gain the module prefix.
-//!
-//! Adopted by the measured comparison for reduce-rust-build-cost task 2.2:
-//! fresh targets under the unchanged heavy budget, identical compact-dev
-//! settings, cold compile payload 171.7s -> 148.7s, integration artifacts
-//! 205.8 MB -> 37.4 MB, inventory 148 == 148 and execution 132 passed /
-//! 16 ignored / 0 failed on both sides.
+//! One integration executable with a module per test area. Keep new test files
+//! registered below: automatic discovery is disabled in the package manifest.
+//! Test bodies, ignored cases and platform gates remain in their original files;
+//! use the module prefix to select an area within this target.
 
 mod cancellable_pipe;
 mod config_creation;

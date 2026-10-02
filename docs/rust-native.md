@@ -47,12 +47,24 @@ are locked in the root
 lockfile. Use the existing toolchain; Check does not install packages.
 
 ```powershell
-codex-harness heavy -- cargo build --workspace --locked --jobs 1
+codex-harness heavy -- cargo build --workspace --locked --jobs 2
 cargo fmt --all -- --check
-codex-harness heavy -- cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
-codex-harness heavy -- cargo test --workspace --locked --jobs 1 -- --test-threads=1
+codex-harness heavy -- cargo clippy --workspace --all-targets --locked --jobs 2 -- -D warnings
+codex-harness heavy -- cargo test --workspace --exclude codex-harness --locked --jobs 2 --no-fail-fast -- --test-threads=1
+codex-harness heavy -- cargo test -p codex-harness --lib --bins --locked --jobs 2 --no-fail-fast -- --test-threads=1
 cargo run -p codex-harness --bin harness-source-check -- --root .
 ```
+
+The two test commands match the automatic
+[deterministic CI](../.github/workflows/windows-native-checks.yml) surfaces.
+They do not cover `codex-harness` installed-lifecycle integration targets.
+Run affected integration targets when changing their behavior; the complete
+[installed integration matrix](../.github/workflows/windows-installed-integration.yml)
+is an explicit separate gate with its own environment prerequisites.
+`cargo test --workspace --locked --jobs 2 -- --test-threads=1` selects the
+broader workspace suite, including those integration targets. Preserve whichever
+complete gate the change requires; a focused loop is not evidence for omitted
+tests.
 
 ### Development profiles and build storage
 
@@ -71,7 +83,8 @@ full debug information. Returning to ordinary Cargo commands reuses the compact
 `target/debug` artifacts. The release profile is unchanged.
 
 A matched Windows MSVC/Rust 1.98.1 comparison on the real `harness-core`
-`config_file` integration target, under the same heavy budget and `--jobs 1`,
+`config_file` tests (then a separate integration target), under the same heavy
+budget and `--jobs 1`,
 gave the following scoped results. Fresh target roots were used for each arm;
 the edit changed one test fixture value, then restored the original bytes.
 
@@ -106,12 +119,51 @@ download-cache GC does not collect target artifacts; repeatedly cleaning the
 active root trades disk space for a new cold build. The portable diagnosis and
 comparison procedure belongs to [cargo-fast](../.agents/skills/cargo-fast/SKILL.md).
 
+### Integration targets and compilation parallelism
+
+`harness-core` now has one integration executable. The original files remain
+modules of `tests/integration.rs`; add new areas to that file because automatic
+test-target discovery is disabled. Select an area with
+`cargo test -p harness-core --test integration config_file:: -- --test-threads=1`.
+Self-invoked test helpers include their module prefix in `--exact` selectors.
+
+A matched comparison on Windows MSVC/Rust 1.98.1 used the compact profile,
+fresh targets, `--jobs 1` and the same enforced heavy budget:
+
+| Measurement | 18 integration targets | One integration target |
+| --- | ---: | ---: |
+| Package test compilation, heavy payload | 171.67 s | 148.70 s |
+| Integration EXE and PDB file lengths | 205.8 MiB | 37.4 MiB |
+| Serial test execution reported by libtest | 271.47 s total | 265.71 s |
+| Discovered / passed / ignored cases | 148 / 132 / 16 | 148 / 132 / 16 |
+
+The normalized test inventory was identical, including the real child-process
+cases. No ignored or platform condition changed. These artifact totals exclude
+dependencies and the separate library-test executable; they are not whole-target
+size estimates. This is one matched pair, with queue waiting excluded.
+
+On the accepted layout, changing only Cargo jobs from 1 to 2 reduced a fresh
+package test compilation from 148.70 s to 101.86 s. Peak accounted job memory
+rose from 1.85 GiB to 3.15 GiB, within the unchanged 8 GiB limit. The local
+ordinary dev/test commands above recommend `--jobs 2`; no global Cargo setting
+changes. Native release publication and CI retain their explicit `--jobs 1`.
+The speed comparison covers one package and machine, not every workspace or
+runner; retain the resource wrapper and remeasure for a different budget.
+
+Keep the resource wrapper's payload a direct Cargo invocation. In the measured
+MSIX PowerShell environment, inserting another `pwsh` inside that payload let
+the compiler escape the admitted Job and made nested builds queue on their own
+parent. Those early timing/memory observations were discarded and repeated via
+direct Cargo/cmd-only chains. A launcher-only memory reading does not establish
+compiler-tree containment. PowerShell remains the command driver outside the
+admitted payload; no alternate PowerShell installation is needed.
+
 ### Development feedback without a publication build
 
 The installed OpenSpec planning prerequisite is exercised without model calls:
 
 ```powershell
-codex-harness heavy -- cargo test --locked -p harness-core --test improvement_spec --jobs 1 -- --include-ignored --test-threads=1
+codex-harness heavy -- cargo test --locked -p harness-core --test integration improvement_spec:: --jobs 2 -- --include-ignored --test-threads=1
 ```
 
 These checks cover repository and registered-store planning, missing acceptance
@@ -135,7 +187,7 @@ installed path; it is not a prerequisite for ordinary feedback. Measured
 | Warm affected integration filter (`cargo test -p codex-harness --test native_build -- <filter>`) | 658 s payload for three cases, each running the real `codex-harness build` CLI over owned fixture workspaces and real Cargo |
 | Warm full package suite (`cargo test -p harness-core --lib`) | 745 passed in 397 s; 422 s payload |
 | Cold development target (fresh `--target-dir`, `--no-run` for the two affected packages) | 326 s (5 min 26 s), peak 1.84 GiB in the heavy job |
-| Cold release publication (three published packages, seven binaries, real `codex-harness build`) | 448 s end to end, peak 1.88 GiB; the compile step alone is 447 s |
+| Previous `--bins` publication (three packages, seven delivered programs, real `codex-harness build`) | 448 s end to end, peak 1.88 GiB; the compile step alone is 447 s |
 
 The smallest sufficient loop after an edit is `cargo fmt --all`, then the
 focused unit filter for changed logic, then the affected integration target
@@ -166,6 +218,16 @@ stale artifact, while an unchanged identity is already served by verified
 artifact reuse (a full live-identity and integrity validation measured
 114-138 ms) without running Cargo at all.
 
+Publication now bootstraps the requested source's manager, asks it for its
+declared delivery programs, and completes exactly those binaries in the same
+fresh compiler directory. The two Cargo phases reuse eligible compiler outputs;
+unrelated test helpers are not selected. This also preserves upgrades where the
+new source adds delivery programs: the installed producer's older list does not
+limit the new source. A manager rejecting the delivery query keeps the previous
+whole-package route with an explicit diagnostic and retained log. An incomplete
+query or unusable successful response fails instead of silently widening the
+build. Both compiler phases retain the existing admission and resource limits.
+
 ### Compact verification output
 
 The same verification forms also run through the installed native compression
@@ -173,9 +235,10 @@ boundary, which keeps the heavy-command resource ownership and the native Cargo
 argument vector:
 
 ```powershell
-codex-harness heavy -- harness-rtk.exe compact cargo build --workspace --locked --jobs 1
-codex-harness heavy -- harness-rtk.exe compact cargo clippy --workspace --all-targets --locked --jobs 1 -- -D warnings
-codex-harness heavy -- harness-rtk.exe compact cargo test --workspace --locked --jobs 1 -- --test-threads=1
+codex-harness heavy -- harness-rtk.exe compact cargo build --workspace --locked --jobs 2
+codex-harness heavy -- harness-rtk.exe compact cargo clippy --workspace --all-targets --locked --jobs 2 -- -D warnings
+codex-harness heavy -- harness-rtk.exe compact cargo test --workspace --exclude codex-harness --locked --jobs 2 -- --test-threads=1
+codex-harness heavy -- harness-rtk.exe compact cargo test -p codex-harness --lib --bins --locked --jobs 2 -- --test-threads=1
 ```
 
 `harness-rtk.exe compact` forwards the whole argument tail to `cargo` unchanged
@@ -1341,7 +1404,7 @@ Disconnect disables `hooks` and restores recorded `previousCodeMode`, and
 Recover of a not-enabled previous state disables `hooks`. Feature edits are
 skipped when that executable is absent and refuse a reparse `config.toml`
 without following it.
-`cargo test --locked -p harness-core --test serena --jobs 1 -- --test-threads=1`
+`cargo test --locked -p harness-core --test integration serena:: --jobs 2 -- --test-threads=1`
 rejects missing registry, missing Python and incompatible version/status before a
 child starts. Adopted-package probes need `HARNESS_CODE_TOOLS_REGISTRY` and
 `--ignored`. The helper sets an owned `SERENA_HOME` under the launch home and
