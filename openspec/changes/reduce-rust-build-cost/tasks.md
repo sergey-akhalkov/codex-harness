@@ -19,4 +19,4 @@
 ## 4. Integration and delivery
 
 - [x] 4.1 Integrate accepted changes and complete workspace formatting, warning-as-error clippy, required affected unit/integration/doctest coverage, ownership and source checks without omitting existing gates; retain any original failures and corrections.
-- [ ] 4.2 Deploy through the native installation lifecycle, verify the new immutable build and executor probe from outside the checkout, validate OpenSpec strictly and close tasks only on their actual evidence.
+- [x] 4.2 Deploy through the native installation lifecycle, verify the new immutable build and executor probe from outside the checkout, validate OpenSpec strictly and close tasks only on their actual evidence.

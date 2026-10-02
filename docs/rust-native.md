@@ -142,6 +142,12 @@ cases. No ignored or platform condition changed. These artifact totals exclude
 dependencies and the separate library-test executable; they are not whole-target
 size estimates. This is one matched pair, with queue waiting excluded.
 
+A final focused check on the adopted layout ran the four `config_file::` tests
+in 0.304 s with unchanged inputs and in 1.565 s after a one-value fixture edit,
+including its rebuild. Restoring the exact source bytes and rerunning passed.
+This confirms that small edit feedback remains practical on the combined
+executable; it is a single sample, not a matched speedup estimate.
+
 On the accepted layout, changing only Cargo jobs from 1 to 2 reduced a fresh
 package test compilation from 148.70 s to 101.86 s. Peak accounted job memory
 rose from 1.85 GiB to 3.15 GiB, within the unchanged 8 GiB limit. The local
