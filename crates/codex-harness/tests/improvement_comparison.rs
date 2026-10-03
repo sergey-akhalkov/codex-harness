@@ -884,6 +884,10 @@ impl Fixture {
         self.improve(&["resume", "--run", self.run.to_str().unwrap()])
     }
 
+    fn stop(&self) -> Output {
+        self.improve(&["stop", "--run", self.run.to_str().unwrap()])
+    }
+
     /// One resume that may dispatch a measured arm: the child-only fixture
     /// mode reaches the installed launcher double through the host's explicit
     /// forward, exactly as the arm's own settings do.
@@ -4762,5 +4766,252 @@ fn a_workload_arm_without_independent_acceptance_leaves_no_candidate_patch() {
         fixture.cursor()["attempts"].as_array().unwrap().len(),
         attempts,
         "no model work is started to invent a next candidate"
+    );
+}
+
+/// A comparison interrupted after the baseline arm reuses that completed arm
+/// only while its recorded conditions still hold. Changed planning inputs
+/// keep the retained arm out of the comparison and record why remeasurement is
+/// required; restored inputs reuse the same arm without replaying any model
+/// attempt, and the retained patch and branch survive the refusal untouched.
+#[test]
+fn a_completed_arm_is_reused_only_while_its_planning_inputs_remain_valid() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("arm-reuse");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    // The interrupted baseline conversation is seeded through the same durable
+    // seam the controller recovery uses: the dispatch was refused before
+    // submission, its terminal receipt is retained and the committed solution
+    // stays in the arm's pooled checkout.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("arm-reuse-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 20, 5.0, 2, 3, &session);
+    let solution_slot = fixture.arm_dir("baseline").join("checkout-wt1");
+    let solution_revision = git_output(&solution_slot, &["rev-parse", "HEAD"]);
+    let dispatched = fixture.cursor()["attempts"].as_array().unwrap().len();
+
+    // The user stops the loop after the baseline arm: the run suspends new
+    // work, preserves the attempt and its committed solution, and marks the
+    // in-flight measured effect explicitly instead of replaying it.
+    let stop = fixture.stop();
+    let output = text(&stop);
+    assert!(stop.status.success(), "{output}");
+    let stopped = fixture.cursor();
+    assert_eq!(stopped["phase"], "stopped", "{stopped}\n{output}");
+    assert_eq!(stopped["attempts"].as_array().unwrap().len(), dispatched);
+    let state = stopped["attempts"][0]["state"].as_str().unwrap_or_default();
+    assert!(
+        ["completed", "unknown", "interrupted", "stopped", "failed"].contains(&state),
+        "the in-flight effect is explicitly resolved or retained as {state}: {stopped}"
+    );
+
+    // Changed planning inputs: the completed arm is not reusable, so nothing
+    // is consumed, no further model work is dispatched and no decision is
+    // published.
+    let change_spec = fixture
+        .proj
+        .join("openspec/changes/add-synthetic/specs/synthetic/spec.md");
+    let original = fs::read(&change_spec).unwrap();
+    let changed = format!(
+        "{}### Requirement: Additional synthetic behavior\n\nThe system SHALL do the additional synthetic thing.\n\n#### Scenario: Additional synthetic case\n\n- **WHEN** the probe runs again\n- **THEN** it reports success\n",
+        String::from_utf8(original.clone()).unwrap()
+    );
+    fs::write(&change_spec, changed).unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("changed conditions require remeasurement"),
+        "the resume names the required remeasurement: {output}"
+    );
+    assert!(
+        output.contains("cannot be reused"),
+        "the comparison records the exact refusal: {output}"
+    );
+    let cursor = fixture.cursor();
+    let baseline_attempt = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["role"] == "baseline")
+        .unwrap();
+    assert_eq!(baseline_attempt["state"], "completed", "{cursor}");
+    assert!(
+        baseline_attempt["reuse_refused"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("planning inputs changed")),
+        "the refused planning inputs are recorded on the attempt: {cursor}"
+    );
+    assert_eq!(
+        dispatched,
+        cursor["attempts"].as_array().unwrap().len(),
+        "no attempt is replayed or added while the arm is not reusable: {cursor}"
+    );
+    assert_eq!(
+        cursor["comparison"]["baseline"]["accepted"],
+        Value::Null,
+        "the refused arm does not enter the comparison: {cursor}"
+    );
+    assert_eq!(
+        cursor["comparison"]["baseline"]["revision"],
+        Value::Null,
+        "{cursor}"
+    );
+    // The useful patch and branch survive the refused reuse exactly.
+    assert_eq!(
+        fs::read_to_string(solution_slot.join("solution.txt")).unwrap(),
+        "solved\n",
+        "the completed arm's committed solution is preserved"
+    );
+    assert_eq!(
+        git_output(&solution_slot, &["rev-parse", "HEAD"]),
+        solution_revision
+    );
+
+    // Restored planning inputs make the same completed arm reusable: it is
+    // consumed without any replay and the candidate dispatch proceeds.
+    fs::write(&change_spec, &original).unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "the restored inputs reuse the retained arm: {status}\n{output}"
+    );
+    assert_eq!(
+        status["comparison"]["baseline"]["revision"].as_str(),
+        Some(solution_revision.as_str()),
+        "{status}"
+    );
+    let cursor = fixture.cursor();
+    let candidate = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["role"] == "candidate")
+        .expect("the candidate dispatch is attempted once the baseline is reusable");
+    assert_eq!(candidate["state"], "failed", "{cursor}");
+    assert!(
+        candidate["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no model request was made"),
+        "{cursor}"
+    );
+
+    // A consumed arm is not reused either while its inputs are invalid: the
+    // pair's remaining work and its decision stay stopped, while the consumed
+    // result itself stays retained.
+    let changed = format!(
+        "{}### Requirement: Another synthetic behavior\n\nThe system SHALL do another synthetic thing.\n\n#### Scenario: Another synthetic case\n\n- **WHEN** the probe runs once more\n- **THEN** it reports success\n",
+        String::from_utf8(original.clone()).unwrap()
+    );
+    fs::write(&change_spec, changed).unwrap();
+    let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("cannot be reused"),
+        "the consumed arm's changed inputs still stop the pair: {output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "blocked", "{status}\n{output}");
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "the remaining arm is not dispatched from a non-reusable pair"
+    );
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"],
+        Value::Null,
+        "{status}"
+    );
+    assert!(status["comparison"]["decision"].is_null(), "{status}");
+
+    // The same applies to the candidate arm: once its interrupted conversation
+    // is retained, changed planning inputs keep it out of the comparison until
+    // the inputs are restored, and then the pair settles exactly once.
+    fs::write(&change_spec, &original).unwrap();
+    let session = session_id("arm-reuse-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 5, 1.0, 1, 1, &session);
+    let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let changed = format!(
+        "{}### Requirement: Yet another synthetic behavior\n\nThe system SHALL do yet another synthetic thing.\n\n#### Scenario: Yet another synthetic case\n\n- **WHEN** the probe runs a final time\n- **THEN** it reports success\n",
+        String::from_utf8(original.clone()).unwrap()
+    );
+    fs::write(&change_spec, changed).unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("cannot be reused"),
+        "the completed candidate arm is held out of the comparison: {output}"
+    );
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "blocked", "{status}\n{output}");
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"],
+        Value::Null,
+        "{status}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "neither arm is replayed while the pair is not reusable"
+    );
+    assert!(status["comparison"]["decision"].is_null(), "{status}");
+
+    // Restored inputs first clear the recorded refusal: the resume returns the
+    // run to its comparison phase without consuming anything, and the next
+    // resume settles the retained candidate once and publishes exactly one
+    // evidence-bound decision.
+    fs::write(&change_spec, &original).unwrap();
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "baseline-attempt", "{status}\n{output}");
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"],
+        Value::Null,
+        "the recovery resume consumes nothing before the recorded refusal is gone: {status}"
+    );
+    assert!(status["comparison"]["decision"].is_null(), "{status}");
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}\n{output}");
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], true,
+        "{status}"
+    );
+    let comments =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &fixture.card)
+            .unwrap();
+    let records = harness_core::benefit_gate::parse_gate_comments(&comments);
+    assert_eq!(
+        records.len(),
+        1,
+        "the exact decision is recorded once, never counted twice: {comments:?}"
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "settling the pair dispatches no model work"
+    );
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(fixture.status_json()["phase"], "decision-recorded");
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "a repeated resume replays neither the decision nor a trial"
     );
 }

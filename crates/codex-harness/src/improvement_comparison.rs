@@ -374,6 +374,9 @@ pub(super) fn advance(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> 
     if !ensure_prepared(run, notes)? {
         return Ok(());
     }
+    if let Some(reason) = reuse_refusal(run) {
+        return block(run, notes, reason);
+    }
     consume_settled_arm(run, ComparisonArm::Baseline, notes)?;
     if run.cursor.phase != Phase::Blocked {
         consume_settled_arm(run, ComparisonArm::Candidate, notes)?;
@@ -385,6 +388,39 @@ pub(super) fn advance(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> 
         publish_decision(run, notes)?;
     }
     run.store.save_cursor(&run.cursor)
+}
+
+/// Why a completed measured arm must not be reused on this advance. A resume
+/// records the refusal on the attempt when the frozen planning inputs changed
+/// while the arm was completed; consuming, pairing or publishing from it would
+/// silently continue a comparison whose recorded conditions no longer hold.
+/// The retained attempt stays untouched (an arm already refused for its own
+/// reason keeps that visible reason), and a later resume that re-validates the
+/// inputs clears the refusal and may reuse it.
+fn reuse_refusal(run: &Run) -> Option<String> {
+    for attempt in &run.cursor.attempts {
+        if !attempt.role.is_measured() || attempt.state != AttemptState::Completed {
+            continue;
+        }
+        let Some(reason) = attempt.reuse_refused.as_deref() else {
+            continue;
+        };
+        let arm = arm_of_role(attempt.role);
+        if run
+            .cursor
+            .comparison
+            .as_ref()
+            .is_some_and(|state| state.arm(arm).condition.is_some())
+        {
+            continue;
+        }
+        return Some(format!(
+            "the completed {} arm attempt {} cannot be reused: {reason}; changed conditions require remeasurement, and the retained attempt is preserved and never replayed automatically",
+            arm.as_str(),
+            attempt.id
+        ));
+    }
+    None
 }
 
 /// The model-free comparison preparation, idempotent across resumes. Returns
@@ -542,7 +578,7 @@ fn ensure_prepared(run: &mut Run, notes: &mut Vec<String>) -> io::Result<bool> {
 
 /// Qualify or revalidate the workload's own OpenSpec change inside the
 /// declared task project. A changed or missing receipt blocks dependent work.
-fn ensure_workload_planning(run: &Run, comparison: &ComparisonInputs) -> Result<(), String> {
+fn ensure_workload_planning(run: &mut Run, comparison: &ComparisonInputs) -> Result<(), String> {
     let path = run.store.comparison_planning_path();
     let openspec = OpenSpec::default();
     let receipt: PlanningReceipt = if path.is_file() {
@@ -562,7 +598,16 @@ fn ensure_workload_planning(run: &Run, comparison: &ComparisonInputs) -> Result<
     };
     openspec
         .revalidate(&receipt)
-        .map_err(|error| format!("the workload planning inputs changed: {error}"))
+        .map_err(|error| format!("the workload planning inputs changed: {error}"))?;
+    // The retained receipt is recovery data of the frozen experiment
+    // planning: record its locator in the comparison state so a resume reads
+    // the evidence reference from the cursor instead of re-deriving it.
+    if let Some(state) = run.cursor.comparison.as_mut()
+        && state.planning.as_deref() != Some(path.as_path())
+    {
+        state.planning = Some(path);
+    }
+    Ok(())
 }
 
 /// Workload B's own durable owner: the card must exist, be a hypothesis, not
