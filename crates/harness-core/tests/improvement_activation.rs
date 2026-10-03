@@ -12,16 +12,16 @@ use harness_core::benefit_gate::{
 };
 use harness_core::board_feedback;
 use harness_core::board_hypothesis::{
-    self, Admission, BoundedHypothesis, BoundedRemovalDecision, BoundedRemovalProposal,
-    HypothesisDraft, RemovalAction, RemovalDecisionDraft, RemovalDecisionKind,
-    RemovalProposalDraft,
+    self, Admission, BoundedHypothesis, BoundedImplementation, BoundedRemovalDecision,
+    BoundedRemovalProposal, HypothesisDraft, HypothesisRole, ImplementationDraft, RemovalAction,
+    RemovalDecisionDraft, RemovalDecisionKind, RemovalProposalDraft,
 };
 use harness_core::build_identity;
 use harness_core::improvement_activation::{
     ActivationOutcome,
     ActivationOutcome::{Activated, Confirmed},
     ActivationRequest, Blocked, CheckOutput, CheckReceipt, CheckSpec, IntegrationOutcome,
-    IntegrationReceipt, IntegrationRequest, RECEIPT_SCHEMA, activate, integrate,
+    IntegrationReceipt, IntegrationRequest, RECEIPT_SCHEMA, WorkloadLineage, activate, integrate,
 };
 use harness_core::improvement_experiment::{
     Arm, ArmBinding, ExperimentBindings, PreparedVariant, prepare_home, prepare_variant,
@@ -1057,6 +1057,7 @@ fn gate_only_receipt() -> IntegrationReceipt {
             stdout: output("receipt-stdout"),
             stderr: output("receipt-stderr"),
         },
+        workload_lineage: Vec::new(),
     }
 }
 
@@ -2615,4 +2616,253 @@ fn activation_requires_verified_consumption_and_binds_the_integrated_revision() 
         "{}",
         blocked.reason
     );
+}
+
+// ---------------------------------------------------------------------------
+// A-on-B to B-on-C lineage: the useful B solutions stay under their Beads
+// owner, and the resulting baseline records the exact retained solution it
+// contains even when rebasing onto a new baseline changed its identity.
+// ---------------------------------------------------------------------------
+
+/// One differing valid B solution committed from the same frozen base, exactly
+/// as one measured arm of the predecessor A-on-B experiment produced it. The
+/// scratch worktree is removed afterwards, so the commit survives only as a
+/// retained revision of the source repository.
+fn retained_solution(
+    source: &Path,
+    scratch: &Path,
+    base: &str,
+    content: &str,
+    message: &str,
+) -> String {
+    git(
+        source,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            scratch.to_str().unwrap(),
+            base,
+        ],
+    );
+    fs::write(scratch.join("crates/one/src/lib.rs"), content).unwrap();
+    git(scratch, &["add", "."]);
+    git(scratch, &["commit", "-qm", message]);
+    let revision = rev(scratch);
+    git(
+        source,
+        &["worktree", "remove", "--force", scratch.to_str().unwrap()],
+    );
+    revision
+}
+
+/// Record one retained `role=workload` implementation on the run's own
+/// hypothesis card, exactly as the comparison owner retains an independently
+/// accepted arm solution.
+fn record_retained_solution(scenario: &Scenario, branch: &str, base: &str, revision: &str) {
+    let implementation = BoundedImplementation::try_from_draft(ImplementationDraft {
+        role: HypothesisRole::Workload,
+        branch: branch.to_owned(),
+        base: base.to_owned(),
+        revision: revision.to_owned(),
+        worktree: format!("wt/{branch}"),
+        runtime: None,
+        baseline_runtime: None,
+    })
+    .unwrap();
+    board_hypothesis::record_implementation(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &implementation,
+    )
+    .unwrap();
+}
+
+/// The supported transition: A was adopted (the mainline is the resulting
+/// baseline), B's card retains two differing valid arm solutions, and B's own
+/// candidate rebased onto that baseline integrates with its exact retained
+/// lineage recorded. The lineage names the retained revision, not the rebased
+/// candidate identity that changed.
+#[test]
+fn a_rebased_retained_solution_keeps_its_exact_lineage_on_the_resulting_baseline() {
+    let mut scenario = fixture_scenario("improvement-activation-lineage-", Fixture::Adopt);
+    let source = scenario.source.clone();
+    let frozen = rev(&source);
+    let retained_baseline = retained_solution(
+        &source,
+        &scenario.root.path().join("scratch-baseline"),
+        &frozen,
+        "pub fn one() { /* baseline arm B solution */ }\n",
+        "baseline arm solves B",
+    );
+    let retained_candidate = retained_solution(
+        &source,
+        &scenario.root.path().join("scratch-candidate"),
+        &frozen,
+        "pub fn one() { /* candidate arm B solution */ }\n",
+        "candidate arm solves B",
+    );
+    assert_ne!(retained_baseline, retained_candidate);
+    record_retained_solution(&scenario, "workload-baseline", &frozen, &retained_baseline);
+    record_retained_solution(
+        &scenario,
+        "workload-candidate",
+        &frozen,
+        &retained_candidate,
+    );
+    // A retained revision that is not an object of this repository cannot be
+    // attributed to anything this baseline carries.
+    record_retained_solution(&scenario, "workload-foreign", &frozen, &"0".repeat(40));
+
+    // A's adoption advanced the mainline: the resulting baseline carries a
+    // source file that neither B solution touches.
+    fs::write(source.join("crates/one/src/from-a.rs"), "pub fn a() {}\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-qm", "adopted predecessor A"]);
+    let resulting = rev(&source);
+
+    // B is independently selected next: its candidate branch is based on the
+    // resulting baseline and carries the exact candidate-arm change, so the
+    // rebase changed the commit identity but not the solution.
+    let mut checkout = allocate_candidate_checkout(
+        &source,
+        &scenario.root.path().join("alloc/b-on-c"),
+        "hypothesis-b",
+        &resulting,
+    )
+    .unwrap();
+    fs::write(
+        checkout.path.join("crates/one/src/lib.rs"),
+        "pub fn one() { /* candidate arm B solution */ }\n",
+    )
+    .unwrap();
+    git(&checkout.path, &["add", "."]);
+    git(&checkout.path, &["commit", "-qm", "rebased candidate B"]);
+    checkout.revision = rev(&checkout.path);
+    assert_ne!(checkout.revision, retained_candidate);
+    scenario.bindings.candidate = checkout.clone();
+    scenario.bindings.base_revision = resulting.clone();
+    scenario.spec.base_revision = resulting.clone();
+    publish(&scenario);
+
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
+    else {
+        panic!("the supported B-on-C candidate integrates against the resulting baseline");
+    };
+    assert_eq!(receipt.base_revision, resulting);
+    assert_eq!(receipt.integrated_revision, checkout.revision);
+    assert_ne!(
+        receipt.integrated_revision, retained_candidate,
+        "the rebased candidate has a changed identity"
+    );
+    assert_eq!(
+        receipt.workload_lineage,
+        vec![WorkloadLineage {
+            item: scenario.item.clone(),
+            branch: "workload-candidate".to_owned(),
+            base: frozen.clone(),
+            revision: retained_candidate.clone(),
+        }],
+        "the exact retained solution is recorded, and only the matching one"
+    );
+    assert_eq!(rev(&source), checkout.revision);
+}
+
+/// A rejected predecessor leaves the mainline at the frozen base, so the
+/// exact retained B revision can be selected unchanged: the lineage and the
+/// integrated revision are one identity.
+#[test]
+fn a_rejected_predecessor_keeps_the_exact_retained_solution_revision() {
+    let mut scenario = fixture_scenario("improvement-activation-exact-", Fixture::Adopt);
+    let source = scenario.source.clone();
+    let frozen = rev(&source);
+    let retained = retained_solution(
+        &source,
+        &scenario.root.path().join("scratch-retained"),
+        &frozen,
+        "pub fn one() { /* retained B solution */ }\n",
+        "an arm solves B",
+    );
+    record_retained_solution(&scenario, "workload-baseline", &frozen, &retained);
+
+    // A was rejected: the accepted baseline is unchanged, and B's candidate is
+    // the exact retained revision under its original identity.
+    let mut checkout = allocate_candidate_checkout(
+        &source,
+        &scenario.root.path().join("alloc/exact"),
+        "hypothesis-b",
+        &frozen,
+    )
+    .unwrap();
+    git(&checkout.path, &["reset", "--hard", &retained]);
+    checkout.revision = retained.clone();
+    scenario.bindings.candidate = checkout.clone();
+    scenario.bindings.base_revision = frozen.clone();
+    scenario.spec.base_revision = frozen.clone();
+    publish(&scenario);
+
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
+    else {
+        panic!("the exact retained revision integrates onto the unchanged baseline");
+    };
+    assert_eq!(receipt.integrated_revision, retained);
+    assert_eq!(
+        receipt.workload_lineage,
+        vec![WorkloadLineage {
+            item: scenario.item.clone(),
+            branch: "workload-baseline".to_owned(),
+            base: frozen,
+            revision: retained.clone(),
+        }]
+    );
+    assert_eq!(rev(&source), retained);
+}
+
+/// B-on-C stays optional: a candidate that carries a different change than
+/// every retained solution integrates normally and attributes no retained
+/// lineage, so another revision's solution is never credited.
+#[test]
+fn a_candidate_with_a_different_change_records_no_retained_lineage() {
+    let mut scenario = fixture_scenario("improvement-activation-different-", Fixture::Adopt);
+    let source = scenario.source.clone();
+    let frozen = rev(&source);
+    let retained = retained_solution(
+        &source,
+        &scenario.root.path().join("scratch-other"),
+        &frozen,
+        "pub fn one() { /* an arm's B solution */ }\n",
+        "an arm solves B",
+    );
+    record_retained_solution(&scenario, "workload-candidate", &frozen, &retained);
+
+    let mut checkout = allocate_candidate_checkout(
+        &source,
+        &scenario.root.path().join("alloc/fresh"),
+        "hypothesis-b",
+        &frozen,
+    )
+    .unwrap();
+    fs::write(
+        checkout.path.join("crates/one/src/lib.rs"),
+        "pub fn one() { /* a different B implementation */ }\n",
+    )
+    .unwrap();
+    git(&checkout.path, &["add", "."]);
+    git(&checkout.path, &["commit", "-qm", "fresh candidate B"]);
+    checkout.revision = rev(&checkout.path);
+    scenario.bindings.candidate = checkout.clone();
+    scenario.bindings.base_revision = frozen.clone();
+    scenario.spec.base_revision = frozen.clone();
+    publish(&scenario);
+
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
+    else {
+        panic!("a fresh candidate without a retained lineage still integrates");
+    };
+    assert!(receipt.workload_lineage.is_empty());
+    assert_eq!(rev(&source), checkout.revision);
 }

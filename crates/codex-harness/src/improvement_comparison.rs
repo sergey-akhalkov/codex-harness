@@ -2233,20 +2233,6 @@ fn consume_settled_arm(
             );
         }
     };
-    // The verified workload implementation is retained under its own durable
-    // owner (B's card) with the exact arm and revision; B's later benefit
-    // verdict is a separate decision and is not required for this reference.
-    if let Err(reason) = record_workload_implementation(run, &comparison, arm, &solution) {
-        return block(
-            run,
-            notes,
-            format!(
-                "the verified {} arm implementation could not be retained on workload card {}: {reason}",
-                arm.as_str(),
-                comparison.workload_card
-            ),
-        );
-    }
     let acceptance = match run_oracle(run, &comparison, arm, &solution) {
         Ok(acceptance) => acceptance,
         Err(reason) => {
@@ -2260,6 +2246,26 @@ fn consume_settled_arm(
             );
         }
     };
+    // Only an arm whose frozen independent acceptance passed leaves a usable
+    // B artifact: the verified implementation is retained under its own
+    // durable owner (B's card) with the exact arm and revision, so a later
+    // exact B candidate can be selected only from independently justified
+    // solutions. B's later benefit verdict is a separate decision and is not
+    // required for this reference; a failed arm stays visible through its
+    // retained attempt and acceptance record and is never selectable.
+    if acceptance.passed
+        && let Err(reason) = record_workload_implementation(run, &comparison, arm, &solution)
+    {
+        return block(
+            run,
+            notes,
+            format!(
+                "the verified {} arm implementation could not be retained on workload card {}: {reason}",
+                arm.as_str(),
+                comparison.workload_card
+            ),
+        );
+    }
     let row = build_row(
         run,
         &comparison,
@@ -2343,10 +2349,13 @@ fn refuse_arm(
     )
 }
 
-/// Retain one verified workload implementation under B's own card. The record
-/// names the frozen base, the exact verified solution revision, the owned
-/// worktree and the arm runtime actually consumed; it does not depend on B's
-/// later benefit verdict.
+/// Retain one independently accepted workload implementation under B's own
+/// card. The record names the frozen base, the exact verified solution
+/// revision, the owned worktree and the arm runtime actually consumed; it does
+/// not depend on B's later benefit verdict. Called only after the arm's frozen
+/// acceptance passed, so every retained artifact is independently justified
+/// and can be selected as an exact B candidate later, while a failed arm's
+/// solution is never presented as one.
 fn record_workload_implementation(
     run: &Run,
     comparison: &ComparisonInputs,
