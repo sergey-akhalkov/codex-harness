@@ -83,6 +83,7 @@ fn run_inputs_reject_missing_or_inconsistent_fields() {
         model: Some("deepseek-flash".to_owned()),
         model_provider: None,
         reasoning_effort: None,
+        retry: None,
     });
     assert!(pair.validate().is_err());
 
@@ -1049,6 +1050,10 @@ fn evidence_locators_are_stable_and_path_safe() {
     assert!(evidence_locator("../escape.jsonl").is_none());
     assert!(evidence_locator("/rooted.jsonl").is_none());
     assert!(evidence_locator("C:/drive.jsonl").is_none());
+    assert!(evidence_locator(r"\\server\share\x.jsonl").is_none());
+    assert!(evidence_locator("rollouts/../../escape.jsonl").is_none());
+    assert!(evidence_locator("file:rollouts/x.jsonl").is_none());
+    assert!(evidence_locator("rollouts/").is_some());
     assert!(evidence_locator("   ").is_none());
 }
 
@@ -1114,6 +1119,8 @@ fn cursor_round_trips_intake_and_candidate_state_with_legacy_defaults() {
     let decoded: Cursor = serde_json::from_value(legacy).unwrap();
     assert!(decoded.intake.is_none());
     assert!(decoded.candidate.is_none());
+    assert_eq!(decoded.attempts_dropped, 0);
+    assert_eq!(decoded.retry, RetryPolicy::default());
 
     // A run that already validated one candidate does not silently switch
     // hypotheses.
@@ -1202,6 +1209,7 @@ fn comparison_spec(root: &Path, name: &str) -> RunSpec {
         model: None,
         model_provider: None,
         reasoning_effort: None,
+        retry: None,
     });
     spec.local_runner = Some(crate::outcome_qualification::LocalRunner {
         endpoint: "http://127.0.0.1:45999/v1".to_owned(),
@@ -1426,4 +1434,554 @@ fn comparison_state_round_trips_and_defaults_without_legacy_state() {
     let parsed: Cursor = serde_json::from_value(legacy).unwrap();
     assert!(parsed.comparison.is_none());
     assert!(parsed.intake.is_none());
+}
+
+/// The gate facts of a run whose visible surface is actually available.
+fn ready_facts(root: &Path) -> DispatchFacts {
+    let launcher = root.join("codex.exe");
+    fs::write(&launcher, "fixture").unwrap();
+    DispatchFacts {
+        runner_declared: true,
+        launcher: Some(launcher),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn retry_policy_grows_bounded_and_is_validated_with_the_run_inputs() {
+    let policy = RetryPolicy::default();
+    assert_eq!(policy.delay_ms(0), 0);
+    assert_eq!(
+        policy.delay_ms(1),
+        0,
+        "a single refusal keeps the documented immediate explicit-retry path"
+    );
+    assert_eq!(policy.delay_ms(2), DEFAULT_RETRY_INITIAL_MS);
+    assert_eq!(policy.delay_ms(3), 2 * DEFAULT_RETRY_INITIAL_MS);
+    assert_eq!(policy.delay_ms(4), 4 * DEFAULT_RETRY_INITIAL_MS);
+    assert_eq!(policy.delay_ms(64), DEFAULT_RETRY_MAX_MS);
+    let constant = RetryPolicy {
+        initial_ms: 500,
+        factor_percent: 100,
+        max_ms: 5_000,
+    };
+    assert_eq!(constant.delay_ms(2), 500);
+    assert_eq!(constant.delay_ms(9), 500);
+    assert!(
+        RetryPolicy {
+            initial_ms: 0,
+            ..policy
+        }
+        .validate("test policy")
+        .is_err()
+    );
+    assert!(
+        RetryPolicy {
+            factor_percent: 99,
+            ..policy
+        }
+        .validate("test policy")
+        .is_err()
+    );
+    assert!(
+        RetryPolicy {
+            initial_ms: 1_000,
+            factor_percent: 200,
+            max_ms: 999,
+        }
+        .validate("test policy")
+        .is_err()
+    );
+    assert!(
+        RetryPolicy {
+            initial_ms: 1_000,
+            factor_percent: 200,
+            max_ms: MAX_RETRY_MS + 1,
+        }
+        .validate("test policy")
+        .is_err()
+    );
+
+    // The declared policy travels with the runner profile and is validated
+    // with the run inputs before any dispatch.
+    let root = fixture_root("retry-inputs");
+    let mut spec = spec_fixture(root.path(), "retry-inputs");
+    spec.runner = Some(RunnerInputs {
+        profile: "ds".to_owned(),
+        model: None,
+        model_provider: None,
+        reasoning_effort: None,
+        retry: Some(RetryPolicy {
+            initial_ms: 0,
+            ..RetryPolicy::default()
+        }),
+    });
+    assert!(spec.validate().is_err());
+    spec.runner.as_mut().unwrap().retry = Some(RetryPolicy {
+        initial_ms: 2_000,
+        factor_percent: 150,
+        max_ms: 30_000,
+    });
+    spec.validate().expect("a bounded retry policy validates");
+    assert_eq!(spec.retry_policy().initial_ms, 2_000);
+    spec.runner.as_mut().unwrap().retry = None;
+    assert_eq!(spec.retry_policy(), RetryPolicy::default());
+}
+
+#[test]
+fn dispatch_gate_applies_configured_bounded_backoff_to_refused_dispatches() {
+    let ctx = tempfile::tempdir().unwrap();
+    let facts = ready_facts(ctx.path());
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    cursor.retry = RetryPolicy {
+        initial_ms: 1_000,
+        factor_percent: 200,
+        max_ms: 4_000,
+    };
+    let now = now_ms();
+    let mut refused = attempt("inv-1", AttemptRole::Investigator, AttemptState::Failed);
+    refused.reason = Some(
+        "dispatch refused before submission: the local endpoint was unreachable; no fallback was attempted and no model request was made"
+            .to_owned(),
+    );
+    refused.updated_ms = now;
+    cursor.push_attempt(refused).unwrap();
+
+    // A single refusal keeps the documented immediate explicit-retry path:
+    // the operator's resume can prepare the fresh attempt at once.
+    assert_eq!(
+        dispatch_gate(&cursor, AttemptRole::Investigator, &facts),
+        DispatchGate::Ready
+    );
+    // A refusal of one role does not throttle an independent role; measured
+    // attempts are serialized separately by the active-attempt rule.
+    assert_eq!(
+        dispatch_gate(&cursor, AttemptRole::Implementer, &facts),
+        DispatchGate::Ready
+    );
+
+    // A second consecutive refusal is a persistent endpoint failure: the
+    // configured bounded window applies and the reason stays visible.
+    let mut persistent = cursor.clone();
+    let mut second = attempt("inv-2", AttemptRole::Investigator, AttemptState::Failed);
+    second.reason = Some(
+        "dispatch refused before submission: the local endpoint was unreachable; no fallback was attempted and no model request was made"
+            .to_owned(),
+    );
+    second.updated_ms = now.saturating_sub(500);
+    persistent.push_attempt(second).unwrap();
+    match dispatch_gate(&persistent, AttemptRole::Investigator, &facts) {
+        DispatchGate::Blocked { reason } => {
+            assert!(reason.contains("endpoint backoff"), "{reason}");
+            assert!(reason.contains("attempt inv-2"), "{reason}");
+            assert!(reason.contains("2 time(s)"), "{reason}");
+            assert!(reason.contains("1000 ms"), "{reason}");
+            assert!(
+                reason.contains("no other provider or route is substituted"),
+                "{reason}"
+            );
+            assert!(reason.contains("completed work is preserved"), "{reason}");
+        }
+        other => panic!("expected the bounded backoff, got {other:?}"),
+    }
+
+    // Once the configured window has elapsed the same recorded state is ready
+    // again; the retry itself stays a fresh attempt, never a replay.
+    persistent.attempts.last_mut().unwrap().updated_ms = now.saturating_sub(10_000);
+    assert_eq!(
+        dispatch_gate(&persistent, AttemptRole::Investigator, &facts),
+        DispatchGate::Ready
+    );
+
+    // Each consecutive refusal grows the delay up to the configured cap.
+    let mut doubling = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    doubling.retry = RetryPolicy {
+        initial_ms: 1_000,
+        factor_percent: 200,
+        max_ms: 4_000,
+    };
+    for (id, at) in [
+        ("inv-1", now.saturating_sub(9_000)),
+        ("inv-2", now.saturating_sub(9_000)),
+        ("inv-3", now.saturating_sub(1_500)),
+    ] {
+        let mut refused = attempt(id, AttemptRole::Investigator, AttemptState::Failed);
+        refused.reason =
+            Some("dispatch refused before submission: no model request was made".to_owned());
+        refused.updated_ms = at;
+        doubling.push_attempt(refused).unwrap();
+    }
+    let window = doubling
+        .dispatch_backoff(AttemptRole::Investigator, now)
+        .expect("the third consecutive refusal is still inside its bounded window");
+    assert_eq!(window.failures, 3);
+    assert_eq!(window.delay_ms, 2_000);
+    assert_eq!(window.ready_at_ms, now.saturating_sub(1_500) + 2_000);
+    for id in ["inv-4", "inv-5", "inv-6"] {
+        let mut refused = attempt(id, AttemptRole::Investigator, AttemptState::Failed);
+        refused.reason =
+            Some("dispatch refused before submission: no model request was made".to_owned());
+        refused.updated_ms = now;
+        doubling.push_attempt(refused).unwrap();
+    }
+    assert_eq!(
+        doubling
+            .dispatch_backoff(AttemptRole::Investigator, now)
+            .unwrap()
+            .delay_ms,
+        4_000,
+        "the configured cap bounds the growth"
+    );
+
+    // A settled model attempt ends the retry chain: a model effect is never
+    // replayed, so it imposes no backoff.
+    doubling
+        .push_attempt(attempt(
+            "inv-7",
+            AttemptRole::Investigator,
+            AttemptState::Completed,
+        ))
+        .unwrap();
+    assert!(
+        doubling
+            .dispatch_backoff(AttemptRole::Investigator, now)
+            .is_none()
+    );
+    assert_eq!(
+        dispatch_gate(&doubling, AttemptRole::Investigator, &facts),
+        DispatchGate::Ready
+    );
+}
+
+#[test]
+fn researcher_and_measured_dispatch_never_overlap_on_shared_inference() {
+    let ctx = tempfile::tempdir().unwrap();
+    let facts = ready_facts(ctx.path());
+    let mut measured = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    measured
+        .push_attempt(attempt(
+            "base-1",
+            AttemptRole::Baseline,
+            AttemptState::Started,
+        ))
+        .unwrap();
+    match dispatch_gate(&measured, AttemptRole::Investigator, &facts) {
+        DispatchGate::Blocked { reason } => {
+            assert!(reason.contains("base-1"), "{reason}");
+            assert!(reason.contains("baseline"), "{reason}");
+            assert!(reason.contains("until it finishes"), "{reason}");
+        }
+        other => panic!("expected the measured attempt to serialize model work, got {other:?}"),
+    }
+    // The frozen runtime keeps its slot: no variant is selected while the
+    // measured attempt is active.
+    assert!(selection_gate(&measured, "candidate", None).is_err());
+
+    // The reverse direction: researcher work in flight blocks both measured
+    // arms, so loop-generated researcher inference cannot overlap an arm.
+    let mut researcher = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    researcher
+        .push_attempt(attempt(
+            "inv-1",
+            AttemptRole::Investigator,
+            AttemptState::Started,
+        ))
+        .unwrap();
+    for role in [
+        AttemptRole::Baseline,
+        AttemptRole::Candidate,
+        AttemptRole::Implementer,
+        AttemptRole::Planner,
+    ] {
+        assert!(
+            matches!(
+                dispatch_gate(&researcher, role, &facts),
+                DispatchGate::Blocked { .. }
+            ),
+            "{role:?} must not overlap the active researcher conversation"
+        );
+    }
+}
+
+#[test]
+fn bounded_attempt_retention_releases_only_unprotected_records() {
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    for index in 0..MAX_ATTEMPTS {
+        let mut settled = attempt(
+            &format!("inv-{index}"),
+            AttemptRole::Investigator,
+            AttemptState::Completed,
+        );
+        settled.updated_ms = index as u64;
+        cursor.push_attempt(settled).unwrap();
+    }
+    cursor
+        .push_attempt(attempt(
+            "inv-next",
+            AttemptRole::Investigator,
+            AttemptState::Completed,
+        ))
+        .unwrap();
+    assert_eq!(
+        cursor.attempts.len(),
+        MAX_ATTEMPTS,
+        "retention stays bounded"
+    );
+    assert_eq!(cursor.attempts_dropped, 1);
+    assert!(
+        cursor.attempt("inv-0").is_none(),
+        "the oldest settled record is released"
+    );
+    assert!(cursor.attempt("inv-next").is_some());
+    assert_eq!(cursor.attempts.last().unwrap().id, "inv-next");
+    assert!(
+        cursor
+            .effects
+            .iter()
+            .any(|effect| effect.kind == EffectKind::AttemptsReleased)
+    );
+
+    // An unresolved outcome and the exact attempts the candidate/comparison
+    // state references stay protected; only the unreferenced settled record
+    // is released.
+    let mut protected = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    protected.comparison = Some(ComparisonState::new("d".repeat(64)));
+    protected.comparison.as_mut().unwrap().candidate.attempt = Some("cand-1".to_owned());
+    protected
+        .push_attempt(attempt(
+            "cand-1",
+            AttemptRole::Candidate,
+            AttemptState::Completed,
+        ))
+        .unwrap();
+    for index in 0..(MAX_ATTEMPTS - 2) {
+        protected
+            .push_attempt(attempt(
+                &format!("inv-{index}"),
+                AttemptRole::Investigator,
+                AttemptState::Completed,
+            ))
+            .unwrap();
+    }
+    let mut unresolved = attempt(
+        "inv-unresolved",
+        AttemptRole::Investigator,
+        AttemptState::Unknown,
+    );
+    unresolved.updated_ms = 1;
+    protected.push_attempt(unresolved).unwrap();
+    assert_eq!(protected.attempts.len(), MAX_ATTEMPTS);
+    protected
+        .push_attempt(attempt(
+            "inv-extra",
+            AttemptRole::Investigator,
+            AttemptState::Completed,
+        ))
+        .unwrap();
+    assert!(
+        protected.attempt("cand-1").is_some(),
+        "the referenced candidate attempt is protected"
+    );
+    assert!(
+        protected.attempt("inv-unresolved").is_some(),
+        "an unresolved outcome stays for recovery"
+    );
+    assert_eq!(protected.attempts_dropped, 1);
+    assert!(
+        protected.attempt("inv-0").is_none(),
+        "the oldest unreferenced record is released first"
+    );
+
+    // When every record is protected, growth is refused explicitly instead of
+    // silently dropping pending recovery; the bound is a retention bound and
+    // never a lifetime cap for settled work.
+    let mut saturated = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    for index in 0..MAX_ATTEMPTS {
+        saturated
+            .push_attempt(attempt(
+                &format!("act-{index}"),
+                AttemptRole::Baseline,
+                AttemptState::Unknown,
+            ))
+            .unwrap();
+    }
+    let error = saturated
+        .push_attempt(attempt(
+            "act-next",
+            AttemptRole::Baseline,
+            AttemptState::Unknown,
+        ))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("every record is protected"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retained_evidence_reports_missing_changed_and_unretained_artifacts() {
+    let root = fixture_root("unsupported");
+    let spec = spec_fixture(root.path(), "unsupported");
+    let run_dir = root.path().join("run");
+    let change_root = root.path().join("openspec/changes/add-synthetic");
+    let store = RunStore::create(&run_dir, &spec, &spec.digest().unwrap(), &change_root).unwrap();
+    let receipt = root.path().join("spawn-9.json");
+    fs::write(&receipt, b"{\"observation\":{\"state\":\"completed\"}}\n").unwrap();
+    let result = root.path().join("message-9.txt");
+    fs::write(&result, "final answer\n").unwrap();
+
+    let retained = store
+        .retain_evidence("impl-9", &receipt, Some(&result))
+        .unwrap();
+    assert!(retained.verify().is_ok());
+    assert_eq!(retained.unsupported_reason(), None);
+    let mut record = attempt("impl-9", AttemptRole::Implementer, AttemptState::Completed);
+    record.receipt = Some(receipt.clone());
+    record.retained = Some(retained.clone());
+    assert_eq!(record.unsupported_evidence(), None);
+
+    // A released or expired snapshot is named explicitly instead of being
+    // reconstructed from a summary.
+    fs::remove_file(&retained.receipt).unwrap();
+    match retained.verify().unwrap_err() {
+        RetainedEvidenceFault::Missing { artifact, .. } => assert_eq!(artifact, "receipt"),
+        other => panic!("expected a missing artifact, got {other:?}"),
+    }
+    let unsupported = record.unsupported_evidence().unwrap();
+    assert!(
+        unsupported.contains("impl-9")
+            && unsupported.contains("no longer available")
+            && unsupported.contains("unsupported"),
+        "{unsupported}"
+    );
+
+    // A snapshot that changed after retention is refused by its digest.
+    let retained = store
+        .retain_evidence("impl-9", &receipt, Some(&result))
+        .unwrap();
+    fs::write(&retained.receipt, b"tampered\n").unwrap();
+    match retained.verify().unwrap_err() {
+        RetainedEvidenceFault::Changed { artifact, .. } => assert_eq!(artifact, "receipt"),
+        other => panic!("expected a changed artifact, got {other:?}"),
+    }
+
+    // A result that was not retained within its bound keeps its explicit
+    // cause; the receipt snapshot itself stays available.
+    let oversized = root.path().join("oversized-9.txt");
+    fs::write(
+        &oversized,
+        vec![b'x'; (MAX_RETAINED_RESULT_BYTES + 1) as usize],
+    )
+    .unwrap();
+    let partial = store
+        .retain_evidence("impl-10", &receipt, Some(&oversized))
+        .unwrap();
+    assert!(partial.verify().is_ok());
+    let reason = partial.unsupported_reason().unwrap();
+    assert!(reason.contains("not retained"), "{reason}");
+
+    // A completed attempt whose evidence never entered the store, and a
+    // refusal that made no model request, stay distinguishable.
+    let mut never = attempt("impl-11", AttemptRole::Implementer, AttemptState::Completed);
+    never.receipt = Some(receipt);
+    assert!(
+        never
+            .unsupported_evidence()
+            .unwrap()
+            .contains("not retained")
+    );
+    assert_eq!(
+        attempt("impl-12", AttemptRole::Implementer, AttemptState::Failed).unsupported_evidence(),
+        None
+    );
+
+    // The cursor surfaces exactly the unsupported attempts.
+    let mut cursor = Cursor::new(
+        "loop-fixture",
+        "a".repeat(64),
+        PathBuf::from(r"C:\work\openspec\changes\x"),
+        "bdct-h1",
+    );
+    cursor.push_attempt(record).unwrap();
+    let reasons = cursor.unsupported_evidence();
+    assert_eq!(reasons.len(), 1);
+    assert!(reasons[0].contains("impl-9"), "{reasons:?}");
+}
+
+#[test]
+fn configured_retry_is_frozen_in_private_state_without_route_details() {
+    let root = fixture_root("publication");
+    let mut spec = spec_fixture(root.path(), "publication");
+    spec.runner = Some(RunnerInputs {
+        profile: "ds".to_owned(),
+        model: None,
+        model_provider: None,
+        reasoning_effort: None,
+        retry: Some(RetryPolicy {
+            initial_ms: 1_500,
+            factor_percent: 300,
+            max_ms: 9_000,
+        }),
+    });
+    spec.local_runner = Some(crate::outcome_qualification::LocalRunner {
+        endpoint: "http://127.0.0.1:45999/v1".to_owned(),
+        model: "synthetic-local".to_owned(),
+        identity: Default::default(),
+    });
+    spec.qualification = Some(root.path().join("qualification.json"));
+    spec.validate().unwrap();
+    let run_dir = root.path().join("run");
+    let change_root = root.path().join("openspec/changes/add-synthetic");
+    let store = RunStore::create(&run_dir, &spec, &spec.digest().unwrap(), &change_root).unwrap();
+    let cursor = store.cursor().unwrap();
+    assert_eq!(
+        cursor.retry,
+        RetryPolicy {
+            initial_ms: 1_500,
+            factor_percent: 300,
+            max_ms: 9_000,
+        },
+        "the configured schedule is frozen with the run"
+    );
+    // The machine-owned recovery state carries no local endpoint, route or
+    // model detail; those stay in the private run inputs.
+    let text = serde_json::to_string(&cursor).unwrap();
+    assert!(!text.contains("127.0.0.1"), "{text}");
+    assert!(!text.contains("http"), "{text}");
+    assert!(!text.contains("synthetic-local"), "{text}");
 }
