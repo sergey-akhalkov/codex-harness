@@ -7,6 +7,9 @@
 //! provider or a subscription.
 #![cfg(windows)]
 
+use harness_core::board_hypothesis::{
+    self, BoundedImplementation, HypothesisRole, ImplementationDraft,
+};
 use harness_core::build_identity::hash_bytes;
 use harness_core::improvement_loop::{AttemptRole, dispatch_owner};
 use harness_core::improvement_policy::{
@@ -709,6 +712,92 @@ fn commit_all(cwd: &Path, message: &str) {
 
 fn head(cwd: &Path) -> String {
     git_output(cwd, &["rev-parse", "HEAD"])
+}
+
+/// One retained workload solution committed in the fixture project's own
+/// repository, exactly as a preserved independently accepted arm solution
+/// leaves it: the scratch worktree is removed and the revision stays an
+/// object of the repository.
+fn retained_solution(
+    proj: &Path,
+    scratch: &Path,
+    base: &str,
+    relative: &str,
+    content: &str,
+    message: &str,
+) -> String {
+    git(
+        proj,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            scratch.to_str().unwrap(),
+            base,
+        ],
+    );
+    fs::write(scratch.join(relative), content).unwrap();
+    commit_all(scratch, message);
+    let revision = head(scratch);
+    git(
+        proj,
+        &["worktree", "remove", "--force", scratch.to_str().unwrap()],
+    );
+    revision
+}
+
+/// Record one retained implementation on the run's hypothesis card, exactly
+/// as the comparison owner records an independently accepted arm solution.
+fn record_retained_solution(
+    fixture: &Fixture,
+    role: HypothesisRole,
+    branch: &str,
+    base: &str,
+    revision: &str,
+) {
+    let implementation = BoundedImplementation::try_from_draft(ImplementationDraft {
+        role,
+        branch: branch.to_owned(),
+        base: base.to_owned(),
+        revision: revision.to_owned(),
+        worktree: format!("retained/{branch}"),
+        runtime: None,
+        baseline_runtime: None,
+    })
+    .expect("the retained implementation record is bounded");
+    board_hypothesis::record_implementation(
+        &fixture.bd,
+        &fixture.proj,
+        &fixture.card,
+        &implementation,
+    )
+    .expect("the hypothesis card records the retained implementation");
+}
+
+/// The activation owner's content identity rule over one committed range:
+/// status and resulting blob identity per changed path, sorted.
+fn change_signature(repo: &Path, base: &str, revision: &str) -> Vec<String> {
+    let raw = git_output(
+        repo,
+        &[
+            "diff",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            base,
+            revision,
+        ],
+    );
+    let mut signature: Vec<String> = raw
+        .lines()
+        .filter_map(|line| {
+            let (meta, path) = line.strip_prefix(':')?.split_once('\t')?;
+            let fields: Vec<&str> = meta.split_whitespace().collect();
+            (fields.len() >= 5).then(|| format!("{} {} {}", fields[4], fields[3], path))
+        })
+        .collect();
+    signature.sort();
+    signature
 }
 
 /// One source file's content with checkout line endings normalized, so a
@@ -1642,6 +1731,269 @@ fn retained_anchor_result_reaches_candidate_ready_through_planning_and_implement
     assert_eq!(
         fixture.cursor()["attempts"].as_array().unwrap().len(),
         attempts
+    );
+}
+
+/// B's run on the resulting baseline: the independently accepted `role=workload`
+/// solution retained on B's own card is materialized onto the freshly
+/// allocated candidate branch without opening any implementer conversation,
+/// and a repeated resume reuses the exact same revision.
+#[test]
+fn a_retained_workload_revision_is_carried_onto_the_candidate_branch() {
+    let fixture = Fixture::new("carry-exact");
+    let base = fixture.base_revision();
+    let retained = retained_solution(
+        &fixture.proj,
+        &fixture.root.join("scratch-retained"),
+        &base,
+        "crates/one/src/lib.rs",
+        "// retained workload solution\n",
+        "the accepted arm solves the workload",
+    );
+    record_retained_solution(
+        &fixture,
+        HypothesisRole::Workload,
+        "workload-candidate",
+        &base,
+        &retained,
+    );
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "candidate-ready", "{report}\n{output}");
+    let carried = report["candidate"]["revision"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!carried.is_empty(), "{report}");
+    let worktree = fixture.candidate_worktree(&fixture.card);
+    assert_eq!(head(&worktree), carried, "{report}");
+    assert_eq!(
+        change_signature(&worktree, &base, &carried),
+        change_signature(&worktree, &base, &retained),
+        "the carried revision reproduces the retained change identity exactly"
+    );
+    assert_eq!(
+        source_content(&worktree.join("crates/one/src/lib.rs")),
+        "// retained workload solution\n"
+    );
+    // No implementer conversation is opened for the model-free carry, and the
+    // candidate-role implementation reference is recorded on the card.
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().clone();
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt["role"] != "implementer"),
+        "{attempts:?}"
+    );
+    assert!(
+        fixture.bd_comments(&fixture.card).contains(&carried),
+        "the card records the carried candidate revision"
+    );
+
+    // A repeated resume reuses the exact retained revision without replay.
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        fixture.status_json()["candidate"]["revision"],
+        json!(carried)
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts.len()
+    );
+}
+
+/// The supported A-on-B to B-on-C transition: A's adoption advanced the
+/// baseline; B's retained solution is rebased onto the resulting baseline as
+/// B's next candidate. The rebase changes the commit identity but not the
+/// exact retained change identity the activation lineage owner verifies.
+#[test]
+fn a_retained_workload_revision_is_rebased_onto_the_resulting_baseline() {
+    let fixture = Fixture::new("carry-rebase");
+    let frozen = fixture.base_revision();
+    let retained = retained_solution(
+        &fixture.proj,
+        &fixture.root.join("scratch-retained"),
+        &frozen,
+        "crates/one/src/lib.rs",
+        "// retained workload solution\n",
+        "the accepted arm solves the workload",
+    );
+    // A was adopted: the resulting baseline carries an unrelated source file
+    // that neither retained solution touches.
+    fs::write(
+        fixture.proj.join("crates/one/src/from-a.rs"),
+        "// adopted predecessor A\n",
+    )
+    .unwrap();
+    commit_all(&fixture.proj, "adopted predecessor A");
+    let resulting = head(&fixture.proj);
+    assert_ne!(resulting, frozen);
+    record_retained_solution(
+        &fixture,
+        HypothesisRole::Workload,
+        "workload-candidate",
+        &frozen,
+        &retained,
+    );
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    assert_eq!(fixture.base_revision(), resulting);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "candidate-ready", "{report}\n{output}");
+    let carried = report["candidate"]["revision"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let worktree = fixture.candidate_worktree(&fixture.card);
+    assert_ne!(
+        carried, retained,
+        "the rebased candidate has a changed commit identity"
+    );
+    assert_eq!(
+        change_signature(&worktree, &resulting, &carried),
+        change_signature(&worktree, &frozen, &retained),
+        "the rebased candidate carries the same exact retained change"
+    );
+    assert_eq!(
+        source_content(&worktree.join("crates/one/src/lib.rs")),
+        "// retained workload solution\n"
+    );
+    assert_eq!(head(&worktree), carried, "{report}");
+    assert!(
+        fixture.bd_comments(&fixture.card).contains(&carried),
+        "the card records the rebased candidate revision"
+    );
+}
+
+/// The independent-justification gate and the no-invented-artifact rule: a
+/// candidate-role record or an unattributable solution yields the ordinary
+/// grounded implementation path, and a retained change that cannot be
+/// materialized exactly (here: it escapes the writable scope) is refused with
+/// its exact reason instead of a fabricated candidate.
+#[test]
+fn only_an_independently_justified_retained_solution_is_carried() {
+    // A candidate-role record - any run's own allocation or implementation -
+    // is not independently justified and is never carried.
+    let fixture = Fixture::new("carry-role-gate");
+    let base = fixture.base_revision();
+    let revision = retained_solution(
+        &fixture.proj,
+        &fixture.root.join("scratch-candidate-role"),
+        &base,
+        "crates/one/src/lib.rs",
+        "// candidate-role change\n",
+        "a candidate-role record",
+    );
+    record_retained_solution(
+        &fixture,
+        HypothesisRole::Candidate,
+        "workload-candidate",
+        &base,
+        &revision,
+    );
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    // The ordinary implementation path is what remains pending: it needs the
+    // installed model launcher this fixture does not provide.
+    assert_eq!(report["phase"], "planning", "{report}");
+    assert_eq!(report["dispatch"]["state"], "blocked", "{report}");
+    assert!(
+        report["dispatch"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("launcher"),
+        "{report}"
+    );
+    assert!(report["candidate"]["revision"].is_null(), "{report}");
+
+    // A workload record whose solution is not an object of this repository is
+    // attributed to nothing; it never fabricates a candidate either.
+    let fixture = Fixture::new("carry-unattributable");
+    let base = fixture.base_revision();
+    record_retained_solution(
+        &fixture,
+        HypothesisRole::Workload,
+        "workload-candidate",
+        &base,
+        &"0".repeat(40),
+    );
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "planning", "{report}");
+    assert_eq!(report["dispatch"]["state"], "blocked", "{report}");
+    assert!(report["candidate"]["revision"].is_null(), "{report}");
+
+    // A retained change that escapes the declared writable scope is refused
+    // with its exact reason: no candidate is fabricated and no substitute
+    // implementation is dispatched.
+    let fixture = Fixture::new("carry-scope");
+    let base = fixture.base_revision();
+    let escaped = retained_solution(
+        &fixture.proj,
+        &fixture.root.join("scratch-escaped"),
+        &base,
+        "global/orchestration.toml",
+        "schema = 2\n",
+        "a change outside the declared writable scope",
+    );
+    record_retained_solution(
+        &fixture,
+        HypothesisRole::Workload,
+        "workload-candidate",
+        &base,
+        &escaped,
+    );
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    let resume = fixture.resume();
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "idle", "{report}\n{output}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or("")
+            .contains("outside the declared writable scope"),
+        "{report}\n{output}"
+    );
+    assert!(report["candidate"]["revision"].is_null(), "{report}");
+    let worktree = fixture.candidate_worktree(&fixture.card);
+    assert_eq!(
+        head(&worktree),
+        base,
+        "the refused carry leaves the candidate branch at its allocation base"
     );
 }
 

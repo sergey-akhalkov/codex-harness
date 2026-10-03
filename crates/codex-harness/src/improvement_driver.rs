@@ -24,8 +24,8 @@ use harness_core::improvement_experiment::{
     select_corroboration,
 };
 use harness_core::improvement_loop::{
-    AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunStore,
-    current_process_identity, owner_is_live, read_json, write_json_atomic,
+    AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunSpec,
+    RunStore, current_process_identity, owner_is_live, read_json, write_json_atomic,
 };
 use harness_core::improvement_policy::{PolicyDecision, PolicyEvaluation};
 use harness_core::improvement_runtime::ArmRuntime;
@@ -204,6 +204,15 @@ struct ContinuationRecord {
     lineage_sha256: Option<String>,
     #[serde(default)]
     decision: Option<String>,
+    /// The successor spec's own hypothesis card, read from its validated
+    /// independent run inputs before it is started; never inferred here.
+    #[serde(default)]
+    hypothesis: Option<String>,
+    /// The evaluation workload the successor's own independently specified
+    /// plan declares. It is that spec's own C and is never inherited from
+    /// this run's experiment.
+    #[serde(default)]
+    workload_card: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
     #[serde(default)]
@@ -2175,6 +2184,16 @@ fn record_lineage(
         .comparison
         .as_ref()
         .map(|comparison| comparison.workload_card.clone());
+    // The activation owner's verified workload lineage - the exact retained
+    // implementations the integrated candidate carries - is consumed here
+    // instead of being lost with the integration receipt: an adopted
+    // baseline keeps its trace to the independently accepted solution, while
+    // a run that never integrated records an empty lineage.
+    let workload_lineage =
+        load_optional::<IntegrationReceipt>(&run.store.root().join(INTEGRATION_FILE))?
+            .map(|receipt| receipt.workload_lineage)
+            .unwrap_or_default();
+    let workload_lineage_count = workload_lineage.len();
     write_json_atomic(
         &path,
         &json!({
@@ -2185,11 +2204,13 @@ fn record_lineage(
             "baseline_revision": comparison.as_ref().and_then(|state| state.baseline.revision.clone()),
             "candidate_revision": comparison.as_ref().and_then(|state| state.candidate.revision.clone()),
             "comparison_dir": run.store.root().join("comparison").display().to_string(),
+            "workload_lineage": workload_lineage,
         }),
     )?;
     notes.push(format!(
-        "controller: retained lineage at {} without rewriting frozen inputs",
-        path.display()
+        "controller: retained lineage at {} without rewriting frozen inputs ({} verified workload solution(s))",
+        path.display(),
+        workload_lineage_count
     ));
     Ok(())
 }
@@ -2294,11 +2315,62 @@ fn finish_continuation(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()>
         lineage: Some(lineage_path.clone()),
         lineage_sha256: Some(lineage_sha256),
         decision: Some(decision.clone()),
+        hypothesis: None,
+        workload_card: None,
         pid: None,
         created: None,
         program: None,
         exit_code: None,
     };
+    // Grounded selection: the successor must be a valid independently
+    // specified run, not merely a file path. Its own declared experiment (the
+    // workload C it evaluates on) is read from that specification and
+    // recorded; nothing is inferred from this run's workload.
+    let successor_spec = match RunSpec::load(&successor.spec) {
+        Ok(spec) => spec,
+        Err(error) => {
+            let note = format!(
+                "the declared successor spec {} is not a valid independent run specification: {error}; no successor controller is started and nothing is manufactured for it",
+                successor.spec.display()
+            );
+            write_json_atomic(
+                &marker,
+                &ContinuationRecord {
+                    phase: "intent".to_owned(),
+                    token: fresh_token(),
+                    note: note.clone(),
+                    ..base.clone()
+                },
+            )?;
+            run.cursor.condition = Some(note.clone());
+            run.cursor
+                .effect(EffectKind::ContinuationRecorded, format!("refused: {note}"));
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(format!("controller: {note}"));
+            return Ok(());
+        }
+    };
+    let base = ContinuationRecord {
+        hypothesis: Some(successor_spec.hypothesis_item.clone()),
+        workload_card: successor_spec
+            .comparison
+            .as_ref()
+            .map(|comparison| comparison.workload_card.clone()),
+        ..base
+    };
+    if run
+        .spec
+        .comparison
+        .as_ref()
+        .map(|comparison| comparison.workload_card.as_str())
+        == base.hypothesis.as_deref()
+    {
+        notes.push(format!(
+            "controller: the independently specified successor investigates {} - this run's evaluated workload - against its own declared workload {}",
+            base.hypothesis.as_deref().unwrap_or_default(),
+            base.workload_card.as_deref().unwrap_or("none")
+        ));
+    }
     // A successor controller that already runs is adopted instead of being
     // started a second time.
     if let Some(owner) = live_successor_owner(&successor.run)? {
@@ -2474,6 +2546,8 @@ fn record_idle_continuation(
             lineage: None,
             lineage_sha256: None,
             decision: None,
+            hypothesis: None,
+            workload_card: None,
             pid: None,
             created: None,
             program: None,
