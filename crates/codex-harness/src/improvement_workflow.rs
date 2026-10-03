@@ -38,7 +38,8 @@ use harness_core::improvement_loop::{
     changed_paths_within_scope, frozen_candidate_removal_digest,
 };
 use harness_core::improvement_spec::{
-    MeasurementReceipt, MeasurementScope, OpenSpec, PlanningReceipt, Specification,
+    MeasurementReceipt, MeasurementScope, OpenSpec, PlanningReceipt, REMOVAL_PROPOSAL_CLAUSES,
+    REMOVAL_PROPOSAL_GUIDE, REMOVAL_PROPOSAL_HEADING, RemovalProposalReceipt, Specification,
 };
 use harness_core::task_worktree::{self, CandidateCheckout, ReuseBlock, WorktreeReuse};
 use std::fs;
@@ -2025,11 +2026,22 @@ fn ensure_planning(
         }
     }
     // A change complete at the current candidate revision needs no
-    // conversation; only a change that does not qualify triggers planning.
+    // conversation; only a change that does not qualify triggers planning. A
+    // removal candidate additionally needs its reviewable removal proposal
+    // stated in the change: without it planning stays incomplete, the bounded
+    // planning conversation authors it first, and no removal effect is applied
+    // during that preparation.
     match openspec.qualify(&target, &run.spec.experiment) {
-        Ok(receipt) => {
-            return store_candidate_receipt(run, candidate, &receipt, notes);
-        }
+        Ok(receipt) => match prepare_removal_proposal(run, candidate, &receipt) {
+            Ok(prepared) => {
+                return store_candidate_receipt(run, candidate, &receipt, prepared.as_ref(), notes);
+            }
+            Err(error) => {
+                notes.push(format!(
+                    "removal proposal: the complete change does not yet state a recordable reviewable removal proposal ({error}); the planning conversation authors it before any decision request and nothing is applied"
+                ));
+            }
+        },
         Err(error) => {
             let text = error.to_string();
             if text.contains("different planning root") || text.contains("different change") {
@@ -2128,12 +2140,156 @@ fn candidate_specification(
     }
 }
 
+/// One resolved reviewable removal proposal: the change-side receipt and the
+/// bounded record the existing hypothesis owner accepts. Resolving and
+/// recording it applies nothing.
+struct PreparedRemovalProposal {
+    /// The reviewed proposal reference recorded on the card.
+    proposal: String,
+    receipt: RemovalProposalReceipt,
+    bounded: board_hypothesis::BoundedRemovalProposal,
+}
+
+/// Resolves the reviewable removal proposal a removal candidate's own
+/// OpenSpec change must state before planning completes: the target and source
+/// references, the unapplied preview, evidence and its gaps, measured versus
+/// predicted benefit, lost scenarios, consumer/configuration/installation
+/// impact, alternatives, retained checks and restoration. `Ok(None)` is an
+/// ordinary candidate; an error names the exact missing or unrecordable
+/// content, and the caller keeps planning incomplete instead of requesting a
+/// decision or applying anything.
+fn prepare_removal_proposal(
+    run: &Run,
+    candidate: &CandidateState,
+    planning: &PlanningReceipt,
+) -> io::Result<Option<PreparedRemovalProposal>> {
+    if !candidate.removal_required {
+        return Ok(None);
+    }
+    let openspec = OpenSpec::default();
+    let proposal = openspec.removal_proposal(planning)?;
+    let reference = match &run.spec.removal {
+        Some(declared) if candidate.hypothesis == run.spec.hypothesis_item => {
+            if proposal.target != declared.target {
+                return Err(invalid(format!(
+                    "the change's removal proposal target {} does not match the run's declared removal target {}; align the reviewed proposal before any removal effect",
+                    proposal.target, declared.target
+                )));
+            }
+            declared.proposal.clone()
+        }
+        _ => format!("openspec/changes/{}", candidate.change),
+    };
+    let section = proposal
+        .artifact
+        .strip_prefix(&planning.change_root)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| proposal.artifact.display().to_string());
+    let detail = format!(
+        "section={section}#{} digest={} clauses={}",
+        proposal.heading,
+        proposal.section_digest,
+        REMOVAL_PROPOSAL_CLAUSES.len()
+    );
+    let bounded = board_hypothesis::BoundedRemovalProposal::try_from_draft(
+        board_hypothesis::RemovalProposalDraft {
+            proposal: reference.clone(),
+            target: proposal.target.clone(),
+            evidence: proposal.evidence.clone(),
+            loss: proposal.loss.clone(),
+            preview: Some(proposal.preview.clone()),
+            detail: Some(detail),
+        },
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "the change's removal proposal is not recordable as a bounded reviewed record: {error}"
+        ))
+    })?;
+    Ok(Some(PreparedRemovalProposal {
+        proposal: reference,
+        receipt: proposal,
+        bounded,
+    }))
+}
+
+/// Records the resolved reviewable removal proposal on the hypothesis card
+/// through the existing board owner, mirroring the clause values the change
+/// states, and freezes the reviewed proposal digest for this candidate. A
+/// later changed proposal version invalidates the frozen review, so it needs a
+/// fresh decision; recording itself applies no removal.
+fn record_removal_proposal(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    prepared: &PreparedRemovalProposal,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let record = board_hypothesis::record_removal_proposal(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+        &prepared.bounded,
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "the reviewable removal proposal could not be recorded on hypothesis card {}: {error}",
+            candidate.hypothesis
+        ))
+    })?;
+    let comments = harness_core::board_feedback::list_comments(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+    )?;
+    candidate.removal_frozen = frozen_candidate_removal_digest(&candidate.hypothesis, &comments);
+    run.cursor.effect(
+        EffectKind::RemovalChecked,
+        format!(
+            "reviewable-removal-proposal proposal={} target={} evidence={} preview={} section={}#{} digest={} reviewed={} record={} applied=nothing",
+            prepared.proposal,
+            prepared.bounded.target,
+            prepared.bounded.evidence,
+            prepared.bounded.preview.as_deref().unwrap_or("none"),
+            prepared.receipt.artifact.display(),
+            prepared.receipt.heading,
+            prepared.receipt.section_digest,
+            candidate.removal_frozen.as_deref().unwrap_or("unknown"),
+            if record.recorded {
+                "written"
+            } else {
+                "already-recorded"
+            }
+        ),
+    );
+    notes.push(format!(
+        "removal proposal: recorded {} for target {} on hypothesis card {} ({}; nothing applied)",
+        prepared.proposal,
+        prepared.bounded.target,
+        candidate.hypothesis,
+        if record.recorded {
+            "written"
+        } else {
+            "already-recorded"
+        }
+    ));
+    Ok(())
+}
+
 fn store_candidate_receipt(
     run: &mut Run,
     candidate: &mut CandidateState,
     receipt: &PlanningReceipt,
+    removal: Option<&PreparedRemovalProposal>,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
+    // A removal candidate's reviewable proposal is recorded before the
+    // planning receipt is retained: the proposal has to be available before
+    // the informed decision is requested, and a failed recording leaves
+    // planning incomplete so the next advance retries it instead of starting
+    // dependent work.
+    if let Some(prepared) = removal {
+        record_removal_proposal(run, candidate, prepared, notes)?;
+    }
     write_json_atomic(&run.store.root().join(CANDIDATE_PLANNING_FILE), receipt)?;
     candidate.planning_receipt = Some(run.store.root().join(CANDIDATE_PLANNING_FILE));
     run.cursor.effect(
@@ -2212,7 +2368,18 @@ fn consume_planner_result(
     let target = candidate_specification(run, &checkout, candidate);
     let openspec = OpenSpec::default();
     match openspec.qualify(&target, &run.spec.experiment) {
-        Ok(receipt) => store_candidate_receipt(run, candidate, &receipt, notes),
+        Ok(receipt) => match prepare_removal_proposal(run, candidate, &receipt) {
+            Ok(prepared) => {
+                store_candidate_receipt(run, candidate, &receipt, prepared.as_ref(), notes)
+            }
+            Err(error) => {
+                let reason = format!(
+                    "the planning conversation finished but the candidate change {} does not state a recordable reviewable removal proposal: {error}; implementation stays undispatched until it is complete and no removal is applied",
+                    candidate.change
+                );
+                refused(run, notes, reason)
+            }
+        },
         Err(error) => {
             let reason = format!(
                 "the planning conversation finished but the candidate change {} does not qualify: {error}; implementation stays undispatched until the missing artifacts are complete",
@@ -2278,8 +2445,15 @@ fn planner_assignment(
         "the board project for the card read is {}",
         run.spec.board.project.display()
     );
+    let removal_objective = if candidate.removal_required {
+        format!(
+            " The change also states the reviewable removal proposal under '{REMOVAL_PROPOSAL_HEADING}' with every required clause; preparing it applies nothing."
+        )
+    } else {
+        String::new()
+    };
     let objective = format!(
-        "Author the complete OpenSpec change {} for the selected hypothesis card {} using the installed OpenSpec CLI in this checkout, and keep the artifacts consistent with the card's mechanism, conditions, predicted effect, counterexample and acceptance. The card read and the run's predeclared acceptance requirements are recorded in the invariants. Run `openspec validate {} --strict --no-interactive` until it passes, then commit the change and leave the tree clean; do not edit product source.",
+        "Author the complete OpenSpec change {} for the selected hypothesis card {} using the installed OpenSpec CLI in this checkout, and keep the artifacts consistent with the card's mechanism, conditions, predicted effect, counterexample and acceptance. The card read and the run's predeclared acceptance requirements are recorded in the invariants. Run `openspec validate {} --strict --no-interactive` until it passes, then commit the change and leave the tree clean; do not edit product source.{removal_objective}",
         candidate.change, candidate.hypothesis, candidate.change
     );
     let outputs = vec![
@@ -2320,42 +2494,68 @@ fn planner_assignment(
             scope.declaration_heading,
             scope.declaration_artifact.display()
         ));
-        measurement_items(
+        bounded_items(
             "declared observed problem: ",
             &scope.observed_problem,
             &mut invariants,
         );
-        measurement_items(
+        bounded_items(
             "declared investigation scope: ",
             &scope.investigation_scope,
             &mut invariants,
         );
-        measurement_items(
+        bounded_items(
             "declared measurement question: ",
             &scope.measurement_question,
             &mut invariants,
         );
-        measurement_items("declared limits: ", &scope.limits, &mut invariants);
+        bounded_items("declared limits: ", &scope.limits, &mut invariants);
         invariants.push(
             "the targeted measurement runs one existing operation whose contract is linked from this same change; do not create a second hypothesis, card or OpenSpec change for the workload".to_owned(),
         );
-        measurement_items(
+        bounded_items(
             "declared workload operation: ",
             &scope.workload.operation,
             &mut invariants,
         );
-        measurement_items(
+        bounded_items(
             "declared workload contract link: ",
             &scope.workload.contract,
             &mut invariants,
         );
         for reference in &scope.evidence_references {
-            measurement_items("declared evidence reference: ", reference, &mut invariants);
+            bounded_items("declared evidence reference: ", reference, &mut invariants);
         }
         acceptance.push(format!(
             "the change states the declared measurement scope section '{}' in {}; the controller re-resolves it through the installed OpenSpec CLI before any directed baseline measurement",
             scope.declaration_heading,
             scope.declaration_artifact.display()
+        ));
+    }
+    if candidate.removal_required {
+        invariants.push(format!(
+            "the change states the reviewable removal proposal under the exact heading '{REMOVAL_PROPOSAL_HEADING}' in one of its resolved artifacts, with each required clause stated exactly once, non-empty and on one line: {}",
+            REMOVAL_PROPOSAL_CLAUSES.join(" ")
+        ));
+        bounded_items(
+            "removal proposal clause meaning: ",
+            REMOVAL_PROPOSAL_GUIDE,
+            &mut invariants,
+        );
+        if let Some(declared) = &run.spec.removal
+            && candidate.hypothesis == run.spec.hypothesis_item
+        {
+            invariants.push(format!(
+                "the run declares the removal proposal reference {} and target {}; the section's Target clause must state exactly that target",
+                declared.proposal, declared.target
+            ));
+        }
+        invariants.push(
+            "the removal proposal is prepared, not applied: this conversation authors the change only, and no removal effect happens before the recorded user decision"
+                .to_owned(),
+        );
+        acceptance.push(format!(
+            "the change states every removal proposal clause under '{REMOVAL_PROPOSAL_HEADING}'; the controller resolves them through the installed OpenSpec CLI and records the reviewable proposal on the hypothesis card before any removal effect"
         ));
     }
     json!({
@@ -2370,10 +2570,10 @@ fn planner_assignment(
     })
 }
 
-/// Renders one declared scope text into bounded invariant items. Long prose is
-/// split at character boundaries so every item stays inside the native
-/// structured assignment item limit and no declared text is shortened.
-fn measurement_items(prefix: &str, text: &str, items: &mut Vec<String>) {
+/// Renders one declared scope or guide text into bounded invariant items. Long
+/// prose is split at character boundaries so every item stays inside the
+/// native structured assignment item limit and no declared text is shortened.
+fn bounded_items(prefix: &str, text: &str, items: &mut Vec<String>) {
     let limit = crate::executor_assignment::MAX_ITEM_BYTES;
     let mut rest = text;
     let mut head = prefix;
@@ -3362,6 +3562,40 @@ mod assignment_tests {
                 .contains(&MAX_MEASUREMENT_FIELD_BYTES.to_string()),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_removal_candidate_receives_the_reviewable_proposal_requirements() {
+        let temp = tempfile::tempdir().unwrap();
+        let (run, mut candidate, _evidence) = fixture(temp.path());
+        let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
+        let ordinary = native_brief(
+            &planner_assignment(&run, &candidate, inputs.clone(), None),
+            &run.spec.project,
+            "planner-ordinary",
+        );
+        assert!(
+            !ordinary.contains(REMOVAL_PROPOSAL_HEADING),
+            "an ordinary candidate carries no removal requirements: {ordinary}"
+        );
+        candidate.removal_required = true;
+        let brief = native_brief(
+            &planner_assignment(&run, &candidate, inputs, None),
+            &run.spec.project,
+            "planner-removal",
+        );
+        assert!(brief.contains(REMOVAL_PROPOSAL_HEADING), "{brief}");
+        for label in REMOVAL_PROPOSAL_CLAUSES {
+            assert!(brief.contains(label), "{label}: {brief}");
+        }
+        for needle in [
+            "never a prediction presented as a measurement",
+            "prepared, not applied",
+            "no removal effect happens before the recorded user decision",
+            "records the reviewable proposal on the hypothesis card before any removal effect",
+        ] {
+            assert!(brief.contains(needle), "{needle}: {brief}");
+        }
     }
 
     #[test]

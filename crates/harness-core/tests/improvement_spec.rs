@@ -1,6 +1,7 @@
 //! Installed OpenSpec contract checks, with all configuration writes isolated.
 use harness_core::improvement_spec::{
-    ExperimentContract, MeasurementScope, MeasurementWorkload, OpenSpec, Specification,
+    ExperimentContract, MeasurementScope, MeasurementWorkload, OpenSpec, REMOVAL_PROPOSAL_CLAUSES,
+    REMOVAL_PROPOSAL_HEADING, Specification,
 };
 use std::{
     collections::BTreeMap,
@@ -143,6 +144,32 @@ fn fill_change(root: &Path) {
     fs::write(root.join("design.md"), "## Context\nRepeated source reads.\n\n## Decisions\nKey reuse on content identity.\n\n## Experiment acceptance\nAn unchanged external checker rejects stale output. The pair freezes source, runtime and cache policy; changed source is the counterexample. Require at least 10 percent lower elapsed time with correctness and no resource regression; run the predeclared matched pairs, never stop on a favorable result.\n").unwrap();
     fs::write(root.join("tasks.md"), "## Implementation\n- [ ] Implement correct read reuse.\n- [ ] Verify invalidation and complete the declared comparison.\n").unwrap();
     fs::write(root.join("specs/repeated-reads/spec.md"), "## ADDED Requirements\n\n### Requirement: Reuse preserves output\nThe reader SHALL preserve correct output when reusing identical inputs.\n\n#### Scenario: Source changes\n- **WHEN** the input content changes\n- **THEN** the next read returns the changed content\n").unwrap();
+}
+
+/// The reviewable removal proposal a hypothesis's own change states: target and
+/// source references, the unapplied preview, evidence and its gaps, measured
+/// versus predicted benefit, lost scenarios, consumer/configuration/
+/// installation impact, alternatives, retained checks and restoration.
+fn removal_section() -> String {
+    [
+        REMOVAL_PROPOSAL_HEADING,
+        "",
+        "- Target: capability-x",
+        "- Source: openspec/changes/improve-repeated-reads",
+        "- Evidence: file:observations/unused-capability.txt",
+        "- Gaps: no invocation telemetry covers the recovery path; indirect consumers are unverified",
+        "- Measured: not yet measured; the retained observation records no consumption in either arm",
+        "- Predicted: lower catalogue and instruction exposure on every accepted task",
+        "- Loss: rare-manual-recovery",
+        "- Lost scenarios: a manual recovery in a degraded environment loses its documented route",
+        "- Impact: the installed skill catalogue, the owned configuration and the current installation",
+        "- Alternatives: keep the capability, narrow its exposure or consolidate it into an existing route",
+        "- Retained checks: the independent oracle and the installation ownership check stay binding",
+        "- Restoration: restore the capability from the pinned revision and re-run the installation lifecycle",
+        "- Preview: preview:retained/unapplied-capability-x.diff",
+        "",
+    ]
+    .join("\n")
 }
 
 /// One installed OpenSpec fixture: an isolated configuration home, the
@@ -539,4 +566,187 @@ fn installed_completion_reconciliation_retains_and_archives_without_spec_sync() 
 #[ignore = "requires installed OpenSpec; creates a store only in an isolated configuration home"]
 fn installed_completion_reconciliation_resolves_a_registered_store() {
     completion_case(true);
+}
+
+/// The reviewable removal proposal is resolved from the hypothesis's own
+/// change: every clause is carried with its value, the section digest binds
+/// the reviewed content, and a drifted artifact is refused instead of read.
+fn removal_proposal_case() {
+    let Installed {
+        temporary: _temporary,
+        target,
+        api,
+    } = installed(false);
+    let root = target
+        .planning_root
+        .join("openspec/changes/improve-repeated-reads");
+    fill_change(&root);
+    let qualified = api.qualify(&target, &contract()).unwrap();
+    // A qualified change that states no section states no reviewable
+    // proposal: the refusal names the exact heading.
+    let absent = api.removal_proposal(&qualified).unwrap_err();
+    assert!(
+        absent.to_string().contains(REMOVAL_PROPOSAL_HEADING),
+        "{absent}"
+    );
+
+    let design = fs::read_to_string(root.join("design.md")).unwrap();
+    fs::write(
+        root.join("design.md"),
+        format!("{design}\n{}", removal_section()),
+    )
+    .unwrap();
+    let qualified = api.qualify(&target, &contract()).unwrap();
+    let receipt = api.removal_proposal(&qualified).unwrap();
+    assert_eq!(receipt.change_root, root.canonicalize().unwrap());
+    assert_eq!(receipt.heading, REMOVAL_PROPOSAL_HEADING);
+    assert!(
+        receipt.artifact.ends_with("design.md"),
+        "{:?}",
+        receipt.artifact
+    );
+    assert_eq!(receipt.target, "capability-x");
+    assert_eq!(receipt.source, "openspec/changes/improve-repeated-reads");
+    assert_eq!(receipt.evidence, "file:observations/unused-capability.txt");
+    assert!(receipt.gaps.contains("unverified"), "{}", receipt.gaps);
+    assert!(
+        receipt.measured.contains("not yet measured"),
+        "{}",
+        receipt.measured
+    );
+    assert!(
+        receipt.predicted.contains("lower catalogue"),
+        "{}",
+        receipt.predicted
+    );
+    assert_eq!(receipt.loss, "rare-manual-recovery");
+    assert!(
+        receipt.lost_scenarios.contains("manual recovery"),
+        "{}",
+        receipt.lost_scenarios
+    );
+    assert!(
+        receipt.impact.contains("installation"),
+        "{}",
+        receipt.impact
+    );
+    assert!(
+        receipt.alternatives.contains("keep the capability"),
+        "{}",
+        receipt.alternatives
+    );
+    assert!(
+        receipt.retained_checks.contains("oracle"),
+        "{}",
+        receipt.retained_checks
+    );
+    assert!(
+        receipt.restoration.contains("pinned revision"),
+        "{}",
+        receipt.restoration
+    );
+    assert_eq!(
+        receipt.preview,
+        "preview:retained/unapplied-capability-x.diff"
+    );
+    for label in REMOVAL_PROPOSAL_CLAUSES {
+        assert!(
+            receipt.clause(label).is_some_and(|value| !value.is_empty()),
+            "{label}"
+        );
+    }
+
+    // The digest binds the exact reviewed section: changing one prose clause
+    // changes it, so an approval recorded for the old content cannot silently
+    // cover the changed proposal. A drifted artifact is refused first.
+    let edited = fs::read_to_string(root.join("design.md")).unwrap().replace(
+        "indirect consumers are unverified",
+        "indirect consumers were later verified absent",
+    );
+    fs::write(root.join("design.md"), edited).unwrap();
+    let drifted = api.removal_proposal(&qualified).unwrap_err();
+    assert!(
+        drifted.to_string().contains("changed after qualification"),
+        "{drifted}"
+    );
+    let requalified = api.qualify(&target, &contract()).unwrap();
+    let updated = api.removal_proposal(&requalified).unwrap();
+    assert_ne!(updated.section_digest, receipt.section_digest);
+    assert_eq!(updated.target, receipt.target);
+    assert!(updated.gaps.contains("verified absent"), "{}", updated.gaps);
+}
+
+#[test]
+#[ignore = "requires installed OpenSpec and owner PowerShell; model-free isolated CLI acceptance"]
+fn installed_removal_proposal_requires_every_clause_and_binds_its_section() {
+    removal_proposal_case();
+}
+
+/// An incomplete or ambiguous removal proposal is refused by clause before
+/// anything can be presented for a decision.
+#[test]
+#[ignore = "requires installed OpenSpec and owner PowerShell; model-free isolated CLI acceptance"]
+fn installed_incomplete_or_ambiguous_removal_proposals_are_refused_by_clause() {
+    let Installed {
+        temporary: _temporary,
+        target,
+        api,
+    } = installed(false);
+    let root = target
+        .planning_root
+        .join("openspec/changes/improve-repeated-reads");
+    fill_change(&root);
+    let base = fs::read_to_string(root.join("design.md")).unwrap();
+    let state = |section: &str| {
+        fs::write(root.join("design.md"), format!("{base}\n{section}")).unwrap();
+        api.qualify(&target, &contract()).unwrap()
+    };
+    let refusal = |section: &str| {
+        let qualified = state(section);
+        api.removal_proposal(&qualified).unwrap_err().to_string()
+    };
+
+    let missing = removal_section()
+        .lines()
+        .filter(|line| !line.starts_with("- Restoration:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        refusal(&missing).contains("missing the clause Restoration:"),
+        "{}",
+        refusal(&missing)
+    );
+
+    let duplicated = format!("{missing}\n- Target: capability-y\n");
+    assert!(
+        refusal(&duplicated).contains("Target: is stated more than once"),
+        "{}",
+        refusal(&duplicated)
+    );
+
+    let empty = removal_section().replace(
+        "- Gaps: no invocation telemetry covers the recovery path; indirect consumers are unverified",
+        "- Gaps:",
+    );
+    assert!(
+        refusal(&empty).contains("Gaps: is empty"),
+        "{}",
+        refusal(&empty)
+    );
+
+    // The section is stated exactly once: a second resolved artifact stating
+    // it is ambiguous and refused.
+    state(&removal_section());
+    let proposal = fs::read_to_string(root.join("proposal.md")).unwrap();
+    fs::write(
+        root.join("proposal.md"),
+        format!("{proposal}\n{}", removal_section()),
+    )
+    .unwrap();
+    let qualified = api.qualify(&target, &contract()).unwrap();
+    let ambiguous = api.removal_proposal(&qualified).unwrap_err().to_string();
+    assert!(
+        ambiguous.contains("more than one resolved artifact"),
+        "{ambiguous}"
+    );
 }
