@@ -20,7 +20,8 @@ use harness_core::improvement_activation::{
 };
 use harness_core::improvement_experiment::{
     Arm, CorroborationRequirement, CorroborationSelection, CorroborationStatus, ExperimentBindings,
-    RetainedTask, TaskRetention, retain_completed_task, select_corroboration,
+    RetainedTask, TaskRetention, retain_completed_task, retained_tasks_from_board,
+    select_corroboration,
 };
 use harness_core::improvement_loop::{
     AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunStore,
@@ -1725,14 +1726,6 @@ fn append_retained_task(run: &Run, retained: &RetainedTask) -> io::Result<()> {
     Ok(())
 }
 
-fn read_retained_tasks(run: &Run) -> io::Result<Vec<RetainedTask>> {
-    let path = run.store.root().join(RETAINED_INDEX_FILE);
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-    read_json(&path, MAX_RUN_SPEC_BYTES)
-}
-
 /// Selects the additional independent corroboration units the declared
 /// adoption scope requires, before the outcome is treated as supporting a
 /// broader claim. Selection is identity-only and order-independent; too few
@@ -1784,25 +1777,49 @@ fn select_corroboration_units(run: &mut Run, notes: &mut Vec<String>) -> io::Res
             ),
         );
     };
+    // Only the declared plan's own unit identities are excluded, never the
+    // owning card: the admission owner reuses one hypothesis card per
+    // mechanism/conditions identity, so this run's own unit and every
+    // applicable independent prior unit are recorded under that same card.
+    // Excluding the card would exclude every applicable prior unit and leave
+    // the broader claim inconclusive exactly when an applicable unit exists.
     let mut excluded: Vec<String> = Vec::new();
-    if let Some(state) = run.cursor.comparison.as_ref() {
-        if let Some(card) = &state.workload_card {
-            excluded.push(card.clone());
-        }
-        if let Some(path) = state.bindings.as_ref()
-            && let Ok(Some(bindings)) = load_optional::<ExperimentBindings>(path)
-        {
-            excluded.push(bindings.case_id.clone());
-        }
+    if let Some(state) = run.cursor.comparison.as_ref()
+        && let Some(path) = state.bindings.as_ref()
+        && let Ok(Some(bindings)) = load_optional::<ExperimentBindings>(path)
+    {
+        excluded.push(bindings.case_id.clone());
     }
-    let candidates = match read_retained_tasks(run) {
-        Ok(tasks) => tasks,
+    // A decision boundary interrupted after retention but before selection
+    // resumes with this run's unit already recorded on its card; its recorded
+    // case id keeps that exact unit out of its own corroboration even when the
+    // declared bindings are no longer readable.
+    if let Ok(Some(receipt)) = retention_receipt(run)
+        && receipt.status == "retained"
+        && !receipt.case_id.is_empty()
+    {
+        excluded.push(receipt.case_id.clone());
+    }
+    // Retained units are discovered from their durable Beads owners, so a
+    // later run can corroborate on tasks an earlier run retained. Records
+    // whose artifacts are missing or changed stay unsupported with their
+    // exact reason instead of being reconstructed from a summary.
+    let candidates = match retained_tasks_from_board(&run.spec.board.bd, &run.spec.board.project) {
+        Ok(discovery) => {
+            for unsupported in &discovery.unsupported {
+                notes.push(format!(
+                    "retained unit {} ({}) not selectable: {}",
+                    unsupported.item, unsupported.case_id, unsupported.reason
+                ));
+            }
+            discovery.tasks
+        }
         Err(error) => {
             return unavailable_corroboration(
                 run,
                 notes,
                 additional,
-                format!("the run-local retained-task index is unreadable: {error}"),
+                format!("retained-task discovery through the board is unavailable: {error}"),
             );
         }
     };

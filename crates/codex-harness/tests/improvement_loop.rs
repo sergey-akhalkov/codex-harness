@@ -3127,18 +3127,6 @@ fn admit_workload_card(fixture: &Fixture) -> String {
     id
 }
 
-/// One plain Beads card, as a prior real task's existing owner.
-fn create_owner_card(fixture: &Fixture, title: &str) -> String {
-    let out = Command::new(bd_executable())
-        .args(["create", title, "--type", "task", "--json"])
-        .current_dir(&fixture.proj)
-        .output()
-        .expect("bd create runs");
-    assert!(out.status.success(), "bd create: {}", text(&out));
-    let created: Value = serde_json::from_slice(&out.stdout).expect("bd create json");
-    created["id"].as_str().expect("created card id").to_owned()
-}
-
 /// The retained comparison bindings at a decision boundary: both arms bind
 /// one frozen pre-solution workload copy, so the completed real task's inputs
 /// are replayable without its solution.
@@ -3329,6 +3317,67 @@ fn prior_retained_task(
         },
     )
     .unwrap()
+}
+
+/// One admitted hypothesis card, as the durable owner a prior retained task is
+/// recorded under. Retention records live on hypothesis cards, so a later run
+/// discovers them through the board.
+fn admit_prior_hypothesis_card(fixture: &Fixture, mechanism: &str) -> String {
+    let out = fixture.feedback(&[
+        "hypothesis-admit",
+        "--mechanism",
+        mechanism,
+        "--conditions",
+        "local-tool-runs",
+        "--observation",
+        "token-audit:prior#7",
+        "--predicted",
+        "the prior task completed under the same conditions",
+        "--counterexample",
+        "the prior solution is unavailable",
+        "--acceptance",
+        "the independent oracle passed for the prior task",
+        "--spec",
+        "openspec/changes/prior",
+        "--basis",
+        "token-audit:prior#7",
+    ]);
+    assert!(out.status.success(), "prior admit: {}", text(&out));
+    let printed = text(&out);
+    let id = printed
+        .strip_prefix("hypothesis ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!id.is_empty(), "prior admission named no card: {printed}");
+    id
+}
+
+/// Record one retained task on its owner card through the durable board
+/// writer, exactly as the controller does at the decision boundary, so a later
+/// run discovers it from the board instead of a run-local index.
+fn record_prior_retention_on_board(
+    fixture: &Fixture,
+    owner: &str,
+    retained: &harness_core::improvement_experiment::RetainedTask,
+) {
+    let draft = harness_core::board_hypothesis::RetentionDraft {
+        case_id: retained.case_id.clone(),
+        experiment: retained.experiment.clone(),
+        mechanism: retained.mechanism.clone(),
+        conditions: retained.conditions.clone(),
+        revision: retained.replay.source_revision.clone(),
+        frozen: retained.replay.revision.clone(),
+        tree: retained.replay.tree_sha256.clone(),
+        oracle: retained.oracle.clone(),
+        acceptance: retained.acceptance.clone(),
+        replay: retained.replay.path.display().to_string(),
+        detail: Some("prior completed real task retained for corroboration".to_owned()),
+    };
+    let bounded = harness_core::board_hypothesis::BoundedRetention::try_from_draft(draft)
+        .expect("the fixture retention draft is bounded");
+    harness_core::board_hypothesis::record_retention(&fixture.bd, &fixture.proj, owner, &bounded)
+        .expect("the owner card records the retention");
 }
 
 fn comparison_inputs(
@@ -3883,18 +3932,14 @@ fn declared_corroboration_excludes_inapplicable_workloads_and_stays_inconclusive
     .unwrap();
     let workload_card = admit_workload_card(&fixture);
     let bindings = seed_bindings(&fixture, &workload, &head);
-    let owner = create_owner_card(&fixture, "Prior inapplicable real task");
+    let owner = admit_prior_hypothesis_card(&fixture, "other-mechanism");
     let prior = prior_retained_task(&fixture, &head, &owner, "case-x", "other-mechanism");
+    record_prior_retention_on_board(&fixture, &owner, &prior);
     let started = fixture.start();
     assert!(started.status.success(), "{}", text(&started));
     fs::write(
         fixture.run.join("supervision.json"),
         r#"{"schema":1,"mode":"continuous"}"#,
-    )
-    .unwrap();
-    fs::write(
-        fixture.run.join("retained-tasks.json"),
-        serde_json::to_vec_pretty(&json!([prior])).unwrap(),
     )
     .unwrap();
     publish_rejection(&fixture, &head, &workload.revision);
@@ -3964,7 +4009,11 @@ fn declared_corroboration_selects_an_independent_retained_unit_by_identity() {
     .unwrap();
     let workload_card = admit_workload_card(&fixture);
     let bindings = seed_bindings(&fixture, &workload, &head);
-    let owner = create_owner_card(&fixture, "Prior applicable real task");
+    // An applicable prior unit is admitted to the same hypothesis card the
+    // run's own workload uses - admission reuses one card per
+    // mechanism/conditions identity - so only its case id distinguishes the
+    // prior unit from the run's own.
+    let owner = admit_prior_hypothesis_card(&fixture, "bounded-output");
     let prior = prior_retained_task(
         &fixture,
         &prior_revision,
@@ -3972,16 +4021,12 @@ fn declared_corroboration_selects_an_independent_retained_unit_by_identity() {
         "case-c",
         "bounded-output",
     );
+    record_prior_retention_on_board(&fixture, &owner, &prior);
     let started = fixture.start();
     assert!(started.status.success(), "{}", text(&started));
     fs::write(
         fixture.run.join("supervision.json"),
         r#"{"schema":1,"mode":"continuous"}"#,
-    )
-    .unwrap();
-    fs::write(
-        fixture.run.join("retained-tasks.json"),
-        serde_json::to_vec_pretty(&json!([prior])).unwrap(),
     )
     .unwrap();
     publish_rejection(&fixture, &head, &workload.revision);
