@@ -27,7 +27,11 @@
 //!    changing anything. The newest board decision and removal authority and
 //!    the exact clean Git identities are re-read after the declared check and
 //!    immediately before the effect, so a withdrawal, a moved mainline or a
-//!    changed candidate tree during a long check blocks without mutation.
+//!    changed candidate tree during a long check blocks without mutation. A
+//!    removal the run declares in its spec and a reviewable removal proposal
+//!    the evaluated hypothesis card records itself resolve through the same
+//!    gate, so an omitted or renamed treatment declaration cannot withdraw a
+//!    capability without the user's scoped decision.
 //! 3. [`activate`] with the returned [`IntegrationReceipt`], the installed
 //!    candidate [`ArmRuntime`] and the run's owned native state: it re-verifies
 //!    the consumed installation identity, re-reads the same decision and
@@ -471,39 +475,32 @@ fn resolve_evidence(context: &FrozenContext<'_>) -> io::Result<Gate<Evidence>> {
     }
     let decision_sha256 = build_identity::hash_bytes(expected.as_bytes());
     if let Some(removal) = &spec.removal {
-        let authority = board_hypothesis::AuthorityRequest {
-            proposal: removal.proposal.clone(),
-            target: removal.target.clone(),
-            action: board_hypothesis::RemovalAction::Integration,
-        };
-        match improvement_loop::removal_gate_at(item, &authority, &comments, context.frozen_removal)
-        {
-            improvement_loop::RemovalGate::Authorized { .. } => {}
-            improvement_loop::RemovalGate::Pending { reason } => {
-                return Ok(Gate::blocked(Blocked {
-                    pending: true,
-                    reason,
-                    check: None,
-                }));
-            }
-            improvement_loop::RemovalGate::Refused { .. } => {
-                return Ok(Gate::blocked(blocked(
-                    false,
-                    format!(
-                        "the user refused removal proposal {} target {}; the latest decision controls and blocks this effect",
-                        removal.proposal, removal.target
-                    ),
-                )));
-            }
-            improvement_loop::RemovalGate::Withdrawn { .. } => {
-                return Ok(Gate::blocked(blocked(
-                    false,
-                    format!(
-                        "the user withdrew approval for removal proposal {} target {}; the latest decision controls and blocks this effect",
-                        removal.proposal, removal.target
-                    ),
-                )));
-            }
+        if let Err(block) = removal_block(
+            item,
+            &removal.proposal,
+            &removal.target,
+            &comments,
+            context.frozen_removal,
+        ) {
+            return Ok(Gate::blocked(block));
+        }
+    } else if let Some(recorded) = evaluated_removal(&comments, item) {
+        // The run declares no removal, but the evaluated hypothesis card
+        // itself records a reviewable removal proposal: the treatment
+        // withdraws an existing capability (a subtraction, disabling or
+        // consolidation admitted by the decision owner) and the same gate
+        // applies, so an omitted or renamed run declaration cannot bypass the
+        // user's decision. A decision that covers only the isolated
+        // experiment still leaves integration and baseline activation
+        // pending.
+        if let Err(block) = removal_block(
+            item,
+            &recorded.proposal,
+            &recorded.target,
+            &comments,
+            context.frozen_removal,
+        ) {
+            return Ok(Gate::blocked(block));
         }
     }
     Ok(Gate::Ready(Evidence {
@@ -515,6 +512,55 @@ fn resolve_evidence(context: &FrozenContext<'_>) -> io::Result<Gate<Evidence>> {
         base_revision: base,
         candidate_revision: candidate,
     }))
+}
+
+/// The latest recorded removal proposal version on the evaluated card, when
+/// one exists; the last matching record is the current version.
+fn evaluated_removal(
+    comments: &[String],
+    item: &str,
+) -> Option<board_hypothesis::RecordedRemovalProposal> {
+    board_hypothesis::parse_removal_proposals(comments)
+        .into_iter()
+        .rfind(|proposal| proposal.item == item)
+}
+
+/// Resolves the current removal authority for the integration stage and maps
+/// it to the exact block: a missing, changed or uncovered decision pends for
+/// the user's decision, while a refusal and a withdrawal are reported as
+/// their own final decisions and are not re-prompted without a new basis.
+fn removal_block(
+    item: &str,
+    proposal: &str,
+    target: &str,
+    comments: &[String],
+    frozen_reviewed: Option<&str>,
+) -> Result<(), Blocked> {
+    let authority = board_hypothesis::AuthorityRequest {
+        proposal: proposal.to_owned(),
+        target: target.to_owned(),
+        action: board_hypothesis::RemovalAction::Integration,
+    };
+    match improvement_loop::removal_gate_at(item, &authority, comments, frozen_reviewed) {
+        improvement_loop::RemovalGate::Authorized { .. } => Ok(()),
+        improvement_loop::RemovalGate::Pending { reason } => Err(Blocked {
+            pending: true,
+            reason,
+            check: None,
+        }),
+        improvement_loop::RemovalGate::Refused { .. } => Err(blocked(
+            false,
+            format!(
+                "the user refused removal proposal {proposal} target {target}; the latest decision controls and blocks this effect"
+            ),
+        )),
+        improvement_loop::RemovalGate::Withdrawn { .. } => Err(blocked(
+            false,
+            format!(
+                "the user withdrew approval for removal proposal {proposal} target {target}; the latest decision controls and blocks this effect"
+            ),
+        )),
+    }
 }
 
 fn reason_text(evaluation: &improvement_policy::PolicyEvaluation) -> String {

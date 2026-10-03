@@ -20,18 +20,21 @@ use harness_core::build_identity;
 use harness_core::improvement_activation::{
     ActivationOutcome,
     ActivationOutcome::{Activated, Confirmed},
-    ActivationRequest, Blocked, CheckSpec, IntegrationOutcome, IntegrationReceipt,
-    IntegrationRequest, activate, integrate,
+    ActivationRequest, Blocked, CheckOutput, CheckReceipt, CheckSpec, IntegrationOutcome,
+    IntegrationReceipt, IntegrationRequest, RECEIPT_SCHEMA, activate, integrate,
 };
 use harness_core::improvement_experiment::{
-    Arm, ArmBinding, ExperimentBindings, prepare_home, prepare_variant,
+    Arm, ArmBinding, ExperimentBindings, PreparedVariant, prepare_home, prepare_variant,
 };
+use harness_core::improvement_intake::{Proposal, Treatment};
 use harness_core::improvement_loop::{BoardInputs, PublicationStage, RemovalScope, RunSpec};
 use harness_core::improvement_policy::{
     Basis, ComparisonPolicy, DeclaredComparison, Objective, Overhead, PolicyDecision,
     PolicyEvaluation, RepeatedSelection, StoppingRule, evaluate,
 };
-use harness_core::improvement_runtime::{ArmRequest, ArmRuntime, install_arm};
+use harness_core::improvement_runtime::{
+    ArmRequest, ArmRuntime, InstallationFacts, InstalledLink, install_arm,
+};
 use harness_core::improvement_spec::{ExperimentContract, Specification};
 use harness_core::outcome_report::{MATCH_FIELDS, summarize_attempts};
 use harness_core::task_worktree::{CandidateCheckout, allocate_candidate_checkout, frozen_copy};
@@ -969,6 +972,91 @@ fn activation_blocked(outcome: ActivationOutcome) -> Blocked {
     }
 }
 
+/// A receipt-shaped runtime identity used only where the removal gate refuses
+/// before any runtime check: the fields satisfy the request type and are
+/// never consumed on the blocked paths.
+fn gate_only_runtime(root: &Path) -> ArmRuntime {
+    let zeros = "0".repeat(64);
+    let link = |name: &str, file: &str| InstalledLink {
+        name: name.to_owned(),
+        destination: root.join("home/harness/bin").join(file),
+        source: root.join("build").join(file),
+        sha256: zeros.clone(),
+    };
+    ArmRuntime {
+        schema: 1,
+        arm: Arm::Candidate,
+        label: "H+A".into(),
+        variant: PreparedVariant {
+            arm: Arm::Candidate,
+            label: "H+A".into(),
+            build: root.join("builds/candidate"),
+            record_sha256: zeros.clone(),
+            source_sha256: zeros.clone(),
+        },
+        source: root.join("source"),
+        home: root.join("home"),
+        user_home: root.join("user"),
+        dependency_user_home: root.join("dependency"),
+        upstream: root.join("codex.exe"),
+        upstream_sha256: zeros.clone(),
+        launcher: link("codex.exe", "codex.exe"),
+        launch_registration: root.join("home/launch.json"),
+        launch_sha256: zeros.clone(),
+        instructions: link("AGENTS.md", "AGENTS.md"),
+        agents: link("agents", "agents.md"),
+        skills: Vec::new(),
+        commands: Vec::new(),
+        components: Vec::new(),
+        configuration: None,
+        private: Vec::new(),
+        installation: InstallationFacts {
+            status: "installed".into(),
+            links: 0,
+            changed_links: 0,
+            path_change: false,
+            runtime_executable_sha256: zeros.clone(),
+            runtime_evidence: root.join("home/evidence"),
+        },
+        model_calls: 0,
+    }
+}
+
+/// A receipt-shaped integration record used only where the removal gate or
+/// the receipt-identity check refuses before any retained evidence is read.
+fn gate_only_receipt() -> IntegrationReceipt {
+    let output = |name: &str| CheckOutput {
+        path: PathBuf::from(name),
+        sha256: "0".repeat(64),
+        bytes: 0,
+    };
+    IntegrationReceipt {
+        schema: RECEIPT_SCHEMA,
+        item: "receipt-item".into(),
+        experiment: "receipt-experiment".into(),
+        decision_sha256: "0".repeat(64),
+        policy_digest: "0".repeat(64),
+        acceptance: "acceptance:receipt".into(),
+        base_revision: "0".repeat(40),
+        candidate_revision: "0".repeat(40),
+        mainline: PathBuf::from("receipt-mainline"),
+        integrated_revision: "0".repeat(40),
+        applied: true,
+        checks: CheckReceipt {
+            program: PathBuf::from("receipt-checker"),
+            program_sha256: "0".repeat(64),
+            args: Vec::new(),
+            revision: "0".repeat(40),
+            cwd: PathBuf::from("receipt-cwd"),
+            exit_code: 0,
+            reason: "exited".into(),
+            duration_ms: 0,
+            stdout: output("receipt-stdout"),
+            stderr: output("receipt-stderr"),
+        },
+    }
+}
+
 fn check_logs(evidence: &Path) -> Vec<PathBuf> {
     let mut logs: Vec<PathBuf> = fs::read_dir(evidence)
         .map(|entries| {
@@ -1307,6 +1395,323 @@ fn removal_authority_gates_integration_with_its_latest_decision() {
     };
     assert_eq!(receipt.integrated_revision, scenario.checkout.revision);
     assert_eq!(rev(&scenario.source), scenario.checkout.revision);
+}
+
+/// The activation effect uses the same removal gate as integration, re-read
+/// from the board before the effect: no decision and an experiment-only
+/// approval pend, a refusal is recorded separately from benefit and is not
+/// re-prompted, a withdrawal controls over the earlier approval, and only an
+/// approval that covers integration opens the gate. The covering approval
+/// proves that by reaching the retained-receipt check instead of a removal
+/// block.
+#[test]
+fn activation_gate_re_reads_the_removal_decision_before_the_effect() {
+    let mut scenario = fixture_scenario("improvement-activation-removal-activate-", Fixture::Adopt);
+    let proposal = BoundedRemovalProposal::try_from_draft(RemovalProposalDraft {
+        proposal: "proposal:fixture".into(),
+        target: "skill:fixture".into(),
+        evidence: "evidence:fixture".into(),
+        loss: "loses-fixture".into(),
+        preview: None,
+        detail: None,
+    })
+    .unwrap();
+    scenario.spec.removal = Some(RemovalScope {
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+    });
+    board_hypothesis::record_removal_proposal(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &proposal,
+    )
+    .unwrap();
+    publish(&scenario);
+    let state = scenario.root.path().join("state");
+    let runtime = gate_only_runtime(scenario.root.path());
+    let receipt = gate_only_receipt();
+
+    let decide = |kind: RemovalDecisionKind, actions: Vec<RemovalAction>| {
+        let bounded = BoundedRemovalDecision::try_from_draft(RemovalDecisionDraft {
+            decision: kind,
+            proposal: proposal.proposal.clone(),
+            target: proposal.target.clone(),
+            actions,
+            loss: Some("loses-fixture".into()),
+            basis: Some("basis:fixture".into()),
+            detail: None,
+        })
+        .unwrap();
+        board_hypothesis::record_removal_decision(
+            &scenario.bd,
+            &scenario.board,
+            &scenario.item,
+            &bounded,
+        )
+        .unwrap();
+    };
+    let activate_now = || {
+        activation_blocked(
+            activate(&activation_request(
+                &scenario, &state, &runtime, &receipt, false,
+            ))
+            .unwrap(),
+        )
+    };
+
+    // Without a decision the dependent removal effect pends.
+    let blocked = activate_now();
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked.reason.contains("missing approval"),
+        "{}",
+        blocked.reason
+    );
+
+    // Experiment-only consent does not cover baseline activation.
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Experiment],
+    );
+    let blocked = activate_now();
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(blocked.reason.contains("not covered"), "{}", blocked.reason);
+
+    // A refusal is recorded separately from benefit and is not re-prompted.
+    decide(RemovalDecisionKind::Refuse, Vec::new());
+    let blocked = activate_now();
+    assert!(!blocked.pending);
+    assert!(blocked.reason.contains("refused"), "{}", blocked.reason);
+
+    // A withdrawal after a covering approval is the latest decision at the
+    // next effect boundary.
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Integration],
+    );
+    decide(RemovalDecisionKind::Withdraw, Vec::new());
+    let blocked = activate_now();
+    assert!(!blocked.pending);
+    assert!(blocked.reason.contains("withdrew"), "{}", blocked.reason);
+
+    // The covering approval opens the removal gate: activation proceeds to
+    // the retained-receipt identity check and never reports a removal block.
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Integration],
+    );
+    let blocked = activate_now();
+    assert!(
+        blocked.reason.contains("integration receipt"),
+        "{}",
+        blocked.reason
+    );
+    assert!(!blocked.reason.contains("removal"), "{}", blocked.reason);
+}
+
+/// A removal effect waiting for the user's decision blocks only that
+/// hypothesis: an independent authorized hypothesis integrates normally, and
+/// the pending candidate's card and mainline stay untouched.
+#[test]
+fn pending_removal_leaves_independent_authorized_work_unaffected() {
+    let mut pending = fixture_scenario(
+        "improvement-activation-independent-removal-",
+        Fixture::Adopt,
+    );
+    let proposal = BoundedRemovalProposal::try_from_draft(RemovalProposalDraft {
+        proposal: "proposal:fixture".into(),
+        target: "skill:fixture".into(),
+        evidence: "evidence:fixture".into(),
+        loss: "loses-fixture".into(),
+        preview: None,
+        detail: None,
+    })
+    .unwrap();
+    pending.spec.removal = Some(RemovalScope {
+        proposal: proposal.proposal.clone(),
+        target: proposal.target.clone(),
+    });
+    board_hypothesis::record_removal_proposal(
+        &pending.bd,
+        &pending.board,
+        &pending.item,
+        &proposal,
+    )
+    .unwrap();
+    publish(&pending);
+    let pending_base = rev(&pending.source);
+    let blocked =
+        blocked_of(integrate(&integration_request(&pending, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+
+    // The independent hypothesis has its own card and nothing to decide.
+    let independent = fixture_scenario("improvement-activation-independent-", Fixture::Adopt);
+    publish(&independent);
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&independent, passing_check(), None)).unwrap()
+    else {
+        panic!("an independent authorized candidate integrates");
+    };
+    assert_eq!(receipt.integrated_revision, independent.checkout.revision);
+    assert_eq!(rev(&independent.source), independent.checkout.revision);
+
+    // The pending hypothesis is unchanged by the independent effect.
+    assert_eq!(rev(&pending.source), pending_base);
+    assert!(
+        !board_feedback::list_comments(&pending.bd, &pending.board, &pending.item)
+            .unwrap()
+            .iter()
+            .any(|comment| comment.starts_with("removal-decision v1")),
+        "the independent effect records no decision on the pending card"
+    );
+}
+
+/// A capability-withdrawing treatment is gated by the evaluated card's own
+/// recorded removal proposal even when the run declares no removal in its
+/// spec: the run inputs cannot omit or rename the treatment to withdraw a
+/// capability without the user's scoped decision.
+#[test]
+fn recorded_removal_proposal_gates_integration_without_a_declared_run_removal() {
+    let scenario = fixture_scenario("improvement-activation-recorded-removal-", Fixture::Adopt);
+    assert!(scenario.spec.removal.is_none());
+    let proposal = BoundedRemovalProposal::try_from_draft(RemovalProposalDraft {
+        proposal: "proposal:fixture".into(),
+        target: "skill:consolidated".into(),
+        evidence: "evidence:fixture".into(),
+        loss: "loses-consolidated-route".into(),
+        preview: None,
+        detail: None,
+    })
+    .unwrap();
+    board_hypothesis::record_removal_proposal(
+        &scenario.bd,
+        &scenario.board,
+        &scenario.item,
+        &proposal,
+    )
+    .unwrap();
+    publish(&scenario);
+    let base = rev(&scenario.source);
+
+    // The recorded proposal is the only declaration of this consolidation
+    // treatment; without a user decision nothing integrates.
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert!(
+        blocked.reason.contains("missing approval"),
+        "{}",
+        blocked.reason
+    );
+    assert_eq!(rev(&scenario.source), base);
+
+    // An experiment-only approval still cannot cover integration.
+    let decide = |kind: RemovalDecisionKind, actions: Vec<RemovalAction>| {
+        let bounded = BoundedRemovalDecision::try_from_draft(RemovalDecisionDraft {
+            decision: kind,
+            proposal: proposal.proposal.clone(),
+            target: proposal.target.clone(),
+            actions,
+            loss: Some("loses-consolidated-route".into()),
+            basis: Some("basis:fixture".into()),
+            detail: None,
+        })
+        .unwrap();
+        board_hypothesis::record_removal_decision(
+            &scenario.bd,
+            &scenario.board,
+            &scenario.item,
+            &bounded,
+        )
+        .unwrap();
+    };
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Experiment],
+    );
+    let blocked =
+        blocked_of(integrate(&integration_request(&scenario, passing_check(), None)).unwrap());
+    assert!(blocked.pending, "{}", blocked.reason);
+    assert_eq!(rev(&scenario.source), base);
+
+    // The approval that covers integration opens the gate for the exact
+    // reviewed scope.
+    decide(
+        RemovalDecisionKind::Approve,
+        vec![RemovalAction::Integration],
+    );
+    let IntegrationOutcome::Integrated(receipt) =
+        integrate(&integration_request(&scenario, passing_check(), None)).unwrap()
+    else {
+        panic!("the covered recorded removal approval must integrate");
+    };
+    assert_eq!(receipt.integrated_revision, scenario.checkout.revision);
+    assert_eq!(rev(&scenario.source), scenario.checkout.revision);
+}
+
+/// A capability withdrawal phrased as disabling or consolidation has no
+/// separate treatment verb: the strict intake vocabulary refuses an invented
+/// verb, and the only admitted withdrawal routes (simplification and
+/// subtraction) both require the removal claim that makes the controller's
+/// removal gate binding, so renaming the action cannot bypass it.
+#[test]
+fn disabling_and_consolidation_cannot_bypass_the_removal_contract() {
+    let report = |treatment: Value| {
+        serde_json::json!({
+            "mechanism": "synthetic-mechanism",
+            "conditions": "synthetic-conditions",
+            "observation": "observed:1",
+            "basis": "basis:1",
+            "treatment": treatment,
+            "evidence": [],
+        })
+    };
+    let coverage = serde_json::json!({
+        "coverage": {
+            "interval": "2026-10-01..2026-10-03",
+            "tasks": "synthetic-tasks",
+            "gaps": "synthetic-gaps",
+            "lost_uses": "synthetic-lost-uses",
+            "restoration": "synthetic-restoration",
+        }
+    });
+
+    // An invented verb cannot describe a withdrawal at all.
+    let invented: Result<Proposal, _> =
+        serde_json::from_value(report(serde_json::json!("disable")));
+    assert!(
+        invented.is_err(),
+        "an invented treatment verb must be refused instead of admitting an ungated withdrawal"
+    );
+
+    // Disabling and consolidation are admitted only as capability-withdrawing
+    // treatments, each carrying the removal claim the gate requires.
+    let consolidation: Proposal = serde_json::from_value(report(serde_json::json!({
+        "simplification": {
+            "removal": {"target": "skill:consolidated", "basis": coverage.clone()}
+        }
+    })))
+    .unwrap();
+    assert!(matches!(
+        consolidation.treatment,
+        Treatment::Simplification { .. }
+    ));
+    let disabling: Proposal = serde_json::from_value(report(serde_json::json!({
+        "subtraction": {
+            "removal": {"target": "skill:disabled", "basis": coverage.clone()}
+        }
+    })))
+    .unwrap();
+    assert!(matches!(disabling.treatment, Treatment::Subtraction { .. }));
+
+    // A withdrawal treatment without the removal claim is refused.
+    let missing_claim: Result<Proposal, _> =
+        serde_json::from_value(report(serde_json::json!({"simplification": {}})));
+    assert!(
+        missing_claim.is_err(),
+        "a withdrawal treatment must carry its removal claim"
+    );
 }
 
 #[test]
