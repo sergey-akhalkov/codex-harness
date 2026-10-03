@@ -120,7 +120,9 @@ pub struct RecordedCall {
 /// event. They are not receipt time and they are not inferred. The item id is
 /// the tool-call identity for a command item when a function call's `call_id`
 /// equals it. `turn_id` is the event's recorded turn, not a response join.
-/// `process_id` is set only when the item's process field is a numeric OS pid.
+/// `process_id` is set only when the item's process field is a numeric producer
+/// id. On the selected app-server route that value is an opaque unified-exec
+/// session id, not an OS pid.
 /// Command text is not retained.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecordedLifecycle {
@@ -460,8 +462,8 @@ fn recorded_ms(value: &Value, snake: &str, camel: &str) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
-/// OS pid from a command item. Only a base-10 integer is a pid. A
-/// client-supplied connection id is a different contract and stays absent.
+/// Producer process id from a command item. Only a base-10 integer is retained.
+/// It is not an OS pid. A non-numeric connection id stays absent.
 fn numeric_process_id(item: &Value) -> Option<u32> {
     let text = item
         .get("process_id")

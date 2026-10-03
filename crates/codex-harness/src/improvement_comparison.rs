@@ -147,7 +147,7 @@ fn same_millisecond_command_has_no_inner_width() {
 }
 
 #[test]
-fn process_correlation_requires_a_unique_pid_and_call_id() {
+fn process_correlation_requires_a_verified_os_link_not_a_numeric_process_id() {
     let root = tempfile::tempdir().unwrap();
     harness_core::heavy_command_trace::write_process_ancestry(
         root.path(),
@@ -168,11 +168,31 @@ fn process_correlation_requires_a_unique_pid_and_call_id() {
             completed_at_ms: Some(2),
         };
     let calls = vec!["call_heavy_blocked_1".to_owned()];
-    assert_eq!(
+    assert!(
         verified_command_identity(
             root.path(),
             "admission-1",
             &[life("call_heavy_blocked_1", Some(4242))],
+            &calls
+        )
+        .is_none(),
+        "a numeric process id equal to an ancestry pid is not OS identity"
+    );
+    harness_core::heavy_command_trace::write_command_process_link(
+        root.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_heavy_blocked_1".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 99,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
             &calls
         )
         .as_deref(),
@@ -182,33 +202,112 @@ fn process_correlation_requires_a_unique_pid_and_call_id() {
         verified_command_identity(
             root.path(),
             "admission-1",
+            &[life("call_heavy_blocked_1", Some(4242))],
+            &calls
+        )
+        .is_none(),
+        "the ancestry pid is not a substitute for the linked producer id"
+    );
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
             &[
-                life("call_heavy_blocked_1", Some(4242)),
-                life("call_other", Some(4242))
+                life("call_heavy_blocked_1", Some(10307)),
+                life("call_other", Some(10307))
             ],
             &calls
         )
         .is_none(),
-        "a repeated process id is not a unique command"
+        "a repeated producer process id is not a unique command"
     );
     assert!(
         verified_command_identity(
             root.path(),
             "admission-1",
-            &[life("call_heavy_blocked_1", Some(7))],
-            &calls
-        )
-        .is_none()
-    );
-    assert!(
-        verified_command_identity(
-            root.path(),
-            "admission-1",
-            &[life("not-a-recorded-call", Some(4242))],
+            &[life("not-a-recorded-call", Some(10307))],
             &calls
         )
         .is_none(),
-        "a pid match without call_id == item id is not a tool-call join"
+        "a link without call_id == item id is not a tool-call join"
+    );
+    harness_core::heavy_command_trace::write_command_process_link(
+        root.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_other".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 99,
+        },
+    )
+    .unwrap();
+    assert!(
+        verified_command_identity(
+            root.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "two items claiming one producer id are ambiguous"
+    );
+
+    let reused = tempfile::tempdir().unwrap();
+    harness_core::heavy_command_trace::write_process_ancestry(
+        reused.path(),
+        "admission-1",
+        &[harness_core::heavy_command_trace::ProcessAncestor {
+            pid: 4242,
+            creation_time: 99,
+        }],
+    )
+    .unwrap();
+    harness_core::heavy_command_trace::write_command_process_link(
+        reused.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_heavy_blocked_1".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 100,
+        },
+    )
+    .unwrap();
+    assert!(
+        verified_command_identity(
+            reused.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "a reused pid with a different creation time is not the admitted process"
+    );
+
+    let invalid = tempfile::tempdir().unwrap();
+    std::fs::write(
+        invalid.path().join("admission-1.ancestry"),
+        r#"{"schema":"codex-harness.heavy-process-ancestry.v1","admission_id":"admission-1","processes":[{"pid":4242,"creation_time":50},{"pid":7,"creation_time":80}]}"#,
+    )
+    .unwrap();
+    harness_core::heavy_command_trace::write_command_process_link(
+        invalid.path(),
+        &harness_core::heavy_command_trace::CommandProcessLink {
+            item_id: "call_heavy_blocked_1".to_owned(),
+            opaque_process_id: "10307".to_owned(),
+            os_pid: 4242,
+            creation_time: 50,
+        },
+    )
+    .unwrap();
+    assert!(
+        verified_command_identity(
+            invalid.path(),
+            "admission-1",
+            &[life("call_heavy_blocked_1", Some(10307))],
+            &calls
+        )
+        .is_none(),
+        "a parent created after its child cannot authorize a deduction"
     );
 }
 
@@ -2953,10 +3052,9 @@ fn turn_scoped_command<'a>(
     matched.next().is_none().then_some(call)
 }
 
-/// Binds an admission to a command item only when this admission's verified
-/// process chain contains that item's unique numeric pid and the item id is a
-/// recorded function-call `call_id`. Caller labels are ignored. Two admissions
-/// or two items claiming the same identity bind nothing.
+/// Binds an admission to a command item only through a verified OS link.
+/// Caller labels and numeric `process_id` equality are ignored. Two
+/// admissions or two items claiming the same identity bind nothing.
 fn bind_verified_commands(
     admissions: &mut [Value],
     directory: &Path,
@@ -3004,6 +3102,11 @@ fn bind_verified_commands(
     }
 }
 
+/// Binds an admission to one command item only through a control-owner OS
+/// link. The rollout `process_id` is an opaque producer id. Numeric equality
+/// with an ancestry pid is not OS identity. The link's OS pid and creation
+/// time must match exactly one ancestry process, the producer id must be
+/// unique, and the item id must be a recorded function-call `call_id`.
 fn verified_command_identity(
     directory: &Path,
     admission_id: &str,
@@ -3012,22 +3115,29 @@ fn verified_command_identity(
 ) -> Option<String> {
     let ancestry =
         harness_core::heavy_command_trace::read_process_ancestry(directory, admission_id)?;
+    let links = harness_core::heavy_command_trace::read_command_process_links(directory);
     let mut matched = lifecycles.iter().filter(|life| {
-        let Some(process_id) = life.process_id else {
+        let Some(opaque) = life.process_id.map(|id| id.to_string()) else {
+            return false;
+        };
+        let Some(link) =
+            harness_core::heavy_command_trace::unambiguous_command_link(&links, &life.id, &opaque)
+        else {
             return false;
         };
         ancestry
             .iter()
-            .filter(|item| item.pid == process_id)
+            .filter(|item| item.pid == link.os_pid && item.creation_time == link.creation_time)
             .count()
             == 1
             && lifecycles
                 .iter()
-                .filter(|other| other.process_id == Some(process_id))
+                .filter(|other| other.process_id.is_some_and(|id| id.to_string() == opaque))
                 .count()
                 == 1
             && call_ids.iter().any(|call_id| call_id == &life.id)
             && harness_core::heavy_command_trace::validate_token(&life.id).is_ok()
+            && harness_core::heavy_command_trace::validate_token(&opaque).is_ok()
     });
     let life = matched.next()?;
     matched.next().is_none().then(|| life.id.clone())

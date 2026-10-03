@@ -283,13 +283,17 @@ fn commit_solution() -> io::Result<()> {
 struct OwnedHeavy {
     started_at_ms: i64,
     completed_at_ms: i64,
-    process_id: Option<u32>,
+    /// Opaque producer process id. This is not the spawned OS pid.
+    process_id: Option<String>,
 }
 
 /// Runs one real heavy command under the controller-supplied account and
 /// evidence environment, and emits the command item the host can correlate.
 /// The item id is the function-call id. It is not supplied as a heavy-command
-/// label: the process id on the completed item is the spawned process.
+/// label. The item's process id is an opaque producer id, not `child.id()`.
+/// The selected app-server route does not put the OS pid in that field, so
+/// the control owner records the private OS link for the process it spawned
+/// while that process is alive instead of seeding the item with a pid.
 fn run_owned_heavy(server: &Server, session: &str) -> OwnedHeavy {
     let started_at_ms = unix_ms();
     server.push(json!({
@@ -318,10 +322,12 @@ fn run_owned_heavy(server: &Server, session: &str) -> OwnedHeavy {
     let spawned = Command::new(cli).args(["heavy", "--", &program]).spawn();
     let (process_id, exit) = match spawned {
         Ok(child) => {
-            let process_id = child.id();
+            let os_pid = child.id();
+            let opaque = opaque_producer_process_id(os_pid);
+            record_control_os_link(&opaque, os_pid);
             let waited = child.wait_with_output();
             (
-                Some(process_id),
+                Some(opaque),
                 waited.ok().and_then(|output| output.status.code()),
             )
         }
@@ -340,7 +346,8 @@ fn run_owned_heavy(server: &Server, session: &str) -> OwnedHeavy {
                 "command": "codex-harness heavy",
                 "status": if exit == Some(0) { "completed" } else { "failed" },
                 "exitCode": exit,
-                "processId": process_id.map(|pid| pid.to_string()),
+                "processId": process_id.clone(),
+                "source": "unified_exec_startup",
             },
         },
     }));
@@ -349,6 +356,36 @@ fn run_owned_heavy(server: &Server, session: &str) -> OwnedHeavy {
         completed_at_ms,
         process_id,
     }
+}
+
+/// Records the control owner's private OS link for the command it spawned
+/// while that process is alive. The route reports an opaque producer id, so
+/// only this live association plus the admission's own ancestry can bind the
+/// item. `HARNESS_IMPROVEMENT_FIXTURE_HEAVY_NO_OS_LINK` suppresses it for the
+/// missing-OS-identity negative control.
+fn record_control_os_link(opaque_process_id: &str, os_pid: u32) {
+    if env::var_os("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_NO_OS_LINK").is_some() {
+        return;
+    }
+    let Some(directory) = env::var_os(harness_core::heavy_command_trace::EVIDENCE_ENV) else {
+        return;
+    };
+    let _ = harness_core::heavy_command::record_live_os_link(
+        Path::new(&directory),
+        HEAVY_CALL_ID,
+        opaque_process_id,
+        os_pid,
+    );
+}
+
+/// A numeric producer id that is not the spawned OS pid. The selected route
+/// reports a unified-exec session id in this field.
+fn opaque_producer_process_id(os_pid: u32) -> String {
+    let mut opaque = os_pid.wrapping_add(1_000_003);
+    if opaque == 0 || opaque == os_pid {
+        opaque = 1_000_003;
+    }
+    opaque.to_string()
 }
 
 fn unix_ms() -> i64 {
@@ -531,7 +568,8 @@ fn write_rollout(
             "id": HEAVY_CALL_ID
         });
         if let Some(process_id) = command.process_id {
-            item["process_id"] = json!(process_id.to_string());
+            item["process_id"] = json!(process_id);
+            item["source"] = json!("unified_exec_startup");
         }
         lines.push(json!({
             "type": "event_msg",

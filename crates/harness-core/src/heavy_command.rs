@@ -2146,8 +2146,10 @@ fn current_identity() -> io::Result<ProcessIdentity> {
 
 /// This process and the ancestors whose pid and creation time could be read
 /// while the admission was running. A parent that cannot be opened stops the
-/// walk; skipping it would guess a further ancestor. The chain is not a
-/// command line and is not written into the public episode document.
+/// walk; skipping it would guess a further ancestor. A parent created after
+/// its child is not recorded: that lifetime is a reused pid or a broken
+/// snapshot, and it must not become a join target. The chain is not a command
+/// line and is not written into the public episode document.
 fn observed_process_ancestry() -> Vec<heavy_command_trace::ProcessAncestor> {
     const MAX_ANCESTORS: usize = 8;
     let mut found = Vec::new();
@@ -2163,6 +2165,7 @@ fn observed_process_ancestry() -> Vec<heavy_command_trace::ProcessAncestor> {
     });
     let table = process_parent_table();
     let mut pid = parent_pid(&table, current.pid);
+    let mut child_created = current.creation_time;
     while let Some(parent) = pid {
         if parent <= 4
             || found.len() >= MAX_ANCESTORS
@@ -2173,13 +2176,48 @@ fn observed_process_ancestry() -> Vec<heavy_command_trace::ProcessAncestor> {
         let Some(created) = creation_time_of_pid(parent) else {
             break;
         };
+        if !parent_not_after_child(child_created, created) {
+            break;
+        }
         found.push(heavy_command_trace::ProcessAncestor {
             pid: parent,
             creation_time: created,
         });
+        child_created = created;
         pid = parent_pid(&table, parent);
     }
     found
+}
+
+/// A recorded parent must already have existed when the child was created.
+fn parent_not_after_child(child_created: u64, parent_created: u64) -> bool {
+    parent_created != 0 && parent_created <= child_created
+}
+
+/// Records a control-owner OS link. `os_pid` must be the control `osPid`,
+/// never a parsed producer `processId`. The creation time is read from that
+/// live process; a dead or unopenable pid is not a link.
+pub fn record_live_os_link(
+    directory: &Path,
+    item_id: &str,
+    opaque_process_id: &str,
+    os_pid: u32,
+) -> io::Result<()> {
+    let Some(creation_time) = creation_time_of_pid(os_pid) else {
+        return Err(io::Error::other("OS pid is not a live process"));
+    };
+    if creation_time == 0 {
+        return Err(io::Error::other("OS pid has no creation time"));
+    }
+    heavy_command_trace::write_command_process_link(
+        directory,
+        &heavy_command_trace::CommandProcessLink {
+            item_id: item_id.to_owned(),
+            opaque_process_id: opaque_process_id.to_owned(),
+            os_pid,
+            creation_time,
+        },
+    )
 }
 
 fn creation_time_of_pid(pid: u32) -> Option<u64> {
@@ -2371,6 +2409,25 @@ mod tests {
             .validate("fixture")
             .is_ok()
         );
+    }
+
+    #[test]
+    fn live_os_link_reads_creation_time_and_keeps_the_producer_id_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let os_pid = std::process::id();
+        let opaque = "10307";
+        assert_ne!(opaque, os_pid.to_string());
+        record_live_os_link(root.path(), "call-1", opaque, os_pid).unwrap();
+        let links = heavy_command_trace::read_command_process_links(root.path());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].item_id, "call-1");
+        assert_eq!(links[0].opaque_process_id, opaque);
+        assert_eq!(links[0].os_pid, os_pid);
+        assert_ne!(links[0].creation_time, 0);
+        assert!(record_live_os_link(root.path(), "call-2", "10308", 0).is_err());
+        assert!(!parent_not_after_child(50, 80));
+        assert!(parent_not_after_child(80, 50));
+        assert!(!parent_not_after_child(80, 0));
     }
 
     #[test]

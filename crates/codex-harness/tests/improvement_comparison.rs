@@ -3534,7 +3534,9 @@ fn real_control_dispatches_refuse_wrong_observed_model_and_effort() {
 
 /// Owned heavy contention plus the visible fixture conversation. The controller
 /// captures the admission, the host observation and the report. This is not an
-/// actual-model comparison.
+/// actual-model comparison. The fixture emits the selected route's opaque
+/// process id and records the control owner's live OS link for the process it
+/// spawned, so the deduction binds through verified identity, not pid equality.
 #[test]
 fn owned_heavy_contention_reaches_the_native_report() {
     let _serial = INSTALL.lock().unwrap();
@@ -3717,7 +3719,7 @@ fn owned_heavy_contention_reaches_the_native_report() {
                     && item["class"] == "unrelated_wait"
             })
         }),
-        "process ownership did not bind the admission to the command item: {admissions}"
+        "the recorded OS link did not bind the admission to the command item: {admissions}"
     );
     let unlabeled = documents.iter().any(|view| {
         matches!(
@@ -3761,5 +3763,174 @@ fn owned_heavy_contention_reaches_the_native_report() {
                     })
                 })),
         "boundary uncertainty must stay visible: {infra}"
+    );
+}
+
+/// The same owned heavy contention without the control owner's OS link. The
+/// item still carries the selected route's opaque producer id and the
+/// admission still records its own ancestry, but no verified association
+/// exists, so the admission must not bind and no time may be deducted. This is
+/// the native missing-OS-identity counterexample, not an actual-model
+/// comparison.
+#[test]
+fn owned_heavy_without_a_control_os_link_cannot_deduct() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("heavy-no-link");
+    let policy_text = fs::read_to_string(&fixture.policy).unwrap();
+    let mut policy: Value = serde_json::from_str(&policy_text).unwrap();
+    policy["uncertainty"] = json!(harness_core::infrastructure_accounting::binding_clause(
+        harness_core::infrastructure_accounting::MetricView::WorkEfficiency,
+        harness_core::infrastructure_accounting::Mechanism::None,
+    ));
+    fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_real_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    let account = fixture.root.join("isolated-heavy-account");
+    harness_core::heavy_command::prepare(&account).unwrap();
+    let mut budget = harness_core::heavy_command::Budget::read(&account).unwrap();
+    budget.max_concurrent_trees = 1;
+    harness_core::heavy_command::Budget::write(&account, &budget).unwrap();
+    let started = fixture.root.join("holder-started.txt");
+    let launch = env!("CARGO_BIN_EXE_harness-launch-fixture");
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
+    holder
+        .arg("heavy")
+        .arg("--account")
+        .arg(&account)
+        .arg("--attempt")
+        .arg("holder-other")
+        .arg("--")
+        .arg(launch)
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "180000")
+        .env("HARNESS_HEAVY_FIXTURE_STARTED", &started);
+    let mut holder = holder.spawn().expect("isolated holder starts");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "holder did not acquire the isolated slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let account_text = account.display().to_string();
+    let marker = fixture.root.join("heavy-started.txt");
+    let marker_text = marker.display().to_string();
+    let release = std::thread::spawn({
+        let marker = marker.clone();
+        move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(240);
+            while !marker.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if marker.exists() {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            let _ = holder.kill();
+            let _ = holder.wait();
+        }
+    });
+    let mut command = Command::new(manager());
+    command
+        .arg("improve")
+        .args(["resume", "--run", fixture.run.to_str().unwrap()])
+        .env_remove("HARNESS_EXECUTOR_SESSION")
+        .env_remove("HARNESS_EXECUTOR_FIXTURE_MODE")
+        .env_remove("HARNESS_EXECUTOR_CHILD_FIXTURE_MODE")
+        .env_remove("HARNESS_EXECUTOR_RUN")
+        .env_remove("HARNESS_ORIGINATING_LEAD")
+        .env_remove("HARNESS_LEAD_THREAD")
+        .env_remove("HARNESS_LEAD_RECIPIENT")
+        .env_remove("WT_SESSION")
+        .env(CONTROL_CHILD_MODE.0, CONTROL_CHILD_MODE.1)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY", "1")
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_NO_OS_LINK", "1")
+        .env("CODEX_HARNESS_HEAVY_ACCOUNT", &account_text)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_MARKER", &marker_text)
+        .env("HARNESS_IMPROVEMENT_FIXTURE_HEAVY_PROGRAM", launch)
+        .env(
+            "HARNESS_IMPROVEMENT_FIXTURE_HEAVY_CLI",
+            env!("CARGO_BIN_EXE_codex-harness"),
+        )
+        .env("HARNESS_LAUNCH_FIXTURE_MODE", "heavy-hold")
+        .env("HARNESS_HEAVY_FIXTURE_MS", "1000");
+    let resume = command.output().expect("baseline resume");
+    let output = text(&resume);
+    assert!(
+        marker.exists(),
+        "the fixture did not reach the owned heavy command: {output}"
+    );
+    assert!(resume.status.success(), "{output}");
+    let _ = release.join();
+    let receipt = attempt_receipt(&fixture, "base-1");
+    let record = wait_for_terminal_receipt(&receipt);
+    assert_eq!(
+        record["observation"]["state"], "completed",
+        "the visible fixture conversation did not complete: {record}"
+    );
+    let settle = fixture.resume_in_process(&[]);
+    let settle_output = text(&settle);
+    assert!(
+        settle.status.success(),
+        "settlement resume failed: {settle_output}\nfirst resume: {output}"
+    );
+    let evidence_dir = fixture
+        .run
+        .join("comparison")
+        .join("queue-evidence")
+        .join("base-1");
+    let entries = fs::read_dir(&evidence_dir)
+        .expect("the attempt evidence directory exists")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        entries.iter().any(|name| name.ends_with(".ancestry")),
+        "the admission did not record its own ancestry: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|name| name.ends_with(".link")),
+        "the negative control must not record an OS link: {entries:?}"
+    );
+
+    let cursor = fixture.cursor();
+    let row_path = cursor["comparison"]["baseline"]["row"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            fixture
+                .run
+                .join("comparison")
+                .join("baseline")
+                .join("row.json")
+        });
+    let row: Value = serde_json::from_slice(&fs::read(&row_path).unwrap()).unwrap();
+    let summarized = harness_core::outcome_report::summarize_attempts(std::slice::from_ref(&row))
+        .expect("native report");
+    let admissions = &row["infrastructure_capture"]["admissions"];
+    assert!(
+        admissions.as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["tool_call_id"].is_null()
+                    && item["command_id"].is_null()
+                    && item["class"] == "unrelated_wait"
+            })
+        }),
+        "an opaque process id without an OS link must not bind the admission: {admissions}"
+    );
+    let infra = &summarized["attempts"][0]["infrastructure"];
+    assert!(infra["observed_seconds"].as_f64().is_some(), "{infra}");
+    assert_ne!(infra["proven_zero_queue"], true);
+    assert!(
+        infra["deductible_ns"].as_u64().unwrap_or(1) == 0,
+        "missing OS identity must not create a deduction: {infra}"
+    );
+    assert!(
+        infra["adjusted_low_ns"].as_u64().unwrap_or(0)
+            <= infra["adjusted_high_ns"].as_u64().unwrap_or(0),
+        "{infra}"
     );
 }

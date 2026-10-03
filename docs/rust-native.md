@@ -333,9 +333,16 @@ printed as `heavy: queue evidence was not recorded` and does not change the
 command result. Public documents contain no account paths or foreign command
 text or pids. A collecting admission also writes a private
 `{admission_id}.ancestry` file with the pid and creation time of that process
-and verified ancestors. The collector binds the admission to a command item
-only when that item's numeric `process_id` is unique in the attempt, equals
-one of those processes, and the item id equals a function-call `call_id`.
+and verified ancestors. A parent created after its child is not part of that
+chain. The selected app-server route reports command `process_id` as an opaque
+unified-exec session id, not an OS pid. `thread/backgroundTerminals/list`
+carries a separate `osPid`, and that route leaves it null while the command
+process is alive. The collector binds an admission only when a control link
+(the private `{item_id}.link` written by the control owner while the named
+process is alive) names that opaque id, a live OS pid, and the creation time
+of one ancestry process, and the item id equals a function-call `call_id`.
+Numeric equality with an ancestry pid, a missing OS pid, a reused pid, or an
+invalid parent lifetime binds nothing.
 Interpret the document; a start/end timer or a missing file is not a
 deduction.
 
