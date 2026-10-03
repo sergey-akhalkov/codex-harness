@@ -122,11 +122,17 @@ impl Fixture {
         }
     }
     fn run(&self, mode: &str, expected: i32) -> Value {
+        self.run_with_env(mode, expected, &[])
+    }
+    fn run_with_env(&self, mode: &str, expected: i32, environment: &[(&str, &str)]) -> Value {
         let mut command = Command::new(env!("CARGO_BIN_EXE_codex-harness"));
         command
             .args(["outcome-arm", "--request"])
             .arg(&self.request)
             .current_dir(self.root.path());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         if mode != "native" {
             command
                 .env("HARNESS_LAUNCH_FIXTURE_MODE", "discovery")
@@ -471,6 +477,29 @@ fn cases_that_can_reach_sibling_git_history_are_refused() {
     .unwrap();
     let row = independent.run("arm", 0);
     assert_eq!(row["case"]["git_boundary"], "independent");
+}
+
+#[test]
+fn exported_git_redirection_does_not_redirect_the_arm_discovery() {
+    // The measuring process may itself sit in a linked worktree with GIT_DIR
+    // and GIT_WORK_TREE exported. The controlled case must still bind its own
+    // frozen contract, and the native discovery child must not resolve the
+    // exported sibling repository.
+    let f = Fixture::new("baseline");
+    let sibling = f.root.path().join("sibling");
+    fs::create_dir_all(sibling.join(".git/worktrees/case")).unwrap();
+    let git_dir = sibling.join(".git");
+    let row = f.run_with_env(
+        "arm",
+        0,
+        &[
+            ("GIT_DIR", git_dir.to_str().unwrap()),
+            ("GIT_WORK_TREE", sibling.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(row["discovery_verified"], true);
+    assert_eq!(row["case"]["contract"], f.contract);
+    assert_eq!(row["case"]["git_boundary"], "absent");
 }
 
 #[test]
