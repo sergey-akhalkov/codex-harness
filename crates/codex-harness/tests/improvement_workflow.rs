@@ -413,6 +413,21 @@ impl Fixture {
         assert!(out.status.success(), "bd comments: {}", text(&out));
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
+
+    /// The run's exact frozen base revision, as the declared spec records it.
+    fn base_revision(&self) -> String {
+        let spec: Value = serde_json::from_slice(&fs::read(&self.spec).unwrap()).unwrap();
+        spec["base_revision"]
+            .as_str()
+            .expect("the run spec records its frozen base")
+            .to_owned()
+    }
+
+    /// The next owner-assigned candidate location: the controller uses it when
+    /// the natural location already holds preserved work.
+    fn replacement_candidate_worktree(&self, hypothesis: &str) -> PathBuf {
+        candidate_area(&self.run).join(format!("{hypothesis}-2"))
+    }
 }
 
 /// The run's own candidate area: a sibling of the run root. The run root holds
@@ -1394,6 +1409,30 @@ fn retained_anchor_result_reaches_candidate_ready_through_planning_and_implement
         "{report}"
     );
     assert_eq!(head(&candidate_worktree), revision);
+    // The unproven candidate revision exists only on its own candidate branch:
+    // the accepted mainline still points at the frozen base and no mainline
+    // ref contains the candidate commit.
+    let base = fixture.base_revision();
+    assert_eq!(
+        head(&fixture.proj),
+        base,
+        "candidate work never advances the accepted mainline"
+    );
+    let candidate_ref = format!("improve/{}/{}", "workflow-fixture", fixture.card);
+    assert_eq!(
+        git_output(
+            &fixture.proj,
+            &[
+                "for-each-ref",
+                "--contains",
+                &revision,
+                "--format=%(refname:short)",
+                "refs/heads"
+            ]
+        ),
+        candidate_ref,
+        "the candidate revision is contained only by its own candidate branch"
+    );
     assert!(
         fixture.bd_comments(&fixture.card).contains(&format!(
             "hypothesis-implementation v1 item={}",
@@ -2513,6 +2552,45 @@ fn comments_record(comments: &str, path: &Path) -> bool {
     comments.contains(text.as_ref()) || comments.contains(&text.replace('\\', "\\\\"))
 }
 
+/// One preserved worktree at the natural owner-assigned candidate location,
+/// exactly as an interrupted earlier allocation of this hypothesis leaves it.
+fn preserved_candidate_worktree(fixture: &Fixture, branch: &str) -> PathBuf {
+    let path = fixture.candidate_worktree(&fixture.card);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    git(
+        &fixture.proj,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            path.to_str().unwrap(),
+            &fixture.base_revision(),
+        ],
+    );
+    path
+}
+
+/// One replacement worktree at the next owner-assigned candidate location,
+/// exactly as a crash between allocation and the cursor save leaves it: a
+/// clean owned checkout of the frozen base on its own dedicated branch.
+fn replacement_candidate_worktree(fixture: &Fixture, branch: &str) -> PathBuf {
+    let path = fixture.replacement_candidate_worktree(&fixture.card);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    git(
+        &fixture.proj,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            path.to_str().unwrap(),
+            &fixture.base_revision(),
+        ],
+    );
+    path
+}
+
 /// The Git move can finish before the board publication and cursor save.
 /// Allocation has already published the pre-scaffold base revision; planning
 /// advanced the cursor to the scaffold commit without republishing. Resume
@@ -2901,6 +2979,362 @@ fn an_interrupted_relocation_reconciles_only_the_exact_registered_identity() {
     );
 }
 
+/// The natural owner-assigned location can already hold preserved work from
+/// an earlier interrupted allocation. The controller leaves it exactly as it
+/// stands - files, branch and revision - and allocates the next owned worktree
+/// from the run's exact committed base, binding that allocation to the Beads
+/// card. The accepted mainline is untouched.
+#[test]
+fn a_preserved_dirty_allocation_is_left_intact_for_a_new_owned_allocation() {
+    let fixture = Fixture::new("preserved-dirty");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    fake_launcher(&fixture);
+    let base = fixture.base_revision();
+    let branch = format!("improve/workflow-fixture/{}", fixture.card);
+    let preserved = preserved_candidate_worktree(&fixture, &branch);
+    fs::write(
+        preserved.join("crates/one/src/lib.rs"),
+        "// preserved work in progress\n",
+    )
+    .unwrap();
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    // The ineligible location is left exactly as found: same branch, same
+    // revision, and its uncommitted work is still present.
+    assert!(preserved.is_dir());
+    assert_eq!(
+        head(&preserved),
+        base,
+        "the preserved revision is unchanged"
+    );
+    assert_eq!(
+        git_output(&preserved, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        branch
+    );
+    assert_eq!(
+        fs::read_to_string(preserved.join("crates/one/src/lib.rs")).unwrap(),
+        "// preserved work in progress\n",
+        "preserved local changes are not reset, cleaned or checked out"
+    );
+
+    // The next owned location was allocated instead, from the exact frozen
+    // base and on its own dedicated branch.
+    let replacement = fixture.replacement_candidate_worktree(&fixture.card);
+    assert!(replacement.is_dir(), "the replacement allocation exists");
+    assert_eq!(
+        head(&replacement),
+        base,
+        "the replacement starts at the exact committed input"
+    );
+    assert_eq!(
+        git_output(&replacement, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("improve/workflow-fixture/{}-2", fixture.card)
+    );
+    let trees = git_output(&fixture.proj, &["worktree", "list", "--porcelain"])
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    assert!(trees.contains(&path_key(&preserved)));
+    assert!(trees.contains(&path_key(&replacement)));
+
+    // The card and the run state bind the replacement branch/base/worktree.
+    let comments = fixture.bd_comments(&fixture.card);
+    assert!(
+        comments_record(&comments, &replacement),
+        "the card records the replacement worktree: {comments}"
+    );
+    assert!(
+        comments.contains(&format!(
+            "role=candidate branch=improve/workflow-fixture/{}-2",
+            fixture.card
+        )),
+        "the card records the replacement branch: {comments}"
+    );
+    assert!(
+        comments.contains(&format!("base={base} ")),
+        "the card records the exact base: {comments}"
+    );
+    let report = fixture.status_json();
+    assert_eq!(report["candidate"]["hypothesis"], fixture.card, "{report}");
+    assert_eq!(
+        report["candidate"]["branch"],
+        format!("improve/workflow-fixture/{}-2", fixture.card),
+        "{report}"
+    );
+    assert_eq!(
+        path_key(Path::new(
+            report["candidate"]["worktree"]
+                .as_str()
+                .expect("the replacement allocation is reported")
+        )),
+        path_key(&replacement),
+        "{report}"
+    );
+
+    // The accepted mainline stays at the frozen base while candidate work
+    // lives on its own branch.
+    assert_eq!(head(&fixture.proj), base);
+}
+
+/// A preserved checkout can carry commits beyond the recorded revision. The
+/// controller leaves that branch and its commits exactly where they are and
+/// allocates the next owned worktree instead of adopting or resetting them.
+#[test]
+fn an_unpreserved_commit_beyond_the_base_is_left_intact_for_a_new_owned_allocation() {
+    let fixture = Fixture::new("preserved-commit");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    fake_launcher(&fixture);
+    let base = fixture.base_revision();
+    let branch = format!("improve/workflow-fixture/{}", fixture.card);
+    let preserved = preserved_candidate_worktree(&fixture, &branch);
+    fs::write(
+        preserved.join("crates/one/src/lib.rs"),
+        "// unmerged previous work\n",
+    )
+    .unwrap();
+    commit_all(&preserved, "preserve unmerged previous work");
+    let preserved_revision = head(&preserved);
+    assert_ne!(preserved_revision, base);
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    // The unpreserved commits stay on their own branch; nothing is reset.
+    assert_eq!(
+        head(&preserved),
+        preserved_revision,
+        "the preserved commit is not reset"
+    );
+    assert_eq!(
+        git_output(&preserved, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        branch
+    );
+    assert_eq!(
+        git_output(
+            &fixture.proj,
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        preserved_revision
+    );
+
+    let replacement = fixture.replacement_candidate_worktree(&fixture.card);
+    assert!(replacement.is_dir(), "a new owned allocation is used");
+    assert_eq!(head(&replacement), base);
+    assert_eq!(
+        git_output(&replacement, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("improve/workflow-fixture/{}-2", fixture.card)
+    );
+    let comments = fixture.bd_comments(&fixture.card);
+    assert!(
+        comments_record(&comments, &replacement),
+        "the card records the replacement worktree: {comments}"
+    );
+    assert_eq!(head(&fixture.proj), base);
+}
+
+/// A Git operation in the preserved checkout (a live `index.lock`) makes it
+/// busy. The controller does not wait on it, reset it or delete the lock; it
+/// allocates the next owned worktree and leaves the busy one untouched.
+#[test]
+fn a_busy_allocation_is_left_intact_for_a_new_owned_allocation() {
+    let fixture = Fixture::new("preserved-busy");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    fake_launcher(&fixture);
+    let base = fixture.base_revision();
+    let branch = format!("improve/workflow-fixture/{}", fixture.card);
+    let preserved = preserved_candidate_worktree(&fixture, &branch);
+    let lock = git_output(&preserved, &["rev-parse", "--git-path", "index.lock"]);
+    let lock = PathBuf::from(lock);
+    let lock = if lock.is_absolute() {
+        lock
+    } else {
+        preserved.join(lock)
+    };
+    fs::write(&lock, "held by another Git operation\n").unwrap();
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    // The busy checkout keeps its lock, revision and clean state.
+    assert!(lock.is_file(), "the foreign Git lock is not removed");
+    assert_eq!(head(&preserved), base);
+    assert!(git_output(&preserved, &["status", "--porcelain"]).is_empty());
+
+    let replacement = fixture.replacement_candidate_worktree(&fixture.card);
+    assert!(replacement.is_dir(), "a new owned allocation is used");
+    assert_eq!(head(&replacement), base);
+    let comments = fixture.bd_comments(&fixture.card);
+    assert!(
+        comments_record(&comments, &replacement),
+        "the card records the replacement worktree: {comments}"
+    );
+    assert_eq!(head(&fixture.proj), base);
+}
+
+/// An attempt whose receipt disappeared is reconciled to an explicit unknown
+/// outcome. Its eligible preserved allocation at the owner-assigned path is
+/// reused in place - never duplicated, reset or replayed - and dependent work
+/// stays blocked until the unknown attempt is reconciled through its owner.
+#[test]
+fn an_unresolved_attempt_keeps_its_preserved_allocation_and_blocks_dependent_work() {
+    let fixture = Fixture::new("unresolved-allocation");
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    fake_launcher(&fixture);
+    let base = fixture.base_revision();
+    let branch = format!("improve/workflow-fixture/{}", fixture.card);
+    let preserved = preserved_candidate_worktree(&fixture, &branch);
+
+    // The run still holds an unresolved planning attempt for this candidate
+    // and no recorded allocation.
+    let mut cursor = fixture.cursor();
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": fixture.change,
+        "removal_required": false,
+        "removal_frozen": Value::Null,
+        "worktree": Value::Null,
+        "planning_receipt": Value::Null,
+        "planner_attempt": "planner-1",
+        "implementer_attempt": Value::Null,
+        "revision": Value::Null,
+        "result": Value::Null,
+    });
+    assert!(cursor["attempts"].as_array().unwrap().is_empty());
+    cursor["attempts"]
+        .as_array_mut()
+        .unwrap()
+        .push(attempt_json(
+            "planner-1",
+            "planner",
+            "workflow-fixture-planner-1",
+            "gen-1",
+            &fixture.run.join("missing-planner-receipt.json"),
+            None,
+            None,
+            "started",
+        ));
+    fixture.write_cursor(&cursor);
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "blocked", "{report}");
+    assert_eq!(report["dispatch"]["state"], "blocked", "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown"),
+        "the unknown attempt is reported with its reason: {report}"
+    );
+    assert_eq!(
+        path_key(Path::new(
+            report["candidate"]["worktree"]
+                .as_str()
+                .expect("the preserved allocation is reused")
+        )),
+        path_key(&preserved),
+        "the eligible preserved allocation is reused in place: {report}"
+    );
+    assert_eq!(report["candidate"]["branch"], branch, "{report}");
+    assert!(
+        !fixture
+            .replacement_candidate_worktree(&fixture.card)
+            .exists(),
+        "an unresolved attempt triggers no second allocation"
+    );
+
+    // The preserved tree is untouched and no conversation is dispatched while
+    // the outcome stays unknown.
+    assert_eq!(head(&preserved), base);
+    assert!(git_output(&preserved, &["status", "--porcelain"]).is_empty());
+    let after = fixture.cursor();
+    assert_eq!(after["attempts"].as_array().unwrap().len(), 1, "{after}");
+    assert_eq!(after["attempts"][0]["state"], "unknown", "{after}");
+}
+
+/// A crash between allocating a replacement worktree and saving its cursor
+/// record leaves an eligible owned allocation on disk. The resume reuses that
+/// exact allocation - branch, base revision and registration - without
+/// allocating another location, while the preserved dirty neighbor at the
+/// natural location stays untouched.
+#[test]
+fn an_eligible_preserved_allocation_is_reused_without_allocating_again() {
+    let fixture = Fixture::new("preserved-eligible");
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    fake_launcher(&fixture);
+    let base = fixture.base_revision();
+    let natural_branch = format!("improve/workflow-fixture/{}", fixture.card);
+    let natural = preserved_candidate_worktree(&fixture, &natural_branch);
+    fs::write(
+        natural.join("crates/one/src/lib.rs"),
+        "// preserved dirty neighbor\n",
+    )
+    .unwrap();
+    let replacement_branch = format!("improve/workflow-fixture/{}-2", fixture.card);
+    let replacement = replacement_candidate_worktree(&fixture, &replacement_branch);
+
+    let mut cursor = fixture.cursor();
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": fixture.change,
+        "removal_required": false,
+        "removal_frozen": Value::Null,
+        "worktree": Value::Null,
+        "planning_receipt": Value::Null,
+        "planner_attempt": Value::Null,
+        "implementer_attempt": Value::Null,
+        "revision": Value::Null,
+        "result": Value::Null,
+    });
+    fixture.write_cursor(&cursor);
+
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(
+        report["candidate"]["branch"], replacement_branch,
+        "the eligible replacement branch is reused: {report}"
+    );
+    assert_eq!(
+        path_key(Path::new(
+            report["candidate"]["worktree"]
+                .as_str()
+                .expect("the reused allocation is reported")
+        )),
+        path_key(&replacement),
+        "{report}"
+    );
+    assert!(
+        !candidate_area(&fixture.run)
+            .join(format!("{}-3", fixture.card))
+            .exists(),
+        "an eligible allocation is reused instead of allocating again"
+    );
+    assert_eq!(head(&replacement), base);
+    assert_eq!(head(&natural), base);
+    assert_eq!(
+        fs::read_to_string(natural.join("crates/one/src/lib.rs")).unwrap(),
+        "// preserved dirty neighbor\n",
+        "the preserved neighbor is untouched by the reuse"
+    );
+}
+
 #[test]
 fn continuous_start_idles_without_a_model_call() {
     let fixture = Fixture::new("continuous-idle");
@@ -3059,6 +3493,7 @@ fn simplification_report(locator: &str) -> Value {
                                 "gaps": "none observed",
                                 "lost_uses": "rare manual recovery",
                                 "restoration": "restore from the pinned revision",
+                                "consumption": "the retained observation records no consumption of capability-x in either arm",
                             },
                         },
                     },

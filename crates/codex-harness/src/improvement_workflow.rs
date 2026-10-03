@@ -40,7 +40,7 @@ use harness_core::improvement_loop::{
 use harness_core::improvement_spec::{
     MeasurementReceipt, MeasurementScope, OpenSpec, PlanningReceipt, Specification,
 };
-use harness_core::task_worktree::{self, CandidateCheckout, WorktreeReuse};
+use harness_core::task_worktree::{self, CandidateCheckout, ReuseBlock, WorktreeReuse};
 use std::fs;
 use std::process::Command;
 
@@ -69,6 +69,10 @@ const MAX_EVIDENCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LISTED_EVIDENCE: usize = 6;
 const MAX_ASSIGNMENT_BYTES: usize = 256 * 1024;
 const MAX_ASSIGNMENT_INPUTS: usize = 32;
+/// The number of owner-assigned candidate locations one hypothesis may use:
+/// the natural location plus the replacements for preserved ineligible or
+/// foreign checkouts that are never touched.
+const CANDIDATE_ALLOCATION_ATTEMPTS: u32 = 16;
 
 /// Advances the run as far as the recorded state and the dispatch gates
 /// allow. Returns human-readable progress notes; a blocked or idle condition
@@ -1023,20 +1027,26 @@ fn refused(run: &mut Run, notes: &mut Vec<String>, reason: String) -> io::Result
 /// that state, which the supervisor gate correctly refuses. An existing
 /// recorded allocation is kept for this candidate; a pre-existing path is
 /// reused only through the worktree owner's read-only eligibility verdict and
-/// never forced. A recorded legacy allocation that still nests inside the run
-/// state cannot reach its own planner, so an inactive, verified, preserved one
-/// is relocated through the worktree owner's own Git operation and anything
-/// else is refused without touching it. A move whose board publication or
-/// cursor save was interrupted is reconciled on the next resume only when Git
-/// registers that same branch, base and revision at the owner-assigned
-/// destination; ambiguous, dirty, active or mismatched state is not adopted.
+/// never forced. When the owner-assigned location already holds an ineligible
+/// or foreign checkout - an active consumer, local or untracked changes,
+/// commits beyond the recorded revision, a detached tree or another task's
+/// worktree - that checkout is left exactly as it stands and the next owned
+/// location in the candidate area is used instead; only when no owned location
+/// remains is the unavailable prerequisite reported. A recorded legacy
+/// allocation that still nests inside the run state cannot reach its own
+/// planner, so an inactive, verified, preserved one is relocated through the
+/// worktree owner's own Git operation and anything else is refused without
+/// touching it. A move whose board publication or cursor save was interrupted
+/// is reconciled on the next resume only when Git registers that same branch,
+/// base and revision at the owner-assigned destination; ambiguous, dirty,
+/// active or mismatched state is not adopted.
 fn ensure_allocation(
     run: &mut Run,
     candidate: &mut CandidateState,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
-    let path = match candidate_checkout_root(run) {
-        Ok(root) => root.join(&candidate.hypothesis),
+    let area = match candidate_checkout_root(run) {
+        Ok(root) => root,
         Err(reason) => return refused(run, notes, reason),
     };
     if let Some(checkout) = candidate.worktree.clone() {
@@ -1052,15 +1062,49 @@ fn ensure_allocation(
             // resume.
             return Ok(());
         }
+        let path = area.join(&candidate.hypothesis);
         return relocate_recorded_allocation(run, candidate, checkout, &path, notes);
     }
-    let branch = format!("improve/{}/{}", run.spec.run, candidate.hypothesis);
-    let checkout = if path.exists() {
-        let active = run
-            .cursor
-            .attempts
-            .iter()
-            .any(|attempt| attempt.state.is_in_flight());
+    let active = run
+        .cursor
+        .attempts
+        .iter()
+        .any(|attempt| attempt.state.is_in_flight());
+    let mut preserved: Vec<String> = Vec::new();
+    let mut allocated: Option<CandidateCheckout> = None;
+    for ordinal in 1..=CANDIDATE_ALLOCATION_ATTEMPTS {
+        let path = if ordinal == 1 {
+            area.join(&candidate.hypothesis)
+        } else {
+            area.join(format!("{}-{ordinal}", candidate.hypothesis))
+        };
+        let branch = if ordinal == 1 {
+            format!("improve/{}/{}", run.spec.run, candidate.hypothesis)
+        } else {
+            format!(
+                "improve/{}/{}-{ordinal}",
+                run.spec.run, candidate.hypothesis
+            )
+        };
+        if !path.exists() {
+            match task_worktree::allocate_candidate_checkout(
+                &run.spec.project,
+                &path,
+                &branch,
+                &run.spec.base_revision,
+            ) {
+                Ok(checkout) => allocated = Some(checkout),
+                Err(error) => {
+                    let reason = format!(
+                        "the candidate branch {branch} could not be allocated from the frozen base {} in {}: {error}",
+                        run.spec.base_revision,
+                        path.display()
+                    );
+                    return refused(run, notes, reason);
+                }
+            }
+            break;
+        }
         match task_worktree::worktree_reuse(
             &run.spec.project,
             &path,
@@ -1069,64 +1113,54 @@ fn ensure_allocation(
             active,
         )? {
             WorktreeReuse::Eligible { revision } => {
-                // Keep the existing allocation's own dedicated branch; a
-                // detached or foreign checkout is refused instead of being
-                // adopted under this run's branch name.
+                // Keep the existing allocation's own dedicated branch; a tree
+                // without one is not an owned allocation and is never adopted
+                // under this run's branch name.
                 let existing = match git_text(&path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
                     Ok(branch) if branch != "HEAD" && !branch.trim().is_empty() => branch,
                     Ok(_) => {
-                        return refused(
-                            run,
-                            notes,
-                            format!(
-                                "the preserved candidate worktree {} is on a detached HEAD; it is not a dedicated candidate branch and is left untouched",
-                                path.display()
-                            ),
-                        );
+                        preserved.push(format!(
+                            "{} (detached HEAD: a detached tree is not a dedicated candidate branch)",
+                            path.display()
+                        ));
+                        continue;
                     }
                     Err(error) => {
-                        return refused(
-                            run,
-                            notes,
-                            format!(
-                                "the preserved candidate worktree {} branch could not be read: {error}",
-                                path.display()
-                            ),
+                        let reason = format!(
+                            "the preserved candidate worktree {} branch could not be read: {error}",
+                            path.display()
                         );
+                        return refused(run, notes, reason);
                     }
                 };
-                CandidateCheckout {
+                allocated = Some(CandidateCheckout {
                     source: run.spec.project.clone(),
                     path: path.clone(),
                     branch: existing,
                     base: revision.clone(),
                     revision,
-                }
+                });
+                break;
             }
             WorktreeReuse::Blocked { kind, reason } => {
-                let reason = format!(
-                    "the recorded candidate worktree {} cannot be reused ({kind:?}): {reason}",
-                    path.display()
-                );
-                return refused(run, notes, reason);
+                if active || kind == ReuseBlock::CurrentCheckout {
+                    let reason = format!(
+                        "the recorded candidate worktree {} cannot be reused ({kind:?}): {reason}",
+                        path.display()
+                    );
+                    return refused(run, notes, reason);
+                }
+                preserved.push(format!("{} ({kind:?}: {reason})", path.display()));
             }
         }
-    } else {
-        match task_worktree::allocate_candidate_checkout(
-            &run.spec.project,
-            &path,
-            &branch,
-            &run.spec.base_revision,
-        ) {
-            Ok(checkout) => checkout,
-            Err(error) => {
-                let reason = format!(
-                    "the candidate branch {branch} could not be allocated from the frozen base {}: {error}",
-                    run.spec.base_revision
-                );
-                return refused(run, notes, reason);
-            }
-        }
+    }
+    let Some(checkout) = allocated else {
+        let reason = format!(
+            "no owned candidate allocation remains for hypothesis {}: every owner-assigned location is occupied and left untouched ({})",
+            candidate.hypothesis,
+            preserved.join("; ")
+        );
+        return refused(run, notes, reason);
     };
     if let Err(error) = verify_candidate_base(run, &checkout) {
         return refused(run, notes, error);
@@ -1151,10 +1185,15 @@ fn ensure_allocation(
             candidate.hypothesis
         ))
     })?;
+    let preserved_note = if preserved.is_empty() {
+        String::new()
+    } else {
+        format!(" preserved {}", preserved.join("; "))
+    };
     run.cursor.effect(
         EffectKind::CandidateAllocated,
         format!(
-            "hypothesis={} branch={} base={} worktree={}",
+            "hypothesis={} branch={} base={} worktree={}{preserved_note}",
             candidate.hypothesis,
             checkout.branch,
             checkout.base,
@@ -1167,6 +1206,13 @@ fn ensure_allocation(
         checkout.base,
         checkout.path.display()
     ));
+    if !preserved.is_empty() {
+        notes.push(format!(
+            "allocation: left {} preserved checkout(s) untouched: {}",
+            preserved.len(),
+            preserved.join("; ")
+        ));
+    }
     candidate.worktree = Some(checkout);
     Ok(())
 }
