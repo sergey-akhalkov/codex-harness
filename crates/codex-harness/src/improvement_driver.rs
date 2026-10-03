@@ -12,12 +12,16 @@
 //! busy.
 
 use super::{Run, advance_run, attempt_evidence, invalid, reconcile, terminal_outcome};
+use harness_core::board_hypothesis;
 use harness_core::build_identity;
 use harness_core::improvement_activation::{
     self, ActivationOutcome, ActivationRequest, CheckSpec, IntegrationOutcome, IntegrationReceipt,
     IntegrationRequest,
 };
-use harness_core::improvement_experiment::ExperimentBindings;
+use harness_core::improvement_experiment::{
+    Arm, CorroborationRequirement, CorroborationSelection, CorroborationStatus, ExperimentBindings,
+    RetainedTask, TaskRetention, retain_completed_task, select_corroboration,
+};
 use harness_core::improvement_loop::{
     AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunStore,
     current_process_identity, owner_is_live, read_json, write_json_atomic,
@@ -50,6 +54,21 @@ const ACTIVATION_FILE: &str = "activation.json";
 const SUCCESSOR_FILE: &str = "successor.json";
 const LINEAGE_FILE: &str = "lineage.json";
 const CONTINUATION_FILE: &str = "continuation.json";
+/// The decision-boundary consumption receipts: the completed real task's
+/// retention, the declared corroboration selection and the unadopted
+/// reconciliation of the hypothesis' own change. Each is written once per
+/// decision, so a later pass never repeats the same external action.
+const RETENTION_FILE: &str = "retention.json";
+const RETAINED_DIR: &str = "retained";
+const RETAINED_INDEX_FILE: &str = "retained-tasks.json";
+const CORROBORATION_FILE: &str = "corroboration.json";
+const RECONCILE_FILE: &str = "reconcile.json";
+/// Bound on one recorded consumption reason; the receipt names the exact
+/// identity, never a long transcript.
+const MAX_CONSUMPTION_DETAIL: usize = 512;
+/// Bound on the run-local retained-task index used for corroboration
+/// selection; the durable owner records stay on the Beads cards.
+const MAX_RETAINED_TASKS: usize = 64;
 const SUCCESSOR_WAIT: Duration = Duration::from_secs(30);
 static TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1167,6 +1186,12 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         return Ok(());
     }
     let evaluation: PolicyEvaluation = read_json(&evaluation_path, MAX_RUN_SPEC_BYTES)?;
+    // Routed consumption at the decision boundary: the merged owners retain
+    // the completed real task, select declared corroboration units and
+    // reconcile an unadopted decision with its own change's actual task
+    // state. Each is recorded once; none of them may change the decision the
+    // comparison owner published.
+    consume_decision_evidence(run, &evaluation, notes)?;
     if evaluation.decision != PolicyDecision::Adopt {
         record_lineage(run, &evaluation, notes)?;
         run.cursor.phase = Phase::Idle;
@@ -1294,6 +1319,709 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
             activate_integrated(run, &bindings, &evaluation, &receipt, notes)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decision-boundary consumption.
+//
+// The controller routes a settled decision to the merged owners instead of
+// duplicating them: the experiment owner retains the completed real task's
+// replayable pre-solution inputs under its existing Beads card, the
+// corroboration selector picks applicable independent retained units for the
+// declared adoption scope, and the feedback owner reconciles an unadopted
+// decision with the hypothesis' own OpenSpec change. Every receipt is
+// identity-only: no solution, patch, answer or conversation content enters
+// run state, the board or the main specifications. Each action is recorded
+// once, so a later pass never repeats the same external action.
+// ---------------------------------------------------------------------------
+
+/// The run-local receipt of the completed real task's retention. It carries
+/// the identity references and the retained pre-solution replay locator; it
+/// has no field for a solution or an answer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetentionReceipt {
+    pub(super) schema: u32,
+    /// `retained` or `unavailable`.
+    pub(super) status: String,
+    pub(super) owner: String,
+    pub(super) case_id: String,
+    pub(super) experiment: String,
+    /// The committed source revision the completed real task ran.
+    pub(super) revision: String,
+    /// The frozen root commit materialized from that revision.
+    pub(super) frozen: String,
+    /// Content digest over the retained snapshot's tree entries.
+    pub(super) tree: String,
+    /// The retained pristine pre-solution copy used for replay.
+    pub(super) replay: Option<PathBuf>,
+    pub(super) reason: Option<String>,
+}
+
+/// The run-local receipt of the declared corroboration selection. The
+/// embedded selection is identity and replay references only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CorroborationReceipt {
+    pub(super) schema: u32,
+    /// `selected` or `unavailable`.
+    pub(super) status: String,
+    /// The additional independent units the declared scope requires beyond
+    /// the run's own declared plan unit.
+    pub(super) required_units: u32,
+    pub(super) selection: Option<CorroborationSelection>,
+    pub(super) reason: Option<String>,
+}
+
+/// The run-local receipt of one unadopted decision's reconcile call. The
+/// merged feedback owner keeps the change's task state authoritative; this
+/// receipt records which exact identities were reconciled and what it did.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReconcileReceipt {
+    pub(super) schema: u32,
+    pub(super) item: String,
+    pub(super) outcome: String,
+    pub(super) action: String,
+    pub(super) change: String,
+    /// `retained`, `archived` or `refused`.
+    pub(super) status: String,
+    pub(super) exit_code: Option<i32>,
+    pub(super) detail: Option<String>,
+}
+
+pub(super) fn retention_receipt(run: &Run) -> io::Result<Option<RetentionReceipt>> {
+    load_optional(&run.store.root().join(RETENTION_FILE))
+}
+
+pub(super) fn corroboration_receipt(run: &Run) -> io::Result<Option<CorroborationReceipt>> {
+    load_optional(&run.store.root().join(CORROBORATION_FILE))
+}
+
+pub(super) fn reconcile_receipt(run: &Run) -> io::Result<Option<ReconcileReceipt>> {
+    load_optional(&run.store.root().join(RECONCILE_FILE))
+}
+
+/// Consumes the settled decision through the merged owners. None of these
+/// steps may change the verdict the comparison owner published; a refusal is
+/// recorded with its exact reason and never retried identically.
+fn consume_decision_evidence(
+    run: &mut Run,
+    evaluation: &PolicyEvaluation,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    retain_completed_workload(run, notes)?;
+    select_corroboration_units(run, notes)?;
+    reconcile_unadopted_decision(run, evaluation, notes)?;
+    Ok(())
+}
+
+/// Retains the completed real workload task through the experiment owner as
+/// soon as one decision is settled: the frozen pre-solution copy is
+/// re-materialized as an independent replayable copy and recorded under the
+/// card that already owns the task. A missing frozen copy or owner record is
+/// recorded as unavailable - never replaced by a summary - and the same exact
+/// attempt is not repeated.
+fn retain_completed_workload(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
+    if run.store.root().join(RETENTION_FILE).is_file() {
+        return Ok(());
+    }
+    if run.spec.comparison.is_none() {
+        return Ok(());
+    }
+    let state = run.cursor.comparison.clone();
+    let owner = state
+        .as_ref()
+        .and_then(|state| state.workload_card.clone())
+        .unwrap_or_default();
+    let experiment = run.cursor.experiment.clone();
+    let bindings = match state.as_ref().and_then(|state| state.bindings.as_ref()) {
+        Some(path) => match load_optional::<ExperimentBindings>(path) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                return unavailable_retention(
+                    run,
+                    notes,
+                    &owner,
+                    "",
+                    &experiment,
+                    None,
+                    format!(
+                        "the retained comparison bindings at {} are unreadable: {error}",
+                        path.display()
+                    ),
+                );
+            }
+        },
+        None => None,
+    };
+    let Some(bindings) = bindings else {
+        return unavailable_retention(
+            run,
+            notes,
+            &owner,
+            "",
+            &experiment,
+            None,
+            "the prepared comparison bindings are not retained; a completed real task is never retained from a summary".to_owned(),
+        );
+    };
+    let case_id = bindings.case_id.clone();
+    if owner.is_empty() {
+        return unavailable_retention(
+            run,
+            notes,
+            &owner,
+            &case_id,
+            &experiment,
+            None,
+            "the run retains no workload card; retention never creates a card or a second task store"
+                .to_owned(),
+        );
+    }
+    let card =
+        match board_hypothesis::load_card(&run.spec.board.bd, &run.spec.board.project, &owner) {
+            Ok(card) => card,
+            Err(error) => {
+                return unavailable_retention(
+                    run,
+                    notes,
+                    &owner,
+                    &case_id,
+                    &experiment,
+                    None,
+                    format!("the owning card {owner} is unreadable: {error}"),
+                );
+            }
+        };
+    let Some(admission) = board_hypothesis::parse_admission(&card.description) else {
+        return unavailable_retention(
+            run,
+            notes,
+            &owner,
+            &case_id,
+            &experiment,
+            None,
+            format!(
+                "the owning card {owner} carries no recognized admission record; its mechanism and conditions are required before retention"
+            ),
+        );
+    };
+    let (Some(mechanism), Some(conditions)) = (admission.mechanism, admission.conditions) else {
+        return unavailable_retention(
+            run,
+            notes,
+            &owner,
+            &case_id,
+            &experiment,
+            None,
+            format!(
+                "the owning card {owner} records no mechanism/conditions; retention never invents applicability"
+            ),
+        );
+    };
+    let workload = match bindings.arm(Arm::Baseline) {
+        Ok(arm) => arm.workload.clone(),
+        Err(error) => {
+            return unavailable_retention(
+                run,
+                notes,
+                &owner,
+                &case_id,
+                &experiment,
+                None,
+                format!("the completed task's frozen baseline arm is not bound: {error}"),
+            );
+        }
+    };
+    let retention = TaskRetention {
+        owner: owner.clone(),
+        case_id: case_id.clone(),
+        experiment: experiment.clone(),
+        mechanism,
+        conditions,
+        oracle: bindings.oracle.clone(),
+        acceptance: bindings.acceptance.clone(),
+    };
+    let destination = run
+        .store
+        .root()
+        .join(RETAINED_DIR)
+        .join(retained_dir_name(&case_id));
+    let retained = match retain_completed_task(&workload, &destination, &retention) {
+        Ok(retained) => retained,
+        Err(error) => {
+            return unavailable_retention(
+                run,
+                notes,
+                &owner,
+                &case_id,
+                &experiment,
+                None,
+                format!("the completed task's frozen copy could not be retained: {error}"),
+            );
+        }
+    };
+    let draft = board_hypothesis::RetentionDraft {
+        case_id: retained.case_id.clone(),
+        experiment: retained.experiment.clone(),
+        mechanism: retained.mechanism.clone(),
+        conditions: retained.conditions.clone(),
+        revision: retained.replay.source_revision.clone(),
+        frozen: retained.replay.revision.clone(),
+        tree: retained.replay.tree_sha256.clone(),
+        oracle: retained.oracle.clone(),
+        acceptance: retained.acceptance.clone(),
+        replay: retained.replay.path.display().to_string(),
+        detail: Some("completed real task retained at the decision boundary".to_owned()),
+    };
+    let bounded = match board_hypothesis::BoundedRetention::try_from_draft(draft) {
+        Ok(bounded) => bounded,
+        Err(error) => {
+            return unavailable_retention(
+                run,
+                notes,
+                &owner,
+                &case_id,
+                &experiment,
+                Some(retained.replay.path.clone()),
+                format!("the retention references were refused: {error}"),
+            );
+        }
+    };
+    let recorded = match board_hypothesis::record_retention(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &owner,
+        &bounded,
+    ) {
+        Ok(record) => record.recorded,
+        Err(error) => {
+            return unavailable_retention(
+                run,
+                notes,
+                &owner,
+                &case_id,
+                &experiment,
+                Some(retained.replay.path.clone()),
+                format!("the owning card {owner} refused the retention record: {error}"),
+            );
+        }
+    };
+    if let Err(error) = append_retained_task(run, &retained) {
+        notes.push(format!(
+            "controller: the run-local retained-task index did not record case {case_id}: {error}; the durable owner record stays on {owner}"
+        ));
+    }
+    write_json_atomic(
+        &run.store.root().join(RETENTION_FILE),
+        &RetentionReceipt {
+            schema: 1,
+            status: "retained".to_owned(),
+            owner: owner.clone(),
+            case_id: case_id.clone(),
+            experiment: experiment.clone(),
+            revision: retained.replay.source_revision.clone(),
+            frozen: retained.replay.revision.clone(),
+            tree: retained.replay.tree_sha256.clone(),
+            replay: Some(retained.replay.path.clone()),
+            reason: None,
+        },
+    )?;
+    run.cursor.effect(
+        EffectKind::ContinuationRecorded,
+        format!(
+            "retention case={case_id} owner={owner} replay={} tree={}",
+            retained.replay.path.display(),
+            &retained.replay.tree_sha256[..16.min(retained.replay.tree_sha256.len())]
+        ),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "controller: retained the completed real task case={case_id} under {owner} ({}) as identity-only replayable pre-solution inputs",
+        if recorded { "new record" } else { "existing record" }
+    ));
+    Ok(())
+}
+
+fn unavailable_retention(
+    run: &mut Run,
+    notes: &mut Vec<String>,
+    owner: &str,
+    case_id: &str,
+    experiment: &str,
+    replay: Option<PathBuf>,
+    reason: String,
+) -> io::Result<()> {
+    let reason = bounded_consumption(reason);
+    write_json_atomic(
+        &run.store.root().join(RETENTION_FILE),
+        &RetentionReceipt {
+            schema: 1,
+            status: "unavailable".to_owned(),
+            owner: owner.to_owned(),
+            case_id: case_id.to_owned(),
+            experiment: experiment.to_owned(),
+            revision: String::new(),
+            frozen: String::new(),
+            tree: String::new(),
+            replay,
+            reason: Some(reason.clone()),
+        },
+    )?;
+    run.cursor.effect(
+        EffectKind::ContinuationRecorded,
+        format!("retention unavailable: {reason}"),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "controller: the completed real task was not retained: {reason}"
+    ));
+    Ok(())
+}
+
+/// A stable, bounded directory name for one retained task identity.
+fn retained_dir_name(case_id: &str) -> String {
+    let digest = build_identity::hash_bytes(case_id.as_bytes());
+    let mut name: String = case_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        name.push_str("case");
+    }
+    format!("{name}-{}", &digest[..12])
+}
+
+/// The run-local retained-task index: complete identity and replay
+/// references of the tasks this run retained, used by corroboration
+/// selection. It never holds a solution, patch or conversation.
+fn append_retained_task(run: &Run, retained: &RetainedTask) -> io::Result<()> {
+    let path = run.store.root().join(RETAINED_INDEX_FILE);
+    let mut tasks: Vec<RetainedTask> = if path.is_file() {
+        read_json(&path, MAX_RUN_SPEC_BYTES)?
+    } else {
+        Vec::new()
+    };
+    let duplicate = tasks.iter().any(|task| {
+        task.case_id == retained.case_id && task.replay.tree_sha256 == retained.replay.tree_sha256
+    });
+    if !duplicate {
+        if tasks.len() >= MAX_RETAINED_TASKS {
+            return Err(invalid(format!(
+                "the retained-task index already holds {MAX_RETAINED_TASKS} tasks; the durable records stay on their Beads cards"
+            )));
+        }
+        tasks.push(retained.clone());
+        write_json_atomic(&path, &tasks)?;
+    }
+    Ok(())
+}
+
+fn read_retained_tasks(run: &Run) -> io::Result<Vec<RetainedTask>> {
+    let path = run.store.root().join(RETAINED_INDEX_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    read_json(&path, MAX_RUN_SPEC_BYTES)
+}
+
+/// Selects the additional independent corroboration units the declared
+/// adoption scope requires, before the outcome is treated as supporting a
+/// broader claim. Selection is identity-only and order-independent; too few
+/// applicable, independent, replayable retained tasks leave the broader claim
+/// explicitly inconclusive rather than turning an inapplicable workload into
+/// evidence or repeating an identical measurement.
+fn select_corroboration_units(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
+    if run.store.root().join(CORROBORATION_FILE).is_file() {
+        return Ok(());
+    }
+    let Some(comparison) = run.spec.comparison.as_ref() else {
+        return Ok(());
+    };
+    let declared = match comparison.declared_policy() {
+        Ok(declared) => declared,
+        Err(error) => {
+            return unavailable_corroboration(
+                run,
+                notes,
+                0,
+                format!("the declared comparison policy is unusable: {error}"),
+            );
+        }
+    };
+    let required_total = declared.policy.stopping.required_units;
+    if required_total <= 1 {
+        return Ok(());
+    }
+    let additional = required_total - 1;
+    let item = run
+        .cursor
+        .candidate
+        .as_ref()
+        .map(|candidate| candidate.hypothesis.clone())
+        .unwrap_or_else(|| run.spec.hypothesis_item.clone());
+    let record = board_hypothesis::load_card(&run.spec.board.bd, &run.spec.board.project, &item)
+        .ok()
+        .and_then(|card| board_hypothesis::parse_admission(&card.description));
+    let (Some(mechanism), Some(conditions)) = (
+        record.as_ref().and_then(|record| record.mechanism.clone()),
+        record.as_ref().and_then(|record| record.conditions.clone()),
+    ) else {
+        return unavailable_corroboration(
+            run,
+            notes,
+            additional,
+            format!(
+                "hypothesis card {item} records no mechanism/conditions; units applicable to the declared claim cannot be selected"
+            ),
+        );
+    };
+    let mut excluded: Vec<String> = Vec::new();
+    if let Some(state) = run.cursor.comparison.as_ref() {
+        if let Some(card) = &state.workload_card {
+            excluded.push(card.clone());
+        }
+        if let Some(path) = state.bindings.as_ref()
+            && let Ok(Some(bindings)) = load_optional::<ExperimentBindings>(path)
+        {
+            excluded.push(bindings.case_id.clone());
+        }
+    }
+    let candidates = match read_retained_tasks(run) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            return unavailable_corroboration(
+                run,
+                notes,
+                additional,
+                format!("the run-local retained-task index is unreadable: {error}"),
+            );
+        }
+    };
+    let requirement = CorroborationRequirement {
+        mechanism,
+        conditions,
+        required_units: additional,
+        excluded,
+    };
+    let selection = match select_corroboration(&candidates, &requirement) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return unavailable_corroboration(
+                run,
+                notes,
+                additional,
+                format!("corroboration selection refused: {error}"),
+            );
+        }
+    };
+    write_json_atomic(
+        &run.store.root().join(CORROBORATION_FILE),
+        &CorroborationReceipt {
+            schema: 1,
+            status: "selected".to_owned(),
+            required_units: additional,
+            selection: Some(selection.clone()),
+            reason: None,
+        },
+    )?;
+    let state = if selection.is_ready() {
+        "ready"
+    } else {
+        "inconclusive"
+    };
+    run.cursor.effect(
+        EffectKind::ContinuationRecorded,
+        format!(
+            "corroboration required=+{additional} status={state} units={} excluded={}",
+            selection.units.len(),
+            selection.excluded.len()
+        ),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "controller: the declared adoption scope requires {additional} additional independent corroboration unit(s); selection is {state} with {} applicable unit(s){}",
+        selection.units.len(),
+        match &selection.status {
+            CorroborationStatus::Inconclusive(reason) => format!(" ({reason})"),
+            CorroborationStatus::Ready => String::new(),
+        }
+    ));
+    Ok(())
+}
+
+fn unavailable_corroboration(
+    run: &mut Run,
+    notes: &mut Vec<String>,
+    required_units: u32,
+    reason: String,
+) -> io::Result<()> {
+    let reason = bounded_consumption(reason);
+    write_json_atomic(
+        &run.store.root().join(CORROBORATION_FILE),
+        &CorroborationReceipt {
+            schema: 1,
+            status: "unavailable".to_owned(),
+            required_units,
+            selection: None,
+            reason: Some(reason.clone()),
+        },
+    )?;
+    run.cursor.effect(
+        EffectKind::ContinuationRecorded,
+        format!("corroboration unavailable: {reason}"),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "controller: corroboration selection was not performed: {reason}"
+    ));
+    Ok(())
+}
+
+/// Routes one unadopted decision to the merged reconcile owner for the
+/// hypothesis card's own linked change. Retention reads the change's actual
+/// task state and writes nothing; archival uses the supported
+/// non-synchronizing path only when every required task is done, so an
+/// unfinished required task is never closed through an experiment outcome
+/// and no unadopted delta reaches the main specifications. An adopted
+/// decision is refused here: its delta synchronizes through the
+/// adoption/integration owner.
+fn reconcile_unadopted_decision(
+    run: &mut Run,
+    evaluation: &PolicyEvaluation,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    if run.store.root().join(RECONCILE_FILE).is_file() {
+        return Ok(());
+    }
+    let outcome = match evaluation.decision {
+        PolicyDecision::Reject => "reject",
+        PolicyDecision::Inconclusive => "inconclusive",
+        PolicyDecision::Adopt => return Ok(()),
+    };
+    let item = run
+        .cursor
+        .candidate
+        .as_ref()
+        .map(|candidate| candidate.hypothesis.clone())
+        .unwrap_or_else(|| run.spec.hypothesis_item.clone());
+    let change = run
+        .cursor
+        .candidate
+        .as_ref()
+        .map(|candidate| candidate.change.clone())
+        .unwrap_or_else(|| run.spec.specification.change.clone());
+    let action = if evaluation.decision == PolicyDecision::Reject {
+        "archive"
+    } else {
+        "retain"
+    };
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("feedback")
+        .arg("hypothesis-reconcile")
+        .arg("--project")
+        .arg(&run.spec.board.project)
+        .arg("--bd")
+        .arg(&run.spec.board.bd)
+        .arg("--item")
+        .arg(&item)
+        .arg("--outcome")
+        .arg(outcome)
+        .arg("--action")
+        .arg(action)
+        .arg("--change")
+        .arg(&change)
+        .arg("--openspec-project")
+        .arg(&run.spec.specification.project)
+        .arg("--planning-root")
+        .arg(&run.spec.specification.planning_root);
+    if let Some(store) = &run.spec.specification.store {
+        command.arg("--store").arg(store);
+    }
+    let receipt = match command.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let code = output.status.code();
+            let status = if stdout.contains("action=archived") {
+                "archived"
+            } else if matches!(code, Some(0 | 1)) {
+                "retained"
+            } else {
+                "refused"
+            };
+            let detail = stdout
+                .lines()
+                .chain(stderr.lines())
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| bounded_consumption(line.to_owned()));
+            ReconcileReceipt {
+                schema: 1,
+                item: item.clone(),
+                outcome: outcome.to_owned(),
+                action: action.to_owned(),
+                change: change.clone(),
+                status: status.to_owned(),
+                exit_code: code,
+                detail,
+            }
+        }
+        Err(error) => ReconcileReceipt {
+            schema: 1,
+            item: item.clone(),
+            outcome: outcome.to_owned(),
+            action: action.to_owned(),
+            change: change.clone(),
+            status: "refused".to_owned(),
+            exit_code: None,
+            detail: Some(bounded_consumption(format!(
+                "the reconcile owner could not be started: {error}"
+            ))),
+        },
+    };
+    write_json_atomic(&run.store.root().join(RECONCILE_FILE), &receipt)?;
+    run.cursor.effect(
+        EffectKind::Reconciled,
+        format!(
+            "outcome={} item={} change={} action={} status={}",
+            receipt.outcome, receipt.item, receipt.change, receipt.action, receipt.status
+        ),
+    );
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(match receipt.status.as_str() {
+        "archived" => format!(
+            "controller: reconciled the unadopted decision {outcome}: the completed change {change} was archived through the non-synchronizing path and the main specifications kept their exact content"
+        ),
+        "retained" => format!(
+            "controller: reconciled the unadopted decision {outcome}: change {change} stays retained; unfinished required tasks were not closed and no unadopted delta reached the main specifications"
+        ),
+        _ => format!(
+            "controller: the reconcile owner refused the unadopted decision {outcome} for change {change}: {}",
+            receipt.detail.as_deref().unwrap_or("no detail")
+        ),
+    });
+    Ok(())
+}
+
+fn bounded_consumption(detail: String) -> String {
+    if detail.len() <= MAX_CONSUMPTION_DETAIL {
+        return detail;
+    }
+    let mut cut = MAX_CONSUMPTION_DETAIL;
+    while !detail.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &detail[..cut])
 }
 
 fn activate_integrated(

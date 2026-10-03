@@ -3023,6 +3023,314 @@ fn stopping_the_controller_suspends_the_running_successor_through_its_own_owner(
     );
 }
 
+/// One comparison-ready run spec: owned state directories, the synthetic
+/// client request, the declared qualification record and a predeclared policy
+/// file, exactly as the existing continuous tests seed them.
+fn seed_comparison_spec(fixture: &Fixture, policy_document: &Value, name: &str) -> String {
+    let state = fixture.root.join(format!("state-{name}"));
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    fs::create_dir_all(state.join("builds/ha-build")).unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join(format!("policy-{name}.json"));
+    fs::write(&policy, serde_json::to_vec_pretty(policy_document).unwrap()).unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[
+            (
+                "runner",
+                json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+            ),
+            (
+                "local_runner",
+                json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+            ),
+            ("qualification", json!(qualification)),
+            (
+                "comparison",
+                comparison_inputs(
+                    fixture,
+                    &state,
+                    &upstream,
+                    &policy,
+                    &request,
+                    &request_sha,
+                    &head,
+                ),
+            ),
+        ],
+        None,
+    );
+    head
+}
+
+/// A predeclared policy that requires one additional independent unit beyond
+/// the run's own declared plan unit.
+fn corroboration_policy() -> Value {
+    json!({
+        "schema": 1,
+        "objective": "time",
+        "basis": "efficiency",
+        "meaningfulEffectPercent": 10.0,
+        "tolerancePercent": 5.0,
+        "requireAcceptance": true,
+        "taskMix": "one frozen workload case",
+        "stopping": {"maxAttemptsPerArm": 1, "requiredUnits": 2},
+        "repeatedSelection": "predeclared",
+        "tradeOff": Value::Null,
+        "uncertainty": "unknown evidence stays inconclusive",
+        "horizonTasks": 1.0,
+        "overhead": {
+            "implementationSeconds": 0.0,
+            "evaluationSeconds": 0.0,
+            "maintenanceSecondsPerTask": 0.0,
+        },
+    })
+}
+
+/// The workload's own hypothesis card. The merged admission owner reuses one
+/// card per mechanism/conditions identity, so this returns the existing card
+/// rather than creating a duplicate hypothesis card.
+fn admit_workload_card(fixture: &Fixture) -> String {
+    let out = fixture.feedback(&[
+        "hypothesis-admit",
+        "--mechanism",
+        "bounded-output",
+        "--conditions",
+        "local-tool-runs",
+        "--observation",
+        "token-audit:findings#13",
+        "--predicted",
+        "the workload runs with bounded output",
+        "--counterexample",
+        "the frozen workload changes between arms",
+        "--acceptance",
+        "the independent oracle passes",
+        "--spec",
+        "openspec/changes/add-synthetic",
+        "--basis",
+        "evidence-2",
+    ]);
+    assert!(out.status.success(), "workload admit: {}", text(&out));
+    let printed = text(&out);
+    let id = printed
+        .strip_prefix("hypothesis ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!id.is_empty(), "admission named no card: {printed}");
+    id
+}
+
+/// One plain Beads card, as a prior real task's existing owner.
+fn create_owner_card(fixture: &Fixture, title: &str) -> String {
+    let out = Command::new(bd_executable())
+        .args(["create", title, "--type", "task", "--json"])
+        .current_dir(&fixture.proj)
+        .output()
+        .expect("bd create runs");
+    assert!(out.status.success(), "bd create: {}", text(&out));
+    let created: Value = serde_json::from_slice(&out.stdout).expect("bd create json");
+    created["id"].as_str().expect("created card id").to_owned()
+}
+
+/// The retained comparison bindings at a decision boundary: both arms bind
+/// one frozen pre-solution workload copy, so the completed real task's inputs
+/// are replayable without its solution.
+fn seed_bindings(
+    fixture: &Fixture,
+    workload: &harness_core::task_worktree::FrozenCopy,
+    revision: &str,
+) -> PathBuf {
+    let path = fixture.run.join("comparison/bindings.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let arm = |name: &str, arm: &str| {
+        json!({
+            "arm": arm,
+            "home": fixture.root.join(name).display().to_string(),
+            "workload": workload,
+            "runtime": {
+                "arm": arm,
+                "label": name,
+                "build": fixture.root.join("builds").join(name).display().to_string(),
+                "recordSha256": "a".repeat(64),
+                "sourceSha256": "b".repeat(64),
+            },
+        })
+    };
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "hypothesis": fixture.card,
+            "caseId": "case-b",
+            "baseRevision": revision,
+            "candidate": {
+                "source": fixture.proj,
+                "path": fixture.proj,
+                "branch": "improve/fixture",
+                "base": revision,
+                "revision": revision,
+            },
+            "oracle": "oracle-7",
+            "acceptance": "acceptance/run-9",
+            "policyDigest": "c".repeat(64),
+            "arms": [arm("baseline-home", "baseline"), arm("candidate-home", "candidate")],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+/// Publish the exact `benefit-gate v2` non-adoption the comparison owner
+/// publishes before the controller consumes the decision.
+fn publish_rejection(fixture: &Fixture, baseline: &str, candidate: &str) {
+    harness_core::benefit_gate::publish_non_adoption(
+        &fixture.bd,
+        &fixture.proj,
+        &harness_core::benefit_gate::NonAdoptionDraft {
+            item: fixture.card.clone(),
+            experiment: "exp-fixture".to_owned(),
+            outcome: harness_core::benefit_gate::DecisionOutcome::Reject,
+            quality: harness_core::benefit_gate::QualityOutcome::Regressed,
+            accounting: "attempts:2,tasks:1,accepted:1".to_owned(),
+            baseline_revision: baseline.to_owned(),
+            candidate_revision: candidate.to_owned(),
+            acceptance: "acceptance/run-9".to_owned(),
+            coverage: "fixture".to_owned(),
+            scope: "fixture".to_owned(),
+            reason: "regressed".to_owned(),
+            detail: None,
+        },
+    )
+    .unwrap();
+}
+
+/// Seed the retained evaluation receipt and the cursor the decision boundary
+/// consumes, exactly as the comparison owner leaves them once a measured pair
+/// produced its evidence-bound decision.
+fn seed_decision_boundary(
+    fixture: &Fixture,
+    bindings: &Path,
+    workload_card: &str,
+    revision: &str,
+    decision: &str,
+) -> PathBuf {
+    let comparison = fixture.run.join("comparison");
+    fs::create_dir_all(&comparison).unwrap();
+    let evaluation = comparison.join("evaluation.json");
+    fs::write(
+        &evaluation,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "policyDigest": "a".repeat(64),
+            "decision": decision,
+            "basis": "efficiency",
+            "quality": "regressed",
+            "matched": 1,
+            "baselineSeconds": 2.0,
+            "candidateSeconds": 3.0,
+            "tolerancePercent": 5.0,
+            "coverage": "fixture",
+            "scope": "fixture",
+            "reasons": ["the candidate regressed the declared metric"],
+            "perSuccess": {
+                "status": "undefined",
+                "seconds": Value::Null,
+                "acceptedTasks": 0,
+                "tasks": 1,
+                "reason": "not used"
+            },
+            "attempts": 2,
+            "tasks": 1,
+            "acceptedTasks": 1,
+            "acceptanceRate": 1.0,
+            "tradeOffUsed": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("decision-recorded");
+    cursor["condition"] = Value::Null;
+    cursor["experiment"] = json!("exp-fixture");
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": revision,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": revision,
+            "revision": revision,
+        }
+    });
+    cursor["comparison"] = json!({
+        "schema": 1,
+        "policy_digest": "a".repeat(64),
+        "bindings": bindings.display().to_string(),
+        "workload_card": workload_card,
+        "evaluation": evaluation.display().to_string(),
+    });
+    fixture.write_cursor(&cursor);
+    evaluation
+}
+
+/// Every main-specification file under one planning root with its digest.
+fn main_spec_files(root: &Path) -> BTreeMap<String, String> {
+    let specs = root.join("openspec/specs");
+    if specs.is_dir() {
+        build_files(&specs)
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// A retained completed real task that a prior run already recorded: the
+/// frozen pre-solution copy plus a committed answer the retention never keeps.
+fn prior_retained_task(
+    fixture: &Fixture,
+    revision: &str,
+    owner: &str,
+    case_id: &str,
+    mechanism: &str,
+) -> harness_core::improvement_experiment::RetainedTask {
+    let completed = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        revision,
+        &fixture.root.join(format!("{case_id}-completed")),
+    )
+    .unwrap();
+    fs::write(
+        completed.path.join("answer.txt"),
+        "prior solution: earlier attempt answer\n",
+    )
+    .unwrap();
+    git(&completed.path, &["add", "."]);
+    git(&completed.path, &["commit", "-qm", "prior answer"]);
+    harness_core::improvement_experiment::retain_completed_task(
+        &completed,
+        &fixture.root.join(format!("{case_id}-retained")),
+        &harness_core::improvement_experiment::TaskRetention {
+            owner: owner.to_owned(),
+            case_id: case_id.to_owned(),
+            experiment: "exp-prior".to_owned(),
+            mechanism: mechanism.to_owned(),
+            conditions: "local-tool-runs".to_owned(),
+            oracle: "oracle-7".to_owned(),
+            acceptance: "acceptance/run-9".to_owned(),
+        },
+    )
+    .unwrap()
+}
+
 fn comparison_inputs(
     fixture: &Fixture,
     state: &Path,
@@ -3345,4 +3653,354 @@ fn the_controller_prepares_a_missing_runtime_through_the_native_owner() {
         "the reconciled build job is removed once its child was reaped"
     );
     assert!(fixture.run.join("build-child.log").is_file());
+}
+
+/// A settled unadopted decision consumes the merged owners at the decision
+/// boundary with no user confirmation: the completed real workload task is
+/// retained under its existing card as identity-only replayable pre-solution
+/// inputs, and the hypothesis' own change is reconciled without closing its
+/// unfinished required task or synchronizing its delta into the main specs.
+#[test]
+fn a_settled_unadopted_decision_retains_the_task_and_reconciles_its_change() {
+    let fixture = Fixture::new("decision-consumption");
+    let head = seed_comparison_spec(&fixture, &json!({}), "consume");
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let workload_card = admit_workload_card(&fixture);
+    let bindings = seed_bindings(&fixture, &workload, &head);
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    publish_rejection(&fixture, &head, &workload.revision);
+    seed_decision_boundary(&fixture, &bindings, &workload_card, &head, "reject");
+
+    // The routine decision-boundary transition needs no per-hypothesis
+    // confirmation: one resume consumes the merged owners.
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "idle", "{report}");
+
+    // Retention: identity-only replayable pre-solution inputs under the card
+    // that already owns the completed real task.
+    let retention = report["retention"].clone();
+    assert_eq!(retention["status"], "retained", "{report}");
+    assert_eq!(retention["owner"], workload_card, "{report}");
+    assert_eq!(retention["case_id"], "case-b", "{report}");
+    let replay = PathBuf::from(retention["replay"].as_str().expect("replay locator"));
+    assert!(replay.is_dir(), "{report}");
+    let index: Vec<harness_core::improvement_experiment::RetainedTask> =
+        serde_json::from_slice(&fs::read(fixture.run.join("retained-tasks.json")).unwrap())
+            .unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index[0].case_id, "case-b");
+    harness_core::task_worktree::verify_frozen_pristine(&index[0].replay).unwrap();
+    assert!(
+        !index[0].replay.path.join("answer.txt").exists(),
+        "the retained copy is pre-solution"
+    );
+    let comments =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &workload_card)
+            .unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|comment| comment.starts_with("hypothesis-retention v1")),
+        "{comments:?}"
+    );
+    assert!(
+        comments
+            .iter()
+            .all(|comment| !comment.contains("prior solution") && !comment.contains("answer")),
+        "{comments:?}"
+    );
+
+    // Reconcile: the finished experiment outcome never closes an unfinished
+    // required task and never pushes the unadopted delta into the specs.
+    let reconcile = report["reconcile"].clone();
+    assert_eq!(reconcile["item"], fixture.card, "{report}");
+    assert_eq!(reconcile["outcome"], "reject", "{report}");
+    assert_eq!(reconcile["action"], "archive", "{report}");
+    assert_eq!(reconcile["change"], "add-synthetic", "{report}");
+    assert_eq!(reconcile["status"], "retained", "{report}");
+    assert!(
+        reconcile["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("archive=unresolved"),
+        "{report}"
+    );
+    let tasks =
+        fs::read_to_string(fixture.proj.join("openspec/changes/add-synthetic/tasks.md")).unwrap();
+    assert!(tasks.contains("- [ ] 1.1"), "{tasks}");
+    assert!(
+        fixture.proj.join("openspec/changes/add-synthetic").is_dir(),
+        "the unfinished change stays active"
+    );
+    let archive = fixture.proj.join("openspec/changes/archive");
+    assert!(
+        !archive.is_dir()
+            || fs::read_dir(&archive)
+                .unwrap()
+                .all(|entry| !entry.unwrap().path().is_dir()),
+        "an unfinished change is not archived"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+
+    // Status surfaces the consumption; the decision itself is unchanged.
+    let printed = text(&fixture.improve(&["status", "--run", fixture.run.to_str().unwrap()]));
+    assert!(printed.contains("retention: status=retained"), "{printed}");
+    assert!(printed.contains("reconcile:"), "{printed}");
+
+    // Idle/deferred truthfulness: a repeated resume repeats no identical
+    // retention, reconcile or model call, and starts no duplicate card.
+    let retained_receipt = fs::read(fixture.run.join("retention.json")).unwrap();
+    let reconcile_receipt = fs::read(fixture.run.join("reconcile.json")).unwrap();
+    let cards = harness_core::board_hypothesis::list_hypothesis_cards(&fixture.bd, &fixture.proj)
+        .unwrap()
+        .len();
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        fs::read(fixture.run.join("retention.json")).unwrap(),
+        retained_receipt,
+        "the identical retention is not repeated"
+    );
+    assert_eq!(
+        fs::read(fixture.run.join("reconcile.json")).unwrap(),
+        reconcile_receipt,
+        "the identical reconcile is not repeated"
+    );
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        harness_core::board_hypothesis::list_hypothesis_cards(&fixture.bd, &fixture.proj)
+            .unwrap()
+            .len(),
+        cards,
+        "no duplicate hypothesis card is created"
+    );
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "idle", "{report}");
+    assert!(
+        report["next"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no model work is started while idle"),
+        "{report}"
+    );
+}
+
+/// A completed but unadopted change is archived through the merged owner's
+/// supported non-synchronizing path: its artifacts stay referencable in the
+/// change archive while the main specifications keep their exact content.
+#[test]
+fn a_completed_unadopted_change_is_archived_without_syncing_its_delta() {
+    let fixture = Fixture::new("decision-archive");
+    fs::write(
+        fixture.proj.join("openspec/changes/add-synthetic/tasks.md"),
+        "## 1. Work\n\n- [x] 1.1 Do the synthetic thing.\n",
+    )
+    .unwrap();
+    let head = seed_comparison_spec(&fixture, &json!({}), "archive");
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let workload_card = admit_workload_card(&fixture);
+    let bindings = seed_bindings(&fixture, &workload, &head);
+    let specs_before = main_spec_files(&fixture.proj);
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    publish_rejection(&fixture, &head, &workload.revision);
+    seed_decision_boundary(&fixture, &bindings, &workload_card, &head, "reject");
+
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    let reconcile = report["reconcile"].clone();
+    assert_eq!(reconcile["status"], "archived", "{report}");
+    assert!(
+        reconcile["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("archived-as="),
+        "{report}"
+    );
+    assert!(
+        !fixture.proj.join("openspec/changes/add-synthetic").exists(),
+        "the archived change left the active changes"
+    );
+    let archive = fixture.proj.join("openspec/changes/archive");
+    assert!(
+        archive.is_dir(),
+        "the change is referencable in the archive"
+    );
+    let archived = fs::read_dir(&archive)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("one archived change directory");
+    assert!(
+        archived.join("tasks.md").is_file(),
+        "the archived artifacts stay readable"
+    );
+    assert_eq!(
+        main_spec_files(&fixture.proj),
+        specs_before,
+        "the unadopted delta is not synchronized into the main specifications"
+    );
+}
+
+/// Corroboration selection consumes the merged selector by identity only: a
+/// retained task that does not exercise the declared mechanism is excluded as
+/// non-evidence, and too few applicable units leave the broader claim
+/// explicitly inconclusive instead of fabricating a summary.
+#[test]
+fn declared_corroboration_excludes_inapplicable_workloads_and_stays_inconclusive() {
+    let fixture = Fixture::new("corroboration-short");
+    let head = seed_comparison_spec(&fixture, &corroboration_policy(), "short");
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let workload_card = admit_workload_card(&fixture);
+    let bindings = seed_bindings(&fixture, &workload, &head);
+    let owner = create_owner_card(&fixture, "Prior inapplicable real task");
+    let prior = prior_retained_task(&fixture, &head, &owner, "case-x", "other-mechanism");
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.run.join("retained-tasks.json"),
+        serde_json::to_vec_pretty(&json!([prior])).unwrap(),
+    )
+    .unwrap();
+    publish_rejection(&fixture, &head, &workload.revision);
+    seed_decision_boundary(&fixture, &bindings, &workload_card, &head, "reject");
+
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("corroboration.json")).unwrap()).unwrap();
+    assert_eq!(receipt["status"], "selected", "{receipt}");
+    assert_eq!(receipt["required_units"], 1, "{receipt}");
+    assert!(
+        receipt["selection"]["status"]["inconclusive"].is_string(),
+        "{receipt}"
+    );
+    assert!(
+        receipt["selection"]["units"].as_array().unwrap().is_empty(),
+        "{receipt}"
+    );
+    let excluded = receipt["selection"]["excluded"].as_array().unwrap();
+    assert_eq!(excluded.len(), 2, "{receipt}");
+    assert_eq!(excluded[0]["caseId"], "case-x", "{receipt}");
+    assert_eq!(excluded[0]["reason"], "notApplicable", "{receipt}");
+    assert_eq!(excluded[1]["caseId"], "case-b", "{receipt}");
+    assert_eq!(excluded[1]["reason"], "alreadyUsed", "{receipt}");
+    let reason = receipt["selection"]["status"]["inconclusive"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("fewer applicable independent replayable retained tasks"),
+        "{receipt}"
+    );
+    assert!(
+        !text(&resumed).contains("prior solution"),
+        "{}",
+        text(&resumed)
+    );
+    let report = status_value(&fixture);
+    assert_eq!(report["corroboration"]["status"], "selected", "{report}");
+    assert_eq!(report["corroboration"]["ready"], false, "{report}");
+    assert_eq!(report["corroboration"]["required_units"], 1, "{report}");
+    let printed = text(&fixture.improve(&["status", "--run", fixture.run.to_str().unwrap()]));
+    assert!(
+        printed.contains("corroboration: required=+1 status=inconclusive"),
+        "{printed}"
+    );
+}
+
+/// With one applicable independent retained unit available, the selection is
+/// ready and returns that unit's identity and replay references only - never
+/// the earlier solution - so a fresh executor reimplements the task.
+#[test]
+fn declared_corroboration_selects_an_independent_retained_unit_by_identity() {
+    let fixture = Fixture::new("corroboration-ready");
+    let head = seed_comparison_spec(&fixture, &corroboration_policy(), "ready");
+    // A second committed revision so the independent unit is a distinct task
+    // snapshot rather than a byte-identical replay of the run's own unit.
+    fs::write(fixture.proj.join("prior-task.txt"), "prior real task\n").unwrap();
+    git(&fixture.proj, &["add", "."]);
+    git(&fixture.proj, &["commit", "-qm", "prior task identity"]);
+    let prior_revision = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let workload = harness_core::task_worktree::frozen_copy(
+        &fixture.proj,
+        &head,
+        &fixture.root.join("workload-pre"),
+    )
+    .unwrap();
+    let workload_card = admit_workload_card(&fixture);
+    let bindings = seed_bindings(&fixture, &workload, &head);
+    let owner = create_owner_card(&fixture, "Prior applicable real task");
+    let prior = prior_retained_task(
+        &fixture,
+        &prior_revision,
+        &owner,
+        "case-c",
+        "bounded-output",
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.run.join("retained-tasks.json"),
+        serde_json::to_vec_pretty(&json!([prior])).unwrap(),
+    )
+    .unwrap();
+    publish_rejection(&fixture, &head, &workload.revision);
+    seed_decision_boundary(&fixture, &bindings, &workload_card, &head, "reject");
+
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("corroboration.json")).unwrap()).unwrap();
+    assert_eq!(receipt["selection"]["status"], "ready", "{receipt}");
+    let units = receipt["selection"]["units"].as_array().unwrap();
+    assert_eq!(units.len(), 1, "{receipt}");
+    assert_eq!(units[0]["caseId"], "case-c", "{receipt}");
+    assert_eq!(units[0]["owner"], owner, "{receipt}");
+    assert_eq!(units[0]["mechanism"], "bounded-output", "{receipt}");
+    assert_eq!(units[0]["conditions"], "local-tool-runs", "{receipt}");
+    assert!(units[0].get("answer").is_none(), "{receipt}");
+    assert!(!receipt.to_string().contains("prior solution"), "{receipt}");
+    let report = status_value(&fixture);
+    assert_eq!(report["corroboration"]["ready"], true, "{report}");
+    assert_eq!(report["corroboration"]["units"][0]["case_id"], "case-c");
 }
