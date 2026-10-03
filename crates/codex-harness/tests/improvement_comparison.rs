@@ -1796,6 +1796,33 @@ fn a_forged_candidate_result_is_rejected_and_never_integrated() {
 fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     let _serial = INSTALL.lock().unwrap();
     let fixture = Fixture::new("adopt");
+    // The baseline arm consumes the skill the candidate treatment removes, so
+    // the declared removal is exercised with retained consumption evidence;
+    // a declared removal without that evidence cannot adopt.
+    let skill = fixture.proj.join(".agents/skills/target-beta");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: target-beta\ndescription: Fixture skill.\n---\n\nfixture skill body\n",
+    )
+    .unwrap();
+    git(&fixture.proj, &["add", "."]);
+    git(
+        &fixture.proj,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "advertise the removable fixture skill",
+        ],
+    );
+    // Re-declare the run spec on the source that carries the removable skill:
+    // the frozen base revision and the candidate branch must agree.
     fixture.write_spec(
         &[(
             "removal",
@@ -1804,7 +1831,25 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         None,
     );
     let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
-    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    let mut checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fs::remove_dir_all(checkout.path.join(".agents/skills/target-beta")).unwrap();
+    fs::write(checkout.path.join(".agents/skills/.gitkeep"), "\n").unwrap();
+    git(&checkout.path, &["add", "-A"]);
+    git(
+        &checkout.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "remove the fixture skill target-beta",
+        ],
+    );
+    checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
     fixture.prepare_builds(&checkout);
     fixture.start_with_ready_candidate(&checkout, true);
     let resume = fixture.resume();
@@ -4170,5 +4215,374 @@ fn owned_heavy_without_a_control_os_link_cannot_deduct() {
         infra["adjusted_low_ns"].as_u64().unwrap_or(0)
             <= infra["adjusted_high_ns"].as_u64().unwrap_or(0),
         "{infra}"
+    );
+}
+
+/// A declared subtractive comparison records the removed burden and each
+/// arm's retained consumption of it, and the accounting and policy gates
+/// consume that record: an exercised removal with retained checks can adopt,
+/// while a candidate that still consumes the removed burden stays
+/// inconclusive instead of banking a faster result.
+#[test]
+fn subtractive_comparison_rows_carry_consumption_through_the_gates() {
+    let _serial = INSTALL.lock().unwrap();
+
+    // The candidate treatment removes the fixture skill the baseline arm
+    // consumes.
+    let fixture = Fixture::new("subtractive-rows");
+    fixture.write_spec(
+        &[(
+            "removal",
+            json!({"proposal": "proposal-skill", "target": "arm-skill"}),
+        )],
+        None,
+    );
+    let mut checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fs::remove_dir_all(checkout.path.join(".agents/skills/arm-skill")).unwrap();
+    // Git does not track empty directories: keep the declared skills location
+    // present in the candidate revision without the removed skill.
+    fs::write(checkout.path.join(".agents/skills/.gitkeep"), "\n").unwrap();
+    git(&checkout.path, &["add", "-A"]);
+    git(
+        &checkout.path,
+        &[
+            "-c",
+            "user.email=fixture@example.test",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "remove the fixture skill arm-skill",
+        ],
+    );
+    checkout.revision = git_output(&checkout.path, &["rev-parse", "HEAD"]);
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, true);
+
+    // First resume: preparation plus the refused pre-submission baseline
+    // dispatch; the retained receipt then settles the baseline arm.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("subtractive-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}"
+    );
+
+    // The declared removal needs the informed decision before the candidate's
+    // measured conversation; the approval covers the experiment stage.
+    let proposed = fixture.feedback(&[
+        "removal-propose",
+        "--item",
+        &fixture.card,
+        "--proposal",
+        "proposal-skill",
+        "--target",
+        "arm-skill",
+        "--evidence",
+        "evidence-1",
+        "--loss",
+        "synthetic-loss",
+        "--preview",
+        "preview-1",
+    ]);
+    assert!(proposed.status.success(), "{}", text(&proposed));
+    let approved = fixture.feedback(&[
+        "removal-decide",
+        "--item",
+        &fixture.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "proposal-skill",
+        "--target",
+        "arm-skill",
+        "--actions",
+        "experiment",
+        "--loss",
+        "synthetic-loss",
+    ]);
+    assert!(approved.status.success(), "{}", text(&approved));
+    // One resume clears the recorded block, the next dispatches the approved
+    // candidate conversation (refused before submission by the fixture
+    // launcher) and the retained receipt settles it.
+    for _ in 0..2 {
+        let resume = fixture.resume();
+        assert!(resume.status.success(), "{}", text(&resume));
+    }
+    let session = session_id("subtractive-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], true,
+        "{status}"
+    );
+
+    // The comparison rows carry the declared treatment and each arm's
+    // consumption in the shapes the merged accounting consumes.
+    let baseline_row: Value =
+        serde_json::from_slice(&fs::read(fixture.arm_dir("baseline").join("row.json")).unwrap())
+            .unwrap();
+    let candidate_row: Value =
+        serde_json::from_slice(&fs::read(fixture.arm_dir("candidate").join("row.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        baseline_row["treatment"]["kind"], "subtraction",
+        "{baseline_row}"
+    );
+    assert_eq!(
+        baseline_row["treatment"]["removed"], "arm-skill",
+        "{baseline_row}"
+    );
+    assert_eq!(
+        baseline_row["consumption"]["capability"], "arm-skill",
+        "{baseline_row}"
+    );
+    assert_eq!(
+        baseline_row["consumption"]["status"], "consumed",
+        "{baseline_row}"
+    );
+    assert_eq!(
+        candidate_row["treatment"]["kind"], "subtraction",
+        "{candidate_row}"
+    );
+    assert_eq!(
+        candidate_row["treatment"]["removed"], "arm-skill",
+        "{candidate_row}"
+    );
+    assert_eq!(
+        candidate_row["consumption"]["capability"], "arm-skill",
+        "{candidate_row}"
+    );
+    assert_eq!(
+        candidate_row["consumption"]["status"], "absent",
+        "{candidate_row}"
+    );
+    for row in [&baseline_row, &candidate_row] {
+        assert!(
+            row["consumption"]["evidence"]
+                .as_str()
+                .is_some_and(|evidence| !evidence.is_empty()),
+            "the consumption record names its retained evidence: {row}"
+        );
+    }
+
+    // The outcome report and the frozen policy consume the same record: the
+    // unit is exercised with retained checks and the decision is bound to it.
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/report.json")).unwrap())
+            .unwrap();
+    for row in report["attempts"].as_array().unwrap() {
+        assert_eq!(row["treatment_kind"], "subtractive", "{row}");
+        assert_eq!(row["removed_burden"], "arm-skill", "{row}");
+        assert_eq!(
+            row["consumption_evidence"]["capability"], "arm-skill",
+            "{row}"
+        );
+        assert_eq!(row["consumption_evidence"]["evidenced"], true, "{row}");
+    }
+    let unit = &report["units"][0];
+    assert_eq!(unit["subtractive"], true, "{unit}");
+    assert_eq!(unit["removed_burden"], "arm-skill", "{unit}");
+    assert_eq!(unit["applicability"], "exercised", "{unit}");
+    assert_eq!(unit["retained_checks"], true, "{unit}");
+    assert_eq!(unit["evidence_complete"], true, "{unit}");
+    assert_eq!(unit["positive_effect"], true, "{unit}");
+    let evaluation: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    assert_eq!(evaluation["decision"], "adopt", "{evaluation}");
+
+    // Stale context after removal: the same declared removal with a candidate
+    // that still consumes the skill records `consumed` on both arms, so a
+    // faster result cannot pass the subtractive gate.
+    let stale = Fixture::new("subtractive-stale");
+    stale.write_spec(
+        &[(
+            "removal",
+            json!({"proposal": "proposal-skill", "target": "arm-skill"}),
+        )],
+        None,
+    );
+    let checkout = stale.prepare_candidate(Some("// candidate implementation\n"));
+    stale.prepare_builds(&checkout);
+    stale.start_with_ready_candidate(&checkout, true);
+    let resume = stale.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let session = session_id("subtractive-stale-baseline");
+    stale.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = stale.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let proposed = stale.feedback(&[
+        "removal-propose",
+        "--item",
+        &stale.card,
+        "--proposal",
+        "proposal-skill",
+        "--target",
+        "arm-skill",
+        "--evidence",
+        "evidence-1",
+        "--loss",
+        "synthetic-loss",
+        "--preview",
+        "preview-1",
+    ]);
+    assert!(proposed.status.success(), "{}", text(&proposed));
+    let approved = stale.feedback(&[
+        "removal-decide",
+        "--item",
+        &stale.card,
+        "--decision",
+        "approve",
+        "--proposal",
+        "proposal-skill",
+        "--target",
+        "arm-skill",
+        "--actions",
+        "experiment",
+        "--loss",
+        "synthetic-loss",
+    ]);
+    assert!(approved.status.success(), "{}", text(&approved));
+    for _ in 0..2 {
+        let resume = stale.resume();
+        assert!(resume.status.success(), "{}", text(&resume));
+    }
+    let session = session_id("subtractive-stale-candidate");
+    stale.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = stale.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = stale.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    let candidate_row: Value =
+        serde_json::from_slice(&fs::read(stale.arm_dir("candidate").join("row.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        candidate_row["consumption"]["status"], "consumed",
+        "the candidate still consumes the removed burden: {candidate_row}"
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(stale.run.join("comparison/report.json")).unwrap())
+            .unwrap();
+    let unit = &report["units"][0];
+    assert_eq!(unit["applicability"], "unknown", "{unit}");
+    assert_eq!(unit["evidence_complete"], false, "{unit}");
+    assert_eq!(unit["positive_effect"], false, "{unit}");
+    let evaluation: Value =
+        serde_json::from_slice(&fs::read(stale.run.join("comparison/evaluation.json")).unwrap())
+            .unwrap();
+    assert_ne!(evaluation["decision"], "adopt", "{evaluation}");
+    assert!(
+        evaluation["reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str().unwrap_or("").contains("not established"))),
+        "{evaluation}"
+    );
+}
+
+/// A comparison-level dispatch refused before submission is re-attempted on
+/// an explicit resume: the recorded same-arm selection is reused instead of
+/// selecting the arm again, and the re-attempt is prepared through the
+/// dispatch gate as the next arm attempt.
+#[test]
+fn refused_comparison_dispatch_resumes_with_the_recorded_selection() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("resume-selection");
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+
+    // The fixture launcher cannot execute a conversation: the first dispatch
+    // is refused before submission and no model request is made, after the
+    // shared runtime-selection owner recorded this arm's runtime.
+    let refused = fixture.resume();
+    let output = text(&refused);
+    assert!(refused.status.success(), "{output}");
+    assert!(output.contains("before submission"), "{output}");
+    let cursor = fixture.cursor();
+    let first = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["role"] == "baseline")
+        .cloned()
+        .expect("the refused baseline dispatch is recorded");
+    assert_eq!(first["id"], "base-1", "{cursor}");
+    assert_eq!(first["state"], "failed", "{cursor}");
+    assert!(
+        first["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no model request was made"),
+        "{cursor}"
+    );
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}");
+    let recorded_runtime = cursor["selected_runtime"].clone();
+    assert!(recorded_runtime.is_string(), "{cursor}");
+
+    // The explicit resume re-attempts the refused dispatch: the recorded
+    // same-arm selection is reused instead of selecting the arm again, and
+    // the re-attempt is prepared through the dispatch gate as the next arm
+    // attempt (here the fixture launcher refuses it again before submission).
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "baseline", "{cursor}");
+    assert_eq!(cursor["selected_runtime"], recorded_runtime, "{cursor}");
+    let variant_selections = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|effect| effect["kind"] == "variant-selected")
+        .count();
+    assert_eq!(
+        variant_selections, 1,
+        "the re-attempt reuses the recorded selection: {cursor}"
+    );
+    let second = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == "base-2")
+        .cloned()
+        .expect("the re-attempt is dispatched as the next arm attempt");
+    assert_eq!(second["state"], "failed", "{cursor}");
+    assert!(
+        second["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no model request was made"),
+        "{cursor}"
+    );
+    assert!(
+        cursor["effects"].as_array().unwrap().iter().any(|effect| {
+            effect["kind"] == "dispatch-prepared"
+                && effect["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("attempt=base-2")
+        }),
+        "the re-attempt passed the gate into a prepared dispatch: {cursor}"
+    );
+    assert!(
+        fixture
+            .run
+            .join("assignments")
+            .join("base-2.json")
+            .is_file(),
+        "the re-attempt wrote its exact assignment"
     );
 }
