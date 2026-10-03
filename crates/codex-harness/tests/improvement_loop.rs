@@ -1139,6 +1139,221 @@ fn select_consumes_prepared_variants_and_refuses_an_active_attempt() {
     );
 }
 
+/// The declared source identity the real preparation owner records for one
+/// prepared variant: `sha256:` plus the first 16 hex digits of the build
+/// record's source digest.
+fn declared_identity(build: &Path) -> String {
+    let record: Value =
+        serde_json::from_slice(&fs::read(build.join("build.json")).unwrap()).unwrap();
+    let sha = record["source"]["sha256"].as_str().unwrap().to_owned();
+    format!("sha256:{}", &sha[..16.min(sha.len())])
+}
+
+/// Ordinary (non-verbatim) canonical spelling for path comparison.
+fn plain_path(path: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(path).unwrap();
+    let text = canonical.to_string_lossy().into_owned();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
+}
+
+/// Every file under one prepared runtime build with its content digest.
+fn build_files(dir: &Path) -> BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(relative, hash_bytes(&fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(dir, dir, &mut files);
+    files
+}
+
+/// The full off/on cycle is driven through the CLI: candidate, baseline,
+/// candidate and one repeated selection. Every step reports the identity it
+/// actually consumed, flips the journaled selection to that exact prepared
+/// build, and leaves both prepared runtimes and the accepted source byte-for-
+/// byte unchanged with no rebuild and no model call. An active measured
+/// attempt then refuses further selection through the same CLI.
+#[test]
+fn select_cycle_reports_consumed_identity_without_source_change_rebuild_or_model_call() {
+    let fixture = Fixture::new("select-cycle");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // Both variants share the one owned state the real preparation owner
+    // records, so the cycle flips the same journaled pointer between them.
+    let (state, baseline_build) = prepare_runtime(&fixture.root, "base");
+    let (candidate_state, staged_candidate) = prepare_runtime(&fixture.root, "cand");
+    let candidate_build = state
+        .join("builds")
+        .join(staged_candidate.file_name().unwrap());
+    fs::rename(&staged_candidate, &candidate_build).unwrap();
+    fs::remove_dir_all(&candidate_state).unwrap();
+
+    let baseline_identity = declared_identity(&baseline_build);
+    let candidate_identity = declared_identity(&candidate_build);
+    fs::write(
+        fixture.run.join("variants.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "baseline": {"state": state, "build": baseline_build, "identity": baseline_identity},
+            "candidate": {"state": state, "build": candidate_build, "identity": candidate_identity},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let before_files = (build_files(&baseline_build), build_files(&candidate_build));
+    let head_before = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let status_before = git_output(&fixture.proj, &["status", "--porcelain"]);
+    let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let effects_before = fixture.cursor()["effects"].as_array().unwrap().len();
+
+    let artifacts_before = [
+        "build-job.json",
+        "build-output.json",
+        "prepared-builds.json",
+    ]
+    .map(|artifact| fixture.run.join(artifact).is_file());
+    let select_variant = |variant: &str, expected: &str, changed: bool| {
+        let selected = fixture.improve(&["select", "--run", &run_arg, "--variant", variant]);
+        assert!(selected.status.success(), "{}", text(&selected));
+        let report = text(&selected);
+        assert!(report.contains(&format!("variant={variant}")), "{report}");
+        assert!(
+            report.contains(&format!("identity={expected}")),
+            "the reported identity must be the prepared variant's actual identity: {report}"
+        );
+        assert!(report.contains(&format!("changed={changed}")), "{report}");
+        assert!(report.contains("no model call"), "{report}");
+        let runtime = report
+            .split("runtime=")
+            .nth(1)
+            .and_then(|rest| rest.split(" identity=").next())
+            .unwrap();
+        assert_eq!(
+            plain_path(Path::new(runtime)),
+            plain_path(if variant == "baseline" {
+                &baseline_build
+            } else {
+                &candidate_build
+            }),
+            "the reported runtime is the build actually selected"
+        );
+    };
+
+    // candidate -> baseline -> candidate: the journaled selection follows the
+    // requested variant and resolves to the exact prepared build every time.
+    select_variant("candidate", &candidate_identity, true);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&candidate_build));
+    assert_eq!(fixture.cursor()["selected_identity"], candidate_identity);
+
+    select_variant("baseline", &baseline_identity, true);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&baseline_build));
+    assert_eq!(fixture.cursor()["selected_variant"], "baseline");
+    assert_eq!(fixture.cursor()["selected_identity"], baseline_identity);
+
+    select_variant("candidate", &candidate_identity, true);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&candidate_build));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "candidate");
+    assert_eq!(cursor["selected_identity"], candidate_identity);
+    assert_eq!(
+        plain_path(Path::new(cursor["selected_runtime"].as_str().unwrap())),
+        plain_path(&candidate_build)
+    );
+
+    // A repeated selection of the unchanged active variant reports the same
+    // consumed identity without changing anything.
+    select_variant("candidate", &candidate_identity, false);
+
+    // No source change and no rebuild: both prepared runtimes and the accepted
+    // source are exactly what preparation published, and no build or model
+    // work was started by selection.
+    assert_eq!(
+        build_files(&baseline_build),
+        before_files.0,
+        "selection never rebuilds or rewrites the baseline runtime"
+    );
+    assert_eq!(
+        build_files(&candidate_build),
+        before_files.1,
+        "selection never rebuilds or rewrites the candidate runtime"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        head_before
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["status", "--porcelain"]),
+        status_before,
+        "selection does not change the accepted source tree"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "selection performs no model call or dispatch"
+    );
+    let selections = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(effects_before)
+        .filter(|effect| effect["kind"] == "variant-selected")
+        .count();
+    assert_eq!(
+        selections, 3,
+        "only the three real off/on changes are journaled: {cursor}"
+    );
+    for (artifact, existed) in [
+        "build-job.json",
+        "build-output.json",
+        "prepared-builds.json",
+    ]
+    .into_iter()
+    .zip(artifacts_before)
+    {
+        assert_eq!(
+            fixture.run.join(artifact).is_file(),
+            existed,
+            "selection must not start a build: {artifact}"
+        );
+    }
+
+    // An active measured attempt keeps its frozen runtime: the CLI refuses the
+    // change and leaves the selected variant, runtimes and source untouched.
+    seed_attempt(
+        &fixture,
+        attempt_json("baseline-1", "baseline", "started", None),
+        "baseline-attempt",
+    );
+    let refused = fixture.improve(&["select", "--run", &run_arg, "--variant", "baseline"]);
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused));
+    assert!(text(&refused).contains("active"), "{}", text(&refused));
+    assert_eq!(fixture.cursor()["selected_variant"], "candidate");
+    assert_eq!(fixture.cursor()["selected_identity"], candidate_identity);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&candidate_build));
+    assert_eq!(build_files(&baseline_build), before_files.0);
+    assert_eq!(build_files(&candidate_build), before_files.1);
+}
+
 #[test]
 fn concurrent_starts_create_exactly_one_owner() {
     let fixture = Fixture::new("concurrent-start");

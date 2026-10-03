@@ -4,11 +4,12 @@
 //! The controller consumes the integrated owners instead of duplicating them:
 //! Beads (`bd`) owns hypothesis identity and decisions, OpenSpec owns the
 //! planning contracts, the orchestration configuration owns the effective
-//! dispatch profile, the build-selection owner owns prepared runtime
-//! selection, and the visible executor dispatch owner opens every model
-//! conversation. Comparison execution and frozen runtime preparation are
-//! separate owners; phases that need them stay explicitly pending here until
-//! an actual effect records them.
+//! dispatch profile, the prepared-variant selection primitive owns runtime
+//! selection (through the journaled build-selection owner), and the visible
+//! executor dispatch owner opens every model conversation. Comparison
+//! execution and frozen runtime preparation are separate owners; phases that
+//! need them stay explicitly pending here until an actual effect records
+//! them.
 //!
 //! The planning/implementation stage of the loop lives in the
 //! [`improvement_workflow`] child module: a retained investigator result is
@@ -31,7 +32,7 @@ use crate::executor_cli::{
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;
 use harness_core::build_identity;
-use harness_core::build_selection;
+use harness_core::improvement_experiment::{self, Arm, PreparedVariant};
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, CURSOR_FILE, Cursor, DispatchBinding, DispatchFacts,
     DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
@@ -93,11 +94,11 @@ its branch/base/revision, the dispatch gate, the removal gate, every attempt
 with its receipt, the selected prepared variant and the phases still pending.
 It performs no model call. --json prints the same report as JSON.
 
-select activates an already prepared baseline/candidate runtime through the
-build-selection owner, records its effective identity and performs no model
-call, build or source edit. It refuses while a measured attempt is active or
-unreconciled, and a candidate that is a removal treatment additionally needs
-the current experimental removal authority.
+select activates an already prepared baseline/candidate variant through the
+shared runtime-selection primitive, records the identity it actually consumed
+and performs no model call, build or source edit. It refuses while a measured
+attempt is active or unreconciled, and a candidate that is a removal treatment
+additionally needs the current experimental removal authority.
 
 stop suspends new work, preserves every attempt and marks in-flight attempts
 unknown so resume never replays them. resume takes over a stopped or
@@ -1223,40 +1224,51 @@ fn select(args: &[OsString]) -> io::Result<i32> {
             "the prepared {variant} runtime identity {declared} does not match its build record {identity}; preparation must be refreshed - nothing was selected"
         )));
     }
-    let selection = build_selection::activate(&entry.state, &entry.build).map_err(|error| {
-        invalid(format!(
-            "the runtime-selection owner refused variant {variant}: {error}"
-        ))
-    })?;
-    let (effective, artifacts) = build_selection::selected(&entry.state)?;
-    if !artifacts.check().runtime_allowed {
-        return Err(invalid(format!(
-            "the selected {variant} runtime at {} is not runtime-allowed: {}",
-            effective.display(),
-            artifacts.check().action
-        )));
-    }
+    // Activation, consumption and the reported effective identity come from
+    // the shared runtime-selection primitive: it re-verifies the prepared
+    // record and artifacts, writes the journaled selection and reports the
+    // build actually selected. The CLI runs no second activation policy.
+    let prepared = PreparedVariant {
+        arm: match variant.as_str() {
+            "baseline" => Arm::Baseline,
+            _ => Arm::Candidate,
+        },
+        label: variant.clone(),
+        build: entry.build.clone(),
+        record_sha256: build_identity::hash_file(&entry.build.join("build.json"))?,
+        source_sha256: record.source.sha256.clone(),
+    };
+    // The gate above already refused an active or unreconciled attempt; the
+    // primitive still owns this check, so pass the observed state instead of
+    // re-implementing the refusal here.
+    let attempt_active = run.cursor.active_attempt().is_some();
+    let consumed = improvement_experiment::select_variant(&entry.state, &prepared, attempt_active)
+        .map_err(|error| {
+            invalid(format!(
+                "the runtime-selection owner refused variant {variant}: {error}"
+            ))
+        })?;
 
     let mut cursor = run.cursor.clone();
-    let changed = selection.changed
+    let changed = consumed.changed
         || cursor.selected_variant.as_deref() != Some(variant.as_str())
-        || cursor.selected_runtime.as_deref() != Some(effective.as_path());
+        || cursor.selected_runtime.as_deref() != Some(consumed.build.as_path());
     cursor.selected_variant = Some(variant.clone());
-    cursor.selected_runtime = Some(effective.clone());
+    cursor.selected_runtime = Some(consumed.build.clone());
     cursor.selected_identity = Some(identity.clone());
     if changed {
         cursor.effect(
             EffectKind::VariantSelected,
             format!(
                 "variant={variant} runtime={} identity={identity} (no model call, no build, no source edit)",
-                effective.display()
+                consumed.build.display()
             ),
         );
     }
     run.store.save_cursor(&cursor)?;
     println!(
         "improve select: variant={variant} runtime={} identity={identity} changed={changed} (no model call, no build, no source edit)",
-        effective.display()
+        consumed.build.display()
     );
     Ok(0)
 }
