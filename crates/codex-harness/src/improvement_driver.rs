@@ -1777,16 +1777,28 @@ fn select_corroboration_units(run: &mut Run, notes: &mut Vec<String>) -> io::Res
             ),
         );
     };
+    // Only the declared plan's own unit identities are excluded, never the
+    // owning card: the admission owner reuses one hypothesis card per
+    // mechanism/conditions identity, so this run's own unit and every
+    // applicable independent prior unit are recorded under that same card.
+    // Excluding the card would exclude every applicable prior unit and leave
+    // the broader claim inconclusive exactly when an applicable unit exists.
     let mut excluded: Vec<String> = Vec::new();
-    if let Some(state) = run.cursor.comparison.as_ref() {
-        if let Some(card) = &state.workload_card {
-            excluded.push(card.clone());
-        }
-        if let Some(path) = state.bindings.as_ref()
-            && let Ok(Some(bindings)) = load_optional::<ExperimentBindings>(path)
-        {
-            excluded.push(bindings.case_id.clone());
-        }
+    if let Some(state) = run.cursor.comparison.as_ref()
+        && let Some(path) = state.bindings.as_ref()
+        && let Ok(Some(bindings)) = load_optional::<ExperimentBindings>(path)
+    {
+        excluded.push(bindings.case_id.clone());
+    }
+    // A decision boundary interrupted after retention but before selection
+    // resumes with this run's unit already recorded on its card; its recorded
+    // case id keeps that exact unit out of its own corroboration even when the
+    // declared bindings are no longer readable.
+    if let Ok(Some(receipt)) = retention_receipt(run)
+        && receipt.status == "retained"
+        && !receipt.case_id.is_empty()
+    {
+        excluded.push(receipt.case_id.clone());
     }
     // Retained units are discovered from their durable Beads owners, so a
     // later run can corroborate on tasks an earlier run retained. Records

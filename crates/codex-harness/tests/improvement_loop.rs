@@ -3127,18 +3127,6 @@ fn admit_workload_card(fixture: &Fixture) -> String {
     id
 }
 
-/// One plain Beads card, as a prior real task's existing owner.
-fn create_owner_card(fixture: &Fixture, title: &str) -> String {
-    let out = Command::new(bd_executable())
-        .args(["create", title, "--type", "task", "--json"])
-        .current_dir(&fixture.proj)
-        .output()
-        .expect("bd create runs");
-    assert!(out.status.success(), "bd create: {}", text(&out));
-    let created: Value = serde_json::from_slice(&out.stdout).expect("bd create json");
-    created["id"].as_str().expect("created card id").to_owned()
-}
-
 /// The retained comparison bindings at a decision boundary: both arms bind
 /// one frozen pre-solution workload copy, so the completed real task's inputs
 /// are replayable without its solution.
@@ -4021,6 +4009,10 @@ fn declared_corroboration_selects_an_independent_retained_unit_by_identity() {
     .unwrap();
     let workload_card = admit_workload_card(&fixture);
     let bindings = seed_bindings(&fixture, &workload, &head);
+    // An applicable prior unit is admitted to the same hypothesis card the
+    // run's own workload uses - admission reuses one card per
+    // mechanism/conditions identity - so only its case id distinguishes the
+    // prior unit from the run's own.
     let owner = admit_prior_hypothesis_card(&fixture, "bounded-output");
     let prior = prior_retained_task(
         &fixture,
