@@ -1193,6 +1193,10 @@ impl Attempt {
 #[serde(rename_all = "kebab-case")]
 pub enum EffectKind {
     PlanningQualified,
+    /// The hypothesis's own OpenSpec change stated the declared measurement
+    /// scope and the directed-measurement receipt was retained before the
+    /// measured-pair owner could direct the baseline attempt.
+    MeasurementQualified,
     /// One retained investigator result was consumed through the grounded
     /// intake owner; the recorded outcomes are recovery data.
     IntakeConsumed,
@@ -1321,6 +1325,11 @@ pub struct CandidateState {
     /// The qualified receipt of the candidate's own OpenSpec change.
     #[serde(default)]
     pub planning_receipt: Option<PathBuf>,
+    /// The retained directed-measurement receipt: proof that the
+    /// hypothesis's own OpenSpec change stated the declared measurement scope
+    /// before the measured-pair owner could direct the baseline attempt.
+    #[serde(default)]
+    pub measurement_receipt: Option<PathBuf>,
     /// The bounded planning conversation attempt for this candidate.
     #[serde(default)]
     pub planner_attempt: Option<String>,
@@ -1344,6 +1353,7 @@ impl CandidateState {
             removal_frozen: None,
             worktree: None,
             planning_receipt: None,
+            measurement_receipt: None,
             planner_attempt: None,
             implementer_attempt: None,
             revision: None,
