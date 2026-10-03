@@ -3,10 +3,11 @@
 //! (`outcome_report::summarize_attempts`); no case substitutes a candidate
 //! claim, a synthetic statistic or a post-hoc threshold.
 use harness_core::improvement_policy::{
-    AnalysisMethod, Basis, ClaimScope, ComparisonPolicy, DeclaredComparison, MeasurementStatus,
-    Objective, Overhead, PerSuccessStatus, PolicyDecision, RepeatedSelection, StatisticalClaim,
-    StoppingRule, TradeOff, VariationStatus, evaluate, parse_statistical_claim,
-    refuse_cross_task_speed_claim, statistical_clause,
+    AnalysisMethod, Basis, ClaimScope, ComparisonPolicy, DeclaredComparison, EffectPath,
+    ExperimentMethod, ExperimentSelection, MeasurementStatus, Objective, Overhead,
+    PerSuccessStatus, PolicyDecision, RepeatedSelection, StatisticalClaim, StoppingRule, TradeOff,
+    VariationStatus, evaluate, experiment_selection_clause, parse_experiment_selection,
+    parse_statistical_claim, refuse_cross_task_speed_claim, statistical_clause,
 };
 use harness_core::infrastructure_accounting::{Mechanism, MetricView, binding_clause};
 use harness_core::outcome_report::{MATCH_FIELDS, summarize_attempts};
@@ -2866,5 +2867,336 @@ fn repeated_selection_and_stopping_stay_bound_to_the_predeclared_rule() {
         "{:?} units={}",
         evaluation.reasons,
         report["units"]
+    );
+}
+
+/// One valid experiment-selection declaration for a declared method and
+/// claim path. Counterexamples replace only the field under test.
+fn selection(method: ExperimentMethod, claim: EffectPath) -> ExperimentSelection {
+    ExperimentSelection {
+        method,
+        claim,
+        outcome: "the declared outcome measured through the real unit".to_owned(),
+        rationale: "the chosen unit exercises the claimed mechanism".to_owned(),
+        controls: "frozen inputs and the accepted baseline conditions".to_owned(),
+        projection: "one bounded experiment with the retention cost staying bounded".to_owned(),
+        baseline: "the accepted revision excluding the candidate edit".to_owned(),
+        stopping:
+            "stop after the declared attempts and escalate only for a named missing observation"
+                .to_owned(),
+    }
+}
+
+/// The policy with its uncertainty text carrying the predeclared selection.
+fn with_selection(
+    mut policy: ComparisonPolicy,
+    method: ExperimentMethod,
+    claim: EffectPath,
+) -> ComparisonPolicy {
+    policy.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}",
+        experiment_selection_clause(&selection(method, claim))
+    );
+    policy
+}
+
+#[test]
+fn the_predeclared_selection_binds_the_smallest_sufficient_unit() {
+    // The declared effect path fixes the smallest sufficient unit, selected
+    // directly with no cheaper trial before it.
+    assert_eq!(
+        EffectPath::LocalOperation.smallest_sufficient(),
+        ExperimentMethod::RealOperation
+    );
+    assert_eq!(
+        EffectPath::AgentChoice.smallest_sufficient(),
+        ExperimentMethod::AgentTask
+    );
+    assert_eq!(
+        EffectPath::TaskStrategy.smallest_sufficient(),
+        ExperimentMethod::PairedImplementations
+    );
+    assert_eq!(
+        EffectPath::RepeatedUse.smallest_sufficient(),
+        ExperimentMethod::Sequence
+    );
+
+    // A local build/output treatment selects the short real operation, and a
+    // bounded input replay of the same operation stays eligible.
+    assert!(ExperimentMethod::RealOperation.exercises(EffectPath::LocalOperation));
+    assert!(ExperimentMethod::BoundedReplay.exercises(EffectPath::LocalOperation));
+
+    // Agent-choice effects require a real agent: a fixed operation bypasses
+    // the choices and a retained replay cannot stand in for the agent.
+    let fixed = selection(ExperimentMethod::RealOperation, EffectPath::AgentChoice);
+    assert!(
+        fixed
+            .problem()
+            .unwrap()
+            .contains("bypasses the agent's choices"),
+        "{:?}",
+        fixed.problem()
+    );
+    let replay = selection(ExperimentMethod::BoundedReplay, EffectPath::AgentChoice);
+    assert!(
+        replay
+            .problem()
+            .unwrap()
+            .contains("cannot stand in for an unexercised agent"),
+        "{:?}",
+        replay.problem()
+    );
+    assert!(
+        selection(ExperimentMethod::AgentTask, EffectPath::AgentChoice)
+            .problem()
+            .is_none()
+    );
+
+    // A broad strategy claim selects complete paired implementations when
+    // shorter work would lose the interactions; the direct selection needs no
+    // earlier stage.
+    let short = selection(ExperimentMethod::AgentTask, EffectPath::TaskStrategy);
+    assert!(
+        short
+            .problem()
+            .unwrap()
+            .contains("complete paired task implementations"),
+        "{:?}",
+        short.problem()
+    );
+    assert!(
+        selection(
+            ExperimentMethod::PairedImplementations,
+            EffectPath::TaskStrategy
+        )
+        .problem()
+        .is_none()
+    );
+
+    // A repeated-use claim preserves the sequence and state; the sequence
+    // unit belongs to that path and is not a generic stronger method.
+    let single = selection(ExperimentMethod::RealOperation, EffectPath::RepeatedUse);
+    assert!(
+        single
+            .problem()
+            .unwrap()
+            .contains("sequence and state transitions"),
+        "{:?}",
+        single.problem()
+    );
+    assert!(
+        selection(ExperimentMethod::Sequence, EffectPath::RepeatedUse)
+            .problem()
+            .is_none()
+    );
+    assert!(
+        selection(ExperimentMethod::Sequence, EffectPath::LocalOperation)
+            .problem()
+            .unwrap()
+            .contains("only for a repeated-use or recovery claim"),
+        "{:?}",
+        selection(ExperimentMethod::Sequence, EffectPath::LocalOperation).problem()
+    );
+
+    // Fewer lines, files, skills or exposed names never establish benefit.
+    let size_only = selection(ExperimentMethod::RealOperation, EffectPath::SizeOnly);
+    assert!(
+        size_only
+            .problem()
+            .unwrap()
+            .contains("fewer lines, files, skills or exposed names never establish benefit"),
+        "{:?}",
+        size_only.problem()
+    );
+
+    // Empty required values are refused before results.
+    let mut empty = selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation);
+    empty.outcome = String::new();
+    assert!(empty.problem().unwrap().contains("outcome is empty"));
+}
+
+#[test]
+fn the_selection_clause_round_trips_and_refuses_staged_ladders() {
+    let declared = declare(&with_selection(
+        policy(),
+        ExperimentMethod::AgentTask,
+        EffectPath::AgentChoice,
+    ));
+    let parsed = parse_experiment_selection(&declared.policy.uncertainty)
+        .unwrap()
+        .expect("the declared clause parses");
+    assert_eq!(parsed.method, ExperimentMethod::AgentTask);
+    assert_eq!(parsed.claim, EffectPath::AgentChoice);
+    assert_eq!(
+        declared.policy.declaration()["selection"]["method"],
+        "agent-task"
+    );
+    assert_eq!(
+        declared.policy.declaration()["selection"]["claim"],
+        "agent-choice"
+    );
+
+    // The clause coexists with the statistical claim and the infrastructure
+    // binding in the order each owner parses: statistical, selection, binding.
+    let mut ordered = policy();
+    ordered.uncertainty = format!(
+        "{}; {} {}",
+        statistical_clause(&claim(ClaimScope::Scoped)),
+        experiment_selection_clause(&selection(
+            ExperimentMethod::PairedImplementations,
+            EffectPath::TaskStrategy
+        )),
+        binding_clause(MetricView::WorkEfficiency, Mechanism::None)
+    );
+    let ordered = declare(&ordered);
+    assert!(
+        parse_statistical_claim(&ordered.policy.uncertainty)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        harness_core::infrastructure_accounting::parse_binding(&ordered.policy.uncertainty)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        parse_experiment_selection(&ordered.policy.uncertainty)
+            .unwrap()
+            .unwrap()
+            .method,
+        ExperimentMethod::PairedImplementations
+    );
+
+    // A staged ladder is not a declared selection: the clause has no such
+    // field, and an unknown method token is refused instead of defaulted.
+    let ladder = "unknown evidence stays inconclusive; experiment-selection.v1; method=paired-implementations; claim=task-strategy; outcome=o; rationale=r; controls=c; projection=p; baseline=b; stopping=s; ladder=operation-then-agent-then-paired";
+    assert!(
+        parse_experiment_selection(ladder)
+            .unwrap_err()
+            .contains("unknown field"),
+        "{}",
+        parse_experiment_selection(ladder).unwrap_err()
+    );
+    let staged = "experiment-selection.v1; method=probe-ladder; claim=task-strategy; outcome=o; rationale=r; controls=c; projection=p; baseline=b; stopping=s";
+    assert!(
+        parse_experiment_selection(staged)
+            .unwrap_err()
+            .contains("method"),
+        "{}",
+        parse_experiment_selection(staged).unwrap_err()
+    );
+    // An incomplete clause is refused rather than silently defaulted.
+    assert!(
+        parse_experiment_selection("experiment-selection.v1; method=agent-task")
+            .unwrap_err()
+            .contains("incomplete")
+    );
+    // A present but unusable declaration blocks the policy itself.
+    let mut broken = policy();
+    broken.uncertainty = format!("{staged}; extra=x");
+    assert!(broken.declare().is_err());
+}
+
+#[test]
+fn a_changed_experiment_selection_cannot_inherit_an_adoption() {
+    let bound = with_selection(
+        policy(),
+        ExperimentMethod::RealOperation,
+        EffectPath::LocalOperation,
+    );
+    let declared = declare(&bound);
+    let rows = [
+        attempt(
+            "b1",
+            "baseline",
+            "case-b",
+            0.0,
+            100.0,
+            true,
+            Some(4),
+            Some(6),
+            true,
+        ),
+        attempt(
+            "c1",
+            "candidate",
+            "case-b",
+            200.0,
+            80.0,
+            true,
+            Some(3),
+            Some(6),
+            true,
+        ),
+    ];
+
+    // The measured pair adopted under the frozen selection.
+    let report = summarize(&rows, &bound);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // The same pair measured before the selection was declared cannot be
+    // paired with the later plan.
+    let stale = summarize(&rows, &policy());
+    let evaluation = evaluate(&declared, &stale).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("declaration differs")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A selection changed after its declaration no longer matches the digest.
+    let mut changed = declared.clone();
+    changed.policy.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}",
+        experiment_selection_clause(&selection(
+            ExperimentMethod::AgentTask,
+            EffectPath::AgentChoice
+        ))
+    );
+    assert!(evaluate(&changed, &report).is_err());
+
+    // A recorded declaration that carries a different selection than the
+    // predeclared policy cannot decide an adoption: the selection clause is
+    // part of the digested uncertainty text recorded before results.
+    let mut tampered_declaration = bound.declaration();
+    tampered_declaration["uncertainty"] = json!(changed.policy.uncertainty);
+    let tampered: Vec<Value> = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row["declaration"] = tampered_declaration.clone();
+            row
+        })
+        .collect();
+    let tampered_report = summarize_attempts(&tampered).unwrap();
+    let evaluation = evaluate(&declared, &tampered_report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("declaration differs")),
+        "{:?}",
+        evaluation.reasons
     );
 }

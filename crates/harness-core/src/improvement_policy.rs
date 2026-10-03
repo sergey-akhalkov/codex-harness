@@ -20,7 +20,17 @@
 //! descriptive bounds and observed complete-pair ranges, but it has no valid
 //! statistical basis for a confidence interval over dependent local runs and
 //! therefore refuses any declared confidence percentage instead of labeling a
-//! measurement bound with one.
+//! measurement bound with one. A declared experiment selection
+//! ([`SELECTION_CLAUSE`]) binds the effect path and claim, the required
+//! outcome, the experimental unit/method, the applicability rationale, the
+//! controls, the projected use/cost, the admissible baseline basis and the
+//! stopping/escalation/deferral rules in the same digested text before any
+//! result exists: a unit that cannot exercise the declared claim (a fixed
+//! command or replay standing in for an agent, a short probe standing in for
+//! complete paired implementations, a single operation standing in for a
+//! repeated-use sequence, or a size-only shortcut) is refused at declaration,
+//! and a declaration changed after results cannot inherit an earlier
+//! adoption.
 
 use crate::benefit_gate::{DecisionDraft, DecisionOutcome, QualityOutcome};
 use serde::{Deserialize, Serialize};
@@ -155,10 +165,18 @@ pub fn parse_statistical_claim(
         );
     }
     let rest = &uncertainty[start + STATISTICAL_CLAUSE.len()..];
-    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
-        Some(end) => &rest[..end],
-        None => rest,
-    };
+    // The body ends at the next predeclared clause or at the infrastructure
+    // binding, so each owner parses its own fields without consuming the
+    // other's clause.
+    let end = [
+        crate::infrastructure_accounting::RULE_VERSION,
+        SELECTION_CLAUSE,
+    ]
+    .into_iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .unwrap_or(rest.len());
+    let body = &rest[..end];
     let mut method = None;
     let mut confidence = false;
     let mut scope = None;
@@ -227,6 +245,401 @@ pub fn parse_statistical_claim(
             "the statistical-analysis clause is incomplete; declare method, confidence, claim and assumptions before results",
         ),
     }
+}
+
+/// Marker of the predeclared experiment-selection clause inside the policy's
+/// uncertainty text. The clause order is: any statistical-analysis clause,
+/// then this selection clause, then the infrastructure binding, so every
+/// owner parses its own fields without consuming another's.
+pub const SELECTION_CLAUSE: &str = "experiment-selection.v1";
+
+/// Bound on one experiment-selection value. The rendered clause also has its
+/// own bound so the whole declaration fits the uncertainty text.
+const MAX_SELECTION_FIELD_BYTES: usize = 192;
+/// Bound on the rendered experiment-selection clause.
+const MAX_SELECTION_CLAUSE_BYTES: usize = 640;
+
+/// Where the claimed effect and its decision-relevant regressions arise. The
+/// declared path fixes the smallest sufficient experimental unit, and there
+/// is no mandatory sequence of cheaper trials before that unit is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EffectPath {
+    /// A local build, check, output transformation or other real operation.
+    LocalOperation,
+    /// Agent search, command selection or diagnosis: the effect propagates
+    /// through the agent's choices and cannot be read from a fixed command.
+    AgentChoice,
+    /// Planning, implementation strategy, delegation or corrections: shorter
+    /// work would omit the decision-relevant interactions and outcomes.
+    TaskStrategy,
+    /// Recurring cache, long-session, repeated-use or recovery behavior: the
+    /// relevant sequence and state transitions must be preserved.
+    RepeatedUse,
+    /// A smaller size, file/skill count or fewer exposed names alone. Refused:
+    /// these never establish benefit without a measured outcome.
+    SizeOnly,
+}
+
+impl EffectPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOperation => "local-operation",
+            Self::AgentChoice => "agent-choice",
+            Self::TaskStrategy => "task-strategy",
+            Self::RepeatedUse => "repeated-use",
+            Self::SizeOnly => "size-only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "local-operation" => Some(Self::LocalOperation),
+            "agent-choice" => Some(Self::AgentChoice),
+            "task-strategy" => Some(Self::TaskStrategy),
+            "repeated-use" => Some(Self::RepeatedUse),
+            "size-only" => Some(Self::SizeOnly),
+            _ => None,
+        }
+    }
+
+    /// The smallest sufficient unit for this path, selected directly. A
+    /// stronger real method is permitted; no cheaper probe is mandatory
+    /// before it.
+    pub fn smallest_sufficient(self) -> ExperimentMethod {
+        match self {
+            Self::LocalOperation => ExperimentMethod::RealOperation,
+            Self::AgentChoice => ExperimentMethod::AgentTask,
+            Self::TaskStrategy => ExperimentMethod::PairedImplementations,
+            Self::RepeatedUse => ExperimentMethod::Sequence,
+            Self::SizeOnly => ExperimentMethod::RealOperation,
+        }
+    }
+}
+
+/// The real experimental unit/method a hypothesis declares. The unit must
+/// exercise the claimed mechanism; a stronger real method is permitted, an
+/// insufficient or mismatched one is refused before dependent work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExperimentMethod {
+    /// A bounded retained-input replay of a real operation. It can validate a
+    /// local transformation and never stands in for an unexercised agent.
+    BoundedReplay,
+    /// The real operation through its actual build/check/run cycle.
+    RealOperation,
+    /// A short real agent task with independently accepted output.
+    AgentTask,
+    /// Complete paired task implementations through accepted completion.
+    PairedImplementations,
+    /// The sequence and state transitions of a repeated-use or recovery path.
+    Sequence,
+}
+
+impl ExperimentMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BoundedReplay => "bounded-replay",
+            Self::RealOperation => "real-operation",
+            Self::AgentTask => "agent-task",
+            Self::PairedImplementations => "paired-implementations",
+            Self::Sequence => "sequence",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bounded-replay" => Some(Self::BoundedReplay),
+            "real-operation" => Some(Self::RealOperation),
+            "agent-task" => Some(Self::AgentTask),
+            "paired-implementations" => Some(Self::PairedImplementations),
+            "sequence" => Some(Self::Sequence),
+            _ => None,
+        }
+    }
+
+    /// Whether this unit exercises the declared effect path.
+    pub fn exercises(self, path: EffectPath) -> bool {
+        self.insufficiency(path).is_none()
+    }
+
+    /// Why this unit cannot support the declared claim, if it cannot.
+    pub fn insufficiency(self, path: EffectPath) -> Option<&'static str> {
+        match (path, self) {
+            (EffectPath::SizeOnly, _) => Some(
+                "fewer lines, files, skills or exposed names never establish benefit; state the measured outcome and the real operation, agent task, paired implementations or sequence that exercises it",
+            ),
+            (EffectPath::LocalOperation, Self::Sequence) => Some(
+                "a repeated-use sequence is selected only for a repeated-use or recovery claim; a local build or output treatment selects a short real operation or a bounded input replay",
+            ),
+            (EffectPath::AgentChoice, Self::BoundedReplay) => Some(
+                "a bounded replay of fixed inputs cannot stand in for an unexercised agent; an agent-choice claim needs a real short agent task",
+            ),
+            (EffectPath::AgentChoice, Self::RealOperation) => Some(
+                "a fixed real operation bypasses the agent's choices; an agent-choice claim needs a real short agent task",
+            ),
+            (EffectPath::AgentChoice, Self::Sequence) => Some(
+                "a repeated-use sequence does not exercise the agent's search, command selection or diagnosis; an agent-choice claim needs a real short agent task",
+            ),
+            (
+                EffectPath::TaskStrategy,
+                Self::BoundedReplay | Self::RealOperation | Self::AgentTask,
+            ) => Some(
+                "planning or implementation strategy effects need complete paired task implementations; shorter work would omit decision-relevant strategy, interactions, corrections or outcomes",
+            ),
+            (
+                EffectPath::RepeatedUse,
+                Self::BoundedReplay
+                | Self::RealOperation
+                | Self::AgentTask
+                | Self::PairedImplementations,
+            ) => Some(
+                "a repeated-use, cache or recovery claim needs the sequence and state transitions of both variants; a single operation or task does not preserve preparation, invalidation, return and state",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// The declared experiment selection: the mechanism's effect path, the
+/// required outcome, the selected experimental unit/method, the applicability
+/// rationale, the controls, the projected use and cost, the admissible
+/// baseline basis and the stopping/escalation/deferral rules. It is declared
+/// before dependent work and never redefined after results.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExperimentSelection {
+    pub method: ExperimentMethod,
+    pub claim: EffectPath,
+    /// The required outcome that would support the claim.
+    pub outcome: String,
+    /// Why the chosen unit exercises the mechanism and operating conditions.
+    pub rationale: String,
+    /// The controls and operating conditions the comparison needs.
+    pub controls: String,
+    /// Projected use and cost of the experiment and of retaining its work.
+    pub projection: String,
+    /// The admissible baseline basis: what is excluded and what makes it stale.
+    pub baseline: String,
+    /// Stopping, escalation and deferral rules, declared before results.
+    pub stopping: String,
+}
+
+impl ExperimentSelection {
+    /// Bounded semantic validation shared by the comparison policy and the
+    /// grounded intake: the declared unit must exercise the declared effect
+    /// path, no size-only shortcut is accepted, and every declared value is a
+    /// nonempty bounded single line.
+    pub fn validate(&self) -> io::Result<()> {
+        match self.problem() {
+            Some(problem) => Err(invalid(problem)),
+            None => Ok(()),
+        }
+    }
+
+    /// The first bounded semantic problem, if any. Shared by every owner that
+    /// consumes a declared selection; the comparison policy wraps it in its
+    /// own error, grounded intake records it as the refusal reason.
+    pub fn problem(&self) -> Option<String> {
+        if let Some(reason) = self.method.insufficiency(self.claim) {
+            return Some(format!(
+                "the declared experiment selection cannot support its claim: {reason}"
+            ));
+        }
+        for (name, value) in [
+            ("outcome", &self.outcome),
+            ("rationale", &self.rationale),
+            ("controls", &self.controls),
+            ("projection", &self.projection),
+            ("baseline", &self.baseline),
+            ("stopping", &self.stopping),
+        ] {
+            if value.trim().is_empty() {
+                return Some(format!(
+                    "the declared experiment selection field {name} is empty; declare it before dependent work"
+                ));
+            }
+            if value.len() > MAX_SELECTION_FIELD_BYTES || value.contains(['\n', '\r', ';']) {
+                return Some(format!(
+                    "the declared experiment selection field {name} must be one bounded line of at most {MAX_SELECTION_FIELD_BYTES} bytes without ';'"
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// The canonical experiment-selection clause. It follows any
+/// statistical-analysis clause and precedes the infrastructure binding.
+pub fn experiment_selection_clause(selection: &ExperimentSelection) -> String {
+    format!(
+        "{SELECTION_CLAUSE}; method={}; claim={}; outcome={}; rationale={}; controls={}; projection={}; baseline={}; stopping={}",
+        selection.method.as_str(),
+        selection.claim.as_str(),
+        selection.outcome,
+        selection.rationale,
+        selection.controls,
+        selection.projection,
+        selection.baseline,
+        selection.stopping
+    )
+}
+
+/// The recorded declaration shape of one experiment selection, attached to
+/// every measured attempt before results.
+fn selection_declaration(selection: &ExperimentSelection) -> Value {
+    json!({
+        "method": selection.method.as_str(),
+        "claim": selection.claim.as_str(),
+        "outcome": selection.outcome,
+        "rationale": selection.rationale,
+        "controls": selection.controls,
+        "projection": selection.projection,
+        "baseline": selection.baseline,
+        "stopping": selection.stopping,
+    })
+}
+
+/// Parse the predeclared experiment-selection clause out of the uncertainty
+/// text. `Ok(None)` when it is absent: the older default binds no selection.
+/// A present but unusable clause is an error so it can never silently degrade
+/// into a different experiment.
+pub fn parse_experiment_selection(
+    uncertainty: &str,
+) -> Result<Option<ExperimentSelection>, String> {
+    let Some(start) = uncertainty.find(SELECTION_CLAUSE) else {
+        return Ok(None);
+    };
+    if let Some(infrastructure) = uncertainty.find(crate::infrastructure_accounting::RULE_VERSION)
+        && infrastructure < start
+    {
+        return Err(
+            "the experiment-selection clause must precede the infrastructure binding it qualifies"
+                .to_owned(),
+        );
+    }
+    if let Some(statistical) = uncertainty.find(STATISTICAL_CLAUSE)
+        && statistical > start
+    {
+        return Err(
+            "the experiment-selection clause must follow the statistical-analysis clause so each owner parses its own fields"
+                .to_owned(),
+        );
+    }
+    let rest = &uncertainty[start + SELECTION_CLAUSE.len()..];
+    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    if body.len() > MAX_SELECTION_CLAUSE_BYTES {
+        return Err(
+            "the experiment-selection clause exceeds its bounded size; keep every declared value within the clause bound"
+                .to_owned(),
+        );
+    }
+    let mut method = None;
+    let mut claim = None;
+    let mut outcome: Option<String> = None;
+    let mut rationale: Option<String> = None;
+    let mut controls: Option<String> = None;
+    let mut projection: Option<String> = None;
+    let mut baseline: Option<String> = None;
+    let mut stopping: Option<String> = None;
+    for segment in body.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = segment.split_once('=') else {
+            return Err(
+                "experiment-selection fields must use key=value separated by ';'".to_owned(),
+            );
+        };
+        let value = value.trim();
+        match key.trim() {
+            "method" => {
+                if method.is_some() {
+                    return Err("the experiment-selection method is declared twice".to_owned());
+                }
+                method = Some(ExperimentMethod::parse(value).ok_or_else(|| {
+                    "the declared experiment method is not bounded-replay, real-operation, agent-task, paired-implementations or sequence".to_owned()
+                })?);
+            }
+            "claim" => {
+                if claim.is_some() {
+                    return Err("the experiment-selection claim path is declared twice".to_owned());
+                }
+                claim = Some(EffectPath::parse(value).ok_or_else(|| {
+                    "the declared claim path is not local-operation, agent-choice, task-strategy, repeated-use or size-only".to_owned()
+                })?);
+            }
+            "outcome" => set_selection_value("outcome", value, &mut outcome)?,
+            "rationale" => set_selection_value("rationale", value, &mut rationale)?,
+            "controls" => set_selection_value("controls", value, &mut controls)?,
+            "projection" => set_selection_value("projection", value, &mut projection)?,
+            "baseline" => set_selection_value("baseline", value, &mut baseline)?,
+            "stopping" => set_selection_value("stopping", value, &mut stopping)?,
+            _ => {
+                return Err(
+                    "the experiment-selection clause has an unknown field; a staged or mandatory ladder is not a declared selection"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    match (
+        method, claim, outcome, rationale, controls, projection, baseline, stopping,
+    ) {
+        (
+            Some(method),
+            Some(claim),
+            Some(outcome),
+            Some(rationale),
+            Some(controls),
+            Some(projection),
+            Some(baseline),
+            Some(stopping),
+        ) => {
+            let selection = ExperimentSelection {
+                method,
+                claim,
+                outcome,
+                rationale,
+                controls,
+                projection,
+                baseline,
+                stopping,
+            };
+            if let Some(problem) = selection.problem() {
+                return Err(problem);
+            }
+            Ok(Some(selection))
+        }
+        _ => Err(
+            "the experiment-selection clause is incomplete; declare method, claim, outcome, rationale, controls, projection, baseline and stopping before results"
+                .to_owned(),
+        ),
+    }
+}
+
+fn set_selection_value(
+    name: &'static str,
+    value: &str,
+    slot: &mut Option<String>,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(match name {
+            "outcome" => "the experiment-selection outcome is declared twice",
+            "rationale" => "the experiment-selection rationale is declared twice",
+            "controls" => "the experiment-selection controls are declared twice",
+            "projection" => "the experiment-selection projection is declared twice",
+            "baseline" => "the experiment-selection baseline is declared twice",
+            _ => "the experiment-selection stopping rule is declared twice",
+        }
+        .to_owned());
+    }
+    *slot = Some(value.to_owned());
+    Ok(())
 }
 
 /// The measured dimension of the declared comparison rule.
@@ -428,6 +841,12 @@ impl ComparisonPolicy {
         if let Some(effect) = declared_effect {
             value["effect_percent"] = json!(effect);
         }
+        // The declared experiment selection is recorded with every measured
+        // attempt before results, so a policy or declaration changed after
+        // results cannot inherit an earlier adoption.
+        if let Ok(Some(selection)) = parse_experiment_selection(&self.uncertainty) {
+            value["selection"] = selection_declaration(&selection);
+        }
         value
     }
 
@@ -538,6 +957,10 @@ impl ComparisonPolicy {
                 "a repeatable claim needs at least two complete paired units declared before results",
             ));
         }
+        // A present selection clause is parsed and validated by its own owner:
+        // the declared unit must exercise the declared claim path and no
+        // size-only shortcut is accepted before any result exists.
+        let _ = parse_experiment_selection(&self.uncertainty).map_err(invalid)?;
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(self).map_err(io::Error::other)?)
