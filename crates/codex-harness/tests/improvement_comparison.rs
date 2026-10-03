@@ -952,7 +952,17 @@ impl Fixture {
 fn write_change(project: &Path, change: &str, group: &str, scenario: &str) {
     let dir = project.join("openspec/changes").join(change);
     fs::create_dir_all(dir.join("specs").join(group)).unwrap();
-    fs::write(dir.join("proposal.md"), format!("## Why\n\n{scenario}.\n")).unwrap();
+    fs::write(
+        dir.join("proposal.md"),
+        format!(
+            "## Why\n\n{scenario}.\n\n## Measurement\n\nObserved problem: the {scenario} flow \
+             repeats measurable work. Investigation scope: one frozen workload revision on this \
+             fixture. Measurement question: how much accepted time does the repeated work cost? \
+             Workload: the existing comparison operation linked from this change. Evidence: the \
+             retained outcome record. Limits: one local fixture and one frozen revision.\n"
+        ),
+    )
+    .unwrap();
     fs::write(
         dir.join("design.md"),
         format!("## Context\n\n{scenario}.\n"),
@@ -1076,6 +1086,27 @@ impl Fixture {
             object.remove(key);
         }
         fs::write(&self.spec, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        // The directed-measurement gate requires the declared scope beside the
+        // frozen spec and the matching section in the hypothesis change.
+        let scope = json!({
+            "observed_problem": "the synthetic flow repeats measurable work",
+            "investigation_scope": "one frozen workload revision on this fixture",
+            "measurement_question": "how much accepted time does the repeated work cost?",
+            "workload": {
+                "operation": "comparison workload-b",
+                "contract": "openspec/changes/add-synthetic/proposal.md#Measurement",
+            },
+            "evidence_references": ["retained outcome record: synthetic comparison"],
+            "limits": "one local fixture and one frozen revision",
+            "declaration_artifact": "proposal.md",
+            "declaration_heading": "## Measurement",
+        });
+        fs::create_dir_all(&self.run).unwrap();
+        fs::write(
+            self.run.join("measurement-scope.json"),
+            serde_json::to_vec_pretty(&scope).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Allocate the ready candidate's owned worktree before the run starts and
