@@ -682,7 +682,7 @@ fn verify_consumed_arm(
 /// and nothing else. A source without a declaration is dispatched through the
 /// owned default-only declaration of one slot; an unusable declaration leaves
 /// the single slot and the ordinary checks still refuse a foreign entry.
-fn dispatch_workspaces(run: &Run, arm: ComparisonArm) -> Vec<PathBuf> {
+pub(super) fn dispatch_workspaces(run: &Run, arm: ComparisonArm) -> Vec<PathBuf> {
     let source = run.store.comparison_arm_dir(arm).join("checkout");
     let pool_size = dispatch_pool_size(run, arm);
     let mut workspaces: Vec<PathBuf> = Vec::new();

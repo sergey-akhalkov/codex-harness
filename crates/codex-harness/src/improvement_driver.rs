@@ -1,23 +1,25 @@
 //! Continuous supervision for one improvement run.
 //!
-//! `start` and `resume` call [`drive`] only when the run persisted
-//! `supervision: continuous`. Absent or `once` keeps the single `advance`
-//! used by recovery and by the comparison owner's existing resume contract.
-//! Continuous mode is the operating loop: it waits for settled attempts,
-//! prepares a missing runtime through `native_build::prepare`, consumes an
-//! exact supported decision, and either starts an independently specified
-//! successor or records idle. It does not publish a live installation, reset
+//! A new `start` persists continuous supervision unless `--supervision once`
+//! is explicit. A run with no supervision file keeps the single `advance`
+//! used by legacy recovery; that frozen input is not rewritten. Continuous
+//! mode stays available across idle, blocked and successor work until stop
+//! or ownership loss. It waits natively, prepares a missing runtime through
+//! `native_build::prepare`, consumes an exact supported decision, and starts
+//! one independently specified successor only after verifying retained
+//! lineage. It does not publish a live installation, reset
 //! `decision-recorded` / `activation-confirmed`, or start model work to stay
 //! busy.
 
 use super::{Run, advance_run, attempt_evidence, invalid, reconcile, terminal_outcome};
+use harness_core::build_identity;
 use harness_core::improvement_activation::{
     self, ActivationOutcome, ActivationRequest, CheckSpec, IntegrationOutcome, IntegrationReceipt,
     IntegrationRequest,
 };
 use harness_core::improvement_experiment::ExperimentBindings;
 use harness_core::improvement_loop::{
-    AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, Phase, RunStore,
+    AttemptState, ComparisonArm, EffectKind, MAX_RUN_SPEC_BYTES, OwnerRecord, Phase, RunStore,
     current_process_identity, owner_is_live, read_json, write_json_atomic,
 };
 use harness_core::improvement_policy::{PolicyDecision, PolicyEvaluation};
@@ -30,8 +32,9 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const POLL: Duration = Duration::from_millis(200);
 const SUPERVISION_FILE: &str = "supervision.json";
@@ -40,12 +43,15 @@ const BUILD_JOB_FILE: &str = "build-job.json";
 const BUILD_OUTPUT_FILE: &str = "build-output.json";
 const BUILD_LOG_FILE: &str = "build-child.log";
 const STOP_REQUEST_FILE: &str = "stop-request.json";
+const STOP_ACK_FILE: &str = "stop-acknowledgement.json";
 const INTEGRATION_CHECK_FILE: &str = "integration-check.json";
 const INTEGRATION_FILE: &str = "integration.json";
 const ACTIVATION_FILE: &str = "activation.json";
 const SUCCESSOR_FILE: &str = "successor.json";
 const LINEAGE_FILE: &str = "lineage.json";
 const CONTINUATION_FILE: &str = "continuation.json";
+const SUCCESSOR_WAIT: Duration = Duration::from_secs(30);
+static TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Supervision {
@@ -98,12 +104,25 @@ struct PreparedBuilds {
 struct BuildJob {
     schema: u32,
     arm: String,
-    pid: u32,
-    created: u64,
-    program: PathBuf,
     source: PathBuf,
     state: PathBuf,
     output: PathBuf,
+    /// `intent` is written before spawn. Identity is added only after the
+    /// child is observed. A resume must not invent either fact.
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    created: Option<u64>,
+    #[serde(default)]
+    program: Option<PathBuf>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,8 +158,106 @@ pub(super) struct SuccessorRecord {
 #[serde(deny_unknown_fields)]
 struct ContinuationRecord {
     schema: u32,
+    /// Legacy flag. Presence of this file is not suppression: `phase`
+    /// separates intent, observed launch and completion.
+    #[serde(default)]
     successor_started: bool,
+    #[serde(default)]
     note: String,
+    /// One of `idle`, `intent`, `observed`, `completed`, `stopped`. Absent on
+    /// legacy records, which are interpreted from `successor_started`.
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    spec: Option<PathBuf>,
+    #[serde(default)]
+    spec_sha256: Option<String>,
+    #[serde(default)]
+    run: Option<PathBuf>,
+    /// The retained predecessor lineage this successor descends from. The
+    /// successor is never started while it is missing.
+    #[serde(default)]
+    lineage: Option<PathBuf>,
+    #[serde(default)]
+    lineage_sha256: Option<String>,
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    created: Option<u64>,
+    #[serde(default)]
+    program: Option<PathBuf>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequest {
+    schema: u32,
+    #[serde(default)]
+    token: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopAcknowledgement {
+    schema: u32,
+    token: String,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn fresh_token() -> String {
+    format!("{}-{}", now_ms(), TOKEN_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Legacy stop requests written before tokens carry no token; they are still
+/// consumed exactly once, under a stable spelling.
+fn normalize_stop_token(token: &str) -> String {
+    if token.is_empty() {
+        "legacy-untokened".to_owned()
+    } else {
+        token.to_owned()
+    }
+}
+
+/// The retained build job's lifecycle stage. `intent` is written before the
+/// spawn; identity is added only after the child is observed.
+fn job_phase(job: &BuildJob) -> &str {
+    if !job.phase.is_empty() {
+        return &job.phase;
+    }
+    if job.pid.is_some() {
+        "observed-legacy"
+    } else {
+        "legacy"
+    }
+}
+
+/// The continuation marker's lifecycle stage, including legacy records.
+fn continuation_phase(record: &ContinuationRecord) -> &str {
+    if !record.phase.is_empty() {
+        return &record.phase;
+    }
+    if record.successor_started {
+        "observed-legacy"
+    } else {
+        "idle-legacy"
+    }
+}
+
+fn hash_file(path: &Path) -> io::Result<String> {
+    build_identity::hash_file(path)
 }
 
 pub(super) fn supervision_of(run: &Run) -> io::Result<Supervision> {
@@ -169,7 +286,9 @@ pub(super) fn persist_supervision(run: &Run, mode: Supervision) -> io::Result<()
 
 pub(super) fn parse_supervision(value: Option<&str>) -> io::Result<Supervision> {
     match value {
-        None => Ok(Supervision::Once),
+        // New starts are continuous. Legacy recovery reads a missing file as
+        // `once` in `supervision_of` and does not rewrite that frozen input.
+        None => Ok(Supervision::Continuous),
         Some(value) => Supervision::parse(value),
     }
 }
@@ -255,11 +374,47 @@ pub(super) fn refuse_live_controller(run: &Run) -> io::Result<()> {
     Ok(())
 }
 
+/// Consumes one pending stop request if one is on disk and returns its token.
+/// A resume uses this so a stop that was never observed by a live controller
+/// suspends the run once instead of lingering as a permanent refusal.
+pub(super) fn consume_pending_stop(run: &Run) -> io::Result<Option<String>> {
+    acknowledge_exact_stop(run.store.root())
+}
+
 pub(super) fn write_stop_request(root: &Path, reason: &str) -> io::Result<()> {
     write_json_atomic(
         &root.join(STOP_REQUEST_FILE),
-        &json!({"schema": 1, "reason": reason}),
+        &StopRequest {
+            schema: 1,
+            token: fresh_token(),
+            reason: reason.to_owned(),
+        },
     )
+}
+
+/// Consumes the stop request currently on disk. A newer request written after
+/// this token was read is left in place, so a concurrent stop is not lost.
+pub(super) fn acknowledge_exact_stop(root: &Path) -> io::Result<Option<String>> {
+    let path = root.join(STOP_REQUEST_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let request: StopRequest = read_json(&path, 4096)?;
+    let token = normalize_stop_token(&request.token);
+    write_json_atomic(
+        &root.join(STOP_ACK_FILE),
+        &StopAcknowledgement {
+            schema: 1,
+            token: token.clone(),
+        },
+    )?;
+    if path.is_file() {
+        let current: StopRequest = read_json(&path, 4096)?;
+        if normalize_stop_token(&current.token) == token {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(Some(token))
 }
 
 pub(super) fn stop_build_job(root: &Path) -> io::Result<Option<String>> {
@@ -268,19 +423,27 @@ pub(super) fn stop_build_job(root: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
     let job: BuildJob = read_json(&path, MAX_RUN_SPEC_BYTES)?;
+    let (Some(pid), Some(created), Some(program)) = (job.pid, job.created, job.program.clone())
+    else {
+        return Ok(Some(format!(
+            "the {} build has no observed process identity ({}); it was not signalled and is not started again",
+            job.arm,
+            job_phase(&job)
+        )));
+    };
     let user = process_service::current_user()?;
     let inspected = ServiceProcess::inspect(
         ProcessIdentity {
-            pid: job.pid,
-            creation_time: job.created,
+            pid,
+            creation_time: created,
         },
-        &job.program,
+        &program,
         &user,
     )?;
     let Some(process) = inspected else {
         return Ok(Some(format!(
             "build child {} is not the recorded live process; it was not signalled",
-            job.pid
+            pid
         )));
     };
     // The recorded program, pid and creation time are the child this run
@@ -289,7 +452,7 @@ pub(super) fn stop_build_job(root: &Path) -> io::Result<Option<String>> {
     Ok(Some(format!(
         "recorded {} build child {} {}",
         job.arm,
-        job.pid,
+        pid,
         if stopped {
             "was stopped"
         } else {
@@ -332,7 +495,7 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
     );
     let mut idle_spins = 0u32;
     loop {
-        if should_leave(run)? {
+        if should_leave(run, &mut notes)? {
             notes.push("controller: stop or ownership change; no further dispatch".to_owned());
             return Ok(notes);
         }
@@ -342,7 +505,7 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
                 "controller: waiting for attempt {id}; no new model work is dispatched"
             ));
             wait_for_attempt(run, &id, &mut notes)?;
-            if should_leave(run)? {
+            if should_leave(run, &mut notes)? {
                 notes.push("controller: left the wait without dispatching again".to_owned());
                 return Ok(notes);
             }
@@ -351,13 +514,21 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
         match run.cursor.phase {
             Phase::Stopped => return Ok(notes),
             Phase::Idle => {
-                notes.push(
-                    "controller: idle; no model work is started only to stay busy".to_owned(),
-                );
+                if continuation_expected(run) {
+                    finish_continuation(run, &mut notes)?;
+                } else {
+                    notes.push(
+                        "controller: idle; no model work is started only to stay busy".to_owned(),
+                    );
+                }
+                // A stop requested during the continuation is consumed here,
+                // so it does not linger after the controller leaves.
+                should_leave(run, &mut notes)?;
                 return Ok(notes);
             }
             Phase::ActivationConfirmed => {
                 finish_continuation(run, &mut notes)?;
+                should_leave(run, &mut notes)?;
                 return Ok(notes);
             }
             Phase::Blocked => {
@@ -377,24 +548,26 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
             .is_some_and(|candidate| candidate.is_ready())
         {
             if !ensure_missing_builds(run, &mut notes)? {
+                should_leave(run, &mut notes)?;
                 return Ok(notes);
             }
             apply_prepared(run)?;
         }
-        if should_leave(run)? {
+        if should_leave(run, &mut notes)? {
             return Ok(notes);
         }
         notes.extend(advance_run(run)?);
         if run.cursor.phase == Phase::DecisionRecorded {
             consume_decision(run, &mut notes)?;
         }
-        if matches!(
-            run.cursor.phase,
-            Phase::Idle | Phase::Blocked | Phase::Stopped | Phase::ActivationConfirmed
-        ) {
-            if run.cursor.phase == Phase::ActivationConfirmed {
+        if matches!(run.cursor.phase, Phase::Idle | Phase::ActivationConfirmed) {
+            if continuation_expected(run) {
                 finish_continuation(run, &mut notes)?;
             }
+            should_leave(run, &mut notes)?;
+            return Ok(notes);
+        }
+        if matches!(run.cursor.phase, Phase::Blocked | Phase::Stopped) {
             return Ok(notes);
         }
         if in_flight_id(&run.cursor).is_some() {
@@ -426,8 +599,33 @@ pub(super) fn drive(run: &mut Run) -> io::Result<Vec<String>> {
     }
 }
 
-fn should_leave(run: &Run) -> io::Result<bool> {
-    if stop_requested(run.store.root()) || run.cursor.phase == Phase::Stopped {
+/// A completed decision or confirmed activation leaves retained lineage; a
+/// declared successor is then consumed even after a rejection, while a plain
+/// intake idle starts no continuation work.
+fn continuation_expected(run: &Run) -> bool {
+    run.cursor.phase == Phase::ActivationConfirmed
+        || run.store.root().join(LINEAGE_FILE).is_file()
+        || run
+            .cursor
+            .comparison
+            .as_ref()
+            .and_then(|state| state.decision.as_deref())
+            .is_some()
+}
+
+/// Consumes the exact stop request when one is present, so a stop is a
+/// one-shot command: the controller leaves and a later resume does not treat
+/// the stale request as a new stop.
+fn should_leave(run: &Run, notes: &mut Vec<String>) -> io::Result<bool> {
+    if stop_requested(run.store.root()) {
+        if let Some(token) = acknowledge_exact_stop(run.store.root())? {
+            notes.push(format!(
+                "controller: consumed the exact stop request ({token}); retained effects stay as recorded"
+            ));
+        }
+        return Ok(true);
+    }
+    if run.cursor.phase == Phase::Stopped {
         return Ok(true);
     }
     if run.store.owner()?.is_none() {
@@ -638,6 +836,20 @@ fn materialize_baseline_source(run: &Run) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// The outcome of reconciling a retained build job before another build.
+enum BuildReconciliation {
+    /// The recorded child left a readable receipt; the build is completed.
+    Prepared {
+        arm: String,
+        prepared: PrepareOutput,
+    },
+    /// The recorded child cannot be reconciled to a receipt. The build is not
+    /// started again automatically and the reason is retained on the cursor.
+    Unknown(String),
+    /// A stop was requested; nothing is dispatched again by this controller.
+    Stopped,
+}
+
 fn publish_missing_build(
     run: &mut Run,
     arm: &str,
@@ -648,9 +860,60 @@ fn publish_missing_build(
     if stop_requested(run.store.root()) {
         return Ok(false);
     }
+    // A retained build job is reconciled before any other build is started.
+    match reconcile_build_job(run, notes)? {
+        Some(BuildReconciliation::Prepared {
+            arm: recorded_arm,
+            prepared,
+        }) => {
+            if recorded_arm != arm {
+                let reason = format!(
+                    "the retained build receipt belongs to the {recorded_arm} runtime while the missing {arm} runtime is required; the mismatch is not resolved automatically"
+                );
+                run.cursor.block(reason.clone());
+                run.store.save_cursor(&run.cursor)?;
+                notes.push(reason);
+                return Ok(false);
+            }
+            record_prepared_build(run, arm, prepared, notes)?;
+            return Ok(true);
+        }
+        Some(BuildReconciliation::Unknown(reason)) => {
+            run.cursor.block(reason.clone());
+            run.cursor.effect(
+                EffectKind::BuildPrepared,
+                format!("arm={arm} reconciled-unknown"),
+            );
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(reason);
+            return Ok(false);
+        }
+        Some(BuildReconciliation::Stopped) => return Ok(false),
+        None => {}
+    }
     let output = run.store.root().join(BUILD_OUTPUT_FILE);
     let _ = fs::remove_file(&output);
     let log_path = run.store.root().join(BUILD_LOG_FILE);
+    let job_path = run.store.root().join(BUILD_JOB_FILE);
+    // Intent is written before the spawn; identity is added only after the
+    // child is observed, so a resume never invents either fact.
+    write_json_atomic(
+        &job_path,
+        &BuildJob {
+            schema: 1,
+            arm: arm.to_owned(),
+            source: source.to_path_buf(),
+            state: state.to_path_buf(),
+            output: output.clone(),
+            phase: "intent".to_owned(),
+            token: fresh_token(),
+            pid: None,
+            created: Some(now_ms()),
+            program: None,
+            exit_code: None,
+            error: None,
+        },
+    )?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -674,6 +937,7 @@ fn publish_missing_build(
         command.env_remove(key);
     }
     let mut child = command.spawn().map_err(|error| {
+        let _ = fs::remove_file(&job_path);
         invalid(format!(
             "the native build child for the {arm} runtime could not be started: {error}"
         ))
@@ -684,25 +948,32 @@ fn publish_missing_build(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = fs::remove_file(&job_path);
             return Err(invalid(format!(
                 "the native build child could not be identified and was stopped: {error}"
             )));
         }
     };
-    let job = BuildJob {
-        schema: 1,
-        arm: arm.to_owned(),
-        pid: observed.identity().pid,
-        created: observed.identity().creation_time,
-        program: exe,
-        source: source.to_path_buf(),
-        state: state.to_path_buf(),
-        output: output.clone(),
-    };
-    write_json_atomic(&run.store.root().join(BUILD_JOB_FILE), &job)?;
+    write_json_atomic(
+        &job_path,
+        &BuildJob {
+            schema: 1,
+            arm: arm.to_owned(),
+            source: source.to_path_buf(),
+            state: state.to_path_buf(),
+            output: output.clone(),
+            phase: "observed".to_owned(),
+            token: fresh_token(),
+            pid: Some(observed.identity().pid),
+            created: Some(observed.identity().creation_time),
+            program: Some(exe),
+            exit_code: None,
+            error: None,
+        },
+    )?;
     run.cursor.condition = Some(format!(
         "preparing the missing {arm} runtime through native_build::prepare (pid {}); status and stop remain available",
-        job.pid
+        observed.identity().pid
     ));
     run.store.save_cursor(&run.cursor)?;
     release(run);
@@ -711,7 +982,7 @@ fn publish_missing_build(
             let _ = child.kill();
             let _ = child.wait();
             reacquire(run)?;
-            let _ = fs::remove_file(run.store.root().join(BUILD_JOB_FILE));
+            let _ = fs::remove_file(&job_path);
             notes.push(format!(
                 "controller: stopped while the {arm} build child was running; it is not dispatched again"
             ));
@@ -723,7 +994,7 @@ fn publish_missing_build(
         }
     };
     reacquire(run)?;
-    let _ = fs::remove_file(run.store.root().join(BUILD_JOB_FILE));
+    let _ = fs::remove_file(&job_path);
     if !status.success() {
         let reason = format!(
             "the native {arm} build failed ({status}); see {}",
@@ -741,6 +1012,95 @@ fn publish_missing_build(
             "the native {arm} build exited 0 but its receipt is unreadable: {error}"
         ))
     })?;
+    record_prepared_build(run, arm, prepared, notes)?;
+    Ok(true)
+}
+
+/// Reconciles the build job currently on disk without ever starting a second
+/// build while one is recorded. Intent-only records carry no observed
+/// identity; they are abandoned to the native owner's own state lock. An
+/// observed record is followed to its process exit and then to its receipt.
+fn reconcile_build_job(
+    run: &mut Run,
+    notes: &mut Vec<String>,
+) -> io::Result<Option<BuildReconciliation>> {
+    let path = run.store.root().join(BUILD_JOB_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let job: BuildJob = read_json(&path, MAX_RUN_SPEC_BYTES)?;
+    let Some((pid, created, program)) = job
+        .pid
+        .zip(job.created)
+        .zip(job.program.clone())
+        .map(|((pid, created), program)| (pid, created, program))
+    else {
+        notes.push(format!(
+            "controller: the retained {} build job records intent without an observed process identity ({}); the native owner still serializes builds for this state, so a fresh observed attempt is prepared",
+            job.arm,
+            job_phase(&job)
+        ));
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    };
+    let user = process_service::current_user()?;
+    let identity = ProcessIdentity {
+        pid,
+        creation_time: created,
+    };
+    if ServiceProcess::inspect(identity, &program, &user)?.is_some() {
+        run.cursor.condition = Some(format!(
+            "waiting for the recorded {} build child {pid}; it is not started again and stop stays available",
+            job.arm
+        ));
+        run.store.save_cursor(&run.cursor)?;
+        release(run);
+        loop {
+            if stop_requested(run.store.root()) {
+                let stopped = stop_build_job(run.store.root())?;
+                reacquire(run)?;
+                notes.push(format!(
+                    "controller: stop was requested while reconciling the recorded {} build child; {}",
+                    job.arm,
+                    stopped.unwrap_or_else(|| "its identity was not resolved".to_owned())
+                ));
+                return Ok(Some(BuildReconciliation::Stopped));
+            }
+            if ServiceProcess::inspect(identity, &program, &user)?.is_none() {
+                break;
+            }
+            thread::sleep(POLL);
+        }
+        reacquire(run)?;
+    }
+    if job.output.is_file()
+        && let Ok(prepared) = read_json::<PrepareOutput>(&job.output, MAX_RUN_SPEC_BYTES)
+    {
+        let _ = fs::remove_file(&path);
+        notes.push(format!(
+            "controller: reconciled the recorded {} build child {pid} with its retained receipt (reused={})",
+            job.arm, prepared.reused
+        ));
+        return Ok(Some(BuildReconciliation::Prepared {
+            arm: job.arm,
+            prepared,
+        }));
+    }
+    Ok(Some(BuildReconciliation::Unknown(format!(
+        "the recorded {} build child {pid} is not running and left no readable receipt at {}; its outcome is unknown and the build is not started again automatically",
+        job.arm,
+        job.output.display()
+    ))))
+}
+
+/// Records one completed native build receipt for this arm and clears the
+/// transient preparing condition.
+fn record_prepared_build(
+    run: &mut Run,
+    arm: &str,
+    prepared: PrepareOutput,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
     let mut record = if run.store.root().join(PREPARED_BUILDS_FILE).is_file() {
         read_json(
             &run.store.root().join(PREPARED_BUILDS_FILE),
@@ -782,7 +1142,7 @@ fn publish_missing_build(
         prepared.build.display(),
         prepared.reused
     ));
-    Ok(true)
+    Ok(())
 }
 
 fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
@@ -830,6 +1190,9 @@ fn consume_decision(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
         .permits(harness_core::improvement_loop::PublicationStage::Integration)
     {
         record_lineage(run, &evaluation, notes)?;
+        // The experiment is complete for this run: leaving it at
+        // `decision-recorded` would only replay the same exact consumption.
+        run.cursor.phase = Phase::Idle;
         run.cursor.condition = Some(
             "the adopted decision is published, but this run's publication scope does not permit integration; the baseline is unchanged and live publication was not performed"
                 .to_owned(),
@@ -963,7 +1326,12 @@ fn activate_integrated(
         runtime: &runtime,
         attempt_active,
     };
-    match improvement_activation::activate(&request)? {
+    // The candidate arm's measured dispatch legitimately appended the trusted
+    // workspace entries its own dispatcher authorized; the accounting owner
+    // verifies consumption that way, and activation must accept exactly the
+    // same authorized slot set.
+    let trusted = super::improvement_comparison::dispatch_workspaces(run, ComparisonArm::Candidate);
+    match improvement_activation::activate_with_trust(&request, &trusted)? {
         ActivationOutcome::Blocked(blocked) => {
             run.cursor.block(format!(
                 "activation refused; the integrated tree is unchanged by this owner: {}",
@@ -1071,40 +1439,50 @@ fn record_lineage(
     Ok(())
 }
 
+/// Consumes the declared continuation of a completed experiment. The marker
+/// records truthful lifecycle phases (`idle`, `intent`, `observed`,
+/// `completed`, `stopped`) so a later declared successor is never suppressed
+/// by an earlier no-successor record, and a launch is never recorded as
+/// started before its process was observed.
 fn finish_continuation(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()> {
     let marker = run.store.root().join(CONTINUATION_FILE);
-    if marker.is_file() {
-        notes.push(
-            "controller: continuation was already recorded; it is not started again".to_owned(),
-        );
-        return Ok(());
-    }
     let successor_path = run.store.root().join(SUCCESSOR_FILE);
-    if !successor_path.is_file() {
-        run.cursor.condition = Some(
-            "no independently specified successor was declared; the run is idle and no model work is started to invent one"
-                .to_owned(),
-        );
-        if run.cursor.phase != Phase::ActivationConfirmed {
-            run.cursor.phase = Phase::Idle;
+    let declared: Option<SuccessorRecord> = if successor_path.is_file() {
+        Some(read_json(&successor_path, MAX_RUN_SPEC_BYTES)?)
+    } else {
+        None
+    };
+    let existing: Option<ContinuationRecord> = if marker.is_file() {
+        Some(read_json(&marker, MAX_RUN_SPEC_BYTES)?)
+    } else {
+        None
+    };
+    if let Some(record) = &existing {
+        match continuation_phase(record) {
+            "completed" if declared_matches(record, declared.as_ref()) => {
+                notes.push(
+                    "controller: the declared successor already completed; it is not started again"
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+            "stopped" if declared_matches(record, declared.as_ref()) => {
+                notes.push(
+                    "controller: the declared successor was already stopped through its own owner; it is not started again"
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+            "observed" | "observed-legacy" => {
+                return reconcile_observed_continuation(run, record.clone(), notes);
+            }
+            "idle" | "idle-legacy" | "intent" => {}
+            _ => {}
         }
-        run.cursor
-            .effect(EffectKind::ContinuationRecorded, "idle: no successor spec");
-        run.store.save_cursor(&run.cursor)?;
-        write_json_atomic(
-            &marker,
-            &ContinuationRecord {
-                schema: 1,
-                successor_started: false,
-                note: "no successor declared".to_owned(),
-            },
-        )?;
-        notes.push(
-            "controller: idle; no successor was specified and no model call was made".to_owned(),
-        );
-        return Ok(());
     }
-    let successor: SuccessorRecord = read_json(&successor_path, MAX_RUN_SPEC_BYTES)?;
+    let Some(successor) = declared else {
+        return record_idle_continuation(run, existing.is_some(), notes);
+    };
     if successor.spec == run.store.spec_path() {
         run.cursor.block(
             "the successor spec is this run's spec; an unchanged inconclusive or completed experiment is not repeated",
@@ -1112,22 +1490,96 @@ fn finish_continuation(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()>
         run.store.save_cursor(&run.cursor)?;
         return Ok(());
     }
-    write_json_atomic(
-        &marker,
-        &ContinuationRecord {
-            schema: 1,
-            successor_started: true,
+    // B-artifact lineage: a successor is never started without the retained
+    // lineage record of the completed experiment it continues.
+    let lineage_path = run.store.root().join(LINEAGE_FILE);
+    if !lineage_path.is_file() {
+        run.cursor.condition = Some(
+            "a successor is declared, but the retained lineage of the completed experiment is missing; a successor is not started without provable lineage"
+                .to_owned(),
+        );
+        run.store.save_cursor(&run.cursor)?;
+        notes
+            .push("controller: refused to start the successor without retained lineage".to_owned());
+        return Ok(());
+    }
+    let spec_sha256 = hash_file(&successor.spec)?;
+    let lineage_sha256 = hash_file(&lineage_path)?;
+    // The retained lineage is the authoritative record of the completed
+    // decision this successor continues.
+    let decision = read_json::<serde_json::Value>(&lineage_path, 4096)
+        .ok()
+        .and_then(|lineage| lineage["decision"].as_str().map(str::to_owned))
+        .or_else(|| {
+            run.cursor
+                .comparison
+                .as_ref()
+                .and_then(|state| state.decision.clone())
+        })
+        .unwrap_or_else(|| {
+            if run.cursor.phase == Phase::ActivationConfirmed {
+                "activated".to_owned()
+            } else {
+                "none".to_owned()
+            }
+        });
+    let base = ContinuationRecord {
+        schema: 1,
+        successor_started: true,
+        note: format!(
+            "successor spec {} run {}",
+            successor.spec.display(),
+            successor.run.display()
+        ),
+        phase: "intent".to_owned(),
+        token: fresh_token(),
+        spec: Some(successor.spec.clone()),
+        spec_sha256: Some(spec_sha256),
+        run: Some(successor.run.clone()),
+        lineage: Some(lineage_path.clone()),
+        lineage_sha256: Some(lineage_sha256),
+        decision: Some(decision.clone()),
+        pid: None,
+        created: None,
+        program: None,
+        exit_code: None,
+    };
+    // A successor controller that already runs is adopted instead of being
+    // started a second time.
+    if let Some(owner) = live_successor_owner(&successor.run)? {
+        let observed = ContinuationRecord {
+            phase: "observed".to_owned(),
+            token: fresh_token(),
+            pid: Some(owner.pid),
+            created: Some(owner.created),
+            program: Some(owner.program),
             note: format!(
-                "successor spec {} run {}",
+                "adopted the live successor controller for {}",
+                successor.run.display()
+            ),
+            ..base.clone()
+        };
+        write_json_atomic(&marker, &observed)?;
+        run.cursor.effect(
+            EffectKind::ContinuationRecorded,
+            format!(
+                "successor spec={} run={} decision={decision} adopted-live",
                 successor.spec.display(),
                 successor.run.display()
             ),
-        },
-    )?;
+        );
+        run.store.save_cursor(&run.cursor)?;
+        notes.push(format!(
+            "controller: adopted the live successor controller for {}; it is not started twice",
+            successor.run.display()
+        ));
+        return reconcile_observed_continuation(run, observed, notes);
+    }
+    write_json_atomic(&marker, &base)?;
     run.cursor.effect(
         EffectKind::ContinuationRecorded,
         format!(
-            "successor spec={} run={}",
+            "successor spec={} run={} decision={decision} intent",
             successor.spec.display(),
             successor.run.display()
         ),
@@ -1148,29 +1600,406 @@ fn finish_continuation(run: &mut Run, notes: &mut Vec<String>) -> io::Result<()>
     if let Some(check) = &successor.integration_check {
         command.arg("--integration-check").arg(check);
     }
-    let mut child = command.spawn()?;
-    let status = loop {
-        if stop_requested(run.store.root()) {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            reacquire(run)?;
+            let failed = ContinuationRecord {
+                phase: "intent".to_owned(),
+                token: fresh_token(),
+                note: format!("the successor controller could not be started: {error}"),
+                ..base.clone()
+            };
+            write_json_atomic(&marker, &failed)?;
+            run.cursor.condition = Some(format!(
+                "the declared successor spec {} could not be started: {error}; the experiment is complete and no model work is dispatched here",
+                successor.spec.display()
+            ));
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(format!(
+                "controller: the successor controller could not be started: {error}"
+            ));
+            return Ok(());
+        }
+    };
+    let user = process_service::current_user()?;
+    let observed = match ServiceProcess::observe(child.id(), &exe, 0, &user) {
+        Ok(observed) => observed,
+        Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
             reacquire(run)?;
+            let failed = ContinuationRecord {
+                phase: "intent".to_owned(),
+                token: fresh_token(),
+                note: format!(
+                    "the successor controller could not be observed and was stopped: {error}"
+                ),
+                ..base.clone()
+            };
+            write_json_atomic(&marker, &failed)?;
+            run.cursor.condition = Some(format!(
+                "the successor controller could not be observed and was stopped: {error}"
+            ));
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(format!(
+                "controller: the successor controller could not be observed and was stopped: {error}"
+            ));
+            return Ok(());
+        }
+    };
+    reacquire(run)?;
+    let observed = ContinuationRecord {
+        phase: "observed".to_owned(),
+        token: fresh_token(),
+        pid: Some(observed.identity().pid),
+        created: Some(observed.identity().creation_time),
+        program: Some(exe),
+        note: format!("successor controller {} observed", successor.run.display()),
+        ..base
+    };
+    write_json_atomic(&marker, &observed)?;
+    run.store.save_cursor(&run.cursor)?;
+    notes.push(format!(
+        "controller: successor controller for {} is observed (pid {}); it is not started twice",
+        successor.run.display(),
+        observed.pid.unwrap_or_default()
+    ));
+    wait_for_successor_child(run, child, &observed, &successor, notes)
+}
+
+/// True when the retained marker belongs to the currently declared successor.
+fn declared_matches(record: &ContinuationRecord, declared: Option<&SuccessorRecord>) -> bool {
+    let Some(declared) = declared else {
+        return false;
+    };
+    record.run.as_deref() == Some(declared.run.as_path())
+        && record.spec.as_deref() == Some(declared.spec.as_path())
+}
+
+fn record_idle_continuation(
+    run: &mut Run,
+    already_recorded: bool,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let marker = run.store.root().join(CONTINUATION_FILE);
+    if already_recorded {
+        run.cursor.effect(
+            EffectKind::ContinuationRecorded,
+            "idle: no successor declared",
+        );
+        run.store.save_cursor(&run.cursor)?;
+        notes.push(
+            "controller: continuation was already recorded; it is not started again".to_owned(),
+        );
+        return Ok(());
+    }
+    if run.cursor.phase == Phase::ActivationConfirmed {
+        run.cursor.condition = Some(
+            "no independently specified successor was declared; the run is idle and no model work is started to invent one"
+                .to_owned(),
+        );
+    }
+    run.cursor.effect(
+        EffectKind::ContinuationRecorded,
+        "idle: no successor declared",
+    );
+    run.store.save_cursor(&run.cursor)?;
+    write_json_atomic(
+        &marker,
+        &ContinuationRecord {
+            schema: 1,
+            successor_started: false,
+            note: "no successor declared".to_owned(),
+            phase: "idle".to_owned(),
+            token: fresh_token(),
+            spec: None,
+            spec_sha256: None,
+            run: None,
+            lineage: None,
+            lineage_sha256: None,
+            decision: None,
+            pid: None,
+            created: None,
+            program: None,
+            exit_code: None,
+        },
+    )?;
+    notes
+        .push("controller: idle; no successor was specified and no model call was made".to_owned());
+    Ok(())
+}
+
+/// The recorded successor controller without a child handle in this process
+/// (a resumed controller): follow its identity to exit, or reconcile it under
+/// a stop through its own run owner.
+fn reconcile_observed_continuation(
+    run: &mut Run,
+    record: ContinuationRecord,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let marker = run.store.root().join(CONTINUATION_FILE);
+    let successor = match record.run.clone() {
+        Some(path) => path,
+        None => {
+            let completed = ContinuationRecord {
+                phase: "completed".to_owned(),
+                token: fresh_token(),
+                note: "the legacy successor marker recorded no run path or process identity; its outcome is not re-started".to_owned(),
+                ..record
+            };
+            write_json_atomic(&marker, &completed)?;
             notes.push(
-                "controller: stop requested while the successor run was starting; it was not adopted twice"
+                "controller: the legacy continuation marker recorded no identity; it is retained as completed-unknown"
                     .to_owned(),
             );
             return Ok(());
         }
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => thread::sleep(POLL),
-        }
     };
-    reacquire(run)?;
+    let declared = successor_record(run)?;
+    let identity = match (record.pid, record.created, record.program.clone()) {
+        (Some(pid), Some(created), Some(program)) => Some((pid, created, program)),
+        _ => None,
+    };
+    if let Some((pid, created, program)) = identity {
+        let user = process_service::current_user()?;
+        let identity = ProcessIdentity {
+            pid,
+            creation_time: created,
+        };
+        if ServiceProcess::inspect(identity, &program, &user)?.is_some() {
+            run.cursor.condition = Some(format!(
+                "waiting for the recorded successor controller {pid}; it is not started twice and stop stays available"
+            ));
+            run.store.save_cursor(&run.cursor)?;
+            release(run);
+            loop {
+                if stop_requested(run.store.root()) {
+                    if let Some(successor) = &declared {
+                        stop_successor_run(successor, notes)?;
+                    }
+                    let deadline = Instant::now() + SUCCESSOR_WAIT;
+                    while Instant::now() < deadline
+                        && ServiceProcess::inspect(identity, &program, &user)?.is_some()
+                    {
+                        thread::sleep(POLL);
+                    }
+                    let exited = ServiceProcess::inspect(identity, &program, &user)?.is_none();
+                    reacquire(run)?;
+                    let stopped = ContinuationRecord {
+                        phase: "stopped".to_owned(),
+                        token: fresh_token(),
+                        exit_code: None,
+                        note: format!(
+                            "stopped under request through the successor's own owner; controller {} {}",
+                            pid,
+                            if exited {
+                                "was observed to exit"
+                            } else {
+                                "was still running when the bounded wait ended"
+                            }
+                        ),
+                        ..record
+                    };
+                    write_json_atomic(&marker, &stopped)?;
+                    run.cursor.condition = Some(
+                        "the successor run was stopped through its own owner; no dependent dispatch remains here"
+                            .to_owned(),
+                    );
+                    run.cursor.effect(
+                        EffectKind::ContinuationRecorded,
+                        "successor stopped through its own owner",
+                    );
+                    run.store.save_cursor(&run.cursor)?;
+                    notes.push(
+                        "controller: the recorded successor was stopped through its own owner"
+                            .to_owned(),
+                    );
+                    return Ok(());
+                }
+                if ServiceProcess::inspect(identity, &program, &user)?.is_none() {
+                    break;
+                }
+                thread::sleep(POLL);
+            }
+            reacquire(run)?;
+        }
+    }
+    let completed = ContinuationRecord {
+        phase: "completed".to_owned(),
+        token: fresh_token(),
+        exit_code: record.exit_code,
+        note: "the recorded successor controller is not running; its exact exit status was not observed by this controller"
+            .to_owned(),
+        ..record
+    };
+    write_json_atomic(&marker, &completed)?;
+    run.cursor.effect(
+        EffectKind::ContinuationRecorded,
+        "successor completed (exit status unobserved)",
+    );
+    run.store.save_cursor(&run.cursor)?;
     notes.push(format!(
-        "controller: successor run {} exited {status}",
-        successor.run.display()
+        "controller: the recorded successor for {} is not running; it is retained as completed with an unobserved exit status",
+        successor.display()
     ));
     Ok(())
+}
+
+fn successor_record(run: &Run) -> io::Result<Option<SuccessorRecord>> {
+    let path = run.store.root().join(SUCCESSOR_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    read_json(&path, MAX_RUN_SPEC_BYTES).map(Some)
+}
+
+fn live_successor_owner(run_path: &Path) -> io::Result<Option<OwnerRecord>> {
+    let path = run_path.join(harness_core::improvement_loop::OWNER_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let record: OwnerRecord = read_json(&path, 4096)?;
+    Ok(matches!(owner_is_live(&record)?, Some(true)).then_some(record))
+}
+
+/// Stops the successor's own run through its existing stop owner, which
+/// resolves its executors and retains unknown effects, instead of only
+/// killing the controller process here.
+fn stop_successor_run(successor: &SuccessorRecord, notes: &mut Vec<String>) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(&exe);
+    command
+        .arg("improve")
+        .arg("stop")
+        .arg("--run")
+        .arg(&successor.run)
+        .arg("--reason")
+        .arg("the predecessor controller was stopped; the successor is suspended through its own owner");
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let summary = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            notes.push(format!("controller: successor stop owner: {summary}"));
+        }
+        Ok(output) => notes.push(format!(
+            "controller: the successor stop owner refused ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => notes.push(format!(
+            "controller: the successor stop owner could not be run: {error}"
+        )),
+    }
+    Ok(())
+}
+
+/// Waits for the successor controller this process spawned. A stop is
+/// resolved through the successor's own run owner before the controller is
+/// reaped, so a successor executor is never left without its stop path.
+fn wait_for_successor_child(
+    run: &mut Run,
+    mut child: std::process::Child,
+    record: &ContinuationRecord,
+    successor: &SuccessorRecord,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let marker = run.store.root().join(CONTINUATION_FILE);
+    // The successor runs as its own owned run; this run keeps status and stop
+    // usable while waiting, so the mutation guard is released here.
+    if run.guard.is_some() {
+        release(run);
+    }
+    loop {
+        if stop_requested(run.store.root()) {
+            stop_successor_run(successor, notes)?;
+            let deadline = Instant::now() + SUCCESSOR_WAIT;
+            let mut status = None;
+            while Instant::now() < deadline {
+                if let Some(current) = child.try_wait()? {
+                    status = Some(current);
+                    break;
+                }
+                thread::sleep(POLL);
+            }
+            let exit_code = match status {
+                Some(status) => {
+                    let _ = child.wait();
+                    status.code()
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    None
+                }
+            };
+            reacquire(run)?;
+            let stopped = ContinuationRecord {
+                phase: "stopped".to_owned(),
+                token: fresh_token(),
+                exit_code,
+                note: format!(
+                    "stopped under request; the successor run owner was invoked, the controller exit code is {}",
+                    exit_code.map_or("unknown".to_owned(), |code| code.to_string())
+                ),
+                ..record.clone()
+            };
+            write_json_atomic(&marker, &stopped)?;
+            run.cursor.condition = Some(
+                "the successor run was stopped through its own owner; no dependent dispatch remains here"
+                    .to_owned(),
+            );
+            run.cursor.effect(
+                EffectKind::ContinuationRecorded,
+                "successor stopped through its own owner",
+            );
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(
+                "controller: stop consumed; the successor was suspended through its own owner before this controller leaves"
+                    .to_owned(),
+            );
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            reacquire(run)?;
+            let completed = ContinuationRecord {
+                phase: "completed".to_owned(),
+                token: fresh_token(),
+                exit_code: status.code(),
+                note: format!(
+                    "successor controller {} exited with {}",
+                    successor.run.display(),
+                    status
+                ),
+                ..record.clone()
+            };
+            write_json_atomic(&marker, &completed)?;
+            run.cursor.effect(
+                EffectKind::ContinuationRecorded,
+                format!(
+                    "successor run={} exited={}",
+                    successor.run.display(),
+                    status
+                ),
+            );
+            run.store.save_cursor(&run.cursor)?;
+            notes.push(format!(
+                "controller: successor run {} exited {status}",
+                successor.run.display()
+            ));
+            return Ok(());
+        }
+        thread::sleep(POLL);
+    }
 }
 
 fn rejected_build_overrides() -> Vec<String> {

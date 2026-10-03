@@ -317,12 +317,17 @@ impl Fixture {
     }
 
     fn start(&self) -> Output {
+        // These cases recover explicit workflow boundaries step by step: they
+        // are explicit single-step callers, while `start_continuous` declares
+        // the CLI default for a supervised loop.
         self.improve(&[
             "start",
             "--run",
             self.run.to_str().unwrap(),
             "--spec",
             self.spec.to_str().unwrap(),
+            "--supervision",
+            "once",
         ])
     }
 

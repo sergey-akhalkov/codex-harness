@@ -73,15 +73,18 @@ owner; a missing evidence base records idle, a missing gate records blocked,
 and neither starts hidden model work.
 
 A run that declares the explicit comparison inputs also prepares and drives
-the sequential measured pair from candidate-ready. `--supervision continuous`
-keeps that process driving settled attempts, prepares a missing runtime through
-the existing native build owner, and hands an exact supported decision to the
-integration and activation owners. Absent supervision, or `once`, performs a
-single advance so an interrupted run and an external one-step resume stay
-recoverable. Live publication is never implied. Rejection, an inconclusive
-decision, drift, a failed check or missing removal authority leaves the
-baseline unchanged. A declared successor is started only after that decision;
-otherwise the controller records idle and does not call a model to stay busy.
+the sequential measured pair from candidate-ready. Continuous supervision is
+the default for a new start: it keeps driving settled attempts, prepares a
+missing runtime through the existing native build owner, and hands an exact
+supported decision to the integration and activation owners. `once` is the
+explicit single-step mode, and a run with no recorded supervision keeps that
+one-step recovery. A retained build job is reconciled before another build, a
+stop request is consumed exactly once, and a declared successor is started
+only after the completed decision with its retained lineage; otherwise the
+controller records a non-suppressing idle continuation and does not call a
+model to stay busy. Live publication is never implied. Rejection, an
+inconclusive decision, drift, a failed check or missing removal authority
+leaves the baseline unchanged.
 
 status prints the recoverable phase cursor: current phase and condition, the
 hypothesis card, the qualified planning change, the effective runner binding,
@@ -1698,6 +1701,15 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(args, &["--run"], &[])?;
     let mut run = open_run_locked(&PathBuf::from(options.required("--run")?))?;
     improvement_driver::refuse_live_controller(&run)?;
+    // A stop request that no live controller consumed is acknowledged here.
+    // The stop itself already recorded its own effect through the stop owner;
+    // the exact request is consumed once instead of lingering as a permanent
+    // refusal for every later resume.
+    if let Some(token) = improvement_driver::consume_pending_stop(&run)? {
+        println!(
+            "resume: consumed the exact stop request ({token}) that no live controller observed; the run continues from its recorded phase"
+        );
+    }
     claim_ownership(&mut run)?;
     let (mut cursor, report, notes) = reconcile(&run)?;
     cursor.resume_phase();
