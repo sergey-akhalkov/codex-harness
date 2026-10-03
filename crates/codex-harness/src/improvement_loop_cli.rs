@@ -4,11 +4,12 @@
 //! The controller consumes the integrated owners instead of duplicating them:
 //! Beads (`bd`) owns hypothesis identity and decisions, OpenSpec owns the
 //! planning contracts, the orchestration configuration owns the effective
-//! dispatch profile, the build-selection owner owns prepared runtime
-//! selection, and the visible executor dispatch owner opens every model
-//! conversation. Comparison execution and frozen runtime preparation are
-//! separate owners; phases that need them stay explicitly pending here until
-//! an actual effect records them.
+//! dispatch profile, the prepared-variant selection primitive owns runtime
+//! selection (through the journaled build-selection owner), and the visible
+//! executor dispatch owner opens every model conversation. Comparison
+//! execution and frozen runtime preparation are separate owners; phases that
+//! need them stay explicitly pending here until an actual effect records
+//! them.
 //!
 //! The planning/implementation stage of the loop lives in the
 //! [`improvement_workflow`] child module: a retained investigator result is
@@ -31,7 +32,7 @@ use crate::executor_cli::{
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;
 use harness_core::build_identity;
-use harness_core::build_selection;
+use harness_core::improvement_experiment::{self, Arm, PreparedVariant};
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, CURSOR_FILE, Cursor, DispatchBinding, DispatchFacts,
     DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
@@ -89,15 +90,17 @@ leaves the baseline unchanged.
 status prints the recoverable phase cursor: current phase and condition, the
 hypothesis card, the qualified planning change, the effective runner binding,
 the evidence root, the consumed intake outcomes, the selected candidate with
-its branch/base/revision, the dispatch gate, the removal gate, every attempt
-with its receipt, the selected prepared variant and the phases still pending.
-It performs no model call. --json prints the same report as JSON.
+its branch/base/revision, the dispatch gate, the removal gate, the
+directed-measurement gate state (the declared measurement-scope file and the
+retained measurement receipt), every attempt with its receipt, the selected
+prepared variant and the phases still pending. It performs no model call.
+--json prints the same report as JSON.
 
-select activates an already prepared baseline/candidate runtime through the
-build-selection owner, records its effective identity and performs no model
-call, build or source edit. It refuses while a measured attempt is active or
-unreconciled, and a candidate that is a removal treatment additionally needs
-the current experimental removal authority.
+select activates an already prepared baseline/candidate variant through the
+shared runtime-selection primitive, records the identity it actually consumed
+and performs no model call, build or source edit. It refuses while a measured
+attempt is active or unreconciled, and a candidate that is a removal treatment
+additionally needs the current experimental removal authority.
 
 stop suspends new work, preserves every attempt and marks in-flight attempts
 unknown so resume never replays them. resume takes over a stopped or
@@ -644,6 +647,66 @@ fn removal_text(gate: &Option<RemovalGate>) -> String {
     }
 }
 
+/// The declared measurement scope is explicit local run data beside the
+/// frozen spec; the workflow owner's directed-measurement gate consumes the
+/// same file name before it may direct the baseline attempt.
+const MEASUREMENT_SCOPE_FILE: &str = "measurement-scope.json";
+/// Bound of one reported reason in the status surface: the recorded
+/// condition already carries the exact artifact, and the report never lets
+/// one long text dominate the output.
+const MAX_REPORTED_REASON_BYTES: usize = 512;
+
+/// The directed-measurement gate state one status report surfaces: the
+/// declared scope artifact, the retained receipt and the currently recorded
+/// blocking reason. This is reporting only; nothing here gates a run.
+struct MeasurementState {
+    scope_path: PathBuf,
+    scope_present: bool,
+    receipt: Option<PathBuf>,
+    blocked_reason: Option<String>,
+}
+
+fn measurement_state(run: &Run) -> MeasurementState {
+    let scope_path = run.store.root().join(MEASUREMENT_SCOPE_FILE);
+    MeasurementState {
+        scope_present: scope_path.is_file(),
+        scope_path,
+        receipt: run
+            .cursor
+            .candidate
+            .as_ref()
+            .and_then(|candidate| candidate.measurement_receipt.clone()),
+        blocked_reason: run
+            .cursor
+            .condition
+            .as_deref()
+            .filter(|_| run.cursor.phase == Phase::Blocked)
+            .map(bounded_reason),
+    }
+}
+
+fn bounded_reason(reason: &str) -> String {
+    if reason.len() <= MAX_REPORTED_REASON_BYTES {
+        return reason.to_owned();
+    }
+    let mut cut = MAX_REPORTED_REASON_BYTES;
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &reason[..cut])
+}
+
+fn measurement_json(state: &MeasurementState) -> serde_json::Value {
+    json!({
+        "scope": {
+            "path": state.scope_path.display().to_string(),
+            "status": if state.scope_present { "present" } else { "missing" },
+        },
+        "receipt": state.receipt.as_ref().map(|path| path.display().to_string()),
+        "blocked_reason": state.blocked_reason.as_deref(),
+    })
+}
+
 fn run_report(run: &Run) -> io::Result<serde_json::Value> {
     let stage = stage_role(&run.cursor);
     let facts = dispatch_facts_for(run, stage)?;
@@ -651,6 +714,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
     let removal = facts.removal.clone();
     let planning = run.store.planning()?;
     let variants = run.store.variants_path();
+    let measurement = measurement_state(run);
     Ok(json!({
         "schema": 1,
         "run": run.spec.run,
@@ -682,6 +746,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             None => json!({"declared": false}),
             Some(gate) => json!({"declared": true, "gate": removal_text(&Some(gate.clone()))}),
         },
+        "measurement": measurement_json(&measurement),
         "attempts": run.cursor.attempts.iter().map(|attempt| json!({
             "id": attempt.id,
             "role": attempt.role.as_str(),
@@ -751,6 +816,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             "base": candidate.worktree.as_ref().map(|checkout| checkout.base.clone()),
             "worktree": candidate.worktree.as_ref().map(|checkout| checkout.path.display().to_string()),
             "planning_receipt": candidate.planning_receipt.as_ref().map(|path| path.display().to_string()),
+            "measurement_receipt": candidate.measurement_receipt.as_ref().map(|path| path.display().to_string()),
             "planner_attempt": candidate.planner_attempt,
             "implementer_attempt": candidate.implementer_attempt,
             "revision": candidate.revision,
@@ -826,6 +892,24 @@ fn print_report(run: &Run) -> io::Result<()> {
     match &run.spec.evidence_root {
         Some(root) => println!("evidence root: {}", root.display()),
         None => println!("evidence root: none declared (run-retained attempt evidence only)"),
+    }
+    let measurement = measurement_state(run);
+    println!(
+        "measurement: declared scope {} {}; retained receipt {}",
+        measurement.scope_path.display(),
+        if measurement.scope_present {
+            "present"
+        } else {
+            "missing"
+        },
+        measurement
+            .receipt
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    );
+    if let Some(reason) = &measurement.blocked_reason {
+        println!("measurement blocked: {reason}");
     }
     match &run.cursor.intake {
         Some(intake) => println!(
@@ -1223,40 +1307,51 @@ fn select(args: &[OsString]) -> io::Result<i32> {
             "the prepared {variant} runtime identity {declared} does not match its build record {identity}; preparation must be refreshed - nothing was selected"
         )));
     }
-    let selection = build_selection::activate(&entry.state, &entry.build).map_err(|error| {
-        invalid(format!(
-            "the runtime-selection owner refused variant {variant}: {error}"
-        ))
-    })?;
-    let (effective, artifacts) = build_selection::selected(&entry.state)?;
-    if !artifacts.check().runtime_allowed {
-        return Err(invalid(format!(
-            "the selected {variant} runtime at {} is not runtime-allowed: {}",
-            effective.display(),
-            artifacts.check().action
-        )));
-    }
+    // Activation, consumption and the reported effective identity come from
+    // the shared runtime-selection primitive: it re-verifies the prepared
+    // record and artifacts, writes the journaled selection and reports the
+    // build actually selected. The CLI runs no second activation policy.
+    let prepared = PreparedVariant {
+        arm: match variant.as_str() {
+            "baseline" => Arm::Baseline,
+            _ => Arm::Candidate,
+        },
+        label: variant.clone(),
+        build: entry.build.clone(),
+        record_sha256: build_identity::hash_file(&entry.build.join("build.json"))?,
+        source_sha256: record.source.sha256.clone(),
+    };
+    // The gate above already refused an active or unreconciled attempt; the
+    // primitive still owns this check, so pass the observed state instead of
+    // re-implementing the refusal here.
+    let attempt_active = run.cursor.active_attempt().is_some();
+    let consumed = improvement_experiment::select_variant(&entry.state, &prepared, attempt_active)
+        .map_err(|error| {
+            invalid(format!(
+                "the runtime-selection owner refused variant {variant}: {error}"
+            ))
+        })?;
 
     let mut cursor = run.cursor.clone();
-    let changed = selection.changed
+    let changed = consumed.changed
         || cursor.selected_variant.as_deref() != Some(variant.as_str())
-        || cursor.selected_runtime.as_deref() != Some(effective.as_path());
+        || cursor.selected_runtime.as_deref() != Some(consumed.build.as_path());
     cursor.selected_variant = Some(variant.clone());
-    cursor.selected_runtime = Some(effective.clone());
+    cursor.selected_runtime = Some(consumed.build.clone());
     cursor.selected_identity = Some(identity.clone());
     if changed {
         cursor.effect(
             EffectKind::VariantSelected,
             format!(
                 "variant={variant} runtime={} identity={identity} (no model call, no build, no source edit)",
-                effective.display()
+                consumed.build.display()
             ),
         );
     }
     run.store.save_cursor(&cursor)?;
     println!(
         "improve select: variant={variant} runtime={} identity={identity} changed={changed} (no model call, no build, no source edit)",
-        effective.display()
+        consumed.build.display()
     );
     Ok(0)
 }

@@ -1139,6 +1139,395 @@ fn select_consumes_prepared_variants_and_refuses_an_active_attempt() {
     );
 }
 
+/// The declared source identity the real preparation owner records for one
+/// prepared variant: `sha256:` plus the first 16 hex digits of the build
+/// record's source digest.
+fn declared_identity(build: &Path) -> String {
+    let record: Value =
+        serde_json::from_slice(&fs::read(build.join("build.json")).unwrap()).unwrap();
+    let sha = record["source"]["sha256"].as_str().unwrap().to_owned();
+    format!("sha256:{}", &sha[..16.min(sha.len())])
+}
+
+/// Ordinary (non-verbatim) canonical spelling for path comparison.
+fn plain_path(path: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(path).unwrap();
+    let text = canonical.to_string_lossy().into_owned();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
+}
+
+/// Every file under one prepared runtime build with its content digest.
+fn build_files(dir: &Path) -> BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(relative, hash_bytes(&fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(dir, dir, &mut files);
+    files
+}
+
+/// The full off/on cycle is driven through the CLI: candidate, baseline,
+/// candidate and one repeated selection. Every step reports the identity it
+/// actually consumed, flips the journaled selection to that exact prepared
+/// build, and leaves both prepared runtimes and the accepted source byte-for-
+/// byte unchanged with no rebuild and no model call. An active measured
+/// attempt then refuses further selection through the same CLI.
+#[test]
+fn select_cycle_reports_consumed_identity_without_source_change_rebuild_or_model_call() {
+    let fixture = Fixture::new("select-cycle");
+    fixture.write_spec(&[], None);
+    let out = fixture.start();
+    assert!(out.status.success(), "{}", text(&out));
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+
+    // Both variants share the one owned state the real preparation owner
+    // records, so the cycle flips the same journaled pointer between them.
+    let (state, baseline_build) = prepare_runtime(&fixture.root, "base");
+    let (candidate_state, staged_candidate) = prepare_runtime(&fixture.root, "cand");
+    let candidate_build = state
+        .join("builds")
+        .join(staged_candidate.file_name().unwrap());
+    fs::rename(&staged_candidate, &candidate_build).unwrap();
+    fs::remove_dir_all(&candidate_state).unwrap();
+
+    let baseline_identity = declared_identity(&baseline_build);
+    let candidate_identity = declared_identity(&candidate_build);
+    fs::write(
+        fixture.run.join("variants.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "baseline": {"state": state, "build": baseline_build, "identity": baseline_identity},
+            "candidate": {"state": state, "build": candidate_build, "identity": candidate_identity},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let before_files = (build_files(&baseline_build), build_files(&candidate_build));
+    let head_before = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let status_before = git_output(&fixture.proj, &["status", "--porcelain"]);
+    let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let effects_before = fixture.cursor()["effects"].as_array().unwrap().len();
+
+    let artifacts_before = [
+        "build-job.json",
+        "build-output.json",
+        "prepared-builds.json",
+    ]
+    .map(|artifact| fixture.run.join(artifact).is_file());
+    let select_variant = |variant: &str, expected: &str, changed: bool| {
+        let selected = fixture.improve(&["select", "--run", &run_arg, "--variant", variant]);
+        assert!(selected.status.success(), "{}", text(&selected));
+        let report = text(&selected);
+        assert!(report.contains(&format!("variant={variant}")), "{report}");
+        assert!(
+            report.contains(&format!("identity={expected}")),
+            "the reported identity must be the prepared variant's actual identity: {report}"
+        );
+        assert!(report.contains(&format!("changed={changed}")), "{report}");
+        assert!(report.contains("no model call"), "{report}");
+        let runtime = report
+            .split("runtime=")
+            .nth(1)
+            .and_then(|rest| rest.split(" identity=").next())
+            .unwrap();
+        assert_eq!(
+            plain_path(Path::new(runtime)),
+            plain_path(if variant == "baseline" {
+                &baseline_build
+            } else {
+                &candidate_build
+            }),
+            "the reported runtime is the build actually selected"
+        );
+    };
+
+    // candidate -> baseline -> candidate: the journaled selection follows the
+    // requested variant and resolves to the exact prepared build every time.
+    select_variant("candidate", &candidate_identity, true);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&candidate_build));
+    assert_eq!(fixture.cursor()["selected_identity"], candidate_identity);
+
+    select_variant("baseline", &baseline_identity, true);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&baseline_build));
+    assert_eq!(fixture.cursor()["selected_variant"], "baseline");
+    assert_eq!(fixture.cursor()["selected_identity"], baseline_identity);
+
+    select_variant("candidate", &candidate_identity, true);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&candidate_build));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["selected_variant"], "candidate");
+    assert_eq!(cursor["selected_identity"], candidate_identity);
+    assert_eq!(
+        plain_path(Path::new(cursor["selected_runtime"].as_str().unwrap())),
+        plain_path(&candidate_build)
+    );
+
+    // A repeated selection of the unchanged active variant reports the same
+    // consumed identity without changing anything.
+    select_variant("candidate", &candidate_identity, false);
+
+    // No source change and no rebuild: both prepared runtimes and the accepted
+    // source are exactly what preparation published, and no build or model
+    // work was started by selection.
+    assert_eq!(
+        build_files(&baseline_build),
+        before_files.0,
+        "selection never rebuilds or rewrites the baseline runtime"
+    );
+    assert_eq!(
+        build_files(&candidate_build),
+        before_files.1,
+        "selection never rebuilds or rewrites the candidate runtime"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        head_before
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["status", "--porcelain"]),
+        status_before,
+        "selection does not change the accepted source tree"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "selection performs no model call or dispatch"
+    );
+    let selections = cursor["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(effects_before)
+        .filter(|effect| effect["kind"] == "variant-selected")
+        .count();
+    assert_eq!(
+        selections, 3,
+        "only the three real off/on changes are journaled: {cursor}"
+    );
+    for (artifact, existed) in [
+        "build-job.json",
+        "build-output.json",
+        "prepared-builds.json",
+    ]
+    .into_iter()
+    .zip(artifacts_before)
+    {
+        assert_eq!(
+            fixture.run.join(artifact).is_file(),
+            existed,
+            "selection must not start a build: {artifact}"
+        );
+    }
+
+    // An active measured attempt keeps its frozen runtime: the CLI refuses the
+    // change and leaves the selected variant, runtimes and source untouched.
+    seed_attempt(
+        &fixture,
+        attempt_json("baseline-1", "baseline", "started", None),
+        "baseline-attempt",
+    );
+    let refused = fixture.improve(&["select", "--run", &run_arg, "--variant", "baseline"]);
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused));
+    assert!(text(&refused).contains("active"), "{}", text(&refused));
+    assert_eq!(fixture.cursor()["selected_variant"], "candidate");
+    assert_eq!(fixture.cursor()["selected_identity"], candidate_identity);
+    let (active, _) = harness_core::build_selection::selected(&state).unwrap();
+    assert_eq!(plain_path(&active), plain_path(&candidate_build));
+    assert_eq!(build_files(&baseline_build), before_files.0);
+    assert_eq!(build_files(&candidate_build), before_files.1);
+}
+
+/// The declared directed-measurement scope: the hypothesis's own targeted
+/// measurement, bound to a section of its own OpenSpec change.
+fn measurement_scope_json() -> Value {
+    json!({
+        "observed_problem": "identical repeated reads waste accepted-task time",
+        "investigation_scope": "the reader's repeated reads at one frozen source revision",
+        "measurement_question": "how much accepted-task time do identical repeated reads cost?",
+        "workload": {
+            "operation": "cargo build -p example-reader",
+            "contract": "openspec/changes/add-synthetic/proposal.md#Measurement",
+        },
+        "evidence_references": ["retained outcome record: repeated reads"],
+        "limits": "one local machine and one frozen source revision",
+        "declaration_artifact": "proposal.md",
+        "declaration_heading": "## Measurement",
+    })
+}
+
+/// A recorded block is cleared the way operator-driven recovery leaves it
+/// before an explicit resume re-evaluates the gate.
+fn clear_recorded_block(fixture: &Fixture) {
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+}
+
+/// `improve status` (text and `--json`) surfaces the directed-measurement
+/// gate state from recorded run state only: the declared measurement-scope
+/// file (present/missing), the retained receipt path and the bounded blocking
+/// reason while the gate holds the run.
+#[test]
+fn status_surfaces_the_directed_measurement_gate_state() {
+    let fixture = Fixture::new("measurement-status");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    fs::create_dir_all(state.join("builds/ha-build")).unwrap();
+    fs::write(state.join("owner"), "codex-harness-native-state-v1\n").unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[
+            (
+                "runner",
+                json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+            ),
+            (
+                "local_runner",
+                json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+            ),
+            ("qualification", json!(qualification)),
+            (
+                "comparison",
+                comparison_inputs(
+                    &fixture,
+                    &state,
+                    &upstream,
+                    &policy,
+                    &request,
+                    &request_sha,
+                    &head,
+                ),
+            ),
+        ],
+        None,
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    // No declared scope: the gate holds the run, and status reports the exact
+    // artifact, the absent receipt and the bounded reason.
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "blocked", "{report}");
+    assert_eq!(
+        report["measurement"]["scope"]["status"], "missing",
+        "{report}"
+    );
+    assert!(
+        report["measurement"]["scope"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("measurement-scope.json"),
+        "{report}"
+    );
+    assert!(report["measurement"]["receipt"].is_null(), "{report}");
+    assert_eq!(
+        report["candidate"]["measurement_receipt"],
+        Value::Null,
+        "{report}"
+    );
+    let reason = report["measurement"]["blocked_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no hypothesis measurement scope is declared"),
+        "{report}"
+    );
+    let printed = text(&fixture.improve(&["status", "--run", fixture.run.to_str().unwrap()]));
+    assert!(printed.contains("measurement: declared scope"), "{printed}");
+    assert!(printed.contains("missing"), "{printed}");
+    assert!(printed.contains("measurement blocked:"), "{printed}");
+
+    // A declared scope whose own change does not state the section keeps the
+    // receipt unretained and reports the gate's exact reason.
+    fs::write(
+        fixture.run.join("measurement-scope.json"),
+        serde_json::to_vec_pretty(&measurement_scope_json()).unwrap(),
+    )
+    .unwrap();
+    clear_recorded_block(&fixture);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(
+        report["measurement"]["scope"]["status"], "present",
+        "{report}"
+    );
+    assert!(report["measurement"]["receipt"].is_null(), "{report}");
+    let reason = report["measurement"]["blocked_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("missing or empty measurement scope section"),
+        "{report}"
+    );
+
+    // Once the hypothesis's own change states the section, the gate retains
+    // the receipt before the measured-pair owner is engaged, and status
+    // surfaces that exact retained path.
+    let proposal = fixture
+        .proj
+        .join("openspec/changes/add-synthetic/proposal.md");
+    let mut content = fs::read_to_string(&proposal).unwrap();
+    content.push_str("\n## Measurement\n\nObserved problem: identical repeated reads waste accepted-task time. Investigation scope: reads at one frozen source revision. Measurement question: how much accepted-task time do they cost? Workload: the existing cargo build operation linked from this change. Evidence: the retained outcome record. Limits: one local machine and one frozen source revision.\n");
+    fs::write(&proposal, content).unwrap();
+    clear_recorded_block(&fixture);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(
+        report["measurement"]["scope"]["status"], "present",
+        "{report}"
+    );
+    let receipt = report["measurement"]["receipt"].as_str().unwrap();
+    assert!(receipt.ends_with("measurement-receipt.json"), "{report}");
+    assert!(Path::new(receipt).is_file(), "{report}");
+    assert_eq!(
+        report["candidate"]["measurement_receipt"], receipt,
+        "{report}"
+    );
+}
+
 #[test]
 fn concurrent_starts_create_exactly_one_owner() {
     let fixture = Fixture::new("concurrent-start");
