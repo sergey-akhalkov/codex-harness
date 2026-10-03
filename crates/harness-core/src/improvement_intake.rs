@@ -37,6 +37,15 @@
 //!   context exposure are distinct), and this module never applies a removal -
 //!   the user's informed decision remains owned by the removal
 //!   proposal/decision verbs;
+//! - additional machinery is never the default: an addition is refused unless
+//!   it records why no change, reuse of the smallest sufficient existing
+//!   route, simplification and subtraction cannot satisfy the evidenced need,
+//!   and reuse/no-change/removal conclusions are offered before admission;
+//! - review reuses the existing owners instead of commissioning audits: usage
+//!   and outcome records stay attributed to their reader, a coverage claim
+//!   names the observed interval, task/environment mix, telemetry gaps and
+//!   rare/explicit/indirect uses at risk, and low usage is a lead for
+//!   investigation - never a finding of uselessness or an automatic deletion;
 //! - prior results participate in admission through
 //!   [`crate::board_hypothesis::admit_hypothesis`]: open, closed and deferred
 //!   same-condition cards are reused, and only a recorded new evidential basis
@@ -607,6 +616,13 @@ pub struct Proposal {
     pub counterexample: Option<String>,
     #[serde(default)]
     pub acceptance: Option<String>,
+    /// Why no change, reuse of the smallest sufficient existing route,
+    /// simplification or subtraction cannot satisfy the evidenced need.
+    /// Required for an addition, so additional machinery is proposed only
+    /// after the smaller routes were considered; a no-change, reuse or
+    /// removal candidate states its conclusion instead.
+    #[serde(default)]
+    pub alternatives: Option<String>,
     /// The exact OpenSpec change reference.
     #[serde(default)]
     pub spec: Option<String>,
@@ -968,6 +984,22 @@ fn prepare(proposal: &Proposal, index: &EvidenceIndex) -> Result<Prepared, Failu
         full,
         &mut issues,
     );
+    match proposal.alternatives.as_deref() {
+        Some(value) => {
+            let _ = bounded_line(
+                "alternatives consideration",
+                value,
+                MAX_STATEMENT,
+                &mut issues,
+            );
+        }
+        None if matches!(proposal.treatment, Treatment::Addition) => {
+            issues.push(Issue::unsupported(
+                "an addition needs an alternatives consideration: state why no change, reuse of the smallest sufficient existing route, simplification or subtraction cannot satisfy the evidenced need before proposing additional machinery",
+            ));
+        }
+        None => {}
+    }
     let spec = match proposal.spec.as_deref() {
         Some(value) => bounded_token("spec reference", value, MAX_LOCATOR, &mut issues),
         None if full => {
@@ -1528,6 +1560,10 @@ mod tests {
             predicted: Some("less repeated context loading".to_owned()),
             counterexample: Some("diagnostics vanish on failure".to_owned()),
             acceptance: Some("the independent oracle passes".to_owned()),
+            alternatives: Some(
+                "no change, reuse of the existing reader, simplification and subtraction each leave the measured burden in place"
+                    .to_owned(),
+            ),
             spec: Some("openspec/changes/add-synthetic".to_owned()),
             basis: "outcome:cycle-1#task".to_owned(),
             treatment: Treatment::Addition,
@@ -1996,6 +2032,286 @@ mod tests {
         let outcomes = intake(bd, project, &report(reuse), &index()).unwrap();
         assert!(
             matches!(&outcomes.outcomes[0], IntakeOutcome::ReuseSuffices { existing } if existing == "outcome:cycle-1#task"),
+            "{:?}",
+            outcomes.outcomes[0]
+        );
+    }
+
+    #[test]
+    fn an_addition_is_refused_without_the_smaller_route_consideration() {
+        let (bd, project) = unowned_board();
+        let mut candidate = addition("bounded-output");
+        candidate.alternatives = None;
+        let outcomes = intake(bd, project, &report(candidate), &index()).unwrap();
+        let IntakeOutcome::Refused { reasons } = &outcomes.outcomes[0] else {
+            panic!("expected refusal, got {:?}", outcomes.outcomes[0]);
+        };
+        let joined = reasons.join(" ");
+        for needle in [
+            "alternatives consideration",
+            "no change",
+            "reuse",
+            "simplification",
+            "subtraction",
+        ] {
+            assert!(joined.contains(needle), "{needle}: {reasons:?}");
+        }
+
+        let mut blank = addition("bounded-output");
+        blank.alternatives = Some("   ".to_owned());
+        let outcomes = intake(bd, project, &report(blank), &index()).unwrap();
+        assert!(
+            matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("alternatives consideration"))),
+            "{:?}",
+            outcomes.outcomes[0]
+        );
+
+        // The smaller treatments carry their own conclusion instead of an
+        // alternatives statement: a no-change reason, a retained reuse route
+        // or a removal claim; none is refused for lacking the field.
+        let mut no_change = addition("keep-current-route");
+        no_change.alternatives = None;
+        no_change.treatment = Treatment::NoChange {
+            reason: "the measured burden is within the declared variation".to_owned(),
+        };
+        assert!(matches!(
+            prepare(&no_change, &index()),
+            Ok(Prepared::NoChange(_))
+        ));
+
+        let mut subtraction = addition("retire-dormant-helper");
+        subtraction.alternatives = None;
+        subtraction.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "dormant-helper".to_owned(),
+                basis: RemovalBasis::UsageVolume {
+                    invocations: 0,
+                    window: "90d".to_owned(),
+                },
+            },
+        };
+        let Err(failure) = prepare(&subtraction, &index()) else {
+            panic!("the usage-volume removal defers instead of being refused");
+        };
+        assert!(
+            !failure
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("alternatives")),
+            "{}",
+            failure
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        assert!(matches!(
+            failure.outcome(),
+            IntakeOutcome::Deferred { reason, .. } if reason.contains("lead for investigation")
+        ));
+    }
+
+    #[test]
+    fn context_exposure_without_invocation_is_a_lead_not_a_finding() {
+        let (bd, project) = unowned_board();
+        // A skill loaded into the catalogue that consumes context on every
+        // accepted task while recording zero invocations: the usage volume
+        // cannot justify retirement, and this module applies no removal.
+        let mut candidate = addition("retire-context-heavy-skill");
+        candidate.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "skill:context-heavy".to_owned(),
+                basis: RemovalBasis::UsageVolume {
+                    invocations: 0,
+                    window: "365d".to_owned(),
+                },
+            },
+        };
+        let outcomes = intake(bd, project, &report(candidate), &index()).unwrap();
+        let IntakeOutcome::Deferred { reason, next } = &outcomes.outcomes[0] else {
+            panic!("expected deferral, got {:?}", outcomes.outcomes[0]);
+        };
+        assert!(reason.contains("lead for investigation"), "{reason}");
+        assert!(reason.contains("catalogue"), "{reason}");
+        assert!(reason.contains("0 invocation(s) over 365d"), "{reason}");
+        assert!(next.contains("observation interval"), "{next}");
+        assert!(next.contains("consumption"), "{next}");
+        assert!(next.contains("rare"), "{next}");
+    }
+
+    #[test]
+    fn incomplete_usage_coverage_defers_instead_of_removing() {
+        let (bd, project) = unowned_board();
+        // One workstation's usage records are unreadable: the retained item is
+        // partial, so unresolved supported use stays explicit and removal
+        // planning cannot start from it.
+        let partial = EvidenceItem::new(
+            "rollout:fleet#partial",
+            EvidenceOwner::Rollout,
+            ClaimKind::Observed,
+            "lines=120 unrecognized=40; one workstation's session store was unreadable",
+            &[
+                "one workstation's usage records were unreadable; their use stays unknown"
+                    .to_owned(),
+            ],
+            &[],
+        )
+        .unwrap();
+        let partial_index = EvidenceIndex::new(vec![
+            evidence(
+                "outcome:cycle-1#task",
+                ClaimKind::Observed,
+                "rounds=2 attempts=1",
+            ),
+            partial,
+        ])
+        .unwrap();
+        let coverage = |gaps: &str| {
+            RemovalBasis::Coverage {
+            interval: "180d".to_owned(),
+            tasks: "every owned task on the covered workstations".to_owned(),
+            gaps: gaps.to_owned(),
+            lost_uses: "a rare manual recovery in a degraded environment".to_owned(),
+            restoration: "restore from the retained revision".to_owned(),
+            consumption:
+                "each covered arm records the effective exposure of the capability, not just invocations"
+                    .to_owned(),
+        }
+        };
+        let mut incomplete = addition("retire-rarely-used-capability");
+        incomplete.observation = "rollout:fleet#partial".to_owned();
+        incomplete.basis = "rollout:fleet#partial".to_owned();
+        incomplete.evidence = vec![EvidenceRef {
+            locator: "rollout:fleet#partial".to_owned(),
+            kind: ClaimKind::Observed,
+        }];
+        incomplete.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "capability-x".to_owned(),
+                basis: coverage(
+                    "two workstations record no usage; their consumers are uncheckable",
+                ),
+            },
+        };
+        let outcomes = intake(bd, project, &report(incomplete), &partial_index).unwrap();
+        let IntakeOutcome::Deferred { reason, next } = &outcomes.outcomes[0] else {
+            panic!("expected deferral, got {:?}", outcomes.outcomes[0]);
+        };
+        assert!(reason.contains("partial"), "{reason}");
+        assert!(next.contains("retain"), "{next}");
+
+        // A blank gaps statement is refused: coverage gaps must stay explicit
+        // rather than being read as absent.
+        let mut hidden_gaps = addition("retire-rarely-used-capability");
+        hidden_gaps.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "capability-x".to_owned(),
+                basis: coverage("   "),
+            },
+        };
+        let outcomes = intake(bd, project, &report(hidden_gaps), &index()).unwrap();
+        assert!(
+            matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("coverage gaps is required"))),
+            "{:?}",
+            outcomes.outcomes[0]
+        );
+    }
+
+    #[test]
+    fn a_rare_recovery_loss_stays_a_pending_candidate_with_restoration() {
+        let coverage = |lost_uses: &str, restoration: &str| {
+            RemovalBasis::Coverage {
+            interval: "180d".to_owned(),
+            tasks: "recorded owned tasks".to_owned(),
+            gaps: "no machine-readable use from two workstations".to_owned(),
+            lost_uses: lost_uses.to_owned(),
+            restoration: restoration.to_owned(),
+            consumption:
+                "each arm records the effective catalogue identity and where the capability was consumed"
+                    .to_owned(),
+        }
+        };
+        // Ordinary-task nonuse cannot retire a still-required recovery path:
+        // the candidate stays a pending hypothesis behind the informed
+        // decision, and this module applies no removal.
+        let mut candidate = addition("retire-rare-recovery-capability");
+        candidate.alternatives = None;
+        candidate.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "capability-x".to_owned(),
+                basis: coverage(
+                    "a rare manual recovery in a degraded environment",
+                    "restore from the pinned revision",
+                ),
+            },
+        };
+        assert!(
+            matches!(
+                prepare(&candidate, &index()),
+                Ok(Prepared::Hypothesis {
+                    removal_required: true,
+                    ..
+                })
+            ),
+            "the rare recovery use stays explicit with its restoration route"
+        );
+
+        // Without a restoration route the required behavior cannot be kept
+        // recoverable, so the candidate is refused before admission.
+        let mut unrecoverable = addition("retire-rare-recovery-capability");
+        unrecoverable.alternatives = None;
+        unrecoverable.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "capability-x".to_owned(),
+                basis: coverage("a rare manual recovery", "   "),
+            },
+        };
+        let Err(failure) = prepare(&unrecoverable, &index()) else {
+            panic!("a removal claim without a restoration route must be refused");
+        };
+        assert!(
+            failure
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("restoration is required")),
+            "{}",
+            failure
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        assert!(matches!(failure.outcome(), IntakeOutcome::Refused { .. }));
+    }
+
+    #[test]
+    fn an_overlapping_route_concludes_reuse_without_a_card() {
+        let (bd, project) = unowned_board();
+        // The evidenced need is already satisfied by the smallest sufficient
+        // existing route: intake concludes reuse instead of admitting a new
+        // addition.
+        let mut reuse = addition("overlap-with-existing-reader");
+        reuse.treatment = Treatment::Reuse {
+            existing: "outcome:cycle-1#task".to_owned(),
+        };
+        let outcomes = intake(bd, project, &report(reuse), &index()).unwrap();
+        assert!(
+            matches!(&outcomes.outcomes[0], IntakeOutcome::ReuseSuffices { existing } if existing == "outcome:cycle-1#task"),
+            "{:?}",
+            outcomes.outcomes[0]
+        );
+
+        // A reuse conclusion must name a retained attributable route; an
+        // invented existing capability is refused.
+        let mut unretained = addition("overlap-with-existing-reader");
+        unretained.treatment = Treatment::Reuse {
+            existing: "outcome:missing#route".to_owned(),
+        };
+        let outcomes = intake(bd, project, &report(unretained), &index()).unwrap();
+        assert!(
+            matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("not retained in the evidence index"))),
             "{:?}",
             outcomes.outcomes[0]
         );

@@ -2876,8 +2876,15 @@ fn dispatch_investigator(
 /// native structured contract can be checked without a controller run.
 fn investigator_assignment(run: &Run, evidence: &Evidence) -> serde_json::Value {
     let mut invariants = vec![
-        "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"<own OpenSpec change reference>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates".to_owned(),
-        "every candidate cites at least one observed retained locator; intake refuses an ungrounded or prediction-only citation".to_owned(),
+        "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[<candidate>],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates".to_owned(),
+        "each candidate carries mechanism (<=96-char token), conditions (<=96-char token applicability), observation (retained locator), predicted (<=256 chars), counterexample (<=256 chars), acceptance (<=256 chars), spec (its own OpenSpec change reference), basis (retained locator), evidence (at least one observed retained locator), treatment and optional next_check".to_owned(),
+        "grounded intake refuses an ungrounded or prediction-only citation; a predicted statement is never retained evidence".to_owned(),
+        "treatment is one of \"addition\", \"no-change\", \"reuse\", \"simplification\" or \"subtraction\"; consider no change, reuse of the smallest sufficient existing route, simplification and subtraction before additional machinery, and an addition is refused without a bounded \"alternatives\" statement saying why each smaller route does not satisfy the evidenced need".to_owned(),
+        "a no-change candidate carries its bounded reason; a reuse candidate names the retained locator of the existing attributable route and concludes reuse-suffices without a new card or implementation".to_owned(),
+        "a simplification or subtraction candidate carries its removal target and basis; low or absent invocations are a lead for investigation, never a finding of uselessness - catalogue, instruction and initialization exposure can exist with zero invocations - and usage volume alone is not admitted".to_owned(),
+        "a coverage basis states the observation interval, task/environment coverage, telemetry gaps including uncheckable consumer access, the rare, explicit and indirect uses at risk, how each arm's actual consumption (not just invocations) is evidenced, and the restoration route".to_owned(),
+        "every candidate states applicability conditions and a counterexample; no candidate may auto-delete a capability, invent demand, commission a new audit service or recurring inventory, or treat fewer lines, files, skills or exposed names as the benefit by itself".to_owned(),
+        "usage and outcome evidence cites existing retained owners - the installed `codex-harness skills usage` report for skills, rollout/outcome records otherwise; a candidate changing owned skill scope follows the owned skill-evolution procedure and other domains use their lifecycle owners; this loop publishes nothing itself".to_owned(),
         "the spec field names the candidate's own OpenSpec change under the run's openspec/changes planning root; an existing linked change is valid as it stands, and the controller qualifies it - preparing and authoring a missing change - before any implementation".to_owned(),
         format!(
             "candidate spec references resolve under the run's planning root {} (a spec is a change name or an openspec/changes/<name> reference; a path-shaped reference outside that root is refused before any candidate work)",
@@ -2899,7 +2906,7 @@ fn investigator_assignment(run: &Run, evidence: &Evidence) -> serde_json::Value 
         ));
     }
     let objective = format!(
-        "Bounded improvement investigation for run {}. Inspect this checkout's source and every retained evidence locator recorded in the invariants. Your final message is ONLY the JSON investigator report described in the other invariants; the controller consumes it through grounded intake. Do not edit source and start no other model or paid calls.",
+        "Bounded improvement investigation for run {}. Inspect this checkout's source and every retained evidence locator recorded in the invariants. Consider no change, reuse, simplification and subtraction before additional machinery. Your final message is ONLY the JSON investigator report described in the other invariants; the controller consumes it through grounded intake. Do not edit source and start no other model or paid calls.",
         run.spec.run
     );
     json!({

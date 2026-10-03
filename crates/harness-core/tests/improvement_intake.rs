@@ -158,6 +158,10 @@ fn base_proposal(basis: &str) -> Proposal {
         predicted: Some("less repeated context loading".to_owned()),
         counterexample: Some("diagnostics vanish on failure".to_owned()),
         acceptance: Some("the independent oracle passes".to_owned()),
+        alternatives: Some(
+            "no change, reuse of the existing reader, simplification and subtraction each leave the measured burden in place"
+                .to_owned(),
+        ),
         spec: Some("openspec/changes/add-synthetic".to_owned()),
         basis: basis.to_owned(),
         treatment: Treatment::Addition,
@@ -851,4 +855,167 @@ fn removal_coverage_requires_consumption_evidence_before_admission() {
             .is_empty(),
         "a coverage basis without consumption evidence creates no card"
     );
+}
+
+/// The simplification review path through the real board: usage evidence is
+/// cited from an existing owner's retained report instead of a new audit;
+/// zero invocations never delete anything; incomplete usage coverage defers;
+/// and a complete coverage/lost-use/consumption/restoration review admits only
+/// a pending candidate behind the user's informed removal decision.
+#[test]
+fn skill_usage_review_reuses_owners_and_gates_removal() {
+    let bd = bd_executable();
+    let temp = tempfile::tempdir().unwrap();
+    let project = board_project(temp.path());
+    // The installed skill-usage owner's retained report: the review cites it
+    // by its content identity instead of re-deriving usage.
+    let report_path = temp.path().join("skills-usage.txt");
+    fs::write(
+        &report_path,
+        "skill:context-heavy last_invocation=none catalogue=loaded exposure=every-session\nskill:rare-recovery last_invocation=2026-09-07 route=manual-recovery\n",
+    )
+    .unwrap();
+    let index = EvidenceIndex::new(vec![
+        EvidenceItem::read_source("file:skills-usage.txt", "context:review-1", &report_path)
+            .unwrap(),
+        EvidenceItem::new(
+            "outcome:cycle-1#task",
+            EvidenceOwner::Outcome,
+            ClaimKind::Observed,
+            "rounds=2 attempts=1",
+            &[],
+            &[],
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+
+    // Zero invocations over a year are a lead for investigation: the exposure
+    // a dormant skill still adds is not shown absent, and nothing is deleted.
+    let mut usage_volume = base_proposal("file:skills-usage.txt");
+    usage_volume.observation = "file:skills-usage.txt".to_owned();
+    usage_volume.evidence = vec![EvidenceRef {
+        locator: "file:skills-usage.txt".to_owned(),
+        kind: ClaimKind::Observed,
+    }];
+    usage_volume.treatment = Treatment::Subtraction {
+        removal: RemovalClaim {
+            target: "skill:context-heavy".to_owned(),
+            basis: RemovalBasis::UsageVolume {
+                invocations: 0,
+                window: "365d".to_owned(),
+            },
+        },
+    };
+    let outcomes = intake(&bd, &project, &report(usage_volume), &index).unwrap();
+    let IntakeOutcome::Deferred { reason, next } = &outcomes.outcomes[0] else {
+        panic!("expected deferral, got {:?}", outcomes.outcomes[0]);
+    };
+    assert!(reason.contains("lead for investigation"), "{reason}");
+    assert!(reason.contains("catalogue"), "{reason}");
+    assert!(next.contains("consumption"), "{next}");
+    assert!(
+        board_hypothesis::list_hypothesis_cards(&bd, &project)
+            .unwrap()
+            .is_empty(),
+        "usage volume alone admits nothing and removes nothing"
+    );
+
+    // An incomplete usage reader (one session store unreadable) cannot ground
+    // removal planning: unresolved supported use stays explicit.
+    let partial = EvidenceIndex::new(vec![
+        EvidenceItem::new(
+            "rollout:fleet#partial",
+            EvidenceOwner::Rollout,
+            ClaimKind::Observed,
+            "lines=120; one workstation's session store was unreadable",
+            &[
+                "one workstation's usage records were unreadable; their use stays unknown"
+                    .to_owned(),
+            ],
+            &[],
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let mut incomplete = base_proposal("rollout:fleet#partial");
+    incomplete.observation = "rollout:fleet#partial".to_owned();
+    incomplete.evidence = vec![EvidenceRef {
+        locator: "rollout:fleet#partial".to_owned(),
+        kind: ClaimKind::Observed,
+    }];
+    incomplete.treatment = Treatment::Subtraction {
+        removal: RemovalClaim {
+            target: "skill:context-heavy".to_owned(),
+            basis: RemovalBasis::Coverage {
+                interval: "365d".to_owned(),
+                tasks: "every recorded task on the covered workstations".to_owned(),
+                gaps: "two workstations record no usage; their consumers are uncheckable"
+                    .to_owned(),
+                lost_uses: "a rare manual recovery in a degraded environment".to_owned(),
+                restoration: "restore from the retained source revision".to_owned(),
+                consumption:
+                    "each covered arm records the effective catalogue exposure, not just invocations"
+                        .to_owned(),
+            },
+        },
+    };
+    let outcomes = intake(&bd, &project, &report(incomplete), &partial).unwrap();
+    assert!(
+        matches!(&outcomes.outcomes[0], IntakeOutcome::Deferred { reason, .. } if reason.contains("partial")),
+        "{:?}",
+        outcomes.outcomes[0]
+    );
+    assert!(
+        board_hypothesis::list_hypothesis_cards(&bd, &project)
+            .unwrap()
+            .is_empty(),
+        "partial usage evidence admits no card"
+    );
+
+    // A complete coverage review of the same skill states the interval,
+    // task/environment coverage, telemetry gaps, the rare recovery use at
+    // risk, the per-arm consumption evidence and restoration. It is admitted
+    // only as a pending candidate: no removal is applied here, and the user's
+    // informed decision remains owned by the removal gate.
+    let mut review = base_proposal("file:skills-usage.txt");
+    review.observation = "file:skills-usage.txt".to_owned();
+    review.evidence = vec![EvidenceRef {
+        locator: "file:skills-usage.txt".to_owned(),
+        kind: ClaimKind::Observed,
+    }];
+    review.treatment = Treatment::Simplification {
+        removal: RemovalClaim {
+            target: "skill:context-heavy".to_owned(),
+            basis: RemovalBasis::Coverage {
+                interval: "2026-01-01..2026-10-01".to_owned(),
+                tasks: "every recorded synthetic task on one reviewed workstation".to_owned(),
+                gaps: "two workstations record no usage; their consumers are uncheckable"
+                    .to_owned(),
+                lost_uses: "a rare manual recovery in a degraded environment".to_owned(),
+                restoration: "restore from the retained source revision".to_owned(),
+                consumption:
+                    "each arm records the effective catalogue exposure and where the capability was consumed"
+                        .to_owned(),
+            },
+        },
+    };
+    let outcomes = intake(&bd, &project, &report(review), &index).unwrap();
+    let IntakeOutcome::Admitted {
+        id,
+        removal_required: true,
+        ..
+    } = &outcomes.outcomes[0]
+    else {
+        panic!(
+            "expected a removal candidate admission, got {:?}",
+            outcomes.outcomes[0]
+        );
+    };
+    let card = board_hypothesis::load_card(&bd, &project, id).unwrap();
+    assert!(
+        !matches!(card.status.as_str(), "closed" | "deferred"),
+        "the review is a pending candidate, not an applied removal"
+    );
+    assert!(report_path.is_file(), "nothing was deleted by intake");
 }
