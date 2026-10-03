@@ -346,6 +346,10 @@ impl Fixture {
         ])
     }
 
+    fn resume(&self) -> Output {
+        self.improve(&["resume", "--run", self.run.to_str().unwrap()])
+    }
+
     fn cursor(&self) -> Value {
         serde_json::from_slice(&fs::read(self.run.join("cursor.json")).unwrap()).unwrap()
     }
@@ -924,7 +928,17 @@ fn removal_authority_blocks_candidate_selection_until_it_is_current() {
 fn stop_and_resume_recover_boundaries_and_never_replay_unknown_attempts() {
     let fixture = Fixture::new("recovery");
     fixture.write_spec(&[], None);
-    let out = fixture.start();
+    // This case recovers explicit phase boundaries step by step: it is an
+    // explicit single-step caller, so continuous supervision is not declared.
+    let out = fixture.improve(&[
+        "start",
+        "--run",
+        fixture.run.to_str().unwrap(),
+        "--spec",
+        fixture.spec.to_str().unwrap(),
+        "--supervision",
+        "once",
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let run_arg = fixture.run.to_str().unwrap().to_owned();
     let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
@@ -1758,4 +1772,1188 @@ fn resume_settles_and_retains_evidence_for_the_unchanged_generation() {
         report["attempts"][0]["observed"],
         "settled(retained evidence)"
     );
+}
+
+#[test]
+fn continuous_resume_waits_without_a_second_controller_or_replay() {
+    let fixture = Fixture::new("continuous-wait");
+    fixture.write_spec(&[], None);
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let (pid, created, program) =
+        harness_core::improvement_loop::current_process_identity().unwrap();
+    let receipt = fixture.run.join("live-receipt.json");
+    fs::write(
+        &receipt,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "launcher": program,
+            "profile": "ds",
+            "mode": "tui",
+            "visible": true,
+            "host": "windows-terminal-tab",
+            "slot": {
+                "index": 1,
+                "path": "C:\\fixture\\slot-1",
+                "source": "C:\\fixture\\source",
+                "owner": "loop-fixture-implementer-1",
+                "base": "base",
+                "remote": "origin",
+                "branch": Value::Null,
+            },
+            "originatingLead": {
+                "schema": 1,
+                "threadId": "fixture-thread",
+                "runGeneration": "gen-1",
+                "dispatcher": {"pid": 1, "creationTime": 1, "program": "C:\\fixture\\dispatcher.exe"},
+            },
+            "observation": {
+                "schema": 1,
+                "coverage": "native",
+                "reason": Value::Null,
+                "state": "running",
+                "session": Value::Null,
+                "previousSession": Value::Null,
+                "exitCode": Value::Null,
+                "events": 0,
+                "messages": 0,
+                "toolCalls": 0,
+                "malformed": 0,
+                "cause": Value::Null,
+                "host": {"pid": pid, "created": created, "program": program},
+                "result": Value::Null,
+                "detail": Value::Null,
+                "updatedMs": 1,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    seed_attempt(
+        &fixture,
+        attempt_json("implementer-1", "implementer", "started", Some(&receipt)),
+        "candidate-attempt",
+    );
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+    let mut controller = Command::new(manager())
+        .arg("improve")
+        .args(["resume", "--run", &run_arg])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("continuous resume starts");
+    let waiting = wait_for(
+        || {
+            status_value(&fixture)
+                .get("condition")
+                .and_then(|value| value.as_str())
+                .is_some_and(|condition| condition.contains("waiting for attempt"))
+        },
+        Duration::from_secs(15),
+    );
+    if !waiting {
+        panic!(
+            "controller did not stay waiting: {}",
+            controller_output(controller)
+        );
+    }
+    let during = status_value(&fixture);
+    assert_eq!(during["attempts"].as_array().unwrap().len(), 1, "{during}");
+    assert_eq!(during["supervision"], "continuous", "{during}");
+    let duplicate = fixture.improve(&["resume", "--run", &run_arg]);
+    assert_eq!(duplicate.status.code(), Some(2), "{}", text(&duplicate));
+    assert!(
+        text(&duplicate).contains("second controller is refused"),
+        "{}",
+        text(&duplicate)
+    );
+    let stopped = fixture.improve(&["stop", "--run", &run_arg, "--reason", "test stop"]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let finished = wait_for(
+        || matches!(controller.try_wait(), Ok(Some(_))),
+        Duration::from_secs(15),
+    );
+    if !finished {
+        panic!(
+            "controller did not leave after stop: {}",
+            controller_output(controller)
+        );
+    }
+    let _ = controller.wait();
+    let again = fixture.improve(&["resume", "--run", &run_arg]);
+    assert!(again.status.success(), "{}", text(&again));
+    let cursor = fixture.cursor();
+    assert_eq!(cursor["attempts"].as_array().unwrap().len(), 1, "{cursor}");
+    assert_ne!(cursor["phase"], "candidate-ready", "{cursor}");
+}
+
+fn wait_for(mut ready: impl FnMut() -> bool, limit: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if ready() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    ready()
+}
+
+fn status_value(fixture: &Fixture) -> Value {
+    let status = fixture.improve(&["status", "--run", fixture.run.to_str().unwrap(), "--json"]);
+    assert!(status.status.success(), "status: {}", text(&status));
+    serde_json::from_str(&text(&status)).expect("status --json")
+}
+
+fn controller_output(mut child: Child) -> String {
+    let _ = child.kill();
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("controller output: {error}"));
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn continuous_rejection_keeps_the_baseline_and_records_lineage() {
+    let fixture = Fixture::new("continuous-reject");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    fs::create_dir_all(state.join("builds/ha-build")).unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[
+            (
+                "runner",
+                json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+            ),
+            (
+                "local_runner",
+                json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+            ),
+            ("qualification", json!(qualification)),
+            (
+                "comparison",
+                comparison_inputs(
+                    &fixture,
+                    &state,
+                    &upstream,
+                    &policy,
+                    &request,
+                    &request_sha,
+                    &head,
+                ),
+            ),
+        ],
+        None,
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.run.join("comparison")).unwrap();
+    fs::write(
+        fixture.run.join("comparison/evaluation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "policyDigest": "a".repeat(64),
+            "decision": "reject",
+            "basis": "efficiency",
+            "quality": "regressed",
+            "matched": 1,
+            "baselineSeconds": 2.0,
+            "candidateSeconds": 3.0,
+            "tolerancePercent": 5.0,
+            "coverage": "fixture",
+            "scope": "fixture",
+            "reasons": ["the candidate regressed the declared metric"],
+            "perSuccess": {
+                "status": "undefined",
+                "seconds": Value::Null,
+                "acceptedTasks": 0,
+                "tasks": 1,
+                "reason": "not used"
+            },
+            "attempts": 2,
+            "tasks": 1,
+            "acceptedTasks": 1,
+            "acceptanceRate": 1.0,
+            "tradeOffUsed": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("decision-recorded");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "idle", "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap()
+            .contains("leaves the baseline unchanged"),
+        "{report}"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert!(!fixture.run.join("activation.json").is_file());
+    assert!(fixture.run.join("lineage.json").is_file());
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn a_missing_candidate_build_is_prepared_by_the_native_owner_and_keeps_its_error() {
+    let fixture = Fixture::new("continuous-build");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[(
+            "runner",
+            json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+        ), (
+            "local_runner",
+            json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+        ), (
+            "qualification",
+            json!(qualification),
+        ), (
+            "comparison",
+            comparison_inputs(&fixture, &state, &upstream, &policy, &request, &request_sha, &head),
+        )],
+        None,
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "blocked", "{report}\n{output}");
+    let condition = report["condition"].as_str().unwrap_or("");
+    assert!(
+        condition.contains("native") || condition.contains("build"),
+        "{report}\n{output}"
+    );
+    assert!(
+        fixture.run.join("build-child.log").is_file(),
+        "the native build child was not started"
+    );
+    assert!(!fixture.run.join("integration.json").is_file());
+    assert_eq!(fixture.cursor()["attempts"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn continuous_activation_without_a_successor_idles_without_a_model_call() {
+    let fixture = Fixture::new("continuous-next");
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let mut cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().unwrap().len();
+    cursor["phase"] = json!("activation-confirmed");
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+    let resumed = fixture.resume();
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "activation-confirmed", "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap()
+            .contains("no independently specified successor"),
+        "{report}"
+    );
+    assert!(fixture.run.join("continuation.json").is_file());
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts
+    );
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert!(
+        text(&again).contains("already recorded"),
+        "{}",
+        text(&again)
+    );
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts
+    );
+}
+
+#[test]
+fn a_new_start_defaults_to_continuous_and_consumes_one_stop_request_per_resume() {
+    let fixture = Fixture::new("default-supervision");
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let supervision: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("supervision.json")).unwrap()).unwrap();
+    assert_eq!(supervision["mode"], "continuous", "{supervision}");
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+
+    // A stop request no live controller observed is consumed exactly once by
+    // resume, and the run stays available afterwards instead of refusing.
+    fs::write(
+        fixture.run.join("stop-request.json"),
+        br#"{"schema":1,"token":"resume-stop-1","reason":"owner pause"}"#,
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("consumed the exact stop request"),
+        "{output}"
+    );
+    assert!(!fixture.run.join("stop-request.json").is_file());
+    let ack: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("stop-acknowledgement.json")).unwrap())
+            .unwrap();
+    assert_eq!(ack["token"], "resume-stop-1", "{ack}");
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts
+    );
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+
+    // An explicit single-step start keeps `once` supervision.
+    let once = Fixture::new("explicit-once");
+    let started = once.improve(&[
+        "start",
+        "--run",
+        once.run.to_str().unwrap(),
+        "--spec",
+        once.spec.to_str().unwrap(),
+        "--supervision",
+        "once",
+    ]);
+    assert!(started.status.success(), "{}", text(&started));
+    let supervision: Value =
+        serde_json::from_slice(&fs::read(once.run.join("supervision.json")).unwrap()).unwrap();
+    assert_eq!(supervision["mode"], "once", "{supervision}");
+}
+
+#[test]
+fn a_recorded_build_job_is_reconciled_before_another_build_is_started() {
+    let fixture = Fixture::new("build-reconcile");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[(
+            "runner",
+            json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+        ), (
+            "local_runner",
+            json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+        ), (
+            "qualification",
+            json!(qualification),
+        ), (
+            "comparison",
+            comparison_inputs(&fixture, &state, &upstream, &policy, &request, &request_sha, &head),
+        )],
+        None,
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    // A retained build job records a child that is not running and left no
+    // receipt. The controller must not start a second build child.
+    let mut dead = Command::new("cmd")
+        .args(["/c", "exit", "0"])
+        .spawn()
+        .expect("a short-lived process starts");
+    let pid = dead.id();
+    dead.wait().unwrap();
+    fs::write(
+        fixture.run.join("build-job.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "arm": "candidate",
+            "source": fixture.proj,
+            "state": state,
+            "output": fixture.run.join("build-output.json"),
+            "phase": "observed",
+            "token": "build-token-1",
+            "pid": pid,
+            "created": 1,
+            "program": manager(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "blocked", "{report}\n{output}");
+    let condition = report["condition"].as_str().unwrap_or("");
+    assert!(
+        condition.contains("recorded candidate build child") && condition.contains("unknown"),
+        "{report}\n{output}"
+    );
+    assert!(
+        !fixture.run.join("build-child.log").is_file(),
+        "no second build child is started while a recorded one is unresolved"
+    );
+    assert!(
+        fixture.run.join("build-job.json").is_file(),
+        "the unresolved job stays retained"
+    );
+    assert!(!fixture.run.join("build-output.json").is_file());
+}
+
+#[test]
+fn a_rejected_experiment_continues_into_the_declared_successor_with_lineage() {
+    let fixture = Fixture::new("continue-reject");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    fs::create_dir_all(state.join("builds/ha-build")).unwrap();
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[(
+            "runner",
+            json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+        ), (
+            "local_runner",
+            json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+        ), (
+            "qualification",
+            json!(qualification),
+        ), (
+            "comparison",
+            comparison_inputs(&fixture, &state, &upstream, &policy, &request, &request_sha, &head),
+        )],
+        None,
+    );
+    // The successor's own spec: the same synthetic project and admitted
+    // change, with its own run state directory.
+    let spec_b = fixture.root.join("spec-successor.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    document["run"] = json!("loop-fixture-successor");
+    fs::write(&spec_b, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let run_b = fixture.root.join("runs-successor");
+    let started = fixture.improve(&[
+        "start",
+        "--run",
+        fixture.run.to_str().unwrap(),
+        "--spec",
+        fixture.spec.to_str().unwrap(),
+        "--successor-spec",
+        spec_b.to_str().unwrap(),
+        "--successor-run",
+        run_b.to_str().unwrap(),
+    ]);
+    assert!(started.status.success(), "{}", text(&started));
+    fs::create_dir_all(fixture.run.join("comparison")).unwrap();
+    fs::write(
+        fixture.run.join("comparison/evaluation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "policyDigest": "a".repeat(64),
+            "decision": "reject",
+            "basis": "efficiency",
+            "quality": "regressed",
+            "matched": 1,
+            "baselineSeconds": 2.0,
+            "candidateSeconds": 3.0,
+            "tolerancePercent": 5.0,
+            "coverage": "fixture",
+            "scope": "fixture",
+            "reasons": ["the candidate regressed the declared metric"],
+            "perSuccess": {
+                "status": "undefined",
+                "seconds": Value::Null,
+                "acceptedTasks": 0,
+                "tasks": 1,
+                "reason": "not used"
+            },
+            "attempts": 2,
+            "tasks": 1,
+            "acceptedTasks": 1,
+            "acceptanceRate": 1.0,
+            "tradeOffUsed": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("decision-recorded");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    // A rejected experiment still consumes the declared continuation, and the
+    // successor is started only with retained lineage and its exact spec.
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(output.contains("successor"), "{output}");
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "idle", "{report}");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "completed", "{marker}");
+    assert_eq!(marker["exit_code"], 0, "{marker}");
+    assert_eq!(
+        marker["spec_sha256"],
+        hash_bytes(&fs::read(&spec_b).unwrap()),
+        "{marker}"
+    );
+    assert_eq!(
+        marker["lineage_sha256"],
+        hash_bytes(&fs::read(fixture.run.join("lineage.json")).unwrap()),
+        "{marker}"
+    );
+    assert_eq!(marker["decision"], "reject", "{marker}");
+    assert!(
+        run_b.join("cursor.json").is_file(),
+        "the declared successor run was started"
+    );
+    assert!(run_b.join("spec.json").is_file());
+
+    // The completed continuation is not started again on a later resume.
+    let again = fixture.resume();
+    let output = text(&again);
+    assert!(again.status.success(), "{output}");
+    assert!(output.contains("already completed"), "{output}");
+}
+
+#[test]
+fn an_idle_continuation_record_does_not_suppress_a_later_declared_successor() {
+    let fixture = Fixture::new("continue-later");
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("activation-confirmed");
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+    fs::write(fixture.run.join("lineage.json"), b"{\"schema\":1}\n").unwrap();
+    let first = fixture.resume();
+    assert!(first.status.success(), "{}", text(&first));
+    let report = status_value(&fixture);
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap()
+            .contains("no independently specified successor"),
+        "{report}"
+    );
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "idle", "{marker}");
+
+    // A successor declared later is started instead of being suppressed by
+    // the earlier no-successor record.
+    let spec_b = fixture.root.join("spec-later.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    document["run"] = json!("loop-fixture-later");
+    fs::write(&spec_b, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let run_b = fixture.root.join("runs-later");
+    fs::write(
+        fixture.run.join("successor.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "spec": spec_b,
+            "run": run_b,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "completed", "{marker}");
+    assert_eq!(
+        marker["run"].as_str().map(PathBuf::from),
+        Some(run_b.clone()),
+        "{marker}"
+    );
+    assert!(
+        run_b.join("cursor.json").is_file(),
+        "the later declared successor run was started"
+    );
+}
+
+#[test]
+fn stopping_the_controller_suspends_the_running_successor_through_its_own_owner() {
+    // A real successor run state exists first, so the successor's own stop
+    // owner can resolve it.
+    let successor = Fixture::new("successor-stop-b");
+    let started = successor.improve(&[
+        "start",
+        "--run",
+        successor.run.to_str().unwrap(),
+        "--spec",
+        successor.spec.to_str().unwrap(),
+        "--supervision",
+        "once",
+    ]);
+    assert!(started.status.success(), "{}", text(&started));
+
+    let fixture = Fixture::new("successor-stop-a");
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("idle");
+    cursor["condition"] = Value::Null;
+    fixture.write_cursor(&cursor);
+    let lineage = fixture.run.join("lineage.json");
+    fs::write(&lineage, b"{\"schema\":1,\"decision\":\"reject\"}\n").unwrap();
+    fs::write(
+        fixture.run.join("successor.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "spec": successor.spec,
+            "run": successor.run,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // A stand-in successor controller that this run did not spawn: the exact
+    // recorded identity is what the stop path resolves.
+    let program = powershell();
+    let mut stand_in = start_sleeper();
+    let user = harness_core::process_service::current_user().unwrap();
+    let observed =
+        harness_core::process_service::ServiceProcess::observe(stand_in.id(), &program, 0, &user)
+            .expect("the stand-in identity is observed");
+    fs::write(
+        fixture.run.join("continuation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "successor_started": true,
+            "note": "stand-in observed successor",
+            "phase": "observed",
+            "token": "observed-1",
+            "spec": successor.spec,
+            "spec_sha256": hash_bytes(&fs::read(&successor.spec).unwrap()),
+            "run": successor.run,
+            "lineage": lineage,
+            "lineage_sha256": hash_bytes(&fs::read(&lineage).unwrap()),
+            "decision": "reject",
+            "pid": observed.identity().pid,
+            "created": observed.identity().creation_time,
+            "program": program,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+    let mut controller = Command::new(manager())
+        .arg("improve")
+        .args(["resume", "--run", &run_arg])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("continuous resume starts");
+    let waiting = wait_for(
+        || {
+            status_value(&fixture)
+                .get("condition")
+                .and_then(|value| value.as_str())
+                .is_some_and(|condition| condition.contains("recorded successor controller"))
+        },
+        Duration::from_secs(20),
+    );
+    if !waiting {
+        let _ = stand_in.kill();
+        panic!(
+            "controller did not wait for the recorded successor: {}",
+            controller_output(controller)
+        );
+    }
+    let stopped = fixture.improve(&["stop", "--run", &run_arg, "--reason", "test stop"]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    let successor_stopped = wait_for(
+        || {
+            successor
+                .cursor()
+                .get("phase")
+                .and_then(|value| value.as_str())
+                == Some("stopped")
+        },
+        Duration::from_secs(20),
+    );
+    let _ = stand_in.kill();
+    let _ = stand_in.wait();
+    assert!(
+        successor_stopped,
+        "the successor was not suspended through its own owner: {}",
+        text(&stopped)
+    );
+    let finished = wait_for(
+        || matches!(controller.try_wait(), Ok(Some(_))),
+        Duration::from_secs(20),
+    );
+    if !finished {
+        panic!(
+            "controller did not leave after stop: {}",
+            controller_output(controller)
+        );
+    }
+    let output = controller.wait_with_output().unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.contains("successor stop owner"),
+        "the stop established cleanup through the successor's own owner: {output}"
+    );
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "stopped", "{marker}");
+    assert!(
+        !fixture.run.join("stop-request.json").is_file(),
+        "the consumed stop request does not linger"
+    );
+}
+
+fn comparison_inputs(
+    fixture: &Fixture,
+    state: &Path,
+    upstream: &Path,
+    policy: &Path,
+    request: &Path,
+    request_sha: &str,
+    revision: &str,
+) -> Value {
+    json!({
+        "schema": 1,
+        "specification": {
+            "project": fixture.proj,
+            "change": "add-synthetic",
+            "store": Value::Null,
+            "planning_root": fixture.proj,
+        },
+        "contract": {
+            "acceptance_artifact": "specs/synthetic/spec.md",
+            "acceptance_heading": "#### Scenario: Synthetic case",
+            "mechanism": "frozen-workload",
+            "counterexample": "the workload changes between arms",
+            "applicability": "the frozen task snapshot",
+            "independent_acceptance": "the oracle checker executes",
+            "meaningful_effect": "less repeated work",
+            "operating_conditions": "one pair",
+            "comparison_policy": "matched pairs",
+            "stopping_rule": "one pair",
+        },
+        "workload_card": "workload-b",
+        "task": {
+            "source": fixture.proj,
+            "revision": revision,
+            "name": "workload-b",
+            "writable_scope": ["crates/one"],
+        },
+        "runtimes": {
+            "state": state,
+            "baseline_build": state.join("builds/h-build"),
+            "candidate_build": state.join("builds/ha-build"),
+            "baseline_label": "H",
+            "candidate_label": "H+A",
+            "upstream": upstream,
+            "client": {
+                "runner": {
+                    "endpoint": "http://127.0.0.1:9/v1",
+                    "model": "fixture-glyph-1",
+                    "identity": {},
+                },
+                "reasoningEffort": "low",
+            },
+        },
+        "policy": policy,
+        "acceptance": {
+            "request": request,
+            "request_sha256": request_sha,
+        },
+        "observation_inputs": [],
+    })
+}
+
+/// A synthetic harness source the native build owner can actually compile.
+/// It mirrors the owned fixture in `tests/native_build.rs`: a stub manager
+/// workspace whose `finalize-build-v1`/`check`/`activate-build` dispatch runs
+/// over the real `harness-core` source.
+fn scaffold_native_source(source: &Path) {
+    let schema = source.join(harness_core::build_identity::INSPECTION_SCHEMA);
+    fs::create_dir_all(schema.parent().unwrap()).unwrap();
+    fs::write(schema, "{}").unwrap();
+    fs::create_dir_all(source.join("crates/manager/src")).unwrap();
+    fs::create_dir_all(source.join("crates/harness-rtk/src")).unwrap();
+    fs::write(
+        source.join("Cargo.toml"),
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
+            .unwrap()
+            .replace("crates/codex-harness", "crates/manager")
+            .split("[profile.release]")
+            .next()
+            .unwrap()
+            .to_owned()
+            + "\n[profile.release]\nopt-level=0\n",
+    )
+    .unwrap();
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../harness-core");
+    copy_source_tree(&core.join("src"), &source.join("crates/harness-core/src"));
+    fs::copy(
+        core.join("Cargo.toml"),
+        source.join("crates/harness-core/Cargo.toml"),
+    )
+    .unwrap();
+    let evolution = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skill-evolution");
+    copy_source_tree(
+        &evolution.join("src"),
+        &source.join("crates/skill-evolution/src"),
+    );
+    fs::copy(
+        evolution.join("Cargo.toml"),
+        source.join("crates/skill-evolution/Cargo.toml"),
+    )
+    .unwrap();
+    for (directory, name) in [
+        ("crates/manager", "codex-harness"),
+        ("crates/harness-rtk", "harness-rtk"),
+        ("crates/token-audit", "token-audit"),
+    ] {
+        fs::create_dir_all(source.join(directory).join("src")).unwrap();
+        fs::write(
+            source.join(directory).join("Cargo.toml"),
+            format!(
+                "[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n{}",
+                if name == "codex-harness" {
+                    "[dependencies]\nharness-core={path='../harness-core'}\nserde_json.workspace=true\n"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        fs::write(
+            source.join(directory).join("src/main.rs"),
+            if name == "codex-harness" {
+                manager_source("fn main() { println!(\"owned native fixture\"); }\n")
+            } else {
+                "fn main() {}\n".into()
+            },
+        )
+        .unwrap();
+    }
+    // The synthetic manifest keeps the real workspace member list so ancestor
+    // Cargo configuration stays part of build identity; every listed member
+    // must exist, even when the fixture replaces it with a stub.
+    let manifest = fs::read_to_string(source.join("Cargo.toml")).unwrap();
+    let members = manifest
+        .split("members = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap();
+    for member in members.split_whitespace() {
+        let member = member.trim_matches(|character| character == '"' || character == ',');
+        if member.is_empty() {
+            continue;
+        }
+        let directory = source.join(member);
+        if directory.join("Cargo.toml").exists() {
+            continue;
+        }
+        fs::create_dir_all(directory.join("src")).unwrap();
+        fs::write(
+            directory.join("Cargo.toml"),
+            format!(
+                "[package]\nname='{}'\nversion='0.1.0'\nedition='2024'\n",
+                member.rsplit('/').next().unwrap_or(member)
+            ),
+        )
+        .unwrap();
+        fs::write(directory.join("src/lib.rs"), "").unwrap();
+    }
+    fs::create_dir_all(source.join("crates/manager/src/bin")).unwrap();
+    for name in harness_core::build_identity::BINARIES {
+        if !["codex-harness.exe", "harness-rtk.exe"].contains(name) {
+            fs::write(
+                source
+                    .join("crates/manager/src/bin")
+                    .join(name.replace(".exe", ".rs")),
+                "fn main() {}\n",
+            )
+            .unwrap();
+        }
+    }
+    let lock = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(source)
+        .output()
+        .unwrap();
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+}
+
+/// The same dispatch the native build tests use, so the compiled stub manager
+/// can finish its own handoff without a real manager source.
+fn manager_source(program: &str) -> String {
+    let dispatch = r#"
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "finalize-build-v1") {
+        if let Err(error) = harness_core::native_build::finalize(std::path::Path::new(&args[1])) {
+            eprintln!("{error}"); std::process::exit(2);
+        }
+        return;
+    }
+    if args.first().is_some_and(|a| a == "check") {
+        let source = args.windows(2).find(|w| w[0] == "--source").map(|w| std::path::Path::new(&w[1]));
+        let build = args.windows(2).find(|w| w[0] == "--build").unwrap();
+        let report = harness_core::build_identity::check(std::path::Path::new(&build[1]), source);
+        println!("{}", serde_json::to_string(&report).unwrap());
+        std::process::exit(i32::from(
+            report.status != harness_core::build_identity::Health::Healthy,
+        ));
+    }
+    if args.first().is_some_and(|a| a == "activate-build") {
+        let state = args.windows(2).find(|w| w[0] == "--state").unwrap();
+        let build = args.windows(2).find(|w| w[0] == "--build").unwrap();
+        match harness_core::build_selection::activate(std::path::Path::new(&state[1]), std::path::Path::new(&build[1])) {
+            Ok(result) => println!("{}", serde_json::to_string(&result).unwrap()),
+            Err(error) => { eprintln!("{error}"); std::process::exit(2); }
+        }
+        return;
+    }
+"#;
+    program.replacen("fn main() {", &format!("fn main() {{{dispatch}"), 1)
+}
+
+fn copy_source_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        assert!(!entry.file_type().unwrap().is_symlink());
+        if path.is_dir() {
+            copy_source_tree(&path, &destination.join(entry.file_name()));
+        } else {
+            fs::copy(&path, destination.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+/// The controller prepares the missing candidate runtime through the real
+/// native build owner: the stub harness workspace is compiled and published
+/// inside the owned state with its receipt, while the pre-published baseline
+/// build is left alone.
+#[test]
+fn the_controller_prepares_a_missing_runtime_through_the_native_owner() {
+    let fixture = Fixture::new("native-build-success");
+    let state = fixture.root.join("state");
+    fs::create_dir_all(state.join("builds/h-build")).unwrap();
+    fs::write(state.join("owner"), "codex-harness-native-state-v1\n").unwrap();
+    let source = fixture.root.join("native-source");
+    scaffold_native_source(&source);
+    let upstream = fixture.root.join("upstream.exe");
+    fs::write(&upstream, b"fixture-client").unwrap();
+    let policy = fixture.root.join("policy.json");
+    fs::write(&policy, b"{}\n").unwrap();
+    let request = fixture.root.join("request.json");
+    fs::write(&request, b"{\"schema\":1}\n").unwrap();
+    let qualification = fixture.root.join("qualification.json");
+    fs::write(&qualification, b"{}\n").unwrap();
+    let request_sha = hash_bytes(&fs::read(&request).unwrap());
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    fixture.write_spec(
+        &[(
+            "runner",
+            json!({"profile":"ds","model":Value::Null,"model_provider":Value::Null,"reasoning_effort":Value::Null}),
+        ), (
+            "local_runner",
+            json!({"endpoint":"http://127.0.0.1:9/v1","model":"fixture-glyph-1","identity":{}}),
+        ), (
+            "qualification",
+            json!(qualification),
+        ), (
+            "comparison",
+            comparison_inputs(&fixture, &state, &upstream, &policy, &request, &request_sha, &head),
+        )],
+        None,
+    );
+    let started = fixture.start();
+    assert!(started.status.success(), "{}", text(&started));
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("candidate-ready");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": source,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    // The heavy build runs in an owned isolated account so the check is
+    // independent of any ambient shared heavy-command lease.
+    let heavy_account = fixture.root.join("heavy-account");
+    let cpu_account = fixture.root.join("cpu-account");
+    let mut command = Command::new(manager());
+    command
+        .arg("improve")
+        .args(["resume", "--run", fixture.run.to_str().unwrap()]);
+    command.env("CODEX_HARNESS_HEAVY_ACCOUNT", &heavy_account);
+    command.env("CODEX_HARNESS_CPU_ACCOUNT", &cpu_account);
+    let resumed = command.output().expect("resume runs");
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("prepared the missing candidate runtime"),
+        "{output}"
+    );
+
+    let prepared: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("prepared-builds.json")).unwrap())
+            .unwrap();
+    let recorded = prepared["candidate"].as_str().expect("candidate build");
+    let build = PathBuf::from(recorded.strip_prefix(r"\\?\").unwrap_or(recorded));
+    assert!(build.starts_with(state.join("builds")), "{prepared}");
+    assert!(build.join("build.json").is_file(), "{prepared}");
+    assert!(build.join("codex-harness.exe").is_file(), "{prepared}");
+    let identity = prepared["candidate_identity"].as_str().unwrap();
+    assert_eq!(identity.len(), 64, "{prepared}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("build-output.json")).unwrap()).unwrap();
+    assert_eq!(receipt["reused"], false, "{receipt}");
+    assert_eq!(receipt["build"], prepared["candidate"], "{receipt}");
+    assert!(
+        !fixture.run.join("build-job.json").is_file(),
+        "the reconciled build job is removed once its child was reaped"
+    );
+    assert!(fixture.run.join("build-child.log").is_file());
 }

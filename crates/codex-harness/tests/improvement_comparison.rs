@@ -866,12 +866,17 @@ impl Fixture {
     }
 
     fn start(&self) -> Output {
+        // The comparison cases advance one explicit boundary at a time; they
+        // declare the single-step mode while the CLI default for new starts
+        // stays continuous.
         self.improve(&[
             "start",
             "--run",
             self.run.to_str().unwrap(),
             "--spec",
             self.spec.to_str().unwrap(),
+            "--supervision",
+            "once",
         ])
     }
 
@@ -1992,6 +1997,133 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     assert!(resume.status.success(), "{}", text(&resume));
     assert_eq!(fixture.cursor()["attempts"], before["attempts"]);
     assert_eq!(fixture.bd_comments(&fixture.card), comments_before);
+}
+
+/// The continuous controller consumes a supported adoption through the real
+/// integration and activation owners: the checked revision reaches the
+/// mainline, the prepared candidate runtime becomes the experimental
+/// baseline, lineage is retained and the settled continuation is not replayed.
+#[test]
+fn a_continuous_controller_consumes_an_adoption_through_integration_and_activation() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("controller-activate");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    // The measured arms' independent checks run inside the heavy-command
+    // budget; this case owns isolated accounts so it does not depend on any
+    // ambient shared lease.
+    let heavy_account = fixture.root.join("heavy-account");
+    let cpu_account = fixture.root.join("cpu-account");
+    let accounts = [
+        (
+            "CODEX_HARNESS_HEAVY_ACCOUNT",
+            heavy_account.to_str().unwrap(),
+        ),
+        ("CODEX_HARNESS_CPU_ACCOUNT", cpu_account.to_str().unwrap()),
+    ];
+    let run_arg = fixture.run.to_str().unwrap().to_owned();
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(
+        output.contains("before submission"),
+        "the fixture launcher cannot run a conversation: {output}"
+    );
+    let session = session_id("activate-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}\n{output}"
+    );
+
+    let session = session_id("activate-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "decision-recorded", "{status}\n{output}");
+    assert!(
+        status["comparison"]["decision"]
+            .as_str()
+            .unwrap()
+            .contains("outcome=adopt"),
+        "{status}"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        base,
+        "the verdict alone integrates nothing"
+    );
+
+    // Hand the exact supported decision to the continuous controller: the
+    // declared combined-tree check and the prepared candidate runtime flow
+    // through the existing integration and activation owners.
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let expected_answer = fixture.root.join("answer-expected.txt");
+    fs::write(&expected_answer, "integrated\n").unwrap();
+    fs::write(
+        fixture.run.join("integration-check.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "program": env!("CARGO_BIN_EXE_harness-improvement-fixture"),
+            "args": ["check", checkout.path, expected_answer],
+            "timeout_seconds": 120,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let attempts_before = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let resume = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&resume);
+    assert!(resume.status.success(), "{output}");
+    assert!(output.contains("integration owner"), "{output}");
+    assert!(output.contains("activation owner"), "{output}");
+    let status = fixture.status_json();
+    assert_eq!(
+        status["phase"], "activation-confirmed",
+        "{status}\n{output}"
+    );
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        checkout.revision,
+        "the checked integrated revision is the mainline"
+    );
+    assert!(fixture.run.join("integration.json").is_file());
+    assert!(fixture.run.join("activation.json").is_file());
+    let lineage: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("lineage.json")).unwrap()).unwrap();
+    assert_eq!(lineage["decision"], "adopt", "{lineage}");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "idle", "{marker}");
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before,
+        "integration and activation dispatch no model work"
+    );
+
+    // The settled continuation is idempotent: a repeated resume replays
+    // neither the decision nor the activation.
+    let again = fixture.improve_with_env(&["resume", "--run", &run_arg], &accounts);
+    let output = text(&again);
+    assert!(again.status.success(), "{output}");
+    assert!(output.contains("already recorded"), "{output}");
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts_before
+    );
+    assert_eq!(fixture.status_json()["phase"], "activation-confirmed");
 }
 
 /// Missing measured counters stay visible: the declared rounds/tool evidence

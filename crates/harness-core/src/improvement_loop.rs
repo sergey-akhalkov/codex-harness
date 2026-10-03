@@ -1234,6 +1234,19 @@ pub enum EffectKind {
     Resumed,
     Reconciled,
     RemeasurementRequired,
+    /// A missing declared runtime was published by the existing native build
+    /// owner. The frozen run spec is not rewritten; the published path is
+    /// retained beside the run.
+    BuildPrepared,
+    /// The exact supported decision was handed to the integration owner.
+    IntegrationConsumed,
+    /// The exact integrated revision was handed to the activation owner.
+    /// Live publication is not this effect.
+    ActivationConsumed,
+    /// Useful workload lineage was retained and the next independently
+    /// specified run, or an honest idle, was recorded. No model call is made
+    /// only to stay busy.
+    ContinuationRecorded,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

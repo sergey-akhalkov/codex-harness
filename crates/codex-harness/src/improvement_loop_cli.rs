@@ -19,6 +19,8 @@
 
 #[path = "improvement_comparison.rs"]
 mod improvement_comparison;
+#[path = "improvement_driver.rs"]
+mod improvement_driver;
 #[path = "improvement_workflow.rs"]
 mod improvement_workflow;
 
@@ -31,10 +33,10 @@ use harness_core::board_hypothesis;
 use harness_core::build_identity;
 use harness_core::build_selection;
 use harness_core::improvement_loop::{
-    Attempt, AttemptRole, AttemptState, Cursor, DispatchBinding, DispatchFacts, DispatchGate,
-    EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity, ObservedOutcome,
-    Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE, VariantSet,
-    candidate_removal_gate, declared_removal_gate, dispatch_gate, dispatch_owner,
+    Attempt, AttemptRole, AttemptState, CURSOR_FILE, Cursor, DispatchBinding, DispatchFacts,
+    DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
+    ObservedOutcome, Phase, RemovalGate, ResumeReport, RunMutation, RunSpec, RunStore, SPEC_FILE,
+    VariantSet, candidate_removal_gate, declared_removal_gate, dispatch_gate, dispatch_owner,
     frozen_removal_digest, now_ms, read_json, selection_gate, settle_completed_reuse,
     verify_dispatch_identity, write_json_atomic,
 };
@@ -44,11 +46,12 @@ use serde_json::json;
 use std::{ffi::OsString, io, path::Path, path::PathBuf, time::Duration};
 
 const USAGE: &str = "\
-codex-harness improve start --run DIRECTORY --spec FILE
+codex-harness improve start --run DIRECTORY --spec FILE [--supervision once|continuous] [--integration-check FILE] [--successor-spec FILE --successor-run DIRECTORY]
 codex-harness improve status --run DIRECTORY [--json]
 codex-harness improve select --run DIRECTORY --variant baseline|candidate
 codex-harness improve stop --run DIRECTORY [--reason TEXT]
 codex-harness improve resume --run DIRECTORY
+codex-harness improve prepare-runtime --source DIRECTORY --state DIRECTORY --output FILE
 
 One explicitly started, durable improvement run. Beads owns the hypothesis and
 its decisions, OpenSpec owns the planning artifacts, the installed profile
@@ -70,15 +73,18 @@ owner; a missing evidence base records idle, a missing gate records blocked,
 and neither starts hidden model work.
 
 A run that declares the explicit comparison inputs also prepares and drives
-the sequential measured pair from candidate-ready: the workload's own OpenSpec
-change and the two frozen task copies are qualified, the prepared baseline and
-candidate runtimes are installed into fresh homes from the declared client
-inputs and verified, one visible baseline conversation and then one visible
-candidate conversation run the frozen workload, the unchanged supervisor's
-real-task oracle checks each committed solution, and the predeclared policy
-publishes an evidence-bound decision to the hypothesis card. Missing
-preparation, qualification or consumption proof prevents any model dispatch,
-and the published verdict never integrates, activates or publishes anything.
+the sequential measured pair from candidate-ready. Continuous supervision is
+the default for a new start: it keeps driving settled attempts, prepares a
+missing runtime through the existing native build owner, and hands an exact
+supported decision to the integration and activation owners. `once` is the
+explicit single-step mode, and a run with no recorded supervision keeps that
+one-step recovery. A retained build job is reconciled before another build, a
+stop request is consumed exactly once, and a declared successor is started
+only after the completed decision with its retained lineage; otherwise the
+controller records a non-suppressing idle continuation and does not call a
+model to stay busy. Live publication is never implied. Rejection, an
+inconclusive decision, drift, a failed check or missing removal authority
+leaves the baseline unchanged.
 
 status prints the recoverable phase cursor: current phase and condition, the
 hypothesis card, the qualified planning change, the effective runner binding,
@@ -127,10 +133,15 @@ pub fn run(args: &[OsString]) -> io::Result<i32> {
         Some("select") => select(&args[1..]),
         Some("stop") => stop(&args[1..]),
         Some("resume") => resume(&args[1..]),
+        Some("prepare-runtime") => improvement_driver::prepare_runtime(&args[1..]),
         _ => Err(invalid(
             "invalid improve options; use codex-harness improve --help",
         )),
     }
+}
+
+fn advance_run(run: &mut Run) -> io::Result<Vec<String>> {
+    improvement_workflow::advance(run)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -646,6 +657,7 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
         "directory": run.store.root().display().to_string(),
         "phase": run.cursor.phase.as_str(),
         "condition": run.cursor.condition,
+        "supervision": improvement_driver::supervision_of(run)?.as_str(),
         "hypothesis_item": run.spec.hypothesis_item,
         "experiment": run.cursor.experiment,
         "planning": {
@@ -937,9 +949,21 @@ fn print_report(run: &Run) -> io::Result<()> {
 }
 
 fn start(args: &[OsString]) -> io::Result<i32> {
-    let options = Options::parse(args, &["--run", "--spec"], &[])?;
+    let options = Options::parse(
+        args,
+        &[
+            "--run",
+            "--spec",
+            "--supervision",
+            "--integration-check",
+            "--successor-spec",
+            "--successor-run",
+        ],
+        &[],
+    )?;
     let run_dir = PathBuf::from(options.required("--run")?);
     let spec_path = PathBuf::from(options.required("--spec")?);
+    let supervision = improvement_driver::parse_supervision(options.get("--supervision"))?;
     if !run_dir.is_absolute() || !spec_path.is_absolute() {
         return Err(invalid("--run and --spec must be absolute paths"));
     }
@@ -1026,13 +1050,27 @@ fn start(args: &[OsString]) -> io::Result<i32> {
         guard: Some(guard),
     };
     claim_ownership(&mut run)?;
+    improvement_driver::persist_supervision(&run, supervision)?;
+    if let Some(check) = options.get("--integration-check") {
+        improvement_driver::persist_integration_check(&run, Path::new(check))?;
+    }
+    improvement_driver::persist_successor(
+        &run,
+        options.get("--successor-spec"),
+        options.get("--successor-run"),
+        None,
+    )?;
 
     // The planning/implementation workflow advances as far as the recorded
     // state and the dispatch gates allow: it consumes a retained investigator
     // result through grounded intake, qualifies the selected candidate's own
     // OpenSpec change and dispatches bounded conversations. A missing
     // evidence base records an honest idle state and starts no model work.
-    let notes = improvement_workflow::advance(&mut run)?;
+    let notes = if supervision == improvement_driver::Supervision::Continuous {
+        improvement_driver::drive(&mut run)?
+    } else {
+        improvement_workflow::advance(&mut run)?
+    };
     print_report(&run)?;
     for note in &notes {
         println!("{note}");
@@ -1487,13 +1525,22 @@ fn cleanup_owned_attempts(run: &mut Run, timeout: Duration) -> Vec<(String, Stri
 
 fn stop(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(args, &["--run", "--reason", "--timeout"], &[])?;
-    let mut run = open_run_locked(&PathBuf::from(options.required("--run")?))?;
-    claim_ownership(&mut run)?;
+    let run_dir = PathBuf::from(options.required("--run")?);
     let reason = options
         .get("--reason")
         .map(str::to_owned)
         .unwrap_or_else(|| "stopped through `improve stop`".to_owned());
+    // Visible before the mutation guard, so a controller waiting with the
+    // guard released can leave without dispatching again.
+    if run_dir.join(CURSOR_FILE).is_file() {
+        improvement_driver::write_stop_request(&run_dir, &reason)?;
+    }
+    let mut run = open_run_locked(&run_dir)?;
+    claim_ownership(&mut run)?;
     let timeout = timeout_option(options.get("--timeout"))?;
+    if let Some(note) = improvement_driver::stop_build_job(run.store.root())? {
+        println!("improve stop: {note}");
+    }
 
     // Every known owned effect is resolved through the exact-identity executor
     // stop owner; anything that cannot be verified stays retained as unknown.
@@ -1653,6 +1700,16 @@ fn reconcile(run: &Run) -> io::Result<(Cursor, ResumeReport, Vec<String>)> {
 fn resume(args: &[OsString]) -> io::Result<i32> {
     let options = Options::parse(args, &["--run"], &[])?;
     let mut run = open_run_locked(&PathBuf::from(options.required("--run")?))?;
+    improvement_driver::refuse_live_controller(&run)?;
+    // A stop request that no live controller consumed is acknowledged here.
+    // The stop itself already recorded its own effect through the stop owner;
+    // the exact request is consumed once instead of lingering as a permanent
+    // refusal for every later resume.
+    if let Some(token) = improvement_driver::consume_pending_stop(&run)? {
+        println!(
+            "resume: consumed the exact stop request ({token}) that no live controller observed; the run continues from its recorded phase"
+        );
+    }
     claim_ownership(&mut run)?;
     let (mut cursor, report, notes) = reconcile(&run)?;
     cursor.resume_phase();
@@ -1714,12 +1771,23 @@ fn resume(args: &[OsString]) -> io::Result<i32> {
     // a settled investigator result is consumed through grounded intake, the
     // selected candidate's own change is qualified and bounded conversations
     // are dispatched - or an honest idle/blocked condition is recorded.
-    let advanced = improvement_workflow::advance(&mut run)?;
-    match condition {
-        Some(condition) => merge_condition(&mut run.cursor, condition),
-        None => {
-            if run.cursor.phase != Phase::Idle {
-                run.cursor.clear_blocked();
+    let continuous =
+        improvement_driver::supervision_of(&run)? == improvement_driver::Supervision::Continuous;
+    let advanced = if continuous {
+        improvement_driver::drive(&mut run)?
+    } else {
+        improvement_workflow::advance(&mut run)?
+    };
+    // A continuous drive already recorded the authoritative phase. Clearing
+    // it here would turn a build failure or a recorded decision back into the
+    // phase resume started from.
+    if !continuous {
+        match condition {
+            Some(condition) => merge_condition(&mut run.cursor, condition),
+            None => {
+                if run.cursor.phase != Phase::Idle {
+                    run.cursor.clear_blocked();
+                }
             }
         }
     }
