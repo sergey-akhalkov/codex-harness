@@ -2266,6 +2266,7 @@ fn consume_settled_arm(
         arm,
         &attempt,
         &runtime,
+        &runtime_path,
         &solution,
         &acceptance,
     )?;
@@ -2569,15 +2570,93 @@ fn run_oracle(
     })
 }
 
+/// The declared subtractive treatment of a measured comparison: the frozen
+/// removal scope names the capability this candidate treatment removes. A run
+/// without any removal declaration stays additive.
+struct DeclaredRemoval {
+    target: Option<String>,
+}
+
+fn declared_removal(run: &Run) -> Option<DeclaredRemoval> {
+    let subtractive = run.spec.removal.is_some()
+        || run.cursor.removal_frozen.is_some()
+        || run
+            .cursor
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.removal_required);
+    if !subtractive {
+        return None;
+    }
+    Some(DeclaredRemoval {
+        target: run
+            .spec
+            .removal
+            .as_ref()
+            .map(|removal| removal.target.clone()),
+    })
+}
+
+/// One arm's recorded consumption of the declared removed capability, in the
+/// shape the authoritative accounting consumes. The verified arm runtime
+/// receipt is this arm's retained consumption record: a prepared component or
+/// consumed link carrying the capability name establishes `consumed`, and the
+/// same complete record without it establishes `absent`. Invocation and
+/// tool-call counts stay a separate measure and are never consumption
+/// evidence.
+fn capability_consumption(runtime: &ArmRuntime, runtime_path: &Path, capability: &str) -> Value {
+    let consumed = runtime
+        .components
+        .iter()
+        .find(|component| component.name == capability)
+        .map(|component| format!("component:{}", component.name))
+        .or_else(|| {
+            runtime
+                .components
+                .iter()
+                .flat_map(|component| component.links.iter())
+                .find(|link| link.name == capability)
+                .map(|link| format!("link:{}", link.name))
+        })
+        .or_else(|| {
+            runtime
+                .skills
+                .iter()
+                .find(|link| link.name == capability)
+                .map(|link| format!("skill:{}", link.name))
+        })
+        .or_else(|| {
+            runtime
+                .commands
+                .iter()
+                .find(|link| link.name == capability)
+                .map(|link| format!("command:{}", link.name))
+        });
+    let (status, anchor) = match consumed {
+        Some(anchor) => ("consumed", anchor),
+        None => ("absent", "inventory".to_owned()),
+    };
+    json!({
+        "capability": capability,
+        "status": status,
+        "evidence": format!("{}#{anchor}", runtime_path.display()),
+    })
+}
+
 /// One authoritative accounting row per arm. The identity fields are the
 /// frozen comparison inputs; the measured fields come from the native
-/// dispatcher receipt and the rollout owner, never from candidate prose.
+/// dispatcher receipt and the rollout owner, never from candidate prose. A
+/// declared subtractive treatment additionally records the removed burden and
+/// this arm's consumption of it in the shapes the outcome report and policy
+/// owners consume, so a comparison is accounted under the same subtractive
+/// contract as every other measured attempt.
 fn build_row(
     run: &Run,
     comparison: &ComparisonInputs,
     arm: ComparisonArm,
     attempt: &Attempt,
     runtime: &ArmRuntime,
+    runtime_path: &Path,
     solution: &Solution,
     acceptance: &Acceptance,
 ) -> io::Result<Value> {
@@ -2621,7 +2700,22 @@ fn build_row(
     }
     let declaration = comparison.declared_policy()?.policy.declaration();
     let infrastructure_capture = infrastructure_capture(run, attempt);
-    Ok(json!({
+    let removal = declared_removal(run);
+    let mut treatment = json!({
+        "label": runtime.label,
+        "build": runtime.variant.build.display().to_string(),
+        "build_source_sha256": runtime.variant.source_sha256,
+        "solution_revision": solution.revision,
+        "solution_paths": solution.changed_paths,
+        "components": component_inventory(runtime),
+    });
+    if let Some(removal) = &removal {
+        treatment["kind"] = json!("subtraction");
+        if let Some(target) = &removal.target {
+            treatment["removed"] = json!(target);
+        }
+    }
+    let mut row = json!({
         "attempt_id": format!("{}-{}", run.cursor.experiment, attempt.id),
         "case_id": comparison.task.name,
         "arm": arm.as_str(),
@@ -2650,15 +2744,14 @@ fn build_row(
         "interventions": [],
         "retry_of": null,
         "infrastructure_capture": infrastructure_capture,
-        "treatment": {
-            "label": runtime.label,
-            "build": runtime.variant.build.display().to_string(),
-            "build_source_sha256": runtime.variant.source_sha256,
-            "solution_revision": solution.revision,
-            "solution_paths": solution.changed_paths,
-            "components": component_inventory(runtime),
-        },
-    }))
+        "treatment": treatment,
+    });
+    if let Some(removal) = &removal
+        && let Some(target) = &removal.target
+    {
+        row["consumption"] = capability_consumption(runtime, runtime_path, target);
+    }
+    Ok(row)
 }
 
 fn infrastructure_capture(run: &Run, attempt: &Attempt) -> Value {
