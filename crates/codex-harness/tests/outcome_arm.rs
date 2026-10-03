@@ -1,5 +1,6 @@
 //! Model-free actual CLI treatment and rollback, entirely on owned temp data.
 #![cfg(windows)]
+use harness_core::build_identity::hash_file;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -10,6 +11,28 @@ use std::{
 
 const CANDIDATES: [&str; 2] = ["project-verification", "reproduce-regression"];
 const BASE: &str = "# owned original\r\nmodel = 'gpt-6-astra'\r\ncheck_for_update_on_startup = false\r\n[features]\r\nhooks = false\r\nmulti_agent = false\r\n";
+
+/// One fresh controlled case through the real preparation entry point. Its
+/// path-independent contract digest is what the arm must bind.
+fn prepare_case(host: &Path) -> (PathBuf, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-harness"))
+        .args(["outcome-prepare", "--case", "entrypoint"])
+        .current_dir(host)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "passed");
+    (
+        PathBuf::from(report["case_root"].as_str().unwrap()),
+        report["setup"]["contract"].as_str().unwrap().to_owned(),
+    )
+}
+
 fn read(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
@@ -23,6 +46,7 @@ struct Fixture {
     home: PathBuf,
     user: PathBuf,
     case: PathBuf,
+    contract: String,
     state: PathBuf,
     request: PathBuf,
 }
@@ -35,7 +59,7 @@ impl Fixture {
         let source = root.path().join("source");
         let user = root.path().join("user");
         let home = user.join(".codex");
-        let case = root.path().join("case");
+        let (case, contract) = prepare_case(root.path());
         let request = root.path().join("request.json");
         let state = home.join("harness/installation.json");
         for dir in [
@@ -43,7 +67,6 @@ impl Fixture {
             user.join(".agents/skills"),
             home.join("skills"),
             home.join("harness"),
-            case.clone(),
         ] {
             fs::create_dir_all(dir).unwrap();
         }
@@ -85,7 +108,7 @@ impl Fixture {
         fs::write(home.join("config.toml"), BASE).unwrap();
         write(
             &request,
-            &json!({"case_root":case,"codex_home":home,"user_home":user,"dependency_user_home":user,"source_root":source,"upstream":env!("CARGO_BIN_EXE_harness-launch-fixture"),"arm":arm,"timeout":5}),
+            &json!({"case_root":case,"case_contract":contract,"codex_home":home,"user_home":user,"dependency_user_home":user,"source_root":source,"upstream":env!("CARGO_BIN_EXE_harness-launch-fixture"),"arm":arm,"timeout":5}),
         );
         Self {
             root,
@@ -93,6 +116,7 @@ impl Fixture {
             home,
             user,
             case,
+            contract,
             state,
             request,
         }
@@ -298,6 +322,214 @@ fn opposite_existing_override_is_preserved_and_refused() {
     let row = f.run("arm", 1);
     assert!(row.get("publication_state").is_none());
     assert_eq!(fs::read(f.home.join("config.toml")).unwrap(), bytes);
+}
+
+fn failure_message(row: &Value) -> String {
+    read(&Path::new(row["evidence_root"].as_str().unwrap()).join("failure.json"))["message"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn both_arms_bind_the_same_frozen_contract_over_separate_case_copies() {
+    let baseline = Fixture::new("baseline");
+    let candidate = Fixture::new("candidate");
+    assert_ne!(baseline.case, candidate.case);
+    assert_eq!(baseline.contract, candidate.contract);
+    let left = baseline.run("arm", 0);
+    let right = candidate.run("arm", 0);
+    assert_eq!(left["case"]["contract"], baseline.contract);
+    assert_eq!(right["case"]["contract"], candidate.contract);
+    assert_eq!(left["case"]["case_id"], "entrypoint");
+    assert_eq!(left["case"]["source_state"], "controlled-v3-rust");
+    assert_eq!(left["case"]["git_boundary"], "absent");
+    assert_eq!(left["case"]["verified_before"], true);
+    assert_eq!(left["case"]["verified_after"], true);
+    assert_ne!(left["case"]["root"], right["case"]["root"]);
+}
+
+#[test]
+fn changed_missing_or_mismatched_frozen_contracts_refuse_before_publication() {
+    // An earlier arm's executor changed this copy's frozen input.
+    let f = Fixture::new("baseline");
+    fs::write(f.case.join("source.json"), "{\"version\":9}\n").unwrap();
+    let row = f.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("frozen input changed since preparation"));
+    // The contaminated copy is retained, not cleaned or silently re-frozen.
+    assert_eq!(
+        fs::read_to_string(f.case.join("source.json")).unwrap(),
+        "{\"version\":9}\n"
+    );
+    assert_eq!(
+        fs::read(f.home.join("config.toml")).unwrap(),
+        BASE.as_bytes()
+    );
+
+    // A case whose receipt was removed cannot be measured at all.
+    let f = Fixture::new("baseline");
+    fs::remove_file(f.case.join("preparation.json")).unwrap();
+    let row = f.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("no readable preparation receipt"));
+
+    // An incomplete preparation is not a frozen workload.
+    let f = Fixture::new("baseline");
+    let receipt = f.case.join("preparation.json");
+    let mut value = read(&receipt);
+    value["status"] = json!("incomplete");
+    write(&receipt, &value);
+    let row = f.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("preparation did not pass"));
+
+    // A receipt rewritten to a different contract does not match the
+    // expected digest the caller received from the preparation entry point.
+    let f = Fixture::new("baseline");
+    let mut request = read(&f.request);
+    request["case_contract"] = json!("0".repeat(64));
+    write(&f.request, &request);
+    let row = f.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("does not carry the frozen task contract"));
+    assert_eq!(
+        fs::read(f.home.join("config.toml")).unwrap(),
+        BASE.as_bytes()
+    );
+}
+
+#[test]
+fn cases_that_can_reach_sibling_git_history_are_refused() {
+    let linked = Fixture::new("baseline");
+    fs::write(
+        linked.case.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            linked
+                .root
+                .path()
+                .join("sibling/.git/worktrees/case")
+                .display()
+        ),
+    )
+    .unwrap();
+    let row = linked.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("links an external Git directory"));
+
+    let shared = Fixture::new("baseline");
+    fs::create_dir(shared.case.join(".git")).unwrap();
+    fs::write(shared.case.join(".git/commondir"), "../shared\n").unwrap();
+    let row = shared.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("shares a common Git directory"));
+
+    let alternate = Fixture::new("baseline");
+    fs::create_dir_all(alternate.case.join(".git/objects/info")).unwrap();
+    fs::write(
+        alternate.case.join(".git/objects/info/alternates"),
+        "D:/somewhere/objects\n",
+    )
+    .unwrap();
+    let row = alternate.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("shares an alternate Git object store"));
+
+    let remote = Fixture::new("baseline");
+    fs::create_dir(remote.case.join(".git")).unwrap();
+    fs::write(
+        remote.case.join(".git/config"),
+        "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = ../sibling\n",
+    )
+    .unwrap();
+    let row = remote.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("holds a configured Git remote"));
+
+    // A case nested inside an enclosing checkout resolves that checkout's
+    // references from its working directory and is refused as well.
+    let nested = Fixture::new("baseline");
+    let enclosing = nested.root.path().join("enclosing");
+    fs::create_dir_all(enclosing.join(".git")).unwrap();
+    let moved = enclosing.join("case");
+    fs::rename(&nested.case, &moved).unwrap();
+    let mut request = read(&nested.request);
+    request["case_root"] = json!(moved);
+    write(&nested.request, &request);
+    let row = nested.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("lies inside an enclosing Git checkout"));
+
+    // An independent repository boundary is accepted and recorded.
+    let independent = Fixture::new("baseline");
+    fs::create_dir(independent.case.join(".git")).unwrap();
+    fs::write(
+        independent.case.join(".git/config"),
+        "[core]\n\trepositoryformatversion = 0\n",
+    )
+    .unwrap();
+    let row = independent.run("arm", 0);
+    assert_eq!(row["case"]["git_boundary"], "independent");
+}
+
+#[test]
+fn one_arms_work_cannot_change_the_other_arms_frozen_input() {
+    let left = Fixture::new("baseline");
+    let right = Fixture::new("candidate");
+    // The baseline arm's executor legitimately rewrites its own generated
+    // artifact and leaves its solution attempt in its own copy.
+    fs::write(left.case.join("built.json"), "{\"version\":2}\n").unwrap();
+    fs::write(left.case.join("solution-attempt.txt"), "arm work\n").unwrap();
+    let left_row = left.run("arm", 0);
+    assert_eq!(left_row["case"]["verified_after"], true);
+    // Its own frozen inputs are unchanged by the arm's own preparation.
+    let receipt = read(&left.case.join("preparation.json"));
+    for (name, hash) in receipt["setup"]["immutable"].as_object().unwrap() {
+        assert_eq!(
+            hash_file(&left.case.join(name)).unwrap(),
+            hash.as_str().unwrap()
+        );
+    }
+    // The other arm still measures the untouched frozen contract, sees no
+    // solution artifact and binds the same contract identity.
+    let right_row = right.run("arm", 0);
+    assert_eq!(right_row["case"]["contract"], left_row["case"]["contract"]);
+    assert!(!right.case.join("solution-attempt.txt").exists());
+    assert_eq!(
+        fs::read_to_string(right.case.join("built.json")).unwrap(),
+        "{\"version\":1}\n"
+    );
+}
+
+#[test]
+fn a_home_instruction_override_is_refused_before_publication() {
+    let f = Fixture::new("baseline");
+    fs::write(f.home.join("AGENTS.override.md"), "# sibling context\n").unwrap();
+    let row = f.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("AGENTS override"));
+    assert_eq!(
+        fs::read(f.home.join("config.toml")).unwrap(),
+        BASE.as_bytes()
+    );
+}
+
+#[test]
+fn the_measured_case_must_stay_separate_from_the_installation_homes() {
+    let f = Fixture::new("baseline");
+    let nested = f.user.join("measured-case");
+    fs::rename(&f.case, &nested).unwrap();
+    let mut request = read(&f.request);
+    request["case_root"] = json!(nested);
+    write(&f.request, &request);
+    let row = f.run("arm", 1);
+    assert!(row.get("publication_state").is_none());
+    assert!(failure_message(&row).contains("outside installation homes"));
+    assert_eq!(
+        fs::read(f.home.join("config.toml")).unwrap(),
+        BASE.as_bytes()
+    );
 }
 
 #[test]
