@@ -22,6 +22,11 @@
 //!    committed base, the declared writable scope and the frozen planning
 //!    artifacts, transferred onto the candidate branch and retained as
 //!    `candidate-ready`.
+//! 5. when this run's own hypothesis card retains an independently accepted
+//!    `role=workload` solution whose exact change can be materialized onto
+//!    the freshly allocated candidate branch, that solution is carried
+//!    model-free as this candidate's implementation - the same content
+//!    identity the activation lineage owner later verifies.
 //!
 //! Every conversation works in the dispatcher's own pooled slot checkout, so
 //! the controller validates the *returned* checkout and then advances the
@@ -34,8 +39,8 @@ use harness_core::improvement_intake::{
     self, ClaimKind, EvidenceIndex, EvidenceItem, EvidenceOwner, IntakeOutcome,
 };
 use harness_core::improvement_loop::{
-    CandidateState, IntakeState, OutcomeRecord, candidate_change_dir, candidate_change_name,
-    changed_paths_within_scope, frozen_candidate_removal_digest,
+    CandidateState, IntakeState, OutcomeRecord, RemovalGate, candidate_change_dir,
+    candidate_change_name, changed_paths_within_scope, frozen_candidate_removal_digest,
 };
 use harness_core::improvement_spec::{
     MeasurementReceipt, MeasurementScope, OpenSpec, PlanningReceipt, REMOVAL_PROPOSAL_CLAUSES,
@@ -43,7 +48,8 @@ use harness_core::improvement_spec::{
 };
 use harness_core::task_worktree::{self, CandidateCheckout, ReuseBlock, WorktreeReuse};
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// The run-local qualified receipt of the selected candidate's own OpenSpec
 /// change. The run's declared `planning.json` stays the frozen anchor receipt.
@@ -74,6 +80,10 @@ const MAX_ASSIGNMENT_INPUTS: usize = 32;
 /// the natural location plus the replacements for preserved ineligible or
 /// foreign checkouts that are never touched.
 const CANDIDATE_ALLOCATION_ATTEMPTS: u32 = 16;
+/// The maximum retained `role=workload` solution records one hypothesis card
+/// may contribute to the model-free carry; the activation lineage owner reads
+/// the same bounded comment set.
+const MAX_RETAINED_SOLUTIONS: usize = 8;
 
 /// Advances the run as far as the recorded state and the dispatch gates
 /// allow. Returns human-readable progress notes; a blocked or idle condition
@@ -2980,11 +2990,444 @@ fn ensure_implementation(
             return block(run, notes, reason);
         }
     }
+    // An independently accepted retained workload solution is materialized
+    // model-free before any dispatch: its exact change, checked against the
+    // resulting baseline, IS this candidate's implementation.
+    match carry_retained_solution(run, candidate, notes)? {
+        CarryOutcome::Carried | CarryOutcome::Refused => return Ok(()),
+        CarryOutcome::Absent => {}
+    }
     let facts = dispatch_facts_for(run, AttemptRole::Implementer)?;
     match dispatch_gate(&run.cursor, AttemptRole::Implementer, &facts) {
         DispatchGate::Ready => dispatch_implementer(run, candidate, notes),
         DispatchGate::Blocked { reason } => block(run, notes, reason),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Model-free carry of an independently accepted retained workload solution.
+//
+// When this run's own hypothesis card retains an exact `role=workload`
+// implementation - written by the comparison owner only after the arm's
+// frozen independent acceptance passed - and that change can be materialized
+// onto the freshly allocated candidate branch without changing its content
+// identity, the retained solution IS this run's candidate implementation.
+// The carry reads the same bounded `hypothesis-implementation v1` records and
+// applies the same content rule (`git diff --raw`, status plus resulting blob
+// per path) the activation lineage owner verifies, so the resulting baseline
+// can later be traced to the exact independently accepted revision. Nothing
+// is ever materialized from an unattributable record, and a record that
+// cannot reproduce its exact change never becomes a candidate.
+// ---------------------------------------------------------------------------
+
+/// One retained `role=workload` implementation record read back from this
+/// run's own hypothesis card. Candidate-role records - this run's own
+/// allocation or any other implementation - are never eligible, because only
+/// the workload record is written after the frozen independent acceptance
+/// passed.
+struct RetainedWorkloadSolution {
+    branch: String,
+    base: String,
+    revision: String,
+}
+
+/// Whether the implementation stage resolved through the retained-solution
+/// carry, found nothing attributable (the ordinary grounded implementation
+/// path), or refused without fabricating a candidate.
+enum CarryOutcome {
+    Carried,
+    Absent,
+    Refused,
+}
+
+/// Materializes one exact retained workload solution as this candidate's
+/// implementation, or records the exact refusal. A refused carry neither
+/// fabricates a candidate nor dispatches a substitute implementation: the
+/// recorded condition names the fact the next action needs.
+fn carry_retained_solution(
+    run: &mut Run,
+    candidate: &mut CandidateState,
+    notes: &mut Vec<String>,
+) -> io::Result<CarryOutcome> {
+    let Some(checkout) = candidate.worktree.clone() else {
+        return Ok(CarryOutcome::Absent);
+    };
+    let solutions = retained_workload_solutions(run)?;
+    if solutions.is_empty() {
+        return Ok(CarryOutcome::Absent);
+    }
+    // A removal treatment keeps waiting for the user's exact decision before
+    // any dependent effect: the carry applies the same authority gate an
+    // implementer dispatch would, even though it opens no conversation.
+    let facts = dispatch_facts_for(run, AttemptRole::Implementer)?;
+    match &facts.removal {
+        Some(RemovalGate::Pending { reason }) => {
+            block(run, notes, format!("removal approval is pending: {reason}"))?;
+            return Ok(CarryOutcome::Refused);
+        }
+        Some(RemovalGate::Refused { .. }) => {
+            block(
+                run,
+                notes,
+                "the user declined this removal; the dependent removal effect stays blocked"
+                    .to_owned(),
+            )?;
+            return Ok(CarryOutcome::Refused);
+        }
+        Some(RemovalGate::Withdrawn { .. }) => {
+            block(
+                run,
+                notes,
+                "the removal approval was withdrawn; the dependent removal effect stays blocked until a new decision"
+                    .to_owned(),
+            )?;
+            return Ok(CarryOutcome::Refused);
+        }
+        _ => {}
+    }
+    // Deterministic order: a record produced from the candidate's own base
+    // first (its identity is preserved exactly), then the recorded order.
+    let mut ordered: Vec<&RetainedWorkloadSolution> = solutions.iter().collect();
+    ordered.sort_by_key(|solution| solution.base != checkout.base);
+    let mut failures: Vec<String> = Vec::new();
+    for solution in ordered {
+        // Both commits must be objects of this repository: like the
+        // activation lineage owner, a record whose solution is not available
+        // here is attributed to nothing.
+        if !git_ok(
+            &checkout.path,
+            &["cat-file", "-e", &format!("{}^{{commit}}", solution.base)],
+        )
+        .unwrap_or(false)
+            || !git_ok(
+                &checkout.path,
+                &[
+                    "cat-file",
+                    "-e",
+                    &format!("{}^{{commit}}", solution.revision),
+                ],
+            )
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        match materialize_retained_solution(run, candidate, &checkout, solution) {
+            Ok(head) => {
+                run.cursor.effect(
+                    EffectKind::ImplementationValidated,
+                    format!(
+                        "carried retained workload solution branch={} base={} revision={} as {head} (model-free materialization, no model attempt)",
+                        solution.branch, solution.base, solution.revision
+                    ),
+                );
+                notes.push(format!(
+                    "candidate-ready: carried the exact retained workload solution {} revision {} as {} on the fresh candidate allocation",
+                    solution.branch, solution.revision, head
+                ));
+                return Ok(CarryOutcome::Carried);
+            }
+            Err(reason) => failures.push(format!(
+                "{} revision {}: {reason}",
+                solution.branch, solution.revision
+            )),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(CarryOutcome::Absent);
+    }
+    let reason = format!(
+        "the retained workload solution recorded on card {} cannot be materialized exactly onto the resulting baseline: {}; no candidate is fabricated and no substitute implementation is dispatched - reconcile the named fact and resume",
+        run.spec.hypothesis_item,
+        failures.join("; ")
+    );
+    refused(run, notes, reason)?;
+    Ok(CarryOutcome::Refused)
+}
+
+/// The bounded retained `role=workload` implementation records of the run's
+/// own hypothesis card, in their recorded order.
+fn retained_workload_solutions(run: &Run) -> io::Result<Vec<RetainedWorkloadSolution>> {
+    let comments = harness_core::board_feedback::list_comments(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &run.spec.hypothesis_item,
+    )?;
+    let mut solutions = Vec::new();
+    for comment in &comments {
+        let Some(solution) = parse_retained_workload_solution(comment, &run.spec.hypothesis_item)
+        else {
+            continue;
+        };
+        solutions.push(solution);
+        if solutions.len() >= MAX_RETAINED_SOLUTIONS {
+            break;
+        }
+    }
+    Ok(solutions)
+}
+
+/// One `hypothesis-implementation v1` comment of this run's own card that
+/// names a `role=workload` solution. Every other comment - including this
+/// run's own `role=candidate` allocation - yields `None`.
+fn parse_retained_workload_solution(comment: &str, item: &str) -> Option<RetainedWorkloadSolution> {
+    let rest = comment
+        .trim_start()
+        .strip_prefix(board_hypothesis::IMPLEMENTATION_PREFIX)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if implementation_field(&fields, "item") != Some(item)
+        || implementation_field(&fields, "role") != Some("workload")
+    {
+        return None;
+    }
+    Some(RetainedWorkloadSolution {
+        branch: implementation_field(&fields, "branch")?.to_owned(),
+        base: implementation_field(&fields, "base")?.to_owned(),
+        revision: implementation_field(&fields, "revision")?.to_owned(),
+    })
+}
+
+fn implementation_field<'a>(fields: &[&'a str], key: &str) -> Option<&'a str> {
+    fields.iter().find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        (name == key && !value.is_empty()).then_some(value)
+    })
+}
+
+/// Materializes one retained solution's exact committed change onto the
+/// freshly allocated candidate branch and verifies every gate the ordinary
+/// implementation path applies: the change reproduces the retained content
+/// identity exactly, stays inside the declared writable scope or the
+/// candidate's own change, and leaves the frozen planning artifacts
+/// unchanged. The record's own worktree, branch and runtime are never reused
+/// or adopted. Returns the committed candidate revision.
+fn materialize_retained_solution(
+    run: &Run,
+    candidate: &mut CandidateState,
+    checkout: &CandidateCheckout,
+    solution: &RetainedWorkloadSolution,
+) -> Result<String, String> {
+    let retained = change_signature(&checkout.path, &solution.base, &solution.revision)?;
+    if retained.is_empty() {
+        return Err("the retained record names no committed change".to_owned());
+    }
+    let status = git_text(
+        &checkout.path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+    if !status.trim().is_empty() {
+        return Err(
+            "the candidate worktree is not clean; a retained solution is never materialized over local or untracked work"
+                .to_owned(),
+        );
+    }
+    let head = git_text(&checkout.path, &["rev-parse", "HEAD"])?;
+    let current = change_signature(&checkout.path, &checkout.base, &head)?;
+    let carried = if head != checkout.base && current == retained {
+        // A resume after a partial pass: the exact change is already the
+        // candidate head, so the same revision is adopted instead of a
+        // second commit being replayed.
+        head.clone()
+    } else if head == checkout.revision {
+        let patch = git_bytes(
+            &checkout.path,
+            &["diff", "--binary", &solution.base, &solution.revision],
+        )?;
+        git_apply_patch(&checkout.path, &patch)?;
+        let message = format!(
+            "carry retained workload solution {} ({})",
+            solution.branch,
+            retained_revision_short(&solution.revision)
+        );
+        git_text(
+            &checkout.path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-verify",
+                "-m",
+                &message,
+            ],
+        )?;
+        let committed = git_text(&checkout.path, &["rev-parse", "HEAD"])?;
+        if change_signature(&checkout.path, &checkout.base, &committed)? != retained {
+            restore_carried_revision(&checkout.path, &head);
+            return Err(
+                "the materialized change does not reproduce the retained change identity exactly"
+                    .to_owned(),
+            );
+        }
+        committed
+    } else {
+        return Err(format!(
+            "the candidate worktree is at {head} instead of its recorded revision {}; an unrecorded revision is never overwritten",
+            checkout.revision
+        ));
+    };
+    let verify = |carried: &str| -> Result<(), String> {
+        let changed = changed_paths(&checkout.path, &format!("{}..{carried}", checkout.base))?;
+        changed_paths_within_scope(&changed, &run.spec.writable_scope, &candidate.change)?;
+        let receipt: PlanningReceipt = read_json(
+            &run.store.root().join(CANDIDATE_PLANNING_FILE),
+            MAX_RUN_SPEC_BYTES,
+        )
+        .map_err(|error| {
+            format!("the qualified candidate planning receipt is unavailable: {error}")
+        })?;
+        let target = Specification {
+            project: checkout.path.clone(),
+            change: candidate.change.clone(),
+            store: run.spec.specification.store.clone(),
+            planning_root: checkout.path.clone(),
+        };
+        let openspec = OpenSpec::default();
+        let current = openspec
+            .qualify(&target, &run.spec.experiment)
+            .map_err(|error| {
+                format!(
+                    "the materialized revision broke the candidate's planning contract: {error}"
+                )
+            })?;
+        if artifact_digests(&current)? != artifact_digests(&receipt)?
+            || current.contract_digest != receipt.contract_digest
+        {
+            return Err(
+                "the materialized revision changed the candidate's frozen planning artifacts"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    };
+    if let Err(reason) = verify(&carried) {
+        if carried != head {
+            restore_carried_revision(&checkout.path, &head);
+        }
+        return Err(reason);
+    }
+    board_hypothesis::record_implementation(
+        &run.spec.board.bd,
+        &run.spec.board.project,
+        &candidate.hypothesis,
+        &BoundedImplementation {
+            role: board_hypothesis::HypothesisRole::Candidate,
+            branch: checkout.branch.clone(),
+            base: checkout.base.clone(),
+            revision: carried.clone(),
+            worktree: checkout.path.to_string_lossy().into_owned(),
+            runtime: None,
+            baseline_runtime: None,
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "the carried candidate revision could not be recorded on hypothesis card {}: {error}",
+            candidate.hypothesis
+        )
+    })?;
+    let mut advanced = checkout.clone();
+    advanced.revision = carried.clone();
+    candidate.worktree = Some(advanced);
+    candidate.revision = Some(carried.clone());
+    candidate.result = None;
+    Ok(carried)
+}
+
+/// Restores the candidate worktree to the revision the carry started from.
+/// Only this operation's own commit is undone, and only inside the owned
+/// clean candidate allocation that was verified immediately before it.
+fn restore_carried_revision(worktree: &Path, revision: &str) {
+    let _ = git_text(worktree, &["reset", "--hard", revision]);
+}
+
+fn retained_revision_short(revision: &str) -> &str {
+    &revision[..12.min(revision.len())]
+}
+
+/// The content identity of one committed change, exactly as the activation
+/// lineage owner computes it: the status and the resulting blob identity of
+/// every changed path, with rename detection disabled. Two commits that apply
+/// the same change to different bases share this signature, so a retained
+/// solution rebased onto the resulting baseline is recognized as the same
+/// exact solution while a different resolution or an extra edit is not.
+fn change_signature(repo: &Path, base: &str, revision: &str) -> Result<Vec<String>, String> {
+    let raw = git_text(
+        repo,
+        &[
+            "diff",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            base,
+            revision,
+        ],
+    )?;
+    let mut signature: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        // `:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>`
+        let Some(rest) = line.strip_prefix(':') else {
+            continue;
+        };
+        let Some((meta, path)) = rest.split_once('\t') else {
+            continue;
+        };
+        let fields: Vec<&str> = meta.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        signature.push(format!("{} {} {}", fields[4], fields[3], path));
+    }
+    signature.sort();
+    Ok(signature)
+}
+
+/// One read-only Git command whose exact stdout bytes are needed (a binary
+/// patch), never a display string.
+fn git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Applies one binary patch to the clean candidate worktree and its index.
+/// `git apply` is atomic: a patch that does not apply cleanly changes nothing.
+fn git_apply_patch(cwd: &Path, patch: &[u8]) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .args(["apply", "--index", "-"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git apply: {error}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "git apply stdin is unavailable".to_owned())?;
+        stdin
+            .write_all(patch)
+            .map_err(|error| format!("git apply stdin: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("git apply: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the exact retained change does not apply cleanly onto the resulting baseline: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Validates the returned committed implementation against the exact base, the

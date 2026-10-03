@@ -2542,6 +2542,338 @@ fn continuous_activation_without_a_successor_idles_without_a_model_call() {
     );
 }
 
+/// The supported transition after adoption: A's experiment was decided and
+/// the resulting baseline advanced; the independently specified successor
+/// investigates this run's evaluated workload B on its own declared workload
+/// C, and the controller starts it automatically with the retained lineage.
+#[test]
+fn an_adopted_experiment_continues_onto_the_independently_specified_successor() {
+    let fixture = Fixture::new("adopt-successor");
+    let workload = admit_distinct_hypothesis_card(&fixture, "bounded-input");
+    seed_comparison_spec(&fixture, &json!({}), "adopt-successor");
+    set_comparison_workload(&fixture.spec, &workload);
+    // B's own run: the successor spec independently declares hypothesis B
+    // evaluated on C - it is never inherited from this run's experiment.
+    let spec_b = fixture.root.join("spec-adopt-successor.json");
+    successor_run_spec(
+        &fixture,
+        &spec_b,
+        "loop-fixture-successor",
+        &workload,
+        "workload-c",
+    );
+    let run_b = fixture.root.join("runs-successor");
+    let started = fixture.improve(&[
+        "start",
+        "--run",
+        fixture.run.to_str().unwrap(),
+        "--spec",
+        fixture.spec.to_str().unwrap(),
+        "--successor-spec",
+        spec_b.to_str().unwrap(),
+        "--successor-run",
+        run_b.to_str().unwrap(),
+    ]);
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    // The settled adoption decision. This run's publication scope does not
+    // permit integration, so the baseline stays unchanged, the decision
+    // lineage is retained and the loop continues automatically.
+    fs::create_dir_all(fixture.run.join("comparison")).unwrap();
+    fs::write(
+        fixture.run.join("comparison/evaluation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "policyDigest": "a".repeat(64),
+            "decision": "adopt",
+            "basis": "efficiency",
+            "quality": "improved",
+            "matched": 1,
+            "baselineSeconds": 2.0,
+            "candidateSeconds": 1.0,
+            "tolerancePercent": 5.0,
+            "coverage": "fixture",
+            "scope": "fixture",
+            "reasons": ["the candidate improved the declared metric"],
+            "perSuccess": {
+                "status": "complete",
+                "seconds": 1.0,
+                "acceptedTasks": 1,
+                "tasks": 1,
+                "reason": "not used"
+            },
+            "attempts": 2,
+            "tasks": 1,
+            "acceptedTasks": 1,
+            "acceptanceRate": 1.0,
+            "tradeOffUsed": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("decision-recorded");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("independently specified successor"),
+        "{output}"
+    );
+    let lineage: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("lineage.json")).unwrap()).unwrap();
+    assert_eq!(lineage["decision"], "adopt", "{lineage}");
+    assert_eq!(lineage["workload_lineage"], json!([]), "{lineage}");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "completed", "{marker}");
+    assert_eq!(marker["exit_code"], 0, "{marker}");
+    assert_eq!(marker["decision"], "adopt", "{marker}");
+    assert_eq!(marker["hypothesis"], workload, "{marker}");
+    assert_eq!(marker["workload_card"], "workload-c", "{marker}");
+    assert!(
+        run_b.join("cursor.json").is_file(),
+        "the independently specified successor run was started"
+    );
+    assert!(run_b.join("spec.json").is_file());
+}
+
+/// A workload without a retained candidate patch does not fabricate one: the
+/// loop continues with another grounded hypothesis (the independently
+/// specified successor), starts no model work here and invents no artifact.
+#[test]
+fn a_workload_without_a_retained_candidate_continues_with_another_grounded_hypothesis() {
+    let fixture = Fixture::new("no-candidate-next");
+    let workload = admit_distinct_hypothesis_card(&fixture, "bounded-input");
+    let other = admit_distinct_hypothesis_card(&fixture, "bounded-quantity");
+    assert_ne!(workload, other);
+    seed_comparison_spec(&fixture, &json!({}), "no-candidate-next");
+    set_comparison_workload(&fixture.spec, &workload);
+    let workload_comments =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &workload).unwrap();
+    assert!(
+        !workload_comments
+            .iter()
+            .any(|comment| comment.contains("role=workload")),
+        "the workload card retains no candidate solution: {workload_comments:?}"
+    );
+    let spec_b = fixture.root.join("spec-no-candidate.json");
+    successor_run_spec(&fixture, &spec_b, "loop-fixture-next", &other, "workload-c");
+    let run_b = fixture.root.join("runs-next");
+    let started = fixture.improve(&[
+        "start",
+        "--run",
+        fixture.run.to_str().unwrap(),
+        "--spec",
+        fixture.spec.to_str().unwrap(),
+        "--successor-spec",
+        spec_b.to_str().unwrap(),
+        "--successor-run",
+        run_b.to_str().unwrap(),
+    ]);
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.run.join("comparison")).unwrap();
+    fs::write(
+        fixture.run.join("comparison/evaluation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "policyDigest": "a".repeat(64),
+            "decision": "reject",
+            "basis": "efficiency",
+            "quality": "regressed",
+            "matched": 1,
+            "baselineSeconds": 2.0,
+            "candidateSeconds": 3.0,
+            "tolerancePercent": 5.0,
+            "coverage": "fixture",
+            "scope": "fixture",
+            "reasons": ["the candidate regressed the declared metric"],
+            "perSuccess": {
+                "status": "undefined",
+                "seconds": Value::Null,
+                "acceptedTasks": 0,
+                "tasks": 1,
+                "reason": "not used"
+            },
+            "attempts": 2,
+            "tasks": 1,
+            "acceptedTasks": 1,
+            "acceptanceRate": 1.0,
+            "tradeOffUsed": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("decision-recorded");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "completed", "{marker}");
+    assert_eq!(marker["hypothesis"], other, "{marker}");
+    assert_eq!(marker["workload_card"], "workload-c", "{marker}");
+    assert!(
+        run_b.join("cursor.json").is_file(),
+        "the other grounded hypothesis started without a fabricated workload artifact"
+    );
+    let workload_comments_after =
+        harness_core::board_feedback::list_comments(&fixture.bd, &fixture.proj, &workload).unwrap();
+    assert_eq!(
+        workload_comments_after, workload_comments,
+        "no workload candidate or record was fabricated"
+    );
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+}
+
+/// Grounded selection: a declared successor that is not a valid independent
+/// run specification is refused with its exact reason; no successor process
+/// is started and nothing is manufactured for it.
+#[test]
+fn a_successor_that_is_not_an_independent_specification_is_not_started() {
+    let fixture = Fixture::new("invalid-successor");
+    seed_comparison_spec(&fixture, &json!({}), "invalid-successor");
+    let spec_b = fixture.root.join("spec-invalid-successor.json");
+    fs::write(&spec_b, br#"{"schema":1}"#).unwrap();
+    let run_b = fixture.root.join("runs-invalid");
+    let started = fixture.improve(&[
+        "start",
+        "--run",
+        fixture.run.to_str().unwrap(),
+        "--spec",
+        fixture.spec.to_str().unwrap(),
+        "--successor-spec",
+        spec_b.to_str().unwrap(),
+        "--successor-run",
+        run_b.to_str().unwrap(),
+    ]);
+    assert!(started.status.success(), "{}", text(&started));
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.run.join("comparison")).unwrap();
+    fs::write(
+        fixture.run.join("comparison/evaluation.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "policyDigest": "a".repeat(64),
+            "decision": "reject",
+            "basis": "efficiency",
+            "quality": "regressed",
+            "matched": 1,
+            "baselineSeconds": 2.0,
+            "candidateSeconds": 3.0,
+            "tolerancePercent": 5.0,
+            "coverage": "fixture",
+            "scope": "fixture",
+            "reasons": ["the candidate regressed the declared metric"],
+            "perSuccess": {
+                "status": "undefined",
+                "seconds": Value::Null,
+                "acceptedTasks": 0,
+                "tasks": 1,
+                "reason": "not used"
+            },
+            "attempts": 2,
+            "tasks": 1,
+            "acceptedTasks": 1,
+            "acceptanceRate": 1.0,
+            "tradeOffUsed": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let head = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let mut cursor = fixture.cursor();
+    cursor["phase"] = json!("decision-recorded");
+    cursor["condition"] = Value::Null;
+    cursor["candidate"] = json!({
+        "hypothesis": fixture.card,
+        "change": "add-synthetic",
+        "revision": head,
+        "worktree": {
+            "source": fixture.proj,
+            "path": fixture.proj,
+            "branch": "improve/fixture",
+            "base": head,
+            "revision": head,
+        }
+    });
+    fixture.write_cursor(&cursor);
+
+    let resumed = fixture.resume();
+    let output = text(&resumed);
+    assert!(resumed.status.success(), "{output}");
+    let report = status_value(&fixture);
+    assert_eq!(report["phase"], "idle", "{report}\n{output}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a valid independent run specification"),
+        "{report}\n{output}"
+    );
+    let marker: Value =
+        serde_json::from_slice(&fs::read(fixture.run.join("continuation.json")).unwrap()).unwrap();
+    assert_eq!(marker["phase"], "intent", "{marker}");
+    assert!(
+        marker["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a valid independent run specification"),
+        "{marker}"
+    );
+    assert!(
+        !run_b.exists(),
+        "no successor process was started for an invalid specification"
+    );
+    assert!(fixture.cursor()["attempts"].as_array().unwrap().is_empty());
+}
+
 #[test]
 fn a_new_start_defaults_to_continuous_and_consumes_one_stop_request_per_resume() {
     let fixture = Fixture::new("default-supervision");
@@ -3351,6 +3683,60 @@ fn admit_prior_hypothesis_card(fixture: &Fixture, mechanism: &str) -> String {
         .to_owned();
     assert!(!id.is_empty(), "prior admission named no card: {printed}");
     id
+}
+
+/// One admitted hypothesis card with its own distinct mechanism identity and
+/// the fixture's complete OpenSpec change. The merged admission owner reuses
+/// one card per mechanism/conditions identity, so a distinct mechanism
+/// yields a distinct durable owner - as an evaluated workload B or another
+/// independently specified next hypothesis.
+fn admit_distinct_hypothesis_card(fixture: &Fixture, mechanism: &str) -> String {
+    let out = fixture.feedback(&[
+        "hypothesis-admit",
+        "--mechanism",
+        mechanism,
+        "--conditions",
+        "local-tool-runs",
+        "--observation",
+        "token-audit:other#4",
+        "--predicted",
+        "another grounded hypothesis continues",
+        "--counterexample",
+        "the workload produced no candidate patch",
+        "--acceptance",
+        "the independent oracle passes",
+        "--spec",
+        "openspec/changes/add-synthetic",
+        "--basis",
+        "token-audit:other#4",
+    ]);
+    assert!(out.status.success(), "other admit: {}", text(&out));
+    let printed = text(&out);
+    let id = printed
+        .strip_prefix("hypothesis ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!id.is_empty(), "other admission named no card: {printed}");
+    id
+}
+
+/// Rewrite one run spec's declared comparison workload card in place.
+fn set_comparison_workload(spec_path: &Path, workload: &str) {
+    let mut document: Value = serde_json::from_slice(&fs::read(spec_path).unwrap()).unwrap();
+    document["comparison"]["workload_card"] = json!(workload);
+    fs::write(spec_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+}
+
+/// One independently specified successor run spec: this fixture's own run
+/// inputs with their own run identity, hypothesis card and declared workload
+/// C, exactly as an operator declares the next run.
+fn successor_run_spec(fixture: &Fixture, path: &Path, run: &str, hypothesis: &str, workload: &str) {
+    let mut document: Value = serde_json::from_slice(&fs::read(&fixture.spec).unwrap()).unwrap();
+    document["run"] = json!(run);
+    document["hypothesis_item"] = json!(hypothesis);
+    document["comparison"]["workload_card"] = json!(workload);
+    fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 }
 
 /// Record one retained task on its owner card through the durable board
