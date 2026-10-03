@@ -776,6 +776,9 @@ fn refusal_deferral_and_idle_leave_the_board_untouched() {
                 gaps: "no machine-readable use from two workstations".to_owned(),
                 lost_uses: "manual fallback remains available".to_owned(),
                 restoration: "restore from the retained source revision".to_owned(),
+                consumption:
+                    "each arm records the effective catalogue identity and where the capability was consumed"
+                        .to_owned(),
             },
         },
     };
@@ -795,4 +798,57 @@ fn refusal_deferral_and_idle_leave_the_board_untouched() {
         }
         other => panic!("expected a removal candidate admission, got {other:?}"),
     }
+}
+
+#[test]
+fn removal_coverage_requires_consumption_evidence_before_admission() {
+    let bd = bd_executable();
+    let temp = tempfile::tempdir().unwrap();
+    let project = board_project(temp.path());
+    let evidence = EvidenceItem::new(
+        "outcome:cycle-1#task",
+        EvidenceOwner::Outcome,
+        ClaimKind::Observed,
+        "rounds=2 attempts=1",
+        &[],
+        &[],
+    )
+    .unwrap();
+    let index = EvidenceIndex::new(vec![evidence]).unwrap();
+
+    // A coverage basis that names no way to observe actual consumption of
+    // the removed burden is refused before removal planning: invocation
+    // counts and catalogue/context exposure are distinct, so zero
+    // invocations cannot stand in for consumption evidence.
+    let mut removal = base_proposal("outcome:cycle-1#task");
+    removal.observation = "outcome:cycle-1#task".to_owned();
+    removal.evidence = vec![EvidenceRef {
+        locator: "outcome:cycle-1#task".to_owned(),
+        kind: ClaimKind::Observed,
+    }];
+    removal.treatment = Treatment::Subtraction {
+        removal: RemovalClaim {
+            target: "dormant-helper".to_owned(),
+            basis: RemovalBasis::Coverage {
+                interval: "180d".to_owned(),
+                tasks: "all recorded synthetic tasks".to_owned(),
+                gaps: "no machine-readable use from two workstations".to_owned(),
+                lost_uses: "manual fallback remains available".to_owned(),
+                restoration: "restore from the retained source revision".to_owned(),
+                consumption: "   ".to_owned(),
+            },
+        },
+    };
+    let outcomes = intake(&bd, &project, &report(removal), &index).unwrap();
+    assert!(
+        matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("consumption evidence is required"))),
+        "{:?}",
+        outcomes.outcomes[0]
+    );
+    assert!(
+        board_hypothesis::list_hypothesis_cards(&bd, &project)
+            .unwrap()
+            .is_empty(),
+        "a coverage basis without consumption evidence creates no card"
+    );
 }

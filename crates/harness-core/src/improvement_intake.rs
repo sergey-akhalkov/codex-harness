@@ -32,9 +32,11 @@
 //!   same file, content and context identity admit the claim;
 //! - retention, not use counts, grounds a hypothesis: a subtraction or
 //!   simplification proposal is only admitted with a bounded
-//!   coverage/lost-use/restoration basis, usage volume alone defers to further
-//!   investigation, and this module never applies a removal - the user's
-//!   informed decision remains owned by the removal proposal/decision verbs;
+//!   coverage/lost-use/consumption/restoration basis, usage volume alone
+//!   defers to further investigation (invocation counts and catalogue or
+//!   context exposure are distinct), and this module never applies a removal -
+//!   the user's informed decision remains owned by the removal
+//!   proposal/decision verbs;
 //! - prior results participate in admission through
 //!   [`crate::board_hypothesis::admit_hypothesis`]: open, closed and deferred
 //!   same-condition cards are reused, and only a recorded new evidential basis
@@ -547,6 +549,13 @@ pub enum RemovalBasis {
         gaps: String,
         lost_uses: String,
         restoration: String,
+        /// How each arm's actual consumption of the removed burden
+        /// (invocation or catalogue/instruction/initialization exposure) is
+        /// evidenced separately from invocation counts. A missing or blank
+        /// value is refused by intake validation; older records stay readable
+        /// so the gap is reported instead of silently ignored.
+        #[serde(default)]
+        consumption: String,
     },
 }
 
@@ -1401,11 +1410,11 @@ fn validate_removal(removal: &RemovalClaim, issues: &mut Vec<Issue>) -> bool {
             let window = bounded_line("usage window", window, MAX_STATEMENT, issues);
             issues.push(Issue::missing(
                 format!(
-                    "removal of {} rests on usage volume ({invocations} invocation(s) over {}); low or absent use is a lead for investigation, not a finding of uselessness, and removal needs the user's informed decision",
+                    "removal of {} rests on usage volume ({invocations} invocation(s) over {}); low or absent use is a lead for investigation, not a finding of uselessness (invocation counts are not consumption: catalogue, instruction and initialization cost can exist with zero invocations), and removal needs the user's informed decision",
                     target.as_deref().unwrap_or("the claimed target"),
                     window.as_deref().unwrap_or("an unrecorded window")
                 ),
-                "record the observation interval, task/environment coverage, supported rare, explicit and indirect uses, lost scenarios and a restoration route in a removal proposal before dependent work",
+                "record the observation interval, task/environment coverage, supported rare, explicit and indirect uses, how actual consumption of the removed burden is evidenced in each arm, lost scenarios and a restoration route in a removal proposal before dependent work",
             ));
             false
         }
@@ -1415,12 +1424,14 @@ fn validate_removal(removal: &RemovalClaim, issues: &mut Vec<Issue>) -> bool {
             gaps,
             lost_uses,
             restoration,
+            consumption,
         } => {
             let _ = bounded_line("coverage interval", interval, MAX_STATEMENT, issues);
             let _ = bounded_line("covered tasks", tasks, MAX_STATEMENT, issues);
             let _ = bounded_line("coverage gaps", gaps, MAX_STATEMENT, issues);
             let _ = bounded_line("lost uses", lost_uses, MAX_STATEMENT, issues);
             let _ = bounded_line("restoration", restoration, MAX_STATEMENT, issues);
+            let _ = bounded_line("consumption evidence", consumption, MAX_STATEMENT, issues);
             true
         }
     }
@@ -1937,6 +1948,31 @@ mod tests {
         };
         assert!(reason.contains("lead for investigation"), "{reason}");
         assert!(next.contains("removal proposal"), "{next}");
+    }
+
+    #[test]
+    fn removal_coverage_needs_consumption_evidence() {
+        let (bd, project) = unowned_board();
+        let mut candidate = addition("retire-dormant-helper");
+        candidate.treatment = Treatment::Subtraction {
+            removal: RemovalClaim {
+                target: "dormant-helper".to_owned(),
+                basis: RemovalBasis::Coverage {
+                    interval: "180d".to_owned(),
+                    tasks: "all recorded synthetic tasks".to_owned(),
+                    gaps: "none observed".to_owned(),
+                    lost_uses: "manual fallback remains available".to_owned(),
+                    restoration: "restore from the retained source revision".to_owned(),
+                    consumption: "  ".to_owned(),
+                },
+            },
+        };
+        let outcomes = intake(bd, project, &report(candidate), &index()).unwrap();
+        assert!(
+            matches!(&outcomes.outcomes[0], IntakeOutcome::Refused { reasons } if reasons.iter().any(|reason| reason.contains("consumption evidence is required"))),
+            "{:?}",
+            outcomes.outcomes[0]
+        );
     }
 
     #[test]

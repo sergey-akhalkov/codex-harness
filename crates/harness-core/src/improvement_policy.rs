@@ -127,6 +127,17 @@ impl Basis {
             Self::Maintenance { basis } => Some(basis),
         }
     }
+
+    /// The basis text recorded on every measured attempt before results. A
+    /// maintenance-only result is adopted only when the recorded declaration
+    /// carries the same pre-agreed basis, never a reason reconstructed after
+    /// seeing the outcome.
+    pub fn declaration_text(&self) -> String {
+        match self {
+            Self::Efficiency => "efficiency".to_owned(),
+            Self::Maintenance { basis } => format!("maintenance: {basis}"),
+        }
+    }
 }
 
 /// How a candidate selected from several observed attempts is treated.
@@ -224,6 +235,7 @@ impl ComparisonPolicy {
         let mut value = json!({
             "task_mix": self.task_mix,
             "objective": self.objective.as_str(),
+            "basis": self.basis.declaration_text(),
             "nuisance": true,
             "stopping": self.stopping_text(),
             "uncertainty": self.uncertainty,
@@ -479,7 +491,22 @@ struct UnitFacts {
     time_uncertain: bool,
     /// Candidate token increase over baseline, when both totals were observed.
     token_regression: Option<f64>,
+    /// Subtractive applicability recorded by the accounting, when declared.
+    subtractive: Option<SubtractiveFacts>,
     limitations: Vec<String>,
+}
+
+/// What the authoritative accounting recorded for a subtractive unit: the
+/// removed burden and whether both arms establish actual consumption before
+/// removal with the baseline's required checks retained.
+struct SubtractiveFacts {
+    removed: String,
+    applicability: String,
+    retained_checks: bool,
+    /// The unit records its net effect over the declared use horizon (the
+    /// declared implementation, evaluation and recurring maintenance or
+    /// manual-fallback cost included).
+    repayment: bool,
 }
 
 fn unit_limitations(unit: &Value) -> Vec<String> {
@@ -716,6 +743,18 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             (None, None) => {}
             _ => drift.push(format!("unit {name}: declared meaningful effect differs")),
         }
+        // A maintenance-only result is adopted only under the basis recorded
+        // before results. Evidence recorded without it (or with another
+        // basis) cannot become a post-hoc maintenance exemption; evidence
+        // from before this field existed keeps the default efficiency reading.
+        match declared_value.get("basis").and_then(Value::as_str) {
+            Some(basis) if basis == policy.basis.declaration_text() => {}
+            None if policy.basis.maintenance_basis().is_none() => {}
+            _ => drift.push(format!(
+                "unit {name}: the recorded basis is missing or differs from the predeclared {} basis",
+                policy.basis.as_str()
+            )),
+        }
     }
 
     let mut attempts_per_arm: BTreeMap<String, u64> = BTreeMap::new();
@@ -814,6 +853,24 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 == Some("does_not_repay"),
             time_uncertain,
             token_regression,
+            subtractive: (unit.get("subtractive") == Some(&Value::Bool(true))).then(|| {
+                SubtractiveFacts {
+                    removed: unit
+                        .get("removed_burden")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(unnamed)")
+                        .to_owned(),
+                    applicability: unit
+                        .get("applicability")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    retained_checks: unit.get("retained_checks") == Some(&Value::Bool(true)),
+                    repayment: unit
+                        .get("net_saving")
+                        .is_some_and(|saving| !saving.is_null()),
+                }
+            }),
             limitations: unit_limitations(unit),
             name,
         });
@@ -1085,6 +1142,47 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                     .to_owned(),
             );
             decision = PolicyDecision::Inconclusive;
+        } else if let Some(fact) = facts.iter().find(|fact| {
+            fact.subtractive.as_ref().is_some_and(|subtractive| {
+                !subtractive.retained_checks
+                    || subtractive.applicability != "exercised"
+                    || (!subtractive.repayment
+                        && policy.basis.maintenance_basis().is_none()
+                        && policy.objective != Objective::Quality)
+            })
+        }) {
+            let subtractive = fact
+                .subtractive
+                .as_ref()
+                .expect("the matched fact declares a subtractive treatment");
+            if !subtractive.retained_checks {
+                reasons.push(format!(
+                    "the subtractive candidate on unit {} records fewer required checks than the baseline for the removed burden {}; removing the check that would expose a regression cannot support adoption",
+                    fact.name, subtractive.removed
+                ));
+                decision = PolicyDecision::Reject;
+            } else if subtractive.applicability != "exercised" {
+                reasons.push(match subtractive.applicability.as_str() {
+                    "not_exercised" => format!(
+                        "the workload never exercised the removed burden {} (unit {}); removing an unconsumed burden cannot establish a useful saving, and broader usefulness stays unresolved rather than rejected",
+                        subtractive.removed, fact.name
+                    ),
+                    _ => format!(
+                        "actual consumption of the removed burden {} is not established on unit {}; the intended context treatment is unproven and cannot support a saving",
+                        subtractive.removed, fact.name
+                    ),
+                });
+                for limitation in fact.limitations.iter().take(2) {
+                    reasons.push(format!("unit {}: {limitation}", fact.name));
+                }
+                decision = PolicyDecision::Inconclusive;
+            } else {
+                reasons.push(format!(
+                    "the subtractive result on unit {} records no repayment over the declared use horizon; the declared manual/fallback and maintenance cost must be included before adoption",
+                    fact.name
+                ));
+                decision = PolicyDecision::Inconclusive;
+            }
         } else if !incomplete.is_empty() {
             reasons.push(format!(
                 "comparison evidence is incomplete for {} unit(s); unknown evidence is not a decision basis",

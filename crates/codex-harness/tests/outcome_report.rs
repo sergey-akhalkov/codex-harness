@@ -246,3 +246,132 @@ fn malformed_oversized_and_duplicate_inputs_fail_privately_without_mutation() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+#[test]
+fn subtractive_consumption_and_retained_checks_survive_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("subtractive.json");
+    let declaration = json!({
+        "task_mix": "focused cases",
+        "objective": "time",
+        "effect_percent": 5.0,
+        "nuisance": ["fixed order"],
+        "stopping": "single attempt",
+        "uncertainty": "none beyond elapsed",
+        "horizon_tasks": 10.0,
+        "costs": {
+            "implementation_seconds": 1.0,
+            "evaluation_seconds": 1.0,
+            "maintenance_seconds_per_task": 0.0
+        }
+    });
+    let subtractive = |mut row: Value, status: &str| {
+        row["experiment_id"] = json!("exp-1");
+        row["pair_id"] = json!("pair-1");
+        row["declaration"] = declaration.clone();
+        row["observed_model_metadata_verified"] = json!(true);
+        row["treatment"] = json!({"kind": "subtraction", "removed": "catalogue-skill"});
+        row["consumption"] = json!({
+            "capability": "catalogue-skill",
+            "status": status,
+            "evidence": "private/consumption.json"
+        });
+        row
+    };
+    let baseline = subtractive(attempt("a", "baseline"), "consumed");
+    let mut candidate = subtractive(faster(attempt("b", "candidate"), 8.0), "absent");
+
+    // The burden was consumed before removal and the candidate is observed
+    // not to consume it: the unit keeps the recorded applicability and can
+    // support its scoped saving.
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline.clone(), candidate.clone()])).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unit = &report["units"][0];
+    assert_eq!(unit["subtractive"], true);
+    assert_eq!(unit["removed_burden"], "catalogue-skill");
+    assert_eq!(unit["applicability"], "exercised");
+    assert_eq!(unit["retained_checks"], true);
+    assert_eq!(unit["evidence_complete"], true);
+    assert_eq!(unit["positive_effect"], true);
+    assert_eq!(unit["net_saving"]["verdict"], "net_saving");
+
+    // Stale context after removal: the candidate arm still consumes the
+    // removed burden, so the intended context treatment is not established
+    // and a smaller source tree cannot support a saving.
+    candidate["consumption"]["status"] = json!("consumed");
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline.clone(), candidate.clone()])).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unit = &report["units"][0];
+    assert_eq!(unit["applicability"], "unknown");
+    assert_eq!(unit["evidence_complete"], false);
+    assert_eq!(unit["positive_effect"], false);
+    assert!(
+        unit["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|limitation| limitation
+                .as_str()
+                .unwrap_or("")
+                .contains("still records consumption")),
+        "{:?}",
+        unit["limitations"]
+    );
+
+    // A replaced acceptance check leaves the candidate's own record passing
+    // but removes required coverage relative to the baseline; the lower check
+    // cost cannot become an accounted saving.
+    candidate["consumption"]["status"] = json!("absent");
+    candidate["checks"][0]["id"] = json!("quick-check");
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline.clone(), candidate.clone()])).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unit = &report["units"][0];
+    assert_eq!(unit["retained_checks"], false);
+    assert_eq!(unit["evidence_complete"], false);
+
+    // Deleting the acceptance check outright leaves the candidate without
+    // independent acceptance: the pair has no comparable, independently
+    // accepted result and cannot become a decision basis.
+    candidate["checks"] = json!([]);
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!([baseline, candidate])).unwrap(),
+    )
+    .unwrap();
+    let output = run(&input, false);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["attempts"][1]["status"], "incomplete");
+    assert_eq!(report["accounting"]["accepted_tasks"], 1);
+    assert_eq!(report["comparisons"][0]["comparable"], false);
+    assert!(
+        report["comparisons"][0]["excluded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("outcome_incomplete")),
+        "{:?}",
+        report["comparisons"][0]["excluded_reasons"]
+    );
+}
