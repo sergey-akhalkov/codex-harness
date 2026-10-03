@@ -1397,6 +1397,67 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_token_categories_are_flagged_without_rewriting_or_zero_filling() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cumulative = counts(20);
+        cumulative["cached_input_tokens"] = json!(30);
+        cumulative["reasoning_output_tokens"] = json!(40);
+        let mut response = counts(10);
+        response["cached_input_tokens"] = json!(12);
+        response["reasoning_output_tokens"] = json!(7);
+        let path = write(
+            root.path(),
+            "overlap.jsonl",
+            &[
+                meta("thread_overlap"),
+                context(),
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":cumulative}}}),
+                json!({"type":"token_usage_record","payload":{"response_id":"resp_overlap","usage":response}}),
+            ],
+        );
+        let session = read(&path);
+        // Subset violations are flagged; the recorded values stay exactly as
+        // recorded instead of being clamped, dropped or zero-filled.
+        assert!(session.warnings.contains("cached_input_exceeds_input"));
+        assert!(
+            session
+                .warnings
+                .contains("reasoning_not_included_in_output")
+        );
+        assert_eq!(session.row["input_tokens"], 20);
+        assert_eq!(session.row["cached_input_tokens"], 30);
+        assert_eq!(session.row["output_tokens"], 10);
+        assert_eq!(session.row["reasoning_output_tokens"], 40);
+        assert_eq!(
+            session.row["response_usages"]["resp_overlap"]["cached_input_tokens"],
+            12
+        );
+        assert_eq!(
+            session.row["response_usages"]["resp_overlap"]["reasoning_output_tokens"],
+            7
+        );
+
+        // A category no record carried stays missing, never zero.
+        let mut missing = counts(10);
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_output_tokens");
+        let path = write(
+            root.path(),
+            "missing.jsonl",
+            &[
+                meta("thread_missing"),
+                context(),
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":missing}}}),
+            ],
+        );
+        let session = read(&path);
+        assert!(session.row["reasoning_output_tokens"].is_null());
+        assert!(session.warnings.contains("invalid_or_missing_token_fields"));
+    }
+
+    #[test]
     fn a_response_tool_call_keeps_its_identity_without_inventing_a_join() {
         let root = tempfile::tempdir().unwrap();
         let path = write(
@@ -1847,10 +1908,11 @@ mod tests {
             ParserCheckpoint::from_bytes(b"not a checkpoint"),
             Err(CheckpointError::Corrupt)
         ));
-        let foreign =
-            String::from_utf8(bytes)
-                .unwrap()
-                .replacen("\"parser\":1", "\"parser\":999", 1);
+        let foreign = String::from_utf8(bytes).unwrap().replacen(
+            &format!("\"parser\":{PARSER_VERSION}"),
+            "\"parser\":999",
+            1,
+        );
         assert!(matches!(
             ParserCheckpoint::from_bytes(foreign.as_bytes()),
             Err(CheckpointError::VersionMismatch)
