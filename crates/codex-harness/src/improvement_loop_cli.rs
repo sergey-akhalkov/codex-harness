@@ -32,7 +32,7 @@ use crate::executor_cli::{
 use harness_core::board_feedback;
 use harness_core::board_hypothesis;
 use harness_core::build_identity;
-use harness_core::improvement_experiment::{self, Arm, PreparedVariant};
+use harness_core::improvement_experiment::{self, Arm, CorroborationStatus, PreparedVariant};
 use harness_core::improvement_loop::{
     Attempt, AttemptRole, AttemptState, CURSOR_FILE, Cursor, DispatchBinding, DispatchFacts,
     DispatchGate, EffectKind, HostBinding, IdentityCheck, MAX_RUN_SPEC_BYTES, ObservedIdentity,
@@ -93,8 +93,23 @@ the evidence root, the consumed intake outcomes, the selected candidate with
 its branch/base/revision, the dispatch gate, the removal gate, the
 directed-measurement gate state (the declared measurement-scope file and the
 retained measurement receipt), every attempt with its receipt, the selected
-prepared variant and the phases still pending. It performs no model call.
+prepared variant, the decision-boundary consumption receipts (the retained
+completed real task, the declared corroboration selection and the unadopted
+reconcile record) and the phases still pending. It performs no model call.
 --json prints the same report as JSON.
+
+Once a decision is settled, the controller routes it to the merged owners
+without another user confirmation: the completed real workload task is
+retained as identity-only replayable pre-solution inputs under the card that
+already owns it, additional independent corroboration units are selected when
+the predeclared policy requires them (too few applicable units stay explicitly
+inconclusive), and an unadopted decision reconciles the hypothesis' own
+OpenSpec change - retention reads its actual task state and writes nothing,
+while archival uses the supported non-synchronizing path only when every
+required task is done. No unadopted delta reaches the main specifications and
+no unfinished required task is closed through an experiment outcome. An
+adopted decision is not reconciled here: its delta synchronizes through the
+adoption/integration owner.
 
 select activates an already prepared baseline/candidate variant through the
 shared runtime-selection primitive, records the identity it actually consumed
@@ -799,6 +814,45 @@ fn run_report(run: &Run) -> io::Result<serde_json::Value> {
             "evaluation": state.evaluation.as_ref().map(|path| path.display().to_string()),
             "decision": state.decision,
         })),
+        "retention": improvement_driver::retention_receipt(run)?.as_ref().map(|receipt| json!({
+            "status": receipt.status,
+            "owner": receipt.owner,
+            "case_id": receipt.case_id,
+            "experiment": receipt.experiment,
+            "revision": receipt.revision,
+            "frozen": receipt.frozen,
+            "tree": receipt.tree,
+            "replay": receipt.replay.as_ref().map(|path| path.display().to_string()),
+            "reason": receipt.reason,
+        })),
+        "corroboration": improvement_driver::corroboration_receipt(run)?.as_ref().map(|receipt| json!({
+            "status": receipt.status,
+            "required_units": receipt.required_units,
+            "ready": receipt.selection.as_ref().map(|selection| selection.is_ready()),
+            "units": receipt.selection.as_ref().map(|selection| selection.units.iter().map(|unit| json!({
+                "owner": unit.owner,
+                "case_id": unit.case_id,
+                "experiment": unit.experiment,
+                "mechanism": unit.mechanism,
+                "conditions": unit.conditions,
+                "revision": unit.revision,
+                "tree_sha256": unit.tree_sha256,
+            })).collect::<Vec<_>>()),
+            "excluded": receipt.selection.as_ref().map(|selection| selection.excluded.iter().map(|unit| json!({
+                "owner": unit.owner,
+                "case_id": unit.case_id,
+            })).collect::<Vec<_>>()),
+            "reason": receipt.reason,
+        })),
+        "reconcile": improvement_driver::reconcile_receipt(run)?.as_ref().map(|receipt| json!({
+            "item": receipt.item,
+            "outcome": receipt.outcome,
+            "action": receipt.action,
+            "change": receipt.change,
+            "status": receipt.status,
+            "exit_code": receipt.exit_code,
+            "detail": receipt.detail,
+        })),
         "intake": run.cursor.intake.as_ref().map(|intake| json!({
             "result_sha256": intake.result_sha256,
             "evidence_digest": intake.evidence_digest,
@@ -1009,6 +1063,76 @@ fn print_report(run: &Run) -> io::Result<()> {
             } else {
                 "not declared; the run stops at candidate-ready"
             }
+        ),
+    }
+    match improvement_driver::retention_receipt(run)? {
+        Some(receipt) => println!(
+            "retention: status={} owner={} case={} replay={} reason={}",
+            receipt.status,
+            receipt.owner,
+            receipt.case_id,
+            receipt
+                .replay
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            receipt.reason.as_deref().unwrap_or("none")
+        ),
+        None => println!(
+            "retention: none recorded yet (the completed real task is retained at the decision boundary)"
+        ),
+    }
+    match improvement_driver::corroboration_receipt(run)? {
+        Some(receipt) => {
+            let (state, units, excluded, reason) = match &receipt.selection {
+                Some(selection) => (
+                    if selection.is_ready() {
+                        "ready"
+                    } else {
+                        "inconclusive"
+                    },
+                    selection.units.len(),
+                    selection.excluded.len(),
+                    match &selection.status {
+                        CorroborationStatus::Inconclusive(reason) => reason.clone(),
+                        CorroborationStatus::Ready => "none".to_owned(),
+                    },
+                ),
+                None => (
+                    "unavailable",
+                    0,
+                    0,
+                    receipt
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "no detail".to_owned()),
+                ),
+            };
+            println!(
+                "corroboration: required=+{} status={} units={} excluded={} reason={}",
+                receipt.required_units,
+                state,
+                units,
+                excluded,
+                bounded_reason(&reason)
+            );
+        }
+        None => println!(
+            "corroboration: none recorded yet (selected when the declared adoption scope requires additional units)"
+        ),
+    }
+    match improvement_driver::reconcile_receipt(run)? {
+        Some(receipt) => println!(
+            "reconcile: item={} outcome={} action={} change={} status={} detail={}",
+            receipt.item,
+            receipt.outcome,
+            receipt.action,
+            receipt.change,
+            receipt.status,
+            receipt.detail.as_deref().unwrap_or("none")
+        ),
+        None => println!(
+            "reconcile: none recorded yet (an unadopted decision reconciles its own change)"
         ),
     }
     println!(
