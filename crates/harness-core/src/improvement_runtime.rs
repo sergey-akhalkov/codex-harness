@@ -37,8 +37,10 @@
 //! 4. `ExperimentBindings::validate` / `verify_pre_attempt` before the first
 //!    measured attempt; [`verify_consumption`] additionally proves this arm's
 //!    home still consumes exactly the prepared runtime and content.
-//! 5. `improvement_experiment::select_variant` between attempts, with
-//!    `attempt_active` while a measured attempt holds its frozen runtime.
+//! 5. [`select_arm`] between attempts to select one arm's prepared runtime
+//!    through the existing runtime-selection owner and re-verify the identity
+//!    it actually consumes, with `attempt_active` while a measured attempt
+//!    holds its frozen runtime.
 //! 6. [`retire_arm`] when the arm's homes are no longer needed (an aborted
 //!    preparation can be restored with [`discard_arm`]): both restore through
 //!    the registered disconnection owner and touch only recorded owned links.
@@ -56,7 +58,7 @@
 
 use crate::{
     build_identity, core_disconnect, core_install,
-    improvement_experiment::{Arm, PreparedVariant},
+    improvement_experiment::{Arm, ConsumedVariant, PreparedVariant, select_variant},
     installation_lock::InstallationLock,
     installation_state::PathScope,
     inventory,
@@ -511,6 +513,30 @@ pub struct Consumption {
     pub record_sha256: String,
     pub launcher_sha256: String,
     pub model_ready: bool,
+    pub model_calls: u32,
+}
+
+/// One explicit selection of a prepared arm at a safe boundary.
+///
+/// The journaled active-runtime pointer inside the caller's owned state is
+/// the only shared mutable state this operation touches. Each arm's home,
+/// configuration, instructions, skills and tools stay exactly as prepared:
+/// they are verified read-only and never merged or rewritten by selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Selection {
+    pub schema: u32,
+    pub status: String,
+    pub arm: Arm,
+    pub label: String,
+    /// True when this call moved the shared active-runtime pointer; a
+    /// repeated selection of the same prepared arm reports `false`.
+    pub applied: bool,
+    /// The installed arm identity re-verified as actually consumed.
+    pub consumption: Consumption,
+    /// The prepared variant identity reported by the existing selection
+    /// owner.
+    pub selected: ConsumedVariant,
     pub model_calls: u32,
 }
 
@@ -2253,6 +2279,64 @@ pub fn verify_consumption_with_trust(
         record_sha256: runtime.variant.record_sha256.clone(),
         launcher_sha256: runtime.launcher.sha256.clone(),
         model_ready: runtime.client_configured(),
+        model_calls: 0,
+    })
+}
+
+/// Select one prepared arm through the existing runtime-selection owner and
+/// report the identity that is actually consumed.
+///
+/// - An active measured attempt holds its frozen runtime: `attempt_active`
+///   refuses before any state is read or written, and every later attempt
+///   still begins from a fresh executor home.
+/// - The installed arm must re-verify as consumed exactly as prepared (same
+///   build, launcher, instructions, skills, tools, configuration and copied
+///   inputs). A drifted arm refuses instead of reporting an unverified
+///   selection, while the other arm stays untouched and selectable.
+/// - Selecting an already active prepared arm reports the same identity with
+///   `applied = false`: no source revert, no source cleanup, no rebuild and
+///   no model call. Prepared artifacts are reused exactly as published; a
+///   missing or stale artifact refuses instead of triggering a hidden
+///   rebuild outside accounting.
+/// - Shared state stays controlled: the caller passes the single owned state
+///   that the selection owner journals, and the other shared resources
+///   (model server, caches, ports, workers) remain explicit and serialized
+///   by the caller as documented at the module top level.
+pub fn select_arm(
+    state: &Path,
+    runtime: &ArmRuntime,
+    attempt_active: bool,
+) -> io::Result<Selection> {
+    if attempt_active {
+        return Err(invalid(format!(
+            "a measured attempt is active; the {} runtime is frozen until it finishes or is cancelled",
+            runtime.label
+        )));
+    }
+    let consumption = verify_consumption(runtime)?;
+    if !same_place(&consumption.build, &runtime.variant.build)? {
+        return Err(invalid(format!(
+            "the {} arm does not consume its prepared variant; refusing to select an unverified runtime",
+            runtime.label
+        )));
+    }
+    let selected = select_variant(state, &runtime.variant, false)?;
+    if !same_place(&selected.build, &consumption.build)?
+        || selected.record_sha256 != consumption.record_sha256
+    {
+        return Err(invalid(format!(
+            "the selected {} runtime is not the identity this arm consumes; refusing to report an unverified selection",
+            runtime.label
+        )));
+    }
+    Ok(Selection {
+        schema: RUNTIME_SCHEMA,
+        status: "selected".into(),
+        arm: runtime.arm,
+        label: runtime.label.clone(),
+        applied: selected.changed,
+        consumption,
+        selected,
         model_calls: 0,
     })
 }
