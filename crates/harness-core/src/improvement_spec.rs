@@ -3,7 +3,10 @@
 //! OpenSpec remains the artifact owner. These receipts bind its actual resolved
 //! files to a declared initial measurement scope and experiment contract; they
 //! do not certify implementation, task completion, benefit, or user removal
-//! authority.
+//! authority. The adapter also reads the change's actual completion state for
+//! decision reconciliation and archives an unadopted completed change through
+//! the installed CLI's supported non-synchronizing path, so a rejected delta
+//! stays referencable without reaching the main specifications.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +19,10 @@ use std::{
 };
 
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024;
+/// Bound on one task description retained in a completion receipt.
+const MAX_TASK_DESCRIPTION: usize = 240;
+/// Bound on the main-specification files inspected for an accidental sync.
+const MAX_SPEC_FILES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +179,56 @@ pub struct PlanningReceipt {
     pub artifacts: BTreeMap<PathBuf, String>,
     pub contract_digest: String,
     pub implementation_state: String,
+}
+
+/// The change's actual task state, read from the installed CLI and its own
+/// resolved artifacts. Completion reconciliation compares this state; a
+/// decision token never stands in for a required task the artifact still
+/// reports open. Reading it is read-only, so retention keeps the change and
+/// its evidence referencable without any write.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReceipt {
+    pub specification: Specification,
+    pub change_root: PathBuf,
+    pub schema: String,
+    /// The CLI's own apply state; `all_done` exactly when the change's
+    /// artifact reports every task complete.
+    pub state: String,
+    pub total: u64,
+    pub complete: u64,
+    pub remaining: u64,
+    /// Bounded descriptions of the tasks the change's artifact still reports
+    /// open, in artifact order.
+    pub unfinished_tasks: Vec<String>,
+    /// Canonical artifact paths and content digests of the change as it stood
+    /// when completion was read.
+    pub artifacts: BTreeMap<PathBuf, String>,
+}
+
+impl CompletionReceipt {
+    /// True exactly when the change's own artifact reports every task done.
+    pub fn is_complete(&self) -> bool {
+        self.remaining == 0 && self.state == "all_done"
+    }
+}
+
+/// Proof that an unadopted change was archived through the installed CLI's
+/// supported non-synchronizing path: the change and its reconciled artifacts
+/// moved to the change archive with their content intact, while the main
+/// specifications kept their exact files and content.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveReceipt {
+    pub specification: Specification,
+    /// The change's location before the archive.
+    pub change_root: PathBuf,
+    pub archived_as: String,
+    pub archive_root: PathBuf,
+    pub artifacts: BTreeMap<PathBuf, String>,
+    pub main_specs_files: usize,
+    /// Digest of the main specification tree before and after the archive.
+    pub main_specs_digest: String,
 }
 
 /// Only the installed CLI creates and resolves changes. No templates, workflow
@@ -489,6 +546,212 @@ impl OpenSpec {
         }
         Ok(())
     }
+
+    /// Reads the change's actual completion state from the installed CLI and
+    /// its own resolved artifacts. Completion is reconciled from this task
+    /// state alone, so an experiment outcome cannot close a required task the
+    /// change still reports open. The operation writes nothing and is safe to
+    /// repeat, which is what makes retention referencable.
+    pub fn completion(&self, target: &Specification) -> io::Result<CompletionReceipt> {
+        let status = self.json(target, &["status", "--change", &target.change, "--json"])?;
+        let root = PathBuf::from(required(&status["planningHome"], "root")?).canonicalize()?;
+        if root != target.planning_root.canonicalize()? {
+            return Err(invalid(
+                "OpenSpec resolved a different planning root; no completion state is eligible",
+            ));
+        }
+        if required(&status, "changeName")? != target.change {
+            return Err(invalid("OpenSpec resolved a different change"));
+        }
+        let change_root = PathBuf::from(required(&status, "changeRoot")?).canonicalize()?;
+        if !change_root.starts_with(&root) || change_root == root {
+            return Err(invalid(
+                "OpenSpec change escapes its declared planning root",
+            ));
+        }
+        let mut artifacts = BTreeMap::new();
+        for kind in ["proposal", "specs", "design", "tasks"] {
+            let paths = status["artifactPaths"][kind]["existingOutputPaths"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if paths.is_empty() && kind == "tasks" {
+                return Err(invalid(
+                    "missing OpenSpec task artifact; completion cannot be reconciled",
+                ));
+            }
+            for path in &paths {
+                let path = PathBuf::from(
+                    path.as_str()
+                        .ok_or_else(|| invalid("invalid artifact path"))?,
+                )
+                .canonicalize()?;
+                if !path.starts_with(&change_root) || path == change_root {
+                    return Err(invalid("planning artifact escapes the selected change"));
+                }
+                artifacts.insert(path.clone(), digest_artifact(&path)?);
+            }
+        }
+        let apply = self.json(
+            target,
+            &[
+                "instructions",
+                "apply",
+                "--change",
+                &target.change,
+                "--json",
+            ],
+        )?;
+        if required(&apply, "changeName")? != target.change {
+            return Err(invalid("OpenSpec resolved a different change"));
+        }
+        if PathBuf::from(required(&apply, "changeDir")?).canonicalize()? != change_root {
+            return Err(invalid("OpenSpec resolved a different change directory"));
+        }
+        let state = required(&apply, "state")?.to_owned();
+        let progress = &apply["progress"];
+        let total = whole(progress, "total")?;
+        let complete = whole(progress, "complete")?;
+        let remaining = whole(progress, "remaining")?;
+        if complete + remaining != total {
+            return Err(invalid(
+                "OpenSpec reported inconsistent task progress; completion cannot be reconciled",
+            ));
+        }
+        if state == "all_done" && remaining != 0 {
+            return Err(invalid(
+                "OpenSpec reported an all-done state with unfinished tasks; completion cannot be reconciled",
+            ));
+        }
+        let tasks = apply["tasks"]
+            .as_array()
+            .ok_or_else(|| invalid("OpenSpec did not report the change's tasks"))?;
+        let mut open = 0u64;
+        let mut unfinished_tasks = Vec::new();
+        for task in tasks {
+            if task["done"].as_bool() != Some(false) {
+                continue;
+            }
+            open += 1;
+            let text = task["description"].as_str().unwrap_or_default().trim();
+            if !text.is_empty() {
+                unfinished_tasks.push(bounded_task(text));
+            }
+        }
+        if open != remaining {
+            return Err(invalid(
+                "OpenSpec reported a task list inconsistent with its own progress; completion cannot be reconciled",
+            ));
+        }
+        Ok(CompletionReceipt {
+            specification: target.clone(),
+            change_root,
+            schema: required(&status, "schemaName")?.to_owned(),
+            state,
+            total,
+            complete,
+            remaining,
+            unfinished_tasks,
+            artifacts,
+        })
+    }
+
+    /// Archives a completed change whose behavior was not adopted through the
+    /// installed CLI's supported `--skip-specs` path: the change and its
+    /// reconciled artifacts move to the change archive while the main
+    /// specifications keep their exact files and content. Refuses while the
+    /// change's own artifact still reports an unfinished required task - an
+    /// experiment outcome cannot close it - and refuses a stale `expected`
+    /// receipt whose resolved artifacts no longer match.
+    pub fn archive_unadopted(
+        &self,
+        target: &Specification,
+        expected: &CompletionReceipt,
+    ) -> io::Result<ArchiveReceipt> {
+        let current = self.completion(target)?;
+        if !current.is_complete() {
+            let detail = if current.remaining > 0 {
+                let tasks = if current.unfinished_tasks.is_empty() {
+                    "the change reports no usable task description".to_owned()
+                } else {
+                    current.unfinished_tasks.join("; ")
+                };
+                format!(
+                    "the change still reports {} unfinished required task(s): {tasks}; an experiment outcome cannot close them",
+                    current.remaining
+                )
+            } else {
+                format!(
+                    "the change's apply state is {} although its task list reports no open task; completion cannot be confirmed",
+                    current.state
+                )
+            };
+            return Err(invalid(format!(
+                "{detail}, so the unadopted change is retained"
+            )));
+        }
+        if current.change_root != expected.change_root || current.artifacts != expected.artifacts {
+            return Err(invalid(
+                "the change's resolved artifacts changed since it was reconciled; re-read completion and reconcile again before archiving",
+            ));
+        }
+        let before = main_specs_digest(&target.planning_root)?;
+        let archived = self.json(
+            target,
+            &["archive", &target.change, "--skip-specs", "-y", "--json"],
+        )?;
+        let archive = &archived["archive"];
+        if archive["specsUpdated"].as_bool() != Some(false) {
+            return Err(invalid(format!(
+                "the installed CLI did not confirm a non-synchronizing archive (specsUpdated={}); the main specifications may have been changed by the unadopted delta and must be inspected and restored from their retained state",
+                archive["specsUpdated"]
+            )));
+        }
+        let archived_as = required(archive, "archivedAs")?.to_owned();
+        let archive_root = PathBuf::from(required(archive, "path")?).canonicalize()?;
+        if !archive_root.is_dir() {
+            return Err(invalid(
+                "the installed CLI reported an archive path that is not a directory",
+            ));
+        }
+        let after = main_specs_digest(&target.planning_root)?;
+        if before != after {
+            return Err(invalid(format!(
+                "the main specifications changed during the non-synchronizing archive ({} files before, {} after); inspect {} and restore the affected main specifications from their retained state",
+                before.0,
+                after.0,
+                target.planning_root.join("openspec/specs").display()
+            )));
+        }
+        for (path, digest) in &current.artifacts {
+            let relative = path
+                .strip_prefix(&current.change_root)
+                .map_err(|_| invalid("a reconciled artifact escapes its change"))?
+                .to_path_buf();
+            let retained = archive_root.join(&relative);
+            let retained_digest = digest_artifact(&retained).map_err(|error| {
+                invalid(format!(
+                    "the archived change does not retain {}: {error}",
+                    relative.display()
+                ))
+            })?;
+            if retained_digest != *digest {
+                return Err(invalid(format!(
+                    "the archived change does not retain the reconciled content of {}; the unadopted artifacts are not fully accessible",
+                    relative.display()
+                )));
+            }
+        }
+        Ok(ArchiveReceipt {
+            specification: target.clone(),
+            change_root: current.change_root,
+            archived_as,
+            archive_root,
+            artifacts: current.artifacts,
+            main_specs_files: before.0,
+            main_specs_digest: before.1,
+        })
+    }
 }
 
 fn validate_target(target: &Specification) -> io::Result<()> {
@@ -581,6 +844,79 @@ fn digest_artifact(path: &Path) -> io::Result<String> {
 
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A bounded, single-line task description for a completion receipt.
+fn bounded_task(text: &str) -> String {
+    let text = text.replace(['\n', '\r'], " ");
+    if text.chars().count() <= MAX_TASK_DESCRIPTION {
+        return text;
+    }
+    let truncated: String = text.chars().take(MAX_TASK_DESCRIPTION).collect();
+    format!("{truncated}...")
+}
+
+/// Digest of the main specification tree under a resolved planning root over
+/// canonical relative paths and file content. A missing tree is the empty
+/// tree, so an accidental sync of an unadopted delta changes this digest.
+fn main_specs_digest(planning_root: &Path) -> io::Result<(usize, String)> {
+    fn collect(root: &Path, directory: &Path, files: &mut Vec<(String, String)>) -> io::Result<()> {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+            if files.len() >= MAX_SPEC_FILES {
+                return Err(invalid(
+                    "the main specification tree exceeds the inspection bound",
+                ));
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                collect(root, &path, files)?;
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| invalid("a main specification escapes its root"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((relative, digest_file(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let root = planning_root.join("openspec/specs");
+    let mut files = Vec::new();
+    collect(&root, &root, &mut files)?;
+    files.sort();
+    Ok((files.len(), digest_bytes(&serde_json::to_vec(&files)?)))
+}
+
+/// Digest of one main-specification file. Unlike a planning artifact it may
+/// legitimately be empty (a store keeps placeholder files), so only the size
+/// bound applies here.
+fn digest_file(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_ARTIFACT_BYTES as usize {
+        return Err(invalid("a main specification file exceeds the size bound"));
+    }
+    Ok(digest_bytes(&bytes))
+}
+
+/// A required whole-number field of one CLI JSON object.
+fn whole(value: &Value, field: &str) -> io::Result<u64> {
+    value[field]
+        .as_u64()
+        .ok_or_else(|| invalid(format!("OpenSpec did not report {field}")))
 }
 
 fn required<'a>(value: &'a Value, field: &str) -> io::Result<&'a str> {

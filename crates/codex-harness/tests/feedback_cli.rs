@@ -281,6 +281,28 @@ fn output_text(out: &std::process::Output) -> String {
     )
 }
 
+/// Every file under a directory, recursively, for proving the main
+/// specification tree stayed empty or unchanged.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 fn seed_git(project: &Path) {
     git(project, &["init", "-q"]);
     git(
@@ -1821,6 +1843,133 @@ fn hypothesis_decision_publication_is_idempotent_and_evidence_bound() {
     board.drop();
 }
 
+/// Reconciliation binds the claimed outcome and change to what the board and
+/// card actually record before any OpenSpec effect: an unpublished decision,
+/// an unadopted-outcome mismatch, an adopted outcome or another change name
+/// are all refused, so a rejected experiment cannot be reconciled as
+/// something the board does not record.
+#[test]
+fn hypothesis_reconcile_binds_the_recorded_decision_and_linked_change() {
+    let board = Board::new("hypothesis-reconcile-bindings");
+    let h = admit(&board, "m-reconcile", "c-reconcile", "basis-1");
+
+    let absent = board.feedback(&[
+        "hypothesis-reconcile",
+        "--item",
+        &h,
+        "--outcome",
+        "reject",
+        "--change",
+        "demo",
+    ]);
+    let text = output_text(&absent);
+    assert!(!absent.status.success(), "{text}");
+    assert!(text.contains("no recorded benefit-gate decision"), "{text}");
+
+    let adopted = decision(&board, &h, "exp-1", "adopt", "unchanged", "96", false, None);
+    assert!(adopted.status.success(), "{}", output_text(&adopted));
+    let adopt = board.feedback(&[
+        "hypothesis-reconcile",
+        "--item",
+        &h,
+        "--outcome",
+        "adopt",
+        "--change",
+        "demo",
+    ]);
+    let text = output_text(&adopt);
+    assert!(!adopt.status.success(), "{text}");
+    assert!(
+        text.contains("adopted delta synchronizes through the adoption/integration owner"),
+        "{text}"
+    );
+
+    let rejected = decision(
+        &board,
+        &h,
+        "exp-2",
+        "reject",
+        "regressed",
+        "140",
+        true,
+        None,
+    );
+    assert!(rejected.status.success(), "{}", output_text(&rejected));
+
+    // The claimed outcome must be the decision the board actually records.
+    let mismatch = board.feedback(&[
+        "hypothesis-reconcile",
+        "--item",
+        &h,
+        "--outcome",
+        "inconclusive",
+        "--change",
+        "demo",
+    ]);
+    let text = output_text(&mismatch);
+    assert!(!mismatch.status.success(), "{text}");
+    assert!(
+        text.contains("latest recorded decision is reject"),
+        "{text}"
+    );
+
+    // Only the card's own linked change may be reconciled.
+    let wrong_change = board.feedback(&[
+        "hypothesis-reconcile",
+        "--item",
+        &h,
+        "--outcome",
+        "reject",
+        "--change",
+        "other-change",
+    ]);
+    let text = output_text(&wrong_change);
+    assert!(!wrong_change.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "references spec 'openspec/changes/demo' instead of the change 'other-change'"
+        ),
+        "{text}"
+    );
+
+    // An inconclusive investigation is retained, not archived.
+    let pending = admit(&board, "m-pending", "c-reconcile", "basis-2");
+    let pending_decision = decision(
+        &board,
+        &pending,
+        "exp-3",
+        "inconclusive",
+        "unmeasurable",
+        "100",
+        false,
+        None,
+    );
+    assert!(
+        pending_decision.status.success(),
+        "{}",
+        output_text(&pending_decision)
+    );
+    let inconclusive = board.feedback(&[
+        "hypothesis-reconcile",
+        "--item",
+        &pending,
+        "--outcome",
+        "inconclusive",
+        "--change",
+        "demo",
+        "--action",
+        "archive",
+    ]);
+    let text = output_text(&inconclusive);
+    assert!(!inconclusive.status.success(), "{text}");
+    assert!(
+        text.contains("refused for an inconclusive investigation"),
+        "{text}"
+    );
+    assert_no_votes(&board, &h);
+    board.drop();
+}
+
 /// A newer incomplete, malformed or contradictory v2 record supersedes an
 /// earlier supported adoption on the real board read path: the item stays
 /// unadopted, the limitations name the missing or contradicting evidence, and
@@ -1961,7 +2110,7 @@ fn hypothesis_search_reuses_prior_conclusions_and_never_duplicates_cards() {
     );
     assert!(
         text.contains(&format!(
-            "hypothesis {rejected} latest=reject experiment=exp-r"
+            "hypothesis {rejected} latest=reject experiment=exp-r scope=task:synthetic reason=lane-contention"
         )),
         "{text}"
     );
@@ -2450,5 +2599,202 @@ fn removal_consent_binds_to_the_reviewed_proposal_content() {
     assert!(text.contains("record=already-recorded"), "{text}");
     assert_eq!(board.comment_texts(&h).len(), before_repeat + 1);
     assert_no_votes(&board, &h);
+    board.drop();
+}
+
+/// Requires the installed OpenSpec CLI and the owner PowerShell: exercises
+/// the real reconciliation entry point against an isolated OpenSpec
+/// configuration home. Model-free; every artifact lives in the fixture's
+/// own temporary directory.
+#[test]
+#[ignore = "requires installed OpenSpec and owner PowerShell; isolated model-free CLI acceptance"]
+fn installed_reconcile_retains_a_rejected_change_without_synchronizing_specs() {
+    let board = Board::new("hypothesis-reconcile-installed");
+    let configuration = board.root.join("openspec-configuration");
+    fs::create_dir_all(&configuration).unwrap();
+    let openspec = |args: &[&str]| -> std::process::Output {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("pwsh");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-CommandWithArgs",
+                "& openspec @args; exit $LASTEXITCODE",
+            ]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = Command::new("openspec");
+        command
+            .args(args)
+            .current_dir(&board.project)
+            .env("APPDATA", &configuration)
+            .env("XDG_CONFIG_HOME", &configuration)
+            .env("XDG_DATA_HOME", &configuration)
+            .env("LOCALAPPDATA", &configuration)
+            .env("OPENSPEC_TELEMETRY", "0")
+            .output()
+            .unwrap()
+    };
+    // Prove the configuration is isolated before any change is created.
+    let resolved = openspec(&["config", "path"]);
+    assert!(resolved.status.success(), "{}", output_text(&resolved));
+    assert!(
+        Path::new(String::from_utf8_lossy(&resolved.stdout).trim()).starts_with(&configuration),
+        "{}",
+        output_text(&resolved)
+    );
+    fs::create_dir_all(board.project.join("openspec/changes")).unwrap();
+    fs::write(
+        board.project.join("openspec/config.yaml"),
+        "schema: spec-driven\n",
+    )
+    .unwrap();
+    let created = openspec(&["new", "change", "demo", "--schema", "spec-driven", "--json"]);
+    assert!(created.status.success(), "{}", output_text(&created));
+    let change = board.project.join("openspec/changes/demo");
+    fs::write(
+        change.join("proposal.md"),
+        "## Why\nA rejected synthetic candidate.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(change.join("specs/synthetic-capability")).unwrap();
+    fs::write(
+        change.join("specs/synthetic-capability/spec.md"),
+        "## ADDED Requirements\n\n### Requirement: Synthetic capability\nThe candidate SHALL behave synthetically.\n\n#### Scenario: Synthetic case\n- **WHEN** the candidate runs\n- **THEN** it behaves synthetically\n",
+    )
+    .unwrap();
+    fs::write(
+        change.join("design.md"),
+        "## Context\nSynthetic rejection.\n",
+    )
+    .unwrap();
+    fs::write(
+        change.join("tasks.md"),
+        "## Work\n- [x] Record the experiment outcome.\n- [ ] Restore the accepted runtime.\n",
+    )
+    .unwrap();
+    let main_specs = board.project.join("openspec/specs");
+    let main_specs_before = files_under(&main_specs);
+    assert!(
+        main_specs_before.is_empty(),
+        "the delta must start unsynchronized: {main_specs_before:?}"
+    );
+
+    let h = admit(&board, "m-installed", "c-installed", "basis-1");
+    let rejected = decision(
+        &board,
+        &h,
+        "exp-1",
+        "reject",
+        "regressed",
+        "140",
+        true,
+        None,
+    );
+    assert!(rejected.status.success(), "{}", output_text(&rejected));
+
+    let isolated: [(&str, &Path); 5] = [
+        ("CODEX_HOME", board.home.as_path()),
+        ("APPDATA", configuration.as_path()),
+        ("XDG_CONFIG_HOME", configuration.as_path()),
+        ("XDG_DATA_HOME", configuration.as_path()),
+        ("LOCALAPPDATA", configuration.as_path()),
+    ];
+    // An unfinished required task is not closable through the outcome: the
+    // archive is reported unresolved and the change stays in place.
+    let blocked = board.run_feedback(
+        &[
+            "hypothesis-reconcile",
+            "--item",
+            &h,
+            "--outcome",
+            "reject",
+            "--change",
+            "demo",
+            "--action",
+            "archive",
+        ],
+        &isolated,
+    );
+    let text = output_text(&blocked);
+    assert_eq!(blocked.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("action=retained archive=unresolved"),
+        "{text}"
+    );
+    assert!(text.contains("Restore the accepted runtime"), "{text}");
+    assert!(change.join("tasks.md").is_file(), "{text}");
+    assert_eq!(
+        files_under(&main_specs),
+        main_specs_before,
+        "no unadopted delta may synchronize: {text}"
+    );
+
+    // Completing the change's own required tasks is the only thing that makes
+    // the rejected change archivable; its delta still must not synchronize.
+    fs::write(
+        change.join("tasks.md"),
+        "## Work\n- [x] Record the experiment outcome.\n- [x] Restore the accepted runtime.\n",
+    )
+    .unwrap();
+    let archived = board.run_feedback(
+        &[
+            "hypothesis-reconcile",
+            "--item",
+            &h,
+            "--outcome",
+            "reject",
+            "--change",
+            "demo",
+            "--action",
+            "archive",
+        ],
+        &isolated,
+    );
+    let text = output_text(&archived);
+    assert_eq!(archived.status.code(), Some(0), "{text}");
+    assert!(text.contains("action=archived"), "{text}");
+    assert!(text.contains("specs-synced=no"), "{text}");
+    assert!(!change.exists(), "the change moved to the archive");
+    let archive_root = board.project.join("openspec/changes/archive");
+    let entries: Vec<PathBuf> = fs::read_dir(&archive_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let archived_change = &entries[0];
+    assert!(
+        archived_change
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-demo"),
+        "{archived_change:?}"
+    );
+    assert!(archived_change.join("tasks.md").is_file());
+    assert!(
+        archived_change
+            .join("specs/synthetic-capability/spec.md")
+            .is_file()
+    );
+    assert_eq!(
+        files_under(&main_specs),
+        main_specs_before,
+        "the rejected delta reached the main specifications: {text}"
+    );
+
+    // The card keeps the rejection and the linked change stays visible with
+    // the decision scope prior-result search must report.
+    let search = board.feedback(&["hypothesis-search"]);
+    let text = output_text(&search);
+    assert!(search.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("hypothesis {h} latest=reject")),
+        "{text}"
+    );
+    assert!(text.contains("scope=task:synthetic"), "{text}");
     board.drop();
 }
