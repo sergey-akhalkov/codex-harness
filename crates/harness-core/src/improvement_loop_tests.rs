@@ -646,6 +646,31 @@ fn dispatch_gate_requires_model_inputs_visibility_and_current_authority() {
         _ => unreachable!(),
     }
 
+    // A declared configuration that cannot be honored is an unusable profile,
+    // not a reason to dispatch under a different model or route.
+    let misbound = dispatch_gate(
+        &cursor,
+        AttemptRole::Investigator,
+        &DispatchFacts {
+            runner_declared: true,
+            launcher: Some(launcher.clone()),
+            binding_error: Some(
+                "the declared model other-model does not match the installed profile binding deepseek-flash"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    match misbound {
+        DispatchGate::Blocked { reason } => {
+            assert!(
+                reason.contains("the dispatch profile is unusable"),
+                "{reason}"
+            )
+        }
+        _ => unreachable!(),
+    }
+
     let removal = dispatch_gate(
         &cursor,
         AttemptRole::Candidate,

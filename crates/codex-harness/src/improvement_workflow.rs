@@ -2132,6 +2132,16 @@ fn dispatch_bound_assignment(
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
     let surface = surface(&run.spec);
+    // The caller's model-free gate refuses an unusable profile before this
+    // point; the dispatch boundary itself repeats the check so a declared
+    // configuration that cannot be honored never reaches the visible owner,
+    // even if the gate is bypassed or a profile changes in between.
+    if let Some(error) = &surface.binding_error {
+        let reason = format!(
+            "the dispatch profile is unusable: {error}; no dispatch was attempted and no fallback route was used"
+        );
+        return block(run, notes, reason);
+    }
     let Some(binding) = surface.binding.clone() else {
         let reason =
             "the dispatch profile binding is unavailable; no dispatch was attempted".to_owned();
@@ -2177,8 +2187,12 @@ fn dispatch_bound_assignment(
     run.cursor.effect(
         EffectKind::DispatchPrepared,
         format!(
-            "attempt={attempt_id} role={} owner={owner} title=\"{title}\" assignment={}",
+            "attempt={attempt_id} role={} owner={owner} title=\"{title}\" profile={} model={} provider={} effort={} assignment={}",
             role.as_str(),
+            binding.profile,
+            binding.model.as_deref().unwrap_or("unknown"),
+            binding.model_provider.as_deref().unwrap_or("unknown"),
+            binding.reasoning_effort.as_deref().unwrap_or("default"),
             assignment_path.display()
         ),
     );
@@ -2270,6 +2284,10 @@ fn investigator_assignment(run: &Run, evidence: &Evidence) -> serde_json::Value 
         "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[{\"mechanism\":\"<=96-char token\",\"conditions\":\"<=96-char token\",\"observation\":\"<retained locator>\",\"predicted\":\"<=256 chars\",\"counterexample\":\"<=256 chars\",\"acceptance\":\"<=256 chars\",\"spec\":\"<own OpenSpec change reference>\",\"basis\":\"<retained locator>\",\"treatment\":\"addition\",\"evidence\":[{\"locator\":\"<retained locator>\",\"kind\":\"observed\"}],\"next_check\":\"optional\"}],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates".to_owned(),
         "every candidate cites at least one observed retained locator; intake refuses an ungrounded or prediction-only citation".to_owned(),
         "the spec field names the candidate's own OpenSpec change under the run's openspec/changes planning root; an existing linked change is valid as it stands, and the controller qualifies it - preparing and authoring a missing change - before any implementation".to_owned(),
+        format!(
+            "candidate spec references resolve under the run's planning root {} (a spec is a change name or an openspec/changes/<name> reference; a path-shaped reference outside that root is refused before any candidate work)",
+            run.spec.specification.planning_root.display()
+        ),
         "this conversation edits no file and dispatches no other model work".to_owned(),
     ];
     // Retained evidence locators are not checkout-relative paths, so the
@@ -2859,6 +2877,10 @@ mod assignment_tests {
         assert!(
             brief.contains("retained-evidence-root-with-an-ordinary-long-name"),
             "{brief}"
+        );
+        assert!(
+            brief.contains(&run.spec.specification.planning_root.display().to_string()),
+            "the exact specification root stays visible: {brief}"
         );
 
         // Planner: the complete planning reference stays visible.

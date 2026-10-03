@@ -8,6 +8,7 @@
 #![cfg(windows)]
 
 use harness_core::build_identity::hash_bytes;
+use harness_core::improvement_loop::{AttemptRole, dispatch_owner};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -263,9 +264,15 @@ impl Fixture {
     }
 
     fn write_spec(&self, replacements: &[(&str, Value)]) {
+        self.write_run_spec("workflow-fixture", &self.spec, replacements);
+    }
+
+    /// Writes one run spec at an explicit path and run identity, so a single
+    /// fixture project and board can back several declared configurations.
+    fn write_run_spec(&self, run: &str, path: &Path, replacements: &[(&str, Value)]) {
         let mut document = json!({
             "schema": 1,
-            "run": "workflow-fixture",
+            "run": run,
             "project": self.proj,
             "codex_home": self.home,
             "board": {"bd": self.bd, "project": self.proj},
@@ -307,7 +314,7 @@ impl Fixture {
         for (key, value) in replacements {
             object.insert((*key).to_owned(), value.clone());
         }
-        fs::write(&self.spec, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 
     fn improve(&self, args: &[&str]) -> Output {
@@ -346,7 +353,12 @@ impl Fixture {
     }
 
     fn status_json(&self) -> Value {
-        let status = self.improve(&["status", "--run", self.run.to_str().unwrap(), "--json"]);
+        self.run_status(&self.run)
+    }
+
+    /// The `status --json` report of one explicitly named run directory.
+    fn run_status(&self, run: &Path) -> Value {
+        let status = self.improve(&["status", "--run", run.to_str().unwrap(), "--json"]);
         assert!(status.status.success(), "status: {}", text(&status));
         serde_json::from_str(&text(&status)).expect("status --json")
     }
@@ -645,6 +657,33 @@ fn head(cwd: &Path) -> String {
     git_output(cwd, &["rev-parse", "HEAD"])
 }
 
+/// One dispatch-recorded attempt must carry the effective identity the
+/// installed profile binding resolves for its conversation and the
+/// deterministic titled surface derived from its own role and ordinal.
+fn assert_dispatched_conversation(fixture: &Fixture, id: &str, role: AttemptRole) {
+    let ordinal: u32 = id
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("the attempt id {id} carries no ordinal"));
+    let cursor = fixture.cursor();
+    let attempt = cursor["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attempt| attempt["id"] == json!(id))
+        .cloned()
+        .unwrap_or_else(|| panic!("the {id} dispatch is retained"));
+    assert_eq!(attempt["role"], role.as_str(), "{attempt}");
+    assert_eq!(attempt["profile"], "ds", "{attempt}");
+    assert_eq!(attempt["model"], "deepseek-flash", "{attempt}");
+    assert_eq!(attempt["model_provider"], "deepseek", "{attempt}");
+    assert_eq!(attempt["reasoning_effort"], "max", "{attempt}");
+    let owner = dispatch_owner("workflow-fixture", role, ordinal);
+    assert_eq!(attempt["owner"], owner, "{attempt}");
+    assert_eq!(attempt["title"], format!("CEx (ds) - {owner}"), "{attempt}");
+}
+
 #[test]
 fn no_evidence_idles_without_model_work() {
     let fixture = Fixture::new("no-evidence");
@@ -705,6 +744,10 @@ fn an_unreachable_route_records_a_failed_attempt_and_no_model_request() {
             .contains("no model request was made"),
         "{cursor}"
     );
+    // The refused conversation is still one explicit, attributable attempt:
+    // the effective binding identity and its own titled surface are recorded
+    // before any route is contacted.
+    assert_dispatched_conversation(&fixture, "investigator-1", AttemptRole::Investigator);
 }
 
 #[test]
@@ -921,6 +964,14 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
         investigator_brief.contains(&locator),
         "the retained evidence locator stays visible: {investigator_brief}"
     );
+    assert!(
+        investigator_brief.contains(&format!("source: {}", fixture.proj.display())),
+        "the exact source checkout stays visible: {investigator_brief}"
+    );
+    assert!(
+        investigator_brief.contains(&format!("planning root {}", fixture.proj.display())),
+        "the exact specification root stays visible: {investigator_brief}"
+    );
 
     // The refused pre-submission dispatch is a recorded attempt with a known
     // outcome, never an unknown or billed one.
@@ -1009,6 +1060,7 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
         !reason.contains("objective") && !reason.contains("1024"),
         "the generated assignment passes the native limits: {implementer}"
     );
+    assert_dispatched_conversation(&fixture, "implementer-1", AttemptRole::Implementer);
 
     // Native model-free validation: the reproducing multi-file brief passes
     // the same validator dispatch uses and renders the full brief.
@@ -1022,6 +1074,16 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
     let brief = text(&check);
     assert!(brief.contains("executor assignment valid"), "{brief}");
     assert!(brief.contains(change), "{brief}");
+    assert!(
+        brief.contains(&format!("source: {}", fixture.proj.display())),
+        "the exact source checkout stays visible: {brief}"
+    );
+    assert!(
+        brief.contains(&format!(
+            "openspec/changes/{change}/specs/synthetic/spec.md"
+        )),
+        "the exact specification artifact stays visible: {brief}"
+    );
     for path in &scope {
         assert!(
             brief.contains(*path),
@@ -1065,6 +1127,168 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
             .all(|attempt| attempt["state"] != "unknown"),
         "{cursor}"
     );
+}
+
+#[test]
+fn a_lost_conversation_surface_suspends_new_dispatch_without_a_fallback() {
+    let fixture = Fixture::new("surface-loss");
+    let (root, _) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    fake_launcher(&fixture);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    // Replace the pre-submission refusal with the interrupted surface loss the
+    // owning dispatcher records when an accepted conversation's surface dies.
+    let receipt = fixture.run.join("investigator-receipt.json");
+    seed_bound_receipt(
+        &receipt,
+        "workflow-fixture-inv-1",
+        "gen-1",
+        "interrupted",
+        None,
+    );
+    let mut interrupted = attempt_json(
+        "investigator-1",
+        "investigator",
+        "workflow-fixture-inv-1",
+        "gen-1",
+        &receipt,
+        None,
+        None,
+        "interrupted",
+    );
+    interrupted["reason"] = json!("the owned native frontend exited");
+    replace_attempt(&fixture, interrupted);
+
+    // While the surface loss stands, resume refuses to start new model work:
+    // the missing visibility is the recorded blocker, not a hidden retry.
+    for _ in 0..2 {
+        let resume = fixture.resume();
+        assert!(resume.status.success(), "{}", text(&resume));
+        let status = fixture.status_json();
+        assert_eq!(status["dispatch"]["state"], "blocked", "{status}");
+        let reason = status["dispatch"]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("missing visibility"), "{status}");
+        assert!(reason.contains("no hidden fallback"), "{status}");
+        assert_eq!(
+            fixture.cursor()["attempts"].as_array().unwrap().len(),
+            1,
+            "no conversation is dispatched while the surface is lost"
+        );
+    }
+
+    // An explicit stop is the documented release: the next resume may start a
+    // fresh conversation, and that conversation gets its own titled surface.
+    let stop = fixture.improve(&["stop", "--run", fixture.run.to_str().unwrap()]);
+    assert!(stop.status.success(), "{}", text(&stop));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let cursor = fixture.cursor();
+    let attempts = cursor["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{cursor}");
+    assert_eq!(attempts[1]["id"], "investigator-2", "{cursor}");
+    assert_ne!(attempts[0]["owner"], attempts[1]["owner"], "{cursor}");
+    assert_ne!(attempts[0]["title"], attempts[1]["title"], "{cursor}");
+    assert_dispatched_conversation(&fixture, "investigator-2", AttemptRole::Investigator);
+}
+
+#[test]
+fn a_declared_runner_that_cannot_be_honored_never_dispatches_a_model_request() {
+    let fixture = Fixture::new("runner-refusal");
+    let (root, _) = write_evidence_root(&fixture);
+    fake_launcher(&fixture);
+    let cases: Vec<(&str, Vec<(&str, Value)>, &str)> = vec![
+        (
+            "model-mismatch",
+            vec![(
+                "runner",
+                json!({
+                    "profile": "ds",
+                    "model": "other-model",
+                    "model_provider": "deepseek",
+                    "reasoning_effort": "max",
+                }),
+            )],
+            "does not match the installed profile binding",
+        ),
+        (
+            "profile-absent",
+            vec![(
+                "runner",
+                json!({
+                    "profile": "ghost",
+                    "model": "deepseek-flash",
+                    "model_provider": "deepseek",
+                    "reasoning_effort": "max",
+                }),
+            )],
+            "is not installed in",
+        ),
+        (
+            "local-runner-mismatch",
+            vec![
+                (
+                    "local_runner",
+                    json!({
+                        "endpoint": "http://127.0.0.1:9/v1",
+                        "model": "other-local",
+                    }),
+                ),
+                (
+                    "qualification",
+                    json!(fixture.root.join("qualification.json")),
+                ),
+            ],
+            "but the declared local runner serves",
+        ),
+    ];
+    for (name, extra, expected) in cases {
+        let run = fixture.root.join("runs").join(name);
+        fs::create_dir_all(&run).unwrap();
+        let spec = fixture.root.join(format!("run-spec-{name}.json"));
+        let mut replacements: Vec<(&str, Value)> = vec![("evidence_root", json!(root.clone()))];
+        replacements.extend(extra);
+        fixture.write_run_spec(&format!("refuse-{name}"), &spec, &replacements);
+        let start = fixture.improve(&[
+            "start",
+            "--run",
+            run.to_str().unwrap(),
+            "--spec",
+            spec.to_str().unwrap(),
+        ]);
+        assert!(start.status.success(), "{name}: {}", text(&start));
+        let status = fixture.run_status(&run);
+        assert_eq!(status["dispatch"]["state"], "blocked", "{name}: {status}");
+        let reason = status["dispatch"]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains(expected), "{name}: {status}");
+        assert_eq!(
+            status["attempts"].as_array().unwrap().len(),
+            0,
+            "{name}: no conversation may be attempted: {status}"
+        );
+
+        // A resume re-evaluates the same declaration and still records the
+        // refusal instead of dispatching under a different model or route.
+        let resume = fixture.improve(&["resume", "--run", run.to_str().unwrap()]);
+        assert!(resume.status.success(), "{name}: {}", text(&resume));
+        let cursor: Value =
+            serde_json::from_slice(&fs::read(run.join("cursor.json")).unwrap()).unwrap();
+        assert_eq!(
+            cursor["attempts"].as_array().unwrap().len(),
+            0,
+            "{name}: {cursor}"
+        );
+        assert!(
+            cursor["effects"].as_array().unwrap().iter().any(|effect| {
+                effect["kind"] == "dispatch-refused"
+                    && effect["detail"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(expected)
+            }),
+            "{name}: the refusal stays recorded: {cursor}"
+        );
+    }
 }
 
 #[test]
@@ -1417,6 +1641,7 @@ fn new_candidate_scaffolds_plans_and_implements_its_own_change() {
             .all(|attempt| attempt["role"] != "implementer"),
         "no implementation conversation starts before the change qualifies: {cursor}"
     );
+    assert_dispatched_conversation(&fixture, "planner-1", AttemptRole::Planner);
     let planner_assignment = fixture.run.join("assignments/planner-1.json");
     assert!(
         planner_assignment.is_file(),
