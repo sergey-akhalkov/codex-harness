@@ -803,6 +803,25 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
 /// still consume exactly that prepared identity. Any mismatch leaves the
 /// active runtime unchanged.
 pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome> {
+    activate_with_trust(request, &[])
+}
+
+/// The same activation for an arm whose measured dispatches may have trusted
+/// exactly the workspaces authorized by the owning dispatcher. The caller
+/// supplies the owned slot paths from its frozen pool declaration; the arm
+/// configuration may carry those trusted-project entries and nothing else.
+/// `activate` keeps the exact-bytes contract for a never-dispatched arm.
+pub fn activate_with_trust(
+    request: &ActivationRequest<'_>,
+    trusted_workspaces: &[std::path::PathBuf],
+) -> io::Result<ActivationOutcome> {
+    activate_inner(request, trusted_workspaces)
+}
+
+fn activate_inner(
+    request: &ActivationRequest<'_>,
+    trusted_workspaces: &[std::path::PathBuf],
+) -> io::Result<ActivationOutcome> {
     let evidence = match resolve_evidence(&request.context())? {
         Gate::Ready(evidence) => evidence,
         Gate::Blocked(blocked) => return Ok(ActivationOutcome::Blocked(*blocked)),
@@ -891,7 +910,10 @@ pub fn activate(request: &ActivationRequest<'_>) -> io::Result<ActivationOutcome
             ),
         )));
     }
-    let consumption = match improvement_runtime::verify_consumption(request.runtime) {
+    let consumption = match improvement_runtime::verify_consumption_with_trust(
+        request.runtime,
+        trusted_workspaces,
+    ) {
         Ok(consumption) => consumption,
         Err(error) => {
             return Ok(ActivationOutcome::Blocked(blocked(

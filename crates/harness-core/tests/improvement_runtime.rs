@@ -12,10 +12,10 @@
 #![cfg(windows)]
 
 use harness_core::{
-    build_identity,
+    build_identity, build_selection,
     improvement_experiment::{Arm, prepare_home, prepare_variant, select_variant},
     improvement_runtime::{
-        ArmRequest, ClientInputs, PrivateInput, discard_arm, install_arm, retire_arm,
+        ArmRequest, ClientInputs, PrivateInput, discard_arm, install_arm, retire_arm, select_arm,
         verify_consumption, verify_consumption_with_trust,
     },
     outcome_qualification::{LocalRunner, MaterialIdentity},
@@ -385,6 +385,30 @@ fn local_client(catalogue: &Path, overlay: Option<&Path>) -> ClientInputs {
         overlay: overlay.map(Path::to_path_buf),
         executor_profile: None,
     }
+}
+
+/// Sorted relative-path to content-digest map of every ordinary file under a
+/// directory, used to prove selection leaves sources and prepared builds
+/// byte-identical.
+fn tree_fingerprint(root: &Path) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.insert(relative, build_identity::hash_file(&path).unwrap());
+            }
+        }
+    }
+    files
 }
 
 /// End-to-end preparation: both arms install through the real owner, consume
@@ -1426,4 +1450,189 @@ fn advertised_token_workflow_is_prepared_and_drift_refuses_consumption() {
         !missing_home.join("harness/bin/harness-rtk.exe").exists(),
         "a missing component still published a command"
     );
+}
+
+/// Change task 2.5: repeated off/on selection of the prepared
+/// baseline/candidate arms goes through the existing runtime-selection owner,
+/// reports the identity actually consumed, changes no source or build
+/// artifact, makes no model call, refuses mid-attempt changes, and keeps the
+/// shared and per-arm state controlled.
+#[test]
+fn prepared_arm_selection_cycles_without_source_rebuild_or_model_call() {
+    let _serial = INSTALL.lock().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("improvement-runtime-selection-")
+        .tempdir()
+        .unwrap();
+    let root = temp.path();
+    let fixtures = fixtures();
+    let _cpu = EnvironmentGuard::capture("CODEX_HARNESS_CPU_ACCOUNT");
+    fs::create_dir_all(root.join("cpu-account")).unwrap();
+    _cpu.set(&root.join("cpu-account"));
+    let _path = EnvironmentGuard::capture("PATH");
+    let state = owned_state(root);
+
+    let baseline = arm_fixture(
+        root,
+        &state,
+        "baseline",
+        Arm::Baseline,
+        "H",
+        "baseline",
+        &fixtures.launcher,
+        &fixtures.upstream,
+    );
+    let candidate = arm_fixture(
+        root,
+        &state,
+        "candidate",
+        Arm::Candidate,
+        "H+A",
+        "candidate",
+        &fixtures.launcher,
+        &fixtures.upstream,
+    );
+    let catalogue = root.join("model-catalogue.json");
+    fs::write(&catalogue, br#"{"models":[{"name":"fixture-glyph-1"}]}"#).unwrap();
+    let mut baseline_request = baseline.request;
+    let mut candidate_request = candidate.request;
+    for request in [&mut baseline_request, &mut candidate_request] {
+        request.client = Some(local_client(&catalogue, None));
+    }
+    let baseline_runtime = install_arm(&baseline_request).unwrap();
+    let candidate_runtime = install_arm(&candidate_request).unwrap();
+    assert!(baseline_runtime.client_configured());
+    assert!(candidate_runtime.client_configured());
+
+    // The shared owned state holds both prepared immutable builds; each arm
+    // home owns its own configuration and content.
+    let baseline_sources = tree_fingerprint(&baseline.source);
+    let candidate_sources = tree_fingerprint(&candidate.source);
+    let baseline_build_files = tree_fingerprint(&baseline.build);
+    let candidate_build_files = tree_fingerprint(&candidate.build);
+    let build_dirs = |state: &Path| {
+        let mut names: Vec<String> = fs::read_dir(state.join("builds"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let builds_before = build_dirs(&state);
+    let baseline_config = baseline_runtime
+        .configuration
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    let candidate_config = candidate_runtime
+        .configuration
+        .as_ref()
+        .unwrap()
+        .path
+        .clone();
+    assert_ne!(baseline_config, candidate_config);
+    let baseline_config_bytes = fs::read(&baseline_config).unwrap();
+    let candidate_config_bytes = fs::read(&candidate_config).unwrap();
+
+    // Off/on selection: the reported identity is the artifact the selection
+    // owner actually activates and the one this arm home consumes.
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap();
+    let active = || canonical(&build_selection::selected(&state).unwrap().0);
+    let baseline_on = select_arm(&state, &baseline_runtime, false).unwrap();
+    assert!(baseline_on.applied);
+    assert_eq!(baseline_on.arm, Arm::Baseline);
+    assert_eq!(baseline_on.label, "H");
+    assert_eq!(baseline_on.model_calls, 0);
+    assert!(baseline_on.consumption.model_ready);
+    assert_eq!(
+        baseline_on.selected.manager_sha256.as_deref(),
+        Some(
+            build_identity::hash_file(&baseline.build.join("codex-harness.exe"))
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert_eq!(active(), canonical(&baseline_on.consumption.build));
+    assert_eq!(active(), canonical(&baseline_on.selected.build));
+    assert_eq!(
+        baseline_on.selected.record_sha256,
+        baseline_on.consumption.record_sha256
+    );
+
+    let repeated = select_arm(&state, &baseline_runtime, false).unwrap();
+    assert!(!repeated.applied, "an unchanged variant is not reselected");
+    assert_eq!(repeated.consumption, baseline_on.consumption);
+    assert_eq!(repeated.selected.build, baseline_on.selected.build);
+
+    let candidate_on = select_arm(&state, &candidate_runtime, false).unwrap();
+    assert!(candidate_on.applied);
+    assert_eq!(candidate_on.arm, Arm::Candidate);
+    assert_eq!(candidate_on.label, "H+A");
+    assert_eq!(candidate_on.model_calls, 0);
+    assert_eq!(active(), canonical(&candidate_on.consumption.build));
+    assert_ne!(candidate_on.selected.build, baseline_on.selected.build);
+    let candidate_repeated = select_arm(&state, &candidate_runtime, false).unwrap();
+    assert!(!candidate_repeated.applied);
+
+    let baseline_back = select_arm(&state, &baseline_runtime, false).unwrap();
+    assert!(baseline_back.applied);
+    assert_eq!(
+        baseline_back.consumption.build,
+        baseline_on.consumption.build
+    );
+    assert_eq!(active(), canonical(&baseline_on.consumption.build));
+    let candidate_again = select_arm(&state, &candidate_runtime, false).unwrap();
+    assert!(candidate_again.applied);
+    assert_eq!(active(), canonical(&candidate_on.consumption.build));
+
+    // An active measured attempt freezes whichever runtime it holds: every
+    // selection attempt is refused and the active pointer does not move.
+    for runtime in [&baseline_runtime, &candidate_runtime] {
+        let error = select_arm(&state, runtime, true).unwrap_err().to_string();
+        assert!(error.contains("active"), "{error}");
+    }
+    assert_eq!(active(), canonical(&candidate_on.consumption.build));
+
+    // No source edit and no rebuild: sources, prepared builds, the published
+    // build set and both arm configurations are byte-identical afterwards.
+    assert_eq!(tree_fingerprint(&baseline.source), baseline_sources);
+    assert_eq!(tree_fingerprint(&candidate.source), candidate_sources);
+    assert_eq!(tree_fingerprint(&baseline.build), baseline_build_files);
+    assert_eq!(tree_fingerprint(&candidate.build), candidate_build_files);
+    assert_eq!(build_dirs(&state), builds_before);
+    assert_eq!(fs::read(&baseline_config).unwrap(), baseline_config_bytes);
+    assert_eq!(fs::read(&candidate_config).unwrap(), candidate_config_bytes);
+
+    // Per-arm isolation survived the switching: each home still consumes its
+    // own instructions, skills and build.
+    let baseline_text = fs::read_to_string(baseline_runtime.home.join("AGENTS.md")).unwrap();
+    let candidate_text = fs::read_to_string(candidate_runtime.home.join("AGENTS.md")).unwrap();
+    assert!(baseline_text.contains("baseline arm instructions"));
+    assert!(candidate_text.contains("candidate arm instructions"));
+    verify_consumption(&baseline_runtime).unwrap();
+    verify_consumption(&candidate_runtime).unwrap();
+
+    // A drifted arm refuses selection without moving the pointer and without
+    // repairing or rewriting its source; the other arm stays selectable.
+    let skill = candidate.source.join(".agents/skills/arm-skill/SKILL.md");
+    let original_skill = fs::read(&skill).unwrap();
+    let drifted_skill = [original_skill.as_slice(), b"\ndrift"].concat();
+    fs::write(&skill, &drifted_skill).unwrap();
+    let error = select_arm(&state, &candidate_runtime, false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changed since preparation"), "{error}");
+    assert_eq!(active(), canonical(&candidate_on.consumption.build));
+    assert_eq!(fs::read(&skill).unwrap(), drifted_skill);
+    let baseline_again = select_arm(&state, &baseline_runtime, false).unwrap();
+    assert!(baseline_again.applied);
+    assert_eq!(active(), canonical(&baseline_on.consumption.build));
+    fs::write(&skill, &original_skill).unwrap();
+    let candidate_restored = select_arm(&state, &candidate_runtime, false).unwrap();
+    assert!(candidate_restored.applied);
+    assert_eq!(active(), canonical(&candidate_on.consumption.build));
+
+    retire_arm(&baseline_runtime).unwrap();
+    retire_arm(&candidate_runtime).unwrap();
 }

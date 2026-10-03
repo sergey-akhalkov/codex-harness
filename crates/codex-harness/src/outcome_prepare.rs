@@ -1,6 +1,6 @@
 //! Fresh controlled outcome projects. External-project cases remain separate.
 use crate::outcome_run::{repository, write_new};
-use harness_core::build_identity::{hash_file, ordinary};
+use harness_core::build_identity::{hash_bytes, hash_file, ordinary};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -20,6 +20,7 @@ const CASES: [&str; 8] = [
     "cli-prior",
     "typo-fix",
 ];
+const SOURCE_STATE: &str = "controlled-v3-rust";
 const CONTRACT: &str = "This is an explicitly authorized disposable acceptance task outside OpenSpec.\nOnly modify this owned project copy, its documentation, generated fixtures and private\nevidence. Do not modify live checkouts, provider configuration, credentials or shared\nservices. No network or package installation is needed. Do not run model evaluations\nor delegate this bounded task. Preserve the supplied immutable inputs. Leave concise\nevidence and write outcome.json containing status (passed/failed/blocked), command,\nobserved result, evidence paths, and scope. Never count a skipped check as passed.\n";
 
 fn invalid(message: &'static str) -> io::Error {
@@ -53,6 +54,34 @@ fn prompt(case: &str) -> &'static str {
         }
         _ => unreachable!("validated case"),
     }
+}
+
+/// Canonical, path-independent identity of a prepared task contract: the case
+/// kind, its declared source state, the exact task prompt and every immutable
+/// input hash. Independently prepared copies of a path-free case share this
+/// digest, while a changed immutable input or a rewritten receipt changes it.
+/// Arm preparation recomputes the digest before measuring, so a case that
+/// another arm or an executor altered cannot be silently reused as the frozen
+/// workload input.
+pub(crate) fn contract_digest(
+    case: &str,
+    prompt: &str,
+    immutable: &BTreeMap<String, String>,
+) -> String {
+    let mut text = String::from("outcome-case-contract-v1");
+    for (label, value) in [("case", case), ("state", SOURCE_STATE), ("prompt", prompt)] {
+        text.push('\0');
+        text.push_str(label);
+        text.push('\0');
+        text.push_str(value);
+    }
+    for (name, hash) in immutable {
+        text.push('\0');
+        text.push_str(name);
+        text.push('\0');
+        text.push_str(hash);
+    }
+    hash_bytes(text.as_bytes())
 }
 
 pub fn run(args: &[OsString]) -> io::Result<i32> {
@@ -262,9 +291,11 @@ fn prepare(case: &str, root: &Path, observer: Option<&Path>) -> io::Result<Value
             immutable.insert(file, hash);
         }
     }
+    let prompt = format!("{CONTRACT}\n{}", prompt(case));
+    let contract = contract_digest(case, &prompt, &immutable);
     Ok(
         json!({"case_id":case,"consumer":null,"immutable":immutable,"documents":documents,
-        "prompt":format!("{CONTRACT}\n{}",prompt(case)),"source_state":"controlled-v3-rust",
+        "prompt":prompt,"source_state":SOURCE_STATE,"contract":contract,
         "fixture_executables":executable_inputs,"case_root":root}),
     )
 }
