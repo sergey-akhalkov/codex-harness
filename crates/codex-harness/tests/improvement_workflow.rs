@@ -650,6 +650,7 @@ fn anchored_report(observation: &str) -> Value {
             "predicted": "less repeated context loading",
             "counterexample": "diagnostics vanish on failure",
             "acceptance": "the independent oracle passes",
+            "alternatives": "no change, reuse of the existing reader, simplification and subtraction leave the measured burden in place",
             "spec": "openspec/changes/add-synthetic",
             "basis": observation,
             "treatment": "addition",
@@ -832,6 +833,138 @@ fn unsupported_citations_are_refused_without_model_churn() {
     );
 }
 
+/// An addition that never states why the smaller routes cannot satisfy the
+/// evidenced need is refused before admission: additional machinery is only
+/// proposed after no change, reuse, simplification and subtraction were
+/// considered.
+#[test]
+fn an_addition_without_the_smaller_route_consideration_is_refused() {
+    let fixture = Fixture::new("missing-alternatives");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    let baseline_attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+
+    let report = json!({
+        "schema": 1,
+        "candidates": [{
+            "mechanism": "bounded-output",
+            "conditions": "local-tool-runs",
+            "observation": locator,
+            "predicted": "less repeated context loading",
+            "counterexample": "diagnostics vanish on failure",
+            "acceptance": "the independent oracle passes",
+            "spec": "openspec/changes/add-synthetic",
+            "basis": locator,
+            "treatment": "addition",
+            "evidence": [{"locator": locator, "kind": "observed"}],
+            "next_check": null,
+        }],
+        "idle_reason": null,
+    });
+    seed_investigator_report(&fixture, &report);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert_eq!(
+        status["intake"]["outcomes"][0]["outcome"], "refused",
+        "{status}"
+    );
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("alternatives consideration"),
+        "{status}"
+    );
+    assert!(status["candidate"].is_null(), "{status}");
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        baseline_attempts + 1,
+        "only the settled investigator attempt is recorded: {cursor}"
+    );
+    assert!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| !matches!(
+                attempt["role"].as_str(),
+                Some("planner") | Some("implementer")
+            )),
+        "{cursor}"
+    );
+}
+
+/// An evidenced need already satisfied by an existing attributable route is
+/// concluded as reuse: the loop stays idle, creates no card and dispatches no
+/// implementation conversation, so an overlapping capability is not
+/// duplicated as additional machinery.
+#[test]
+fn an_overlapping_existing_route_concludes_reuse_without_dispatch() {
+    let fixture = Fixture::new("overlapping-route");
+    let (root, locator) = write_evidence_root(&fixture);
+    fixture.write_spec(&[("evidence_root", json!(root))]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    let baseline_attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+
+    let report = json!({
+        "schema": 1,
+        "candidates": [{
+            "mechanism": "reuse-existing-reader",
+            "conditions": "local-tool-runs",
+            "observation": locator,
+            "predicted": "no additional machinery is needed",
+            "counterexample": "the existing route loses the required isolation",
+            "acceptance": "the independent oracle passes",
+            "spec": "openspec/changes/add-synthetic",
+            "basis": locator,
+            "treatment": {"reuse": {"existing": locator}},
+            "evidence": [{"locator": locator, "kind": "observed"}],
+            "next_check": null,
+        }],
+        "idle_reason": null,
+    });
+    seed_investigator_report(&fixture, &report);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(status["phase"], "idle", "{status}");
+    assert_eq!(
+        status["intake"]["outcomes"][0]["outcome"], "reuse-suffices",
+        "{status}"
+    );
+    assert!(status["candidate"].is_null(), "{status}");
+    assert!(
+        status["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reuse"),
+        "{status}"
+    );
+    let cursor = fixture.cursor();
+    assert_eq!(
+        cursor["attempts"].as_array().unwrap().len(),
+        baseline_attempts + 1,
+        "only the settled investigator attempt is recorded: {cursor}"
+    );
+    assert!(
+        cursor["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| !matches!(
+                attempt["role"].as_str(),
+                Some("planner") | Some("implementer")
+            )),
+        "{cursor}"
+    );
+}
+
 /// An actual investigator conversation returns prose paragraphs plus its
 /// schema-1 report as the final payload; the controller consumes that
 /// terminal framing without replaying the model, and the digest of the raw
@@ -1010,6 +1143,27 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
         investigator_brief.contains(&format!("planning root {}", fixture.proj.display())),
         "the exact specification root stays visible: {investigator_brief}"
     );
+    // The brief offers the smaller treatments before additional machinery and
+    // states the reuse and review rules the intake enforces.
+    for needle in [
+        "\"no-change\"",
+        "\"reuse\"",
+        "\"simplification\"",
+        "\"subtraction\"",
+        "\"alternatives\"",
+        "before additional machinery",
+        "counterexample",
+        "actual consumption",
+        "skills usage",
+        "skill-evolution",
+        "auto-delete",
+        "fewer lines",
+    ] {
+        assert!(
+            investigator_brief.contains(needle),
+            "{needle}: {investigator_brief}"
+        );
+    }
 
     // The refused pre-submission dispatch is a recorded attempt with a known
     // outcome, never an unknown or billed one.
@@ -1035,6 +1189,7 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
             "predicted": "less repeated context loading",
             "counterexample": "diagnostics vanish on failure",
             "acceptance": "the independent oracle passes",
+            "alternatives": "no change, reuse of the existing reader, simplification and subtraction leave the measured burden in place",
             "spec": format!("openspec/changes/{change}"),
             "basis": locator,
             "treatment": "addition",
@@ -1862,6 +2017,7 @@ fn incomplete_planner_artifacts_block_implementation() {
             "predicted": "smaller resident context",
             "counterexample": "rare fallback needs the full context",
             "acceptance": "the independent oracle passes",
+            "alternatives": "no change, reuse of the existing route, simplification and subtraction leave the resident context unchanged",
             "spec": "add-incomplete",
             "basis": locator,
             "treatment": "addition",
@@ -2314,6 +2470,7 @@ fn missing_change_report(locator: &str) -> Value {
             "predicted": "smaller resident context",
             "counterexample": "rare fallback needs the full context",
             "acceptance": "the independent oracle passes",
+            "alternatives": "no change, reuse of the existing route, simplification and subtraction leave the resident context unchanged",
             "spec": "add-narrow-context",
             "basis": locator,
             "treatment": "addition",
