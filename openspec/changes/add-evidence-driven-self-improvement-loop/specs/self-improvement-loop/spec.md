@@ -1,6 +1,6 @@
 ## Purpose
 
-Continuously investigate evidence-backed harness improvements by using real improvement tasks as controlled workloads, preserving correctness, reproducibility, useful implementations and durable decisions on the existing Beads board.
+Autonomously measure, formulate, implement and evaluate evidence-backed harness improvements using proportionate experiments, preserving correctness, accepted baselines, useful work and durable decisions on the existing Beads board.
 
 ## ADDED Requirements
 
@@ -18,7 +18,7 @@ The loop SHALL admit a hypothesis only with a concrete observation, evidence loc
 
 ### Requirement: An explicit run defines scope and operating inputs
 
-The installed skill SHALL start or resume an explicitly selected loop against an identified project, Beads board, source revision, writable scope, experiment policy and model configuration. The policy SHALL identify permitted researcher and executor routes, the explicitly selected repeatability/identity policy, resource limits, decision scope and any publication authority. Routine planning, implementation and measurement within that authority SHALL continue autonomously; material scope or operating-condition changes SHALL require a user decision. Missing route inputs or observations required by the selected identity policy SHALL permit model-free preparation but MUST NOT trigger guessed endpoints, changed models or paid fallbacks. The selected API-observed policy SHALL keep unavailable weight hashes and hardware details visible as limits without requiring them as setup inputs.
+The installed skill SHALL start or resume an explicitly selected loop against an identified project, Beads board, source revision, writable scope, experiment policy and model configuration. The policy SHALL identify permitted researcher and executor routes, the explicitly selected repeatability/identity policy, resource limits, decision scope and any publication authority. Routine initial measurement, hypothesis formulation, experiment selection, planning, implementation, remeasurement, supported adoption, candidate rollback and selection of the next hypothesis within that authority SHALL continue autonomously without per-hypothesis confirmation; material scope or operating-condition changes SHALL require a user decision. Missing route inputs or observations required by the selected identity policy SHALL permit model-free preparation but MUST NOT trigger guessed endpoints, changed models or paid fallbacks. The selected API-observed policy SHALL keep unavailable weight hashes and hardware details visible as limits without requiring them as setup inputs.
 
 #### Scenario: Model details arrive later
 - **WHEN** the local endpoint or exact serving configuration has not been supplied
@@ -78,33 +78,65 @@ One approval SHALL suffice for all stages expressly covered by its unchanged sco
 - **WHEN** the user refuses the presented proposal
 - **THEN** the loop retains the capability and decision, and does not repeat the same request without a new evidential basis or user instruction
 
-### Requirement: Every implemented hypothesis has a complete planning contract
+### Requirement: Every hypothesis has one planning contract from initial measurement
 
-Before changing any candidate implementation, the loop SHALL satisfy the per-hypothesis OpenSpec prerequisite owned by `orchestration-feedback-loop`. This includes the hypothesis serving as the evaluation task. Both arms SHALL consume the same frozen task contract, including its applicable planning artifacts and independent acceptance. A change to that contract during a comparison SHALL invalidate comparability rather than silently update one arm.
+Each hypothesis SHALL have its own OpenSpec change under the lifecycle owned by `orchestration-feedback-loop`, established before its first targeted baseline measurement. Existing observations can motivate that change without a speculative candidate implementation. The initial contract SHALL identify the problem, measurement question, scope, inputs, measurement tasks and evidence destination; the same change SHALL then own hypothesis formulation, experiment design, implementation, remeasurement, decision and restoration or adoption. Raw evidence SHALL remain in existing local storage with references, not be copied into planning artifacts or a second journal.
+
+Before candidate edits, the change SHALL satisfy the complete per-hypothesis planning prerequisite, including the falsifiable mechanism, independent acceptance, chosen experimental unit, baseline basis, meaningful effect, controls, stopping and escalation/deferral rules. Evidence that changes the hypothesis or required scope SHALL revise the plan explicitly before dependent work; comparative results SHALL NOT retroactively redefine success. An ordinary evaluation workload that is not itself a harness-improvement hypothesis SHALL use its existing contract or the candidate's experiment contract without an artificial second hypothesis or OpenSpec change.
+
+#### Scenario: Initial measurements precede a concrete solution
+- **WHEN** observed friction justifies investigation but no candidate mechanism has yet been selected
+- **THEN** the loop creates the hypothesis's change and records the targeted measurement plan before executing it, then develops the hypothesis and remaining artifacts in that same change
 
 #### Scenario: A small instruction hypothesis has no specification
 - **WHEN** an executor is about to implement a one-line instruction change without its complete linked OpenSpec artifacts
 - **THEN** dispatch is prevented with the missing planning prerequisite identified
 
+#### Scenario: A build is the evaluation workload
+- **WHEN** a specified hypothesis is evaluated by building an existing project and no separate improvement B is being implemented
+- **THEN** that workload has frozen inputs and independent acceptance under the experiment contract without a fabricated B change or implementation
+
 #### Scenario: Task acceptance is revised between arms
 - **WHEN** the evaluation task's requirements or checks change after its baseline attempt
 - **THEN** the previous attempt cannot be paired with the revised candidate attempt
 
-### Requirement: Real improvement tasks rotate through candidate and workload roles
+### Requirement: Autonomous experiments select sufficient work and preserve the accepted baseline
 
-The loop SHALL support the sequence A evaluated on B, then B evaluated on C, without requiring reciprocal A/B comparisons or a separate synthetic coding suite. It SHALL prepare a frozen candidate A, solve the frozen real task B with baseline H and candidate H+A, independently accept each solution, decide A, and retain exact useful implementations of B. The next baseline SHALL be H+A only after a supported adoption of A and any required removal approval for that transition; otherwise it SHALL remain H. Before B becomes the next candidate, its exact selected implementation SHALL be integrated and checked on its candidate branch against that current baseline, with any changed revision recorded. Implementing B successfully SHALL NOT establish B's own benefit or close its hypothesis prematurely.
+The loop SHALL use the experiment-selection contract in `harness-outcome-evaluation` to choose the smallest sufficient real workload and comparison method for each hypothesis before candidate implementation. It SHALL account for expected recurring usefulness, experiment cost, decision uncertainty, consequences of an incorrect decision and reversibility without an invented precision score. A short operation or agent task SHALL be eligible when it preserves the claimed mechanism and required acceptance. Whole-task paired implementations SHALL be selected when shorter work would omit decision-relevant strategy, interactions, corrections or outcomes. Repeated-use or recovery claims SHALL preserve the necessary sequence and state. There SHALL be no mandatory escalation ladder or obligation to implement an unrelated improvement twice.
+
+Within established authority, the loop SHALL execute the planned initial measurements, formulate the hypothesis, implement the candidate, remeasure, publish a supported decision, settle the resulting runtime state and select the next grounded hypothesis. Adoption SHALL integrate only the exact supported candidate after applicable authority and combined-tree checks. Rejection SHALL restore and verify the accepted runtime without adding the candidate to mainline, preserving the candidate, failed attempts, reason and restoration evidence. An inconclusive candidate SHALL remain inactive; a new measurement SHALL require the declared decision-changing reason and stopping policy, otherwise the loop SHALL defer it and continue eligible work. Unknown or failed restoration SHALL block conflicting work on that resource while independent safe work can continue.
+
+Restoring an owned experimental selection to its unchanged accepted baseline SHALL be part of authorized experiment recovery, not a new retirement of accepted capability. This SHALL NOT waive approval for a candidate that removes existing code, features or skills, authorize unrelated cleanup or erase useful work and evidence.
+
+The loop SHALL also support A evaluated by implementing B under H and H+A, then B evaluated on C, when that work is applicable and justified. A and B SHALL retain their own hypothesis specifications and exact candidate identities. Workload B's correctness SHALL NOT establish its own benefit, and the next hypothesis SHALL NOT be forced to be the preceding workload.
+
+#### Scenario: A short comparison is sufficient
+- **WHEN** a build-reuse hypothesis can be decided through the real build/check cycle with required invalidation and correctness checks
+- **THEN** the loop measures that cycle in both variants, records the supported scope and moves to the next hypothesis without two feature implementations
+
+#### Scenario: A hypothesis changes the agent's implementation strategy
+- **WHEN** a fixed-command probe would bypass the decisions and corrections named by the hypothesis
+- **THEN** the loop selects an applicable agent workload through accepted completion, including paired full implementations when needed
+
+#### Scenario: A candidate is rejected
+- **WHEN** adequate applicable evidence rejects the candidate or independent acceptance fails
+- **THEN** the loop records the scoped reason, verifies the accepted runtime is restored, retains the candidate and evidence, and automatically selects other eligible work without re-proposing the same mechanism on unchanged evidence
+
+#### Scenario: Evidence is inconclusive
+- **WHEN** remaining uncertainty can change the decision and another measurement is not justified under the plan
+- **THEN** the candidate stays inactive with the missing fact and reconsideration condition recorded, while another eligible hypothesis can proceed
 
 #### Scenario: A is adopted and B is next
-- **WHEN** A's declared acceptance passes, applicable removal approval covers advancement and both attempts at B are retained
-- **THEN** the loop advances the experimental baseline to the evaluated A revision, selects and checks an exact B revision against it, and evaluates B on a new specified real task C
-
-#### Scenario: A is rejected
-- **WHEN** A regresses required behavior or fails the predeclared benefit decision
-- **THEN** H remains the baseline, A's evidence and decision are retained, and a usable B implementation can still proceed toward evaluation on C
+- **WHEN** a justified A-on-B experiment supports adoption and B is independently selected as the next hypothesis
+- **THEN** the loop advances to the evaluated A baseline, checks an exact useful B revision against it, and evaluates B on an applicable independently specified C
 
 #### Scenario: B requires A to exist in the task inputs
-- **WHEN** B cannot be implemented against the same source and requirements in both arms without depending on A's unaccepted source changes
-- **THEN** B is not used for that paired comparison; the loop records the dependency and selects an independent applicable real task
+- **WHEN** B cannot be implemented against the same source and requirements in both variants without depending on A's unaccepted source changes
+- **THEN** B is not used for that paired comparison and an independent applicable workload is selected
+
+#### Scenario: Restoration has an unknown outcome
+- **WHEN** recovery cannot verify which runtime owns a shared measurement resource
+- **THEN** the controller preserves the original error and evidence and starts no conflicting experiment until that resource's state is reconciled
 
 ### Requirement: Candidates can be selected without changing accepted source
 
@@ -130,7 +162,7 @@ Each hypothesis implementation SHALL have a dedicated branch from an explicit ac
 
 The declared comparison policy SHALL distinguish observed operational metrics from work metrics adjusted for attributable infrastructure waiting, using the rules and coverage gates in `harness-outcome-evaluation`. The loop SHALL NOT interpret unrelated queue imbalance as model/harness benefit or regression, or omit a treatment's own scheduling, polling or build-demand effects. Missing attribution that could change the decision SHALL hold that conclusion as inconclusive without discarding the attempt.
 
-The loop SHALL preserve the paired same-task method and enforce the operating-condition, independent-calibration and distinct-uncertainty requirements of `harness-outcome-evaluation`. Its decision SHALL distinguish an observed task-scoped effect from repeatable or broader benefit. Cache, recovery and model-strategy changes caused by the treatment SHALL remain outcomes; unresolved nuisance effects SHALL NOT be silently removed or converted into statistical confidence. Insufficient evidence SHALL follow the existing declared repetition or deferral policy without replacing the real comparison with proxy metrics.
+The loop SHALL enforce the declared experiment method and its applicable operating-condition, independent-calibration and distinct-uncertainty requirements from `harness-outcome-evaluation`. Full paired implementation SHALL remain required whenever it is the selected sufficient method, and a shorter method SHALL NOT inherit an unmeasured broader claim. Its decision SHALL distinguish an observed task-scoped effect from repeatable or broader benefit. Cache, recovery and model-strategy changes caused by the treatment SHALL remain outcomes; unresolved nuisance effects SHALL NOT be silently removed or converted into statistical confidence. Insufficient evidence SHALL follow the declared escalation, repetition or deferral policy; component counters and replay evidence SHALL NOT substitute for an unexercised agent or end-to-end effect.
 
 Candidate implementation checks and task acceptance SHALL be independent of candidate-controlled claims. The loop SHALL use `harness-outcome-evaluation` to decide `adopt`, `reject` or `inconclusive`, enforce required correctness, and retain all attempts. A metric improvement SHALL NOT excuse weakened requirements, changed oracles or discarded failures. Adoption SHALL identify the exact tested candidate, its supported task/model scope and baseline; reworked or combined candidates SHALL be checked on their new identities before advancement. Live publication SHALL follow existing installation and skill lifecycles within its established authority rather than follow automatically from a task's closed status.
 
@@ -144,7 +176,7 @@ Candidate implementation checks and task acceptance SHALL be independent of cand
 
 ### Requirement: Continuous operation preserves recoverable progress
 
-An explicitly started loop SHALL remain available across successive experiments until stopped or constrained by its configured operating policy. It SHALL expose current baseline, active hypothesis, evaluation task, phase, last decision and next action, including idle, waiting-for-input, blocked and recovery conditions. Stop SHALL suspend new work, resolve or explicitly retain in-flight effects, and preserve evidence and useful patches. Restart/resume SHALL reconcile the board, artifact identities and known process outcomes before continuing; it MUST NOT replay a model attempt, board decision or activation whose outcome is uncertain. Resource limits SHALL bound attempts and retained data without imposing an undocumented lifetime limit on the service.
+An explicitly started loop SHALL remain available across successive experiments until stopped or constrained by its configured operating policy. It SHALL expose current baseline, active hypothesis and its specification, selected method and workload, phase, last decision, restoration state and next action, including idle, waiting-for-input, blocked and recovery conditions. Stop SHALL suspend new work, resolve or explicitly retain in-flight effects, and preserve evidence and useful patches. Restart/resume SHALL reconcile the board, artifact identities and known process outcomes before continuing; it MUST NOT replay a model attempt, board decision or activation whose outcome is uncertain. Resource limits SHALL bound attempts and retained data without imposing an undocumented lifetime limit on the service.
 
 #### Scenario: Interruption follows a recorded adoption
 - **WHEN** the process exits after publishing an adoption decision but before confirming baseline activation
@@ -160,7 +192,7 @@ An explicitly started loop SHALL remain available across successive experiments 
 
 ### Requirement: Every model conversation remains attributable and visible
 
-Research, candidate implementation and measured task execution SHALL each use the existing dispatch mechanism with an identified actual model/configuration and its own visible titled terminal surface. A transcript or background process alone SHALL NOT satisfy conversation visibility. If the required surface is unavailable, the loop SHALL preserve in-flight state and suspend new model dispatch. Measurements sharing local inference hardware SHALL not overlap with other loop-generated model work unless that concurrency is an explicitly controlled part of both arms. The loop SHALL report external interference that prevents a valid comparison.
+Every model conversation used for research, candidate implementation or measured task execution SHALL use the existing dispatch mechanism with an identified actual model/configuration and its own visible titled terminal surface. A model-free workload SHALL use the native execution/evidence path without creating an artificial conversation. A transcript or background process alone SHALL NOT satisfy conversation visibility. If the required surface is unavailable, the loop SHALL preserve in-flight state and suspend new model dispatch. Measurements sharing local inference hardware SHALL not overlap with other loop-generated model work unless that concurrency is an explicitly controlled part of both arms. The loop SHALL report external interference that prevents a valid comparison.
 
 #### Scenario: An executor surface closes
 - **WHEN** the owning dispatch mechanism reports loss of a required conversation surface
@@ -180,8 +212,8 @@ Beads SHALL remain the durable hypothesis and decision owner. Local execution st
 
 ### Requirement: The skill and controller are globally delivered and exercised
 
-The `self-improvement-loop` skill and executable support SHALL be delivered through the existing kit installation/update/recovery lifecycle and usable from an owned project outside this checkout. Acceptance SHALL exercise the real configured local model, actual Beads and OpenSpec, installed tool/instruction consumption, an A-on-B comparison followed by a B-on-C transition, independent task checks and stop/resume. Model-free fixtures SHALL verify failure paths but SHALL NOT replace the real installed path or prove model-backed savings. Missing local model access SHALL keep the corresponding acceptance tasks open.
+The `self-improvement-loop` skill and executable support SHALL be delivered through the existing kit installation/update/recovery lifecycle and usable from an owned project outside this checkout. Acceptance SHALL exercise the real configured local model, actual Beads and OpenSpec, installed tool/instruction consumption, autonomous progress from initial measurement through decision and verified restoration or adoption, both a short real-operation comparison and a justified A-on-B comparison followed by a B-on-C transition, independent task checks and stop/resume. The short path SHALL demonstrate that no duplicate implementation or workload hypothesis is required; the full path SHALL remain exercised rather than being replaced by model-free checks. Model-free fixtures SHALL verify failure paths but SHALL NOT replace the real installed path or prove model-backed savings. Missing local model access SHALL keep the corresponding acceptance tasks open.
 
 #### Scenario: An external project invokes the installed skill
 - **WHEN** a user starts the loop from an owned outside-checkout project with qualified runtime inputs
-- **THEN** the installed skill and controller find the intended board and specification root, perform the sequential experiment path, and expose retained decisions without modifying unrelated installed settings
+- **THEN** the installed skill and controller find the intended board and specification root, perform the autonomous measurement-to-decision path with the selected sufficient method, and expose retained decisions without modifying unrelated installed settings

@@ -1,6 +1,6 @@
 ## Context
 
-See [proposal.md](proposal.md) for motivation and scope. The confirmed operating scenario is one owner starting a continuous local improvement loop, leaving it running across successive experiments, inspecting decisions through Beads, and stopping or returning without losing useful work. The accepted sequence is A evaluated on B, then B on C. Every hypothesis must have its own complete OpenSpec change before implementation, including small instruction or configuration changes.
+See [proposal.md](proposal.md) for motivation and scope. The confirmed operating scenario is one owner starting a continuous local improvement loop, leaving it running across successive experiments, inspecting decisions through Beads, and stopping or returning without losing useful work. The confirmed cycle is initial measurement, hypothesis formulation, implementation, remeasurement, a supported decision and verified adoption or restoration, followed autonomously by another grounded hypothesis. Each hypothesis has its own OpenSpec change from targeted initial measurement onward, completed before candidate edits. A-on-B then B-on-C remains supported when justified; it is not the mandatory shape of every experiment.
 
 Relevant existing owners, inspected during planning:
 
@@ -17,7 +17,7 @@ These are source-inspection findings. Local-runtime qualification and model-back
 
 **Goals:**
 
-- Obtain one useful complete A-on-B experiment early, then deliver the whole continuous B-on-C, recovery and installed-operation contract.
+- Obtain one useful autonomous measurement-to-decision cycle early with the smallest sufficient real workload, then finish short and full experiment paths, optional A-on-B/B-on-C rotation, recovery and installed operation.
 - Let machine-owned execution bookkeeping be deterministic while model work supplies bounded diagnosis, planning and implementation.
 - Preserve the distinction between a correct implementation, an evidenced benefit, an experimental-baseline activation and a live installation publication.
 - Make subtraction a normal candidate route while keeping the user's informed removal decision distinct from measured benefit.
@@ -36,7 +36,7 @@ These are source-inspection findings. Local-runtime qualification and model-back
 
 Add a proposed `codex-harness improve start|status|select|stop|resume` command and owned `.agents/skills/self-improvement-loop/SKILL.md`. Use a small CLI adapter and a cohesive controller in the existing crates, provisionally `crates/codex-harness/src/improvement_loop_cli.rs` and `crates/harness-core/src/improvement_loop.rs`; split only where existing ownership or verification warrants it. No new framework or external dependency is justified at planning time.
 
-The skill starts or attaches to an explicitly configured run. The controller performs board operations, qualification checks, dispatch, attempt observation, independent acceptance, accounting and recovery. It asks the configured investigator for a bounded diagnosis/plan only when evidence is available. Researcher and executor conversations use the owning visible dispatch path with concise relevant context; a single ever-growing chat is not the service state.
+The skill starts or attaches to an explicitly configured run. The controller performs board operations, initial measurement, applicable qualification checks, dispatch, attempt observation, independent acceptance, accounting, authorized adoption/restoration and recovery. It asks the configured investigator for a bounded diagnosis/plan only when evidence is available. Researcher and executor conversations use the owning visible dispatch path with concise relevant context; a single ever-growing chat is not the service state.
 
 A run input names the project/board/specification root, base revision, writable scope, model/runner configuration, local evidence root, comparison policy and permitted activation/publication scope. These are explicit local inputs, not checked-in endpoints or machine paths. One controller owns a run and its shared measurement resources. Existing ownership/process facilities prevent a second start from mutating the same run; this does not require a distributed scheduler.
 
@@ -44,13 +44,13 @@ A run input names the project/board/specification root, base revision, writable 
 
 ### 2. Beads is the only hypothesis and decision authority
 
-Use one `task` with label `hypothesis` for each hypothesis. Keep its observation, mechanism, scope, predeclared acceptance, OpenSpec reference, exact candidate references, experiment references, decisions and reconsideration conditions on that card. Reuse the existing benefit-gate owner for `adopt`, `reject` and `inconclusive`; evidence locators and experiment identity extend its existing contract as required. A consistent record is not execution proof.
+Use one `task` with label `hypothesis` for each hypothesis. Keep its measurement question, observation, mechanism, scope, selected method and rationale, predeclared acceptance, OpenSpec reference, exact candidate references, experiment references, decisions and reconsideration conditions on that card. Reuse the existing benefit-gate owner for `adopt`, `reject` and `inconclusive`; evidence locators and experiment identity extend its existing contract as required. A consistent record is not execution proof.
 
 Use ordinary work statuses separately from benefit outcome. An implemented B remains pending its own benefit evaluation. An evidenced rejected experiment can close normally. An inconclusive investigation records the missing fact and is deferred when no immediate justified check remains. Search includes closed and deferred cards. Reconsideration requires new evidence and preserves prior conclusions rather than overwriting them.
 
 Removal proposals and user decisions use this same card and its existing metadata/comment facilities, with references to the reviewed OpenSpec scope and local preview/evidence. Keep consent separate from the benefit-gate result: a successful experiment can await integration approval, and user refusal is not a measurement failure. No new tracker, consent service or hypothesis status hierarchy is needed.
 
-Record the evaluation relationship using the installed nonblocking `related` edge plus the experiment's explicit candidate/workload roles. Do not use `blocks` for A-tested-on-B: deciding A requires accepted B attempts, not B's future benefit decision. Real source dependencies are different and can make a workload ineligible for a particular pair.
+When a workload is itself a hypothesis, record the evaluation relationship using the installed nonblocking `related` edge plus the experiment's explicit candidate/workload roles. An ordinary build, search or diagnostic workload belongs to the experiment contract and needs no fabricated hypothesis card or change. Do not use `blocks` for A-tested-on-B: deciding A requires accepted B attempts, not B's future benefit decision. Real source dependencies are different and can make a workload ineligible for a particular pair.
 
 Local phase receipts and process identifiers are recovery data, not another task journal. Persist large immutable inputs, patches and traces in the existing local evidence lifecycle and link them from cards. The board alone does not claim an evicted trace remains verifiable. Retention protects active experiments and recovery/baseline provenance, and reports missing historical evidence honestly. Hypothesis cards are durable work items, not ephemeral records subject to automatic purge.
 
@@ -58,11 +58,13 @@ The existing feedback incubator remains lead-owned. The new explicitly invoked i
 
 **Alternative:** a separate Markdown or JSON hypothesis journal. Rejected because it would duplicate board identity, status and decisions. A custom Beads type is unnecessary unless future observed needs exceed `task` plus a label.
 
-### 3. Each hypothesis has a mandatory, linked OpenSpec change
+### 3. One linked OpenSpec change owns each hypothesis from initial measurement
 
-Before any candidate edit, resolve the intended OpenSpec root/store, scaffold through `openspec new change`, create proposal, requirements, design and tasks using the installed instructions, and validate completeness and content. Include the mechanism, counterexample, baseline/workload identity, independent acceptance, meaningful effect and comparison/stopping policy. This requirement applies to A and to the workload B before either is implemented. It overrides the ordinary optional-spec exception only for this loop's hypotheses.
+Before the first targeted measurement for an investigation, resolve the intended OpenSpec root/store and scaffold its change through `openspec new change`. Start from existing attributable observations and an explicit measurement question, scope, inputs, baseline-measurement tasks and local evidence references; a concrete solution is not required yet. Routine telemetry and previously retained evidence do not need a new change per event. Use the same change as measurements inform the falsifiable hypothesis, design, candidate implementation, new measurements, decision and adoption/restoration checks.
 
-Beads owns the lifecycle and decisions. OpenSpec owns intended behavior, technical design, acceptance and the implementation checklist. Use references rather than duplicate conclusions. An experiment is specified to support adopt/reject/inconclusive outcomes: rejecting the candidate can finish its agreed investigation, but cannot mark undelivered mandatory product behavior as delivered. Do not remove a rejected hypothesis's specification or erase its evidence. Archive only through the existing workflow when its actual completion conditions hold. Rejected or otherwise unadopted capability deltas must not synchronize into the main specifications; use the supported retention/archive path without spec synchronization, or retain the change with an explicit unresolved archive action if that path is unavailable. Adoption synchronizes only behavior actually accepted and delivered within the declared scope.
+Before any candidate edit, complete proposal, requirements, design and tasks using the installed instructions, validate them, and freeze the mechanism, counterexample, claimed scope, selected method, baseline/workload identity, independent acceptance, meaningful effect, controls and stopping/escalation policy. This applies separately to A and B when both are improvement hypotheses, including small instruction/configuration changes. A build or other ordinary workload uses its existing contract or the hypothesis's experiment plan, not an artificial B change. A materially different causal hypothesis receives its own change; further trials of the same hypothesis remain linked to its existing owner.
+
+Beads owns the lifecycle and decisions. OpenSpec owns the initial measurement and experiment plan, intended behavior, technical design, acceptance and the measurement-to-decision checklist. Use references rather than duplicate conclusions. An experiment is specified to support adopt/reject/inconclusive outcomes: rejecting the candidate can finish its agreed investigation, but cannot mark undelivered mandatory product behavior as delivered. Do not remove a rejected hypothesis's specification or erase its evidence. Archive only through the existing workflow when its actual completion conditions hold. Rejected or otherwise unadopted capability deltas must not synchronize into the main specifications; use the supported retention/archive path without spec synchronization, or retain the change with an explicit unresolved archive action if that path is unavailable. Adoption synchronizes only behavior actually accepted and delivered within the declared scope.
 
 Planning and implementation are distinct controller phases and executor assignments. A user-authorized autonomous loop can move between them within its established scope; missing authority or a material outcome change pauses the dependent phase. This proposal itself authorizes no implementation. Protected workflow definitions remain untouched.
 
@@ -72,7 +74,33 @@ The deterministic observation path summarizes measured model/tool intervals, rec
 
 The investigator inspects a bounded set of relevant evidence and source, searches prior cards, and checks official tool capabilities where needed. It must explain why a repeated operation is unnecessary: identical filenames alone do not establish waste if content or available context changed. Rank candidates by observed incidence, attributable cost, strength of mechanism, expected useful effect and implementation/evaluation cost. No invented precision or unconditional numeric score is required.
 
-Seed the first A and B from existing attributable evidence, reproducible friction or observation of authorized real tasks. If no defensible candidate exists, report idle with the next possible evidence source. Continuous availability does not require endless model calls or increasingly speculative changes.
+Seed each investigation from existing attributable evidence, reproducible friction or observation of authorized real tasks. Select its workload separately; only an independently grounded hypothesis can later become candidate B. If no defensible candidate exists, report idle with the next possible evidence source. Continuous availability does not require endless model calls or increasingly speculative changes.
+
+#### Choose a sufficient experiment before committing to its cost
+
+Use the existing skill to guide judgment and the existing comparison policy/controller to enforce the selected contract. Extend `crates/harness-core/src/improvement_policy.rs` and the benefit-gate/evidence owners rather than introduce a benchmark service, method registry or second planning format. The current policy already represents objective, meaningful effect, acceptance, stopping, uncertainty and overhead; its extension must bind the experimental unit/method, claim, admissible baseline, applicability rationale and escalation/deferral conditions. Missing or inconsistent required evidence prevents the corresponding effect/decision; prose alone is not proof of execution.
+
+The investigator applies this decision procedure within each hypothesis's change:
+
+1. Establish the observed burden, available baseline evidence, incidence and intended-use horizon; plan only missing targeted measurements.
+2. State the causal mechanism, measurable outcome, minimum useful effect, required quality/regression constraints and counterexample. Keep estimates distinct from measured benefits.
+3. Trace where the effect and important regressions arise: an operation, agent choices, a complete accepted result, or a repeated-use/recovery sequence. Choose the smallest unit preserving that path and explain why omitted work cannot change the decision.
+4. Assess relevant variability/confounders, error consequences, reversibility and total investigation/implementation/evaluation cost. A costly experiment must resolve uncertainty that matters enough to justify it; otherwise defer without claiming failure or adoption. No line-count shortcut, fixed score or mandatory sequence of cheaper trials is needed.
+5. Freeze baseline admissibility, inputs/runtime and acceptance identities, controls, metrics, stopping and justified escalation conditions before candidate implementation and outcomes. Reuse an actual retained baseline only when those conditions hold; record unknowns and obtain a fresh control when they could change the result.
+6. Execute, independently check, compare and act under that plan. Retain all outcomes. Escalate only for a named decision-changing observation under the declared policy, or defer and proceed to another grounded hypothesis.
+
+| Mechanism and claimed outcome | Sufficient experiment when applicable | Boundary |
+| --- | --- | --- |
+| Build reuse, process startup or output transformation | Compare the real operation or bounded retained-input replay under both implementations, with relevant integration/failure checks | Operation savings do not establish changed agent behavior or total task productivity |
+| Agent search, command selection or diagnosis | A short real-agent task with independently accepted output | A fixed command bypassing the agent's choices is insufficient |
+| Planning, implementation strategy, delegation or corrections | Whole-task paired implementation through accepted completion when shorter work loses those interactions | Fresh contexts, comparable inputs and independent acceptance remain required |
+| Recurring cache, long-session or recovery behavior | The relevant sequence and state transitions under both variants | Preserve preparation, invalidation, return/recovery and the declared use horizon |
+
+An operation comparison may itself be A/B; two code implementations are only one possible workload. Replayed tool outputs can validate a local transformation but cannot reconstruct a changed adaptive agent trajectory. A smaller experiment never waives required product behavior, diagnostic checks or a broader agreed outcome. Preliminary measurements inform the plan; success criteria cannot be chosen after candidate results. Ordinary before/after monitoring can motivate a hypothesis but is not a causal comparison when workload or conditions changed.
+
+This adapts [IHI's Model for Improvement](https://www.ihi.org/library/model-for-improvement) for iterative small tests, [NIST's objective-led experiment selection](https://www.itl.nist.gov/div898/handbook/pri/section3/pri31.htm) and [Microsoft's pre-experiment hypothesis and metric guidance](https://www.microsoft.com/en-us/research/?p=680556). Their general principles support the approach; production traffic scale and statistical assumptions are not imported into a single-owner local loop.
+
+**Alternatives:** mandatory full implementation for every change wastes work on local mechanisms; universally replacing real work with microbenchmarks can miss agent decisions and displaced costs. A compulsory ladder adds probes even when the need for a full trial is already evident. Select the sufficient method directly and retain escalation only for unresolved relevant evidence.
 
 #### Apply Occam's razor to candidate selection
 
@@ -105,13 +133,13 @@ The controller checks this authority again at integration, baseline activation a
 
 ### 5. Separate the executing harness from the source being edited
 
-For an A-on-B experiment, retain three identities: base harness H, exact candidate runtime H+A, and the frozen task-B source/contract S. Prepare two equivalent owned copies of S with independent homes, caches according to policy, instructions and tools. Install/select each arm's runtime through the existing lifecycle. Prevent inherited live links, project instructions or global configuration from silently replacing the intended arm, and record what was actually consumed.
+For each selected experiment, retain three identities: base harness H, exact candidate runtime H+A, and the frozen workload inputs/contract S. In a full A-on-B experiment, S is the task-B source and specification. For fresh paired attempts, prepare equivalent owned copies of S with method-appropriate isolated state, caches, instructions and tools; retain admissible historical baseline evidence instead of creating an unnecessary fresh baseline attempt. Agent trials additionally need independent homes and contexts. Install/select each arm's runtime through the existing lifecycle. Prevent inherited live links, project instructions or global configuration from silently replacing the intended arm, and record what was actually consumed.
 
 Keep candidate code on a dedicated hypothesis branch in an owned Git worktree. A branch preserves the implementation and history; the worktree provides a simultaneously usable directory. Reuse an existing allocation only after checking ownership, current branch/base, active use, dirty/untracked files and unmerged commits. Otherwise allocate another owned worktree. Freeze a committed base before dispatch and a committed candidate before measuring; necessary uncommitted inputs must be preserved and explicitly resolved, never silently omitted or copied live between arms. Associate branch/revisions and a local worktree locator with the Beads card. No feature-flag layer is required for every experimental change.
 
-Prepare H and H+A runtime artifacts once and reuse them while source, configuration and build inputs are unchanged. The proposed `improve select --run <id> --variant baseline|candidate` operation selects the prepared variant through the existing runtime-selection owner, returns its effective identity, and performs no model call or source revert. It rejects changes during an active measured attempt; subsequent attempts still begin with fresh executor context. Missing/stale artifacts cause explicit preparation or a clear error, not a silent rebuild hidden from accounting. The controller uses the same selection primitive for paired trials.
+Prepare H and H+A runtime artifacts once and reuse them while source, configuration and build inputs are unchanged. The proposed `improve select --run <id> --variant baseline|candidate` operation selects the prepared variant through the existing runtime-selection owner, returns its effective identity, and performs no model call or source revert. It rejects changes during an active measured attempt; subsequent agent attempts still begin with fresh executor context. Missing/stale artifacts cause explicit preparation or a clear error, not a silent rebuild hidden from accounting. The controller uses the same selection primitive for paired trials.
 
-Both executors implement B against S. Neither receives an existing B solution, sibling branch/logs, investigator notes that reveal the solution, or mutable shared candidate files. An identifier can bind an artifact but does not prove it executed. The independent oracle observes the real product entry point and remains outside candidate writes. Deliberately wrong implementations must fail that oracle before it is trusted for comparison.
+Each variant performs the selected workload against S. If that workload is implementing B, both executors implement B independently; neither receives an existing B solution, sibling branch/logs, investigator notes that reveal the solution, or mutable shared candidate files. Direct operation trials need no artificial model conversation; agent-dependent trials still need fresh contexts and applicable qualification. An identifier can bind an artifact but does not prove it executed. The independent oracle observes the relevant real product entry point and remains outside candidate writes. Deliberately incorrect, skipped or forged-success results must fail that oracle before it is trusted for comparison.
 
 Linked worktrees share repository objects and most references, as documented by [Git worktree](https://git-scm.com/docs/git-worktree). They therefore retain candidates but do not by themselves hide an earlier B solution from another B executor. Materialize each measured source snapshot without sibling solution history, using an independent minimal repository when Git-aware tools require one. Keep shared MCP workers, ports, installation configuration and caches separately allocated or explicitly serialized/controlled. This preserves the convenience of candidate worktrees without claiming they isolate external runtime state.
 
@@ -123,19 +151,24 @@ If B inherently requires A's source change, choose a different applicable real t
 
 The normal path is:
 
-1. Read Beads and evidence; select A and applicable B; complete both planning contracts and any removal approval required for their experimental implementations.
-2. Implement and independently check candidate A on its owned branch/worktree; freeze its commit and prepared runtime identities.
-3. Implement B under H and H+A using fresh contexts and the declared paired order/repetitions; check and retain both results.
-4. Evaluate A using its predeclared scope, quality and benefit policy; publish an evidence-linked decision.
-5. On supported adoption with applicable removal approval, integrate the evaluated candidate into the accepted mainline within the run's authority, check the combined tree and confirm the corresponding H+A runtime before advancing the experimental baseline; otherwise retain H and expose any pending authority. A changed base or resolved conflict requires revalidation of affected benefit evidence and coverage of the actual removal scope. Keep integration/activation receipts distinct from benefit, user authorization and live publication.
-6. Select an exact useful B patch, integrate and check it on B's candidate branch against the resulting baseline, and record any changed identity. Another correct B patch is not interchangeable with a tested one; successful workload implementation does not authorize unproven mainline integration or unapproved removal.
-7. Generate/select and specify C from current evidence; repeat with B as candidate and C as workload.
+1. Search Beads and evidence, select a grounded investigation, and establish its change and targeted initial-measurement plan.
+2. Execute or verify reusable baseline measurements; formulate the falsifiable hypothesis and choose its sufficient experiment. Complete and validate the change before candidate edits, including any required removal approval.
+3. Implement and independently check the candidate on its owned branch/worktree; freeze its commit and prepared runtime identity.
+4. Execute the chosen baseline/candidate workload comparison, reusing admissible baseline evidence when justified. Preserve independent acceptance, original errors, all attempts and overhead.
+5. Evaluate the declared quality, benefit and scope policy and publish an evidence-linked adopt/reject/inconclusive decision.
+6. On supported adoption with applicable authority, integrate the evaluated candidate, check the combined tree and confirm the exact runtime before advancing the experimental baseline. A changed base or resolved conflict requires revalidation of affected benefit evidence. Live publication remains separately scoped.
+7. On rejection or deferral, restore and verify H at a safe boundary, preserving the candidate patch, initial/new measurements and reason. A selected candidate is removed from active use, not erased from history. Unknown or failed restoration stops conflicting use until reconciled.
+8. Select the next grounded hypothesis automatically within run authority, or expose an evidence-based idle/waiting reason. An inconclusive result permits only its justified declared next measurement or deferral, not an endless identical retry.
 
-Extra reciprocal A/B experiments are optional investigations, not a loop prerequisite. If a candidate is invalid, cannot be rebased without changing its claim, or does not exercise the needed mechanism, preserve it with the explicit next action instead of forcing rotation. If A and B each worked against H, their combination still needs validation against the new baseline.
+When useful, the chosen workload can be another improvement B. Retain both accepted B implementations, decide A without waiting for B's benefit, and select an exact B patch only if B is independently chosen next. Integrate/check that patch on its candidate branch against the resulting baseline, recording any changed identity, then evaluate B on an applicable C. This optional rotation preserves useful work and exact lineage without constraining all experiments to produce a next candidate. B's correct implementation is not proof of B's benefit or authority for its adoption/removal.
 
-### 7. Qualify the actual local runtime before cost comparisons
+Routine restoration of the owned experimental runtime to the accepted baseline is covered by the experiment's recovery scope. It does not introduce another removal-approval ritual. Removing accepted capability as a candidate treatment, changing unrelated work, deleting evidence or publishing outside scope still requires the existing authority. Keep decision, integration, activation and restoration receipts distinct.
 
-Extend runner selection with an explicit local-provider configuration common to both arms. Do not permit changing provider/model through arbitrary candidate treatment settings. Preserve existing explicitly selected routes, but never silently use them when the requested local model is unavailable. Verify the real endpoint contract, reported model and deployment metadata, template, available sampling/seed and reasoning settings, context/cache observations, client profile/catalogue, tool round-trip, usage coverage and stop behavior. Keep exact deployment inputs private.
+**Alternative:** choose the next candidate solely because the preceding experiment happened to produce its patch. Rejected because workload applicability and hypothesis value are independent. Optional A-on-B/B-on-C acceptance remains required to verify that supported route.
+
+### 7. Qualify the actual local runtime before model-dependent comparisons
+
+For experiments that execute the model, extend runner selection with an explicit local-provider configuration common to both arms. Do not permit changing provider/model through arbitrary candidate treatment settings. Preserve existing explicitly selected routes, but never silently use them when the requested local model is unavailable. Verify the real endpoint contract, reported model and deployment metadata, template, available sampling/seed and reasoning settings, context/cache observations, client profile/catalogue, tool round-trip, usage coverage and stop behavior. Keep exact deployment inputs private.
 
 Repeated calibration uses the actual agent/tool path with identical controlled inputs. Pin clocks, random inputs, file ordering and comparable cache/load state where they enter the task; define any nonsemantic normalization before observing output. Required solution output must repeat. A finite qualification establishes observed repeatability for that configuration, not mathematical determinism of every future execution.
 
@@ -147,7 +180,7 @@ The intended deployment is a local quantized model with a large context capacity
 
 Keep independent task acceptance as a prerequisite. Report elapsed time through verification and corrections, request/interaction/tool-operation counts, input/output/cache/reasoning categories with subset relationships, and missing coverage. Steps diagnose mechanisms but are not a model-independent price. Token comparisons name the model/tokenizer. Currency, energy or hardware cost require an explicit measured basis; bytes or subscription totals do not supply one.
 
-Report reusable planning, investigation, candidate construction, repeated trials, integration and recovery separately from the matched task attempts. Count each shared activity once. Per-accepted-task resources include unsuccessful attempts and acceptance rate; zero accepted tasks has no finite per-success estimate. The fixed planning artifacts shared by a pair are a common input, with their preparation cost retained as experiment overhead. Claims about a planning-only optimization require a workload that actually exercises that work, not an extrapolation from implementation timings.
+Report reusable planning, investigation, candidate construction, repeated trials, integration and recovery separately from the matched task attempts. Count each shared activity once. Per-accepted-task resources include unsuccessful attempts and acceptance rate; zero accepted tasks has no finite per-success estimate. The fixed planning artifacts shared by a pair are a common input, with their preparation cost retained as experiment overhead. Claims about a planning-only optimization require a workload that actually exercises that work, not an extrapolation from implementation timings. A model-free operation reports model metrics as inapplicable, not measured zero, and does not trigger unrelated model qualification. Measurement scope and claims remain bound to its selected method.
 
 Before comparisons, declare a practically meaningful effect and the allowed noncritical measurement variation. The default decision rule preserves correctness and requires a meaningful improvement in time or resources without a material regression in the other. A genuine cost/time trade-off needs an explicit predeclared policy rather than an invented weighted score. Do not mistake lack of detected regression for proven equivalence.
 
@@ -159,9 +192,11 @@ Preserve replayable real tasks linked to their existing cards. Use applicable ea
 
 #### Control nuisance factors while preserving paired comparison
 
-The confirmed method remains the old and new harness solving the same frozen
-task. Diagnostic counters, component benchmarks and comparisons of different
-tasks cannot substitute for its real-agent acceptance. Extend the existing
+The confirmed comparison uses the old and new harness on the same frozen
+workload appropriate to the hypothesis, with admissible baseline reuse when
+verified. A short operation can establish its declared local effect; counters,
+component benchmarks and different-task timings cannot establish unexercised
+agent behavior or replace a required full-task comparison. Extend the existing
 comparison policy and preflight receipts with the nuisance-control plan before
 either arm starts; reuse it unchanged on resume.
 
@@ -194,7 +229,8 @@ cannot be repaired by subtracting its wall duration. Preserve the original
 attempt and usage, apply the frozen retry/stopping rule, and withhold a causal
 claim when the remaining effect can change its verdict. Treatments of network
 recovery or scheduling retain those effects under controlled relevant faults
-or load. Required solution-repeatability qualification remains a separate gate.
+or load. Required solution-repeatability qualification remains a separate gate
+for model-dependent comparisons.
 
 #### Infrastructure waits and causal interpretation
 
@@ -348,7 +384,7 @@ or the required A-on-B/B-on-C acceptance.
 
 ### 9. Recover deterministic bookkeeping without replaying unknown effects
 
-Use a small persisted phase cursor referencing board/experiment/artifact identities. Natural phases are planning, candidate-ready, baseline-attempt, candidate-attempt, acceptance, decision-recorded and activation-confirmed, plus explicit idle/blocked/stopped conditions. These are operational receipts, not a second set of hypothesis statuses.
+Use a small persisted phase cursor referencing board/experiment/artifact identities. Natural phases are measurement-planned, initial-measurement, hypothesis/experiment-planned, candidate-ready, baseline-attempt or baseline-reused, candidate-attempt, acceptance, decision-recorded and activation/restoration-confirmed, plus explicit idle/blocked/stopped conditions. These phases extend the existing cursor; they do not require another workflow engine. These are operational receipts, not a second set of hypothesis statuses.
 
 Pending removal approval is a waiting-for-input reason referencing the board decision, not a competing lifecycle. Resume resolves current approval/refusal/withdrawal before another removal effect; stale receipts cannot grant consent. Preserve completed effects and evidence, report any restoration needed, and do not replay the experiment merely to recover an approval reference.
 
@@ -360,7 +396,7 @@ Serialize model work on shared local inference hardware during comparisons. Ever
 
 ### 10. Reuse installation and publication boundaries
 
-Experimental advancement operates on isolated runtimes and the agreed source scope. Candidate code enters the accepted mainline only after supported benefit and combined-tree checks; preparation, planning and branch retention do not imply a merge. Live activation is a separately identifiable action using established authority and existing lifecycle checks. Rejection keeps the mainline unchanged, so routine testing and rejection use neither revert commits nor manual code cleanup. Preserve useful rejected/deferred commits and evidence. Reclaim a worktree only after its work is preserved and it has no active consumers, using the normal non-forced Git lifecycle; do not reset another task's tree or delete unmerged work. A candidate that changes the controller or evaluator runs beneath an unchanged external supervisor/oracle and cannot replace its own running control rules.
+Experimental advancement operates on isolated runtimes and the agreed source scope. Candidate code enters the accepted mainline only after supported benefit and combined-tree checks; preparation, planning and branch retention do not imply a merge. Live activation is a separately identifiable action using established authority and existing lifecycle checks. Rejection keeps the mainline unchanged and verifies the accepted runtime is restored, so routine testing and rejection use neither revert commits nor manual code cleanup. Preserve useful rejected/deferred commits and evidence. Reclaim a worktree only after its work is preserved and it has no active consumers, using the normal non-forced Git lifecycle; do not reset another task's tree or delete unmerged work. A candidate that changes the controller or evaluator runs beneath an unchanged external supervisor/oracle and cannot replace its own running control rules.
 
 For approved subtraction, these owners must also verify the intended capability was actually removed from the selected scope, unrelated capabilities remain available and the documented restoration works. Approved source integration does not imply installed retirement unless that stage was expressly covered. Preserve still-needed knowledge, links and evidence in their owners before consolidating or retiring documents and skills.
 
@@ -372,10 +408,12 @@ Deliver the new skill and CLI through the kit's normal installed package, verify
 - **Second attempts inherit the first answer** -> separate ownership of the runtime, source, home and context; test intentional contamination through a sibling solution artifact and shared Git references.
 - **A candidate edits its own grader or hides failed work** -> independent read-protected acceptance and parent-owned accounting; exercise forged-success and dropped-attempt cases.
 - **Required output repeatability or the selected identity policy is unsupported** -> keep qualification open and name the failing observation; do not silently relax the user's policy or turn unavailable facts into verified identity.
-- **Research costs exceed savings** -> record complete overhead and the explicit use horizon for net-benefit claims; prioritize strong evidence and permit idle operation.
+- **Research costs exceed savings** -> select the smallest sufficient experiment, reuse applicable baseline evidence, record complete overhead and the explicit use horizon, and defer unjustified measurement without weakening acceptance.
 - **Nonuse hides a rare dependency, or a smaller catalogue only looks cheaper** -> record coverage gaps, check supported indirect/recovery uses, verify actual consumption and require informed removal approval.
 - **Consent is mistaken for benefit, or benefit for consent** -> retain distinct decisions on the existing card and verify both before the applicable transition, including resume.
 - **The simplification review becomes new overhead** -> reuse bounded evidence and existing owners at intake, with no deletion quota or mandatory recurring inventory.
+- **A short probe omits the claimed effect, or historical drift looks like a gain** -> bind mechanism, claim, experimental unit and baseline admissibility before results; require a fresh control or a stronger real-agent workload when the missing evidence can change the decision.
+
 - **A mandatory spec costs tokens even for a small hypothesis** -> keep artifacts concise and reuse native templates; include that cost rather than introduce a small-change exception to the confirmed requirement.
 - **Beads or installation actions partially succeed** -> reconcile recorded decisions and exact activation identities through existing idempotent owners; retain the original failure and recovery evidence.
 - **Large transcripts fill storage or leak into shared source** -> bounded local retention protecting active evidence, compact board references, synthetic public examples and native source hygiene checks.
@@ -383,8 +421,8 @@ Deliver the new skill and CLI through the kit's normal installed package, verify
 ## Migration Plan
 
 1. Add the new controller/CLI and extend existing board/outcome owners with model-free acceptance. Keep existing feedback, runner selection and installation behavior compatible.
-2. Deliver one installed end-to-end A-on-B path on real supplied local inference, with independent acceptance and Beads/OpenSpec records. Do not declare the full change complete at this milestone.
-3. Complete automatic B-on-C rotation, simplification intake and scoped removal decisions, safe branch/worktree reuse, prepared-variant selection, benefit/authority-gated mainline integration, exact-baseline advancement, retained real-task corroboration and interruption recovery.
+2. Deliver one useful installed autonomous initial-measurement-to-decision path using a sufficient real workload, with independent acceptance and Beads/OpenSpec records. Then exercise the actual supplied local-model A-on-B path; neither milestone alone completes the change.
+3. Complete automatic next-hypothesis selection including the supported B-on-C rotation, method selection and baseline reuse, simplification intake and scoped removal decisions, safe branch/worktree reuse, prepared-variant selection, benefit/authority-gated mainline integration, verified rejection restoration, retained corroboration and interruption recovery.
 4. Deliver and exercise the installed skill/CLI outside the checkout, verify update/recovery and an explicitly bounded continuous-operation observation with multiple experiments and stop/resume. The observation duration is evidence scope, not a service lifetime restriction.
 5. Update owning operating guides and retain commands, identities and private evidence locators. Rollback restores the prior installed/experimental selection through the existing lifecycle, keeping hypothesis history and owned evidence intact.
 

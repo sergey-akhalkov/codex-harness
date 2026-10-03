@@ -662,15 +662,33 @@ unresolved contention could explain it. The active change's
 [measurement contract](../openspec/changes/add-evidence-driven-self-improvement-loop/specs/harness-outcome-evaluation/spec.md#requirement-infrastructure-noise-is-separated-through-attributable-lifecycle-evidence)
 owns the algorithm, causal limits and pending implementation checks.
 
-Each candidate and real evaluation workload has its own complete OpenSpec
-change before implementation, including instruction edits. Beads owns their
-hypotheses and evidence-backed decisions; the controller cursor owns only
-operational recovery. A-on-B then B-on-C uses exact retained candidates,
-independently checked solutions, frozen task inputs and separate runtimes.
-No change, reuse, simplification and subtraction are part of intake; size
-alone is no efficiency evidence. Removal needs a reviewable proposal and
-explicit consent covering the actual affected stages, independently of
-benefit. Experimental activation and live publication remain separate.
+**2026-10-03, confirmed:** each improvement hypothesis has its own OpenSpec
+change from targeted initial measurement through formulation, experiment design,
+implementation, remeasurement and the final decision with verified adoption or
+restoration. Existing routine observations can seed the investigation; complete
+validated artifacts and frozen experiment acceptance precede candidate edits.
+An ordinary evaluation workload does not need an artificial second hypothesis.
+
+Within established run authority, the loop chooses and executes these phases
+autonomously, retaining supported candidates, restoring the accepted runtime
+after rejection, and preserving patches, measurements and the scoped reason.
+Inconclusive candidates stay inactive and receive only a justified declared
+next measurement or deferral; the loop proceeds to other grounded hypotheses.
+Choose the smallest sufficient experiment from its mechanism, claimed outcome,
+quality constraints, uncertainty, expected use, error consequences and cost.
+Short real operations, agent tasks, full paired implementations and repeated-use
+sequences are supported; verified applicable baseline evidence can be reused.
+A-on-B then B-on-C remains an optional supported route, not a requirement for
+every hypothesis. Short evidence cannot establish an unmeasured broader effect.
+
+Beads owns hypotheses and evidence-backed decisions; OpenSpec owns the plan and
+lifecycle checklist; the controller cursor owns recovery. No change, reuse,
+simplification and subtraction remain part of intake; size alone is no
+efficiency evidence. Removal of accepted code, features or skills still needs a
+reviewable proposal and explicit scoped consent. Restoring an owned experimental
+selection to its unchanged accepted baseline is authorized recovery, not a new
+capability retirement. Experimental activation and live publication remain
+separate. The active change owns the method, control and acceptance details.
 
 **2026-09-19/20, confirmed (scoped 2026-10-01 to the ordinary feedback loop):**
 the ordinary feedback loop runs on the consuming project's board, not in chat.
