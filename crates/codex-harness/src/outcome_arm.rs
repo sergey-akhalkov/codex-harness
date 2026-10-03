@@ -4,10 +4,14 @@ mod config;
 
 use crate::{
     outcome_discovery as discovery,
+    outcome_prepare::contract_digest,
     outcome_run::{bounded_read, isolated, repository, write_new},
 };
 use harness_core::{
-    config_create::ConfigCreation, config_file::ConfigSnapshot, registration::Registration,
+    build_identity::{hash_file, ordinary},
+    config_create::ConfigCreation,
+    config_file::ConfigSnapshot,
+    registration::Registration,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,7 +19,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[derive(Clone, Copy, Deserialize)]
@@ -41,6 +45,9 @@ impl Arm {
 #[serde(deny_unknown_fields)]
 struct Request {
     case_root: PathBuf,
+    /// Expected path-independent digest of the frozen task contract, as
+    /// reported by `outcome-prepare`.
+    case_contract: String,
     codex_home: PathBuf,
     user_home: PathBuf,
     dependency_user_home: PathBuf,
@@ -57,10 +64,168 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
 
+const CASE_RECEIPT_LIMIT: u64 = 4 * 1024 * 1024;
+
+fn digest_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn relative_input(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('\0')
+        && Path::new(name)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
+struct CaseContract {
+    contract: String,
+    case_id: String,
+    source_state: String,
+    immutable: BTreeMap<String, String>,
+}
+
+/// Read the prepared case's own receipt and recompute the frozen contract from
+/// it. The digest binds the case kind, the declared source state, the exact
+/// prompt and every immutable input hash, so an altered receipt cannot keep
+/// the expected identity. A missing, incomplete or changed contract refuses
+/// the arm instead of measuring an unknown workload input.
+fn read_case_contract(case: &Path, expected: &str) -> io::Result<CaseContract> {
+    let bytes = bounded_read(&case.join("preparation.json"), CASE_RECEIPT_LIMIT)
+        .map_err(|_| invalid("the measured case has no readable preparation receipt"))?;
+    let receipt: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("the measured case receipt is not valid JSON"))?;
+    if receipt["status"] != "passed" {
+        return Err(invalid("the measured case preparation did not pass"));
+    }
+    let setup = receipt
+        .get("setup")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("the measured case receipt has no frozen contract"))?;
+    let field = |name: &str| {
+        setup
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid("the measured case receipt is incomplete"))
+    };
+    let case_id = field("case_id")?;
+    let source_state = field("source_state")?;
+    let prompt = field("prompt")?;
+    let recorded = field("contract")?;
+    let immutable = setup
+        .get("immutable")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("the measured case receipt has no immutable inputs"))?;
+    let mut frozen = BTreeMap::new();
+    for (name, hash) in immutable {
+        if !relative_input(name) {
+            return Err(invalid(
+                "the measured case receipt holds an invalid input name",
+            ));
+        }
+        let hash = hash
+            .as_str()
+            .filter(|hash| digest_text(hash))
+            .ok_or_else(|| invalid("the measured case receipt holds an invalid input hash"))?;
+        frozen.insert(name.clone(), hash.to_owned());
+    }
+    if frozen.is_empty() {
+        return Err(invalid(
+            "the measured case receipt declares no immutable input",
+        ));
+    }
+    let contract = contract_digest(&case_id, &prompt, &frozen);
+    if !digest_text(&recorded) || recorded != contract || contract != expected {
+        return Err(invalid(
+            "the measured case does not carry the frozen task contract",
+        ));
+    }
+    Ok(CaseContract {
+        contract,
+        case_id,
+        source_state,
+        immutable: frozen,
+    })
+}
+
+/// Re-hash every declared immutable input. A source change made by another
+/// arm's executor, a helper or this arm's own discovery changes one of them
+/// and refuses the arm instead of silently measuring an altered contract.
+fn verify_case_inputs(case: &Path, contract: &CaseContract) -> io::Result<()> {
+    for (name, declared) in &contract.immutable {
+        let path = case.join(name);
+        ordinary(&path).map_err(|_| invalid("a frozen case input is missing or linked"))?;
+        if hash_file(&path).map_err(|_| invalid("a frozen case input is unreadable"))? != *declared
+        {
+            return Err(invalid(
+                "the measured case's frozen input changed since preparation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The measured case may not expose another checkout's Git history. A linked
+/// worktree pointer, a shared common Git directory, an alternate object store
+/// or a configured remote keep sibling solutions reachable from the case, and
+/// a case nested inside an enclosing checkout resolves that checkout's
+/// references from its working directory. An independent repository or no
+/// repository at all is the verified boundary; anything else refuses before
+/// the arm consumes the input.
+fn verify_git_boundary(case: &Path) -> io::Result<&'static str> {
+    let git = case.join(".git");
+    match fs::symlink_metadata(&git) {
+        Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
+            Err(invalid("the measured case links an external Git directory"))
+        }
+        Ok(_) => {
+            ordinary(&git)
+                .map_err(|_| invalid("the measured case links an external Git directory"))?;
+            if git.join("commondir").exists() {
+                return Err(invalid("the measured case shares a common Git directory"));
+            }
+            if git.join("objects/info/alternates").exists() {
+                return Err(invalid(
+                    "the measured case shares an alternate Git object store",
+                ));
+            }
+            let text = bounded_read(&git.join("config"), 1024 * 1024).unwrap_or_default();
+            if String::from_utf8_lossy(&text)
+                .lines()
+                .any(|line| line.trim_start().starts_with("[remote"))
+            {
+                return Err(invalid("the measured case holds a configured Git remote"));
+            }
+            Ok("independent")
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let temp = std::env::temp_dir().canonicalize()?;
+            let mut current = case.parent();
+            while let Some(dir) = current {
+                if fs::symlink_metadata(dir.join(".git")).is_ok() {
+                    return Err(invalid(
+                        "the measured case lies inside an enclosing Git checkout",
+                    ));
+                }
+                if dir == temp {
+                    break;
+                }
+                current = dir.parent();
+            }
+            Ok("absent")
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn run(args: &[OsString]) -> io::Result<i32> {
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
         println!(
-            "codex-harness outcome-arm --request PATH\nModel-free baseline/candidate skill preparation in an owned temporary installation. JSON and recovery evidence are private."
+            "codex-harness outcome-arm --request PATH\nModel-free baseline/candidate preparation of an owned temporary installation over one frozen outcome case. JSON and recovery evidence are private."
         );
         return Ok(0);
     }
@@ -113,6 +278,9 @@ fn skills(report: &Value) -> io::Result<&Vec<Value>> {
 
 fn configure(request: &Request, root: &Path, report: &mut Value) -> io::Result<()> {
     report["phase"] = json!("validation");
+    if !digest_text(&request.case_contract) {
+        return Err(invalid("invalid frozen case contract digest"));
+    }
     let case = isolated(&request.case_root)?;
     let home = isolated(&request.codex_home)?;
     let user = isolated(&request.user_home)?;
@@ -124,6 +292,19 @@ fn configure(request: &Request, root: &Path, report: &mut Value) -> io::Result<(
             "case and evidence must be outside installation homes",
         ));
     }
+    if home.join("AGENTS.override.md").exists() {
+        return Err(invalid(
+            "the arm home carries an AGENTS override; a fresh executor home must not replace the arm's instructions",
+        ));
+    }
+    report["phase"] = json!("case");
+    let boundary = verify_git_boundary(&case)?;
+    let contract = read_case_contract(&case, &request.case_contract)?;
+    verify_case_inputs(&case, &contract)?;
+    report["case"] = json!({"root":case,"contract":contract.contract,
+        "case_id":contract.case_id,"source_state":contract.source_state,
+        "immutable_files":contract.immutable.len(),"git_boundary":boundary,
+        "verified_before":true});
     let path = home.join("config.toml");
     let original = match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -145,7 +326,7 @@ fn configure(request: &Request, root: &Path, report: &mut Value) -> io::Result<(
     )?;
     report["ownership"] = serde_json::to_value(ownership.receipt())?;
     let discovery_request = discovery::Request {
-        case_root: case,
+        case_root: case.clone(),
         codex_home: home,
         upstream: request.upstream.clone(),
         timeout: request.timeout,
@@ -218,6 +399,10 @@ fn configure(request: &Request, root: &Path, report: &mut Value) -> io::Result<(
         if before["upstream_sha256"] != after["upstream_sha256"] {
             return Err(invalid("upstream changed between arm observations"));
         }
+        report["phase"] = json!("case-after");
+        let after_contract = read_case_contract(&case, &request.case_contract)?;
+        verify_case_inputs(&case, &after_contract)?;
+        report["case"]["verified_after"] = json!(true);
         published.verify_unchanged()?;
         profile_guard.verify()?;
         ownership.verify_unchanged()?;

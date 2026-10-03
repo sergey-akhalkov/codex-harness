@@ -112,6 +112,27 @@ fn all_controlled_cases_are_fresh_and_preserve_the_workload_and_document_contrac
 }
 
 #[test]
+fn independently_prepared_copies_share_a_frozen_contract_digest() {
+    let (left, left_report) = prepare("entrypoint");
+    let (right, right_report) = prepare("entrypoint");
+    assert_ne!(left, right);
+    let contract = left_report["setup"]["contract"].as_str().unwrap();
+    assert_eq!(contract.len(), 64);
+    assert!(
+        contract
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    // Two independently prepared copies of the same path-free case carry the
+    // same frozen contract, so a baseline and a candidate arm can be compared
+    // against one declared workload identity.
+    assert_eq!(contract, right_report["setup"]["contract"]);
+    // A different case declares a different contract.
+    let (_, negative) = prepare("negative");
+    assert_ne!(contract, negative["setup"]["contract"].as_str().unwrap());
+}
+
+#[test]
 fn copied_manager_runs_the_real_build_and_product_cli_and_never_reuses_an_old_arm() {
     let (root, _) = prepare("entrypoint");
     let elsewhere = tempfile::tempdir().unwrap();
