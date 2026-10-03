@@ -2,12 +2,19 @@
 //! copies with independent history, candidate checkout allocation and reuse
 //! verdicts, and prepared-runtime identity selection. All repositories are
 //! synthetic fixtures inside the test's temporary directory.
+use harness_core::board_feedback;
+use harness_core::board_hypothesis::{
+    self, Admission, BoundedHypothesis, BoundedRetention, HypothesisDraft, RetentionDraft,
+    SearchFilter,
+};
 use harness_core::improvement_experiment::{
-    Arm, ArmBinding, ExperimentBindings, prepare_home, prepare_variant, select_variant,
+    Arm, ArmBinding, CorroborationRequirement, CorroborationStatus, ExclusionReason,
+    ExperimentBindings, TaskRetention, prepare_home, prepare_variant, retain_completed_task,
+    select_corroboration, select_variant,
 };
 use harness_core::task_worktree::{
-    ReuseBlock, WorktreeReuse, allocate_candidate_checkout, frozen_copy, verify_candidate_checkout,
-    verify_frozen, verify_frozen_pristine, worktree_reuse,
+    FrozenCopy, ReuseBlock, WorktreeReuse, allocate_candidate_checkout, frozen_copy,
+    verify_candidate_checkout, verify_frozen, verify_frozen_pristine, worktree_reuse,
 };
 use harness_core::{build_identity, build_selection};
 use std::{
@@ -700,4 +707,447 @@ fn pre_attempt_gate_rejects_contamination_and_preserves_work() {
     git(&modified.path, &["commit", "-qm", "executor work"]);
     verify_frozen(&modified).unwrap();
     assert!(verify_frozen_pristine(&modified).is_err());
+}
+
+const SOLUTION_TEXT: &str = "prior solution: earlier attempt answer\n";
+
+/// A completed real task: the frozen pre-solution snapshot plus the committed
+/// answer one attempt produced inside its copy.
+fn completed_task(root: &Path, name: &str) -> (FrozenCopy, String) {
+    let source = fixture_repo(root, &format!("{name}-source"));
+    // Each real task has its own inputs; byte-identical snapshots are one
+    // unit, not independent corroboration.
+    fs::write(source.join("task-id.txt"), format!("{name}\n")).unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-qm", "task identity"]);
+    let revision = rev(&source);
+    let completed =
+        frozen_copy(&source, &revision, &root.join(format!("{name}-completed"))).unwrap();
+    fs::write(completed.path.join("answer.txt"), SOLUTION_TEXT).unwrap();
+    git(&completed.path, &["add", "."]);
+    git(
+        &completed.path,
+        &["commit", "-qm", "completed attempt answer"],
+    );
+    let solution = rev(&completed.path);
+    (completed, solution)
+}
+
+fn retained_task(
+    root: &Path,
+    name: &str,
+    owner: &str,
+    case_id: &str,
+    mechanism: &str,
+    conditions: &str,
+) -> (harness_core::improvement_experiment::RetainedTask, String) {
+    let (completed, solution) = completed_task(root, name);
+    let retention = TaskRetention {
+        owner: owner.to_owned(),
+        case_id: case_id.to_owned(),
+        experiment: "exp-corroboration".to_owned(),
+        mechanism: mechanism.to_owned(),
+        conditions: conditions.to_owned(),
+        oracle: "oracle-7".to_owned(),
+        acceptance: "acceptance/run-9".to_owned(),
+    };
+    let retained = retain_completed_task(
+        &completed,
+        &root.join(format!("{name}-retained")),
+        &retention,
+    )
+    .unwrap();
+    (retained, solution)
+}
+
+#[test]
+fn retained_tasks_keep_replayable_pre_solution_inputs_and_refuse_absent_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let (completed, solution) = completed_task(temp.path(), "task");
+    verify_frozen(&completed).unwrap();
+
+    let retention = TaskRetention {
+        owner: "bdct-h1".to_owned(),
+        case_id: "case-b".to_owned(),
+        experiment: "exp-1".to_owned(),
+        mechanism: "bounded-output".to_owned(),
+        conditions: "local-tool-runs".to_owned(),
+        oracle: "oracle-7".to_owned(),
+        acceptance: "acceptance/run-9".to_owned(),
+    };
+    let retained =
+        retain_completed_task(&completed, &temp.path().join("retained"), &retention).unwrap();
+    assert_eq!(retained.schema, 1);
+    assert_eq!(retained.replay.tree_sha256, completed.tree_sha256);
+    assert_eq!(retained.replay.revision, completed.revision);
+    assert_eq!(retained.replay.source_revision, completed.source_revision);
+    verify_frozen_pristine(&retained.replay).unwrap();
+
+    // The retained copy is the pre-solution snapshot: the completed attempt's
+    // committed answer is neither copied nor reachable from it.
+    assert!(!retained.replay.path.join("answer.txt").exists());
+    assert!(!git_result(
+        &retained.replay.path,
+        &["cat-file", "-e", &solution]
+    ));
+    assert_eq!(
+        git(&retained.replay.path, &["log", "--all", "--oneline"])
+            .lines()
+            .count(),
+        1
+    );
+    assert!(git(&retained.replay.path, &["remote"]).trim().is_empty());
+
+    // Absent evidence is refused: a missing oracle or acceptance reference
+    // cannot be replaced by a summary, and the refused destination is not
+    // left behind.
+    let blank_oracle = TaskRetention {
+        oracle: "  ".to_owned(),
+        ..retention.clone()
+    };
+    let destination = temp.path().join("refused-oracle");
+    let error = retain_completed_task(&completed, &destination, &blank_oracle)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("oracle"), "{error}");
+    assert!(!destination.exists());
+
+    let blank_acceptance = TaskRetention {
+        acceptance: String::new(),
+        ..retention.clone()
+    };
+    let destination = temp.path().join("refused-acceptance");
+    let error = retain_completed_task(&completed, &destination, &blank_acceptance)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("acceptance"), "{error}");
+    assert!(!destination.exists());
+
+    // An existing destination is never merged or overwritten.
+    let occupied = temp.path().join("occupied");
+    fs::create_dir_all(&occupied).unwrap();
+    assert!(retain_completed_task(&completed, &occupied, &retention).is_err());
+}
+
+#[test]
+fn corroboration_selection_excludes_inapplicable_workloads_without_leaking_solutions() {
+    let temp = tempfile::tempdir().unwrap();
+    let (case_a, solution_a) = retained_task(
+        temp.path(),
+        "case-a",
+        "bdct-h1",
+        "case-a",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    let (case_b, _) = retained_task(
+        temp.path(),
+        "case-b",
+        "bdct-h2",
+        "case-b",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    let (case_c, _) = retained_task(
+        temp.path(),
+        "case-c",
+        "bdct-h3",
+        "case-c",
+        "other-mechanism",
+        "local-tool-runs",
+    );
+
+    let requirement = CorroborationRequirement {
+        mechanism: "bounded-output".to_owned(),
+        conditions: "local-tool-runs".to_owned(),
+        required_units: 2,
+        excluded: Vec::new(),
+    };
+
+    // Applicable, independent, replayable retained tasks are selected; the
+    // workload that never exercises the mechanism is excluded as
+    // non-evidence rather than counted for or against the claim.
+    let first = select_corroboration(
+        &[case_a.clone(), case_c.clone(), case_b.clone()],
+        &requirement,
+    )
+    .unwrap();
+    assert!(first.is_ready());
+    assert_eq!(first.units.len(), 2);
+    assert!(
+        first
+            .units
+            .iter()
+            .all(|unit| unit.mechanism == "bounded-output")
+    );
+    assert!(
+        first
+            .excluded
+            .iter()
+            .any(|unit| unit.case_id == "case-c" && unit.reason == ExclusionReason::NotApplicable)
+    );
+
+    // Selection is independent of the caller's candidate order.
+    let second = select_corroboration(
+        &[case_b.clone(), case_a.clone(), case_c.clone()],
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(first.units, second.units);
+
+    // The selection carries identity references only: no solution text, no
+    // solution revision, no acceptance content and no replay path.
+    let payload = serde_json::to_string(&first).unwrap();
+    assert!(!payload.contains("prior solution"), "{payload}");
+    assert!(!payload.contains(&solution_a), "{payload}");
+    assert!(!payload.contains("oracle-7"), "{payload}");
+    assert!(!payload.contains("acceptance/run-9"), "{payload}");
+    assert!(!payload.contains("answer.txt"), "{payload}");
+
+    // A fresh executor receives a replayed pre-solution snapshot for a
+    // selected unit, never the completed attempt's answer.
+    let selected = first
+        .units
+        .iter()
+        .find(|unit| unit.case_id == "case-a")
+        .expect("case-a is selected");
+    assert_eq!(selected.owner, "bdct-h1");
+    let replay = case_a
+        .prepare_replay(&temp.path().join("replay-fresh"))
+        .unwrap();
+    verify_frozen_pristine(&replay).unwrap();
+    assert!(!replay.path.join("answer.txt").exists());
+    assert!(!git_result(&replay.path, &["cat-file", "-e", &solution_a]));
+    assert_eq!(replay.tree_sha256, case_a.replay.tree_sha256);
+    assert_eq!(replay.revision, case_a.replay.revision);
+
+    // Fewer applicable units than declared: the broader claim stays
+    // inconclusive - inapplicable workloads are not evidence of general
+    // uselessness - and no summary or saving appears in the result.
+    let strict = CorroborationRequirement {
+        required_units: 3,
+        ..requirement.clone()
+    };
+    let selection =
+        select_corroboration(&[case_a.clone(), case_c.clone(), case_b.clone()], &strict).unwrap();
+    assert!(!selection.is_ready());
+    match &selection.status {
+        CorroborationStatus::Inconclusive(reason) => {
+            assert!(
+                reason.contains("broader claim remains unsupported"),
+                "{reason}"
+            );
+            assert!(reason.contains("not evidence against it"), "{reason}");
+        }
+        other => panic!("expected an inconclusive broader claim, got {other:?}"),
+    }
+
+    // One task or one frozen snapshot is one unit: duplicates are not
+    // independent corroboration.
+    let selection = select_corroboration(
+        &[case_a.clone(), case_a.clone(), case_c.clone()],
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(selection.units.len(), 1);
+    assert_eq!(
+        selection
+            .excluded
+            .iter()
+            .filter(|unit| unit.reason == ExclusionReason::AlreadyUsed)
+            .count(),
+        1
+    );
+    assert!(!selection.is_ready());
+
+    // Identities fixed in the declared plan before results are excluded.
+    let planned = CorroborationRequirement {
+        excluded: vec!["case-a".to_owned()],
+        ..requirement.clone()
+    };
+    let selection = select_corroboration(&[case_a.clone(), case_b.clone()], &planned).unwrap();
+    assert_eq!(selection.units.len(), 1);
+    assert!(selection.units[0].case_id == "case-b");
+    assert!(
+        selection
+            .excluded
+            .iter()
+            .any(|unit| unit.case_id == "case-a" && unit.reason == ExclusionReason::AlreadyUsed)
+    );
+
+    // A corrupted retained copy - or an absent artifact - cannot substitute
+    // for evidence: the unit is excluded, the state is preserved, and the
+    // claim stays inconclusive.
+    fs::write(case_b.replay.path.join("answer.txt"), "late answer\n").unwrap();
+    let selection = select_corroboration(
+        &[case_a.clone(), case_b.clone(), case_c.clone()],
+        &requirement,
+    )
+    .unwrap();
+    assert!(
+        selection
+            .excluded
+            .iter()
+            .any(|unit| unit.case_id == "case-b"
+                && matches!(unit.reason, ExclusionReason::NotReplayable { .. }))
+    );
+    assert_eq!(selection.units.len(), 1);
+    assert!(!selection.is_ready());
+    assert!(case_b.replay.path.join("answer.txt").is_file());
+    assert!(
+        case_b
+            .prepare_replay(&temp.path().join("replay-late"))
+            .is_err()
+    );
+
+    let zero = CorroborationRequirement {
+        required_units: 0,
+        ..requirement.clone()
+    };
+    assert!(select_corroboration(&[case_a], &zero).is_err());
+}
+
+fn bd_name() -> &'static str {
+    if cfg!(windows) { "bd.exe" } else { "bd" }
+}
+
+fn bd_executable() -> PathBuf {
+    if let Some(value) = std::env::var_os("HARNESS_BD_EXE") {
+        return PathBuf::from(value);
+    }
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        let candidate = PathBuf::from(home).join("harness/bin").join(bd_name());
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(bd_name());
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    panic!("bd v1.3.0 is required on PATH, CODEX_HOME/harness/bin, or HARNESS_BD_EXE");
+}
+
+/// One owned synthetic project with a seeded Git checkout and an initialized
+/// bd board.
+fn bd_project(root: &Path) -> PathBuf {
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    git(&project, &["config", "user.email", "fixture@example.test"]);
+    git(&project, &["config", "user.name", "Fixture"]);
+    fs::write(project.join("README.md"), "synthetic\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-qm", "seed"]);
+    let init = Command::new(bd_executable())
+        .args([
+            "init",
+            "--skip-agents",
+            "--non-interactive",
+            "--quiet",
+            "--prefix",
+            "bdct",
+        ])
+        .current_dir(&project)
+        .output()
+        .expect("bd init runs");
+    assert!(
+        init.status.success(),
+        "bd init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    project
+}
+
+#[test]
+fn retention_is_recorded_once_under_its_existing_beads_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = bd_project(temp.path());
+    let bd = bd_executable();
+    let bounded = BoundedHypothesis::try_from_draft(HypothesisDraft {
+        mechanism: "bounded-output".to_owned(),
+        conditions: "local-tool-runs".to_owned(),
+        observation: "fixture:observation#1".to_owned(),
+        predicted: "less repeated context loading".to_owned(),
+        counterexample: "diagnostics vanish on failure".to_owned(),
+        acceptance: "diagnostic preservation check passes".to_owned(),
+        spec: "openspec/changes/fixture".to_owned(),
+        basis: "fixture:seed#1".to_owned(),
+    })
+    .unwrap();
+    let Admission::Created { id } =
+        board_hypothesis::admit_hypothesis(&bd, &project, &bounded, None).unwrap()
+    else {
+        panic!("a fresh synthetic board must create one card");
+    };
+
+    let (retained, _solution) = retained_task(
+        temp.path(),
+        "task",
+        &id,
+        "case-b",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    let draft = RetentionDraft {
+        case_id: retained.case_id.clone(),
+        experiment: retained.experiment.clone(),
+        mechanism: retained.mechanism.clone(),
+        conditions: retained.conditions.clone(),
+        revision: retained.replay.source_revision.clone(),
+        frozen: retained.replay.revision.clone(),
+        tree: retained.replay.tree_sha256.clone(),
+        oracle: retained.oracle.clone(),
+        acceptance: retained.acceptance.clone(),
+        replay: retained.replay.path.display().to_string(),
+        detail: Some("accepted completed real task".to_owned()),
+    };
+    let bounded = BoundedRetention::try_from_draft(draft).unwrap();
+    let record = board_hypothesis::record_retention(&bd, &project, &id, &bounded).unwrap();
+    assert!(record.recorded);
+    assert_eq!(record.case_id, "case-b");
+    let again = board_hypothesis::record_retention(&bd, &project, &id, &bounded).unwrap();
+    assert!(
+        !again.recorded,
+        "an identical retention is not recorded twice"
+    );
+
+    let comments = board_feedback::list_comments(&bd, &project, &id).unwrap();
+    let parsed = board_hypothesis::parse_retentions(&comments);
+    assert_eq!(parsed.len(), 1, "one retention record: {comments:?}");
+    let parsed = &parsed[0];
+    assert_eq!(parsed.item, id);
+    assert_eq!(parsed.case_id, retained.case_id);
+    assert_eq!(parsed.frozen, retained.replay.revision);
+    assert_eq!(parsed.tree, retained.replay.tree_sha256);
+    assert_eq!(parsed.oracle, retained.oracle);
+    assert_eq!(parsed.acceptance, retained.acceptance);
+    assert_eq!(parsed.replay, retained.replay.path.display().to_string());
+    assert!(
+        comments
+            .iter()
+            .all(|comment| !comment.contains("prior solution")),
+        "the owner record is references only: {comments:?}"
+    );
+
+    // Retention stays under the existing owner: one card, no second store,
+    // and the retained task is discoverable through the card's own count.
+    let cards = board_hypothesis::list_hypothesis_cards(&bd, &project).unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].id, id);
+    let matches = board_hypothesis::search_hypotheses(
+        &bd,
+        &project,
+        &SearchFilter {
+            mechanism: Some("bounded-output".to_owned()),
+            conditions: Some("local-tool-runs".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].retentions, 1);
 }
