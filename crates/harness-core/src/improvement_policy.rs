@@ -9,6 +9,18 @@
 //! rules; it never substitutes a model outcome, a synthetic timing or a
 //! post-hoc threshold. Its result is operational evidence for a board decision
 //! published through the benefit gate, not a decision publication itself.
+//!
+//! Measurement/attribution bounds and empirical run-to-run variation stay
+//! separate: bounds come from the infrastructure accounting of both arms,
+//! while variation comes only from complete paired attempts. Requests,
+//! rounds, tool operations and repeated readings within one task are dependent
+//! observations, never replications. A declared statistical claim binds its
+//! method, confidence level and assumptions before results through the same
+//! digested [`ComparisonPolicy::uncertainty`] text; this evaluator can apply
+//! descriptive bounds and observed complete-pair ranges, but it has no valid
+//! statistical basis for a confidence interval over dependent local runs and
+//! therefore refuses any declared confidence percentage instead of labeling a
+//! measurement bound with one.
 
 use crate::benefit_gate::{DecisionDraft, DecisionOutcome, QualityOutcome};
 use serde::{Deserialize, Serialize};
@@ -48,6 +60,173 @@ fn unit_name(unit: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("<unnamed unit>")
         .to_owned()
+}
+
+/// Marker of the predeclared statistical-analysis clause inside the policy's
+/// uncertainty text. The clause must precede any infrastructure binding so
+/// each owner parses its own token without consuming the other's fields.
+pub const STATISTICAL_CLAUSE: &str = "statistical-analysis.v1";
+
+/// The analysis method a declared claim is evaluated with. Only a descriptive
+/// analysis over complete paired attempts is supportable here: this evaluator
+/// cannot verify independence or a sampling model for local agent runs, so it
+/// never assigns a statistical confidence level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnalysisMethod {
+    ObservedPairsDescriptive,
+}
+
+impl AnalysisMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservedPairsDescriptive => "observed-pairs-descriptive",
+        }
+    }
+}
+
+/// What evidence a declared claim is scoped to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimScope {
+    /// The result describes the observed complete paired attempts only.
+    Scoped,
+    /// The claim asserts repeatable savings. It needs at least two complete
+    /// paired attempts whose observed effects clear the declared threshold.
+    Repeatable,
+}
+
+impl ClaimScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scoped => "scoped",
+            Self::Repeatable => "repeatable",
+        }
+    }
+}
+
+/// The predeclared statistical/analysis binding of a comparison, digested and
+/// recorded on every attempt before any comparative outcome. A changed claim
+/// cannot inherit an earlier adoption, and a percentage this evaluator cannot
+/// justify is refused instead of bound.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatisticalClaim {
+    pub method: AnalysisMethod,
+    /// The declared confidence level. Only `None` is supportable; a numeric
+    /// percentage would label a measurement bound without a valid basis.
+    pub confidence_percent: Option<f64>,
+    pub scope: ClaimScope,
+    /// Assumptions recorded before results.
+    pub assumptions: String,
+}
+
+/// The canonical statistical-analysis clause. Callers may add human
+/// uncertainty text before it and append the infrastructure binding after it.
+pub fn statistical_clause(claim: &StatisticalClaim) -> String {
+    let confidence = match claim.confidence_percent {
+        None => "none".to_owned(),
+        Some(value) => value.to_string(),
+    };
+    format!(
+        "{STATISTICAL_CLAUSE}; method={}; confidence={confidence}; claim={}; assumptions={}",
+        claim.method.as_str(),
+        claim.scope.as_str(),
+        claim.assumptions
+    )
+}
+
+/// Parse the predeclared statistical-analysis clause out of the uncertainty
+/// text. `Ok(None)` when it is absent: the descriptive behavior over the
+/// declared stopping and repeated-selection policy is the older default. A
+/// present but unusable clause is an error so it can never silently degrade
+/// into a different analysis.
+pub fn parse_statistical_claim(
+    uncertainty: &str,
+) -> Result<Option<StatisticalClaim>, &'static str> {
+    let Some(start) = uncertainty.find(STATISTICAL_CLAUSE) else {
+        return Ok(None);
+    };
+    if let Some(infrastructure) = uncertainty.find(crate::infrastructure_accounting::RULE_VERSION)
+        && infrastructure < start
+    {
+        return Err(
+            "the statistical-analysis clause must precede the infrastructure binding it qualifies",
+        );
+    }
+    let rest = &uncertainty[start + STATISTICAL_CLAUSE.len()..];
+    let body = match rest.find(crate::infrastructure_accounting::RULE_VERSION) {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    let mut method = None;
+    let mut confidence = false;
+    let mut scope = None;
+    let mut assumptions: Option<String> = None;
+    for segment in body.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = segment.split_once('=') else {
+            return Err("statistical-analysis fields must use key=value separated by ';'");
+        };
+        match (key.trim(), value.trim()) {
+            ("method", "observed-pairs-descriptive") => {
+                if method.is_some() {
+                    return Err("the statistical-analysis method is declared twice");
+                }
+                method = Some(AnalysisMethod::ObservedPairsDescriptive);
+            }
+            ("method", _) => {
+                return Err(
+                    "the declared analysis method has no verifiable statistical basis; only observed-pairs-descriptive is supported",
+                );
+            }
+            ("confidence", "none") => {
+                if confidence {
+                    return Err("the statistical-analysis confidence is declared twice");
+                }
+                confidence = true;
+            }
+            ("confidence", _) => {
+                return Err(
+                    "no valid statistical basis exists for a confidence level over dependent local runs; declare confidence=none",
+                );
+            }
+            ("claim", scope_value) => {
+                if scope.is_some() {
+                    return Err("the statistical-analysis claim scope is declared twice");
+                }
+                scope = Some(match scope_value {
+                    "scoped" => ClaimScope::Scoped,
+                    "repeatable" => ClaimScope::Repeatable,
+                    _ => return Err("the declared claim scope is not scoped or repeatable"),
+                });
+            }
+            ("assumptions", value) => {
+                if assumptions.is_some() {
+                    return Err("the statistical-analysis assumptions are declared twice");
+                }
+                if value.is_empty() || value.len() > 256 || value.contains(['\n', '\r']) {
+                    return Err("the statistical claim must record its assumptions before results");
+                }
+                assumptions = Some(value.to_owned());
+            }
+            _ => return Err("the statistical-analysis clause has an unknown field"),
+        }
+    }
+    match (method, confidence, scope, assumptions) {
+        (Some(method), true, Some(scope), Some(assumptions)) => Ok(Some(StatisticalClaim {
+            method,
+            confidence_percent: None,
+            scope,
+            assumptions,
+        })),
+        _ => Err(
+            "the statistical-analysis clause is incomplete; declare method, confidence, claim and assumptions before results",
+        ),
+    }
 }
 
 /// The measured dimension of the declared comparison rule.
@@ -349,6 +528,16 @@ impl ComparisonPolicy {
         if let Err(error) = crate::infrastructure_accounting::parse_binding(&self.uncertainty) {
             return Err(invalid(error));
         }
+        let statistical = parse_statistical_claim(&self.uncertainty).map_err(invalid)?;
+        if statistical
+            .as_ref()
+            .is_some_and(|claim| claim.scope == ClaimScope::Repeatable)
+            && self.stopping.required_units < 2
+        {
+            return Err(invalid(
+                "a repeatable claim needs at least two complete paired units declared before results",
+            ));
+        }
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(self).map_err(io::Error::other)?)
@@ -449,6 +638,64 @@ pub enum PerSuccessStatus {
     Undefined,
 }
 
+/// Whether a usable attribution bound exists for the evaluated units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeasurementStatus {
+    /// At least one included unit carries a usable attribution range.
+    Bounded,
+    /// No usable bound was recorded. Absent evidence is not a point estimate.
+    Absent,
+}
+
+/// Measurement/attribution bounds applicable to the decision, retained
+/// separately from empirical variation across complete paired attempts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeasurementBounds {
+    pub status: MeasurementStatus,
+    /// Union of the per-unit supported effect ranges from the attributed arm
+    /// bounds. Not a confidence interval and never a substitute for variation.
+    pub effect_percent: Option<[f64; 2]>,
+    /// Worst admissible time regression percent across the included bounds.
+    /// `None` when no usable bound exists; absent evidence is not zero.
+    pub worst_time_regression_percent: Option<f64>,
+    /// Evidence identity of the bounds.
+    pub evidence: String,
+    /// Assumptions carried with the bounds.
+    pub assumptions: String,
+}
+
+/// Whether run-to-run variation is observable from the recorded evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VariationStatus {
+    /// At least two complete paired attempts yield a comparable decision
+    /// metric, so an observed descriptive range exists.
+    Observed,
+    /// Fewer than two complete, comparable paired attempts were recorded.
+    /// The variance is unmeasured, never assumed zero.
+    Unmeasured,
+}
+
+/// Empirical variation across complete paired attempts. Requests, rounds,
+/// tool operations and repeated readings within one task are dependent
+/// observations and are not replications.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VariationRecord {
+    /// Complete one-to-one baseline/candidate attempts; the experimental unit.
+    pub complete_pairs: u64,
+    pub status: VariationStatus,
+    /// Observed decision-metric effect range across the complete pairs. `None`
+    /// when unmeasured; a descriptive range, not a confidence interval.
+    pub observed_effect_percent: Option<[f64; 2]>,
+    /// The declared claim scope this evidence is evaluated against.
+    pub claim: ClaimScope,
+    /// Bounded basis, including what is not counted.
+    pub basis: String,
+}
+
 /// Operational evaluation evidence. Publishing the decision stays with the
 /// benefit-gate owner; this record only states what was measured and decided.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -472,6 +719,15 @@ pub struct PolicyEvaluation {
     pub accepted_tasks: u64,
     pub acceptance_rate: Option<f64>,
     pub trade_off_used: bool,
+    /// Attribution bounds used by the decision, separated from variation.
+    #[serde(default)]
+    pub measurement: Option<MeasurementBounds>,
+    /// Run-to-run variation across complete paired attempts.
+    #[serde(default)]
+    pub variation: Option<VariationRecord>,
+    /// The predeclared statistical claim, when one was bound.
+    #[serde(default)]
+    pub statistical_claim: Option<StatisticalClaim>,
 }
 
 struct UnitFacts {
@@ -479,6 +735,10 @@ struct UnitFacts {
     case_id: String,
     baseline_seconds: Option<f64>,
     candidate_seconds: Option<f64>,
+    /// Attributed arm ranges for this unit, when the accounting produced them.
+    /// They are measurement bounds, not run-to-run variation.
+    baseline_bounds: Option<(f64, f64)>,
+    candidate_bounds: Option<(f64, f64)>,
     baseline_steps: Option<u64>,
     candidate_steps: Option<u64>,
     usage_measured: bool,
@@ -494,6 +754,21 @@ struct UnitFacts {
     /// Subtractive applicability recorded by the accounting, when declared.
     subtractive: Option<SubtractiveFacts>,
     limitations: Vec<String>,
+}
+
+impl UnitFacts {
+    /// Best/worst admissible time regression percent from this unit's
+    /// attribution bounds. `None` when either arm has no usable bound.
+    fn time_regression_range(&self) -> Option<(f64, f64)> {
+        let (baseline_low, baseline_high) = self.baseline_bounds?;
+        let (candidate_low, candidate_high) = self.candidate_bounds?;
+        if baseline_low <= 0.0 || baseline_high <= 0.0 {
+            return None;
+        }
+        let best = percent_regression(baseline_high, candidate_low)?;
+        let worst = percent_regression(baseline_low, candidate_high)?;
+        Some((best.min(worst), best.max(worst)))
+    }
 }
 
 /// What the authoritative accounting recorded for a subtractive unit: the
@@ -653,6 +928,7 @@ fn selected_time_view(
 pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<PolicyEvaluation> {
     declared.verify()?;
     let policy = &declared.policy;
+    let statistical_claim = parse_statistical_claim(&policy.uncertainty).map_err(invalid)?;
     if report.get("schema_version").and_then(Value::as_u64) != Some(2) {
         return Err(invalid(
             "the outcome summary is not the authoritative schema-2 report",
@@ -839,6 +1115,8 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 .to_owned(),
             baseline_seconds,
             candidate_seconds,
+            baseline_bounds: baseline_row.and_then(crate::infrastructure_accounting::arm_bounds),
+            candidate_bounds: candidate_row.and_then(crate::infrastructure_accounting::arm_bounds),
             baseline_steps: baseline_row.and_then(steps),
             candidate_steps: candidate_row.and_then(steps),
             usage_measured: usages,
@@ -875,6 +1153,106 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
             name,
         });
     }
+
+    // Measurement bounds and empirical variation are retained separately.
+    // Bounds come from the attribution accounting of each arm; variation comes
+    // only from complete paired attempts. Requests, rounds, tool operations
+    // and repeated readings within a task are dependent observations, and a
+    // single pair leaves run-to-run variation unmeasured rather than zero.
+    let (time_bound_best, time_bound_worst) = facts
+        .iter()
+        .filter_map(UnitFacts::time_regression_range)
+        .fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(best, worst), (unit_best, unit_worst)| (best.min(unit_best), worst.max(unit_worst)),
+        );
+    let time_bounds_present = time_bound_best.is_finite() && time_bound_worst.is_finite();
+    let bound_effect_ranges: Vec<(f64, f64)> = facts
+        .iter()
+        .filter_map(|fact| {
+            let (baseline_low, baseline_high) = fact.baseline_bounds?;
+            let (candidate_low, candidate_high) = fact.candidate_bounds?;
+            crate::infrastructure_accounting::reduction_range(
+                baseline_low,
+                baseline_high,
+                candidate_low,
+                candidate_high,
+            )
+        })
+        .collect();
+    let measurement = MeasurementBounds {
+        status: if time_bounds_present {
+            MeasurementStatus::Bounded
+        } else {
+            MeasurementStatus::Absent
+        },
+        effect_percent: (!bound_effect_ranges.is_empty()).then(|| {
+            [
+                bound_effect_ranges
+                    .iter()
+                    .map(|(low, _)| *low)
+                    .fold(f64::INFINITY, f64::min),
+                bound_effect_ranges
+                    .iter()
+                    .map(|(_, high)| *high)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            ]
+        }),
+        worst_time_regression_percent: time_bounds_present.then_some(time_bound_worst),
+        evidence: "infrastructure-attribution.v1 arm bounds (host QPC activity, native queue evidence and applicable activity brackets); steps and tokens are exact observed totals".to_owned(),
+        assumptions: "only unrelated-external-blocking is deducted; unresolved evidence widens the range and never becomes zero; this range is an attribution bound, not a confidence interval".to_owned(),
+    };
+    let pair_effects: Vec<f64> = facts
+        .iter()
+        .filter_map(|fact| match policy.objective {
+            Objective::Quality => None,
+            Objective::Time => {
+                let baseline = fact.baseline_seconds?;
+                let candidate = fact.candidate_seconds?;
+                (baseline > 0.0).then(|| (baseline - candidate) / baseline * 100.0)
+            }
+            Objective::Resource => {
+                let baseline = fact.baseline_steps? as f64;
+                let candidate = fact.candidate_steps? as f64;
+                (baseline > 0.0).then(|| (baseline - candidate) / baseline * 100.0)
+            }
+        })
+        .collect();
+    let variation_status = if facts.len() >= 2
+        && (policy.objective == Objective::Quality || pair_effects.len() == facts.len())
+    {
+        VariationStatus::Observed
+    } else {
+        VariationStatus::Unmeasured
+    };
+    let variation = VariationRecord {
+        complete_pairs: facts.len() as u64,
+        status: variation_status,
+        observed_effect_percent: (variation_status == VariationStatus::Observed
+            && !pair_effects.is_empty())
+        .then(|| {
+            [
+                pair_effects.iter().copied().fold(f64::INFINITY, f64::min),
+                pair_effects
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max),
+            ]
+        }),
+        claim: statistical_claim
+            .as_ref()
+            .map_or(ClaimScope::Scoped, |claim| claim.scope),
+        basis: format!(
+            "{} complete paired unit(s); requests, rounds, tool operations and repeated readings within a task are dependent observations and are not replications; {}; model identity remains API-observed with unavailable weight hashes or hardware retained as limits; no statistical confidence level is assigned, and an undetected difference is not evidence of equivalence",
+            facts.len(),
+            match variation_status {
+                VariationStatus::Observed =>
+                    "the observed range is descriptive of these units only",
+                VariationStatus::Unmeasured =>
+                    "run-to-run variation is unmeasured (never assumed zero)",
+            }
+        ),
+    };
 
     let matched: u64 = included
         .iter()
@@ -971,8 +1349,22 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         sorted.dedup();
         sorted
     };
+    let variation_scope = match (variation.status, variation.observed_effect_percent) {
+        (VariationStatus::Observed, Some(range)) => format!(
+            "{} complete paired unit(s) with an observed effect range of {:.1}..{:.1}% (descriptive, not a confidence interval)",
+            variation.complete_pairs, range[0], range[1],
+        ),
+        (VariationStatus::Observed, None) => format!(
+            "{} complete paired unit(s) with recorded per-unit outcomes and no numeric effect range",
+            variation.complete_pairs
+        ),
+        (VariationStatus::Unmeasured, _) => format!(
+            "{} complete paired unit(s); run-to-run variation is unmeasured and is not assumed zero",
+            variation.complete_pairs
+        ),
+    };
     let scope = format!(
-        "matched pairs on {}; each task is compared within itself and absolute durations across different tasks are not a speed trend",
+        "matched pairs on {}; each task is compared within itself and absolute durations across different tasks are not a speed trend; {variation_scope}",
         if cases.is_empty() {
             "no task".to_owned()
         } else {
@@ -1001,6 +1393,11 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
     } else {
         coverage_parts.join("+")
     };
+    coverage.push_str(&format!("; complete-pairs:{}", variation.complete_pairs));
+    coverage.push_str(match variation.status {
+        VariationStatus::Observed => "; variation:observed-range",
+        VariationStatus::Unmeasured => "; variation:unmeasured",
+    });
     let mut missing_coverage: Vec<String> = Vec::new();
     for metric in policy.objective.required_metrics() {
         let measured = match metric {
@@ -1229,25 +1626,46 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                     // admitted by the same predeclared trade-off policy the
                     // efficiency path uses, never a bypass.
                     let mut blocked = false;
-                    for (regressions, worst) in [
-                        (&time_regressions, worst_time),
-                        (&steps_regressions, worst_steps),
+                    let mut bounds_uncertain = false;
+                    for (regressions, worst, bounded) in [
+                        (&time_regressions, worst_time, time_bounds_present),
+                        (&steps_regressions, worst_steps, false),
                     ] {
                         if regressions.is_empty() {
                             continue;
                         }
-                        if covers(worst) {
+                        // A bound-sensitive dimension is evaluated over its
+                        // admissible range: an exchange that only covers the
+                        // observed point does not cover the supported range.
+                        let admissible = if bounded {
+                            worst.max(time_bound_worst)
+                        } else {
+                            worst
+                        };
+                        if covers(admissible) {
                             trade_off_used = true;
+                        } else if bounded
+                            && time_bound_best <= policy.tolerance_percent
+                            && time_bound_worst > policy.tolerance_percent
+                            && worst <= policy.tolerance_percent
+                        {
+                            bounds_uncertain = true;
+                            reasons.push(
+                                "admissible attribution bounds straddle the declared time tolerance; the maintenance result does not hold across the supported range and stays inconclusive"
+                                    .to_owned(),
+                            );
                         } else {
                             blocked = true;
                             reasons.push(format!(
-                                "the maintenance basis does not cover a material regression in a measured dimension (worst +{worst:.1}% beyond the {:.1}% tolerance); it needs the predeclared trade-off policy",
+                                "the maintenance basis does not cover a material regression in a measured dimension (worst +{admissible:.1}% beyond the {:.1}% tolerance); it needs the predeclared trade-off policy",
                                 policy.tolerance_percent
                             ));
                         }
                     }
                     if blocked {
                         decision = PolicyDecision::Reject;
+                    } else if bounds_uncertain {
+                        decision = PolicyDecision::Inconclusive;
                     } else {
                         if trade_off_used {
                             reasons.push(format!(
@@ -1317,26 +1735,41 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                         blocked = true;
                     }
                 }
-                if policy.objective == Objective::Resource
-                    && !time_regressions.is_empty()
-                    && !blocked
-                {
-                    if covers(worst_time) {
-                        trade_off_used = true;
-                        reasons.push(format!(
-                            "adopted under the predeclared trade-off: {}",
-                            policy
-                                .trade_off
-                                .as_ref()
-                                .map(|trade_off| trade_off.basis.as_str())
-                                .unwrap_or("")
-                        ));
+                let mut bounds_uncertain = false;
+                if policy.objective == Objective::Resource && !blocked {
+                    let admissible_worst = if time_bounds_present {
+                        worst_time.max(time_bound_worst)
                     } else {
-                        reasons.push(
-                            "the resource effect comes with a time regression beyond tolerance; declare the trade-off policy before results"
-                                .to_owned(),
-                        );
-                        blocked = true;
+                        worst_time
+                    };
+                    if !time_regressions.is_empty() || admissible_worst > policy.tolerance_percent {
+                        if covers(admissible_worst) {
+                            trade_off_used = true;
+                            reasons.push(format!(
+                                "adopted under the predeclared trade-off: {}",
+                                policy
+                                    .trade_off
+                                    .as_ref()
+                                    .map(|trade_off| trade_off.basis.as_str())
+                                    .unwrap_or("")
+                            ));
+                        } else if time_bounds_present
+                            && time_bound_best <= policy.tolerance_percent
+                            && time_bound_worst > policy.tolerance_percent
+                            && worst_time <= policy.tolerance_percent
+                        {
+                            bounds_uncertain = true;
+                            reasons.push(
+                                "admissible attribution bounds can move the non-primary time regression across the declared tolerance; the resource verdict does not hold across the supported range and stays inconclusive"
+                                    .to_owned(),
+                            );
+                        } else {
+                            reasons.push(
+                                "the resource effect comes with a time regression beyond tolerance; declare the trade-off policy before results"
+                                    .to_owned(),
+                            );
+                            blocked = true;
+                        }
                     }
                 }
                 if !blocked && facts.iter().any(|fact| fact.does_not_repay) {
@@ -1348,6 +1781,8 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
                 }
                 decision = if blocked {
                     PolicyDecision::Reject
+                } else if bounds_uncertain {
+                    PolicyDecision::Inconclusive
                 } else {
                     PolicyDecision::Adopt
                 };
@@ -1364,6 +1799,30 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         decision = PolicyDecision::Inconclusive;
         reasons
             .push("the per-success cost is undefined; no efficiency adoption is stated".to_owned());
+    }
+
+    // A declared repeatable claim is evaluated across the observed complete
+    // pairs. One pair, or a pair whose observed effect sits below the declared
+    // threshold, cannot establish repeatable savings; the adoption is kept
+    // inconclusive for that scope instead of extrapolating from the best pair.
+    // This never softens an acceptance rejection.
+    if decision == PolicyDecision::Adopt && variation.claim == ClaimScope::Repeatable {
+        let supported = match policy.objective {
+            Objective::Quality => variation.status == VariationStatus::Observed,
+            Objective::Time | Objective::Resource => {
+                variation.observed_effect_percent.is_some_and(|range| {
+                    variation.status == VariationStatus::Observed
+                        && range[0] >= policy.meaningful_effect_percent.unwrap_or(0.0)
+                })
+            }
+        };
+        if !supported {
+            decision = PolicyDecision::Inconclusive;
+            reasons.push(
+                "the declared repeatable claim is not supported across the observed complete-pair range; one pair or a pair below the declared threshold cannot establish repeatable savings, so the adoption stays inconclusive for that scope"
+                    .to_owned(),
+            );
+        }
     }
 
     for fact in &facts {
@@ -1412,6 +1871,9 @@ pub fn evaluate(declared: &DeclaredComparison, report: &Value) -> io::Result<Pol
         accepted_tasks,
         acceptance_rate,
         trade_off_used,
+        measurement: Some(measurement),
+        variation: Some(variation),
+        statistical_claim,
     })
 }
 

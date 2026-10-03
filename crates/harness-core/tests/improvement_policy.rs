@@ -3,10 +3,12 @@
 //! (`outcome_report::summarize_attempts`); no case substitutes a candidate
 //! claim, a synthetic statistic or a post-hoc threshold.
 use harness_core::improvement_policy::{
-    Basis, ComparisonPolicy, DeclaredComparison, Objective, Overhead, PerSuccessStatus,
-    PolicyDecision, RepeatedSelection, StoppingRule, TradeOff, evaluate,
-    refuse_cross_task_speed_claim,
+    AnalysisMethod, Basis, ClaimScope, ComparisonPolicy, DeclaredComparison, MeasurementStatus,
+    Objective, Overhead, PerSuccessStatus, PolicyDecision, RepeatedSelection, StatisticalClaim,
+    StoppingRule, TradeOff, VariationStatus, evaluate, parse_statistical_claim,
+    refuse_cross_task_speed_claim, statistical_clause,
 };
+use harness_core::infrastructure_accounting::{Mechanism, MetricView, binding_clause};
 use harness_core::outcome_report::{MATCH_FIELDS, summarize_attempts};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -118,6 +120,53 @@ fn subtractive(mut row: Value, status: &str, evidenced: bool) -> Value {
         "status": status,
         "evidence": if evidenced { "private/consumption.json" } else { "" },
     });
+    row
+}
+
+fn claim(scope: ClaimScope) -> StatisticalClaim {
+    StatisticalClaim {
+        method: AnalysisMethod::ObservedPairsDescriptive,
+        confidence_percent: None,
+        scope,
+        assumptions: "complete paired attempts fixed before results".to_owned(),
+    }
+}
+
+/// Declare the statistical-analysis clause in the policy's uncertainty text.
+fn with_claim(mut policy: ComparisonPolicy, scope: ClaimScope) -> ComparisonPolicy {
+    policy.uncertainty = format!(
+        "unknown evidence stays inconclusive; {}",
+        statistical_clause(&claim(scope))
+    );
+    policy
+}
+
+/// Declared policy with both the statistical claim and the work-efficiency
+/// infrastructure binding, in the order the owners require.
+fn with_claim_and_binding(scope: ClaimScope) -> ComparisonPolicy {
+    let mut policy = with_claim(policy(), scope);
+    policy.uncertainty = format!(
+        "{}; {}",
+        statistical_clause(&claim(scope)),
+        binding_clause(MetricView::WorkEfficiency, Mechanism::None)
+    );
+    policy
+}
+
+/// Record a precomputed measurement/attribution bound on an attempt. The
+/// evaluator consumes exactly this contract; the accounting-side construction
+/// of these values is exercised by the infrastructure-accounting tests.
+fn bounded(row: &mut Value, low: f64, high: f64) {
+    row["infrastructure"] = json!({
+        "adjusted_low_seconds": low,
+        "adjusted_high_seconds": high,
+        "coverage": "measured",
+        "unresolved_seconds": 0.0,
+    });
+}
+
+fn pair(mut row: Value, pair_id: &str) -> Value {
+    row["pair_id"] = json!(pair_id);
     row
 }
 
@@ -1988,5 +2037,834 @@ fn size_only_subtractive_results_cannot_pass_the_default_policy() {
             .any(|reason| reason.contains("reduced size or an unmeasured benefit")),
         "{:?}",
         evaluation.reasons
+    );
+}
+
+#[test]
+fn statistical_claims_bind_method_confidence_and_assumptions_before_results() {
+    let scoped = claim(ClaimScope::Scoped);
+    assert_eq!(
+        parse_statistical_claim(&statistical_clause(&scoped)).unwrap(),
+        Some(scoped.clone())
+    );
+    assert_eq!(parse_statistical_claim("no clause here").unwrap(), None);
+
+    // A confidence percentage has no valid basis over dependent local runs and
+    // is refused at declaration, before any result exists.
+    let mut unsupported = policy();
+    unsupported.uncertainty =
+        "statistical-analysis.v1; method=observed-pairs-descriptive; confidence=95; claim=scoped; assumptions=fixed-order"
+            .to_owned();
+    assert!(unsupported.declare().is_err());
+
+    // An analysis method this evaluator cannot verify is refused, not bound.
+    let mut method = policy();
+    method.uncertainty =
+        "statistical-analysis.v1; method=paired-normal; confidence=none; claim=scoped; assumptions=fixed-order"
+            .to_owned();
+    assert!(method.declare().is_err());
+
+    // A present clause must record its assumptions.
+    let mut assumptions = policy();
+    assumptions.uncertainty =
+        "statistical-analysis.v1; method=observed-pairs-descriptive; confidence=none; claim=scoped; assumptions="
+            .to_owned();
+    assert!(assumptions.declare().is_err());
+
+    // The clause must precede the infrastructure binding it qualifies.
+    let mut order = policy();
+    order.uncertainty = format!(
+        "{}; {}",
+        binding_clause(MetricView::WorkEfficiency, Mechanism::None),
+        statistical_clause(&scoped)
+    );
+    assert!(order.declare().is_err());
+
+    // A repeatable claim needs at least two complete paired units declared
+    // before results; the scoped and repeatable analyses are different
+    // declarations and carry different digests.
+    let mut repeatable = with_claim(policy(), ClaimScope::Repeatable);
+    assert!(repeatable.declare().is_err());
+    repeatable.stopping.required_units = 2;
+    let declared = declare(&repeatable);
+    assert!(declared.digest_matches(&declared.digest));
+    assert_ne!(
+        declared.digest,
+        declare(&with_claim(policy(), ClaimScope::Scoped)).digest
+    );
+}
+
+#[test]
+fn one_pair_and_dependent_within_run_events_do_not_become_variance_or_confidence() {
+    let policy = with_claim(policy(), ClaimScope::Scoped);
+    let declared = declare(&policy);
+    // One complete pair whose arms each contain thousands of dependent events:
+    // rounds and tool operations are not independent replications, so the
+    // result stays a single experimental unit with unmeasured variation.
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(2000),
+                Some(3000),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                80.0,
+                true,
+                Some(2000),
+                Some(3000),
+                true,
+            ),
+        ],
+        &policy,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Adopt);
+    let variation = evaluation.variation.as_ref().expect("variation record");
+    assert_eq!(variation.complete_pairs, 1);
+    assert_eq!(variation.status, VariationStatus::Unmeasured);
+    assert_eq!(
+        variation.observed_effect_percent, None,
+        "one pair is not a variance estimate and must not become zero"
+    );
+    assert_eq!(variation.claim, ClaimScope::Scoped);
+    assert!(variation.basis.contains("not replications"));
+    assert!(variation.basis.contains("never assumed zero"));
+    assert!(variation.basis.contains("not evidence of equivalence"));
+    assert!(
+        variation.basis.contains("API-observed"),
+        "the existing model-identity limits stay visible in the claim: {}",
+        variation.basis
+    );
+    assert_eq!(
+        evaluation
+            .measurement
+            .as_ref()
+            .expect("measurement record")
+            .status,
+        MeasurementStatus::Absent
+    );
+    let claim = evaluation
+        .statistical_claim
+        .as_ref()
+        .expect("declared claim");
+    assert_eq!(claim.confidence_percent, None);
+    assert_eq!(claim.scope, ClaimScope::Scoped);
+    assert!(evaluation.coverage.contains("complete-pairs:1"));
+    assert!(evaluation.coverage.contains("variation:unmeasured"));
+    assert!(evaluation.scope.contains("unmeasured"));
+    assert!(
+        !evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("95%") || reason.contains("confidence interval")),
+        "no bound may be labeled with an unsupported confidence level: {:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn a_single_pair_or_crossing_pair_range_cannot_establish_repeatable_savings() {
+    let mut repeatable = policy();
+    repeatable.stopping.required_units = 2;
+    repeatable.overhead = Overhead {
+        implementation_seconds: 0.0,
+        evaluation_seconds: 0.0,
+        maintenance_seconds_per_task: 0.0,
+    };
+    let repeatable = with_claim(repeatable, ClaimScope::Repeatable);
+    let declared = declare(&repeatable);
+
+    // One recorded pair cannot establish the declared repeatable claim.
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-r",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-r",
+                200.0,
+                80.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &repeatable,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    let variation = evaluation.variation.as_ref().expect("variation record");
+    assert_eq!(variation.complete_pairs, 1);
+    assert_eq!(variation.claim, ClaimScope::Repeatable);
+    assert_eq!(variation.status, VariationStatus::Unmeasured);
+
+    // Two complete pairs that both clear the declared threshold support the
+    // repeatable claim with an observed descriptive range.
+    let report = summarize(
+        &[
+            pair(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-r",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "c2",
+                    "candidate",
+                    "case-r",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "b3",
+                    "baseline",
+                    "case-r",
+                    400.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+            pair(
+                attempt(
+                    "c3",
+                    "candidate",
+                    "case-r",
+                    600.0,
+                    85.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+        ],
+        &repeatable,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?} units={}",
+        evaluation.reasons,
+        report["units"]
+    );
+    let variation = evaluation.variation.as_ref().expect("variation record");
+    assert_eq!(variation.complete_pairs, 2);
+    assert_eq!(variation.status, VariationStatus::Observed);
+    assert_eq!(variation.observed_effect_percent, Some([15.0, 20.0]));
+    assert!(evaluation.scope.contains("observed effect range"));
+
+    // A third pair below the declared threshold makes the repeatable claim
+    // inconclusive even though the required count of positive units exists:
+    // the best pairs never stand in for the declared repeatability.
+    let report = summarize(
+        &[
+            pair(
+                attempt(
+                    "b4",
+                    "baseline",
+                    "case-r",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "c4",
+                    "candidate",
+                    "case-r",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "b5",
+                    "baseline",
+                    "case-r",
+                    400.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+            pair(
+                attempt(
+                    "c5",
+                    "candidate",
+                    "case-r",
+                    600.0,
+                    85.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+            pair(
+                attempt(
+                    "b6",
+                    "baseline",
+                    "case-r",
+                    800.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p3",
+            ),
+            pair(
+                attempt(
+                    "c6",
+                    "candidate",
+                    "case-r",
+                    1000.0,
+                    98.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p3",
+            ),
+        ],
+        &repeatable,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("repeatable claim is not supported")),
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(
+        evaluation
+            .variation
+            .as_ref()
+            .and_then(|variation| variation.observed_effect_percent),
+        Some([2.0, 20.0])
+    );
+}
+
+#[test]
+fn threshold_crossing_bounds_stay_inconclusive_across_decision_metrics() {
+    // Primary time effect: a supported range of -10..10% crosses the declared
+    // 10% threshold, so a favorable midpoint cannot authorize adoption.
+    let binding_policy = with_claim_and_binding(ClaimScope::Scoped);
+    let declared = declare(&binding_policy);
+    let mut baseline = attempt(
+        "b1",
+        "baseline",
+        "case-b",
+        0.0,
+        40.0,
+        true,
+        Some(4),
+        Some(6),
+        true,
+    );
+    let mut candidate = attempt(
+        "c1",
+        "candidate",
+        "case-b",
+        100.0,
+        44.0,
+        true,
+        Some(4),
+        Some(6),
+        true,
+    );
+    bounded(&mut baseline, 40.0, 40.0);
+    bounded(&mut candidate, 36.0, 44.0);
+    let report = summarize(&[baseline.clone(), candidate.clone()], &binding_policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    let measurement = evaluation.measurement.as_ref().expect("measurement record");
+    assert_eq!(measurement.status, MeasurementStatus::Bounded);
+    assert_eq!(measurement.effect_percent, Some([-10.0, 10.0]));
+    assert_eq!(measurement.worst_time_regression_percent, Some(10.0));
+    assert!(
+        measurement
+            .evidence
+            .contains("infrastructure-attribution.v1")
+    );
+
+    // A supported range wholly beyond the threshold may report the scoped
+    // result while the variation stays separately unmeasured.
+    let mut baseline = attempt(
+        "b2",
+        "baseline",
+        "case-b",
+        0.0,
+        40.0,
+        true,
+        Some(4),
+        Some(6),
+        true,
+    );
+    let mut candidate = attempt(
+        "c2",
+        "candidate",
+        "case-b",
+        100.0,
+        20.0,
+        true,
+        Some(4),
+        Some(6),
+        true,
+    );
+    bounded(&mut baseline, 40.0, 40.0);
+    bounded(&mut candidate, 20.0, 20.0);
+    let report = summarize(&[baseline, candidate], &binding_policy);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(
+        evaluation
+            .measurement
+            .as_ref()
+            .and_then(|measurement| measurement.effect_percent),
+        Some([50.0, 50.0])
+    );
+    assert_eq!(
+        evaluation
+            .variation
+            .as_ref()
+            .map(|variation| variation.status),
+        Some(VariationStatus::Unmeasured)
+    );
+
+    // Acceptance is a decision metric too: a candidate acceptance failure on
+    // one complete pair is not offset by a quality improvement on another.
+    let mut quality = policy();
+    quality.objective = Objective::Quality;
+    let quality = with_claim(quality, ClaimScope::Scoped);
+    let declared = declare(&quality);
+    let report = summarize(
+        &[
+            pair(
+                attempt(
+                    "q1",
+                    "baseline",
+                    "case-q",
+                    0.0,
+                    100.0,
+                    false,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "q2",
+                    "candidate",
+                    "case-q",
+                    200.0,
+                    80.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "q3",
+                    "baseline",
+                    "case-q",
+                    400.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+            pair(
+                attempt(
+                    "q4",
+                    "candidate",
+                    "case-q",
+                    600.0,
+                    80.0,
+                    false,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+        ],
+        &quality,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Reject,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("independent acceptance failed")),
+        "{:?}",
+        evaluation.reasons
+    );
+}
+
+#[test]
+fn resource_verdicts_hold_across_time_bounds_and_declared_trade_offs() {
+    // The non-primary time dimension is bound-sensitive: a point regression
+    // under the tolerance whose admissible range crosses it cannot settle a
+    // resource verdict.
+    let mut resource = policy();
+    resource.objective = Objective::Resource;
+    resource.overhead = Overhead {
+        implementation_seconds: 0.0,
+        evaluation_seconds: 0.0,
+        maintenance_seconds_per_task: 0.0,
+    };
+    resource.trade_off = Some(TradeOff {
+        basis: "declared before results: bounded time exchange".into(),
+        allowed_regression_percent: 25.0,
+    });
+    let resource = with_claim(resource, ClaimScope::Scoped);
+    let declared = declare(&resource);
+    let mut baseline = attempt(
+        "rb",
+        "baseline",
+        "case-r",
+        0.0,
+        40.0,
+        true,
+        Some(50),
+        Some(50),
+        true,
+    );
+    let mut candidate = attempt(
+        "rc",
+        "candidate",
+        "case-r",
+        100.0,
+        39.5,
+        true,
+        Some(25),
+        Some(25),
+        true,
+    );
+    bounded(&mut baseline, 30.0, 40.0);
+    bounded(&mut candidate, 39.5, 39.5);
+    let report = summarize(&[baseline.clone(), candidate.clone()], &resource);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Inconclusive,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("non-primary time regression")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A predeclared trade-off that covers the whole admissible time range
+    // admits the same resource effect, with the exchange recorded.
+    let mut covered = policy();
+    covered.objective = Objective::Resource;
+    covered.overhead = Overhead {
+        implementation_seconds: 0.0,
+        evaluation_seconds: 0.0,
+        maintenance_seconds_per_task: 0.0,
+    };
+    covered.trade_off = Some(TradeOff {
+        basis: "declared before results: bounded time exchange".into(),
+        allowed_regression_percent: 35.0,
+    });
+    let covered = with_claim(covered, ClaimScope::Scoped);
+    let declared = declare(&covered);
+    let report = summarize(&[baseline, candidate], &covered);
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert!(evaluation.trade_off_used);
+}
+
+#[test]
+fn changed_analysis_on_resume_cannot_inherit_an_adoption() {
+    let scoped = with_claim(policy(), ClaimScope::Scoped);
+    let declared_scoped = declare(&scoped);
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                80.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &scoped,
+    );
+    assert_eq!(
+        evaluate(&declared_scoped, &report).unwrap().decision,
+        PolicyDecision::Adopt
+    );
+
+    // The same retained evidence resumed under a changed analysis (repeatable
+    // instead of scoped) is not the declared comparison and cannot inherit the
+    // earlier adoption.
+    let mut repeatable = policy();
+    repeatable.stopping.required_units = 2;
+    let repeatable = with_claim(repeatable, ClaimScope::Repeatable);
+    let declared_repeatable = declare(&repeatable);
+    assert_ne!(declared_scoped.digest, declared_repeatable.digest);
+    let resumed = evaluate(&declared_repeatable, &report).unwrap();
+    assert_eq!(resumed.decision, PolicyDecision::Inconclusive);
+    assert!(
+        resumed
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("differs from the predeclared policy")),
+        "{:?}",
+        resumed.reasons
+    );
+}
+
+#[test]
+fn repeated_selection_and_stopping_stay_bound_to_the_predeclared_rule() {
+    // A best-of candidate selected from observed gains needs the declared
+    // corroboration units; one favorable pair is not independent confirmation.
+    let mut best_of = policy();
+    best_of.stopping.required_units = 2;
+    best_of.repeated_selection = RepeatedSelection::BestOf;
+    let best_of = with_claim(best_of, ClaimScope::Scoped);
+    let declared = declare(&best_of);
+    let report = summarize(
+        &[
+            attempt(
+                "b1",
+                "baseline",
+                "case-b",
+                0.0,
+                100.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+            attempt(
+                "c1",
+                "candidate",
+                "case-b",
+                200.0,
+                70.0,
+                true,
+                Some(4),
+                Some(6),
+                true,
+            ),
+        ],
+        &best_of,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_eq!(evaluation.decision, PolicyDecision::Inconclusive);
+    assert!(
+        evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("corroboration")),
+        "{:?}",
+        evaluation.reasons
+    );
+
+    // A favorable best pair beside a below-threshold pair is not the declared
+    // corroboration; both pairs stay retained and no adoption follows.
+    let report = summarize(
+        &[
+            pair(
+                attempt(
+                    "b2",
+                    "baseline",
+                    "case-b",
+                    0.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "c2",
+                    "candidate",
+                    "case-b",
+                    200.0,
+                    70.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p1",
+            ),
+            pair(
+                attempt(
+                    "b3",
+                    "baseline",
+                    "case-b",
+                    400.0,
+                    100.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+            pair(
+                attempt(
+                    "c3",
+                    "candidate",
+                    "case-b",
+                    600.0,
+                    95.0,
+                    true,
+                    Some(4),
+                    Some(6),
+                    true,
+                ),
+                "p2",
+            ),
+        ],
+        &best_of,
+    );
+    let evaluation = evaluate(&declared, &report).unwrap();
+    assert_ne!(
+        evaluation.decision,
+        PolicyDecision::Adopt,
+        "{:?}",
+        evaluation.reasons
+    );
+    assert_eq!(
+        evaluation
+            .variation
+            .as_ref()
+            .map(|variation| variation.complete_pairs),
+        Some(2),
+        "{:?} units={}",
+        evaluation.reasons,
+        report["units"]
     );
 }
