@@ -10,7 +10,7 @@ use harness_core::board_hypothesis::{
 use harness_core::improvement_experiment::{
     Arm, ArmBinding, CorroborationRequirement, CorroborationStatus, ExclusionReason,
     ExperimentBindings, TaskRetention, prepare_home, prepare_variant, retain_completed_task,
-    select_corroboration, select_variant,
+    retained_tasks_from_board, select_corroboration, select_variant,
 };
 use harness_core::task_worktree::{
     FrozenCopy, ReuseBlock, WorktreeReuse, allocate_candidate_checkout, frozen_copy,
@@ -760,6 +760,69 @@ fn retained_task(
     (retained, solution)
 }
 
+/// Admit one synthetic hypothesis card on a fresh board.
+fn admit_fixture_card(bd: &Path, project: &Path) -> String {
+    let bounded = BoundedHypothesis::try_from_draft(HypothesisDraft {
+        mechanism: "bounded-output".to_owned(),
+        conditions: "local-tool-runs".to_owned(),
+        observation: "fixture:observation#1".to_owned(),
+        predicted: "less repeated context loading".to_owned(),
+        counterexample: "diagnostics vanish on failure".to_owned(),
+        acceptance: "diagnostic preservation check passes".to_owned(),
+        spec: "openspec/changes/fixture".to_owned(),
+        basis: "fixture:seed#1".to_owned(),
+    })
+    .unwrap();
+    let Admission::Created { id } =
+        board_hypothesis::admit_hypothesis(bd, project, &bounded, None).unwrap()
+    else {
+        panic!("a fresh synthetic board must create one card");
+    };
+    id
+}
+
+/// Write the durable retention record exactly as the controller does: the
+/// draft carries the identity fields the driver maps from a retained task, and
+/// the board writer resolves the frozen git tree object id from the retained
+/// copy before recording it.
+fn write_board_retention(
+    bd: &Path,
+    project: &Path,
+    item: &str,
+    retained: &harness_core::improvement_experiment::RetainedTask,
+) -> std::io::Result<board_hypothesis::RetentionRecord> {
+    let draft = RetentionDraft {
+        case_id: retained.case_id.clone(),
+        experiment: retained.experiment.clone(),
+        mechanism: retained.mechanism.clone(),
+        conditions: retained.conditions.clone(),
+        revision: retained.replay.source_revision.clone(),
+        frozen: retained.replay.revision.clone(),
+        tree: retained.replay.tree_sha256.clone(),
+        oracle: retained.oracle.clone(),
+        acceptance: retained.acceptance.clone(),
+        replay: retained.replay.path.display().to_string(),
+        detail: Some("completed real task retained at the decision boundary".to_owned()),
+    };
+    let bounded = BoundedRetention::try_from_draft(draft).unwrap();
+    board_hypothesis::record_retention(bd, project, item, &bounded)
+}
+
+/// Append one raw comment through the board's own CLI, as an earlier writer
+/// would have.
+fn add_board_comment(bd: &Path, project: &Path, item: &str, text: &str) {
+    let out = Command::new(bd)
+        .args(["comment", item, "--json", text])
+        .current_dir(project)
+        .output()
+        .expect("bd comment runs");
+    assert!(
+        out.status.success(),
+        "bd comment: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn retained_tasks_keep_replayable_pre_solution_inputs_and_refuse_absent_evidence() {
     let temp = tempfile::tempdir().unwrap();
@@ -1068,22 +1131,7 @@ fn retention_is_recorded_once_under_its_existing_beads_owner() {
     let temp = tempfile::tempdir().unwrap();
     let project = bd_project(temp.path());
     let bd = bd_executable();
-    let bounded = BoundedHypothesis::try_from_draft(HypothesisDraft {
-        mechanism: "bounded-output".to_owned(),
-        conditions: "local-tool-runs".to_owned(),
-        observation: "fixture:observation#1".to_owned(),
-        predicted: "less repeated context loading".to_owned(),
-        counterexample: "diagnostics vanish on failure".to_owned(),
-        acceptance: "diagnostic preservation check passes".to_owned(),
-        spec: "openspec/changes/fixture".to_owned(),
-        basis: "fixture:seed#1".to_owned(),
-    })
-    .unwrap();
-    let Admission::Created { id } =
-        board_hypothesis::admit_hypothesis(&bd, &project, &bounded, None).unwrap()
-    else {
-        panic!("a fresh synthetic board must create one card");
-    };
+    let id = admit_fixture_card(&bd, &project);
 
     let (retained, _solution) = retained_task(
         temp.path(),
@@ -1093,24 +1141,10 @@ fn retention_is_recorded_once_under_its_existing_beads_owner() {
         "bounded-output",
         "local-tool-runs",
     );
-    let draft = RetentionDraft {
-        case_id: retained.case_id.clone(),
-        experiment: retained.experiment.clone(),
-        mechanism: retained.mechanism.clone(),
-        conditions: retained.conditions.clone(),
-        revision: retained.replay.source_revision.clone(),
-        frozen: retained.replay.revision.clone(),
-        tree: retained.replay.tree_sha256.clone(),
-        oracle: retained.oracle.clone(),
-        acceptance: retained.acceptance.clone(),
-        replay: retained.replay.path.display().to_string(),
-        detail: Some("accepted completed real task".to_owned()),
-    };
-    let bounded = BoundedRetention::try_from_draft(draft).unwrap();
-    let record = board_hypothesis::record_retention(&bd, &project, &id, &bounded).unwrap();
+    let record = write_board_retention(&bd, &project, &id, &retained).unwrap();
     assert!(record.recorded);
     assert_eq!(record.case_id, "case-b");
-    let again = board_hypothesis::record_retention(&bd, &project, &id, &bounded).unwrap();
+    let again = write_board_retention(&bd, &project, &id, &retained).unwrap();
     assert!(
         !again.recorded,
         "an identical retention is not recorded twice"
@@ -1124,6 +1158,11 @@ fn retention_is_recorded_once_under_its_existing_beads_owner() {
     assert_eq!(parsed.case_id, retained.case_id);
     assert_eq!(parsed.frozen, retained.replay.revision);
     assert_eq!(parsed.tree, retained.replay.tree_sha256);
+    assert_eq!(
+        parsed.tree_object.as_deref(),
+        Some(retained.replay.tree.as_str()),
+        "the durable record carries the frozen git tree object id"
+    );
     assert_eq!(parsed.oracle, retained.oracle);
     assert_eq!(parsed.acceptance, retained.acceptance);
     assert_eq!(parsed.replay, retained.replay.path.display().to_string());
@@ -1150,4 +1189,247 @@ fn retention_is_recorded_once_under_its_existing_beads_owner() {
     .unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].retentions, 1);
+}
+
+#[test]
+fn board_retained_tasks_rebuild_verifiably_and_stay_selectable() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = bd_project(temp.path());
+    let bd = bd_executable();
+    let id = admit_fixture_card(&bd, &project);
+    let (retained, solution) = retained_task(
+        temp.path(),
+        "task",
+        &id,
+        "case-b",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    let record = write_board_retention(&bd, &project, &id, &retained).unwrap();
+    assert!(record.recorded);
+
+    // The durable owner record carries the frozen git tree object id and the
+    // existing identity references only - never the answer.
+    let comments = board_feedback::list_comments(&bd, &project, &id).unwrap();
+    let parsed = board_hypothesis::parse_retentions(&comments);
+    assert_eq!(parsed.len(), 1, "one retention record: {comments:?}");
+    assert_eq!(
+        parsed[0].tree_object.as_deref(),
+        Some(retained.replay.tree.as_str())
+    );
+    assert!(
+        comments
+            .iter()
+            .all(|comment| !comment.contains("prior solution") && !comment.contains("answer")),
+        "the owner record is references only: {comments:?}"
+    );
+
+    // A later run rebuilds the task from the board alone - no run-local index
+    // is consulted - and the retained copy must reproduce the recorded frozen
+    // identity: root commit, tree object and content digest.
+    let discovery = retained_tasks_from_board(&bd, &project).unwrap();
+    assert!(
+        discovery.unsupported.is_empty(),
+        "{:?}",
+        discovery.unsupported
+    );
+    assert_eq!(discovery.tasks.len(), 1);
+    let rebuilt = &discovery.tasks[0];
+    assert_eq!(rebuilt.owner, id);
+    assert_eq!(rebuilt.case_id, "case-b");
+    assert_eq!(rebuilt.experiment, retained.experiment);
+    assert_eq!(rebuilt.mechanism, "bounded-output");
+    assert_eq!(rebuilt.conditions, "local-tool-runs");
+    assert_eq!(rebuilt.oracle, retained.oracle);
+    assert_eq!(rebuilt.acceptance, retained.acceptance);
+    assert_eq!(rebuilt.replay.revision, retained.replay.revision);
+    assert_eq!(rebuilt.replay.tree, retained.replay.tree);
+    assert_eq!(rebuilt.replay.tree_sha256, retained.replay.tree_sha256);
+    assert_eq!(
+        rebuilt.replay.source_revision,
+        retained.replay.source_revision
+    );
+    verify_frozen_pristine(&rebuilt.replay).unwrap();
+
+    // The rebuilt prior task is selectable for corroboration by identity only:
+    // the fresh executor never sees the earlier answer.
+    let requirement = CorroborationRequirement {
+        mechanism: "bounded-output".to_owned(),
+        conditions: "local-tool-runs".to_owned(),
+        required_units: 1,
+        excluded: Vec::new(),
+    };
+    let selection = select_corroboration(&discovery.tasks, &requirement).unwrap();
+    assert!(selection.is_ready());
+    assert_eq!(selection.units.len(), 1);
+    let unit = &selection.units[0];
+    assert_eq!(unit.owner, id);
+    assert_eq!(unit.case_id, "case-b");
+    assert_eq!(unit.revision, retained.replay.revision);
+    assert_eq!(unit.tree_sha256, retained.replay.tree_sha256);
+    let payload = serde_json::to_string(&selection).unwrap();
+    assert!(!payload.contains(SOLUTION_TEXT.trim()), "{payload}");
+    assert!(!payload.contains(&solution), "{payload}");
+    assert!(!payload.contains("answer.txt"), "{payload}");
+    assert!(!payload.contains("oracle-7"), "{payload}");
+
+    // A declared requirement beyond the rebuilt units stays inconclusive: too
+    // few verifiable units are not replaced by a summary or a saving.
+    let strict = CorroborationRequirement {
+        required_units: 2,
+        ..requirement.clone()
+    };
+    let selection = select_corroboration(&discovery.tasks, &strict).unwrap();
+    assert!(!selection.is_ready());
+    assert_eq!(selection.units.len(), 1, "the one rebuilt unit is reported");
+    assert_eq!(selection.units[0].case_id, "case-b");
+    match &selection.status {
+        CorroborationStatus::Inconclusive(reason) => assert!(
+            reason.contains("fewer applicable independent replayable retained tasks"),
+            "{reason}"
+        ),
+        other => panic!("expected an inconclusive broader claim, got {other:?}"),
+    }
+
+    // A fresh executor receives the replayed pre-solution snapshot of the
+    // rebuilt task, never the completed attempt's answer.
+    let replay = rebuilt
+        .prepare_replay(&temp.path().join("board-replay"))
+        .unwrap();
+    verify_frozen_pristine(&replay).unwrap();
+    assert!(!replay.path.join("answer.txt").exists());
+    assert!(!git_result(&replay.path, &["cat-file", "-e", &solution]));
+    assert_eq!(replay.tree_sha256, rebuilt.replay.tree_sha256);
+    assert_eq!(replay.revision, rebuilt.replay.revision);
+}
+
+#[test]
+fn missing_or_changed_board_artifacts_stay_unsupported() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = bd_project(temp.path());
+    let bd = bd_executable();
+    let id = admit_fixture_card(&bd, &project);
+    let (ok, _) = retained_task(
+        temp.path(),
+        "ok",
+        &id,
+        "case-ok",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    write_board_retention(&bd, &project, &id, &ok).unwrap();
+    let (changed, _) = retained_task(
+        temp.path(),
+        "changed",
+        &id,
+        "case-changed",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    write_board_retention(&bd, &project, &id, &changed).unwrap();
+    let (gone, _) = retained_task(
+        temp.path(),
+        "gone",
+        &id,
+        "case-gone",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    write_board_retention(&bd, &project, &id, &gone).unwrap();
+    fs::remove_dir_all(&gone.replay.path).unwrap();
+
+    // A record written before the frozen tree object id was retained stays
+    // readable, but it cannot be rebuilt verifiably.
+    let legacy = format!(
+        "hypothesis-retention v1 item={id} case=case-legacy experiment=exp-corroboration mechanism=bounded-output conditions=local-tool-runs revision={} frozen={} tree={} oracle=oracle-7 acceptance=acceptance/run-9 replay={} detail=legacy record",
+        ok.replay.source_revision,
+        ok.replay.revision,
+        ok.replay.tree_sha256,
+        ok.replay.path.display()
+    );
+    add_board_comment(&bd, &project, &id, &legacy);
+
+    // A changed artifact: late work moved the frozen branch off the recorded
+    // root commit. The state is preserved, not cleaned or reset.
+    fs::write(changed.replay.path.join("late.txt"), "late work\n").unwrap();
+    git(&changed.replay.path, &["add", "."]);
+    git(&changed.replay.path, &["commit", "-qm", "late work"]);
+
+    let discovery = retained_tasks_from_board(&bd, &project).unwrap();
+    assert_eq!(discovery.tasks.len(), 1);
+    assert_eq!(discovery.tasks[0].case_id, "case-ok");
+    assert_eq!(discovery.unsupported.len(), 3);
+    let reason = |case: &str| {
+        discovery
+            .unsupported
+            .iter()
+            .find(|unit| unit.case_id == case)
+            .map(|unit| unit.reason.clone())
+            .unwrap_or_else(|| panic!("{case} is reported unsupported: {discovery:?}"))
+    };
+    assert!(
+        reason("case-changed").contains("frozen branch moved"),
+        "{}",
+        reason("case-changed")
+    );
+    assert!(
+        reason("case-gone").contains("missing"),
+        "{}",
+        reason("case-gone")
+    );
+    assert!(
+        reason("case-legacy").contains("no frozen git tree object id"),
+        "{}",
+        reason("case-legacy")
+    );
+    assert!(
+        discovery
+            .unsupported
+            .iter()
+            .all(|unit| !unit.reason.contains("prior solution")),
+        "{discovery:?}"
+    );
+    assert!(changed.replay.path.join("late.txt").is_file());
+    assert!(!gone.replay.path.exists());
+
+    // Too few rebuilt units: the declared requirement stays inconclusive and
+    // no unit is synthesized from the unsupported records.
+    let requirement = CorroborationRequirement {
+        mechanism: "bounded-output".to_owned(),
+        conditions: "local-tool-runs".to_owned(),
+        required_units: 2,
+        excluded: Vec::new(),
+    };
+    let selection = select_corroboration(&discovery.tasks, &requirement).unwrap();
+    assert!(!selection.is_ready());
+    assert_eq!(selection.units.len(), 1);
+    assert_eq!(
+        selection.units[0].case_id, "case-ok",
+        "only the verifiable unit is selectable; unsupported records never synthesize a unit"
+    );
+
+    // A retention whose frozen identity cannot be resolved at write time is
+    // refused and not recorded: the durable board never carries an identity
+    // the retained artifact cannot support.
+    let (absent, _) = retained_task(
+        temp.path(),
+        "absent",
+        &id,
+        "case-absent",
+        "bounded-output",
+        "local-tool-runs",
+    );
+    fs::remove_dir_all(&absent.replay.path).unwrap();
+    let error = write_board_retention(&bd, &project, &id, &absent).unwrap_err();
+    assert!(
+        error.to_string().contains("frozen tree object id"),
+        "{error}"
+    );
+    let comments = board_feedback::list_comments(&bd, &project, &id).unwrap();
+    assert!(
+        !comments
+            .iter()
+            .any(|comment| comment.contains("case-absent")),
+        "a refused retention leaves no record: {comments:?}"
+    );
 }

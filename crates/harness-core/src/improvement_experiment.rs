@@ -45,12 +45,17 @@
 //! requires corroboration, [`select_corroboration`] picks applicable,
 //! independent, replayable retained tasks by identity only, and
 //! [`RetainedTask::prepare_replay`] materializes a fresh pre-solution copy per
-//! attempt. A task that does not exercise the mechanism is excluded as
-//! non-evidence: too few applicable units leave the broader claim
-//! inconclusive instead of turning inapplicable workloads into a rejection,
-//! and absent retained evidence is never replaced by a summary or an invented
-//! saving.
+//! attempt. A later run discovers the retained tasks from their Beads owner
+//! cards ([`retained_tasks_from_board`]) and rebuilds each one only when the
+//! retained copy still reproduces the recorded frozen identity - root commit,
+//! frozen git tree object id and content digest; a missing or altered artifact
+//! is reported unsupported and never reconstructed from a summary. A task that
+//! does not exercise the mechanism is excluded as non-evidence: too few
+//! applicable units leave the broader claim inconclusive instead of turning
+//! inapplicable workloads into a rejection, and absent retained evidence is
+//! never replaced by a summary or an invented saving.
 
+use crate::board_hypothesis::RecordedRetention;
 use crate::build_identity;
 use crate::build_selection;
 use crate::task_worktree::{self, CandidateCheckout, FrozenCopy};
@@ -546,6 +551,128 @@ impl RetainedTask {
         }
         Ok(copy)
     }
+
+    /// Rebuild a retained completed real task from its durable Beads owner
+    /// record. The record must carry the frozen git tree object id, and the
+    /// retained pristine copy at its locator must reproduce the exact recorded
+    /// identity: the frozen root commit, its tree object and the content
+    /// digest. A record without the frozen tree object id, or a missing, moved
+    /// or altered artifact, is refused; the unit is never reconstructed from a
+    /// summary, a run-local index or an assumed saving, and the artifact state
+    /// is preserved rather than cleaned or reset.
+    pub fn rebuild_from_record(record: &RecordedRetention) -> io::Result<RetainedTask> {
+        bounded("owner", &record.item, 128)?;
+        bounded("case_id", &record.case_id, 128)?;
+        bounded("experiment", &record.experiment, 128)?;
+        bounded("mechanism", &record.mechanism, 96)?;
+        bounded("conditions", &record.conditions, 96)?;
+        bounded("oracle", &record.oracle, 512)?;
+        bounded("acceptance", &record.acceptance, 512)?;
+        bounded("revision", &record.revision, 192)?;
+        bounded("frozen", &record.frozen, 192)?;
+        bounded("tree", &record.tree, 192)?;
+        bounded("replay", &record.replay, 192)?;
+        let tree_object = record.tree_object.as_deref().ok_or_else(|| {
+            invalid(
+                "the retention record carries no frozen git tree object id; it cannot be rebuilt verifiably and stays unsupported",
+            )
+        })?;
+        if !(40..=64).contains(&tree_object.len())
+            || !tree_object
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "the retention record's frozen git tree object id is not an object identity",
+            ));
+        }
+        // The original source checkout is machine-local and stays out of the
+        // board record; the retained copy itself is the repository the frozen
+        // identity is re-verified against.
+        let replay = FrozenCopy {
+            source: PathBuf::from(&record.replay),
+            source_revision: record.revision.clone(),
+            path: PathBuf::from(&record.replay),
+            revision: record.frozen.clone(),
+            tree: tree_object.to_owned(),
+            tree_sha256: record.tree.clone(),
+        };
+        task_worktree::verify_frozen_pristine(&replay).map_err(|error| {
+            invalid(format!(
+                "the retained copy at {} does not reproduce the recorded frozen identity: {error}",
+                replay.path.display()
+            ))
+        })?;
+        let task = RetainedTask {
+            schema: EXPERIMENT_SCHEMA,
+            owner: record.item.clone(),
+            case_id: record.case_id.clone(),
+            experiment: record.experiment.clone(),
+            mechanism: record.mechanism.clone(),
+            conditions: record.conditions.clone(),
+            oracle: record.oracle.clone(),
+            acceptance: record.acceptance.clone(),
+            replay,
+        };
+        task.validate()?;
+        Ok(task)
+    }
+}
+
+/// The retained completed real tasks recorded under their Beads owner cards:
+/// rebuilt tasks ready for [`select_corroboration`], plus the records that
+/// stayed unsupported with their exact reason. Discovery reads the durable
+/// board, not a run-local index, so a later run can offer prior real tasks for
+/// corroboration; an unsupported record never becomes a selectable unit.
+#[derive(Clone, Debug, Default)]
+pub struct RetainedTaskDiscovery {
+    /// Verifiably rebuilt tasks in board order.
+    pub tasks: Vec<RetainedTask>,
+    /// Retention records that could not be rebuilt, in board order.
+    pub unsupported: Vec<UnsupportedRetention>,
+}
+
+/// One retention record that stayed unsupported, by identity only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedRetention {
+    /// The card the record names.
+    pub item: String,
+    pub case_id: String,
+    /// The exact verification failure; the artifact state is preserved.
+    pub reason: String,
+}
+
+/// Discover the retained completed real tasks recorded under their Beads owner
+/// cards and rebuild each one verifiably from its retained artifact: the
+/// recorded frozen root commit, its frozen git tree object id and the recorded
+/// content digest must still reproduce. A record whose artifact is missing,
+/// moved or altered stays in [`RetainedTaskDiscovery::unsupported`] with its
+/// exact reason, so too few rebuilt units leave a broader claim inconclusive
+/// instead of being replaced by a summary or a synthetic saving.
+pub fn retained_tasks_from_board(bd: &Path, project: &Path) -> io::Result<RetainedTaskDiscovery> {
+    let mut discovery = RetainedTaskDiscovery::default();
+    for card in crate::board_hypothesis::list_hypothesis_cards(bd, project)? {
+        let comments = crate::board_feedback::list_comments(bd, project, &card.id)?;
+        for record in crate::board_hypothesis::parse_retentions(&comments) {
+            let rebuilt = if record.item == card.id {
+                RetainedTask::rebuild_from_record(&record)
+            } else {
+                Err(invalid(format!(
+                    "the retention names card {} but is attached to {}",
+                    record.item, card.id
+                )))
+            };
+            match rebuilt {
+                Ok(task) => discovery.tasks.push(task),
+                Err(error) => discovery.unsupported.push(UnsupportedRetention {
+                    item: record.item.clone(),
+                    case_id: record.case_id.clone(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+    }
+    Ok(discovery)
 }
 
 /// Retain one completed real task: verify the frozen snapshot that ran, create
