@@ -1839,7 +1839,7 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
     let output = text(&resume);
     assert!(resume.status.success(), "{output}");
     assert!(
-        output.contains("declined"),
+        output.contains("removal authority: refused by the user"),
         "the refusal is visible and unbypassable: {output}"
     );
     assert_eq!(
@@ -1870,6 +1870,11 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         "synthetic-loss",
     ]);
     assert!(approved.status.success(), "{}", text(&approved));
+    // The recorded refusal keeps the phase blocked until a resume boundary
+    // resolves it against the new approval: this resume clears the recorded
+    // block, and the next advances to the approved measured conversation.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
     let resume = fixture.resume();
     assert!(resume.status.success(), "{}", text(&resume));
     let candidate_attempts = fixture.cursor()["attempts"]
@@ -1878,7 +1883,12 @@ fn an_accepted_faster_candidate_is_adopted_without_activation_or_integration() {
         .iter()
         .filter(|attempt| attempt["role"] == "candidate")
         .count();
-    assert_eq!(candidate_attempts, 1, "the approved treatment dispatches");
+    assert_eq!(
+        candidate_attempts,
+        1,
+        "the approved treatment dispatches: {}",
+        text(&resume)
+    );
 
     // The candidate solves the workload and is measurably faster.
     let session = session_id("adopt-candidate");
