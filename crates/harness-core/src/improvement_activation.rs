@@ -226,6 +226,32 @@ pub struct IntegrationReceipt {
     /// already present and nothing was replayed.
     pub applied: bool,
     pub checks: CheckReceipt,
+    /// The exact retained workload implementations of the run's own hypothesis
+    /// card whose change the integrated candidate carries. Empty when the
+    /// candidate carries no retained workload solution (a fresh, supported
+    /// implementation) or none could be attributed. This is lineage only: it
+    /// neither adopts the workload hypothesis nor authorizes its removal.
+    #[serde(default)]
+    pub workload_lineage: Vec<WorkloadLineage>,
+}
+
+/// One retained workload implementation whose exact change the integrated
+/// candidate carries. The record names the owning hypothesis card and the
+/// exact verified revision, so the resulting baseline can be traced to the
+/// independently accepted workload solution it contains even when rebasing
+/// onto a new baseline changed the commit identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadLineage {
+    /// The hypothesis card that retains the implementation reference.
+    pub item: String,
+    /// The arm branch that produced the retained solution.
+    pub branch: String,
+    /// The frozen workload revision the solution was produced from.
+    pub base: String,
+    /// The exact retained solution revision, independent of the rebased
+    /// candidate identity recorded in the receipt.
+    pub revision: String,
 }
 
 /// The resolved result of one integration attempt.
@@ -676,6 +702,10 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
             ),
         )));
     }
+    // The baseline's workload lineage is derived read-only from the run's own
+    // hypothesis card before any effect, so the receipt can name the exact
+    // retained solution the integrated candidate carries.
+    let workload_lineage = carried_workload_lineage(request, candidate_checkout)?;
     let head = git_head(&request.mainline)?;
     if head == evidence.candidate_revision {
         let checks = match request
@@ -719,6 +749,7 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
             integrated_revision: evidence.candidate_revision,
             applied: false,
             checks,
+            workload_lineage,
         }));
     }
     if head != evidence.base_revision {
@@ -793,6 +824,7 @@ pub fn integrate(request: &IntegrationRequest<'_>) -> io::Result<IntegrationOutc
         integrated_revision: evidence.candidate_revision,
         applied: true,
         checks,
+        workload_lineage,
     }))
 }
 
@@ -1263,6 +1295,122 @@ fn git_ancestor(cwd: &Path, ancestor: &str, descendant: &str) -> io::Result<bool
             String::from_utf8_lossy(&out.stderr).trim()
         ))),
     }
+}
+
+/// The exact retained workload implementations of the run's own hypothesis
+/// card whose change the evaluated candidate carries. Only the card this run
+/// independently investigates is read, so a retained workload solution is
+/// eligible here only when the run's own hypothesis owns it; a revision that
+/// is not an object of the candidate's repository, or whose change differs,
+/// is never attributed. An empty result means the candidate carries no
+/// retained workload solution, which is a supported state for a fresh
+/// implementation.
+fn carried_workload_lineage(
+    request: &IntegrationRequest<'_>,
+    candidate: &task_worktree::CandidateCheckout,
+) -> io::Result<Vec<WorkloadLineage>> {
+    let signature = change_signature(&candidate.source, &candidate.base, &candidate.revision)?;
+    if signature.is_empty() {
+        return Ok(Vec::new());
+    }
+    let comments = board_feedback::list_comments(
+        &request.spec.board.bd,
+        &request.spec.board.project,
+        &request.spec.hypothesis_item,
+    )?;
+    let mut lineage = Vec::new();
+    for comment in &comments {
+        let Some(record) = retained_workload_solution(comment, &request.spec.hypothesis_item)
+        else {
+            continue;
+        };
+        if !git_object_present(&candidate.source, &record.base)
+            || !git_object_present(&candidate.source, &record.revision)
+        {
+            continue;
+        }
+        let Ok(retained) = change_signature(&candidate.source, &record.base, &record.revision)
+        else {
+            continue;
+        };
+        if !retained.is_empty() && retained == signature {
+            lineage.push(record);
+        }
+    }
+    Ok(lineage)
+}
+
+/// One retained `role=workload` implementation record read back from the
+/// card's bounded comments. Every other comment - including the candidate
+/// card's own `role=candidate` allocations - yields `None`.
+fn retained_workload_solution(comment: &str, item: &str) -> Option<WorkloadLineage> {
+    let rest = comment
+        .trim_start()
+        .strip_prefix(board_hypothesis::IMPLEMENTATION_PREFIX)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if field(&fields, "item") != Some(item) || field(&fields, "role") != Some("workload") {
+        return None;
+    }
+    Some(WorkloadLineage {
+        item: item.to_owned(),
+        branch: field(&fields, "branch")?.to_owned(),
+        base: field(&fields, "base")?.to_owned(),
+        revision: field(&fields, "revision")?.to_owned(),
+    })
+}
+
+fn field<'a>(fields: &[&'a str], key: &str) -> Option<&'a str> {
+    fields.iter().find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        (name == key && !value.is_empty()).then_some(value)
+    })
+}
+
+/// The content identity of one committed change: the status and the resulting
+/// blob identity of every changed path. Two commits that apply the same change
+/// to different bases share this signature, so a retained solution rebased
+/// onto a new baseline is recognized as the same exact solution while a
+/// different resolution or an extra edit is not. `git diff --raw` shows the
+/// content-addressed result per path, and rename detection is disabled so one
+/// logical change always yields the same entries.
+fn change_signature(repo: &Path, base: &str, revision: &str) -> io::Result<Vec<String>> {
+    let raw = git(
+        repo,
+        &[
+            "diff",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            base,
+            revision,
+        ],
+    )?;
+    let mut signature: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        // `:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>`
+        let Some(rest) = line.strip_prefix(':') else {
+            continue;
+        };
+        let Some((meta, path)) = rest.split_once('\t') else {
+            continue;
+        };
+        let fields: Vec<&str> = meta.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        signature.push(format!("{} {} {}", fields[4], fields[3], path));
+    }
+    signature.sort();
+    Ok(signature)
+}
+
+fn git_object_present(repo: &Path, revision: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", &format!("{revision}^{{commit}}")])
+        .current_dir(repo)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// Canonical path without the verbatim prefix `Path::canonicalize` adds on

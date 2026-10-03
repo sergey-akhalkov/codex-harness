@@ -4586,3 +4586,181 @@ fn refused_comparison_dispatch_resumes_with_the_recorded_selection() {
         "the re-attempt wrote its exact assignment"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workload B artifacts: an arm that passes the frozen independent acceptance
+// leaves an exact, selectable solution under B's own card; a failed arm never
+// does. The comparison still completes without inventing a B candidate.
+// ---------------------------------------------------------------------------
+
+/// Both arms independently implement and pass the workload, producing
+/// differing valid B solutions: each exact revision is retained under B's own
+/// card, and the verdict alone integrates nothing.
+#[test]
+fn both_accepted_arms_retain_their_differing_valid_workload_solutions() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("workload-artifacts");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    assert!(
+        text(&resume).contains("before submission"),
+        "the fixture launcher cannot run a conversation: {}",
+        text(&resume)
+    );
+
+    // The baseline arm implements B and passes the frozen oracle.
+    let session = session_id("workload-artifacts-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["baseline"]["accepted"], true,
+        "{status}"
+    );
+    let baseline_revision = status["comparison"]["baseline"]["revision"]
+        .as_str()
+        .expect("the accepted baseline revision is retained")
+        .to_owned();
+    let comments = fixture.bd_comments(&fixture.workload_card);
+    assert!(
+        comments.contains(&format!(
+            "hypothesis-implementation v1 item={} role=workload branch=workload-baseline base={} revision={baseline_revision}",
+            fixture.workload_card, fixture.workload_revision
+        )),
+        "the accepted baseline solution is retained under B's own card: {comments}"
+    );
+
+    // The candidate arm implements B differently and also passes: two
+    // differing valid B solutions must both stay selectable.
+    let session = session_id("workload-artifacts-candidate");
+    fixture.simulate_arm("candidate", "candidate", "solved", 50, 1.5, 1, 1, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], true,
+        "{status}"
+    );
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    let candidate_revision = status["comparison"]["candidate"]["revision"]
+        .as_str()
+        .expect("the accepted candidate revision is retained")
+        .to_owned();
+    assert_ne!(
+        baseline_revision, candidate_revision,
+        "the arms produced differing valid B solutions"
+    );
+    let comments = fixture.bd_comments(&fixture.workload_card);
+    assert!(
+        comments.contains(&format!(
+            "hypothesis-implementation v1 item={} role=workload branch=workload-candidate base={} revision={candidate_revision}",
+            fixture.workload_card, fixture.workload_revision
+        )),
+        "the accepted candidate solution is retained under B's own card: {comments}"
+    );
+    assert!(
+        comments.contains(&baseline_revision),
+        "the other valid B solution stays retained: {comments}"
+    );
+    // B's correctness is not B's benefit: the verdict alone integrates nothing.
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        base,
+        "the comparison never advances the mainline"
+    );
+}
+
+/// An arm whose frozen independent acceptance failed leaves no usable B
+/// artifact: only the accepted solution is retained, and the comparison still
+/// publishes its supported non-adoption and settles without inventing a next
+/// candidate patch.
+#[test]
+fn a_workload_arm_without_independent_acceptance_leaves_no_candidate_patch() {
+    let _serial = INSTALL.lock().unwrap();
+    let fixture = Fixture::new("workload-no-patch");
+    let base = git_output(&fixture.proj, &["rev-parse", "HEAD"]);
+    let checkout = fixture.prepare_candidate(Some("// candidate implementation\n"));
+    fixture.prepare_builds(&checkout);
+    fixture.start_with_ready_candidate(&checkout, false);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+
+    let session = session_id("workload-no-patch-baseline");
+    fixture.simulate_arm("baseline", "baseline", "solved", 1200, 60.0, 2, 3, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    let baseline_revision = status["comparison"]["baseline"]["revision"]
+        .as_str()
+        .expect("the accepted baseline revision is retained")
+        .to_owned();
+
+    // The candidate arm returns a solution the frozen checker rejects.
+    let session = session_id("workload-no-patch-candidate");
+    fixture.simulate_arm("candidate", "candidate", "wrong", 30, 1.0, 1, 1, &session);
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let status = fixture.status_json();
+    assert_eq!(
+        status["comparison"]["candidate"]["accepted"], false,
+        "{status}"
+    );
+    assert_eq!(status["phase"], "decision-recorded", "{status}");
+    let failed_revision = status["comparison"]["candidate"]["revision"]
+        .as_str()
+        .expect("the failed arm's attempted revision stays visible")
+        .to_owned();
+    let comments = fixture.bd_comments(&fixture.workload_card);
+    assert!(
+        comments.contains(&baseline_revision),
+        "the independently accepted solution stays retained: {comments}"
+    );
+    assert!(
+        !comments.contains(&failed_revision),
+        "a failed arm's solution is never presented as a selectable B artifact: {comments}"
+    );
+    let evaluation: Value = load_json(&fixture.run.join("comparison/evaluation.json"));
+    assert_eq!(evaluation["decision"], "reject", "{evaluation}");
+    assert_eq!(
+        git_output(&fixture.proj, &["rev-parse", "HEAD"]),
+        base,
+        "a failed workload arm never advances the mainline"
+    );
+
+    // No candidate patch exists, but the run is not blocked on one: its
+    // continuation records the retained lineage and goes idle without model
+    // work invented to produce a next candidate.
+    fs::write(
+        fixture.run.join("supervision.json"),
+        r#"{"schema":1,"mode":"continuous"}"#,
+    )
+    .unwrap();
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let report = fixture.status_json();
+    assert_eq!(report["phase"], "idle", "{report}");
+    assert!(
+        report["condition"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("leaves the baseline unchanged"),
+        "{report}"
+    );
+    assert!(
+        fixture.run.join("lineage.json").is_file(),
+        "the retained lineage stays available for the next grounded hypothesis"
+    );
+    let attempts = fixture.cursor()["attempts"].as_array().unwrap().len();
+    let again = fixture.resume();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        fixture.cursor()["attempts"].as_array().unwrap().len(),
+        attempts,
+        "no model work is started to invent a next candidate"
+    );
+}
