@@ -14,6 +14,7 @@ mod improvement_intake;
 mod improvement_policy;
 mod improvement_runtime;
 mod improvement_spec;
+mod infrastructure_accounting;
 mod launcher;
 mod link_changes;
 mod process;
