@@ -6,9 +6,12 @@
 //! counterexample, acceptance and the linked OpenSpec change); native
 //! comments carry the lifecycle events: experiment trials with their
 //! nonblocking candidate/workload relationship, implementation references,
-//! reconsiderations and the user's scoped removal decisions. No second
-//! journal, vote or approval tracker is introduced - every operation here is
-//! a bounded `bd` call through the existing board adapter.
+//! reconsiderations, retentions of completed real tasks and the user's scoped
+//! removal decisions. A retention carries the replayable frozen task identity
+//! with its independent oracle and acceptance references - never a solution,
+//! patch or summary. No second journal, vote or approval tracker is
+//! introduced - every operation here is a bounded `bd` call through the
+//! existing board adapter.
 //!
 //! Admission searches open, closed and deferred cards first: a prior
 //! same-condition conclusion is reused as recorded, and reconsidering it
@@ -31,6 +34,8 @@ pub const ADMISSION_HEADER: &str = "hypothesis: 1";
 pub const TRIAL_PREFIX: &str = "hypothesis-trial v1";
 /// One recorded implementation reference (candidate branch/worktree).
 pub const IMPLEMENTATION_PREFIX: &str = "hypothesis-implementation v1";
+/// One recorded retention of a completed real task on its owning card.
+pub const RETENTION_PREFIX: &str = "hypothesis-retention v1";
 /// One recorded reconsideration of an earlier conclusion.
 pub const RECONSIDERATION_PREFIX: &str = "hypothesis-reconsideration v1";
 /// One recorded removal proposal awaiting the user's decision.
@@ -261,6 +266,8 @@ pub struct HypothesisCard {
     pub reconsiderations: usize,
     pub trials: usize,
     pub implementations: usize,
+    /// Retained completed real tasks recorded under this owner.
+    pub retentions: usize,
 }
 
 /// What an admission search restricts to; both fields are exact matches
@@ -333,14 +340,16 @@ pub fn list_hypothesis_cards(bd: &Path, project: &Path) -> io::Result<Vec<Hypoth
             reconsiderations: 0,
             trials: 0,
             implementations: 0,
+            retentions: 0,
         });
     }
     Ok(cards)
 }
 
 /// Lists hypothesis cards matching the filter, reading each matching card's
-/// comments for its decision, reconsideration, trial and implementation
-/// counts. Closed and deferred cards participate exactly like open ones.
+/// comments for its decision, reconsideration, trial, implementation and
+/// retention counts. Closed and deferred cards participate exactly like open
+/// ones.
 pub fn search_hypotheses(
     bd: &Path,
     project: &Path,
@@ -364,6 +373,10 @@ pub fn search_hypotheses(
         card.implementations = comments
             .iter()
             .filter(|comment| comment.starts_with(IMPLEMENTATION_PREFIX))
+            .count();
+        card.retentions = comments
+            .iter()
+            .filter(|comment| comment.starts_with(RETENTION_PREFIX))
             .count();
     }
     Ok(cards)
@@ -771,6 +784,115 @@ pub fn record_implementation(
         role: implementation.role,
         branch: implementation.branch.clone(),
         revision: implementation.revision.clone(),
+        recorded: !already,
+    })
+}
+
+/// One retention declaration for a completed real task, recorded on the card
+/// that already owns it. The record carries bounded references only - the
+/// frozen task identity, the retained pristine pre-solution replay copy and
+/// the independent oracle and acceptance references - so reading it back
+/// cannot hand a solution to a fresh executor. A missing oracle, acceptance or
+/// replay reference is refused: no summary substitutes for retained evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionDraft {
+    pub case_id: String,
+    pub experiment: String,
+    pub mechanism: String,
+    pub conditions: String,
+    /// The committed source revision the completed real task ran.
+    pub revision: String,
+    /// The frozen root commit materialized from that revision.
+    pub frozen: String,
+    /// Content digest over the frozen tree entries.
+    pub tree: String,
+    pub oracle: String,
+    pub acceptance: String,
+    /// The retained pristine pre-solution copy used for replay.
+    pub replay: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedRetention {
+    pub case_id: String,
+    pub experiment: String,
+    pub mechanism: String,
+    pub conditions: String,
+    pub revision: String,
+    pub frozen: String,
+    pub tree: String,
+    pub oracle: String,
+    pub acceptance: String,
+    pub replay: String,
+    pub detail: Option<String>,
+}
+
+impl BoundedRetention {
+    pub fn try_from_draft(draft: RetentionDraft) -> io::Result<Self> {
+        Ok(Self {
+            case_id: require_token("case", &draft.case_id, MAX_EXPERIMENT)?,
+            experiment: require_token("experiment", &draft.experiment, MAX_EXPERIMENT)?,
+            mechanism: require_token("mechanism", &draft.mechanism, MAX_MECHANISM)?,
+            conditions: require_token("conditions", &draft.conditions, MAX_CONDITIONS)?,
+            revision: require_token("revision", &draft.revision, MAX_LOCATOR)?,
+            frozen: require_token("frozen", &draft.frozen, MAX_LOCATOR)?,
+            tree: require_token("tree", &draft.tree, MAX_LOCATOR)?,
+            oracle: require_token("oracle", &draft.oracle, MAX_LOCATOR)?,
+            acceptance: require_token("acceptance", &draft.acceptance, MAX_LOCATOR)?,
+            replay: require_token("replay", &draft.replay, MAX_LOCATOR)?,
+            detail: optional_detail("detail", draft.detail.as_deref(), MAX_DETAIL)?,
+        })
+    }
+
+    fn comment(&self, item: &str) -> String {
+        let mut text = format!(
+            "{RETENTION_PREFIX} item={item} case={} experiment={} mechanism={} conditions={} revision={} frozen={} tree={} oracle={} acceptance={} replay={}",
+            self.case_id,
+            self.experiment,
+            self.mechanism,
+            self.conditions,
+            self.revision,
+            self.frozen,
+            self.tree,
+            self.oracle,
+            self.acceptance,
+            self.replay
+        );
+        if let Some(detail) = &self.detail {
+            text.push_str(&format!(" detail={detail}"));
+        }
+        text
+    }
+}
+
+/// The result of recording a retention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionRecord {
+    pub case_id: String,
+    /// A new retention comment was written; `false` when the identical
+    /// retention was already recorded.
+    pub recorded: bool,
+}
+
+/// Records the retained replayable identity of one completed real task on the
+/// card that already owns it. The card must exist: retention never creates a
+/// card, a synthetic task or a second task store.
+pub fn record_retention(
+    bd: &Path,
+    project: &Path,
+    item: &str,
+    retention: &BoundedRetention,
+) -> io::Result<RetentionRecord> {
+    require_hypothesis_card(bd, project, item)?;
+    let text = retention.comment(item);
+    let comments = board_feedback::list_comments(bd, project, item)?;
+    let already = comments.iter().any(|comment| comment == &text);
+    if !already {
+        write_comment_once(bd, project, item, &comments, &text)?;
+    }
+    Ok(RetentionRecord {
+        case_id: retention.case_id.clone(),
         recorded: !already,
     })
 }
@@ -1544,6 +1666,84 @@ fn parse_reconsideration(comment: &str) -> Option<ReconsiderationComment> {
     })
 }
 
+/// One recorded retention of a completed real task, as read back from its
+/// owning card. The fields are references: no solution, patch, answer or
+/// acceptance content can be carried here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRetention {
+    pub item: String,
+    pub case_id: String,
+    pub experiment: String,
+    pub mechanism: String,
+    pub conditions: String,
+    pub revision: String,
+    pub frozen: String,
+    pub tree: String,
+    pub oracle: String,
+    pub acceptance: String,
+    pub replay: String,
+    pub detail: Option<String>,
+}
+
+/// Parses recorded retentions in board order. A record missing any required
+/// reference - including the independent oracle or acceptance evidence - is
+/// not a retention, so an absent-evidence summary cannot be read back as one.
+pub fn parse_retentions(comments: &[String]) -> Vec<RecordedRetention> {
+    comments
+        .iter()
+        .filter_map(|comment| parse_retention(comment))
+        .collect()
+}
+
+fn parse_retention(comment: &str) -> Option<RecordedRetention> {
+    let rest = comment.strip_prefix(RETENTION_PREFIX)?.trim();
+    let (head, detail) = split_detail(rest);
+    let mut item = None;
+    let mut case_id = None;
+    let mut experiment = None;
+    let mut mechanism = None;
+    let mut conditions = None;
+    let mut revision = None;
+    let mut frozen = None;
+    let mut tree = None;
+    let mut oracle = None;
+    let mut acceptance = None;
+    let mut replay = None;
+    for part in head.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "item" => item = non_none(value),
+            "case" => case_id = non_none(value),
+            "experiment" => experiment = non_none(value),
+            "mechanism" => mechanism = non_none(value),
+            "conditions" => conditions = non_none(value),
+            "revision" => revision = non_none(value),
+            "frozen" => frozen = non_none(value),
+            "tree" => tree = non_none(value),
+            "oracle" => oracle = non_none(value),
+            "acceptance" => acceptance = non_none(value),
+            "replay" => replay = non_none(value),
+            _ => {}
+        }
+    }
+    Some(RecordedRetention {
+        item: item?,
+        case_id: case_id?,
+        experiment: experiment?,
+        mechanism: mechanism?,
+        conditions: conditions?,
+        revision: revision?,
+        frozen: frozen?,
+        tree: tree?,
+        oracle: oracle?,
+        acceptance: acceptance?,
+        replay: replay?,
+        detail: detail.map(str::to_owned),
+    })
+}
+
 /// One recorded removal proposal version. The decisions bind to these fields,
 /// and the controller can retain the preview and full references from here
 /// without another tracker.
@@ -2112,5 +2312,103 @@ mod tests {
             implementation.comment("bdct-b"),
             "hypothesis-implementation v1 item=bdct-b role=workload branch=hypothesis/b base=0b960b4c87f21a38f5ade8b8d27e374bacb81b8a revision=abc1234 worktree=wt-loc-1 runtime=runtime-candidate baseline=runtime-baseline"
         );
+    }
+
+    fn retention_components() -> RetentionDraft {
+        RetentionDraft {
+            case_id: "case-b".to_owned(),
+            experiment: "exp-1".to_owned(),
+            mechanism: "bounded-output".to_owned(),
+            conditions: "local-tool-runs".to_owned(),
+            revision: "0b960b4c87f21a38f5ade8b8d27e374bacb81b8a".to_owned(),
+            frozen: "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00".to_owned(),
+            tree: "d1g3e5s7t9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9".to_owned(),
+            oracle: "oracle-7".to_owned(),
+            acceptance: "acceptance/run-9".to_owned(),
+            replay: r"C:\state\replay-1".to_owned(),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn retention_comment_round_trips_references_only() {
+        let retention = BoundedRetention::try_from_draft(RetentionDraft {
+            detail: Some("accepted completed real task".to_owned()),
+            ..retention_components()
+        })
+        .unwrap();
+        let comment = retention.comment("bdct-h1");
+        assert_eq!(
+            comment,
+            r"hypothesis-retention v1 item=bdct-h1 case=case-b experiment=exp-1 mechanism=bounded-output conditions=local-tool-runs revision=0b960b4c87f21a38f5ade8b8d27e374bacb81b8a frozen=aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00 tree=d1g3e5s7t9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9 oracle=oracle-7 acceptance=acceptance/run-9 replay=C:\state\replay-1 detail=accepted completed real task"
+        );
+        let parsed = parse_retention(&comment).unwrap();
+        assert_eq!(parsed.item, "bdct-h1");
+        assert_eq!(parsed.case_id, "case-b");
+        assert_eq!(parsed.experiment, "exp-1");
+        assert_eq!(parsed.mechanism, "bounded-output");
+        assert_eq!(parsed.conditions, "local-tool-runs");
+        assert_eq!(parsed.frozen, "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00");
+        assert_eq!(parsed.oracle, "oracle-7");
+        assert_eq!(parsed.acceptance, "acceptance/run-9");
+        assert_eq!(parsed.replay, r"C:\state\replay-1");
+        assert_eq!(
+            parsed.detail.as_deref(),
+            Some("accepted completed real task")
+        );
+
+        // Absent evidence is not a retention: a summary cannot stand in for
+        // the oracle, the acceptance reference or the frozen replay identity.
+        let summary = "hypothesis-retention v1 item=bdct-h1 case=case-b experiment=exp-1 mechanism=bounded-output conditions=local-tool-runs revision=abc frozen=def tree=tre oracle=none acceptance=acceptance/run-9 replay=C:/state/replay-1 detail=claimed saving";
+        assert!(parse_retention(summary).is_none());
+        let no_acceptance = summary.replace("acceptance/run-9", "none");
+        assert!(parse_retention(&no_acceptance).is_none());
+        let no_summary_evidence =
+            "hypothesis-retention v1 item=bdct-h1 case=case-b detail=claimed saving";
+        assert!(parse_retention(no_summary_evidence).is_none());
+
+        // A mixed comment list keeps only complete retention records.
+        let records = parse_retentions(&[
+            summary.to_owned(),
+            comment.clone(),
+            "hypothesis-trial v1 item=bdct-h1 experiment=exp-1 role=workload counterpart=bdct-b"
+                .to_owned(),
+        ]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].case_id, "case-b");
+    }
+
+    #[test]
+    fn retention_requires_bounded_single_line_evidence() {
+        let error = BoundedRetention::try_from_draft(RetentionDraft {
+            acceptance: "   ".to_owned(),
+            ..retention_components()
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("acceptance is required"),
+            "{error}"
+        );
+        let error = BoundedRetention::try_from_draft(RetentionDraft {
+            oracle: "line one\nline two".to_owned(),
+            ..retention_components()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("single line"), "{error}");
+        let error = BoundedRetention::try_from_draft(RetentionDraft {
+            mechanism: "bounded output".to_owned(),
+            ..retention_components()
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported characters"),
+            "{error}"
+        );
+        let error = BoundedRetention::try_from_draft(RetentionDraft {
+            detail: Some("two\nlines".to_owned()),
+            ..retention_components()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("single line"), "{error}");
     }
 }

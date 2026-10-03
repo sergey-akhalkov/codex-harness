@@ -34,6 +34,22 @@
 //! 7. [`select_variant`] between attempts (`attempt_active = true` while a
 //!    measured attempt holds its frozen runtime) and report the returned
 //!    [`ConsumedVariant`] identity as the actually consumed runtime.
+//!
+//! # Retention and corroboration
+//!
+//! A completed real task is retained as identity plus a pristine, replayable
+//! copy of its frozen pre-solution inputs ([`retain_completed_task`]). The
+//! retention never stores or returns the task's solution, patch or
+//! conversation, so selecting the task for corroboration cannot hand the
+//! earlier answer to a fresh executor. When the declared adoption scope
+//! requires corroboration, [`select_corroboration`] picks applicable,
+//! independent, replayable retained tasks by identity only, and
+//! [`RetainedTask::prepare_replay`] materializes a fresh pre-solution copy per
+//! attempt. A task that does not exercise the mechanism is excluded as
+//! non-evidence: too few applicable units leave the broader claim
+//! inconclusive instead of turning inapplicable workloads into a rejection,
+//! and absent retained evidence is never replaced by a summary or an invented
+//! saving.
 
 use crate::build_identity;
 use crate::build_selection;
@@ -434,4 +450,348 @@ impl ExperimentBindings {
         })?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Completed real-task retention and corroboration selection.
+//
+// A completed real task is retained as identity plus a pristine, replayable
+// copy of its frozen pre-solution inputs. The retention never stores or
+// returns the task's solution, patch or conversation. When the declared
+// adoption scope requires corroboration, applicable, independent, replayable
+// retained tasks are selected by identity only; a task that does not exercise
+// the mechanism is excluded as non-evidence, so too few applicable units leave
+// the broader claim inconclusive rather than turning inapplicable workloads
+// into a rejection, and absent retained evidence is never replaced by a
+// summary or an invented saving.
+// ---------------------------------------------------------------------------
+
+/// One completed real task declared for retention, before its replayable copy
+/// exists. Every field is a bounded reference; the operational identity is
+/// derived from the frozen snapshot that actually ran, not from a summary.
+/// The matching durable record on the owning Beads card is written by
+/// `crate::board_hypothesis::record_retention` with the same identity fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRetention {
+    /// The existing Beads card that owns the retained task; retention never
+    /// creates a card or a second task store.
+    pub owner: String,
+    /// The workload identity within the experiment that completed it.
+    pub case_id: String,
+    /// The experiment that completed this real task.
+    pub experiment: String,
+    /// The mechanism this task actually exercises.
+    pub mechanism: String,
+    /// The declared applicability conditions of that mechanism.
+    pub conditions: String,
+    /// Identity of the fixed independent acceptance oracle.
+    pub oracle: String,
+    /// Reference to the retained independent acceptance evidence.
+    pub acceptance: String,
+}
+
+/// A replayable completed real task retained under its Beads owner. The record
+/// carries the frozen input identity and the retained pristine pre-solution
+/// copy. It has no field for a solution, patch or conversation, so selection
+/// for corroboration returns identity references and the replay is
+/// reconstructed from pre-solution inputs alone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedTask {
+    pub schema: u32,
+    pub owner: String,
+    pub case_id: String,
+    pub experiment: String,
+    pub mechanism: String,
+    pub conditions: String,
+    pub oracle: String,
+    pub acceptance: String,
+    /// The retained pristine pre-solution copy: the replayable task inputs.
+    pub replay: FrozenCopy,
+}
+
+impl RetainedTask {
+    /// Validate the recorded references. The replay copy's own verification is
+    /// separate: a retained copy that is missing or no longer pristine makes
+    /// the unit unusable without invalidating the record itself.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.schema != EXPERIMENT_SCHEMA {
+            return Err(invalid("unsupported retained task schema"));
+        }
+        bounded("owner", &self.owner, 128)?;
+        bounded("case_id", &self.case_id, 128)?;
+        bounded("experiment", &self.experiment, 128)?;
+        bounded("mechanism", &self.mechanism, 96)?;
+        bounded("conditions", &self.conditions, 96)?;
+        bounded("oracle", &self.oracle, 512)?;
+        bounded("acceptance", &self.acceptance, 512)?;
+        Ok(())
+    }
+
+    /// Materialize a fresh pre-solution copy of the retained task inputs for
+    /// one corroboration attempt. The retained copy must still verify as the
+    /// pristine frozen snapshot, and the fresh copy must reproduce its exact
+    /// identity; the completed task's solution is neither copied nor
+    /// reachable from the result.
+    pub fn prepare_replay(&self, destination: &Path) -> io::Result<FrozenCopy> {
+        self.validate()?;
+        task_worktree::verify_frozen_pristine(&self.replay)?;
+        let copy =
+            task_worktree::frozen_copy(&self.replay.path, &self.replay.revision, destination)?;
+        if copy.tree_sha256 != self.replay.tree_sha256 || copy.revision != self.replay.revision {
+            let _ = fs::remove_dir_all(&copy.path);
+            return Err(invalid(
+                "the replayed copy is not the retained frozen snapshot",
+            ));
+        }
+        Ok(copy)
+    }
+}
+
+/// Retain one completed real task: verify the frozen snapshot that ran, create
+/// and verify the pristine replayable copy, and refuse any missing evidence
+/// reference. `completed` may already hold the attempt's committed work (use
+/// `task_worktree::verify_frozen`); the retained copy is materialized from the
+/// frozen source revision, so the retained inputs stay pre-solution.
+pub fn retain_completed_task(
+    completed: &FrozenCopy,
+    destination: &Path,
+    retention: &TaskRetention,
+) -> io::Result<RetainedTask> {
+    bounded("owner", &retention.owner, 128)?;
+    bounded("case_id", &retention.case_id, 128)?;
+    bounded("experiment", &retention.experiment, 128)?;
+    bounded("mechanism", &retention.mechanism, 96)?;
+    bounded("conditions", &retention.conditions, 96)?;
+    bounded("oracle", &retention.oracle, 512)?;
+    bounded("acceptance", &retention.acceptance, 512)?;
+    task_worktree::verify_frozen(completed)?;
+    let copy =
+        task_worktree::frozen_copy(&completed.source, &completed.source_revision, destination)?;
+    let verified = (|| {
+        if copy.tree_sha256 != completed.tree_sha256 || copy.revision != completed.revision {
+            return Err(invalid(
+                "the retained copy is not the frozen snapshot the completed task ran",
+            ));
+        }
+        task_worktree::verify_frozen_pristine(&copy)
+    })();
+    if let Err(error) = verified {
+        let _ = fs::remove_dir_all(&copy.path);
+        return Err(error);
+    }
+    Ok(RetainedTask {
+        schema: EXPERIMENT_SCHEMA,
+        owner: retention.owner.clone(),
+        case_id: retention.case_id.clone(),
+        experiment: retention.experiment.clone(),
+        mechanism: retention.mechanism.clone(),
+        conditions: retention.conditions.clone(),
+        oracle: retention.oracle.clone(),
+        acceptance: retention.acceptance.clone(),
+        replay: copy,
+    })
+}
+
+/// The corroboration the declared adoption scope still requires, fixed before
+/// any comparative result. `required_units` counts the additional independent
+/// units; identities already part of the declared plan are excluded here
+/// rather than after seeing an outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorroborationRequirement {
+    /// The mechanism the additional units must exercise.
+    pub mechanism: String,
+    /// The applicability conditions the units must declare.
+    pub conditions: String,
+    /// Additional independent units the declared scope requires.
+    pub required_units: u32,
+    /// Unit identities already in the declared plan - a case id or an owner
+    /// card - excluded before any result exists.
+    pub excluded: Vec<String>,
+}
+
+/// One selected corroboration unit: identity and replay references only. No
+/// solution, patch, conversation or acceptance content is part of the
+/// selection, so a fresh executor reimplements the task without the earlier
+/// answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CorroborationUnit {
+    pub owner: String,
+    pub case_id: String,
+    pub experiment: String,
+    pub mechanism: String,
+    pub conditions: String,
+    /// Frozen root commit identity of the replayed snapshot.
+    pub revision: String,
+    /// Content digest over the frozen tree entries.
+    pub tree_sha256: String,
+}
+
+/// Why a retained task is not part of the corroboration selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExclusionReason {
+    /// The task does not exercise the declared mechanism and conditions; it is
+    /// not evidence about the mechanism in either direction.
+    NotApplicable,
+    /// The unit is already part of the declared plan or is not independent of
+    /// an earlier unit (same task or same frozen snapshot).
+    AlreadyUsed,
+    /// The retained copy no longer verifies as the pristine pre-solution
+    /// snapshot, so the task cannot be replayed with retained inputs.
+    NotReplayable {
+        /// The verification failure; the contaminated state is preserved.
+        detail: String,
+    },
+}
+
+/// One candidate left out of the selection, by identity only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExcludedUnit {
+    pub owner: String,
+    pub case_id: String,
+    pub reason: ExclusionReason,
+}
+
+/// What the selection supports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CorroborationStatus {
+    /// Enough independent applicable replayable units were selected for the
+    /// declared requirement.
+    Ready,
+    /// Fewer units than declared: the broader claim remains unsupported. A
+    /// workload without the mechanism is not evidence against it, and a
+    /// missing retained artifact cannot be replaced by a summary or an
+    /// assumed saving.
+    Inconclusive(String),
+}
+
+/// The deterministic corroboration selection over retained tasks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CorroborationSelection {
+    pub schema: u32,
+    pub required_units: u32,
+    pub status: CorroborationStatus,
+    /// At most `required_units` units, in a fixed order independent of the
+    /// caller's candidate order, so selection never extends the declared plan.
+    pub units: Vec<CorroborationUnit>,
+    pub excluded: Vec<ExcludedUnit>,
+}
+
+impl CorroborationSelection {
+    /// True when the declared corroboration requirement is satisfied.
+    pub fn is_ready(&self) -> bool {
+        matches!(self.status, CorroborationStatus::Ready)
+    }
+}
+
+/// Select corroboration units from retained completed real tasks. Selection is
+/// order-independent: applicable, independent, replayable units are ordered by
+/// task identity and only the declared number is returned. Fewer usable units
+/// than declared produce an explicit inconclusive status, never a rejection or
+/// a fabricated summary.
+pub fn select_corroboration(
+    candidates: &[RetainedTask],
+    requirement: &CorroborationRequirement,
+) -> io::Result<CorroborationSelection> {
+    if requirement.required_units == 0 {
+        return Err(invalid(
+            "corroboration requires at least one independent unit",
+        ));
+    }
+    bounded("mechanism", &requirement.mechanism, 96)?;
+    bounded("conditions", &requirement.conditions, 96)?;
+    let mut excluded = Vec::new();
+    let mut admissible: Vec<&RetainedTask> = Vec::new();
+    for candidate in candidates {
+        candidate.validate()?;
+        let already_planned = requirement
+            .excluded
+            .iter()
+            .any(|identity| identity == &candidate.case_id || identity == &candidate.owner);
+        if candidate.mechanism != requirement.mechanism
+            || candidate.conditions != requirement.conditions
+        {
+            excluded.push(ExcludedUnit {
+                owner: candidate.owner.clone(),
+                case_id: candidate.case_id.clone(),
+                reason: ExclusionReason::NotApplicable,
+            });
+        } else if already_planned {
+            excluded.push(ExcludedUnit {
+                owner: candidate.owner.clone(),
+                case_id: candidate.case_id.clone(),
+                reason: ExclusionReason::AlreadyUsed,
+            });
+        } else if let Err(error) = task_worktree::verify_frozen_pristine(&candidate.replay) {
+            excluded.push(ExcludedUnit {
+                owner: candidate.owner.clone(),
+                case_id: candidate.case_id.clone(),
+                reason: ExclusionReason::NotReplayable {
+                    detail: error.to_string(),
+                },
+            });
+        } else {
+            admissible.push(candidate);
+        }
+    }
+    admissible.sort_by(|left, right| {
+        (
+            left.case_id.as_str(),
+            left.owner.as_str(),
+            left.replay.tree_sha256.as_str(),
+        )
+            .cmp(&(
+                right.case_id.as_str(),
+                right.owner.as_str(),
+                right.replay.tree_sha256.as_str(),
+            ))
+    });
+    let mut units = Vec::new();
+    let mut used_cases = BTreeSet::new();
+    let mut used_trees = BTreeSet::new();
+    for candidate in admissible {
+        if units.len() >= requirement.required_units as usize {
+            break;
+        }
+        if !used_cases.insert(candidate.case_id.clone())
+            || !used_trees.insert(candidate.replay.tree_sha256.clone())
+        {
+            excluded.push(ExcludedUnit {
+                owner: candidate.owner.clone(),
+                case_id: candidate.case_id.clone(),
+                reason: ExclusionReason::AlreadyUsed,
+            });
+            continue;
+        }
+        units.push(CorroborationUnit {
+            owner: candidate.owner.clone(),
+            case_id: candidate.case_id.clone(),
+            experiment: candidate.experiment.clone(),
+            mechanism: candidate.mechanism.clone(),
+            conditions: candidate.conditions.clone(),
+            revision: candidate.replay.revision.clone(),
+            tree_sha256: candidate.replay.tree_sha256.clone(),
+        });
+    }
+    let status = if units.len() >= requirement.required_units as usize {
+        CorroborationStatus::Ready
+    } else {
+        CorroborationStatus::Inconclusive(format!(
+            "fewer applicable independent replayable retained tasks than the declared corroboration requirement (required {}, admissible {}); the broader claim remains unsupported, and a workload that does not exercise the mechanism is not evidence against it",
+            requirement.required_units,
+            units.len()
+        ))
+    };
+    Ok(CorroborationSelection {
+        schema: EXPERIMENT_SCHEMA,
+        required_units: requirement.required_units,
+        status,
+        units,
+        excluded,
+    })
 }
