@@ -41,6 +41,17 @@
 //!   it records why no change, reuse of the smallest sufficient existing
 //!   route, simplification and subtraction cannot satisfy the evidenced need,
 //!   and reuse/no-change/removal conclusions are offered before admission;
+//! - every treatment that selects an experiment declares its selection before
+//!   dependent work - the effect path and claim, the required outcome, the
+//!   smallest sufficient real unit/method with its applicability rationale,
+//!   the controls, the projected use/cost, the admissible baseline basis and
+//!   the stopping/escalation/deferral rules - and the declared unit must
+//!   exercise the declared claim: a fixed command or retained replay never
+//!   stands in for an unexercised agent, a broad strategy claim needs complete
+//!   paired implementations, a repeated-use claim needs the sequence and
+//!   state, and fewer lines, files or exposed names never establish benefit. A
+//!   costly, low-value measurement is deferred with the missing fact and the
+//!   reconsideration condition instead of running or being adopted;
 //! - review reuses the existing owners instead of commissioning audits: usage
 //!   and outcome records stay attributed to their reader, a coverage claim
 //!   names the observed interval, task/environment mix, telemetry gaps and
@@ -89,7 +100,9 @@
 //! # }
 //! ```
 
-use crate::{board_hypothesis, build_identity, rollout_reader};
+use crate::{
+    board_hypothesis, build_identity, improvement_policy::ExperimentSelection, rollout_reader,
+};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use std::{io, path::Path};
 
@@ -576,6 +589,20 @@ pub struct RemovalClaim {
     pub basis: RemovalBasis,
 }
 
+/// The declared deferral of one selected experiment: the sufficient
+/// experiment is not worth its cost, so it is deferred with the missing fact
+/// and the condition under which the measurement is reconsidered. A deferral
+/// never adopts without support and never describes a cheaper probe as the
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SelectionDeferral {
+    /// The decision-changing fact the deferred measurement could not obtain.
+    pub missing_fact: String,
+    /// The condition under which the deferred measurement is reconsidered.
+    pub reconsideration: String,
+}
+
 /// The investigator's route: addition, no change, reuse of an existing route,
 /// simplification or subtraction. No-change and reuse are concluded outcomes;
 /// simplification and subtraction stay behind the separate removal authority.
@@ -638,6 +665,18 @@ pub struct Proposal {
     /// The useful next check when the candidate cannot be grounded yet.
     #[serde(default)]
     pub next_check: Option<String>,
+    /// The declared experiment selection: the effect path and claim, the
+    /// required outcome, the selected experimental unit/method, its
+    /// applicability rationale, the controls, the projected use/cost, the
+    /// admissible baseline basis and the stopping/escalation/deferral rules.
+    /// Required for every treatment that selects an experiment, so the
+    /// smallest sufficient real unit is declared before dependent work.
+    #[serde(default)]
+    pub selection: Option<ExperimentSelection>,
+    /// A declared deferral for a sufficient experiment whose cost is not
+    /// worth its decision value; the candidate is deferred instead of run.
+    #[serde(default)]
+    pub deferral: Option<SelectionDeferral>,
 }
 
 /// The investigator's bounded output for one intake round.
@@ -921,6 +960,12 @@ enum Prepared {
     },
     NoChange(String),
     Reuse(String),
+    /// The declared sufficient experiment is not worth its cost; the missing
+    /// fact and reconsideration condition are carried to the caller.
+    Deferred {
+        reason: String,
+        next: String,
+    },
 }
 
 enum TreatmentBuild {
@@ -942,6 +987,7 @@ fn evaluate(
         }) => admit(bd, project, proposal, &bounded, removal_required),
         Ok(Prepared::NoChange(reason)) => Ok(IntakeOutcome::NoChange { reason }),
         Ok(Prepared::Reuse(existing)) => Ok(IntakeOutcome::ReuseSuffices { existing }),
+        Ok(Prepared::Deferred { reason, next }) => Ok(IntakeOutcome::Deferred { reason, next }),
         Err(failure) => Ok(failure.outcome()),
     }
 }
@@ -1010,6 +1056,58 @@ fn prepare(proposal: &Proposal, index: &EvidenceIndex) -> Result<Prepared, Failu
         }
         None => None,
     };
+
+    // The experiment-selection procedure is declared before dependent work:
+    // the claimed effect path, the required outcome, the smallest sufficient
+    // real unit/method with its applicability rationale, the controls, the
+    // projected use/cost, the admissible baseline basis and the
+    // stopping/escalation/deferral rules. Admission checks that the declared
+    // unit can exercise the declared claim; a fixed command or retained replay
+    // never stands in for an unexercised agent, a broad strategy claim needs
+    // complete paired implementations, a repeated-use claim needs the
+    // sequence and state, and fewer lines or files alone establish nothing.
+    match (full, proposal.selection.as_ref()) {
+        (true, Some(selection)) => {
+            if let Some(problem) = selection.problem() {
+                issues.push(Issue::unsupported(problem));
+            }
+        }
+        (true, None) => issues.push(Issue::unsupported(
+            "an experiment-selection declaration is required before admission: the effect path and claim, the required outcome, the experimental unit/method with its applicability rationale, the controls, the projected use/cost, the admissible baseline basis and the stopping/escalation/deferral rules",
+        )),
+        (false, _) => {}
+    }
+    // A costly, low-value measurement is deferred with the missing fact and
+    // the reconsideration condition: the loop continues other eligible work
+    // instead of running an unjustified experiment, adopting without support
+    // or repeating an identically inconclusive one.
+    let mut deferred: Option<(String, String)> = None;
+    if let Some(declared) = &proposal.deferral {
+        if !full {
+            issues.push(Issue::unsupported(
+                "a deferral belongs to a candidate that selects an experiment; a no-change or reuse conclusion runs none",
+            ));
+        } else {
+            let missing = bounded_line(
+                "deferral missing fact",
+                &declared.missing_fact,
+                MAX_STATEMENT,
+                &mut issues,
+            );
+            let reconsideration = bounded_line(
+                "deferral reconsideration",
+                &declared.reconsideration,
+                MAX_STATEMENT,
+                &mut issues,
+            );
+            if let (Some(missing), Some(reconsideration)) = (missing, reconsideration) {
+                deferred = Some((
+                    format!("the selected experiment is deferred as not worth its cost: {missing}"),
+                    reconsideration,
+                ));
+            }
+        }
+    }
 
     if proposal.evidence.is_empty() {
         issues.push(Issue::unsupported(
@@ -1154,6 +1252,9 @@ fn prepare(proposal: &Proposal, index: &EvidenceIndex) -> Result<Prepared, Failu
         TreatmentBuild::NoChange(reason) => Ok(Prepared::NoChange(reason)),
         TreatmentBuild::Reuse(existing) => Ok(Prepared::Reuse(existing)),
         TreatmentBuild::Hypothesis => {
+            if let Some((reason, next)) = deferred {
+                return Ok(Prepared::Deferred { reason, next });
+            }
             let (Some(mechanism), Some(conditions), Some(observation), Some(basis)) =
                 (mechanism, conditions, observation, basis)
             else {
@@ -1574,6 +1675,20 @@ mod tests {
             repeated_read: None,
             workload: None,
             next_check: None,
+            selection: Some(ExperimentSelection {
+                method: crate::improvement_policy::ExperimentMethod::RealOperation,
+                claim: crate::improvement_policy::EffectPath::LocalOperation,
+                outcome: "the declared outcome measured through the real operation".to_owned(),
+                rationale: "the unit exercises the claimed mechanism under the declared conditions"
+                    .to_owned(),
+                controls: "frozen inputs and the accepted baseline conditions".to_owned(),
+                projection: "one bounded local cycle with the retention cost staying bounded".to_owned(),
+                baseline: "the accepted revision, excluding the candidate edit".to_owned(),
+                stopping:
+                    "stop after the declared attempts and escalate only for a named missing observation"
+                        .to_owned(),
+            }),
+            deferral: None,
         }
     }
 

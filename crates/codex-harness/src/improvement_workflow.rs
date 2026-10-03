@@ -17,7 +17,11 @@
 //! 3. the candidate's own OpenSpec change is qualified inside its owned
 //!    worktree; a missing change is scaffolded through the installed CLI and
 //!    authored by a bounded planning conversation, and implementation is
-//!    dispatched only after the change qualifies;
+//!    dispatched only after the change qualifies and, when the run's
+//!    predeclared comparison policy binds an experiment selection, states
+//!    that selection under its exact heading with the predeclared method and
+//!    claim; a missing or substituted section keeps dependent work
+//!    undispatched and the planning conversation authors it;
 //! 4. the returned implementation checkout is validated against the exact
 //!    committed base, the declared writable scope and the frozen planning
 //!    artifacts, transferred onto the candidate branch and retained as
@@ -37,11 +41,15 @@ use harness_core::improvement_loop::{
     CandidateState, IntakeState, OutcomeRecord, candidate_change_dir, candidate_change_name,
     changed_paths_within_scope, frozen_candidate_removal_digest,
 };
+use harness_core::improvement_policy::{
+    ComparisonPolicy, EffectPath, ExperimentMethod, ExperimentSelection, parse_experiment_selection,
+};
 use harness_core::improvement_spec::{
     MeasurementReceipt, MeasurementScope, OpenSpec, PlanningReceipt, REMOVAL_PROPOSAL_CLAUSES,
     REMOVAL_PROPOSAL_GUIDE, REMOVAL_PROPOSAL_HEADING, RemovalProposalReceipt, Specification,
 };
 use harness_core::task_worktree::{self, CandidateCheckout, ReuseBlock, WorktreeReuse};
+use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 
@@ -74,6 +82,28 @@ const MAX_ASSIGNMENT_INPUTS: usize = 32;
 /// the natural location plus the replacements for preserved ineligible or
 /// foreign checkouts that are never touched.
 const CANDIDATE_ALLOCATION_ATTEMPTS: u32 = 16;
+/// The exact Markdown heading under which a hypothesis's own OpenSpec change
+/// states the run's predeclared experiment selection, resolved by the
+/// controller before any implementation or directed baseline measurement.
+const EXPERIMENT_SELECTION_HEADING: &str = "## Experiment selection";
+/// The clause labels a selection section states exactly once, each non-empty
+/// and on one line.
+const EXPERIMENT_SELECTION_CLAUSES: [&str; 8] = [
+    "Method:",
+    "Claim:",
+    "Outcome:",
+    "Rationale:",
+    "Controls:",
+    "Projection:",
+    "Baseline:",
+    "Stopping:",
+];
+/// Bound on one selection clause value the controller resolves.
+const MAX_SELECTION_CLAUSE_BYTES: usize = 512;
+/// Bound on one planning artifact the selection resolver reads.
+const MAX_SELECTION_ARTIFACT_BYTES: u64 = 1024 * 1024;
+/// Bound on the predeclared comparison policy file the selection gate reads.
+const MAX_POLICY_FILE_BYTES: u64 = 256 * 1024;
 
 /// Advances the run as far as the recorded state and the dispatch gates
 /// allow. Returns human-readable progress notes; a blocked or idle condition
@@ -369,6 +399,279 @@ fn declared_measurement_scope(run: &Run) -> io::Result<Option<MeasurementScope>>
         }
     }
     Ok(Some(scope))
+}
+
+/// One experiment-selection section resolved from an already qualified
+/// change. Resolving it applies nothing, and the frozen artifact digests must
+/// still match the receipt, so a selection is never read from a drifted
+/// change.
+struct ResolvedExperimentSelection {
+    artifact: PathBuf,
+    section_digest: String,
+    selection: ExperimentSelection,
+}
+
+/// The experiment selection the run's predeclared comparison policy binds.
+/// `Ok(None)` means no readable policy declares one; a missing, unreadable or
+/// invalid policy file stays with the comparison owner, which reports it at
+/// its own gate, so this early resolver never duplicates that verdict. A
+/// readable policy whose selection clause is unusable is an error: dependent
+/// work stops with the exact cause instead of continuing without its declared
+/// plan.
+fn predeclared_experiment_selection(run: &Run) -> io::Result<Option<ExperimentSelection>> {
+    let Some(comparison) = &run.spec.comparison else {
+        return Ok(None);
+    };
+    let bytes = match fs::read(&comparison.policy) {
+        Ok(bytes) if bytes.len() as u64 <= MAX_POLICY_FILE_BYTES => bytes,
+        _ => return Ok(None),
+    };
+    let policy: ComparisonPolicy = match serde_json::from_slice(&bytes) {
+        Ok(policy) => policy,
+        Err(_) => return Ok(None),
+    };
+    if policy.declare().is_err() {
+        return Ok(None);
+    }
+    match parse_experiment_selection(&policy.uncertainty) {
+        Ok(selection) => Ok(selection),
+        Err(error) => Err(invalid(format!(
+            "the predeclared experiment selection is unusable: {error}"
+        ))),
+    }
+}
+
+/// Resolves the experiment-selection section a qualified change must state:
+/// every clause present exactly once, non-empty and on one line, with the
+/// declared method and claim path naming a bounded experiment unit.
+fn resolve_experiment_selection(
+    receipt: &PlanningReceipt,
+) -> io::Result<ResolvedExperimentSelection> {
+    let mut stated: Option<(PathBuf, String)> = None;
+    for (path, digest) in &receipt.artifacts {
+        if !path.starts_with(&receipt.change_root) || path == &receipt.change_root {
+            return Err(invalid("a planning artifact escapes the selected change"));
+        }
+        let relative = path
+            .strip_prefix(&receipt.change_root)
+            .map_err(|_| invalid("a planning artifact escapes the selected change"))?;
+        let bytes = fs::read(path).map_err(|error| {
+            invalid(format!(
+                "the planning artifact {} is unreadable: {error}",
+                relative.display()
+            ))
+        })?;
+        if bytes.len() as u64 > MAX_SELECTION_ARTIFACT_BYTES {
+            return Err(invalid(format!(
+                "the planning artifact {} exceeds the bounded planning contract",
+                relative.display()
+            )));
+        }
+        if build_identity::hash_bytes(&bytes) != *digest {
+            return Err(invalid(format!(
+                "the planning artifact {} changed after qualification; re-qualify the change before resolving its experiment selection",
+                relative.display()
+            )));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| {
+            invalid(format!(
+                "the planning artifact {} is not UTF-8 text",
+                relative.display()
+            ))
+        })?;
+        if let Some(section) = extract_experiment_selection_section(&text) {
+            if let Some((first, _)) = &stated {
+                let first = first.strip_prefix(&receipt.change_root).unwrap_or(first);
+                return Err(invalid(format!(
+                    "the experiment selection is stated in more than one resolved artifact ({} and {}); state it exactly once under '{EXPERIMENT_SELECTION_HEADING}'",
+                    first.display(),
+                    relative.display()
+                )));
+            }
+            stated = Some((path.clone(), section));
+        }
+    }
+    let Some((artifact, section)) = stated else {
+        return Err(invalid(format!(
+            "the change states no experiment selection: missing the section '{EXPERIMENT_SELECTION_HEADING}' in its resolved artifacts"
+        )));
+    };
+    let clauses = experiment_selection_clauses(&section)?;
+    let clause = |label: &str| clauses.get(label).cloned().unwrap_or_default();
+    let method = ExperimentMethod::parse(clause("Method:").trim()).ok_or_else(|| {
+        invalid(
+            "the experiment selection Method clause is not bounded-replay, real-operation, agent-task, paired-implementations or sequence",
+        )
+    })?;
+    let claim = EffectPath::parse(clause("Claim:").trim()).ok_or_else(|| {
+        invalid(
+            "the experiment selection Claim clause is not local-operation, agent-choice, task-strategy, repeated-use or size-only",
+        )
+    })?;
+    let selection = ExperimentSelection {
+        method,
+        claim,
+        outcome: clause("Outcome:"),
+        rationale: clause("Rationale:"),
+        controls: clause("Controls:"),
+        projection: clause("Projection:"),
+        baseline: clause("Baseline:"),
+        stopping: clause("Stopping:"),
+    };
+    if let Some(problem) = selection.problem() {
+        return Err(invalid(format!(
+            "the experiment selection section is unusable: {problem}"
+        )));
+    }
+    Ok(ResolvedExperimentSelection {
+        artifact,
+        section_digest: build_identity::hash_bytes(section.as_bytes()),
+        selection,
+    })
+}
+
+/// Extracts the selection section body: the lines after the exact heading
+/// until the next heading of the same or higher level. A heading deeper than
+/// the section heading stays inside it.
+fn extract_experiment_selection_section(text: &str) -> Option<String> {
+    let level = EXPERIMENT_SELECTION_HEADING
+        .bytes()
+        .take_while(|byte| *byte == b'#')
+        .count();
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim() != EXPERIMENT_SELECTION_HEADING);
+    lines.next()?;
+    let body: Vec<&str> = lines
+        .take_while(|line| {
+            let line = line.trim();
+            let next_level = line.bytes().take_while(|byte| *byte == b'#').count();
+            next_level == 0 || next_level > level || !line[next_level..].starts_with(' ')
+        })
+        .collect();
+    Some(body.join("\n"))
+}
+
+/// Parses the clause values of one experiment-selection section. Every clause
+/// must be stated exactly once, non-empty, on one line and within the bounded
+/// clause size; a clause line may carry a Markdown bullet.
+fn experiment_selection_clauses(section: &str) -> io::Result<BTreeMap<&'static str, String>> {
+    let mut clauses: BTreeMap<&'static str, String> = BTreeMap::new();
+    for line in section.lines() {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line)
+            .trim_start();
+        for label in EXPERIMENT_SELECTION_CLAUSES {
+            let Some(value) = line.strip_prefix(label) else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(invalid(format!(
+                    "the experiment selection clause {label} is empty"
+                )));
+            }
+            if value.len() > MAX_SELECTION_CLAUSE_BYTES {
+                return Err(invalid(format!(
+                    "the experiment selection clause {label} exceeds {MAX_SELECTION_CLAUSE_BYTES} bytes"
+                )));
+            }
+            if clauses.insert(label, value.to_owned()).is_some() {
+                return Err(invalid(format!(
+                    "the experiment selection clause {label} is stated more than once"
+                )));
+            }
+            break;
+        }
+    }
+    for label in EXPERIMENT_SELECTION_CLAUSES {
+        if !clauses.contains_key(label) {
+            return Err(invalid(format!(
+                "the experiment selection section is incomplete: missing the clause {label}"
+            )));
+        }
+    }
+    Ok(clauses)
+}
+
+/// The controller's verdict about the run's predeclared experiment selection.
+enum SelectionFreeze {
+    /// The run predeclares no selection; the gate does not apply.
+    NotPredeclared,
+    /// The qualified change states the predeclared selection.
+    Frozen(ResolvedExperimentSelection),
+    /// The change does not (yet) state it; the detail names the exact gap.
+    Pending(String),
+}
+
+/// Verifies that the qualified change states the run's predeclared experiment
+/// selection before implementation or measurement depends on it: the declared
+/// method and claim path must match the predeclared binding exactly, and
+/// every clause must be stated once. A missing, mismatched or unreadable
+/// section stays pending with the exact detail; nothing is applied.
+fn selection_freeze(run: &Run, receipt: &PlanningReceipt) -> io::Result<SelectionFreeze> {
+    let predeclared = match predeclared_experiment_selection(run)? {
+        Some(selection) => selection,
+        None => return Ok(SelectionFreeze::NotPredeclared),
+    };
+    match resolve_experiment_selection(receipt) {
+        Ok(resolved) => {
+            if resolved.selection.method != predeclared.method
+                || resolved.selection.claim != predeclared.claim
+            {
+                return Ok(SelectionFreeze::Pending(format!(
+                    "the change states method={} claim={} but the run predeclares method={} claim={}; align the section with the predeclared selection before implementation",
+                    resolved.selection.method.as_str(),
+                    resolved.selection.claim.as_str(),
+                    predeclared.method.as_str(),
+                    predeclared.claim.as_str()
+                )));
+            }
+            Ok(SelectionFreeze::Frozen(resolved))
+        }
+        Err(error) => Ok(SelectionFreeze::Pending(error.to_string())),
+    }
+}
+
+/// The planning gate around the predeclared selection. `Ok(Ok(()))` means the
+/// qualified change states it (or none is predeclared) and the planning
+/// receipt may be retained; `Ok(Err(detail))` means dependent implementation
+/// must wait for the selection section; an error means the run's own
+/// predeclared clause is unusable and dependent work stops.
+#[allow(clippy::type_complexity)]
+fn ensure_experiment_selection(
+    run: &Run,
+    receipt: &PlanningReceipt,
+    notes: &mut Vec<String>,
+) -> io::Result<Result<(), String>> {
+    let freeze = selection_freeze(run, receipt).map_err(|error| {
+        invalid(format!(
+            "the run's predeclared experiment selection is unusable: {error}; dependent work stops until the comparison policy is corrected"
+        ))
+    })?;
+    match freeze {
+        SelectionFreeze::NotPredeclared => Ok(Ok(())),
+        SelectionFreeze::Frozen(resolved) => {
+            notes.push(format!(
+                "experiment selection: change {} states the predeclared selection method={} claim={} ({}#{}, digest {})",
+                receipt.specification.change,
+                resolved.selection.method.as_str(),
+                resolved.selection.claim.as_str(),
+                resolved
+                    .artifact
+                    .strip_prefix(&receipt.change_root)
+                    .unwrap_or(&resolved.artifact)
+                    .display(),
+                EXPERIMENT_SELECTION_HEADING,
+                &resolved.section_digest[..16.min(resolved.section_digest.len())]
+            ));
+            Ok(Ok(()))
+        }
+        SelectionFreeze::Pending(detail) => Ok(Err(detail)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2034,7 +2337,21 @@ fn ensure_planning(
     match openspec.qualify(&target, &run.spec.experiment) {
         Ok(receipt) => match prepare_removal_proposal(run, candidate, &receipt) {
             Ok(prepared) => {
-                return store_candidate_receipt(run, candidate, &receipt, prepared.as_ref(), notes);
+                match ensure_experiment_selection(run, &receipt, notes)? {
+                    Ok(()) => {
+                        return store_candidate_receipt(
+                            run,
+                            candidate,
+                            &receipt,
+                            prepared.as_ref(),
+                            notes,
+                        );
+                    }
+                    Err(detail) => notes.push(format!(
+                        "experiment selection: the complete change {} does not yet state the predeclared experiment selection ({detail}); the planning conversation authors it under '{EXPERIMENT_SELECTION_HEADING}' before any implementation or directed baseline measurement",
+                        receipt.specification.change
+                    )),
+                }
             }
             Err(error) => {
                 notes.push(format!(
@@ -2369,9 +2686,19 @@ fn consume_planner_result(
     let openspec = OpenSpec::default();
     match openspec.qualify(&target, &run.spec.experiment) {
         Ok(receipt) => match prepare_removal_proposal(run, candidate, &receipt) {
-            Ok(prepared) => {
-                store_candidate_receipt(run, candidate, &receipt, prepared.as_ref(), notes)
-            }
+            Ok(prepared) => match ensure_experiment_selection(run, &receipt, notes)? {
+                Ok(()) => {
+                    store_candidate_receipt(run, candidate, &receipt, prepared.as_ref(), notes)
+                }
+                Err(detail) => refused(
+                    run,
+                    notes,
+                    format!(
+                        "the planning conversation finished but the candidate change {} does not state the predeclared experiment selection ({detail}); implementation stays undispatched until the section '{EXPERIMENT_SELECTION_HEADING}' states the declared method and claim",
+                        candidate.change
+                    ),
+                ),
+            },
             Err(error) => {
                 let reason = format!(
                     "the planning conversation finished but the candidate change {} does not state a recordable reviewable removal proposal: {error}; implementation stays undispatched until it is complete and no removal is applied",
@@ -2413,7 +2740,25 @@ fn dispatch_planner(
             None
         }
     };
-    let assignment = planner_assignment(run, candidate, inputs, declared.as_ref());
+    // A predeclared experiment selection the planner cannot read stays
+    // omitted from the brief for the same reason: the selection gate keeps
+    // dependent work undispatched with the exact cause instead.
+    let predeclared = match predeclared_experiment_selection(run) {
+        Ok(selection) => selection,
+        Err(error) => {
+            notes.push(format!(
+                "experiment selection: the predeclared selection is unusable ({error}); the planning brief omits it and dependent work stops until the comparison policy is corrected"
+            ));
+            None
+        }
+    };
+    let assignment = planner_assignment(
+        run,
+        candidate,
+        inputs,
+        declared.as_ref(),
+        predeclared.as_ref(),
+    );
     let attempt_id = next_attempt_id(&run.cursor, AttemptRole::Planner);
     candidate.planner_attempt = Some(attempt_id.clone());
     dispatch_bound_assignment(
@@ -2433,6 +2778,7 @@ fn planner_assignment(
     candidate: &CandidateState,
     inputs: Vec<String>,
     declared: Option<&MeasurementScope>,
+    selection: Option<&ExperimentSelection>,
 ) -> serde_json::Value {
     let acceptance_artifact = run.spec.experiment.acceptance_artifact.clone();
     let acceptance_heading = run.spec.experiment.acceptance_heading.clone();
@@ -2530,6 +2876,46 @@ fn planner_assignment(
             "the change states the declared measurement scope section '{}' in {}; the controller re-resolves it through the installed OpenSpec CLI before any directed baseline measurement",
             scope.declaration_heading,
             scope.declaration_artifact.display()
+        ));
+    }
+    if let Some(selection) = selection {
+        invariants.push(format!(
+            "the change states the run's predeclared experiment selection under the exact heading '{EXPERIMENT_SELECTION_HEADING}' in one of its resolved artifacts, with each required clause stated exactly once, non-empty and on one line: {}",
+            EXPERIMENT_SELECTION_CLAUSES.join(" ")
+        ));
+        invariants.push(format!(
+            "the predeclared selection is method={} claim={}; the section's Method and Claim clauses must state exactly those bounded tokens, and the section must declare the outcome, rationale, controls, projection, baseline and stopping/escalation/deferral values below",
+            selection.method.as_str(),
+            selection.claim.as_str()
+        ));
+        bounded_items(
+            "declared required outcome: ",
+            &selection.outcome,
+            &mut invariants,
+        );
+        bounded_items(
+            "declared applicability rationale: ",
+            &selection.rationale,
+            &mut invariants,
+        );
+        bounded_items("declared controls: ", &selection.controls, &mut invariants);
+        bounded_items(
+            "declared projected use and cost: ",
+            &selection.projection,
+            &mut invariants,
+        );
+        bounded_items(
+            "declared admissible baseline basis: ",
+            &selection.baseline,
+            &mut invariants,
+        );
+        bounded_items(
+            "declared stopping, escalation and deferral rules: ",
+            &selection.stopping,
+            &mut invariants,
+        );
+        acceptance.push(format!(
+            "the change states the predeclared experiment selection; the controller resolves it before any implementation or directed baseline measurement, and a missing, changed or mismatched section blocks dependent work"
         ));
     }
     if candidate.removal_required {
@@ -2878,6 +3264,7 @@ fn investigator_assignment(run: &Run, evidence: &Evidence) -> serde_json::Value 
     let mut invariants = vec![
         "the final message is exactly one JSON object: {\"schema\":1,\"candidates\":[<candidate>],\"idle_reason\":\"why no candidate is grounded or null\"}; at most 3 candidates".to_owned(),
         "each candidate carries mechanism (<=96-char token), conditions (<=96-char token applicability), observation (retained locator), predicted (<=256 chars), counterexample (<=256 chars), acceptance (<=256 chars), spec (its own OpenSpec change reference), basis (retained locator), evidence (at least one observed retained locator), treatment and optional next_check".to_owned(),
+        "a candidate that selects an experiment (addition, simplification or subtraction) also declares its \"selection\": the claim path (local-operation, agent-choice, task-strategy or repeated-use), the required outcome, the method (bounded-replay, real-operation, agent-task, paired-implementations or sequence), the applicability rationale, controls, projected use/cost, admissible baseline basis and the stopping/escalation/deferral rules".to_owned(),
         "grounded intake refuses an ungrounded or prediction-only citation; a predicted statement is never retained evidence".to_owned(),
         "treatment is one of \"addition\", \"no-change\", \"reuse\", \"simplification\" or \"subtraction\"; consider no change, reuse of the smallest sufficient existing route, simplification and subtraction before additional machinery, and an addition is refused without a bounded \"alternatives\" statement saying why each smaller route does not satisfy the evidenced need".to_owned(),
         "a no-change candidate carries its bounded reason; a reuse candidate names the retained locator of the existing attributable route and concludes reuse-suffices without a new card or implementation".to_owned(),
@@ -2892,6 +3279,11 @@ fn investigator_assignment(run: &Run, evidence: &Evidence) -> serde_json::Value 
         ),
         "this conversation edits no file and dispatches no other model work".to_owned(),
     ];
+    bounded_items(
+        "selection rules: ",
+        "the declared method must exercise the declared claim path - a fixed command or retained replay never stands in for an unexercised agent; a broad strategy claim needs complete paired implementations; a repeated-use claim needs the sequence and state; fewer lines, files, skills or exposed names never establish benefit. When the sufficient experiment is not worth its cost, declare the deferral object {missingFact, reconsideration} instead of running or adopting it.",
+        &mut invariants,
+    );
     // Retained evidence locators are not checkout-relative paths, so the
     // structured inputs field cannot carry them. Each listed locator stays a
     // separately bounded invariant item: the whole inspection input remains
@@ -3488,7 +3880,7 @@ mod assignment_tests {
         // Planner: the complete planning reference stays visible.
         let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
         let brief = native_brief(
-            &planner_assignment(&run, &candidate, inputs.clone(), None),
+            &planner_assignment(&run, &candidate, inputs.clone(), None, None),
             &checkout,
             "planner",
         );
@@ -3539,7 +3931,7 @@ mod assignment_tests {
             .expect("the declared scope reads");
         let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
         let brief = native_brief(
-            &planner_assignment(&run, &candidate, inputs, Some(&declared)),
+            &planner_assignment(&run, &candidate, inputs, Some(&declared), None),
             &run.spec.project,
             "planner-measurement",
         );
@@ -3577,7 +3969,7 @@ mod assignment_tests {
         let (run, mut candidate, _evidence) = fixture(temp.path());
         let inputs = vec![format!("{}/proposal.md", candidate_change_dir(LONG_CHANGE))];
         let ordinary = native_brief(
-            &planner_assignment(&run, &candidate, inputs.clone(), None),
+            &planner_assignment(&run, &candidate, inputs.clone(), None, None),
             &run.spec.project,
             "planner-ordinary",
         );
@@ -3587,7 +3979,7 @@ mod assignment_tests {
         );
         candidate.removal_required = true;
         let brief = native_brief(
-            &planner_assignment(&run, &candidate, inputs, None),
+            &planner_assignment(&run, &candidate, inputs, None, None),
             &run.spec.project,
             "planner-removal",
         );

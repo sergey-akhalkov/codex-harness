@@ -9,6 +9,9 @@
 
 use harness_core::build_identity::hash_bytes;
 use harness_core::improvement_loop::{AttemptRole, dispatch_owner};
+use harness_core::improvement_policy::{
+    EffectPath, ExperimentMethod, ExperimentSelection, experiment_selection_clause,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -638,6 +641,23 @@ fn seed_investigator_report(fixture: &Fixture, report: &Value) -> PathBuf {
     seed_investigator_message(fixture, &serde_json::to_vec_pretty(report).unwrap())
 }
 
+/// One valid experiment-selection declaration for the report fixtures: a
+/// local build/output treatment measured through a short real operation. The
+/// report contract requires it for every treatment that selects an
+/// experiment.
+fn selection_json() -> Value {
+    json!({
+        "method": "real-operation",
+        "claim": "local-operation",
+        "outcome": "the declared outcome measured through the real operation",
+        "rationale": "the chosen unit exercises the claimed mechanism",
+        "controls": "frozen inputs and the accepted baseline conditions",
+        "projection": "one bounded local cycle with the retention cost staying bounded",
+        "baseline": "the accepted revision, excluding the candidate edit",
+        "stopping": "stop after the declared attempts and escalate only for a named missing observation",
+    })
+}
+
 /// One anchored report: the proposal matches the fixture's admitted card, so
 /// grounded intake reuses that card as this run's candidate.
 fn anchored_report(observation: &str) -> Value {
@@ -656,6 +676,7 @@ fn anchored_report(observation: &str) -> Value {
             "treatment": "addition",
             "evidence": [{"locator": observation, "kind": "observed"}],
             "next_check": null,
+            "selection": selection_json(),
         }],
         "idle_reason": null,
     })
@@ -859,6 +880,7 @@ fn an_addition_without_the_smaller_route_consideration_is_refused() {
             "basis": locator,
             "treatment": "addition",
             "evidence": [{"locator": locator, "kind": "observed"}],
+            "selection": selection_json(),
             "next_check": null,
         }],
         "idle_reason": null,
@@ -1194,6 +1216,7 @@ fn ordinary_multi_file_briefs_pass_the_native_assignment_contract() {
             "basis": locator,
             "treatment": "addition",
             "evidence": [{"locator": locator, "kind": "observed"}],
+            "selection": selection_json(),
             "next_check": null,
         }],
         "idle_reason": null,
@@ -2022,6 +2045,7 @@ fn incomplete_planner_artifacts_block_implementation() {
             "basis": locator,
             "treatment": "addition",
             "evidence": [{"locator": locator, "kind": "observed"}],
+            "selection": selection_json(),
             "next_check": null,
         }],
         "idle_reason": null,
@@ -2475,6 +2499,7 @@ fn missing_change_report(locator: &str) -> Value {
             "basis": locator,
             "treatment": "addition",
             "evidence": [{"locator": locator, "kind": "observed"}],
+            "selection": selection_json(),
             "next_check": null,
         }],
         "idle_reason": null,
@@ -3735,6 +3760,7 @@ fn simplification_report(locator: &str) -> Value {
                 },
             },
             "evidence": [{"locator": locator, "kind": "observed"}],
+            "selection": selection_json(),
             "next_check": null,
         }],
         "idle_reason": null,
@@ -3848,6 +3874,201 @@ fn commit_measurement_section(worktree: &Path, change: &str, section: &str) {
 }
 
 const MEASUREMENT_SECTION: &str = "## Measurement\n\nObserved problem: identical repeated reads waste accepted-task time. Investigation scope: reads at one frozen source revision. Measurement question: how much accepted-task time do they cost? Workload: the existing cargo build operation linked from this change. Evidence: the retained outcome record. Limits: one local machine and one frozen source revision.\n";
+
+/// One predeclared experiment selection for the gate fixtures: a local
+/// build/output treatment measured through the short real operation.
+fn gate_selection(method: &str, claim: &str) -> ExperimentSelection {
+    ExperimentSelection {
+        method: ExperimentMethod::parse(method).expect("a known method"),
+        claim: EffectPath::parse(claim).expect("a known claim path"),
+        outcome: "the declared outcome measured through the real unit".to_owned(),
+        rationale: "the chosen unit exercises the claimed mechanism".to_owned(),
+        controls: "frozen inputs and the accepted baseline conditions".to_owned(),
+        projection: "one bounded experiment with the retention cost staying bounded".to_owned(),
+        baseline: "the accepted revision excluding the candidate edit".to_owned(),
+        stopping:
+            "stop after the declared attempts and escalate only for a named missing observation"
+                .to_owned(),
+    }
+}
+
+/// Writes the predeclared comparison policy beside the frozen run spec, with
+/// the selection clause the controller resolves before dependent work.
+fn write_selection_policy(fixture: &Fixture, method: &str, claim: &str) {
+    fs::create_dir_all(&fixture.run).unwrap();
+    fs::write(
+        fixture.run.join("comparison-policy.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "objective": "time",
+            "basis": "efficiency",
+            "meaningfulEffectPercent": 10.0,
+            "tolerancePercent": 5.0,
+            "requireAcceptance": true,
+            "taskMix": "one frozen workload case",
+            "stopping": {"maxAttemptsPerArm": 1, "requiredUnits": 1},
+            "repeatedSelection": "predeclared",
+            "tradeOff": null,
+            "uncertainty": format!(
+                "unknown evidence stays inconclusive; {}",
+                experiment_selection_clause(&gate_selection(method, claim))
+            ),
+            "horizonTasks": 1.0,
+            "overhead": {
+                "implementationSeconds": 0.0,
+                "evaluationSeconds": 0.0,
+                "maintenanceSecondsPerTask": 0.0,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// Rewrites the candidate's own change so its proposal states the experiment
+/// selection section, committed on the candidate branch.
+fn commit_selection_section(worktree: &Path, change: &str, method: &str, claim: &str) {
+    fs::write(
+        worktree.join(format!("openspec/changes/{change}/proposal.md")),
+        format!(
+            "## Why\n\nSynthetic.\n\n## Experiment selection\n\n- Method: {method}\n- Claim: {claim}\n- Outcome: the declared outcome measured through the real unit\n- Rationale: the chosen unit exercises the claimed mechanism\n- Controls: frozen inputs and the accepted baseline conditions\n- Projection: one bounded experiment with the retention cost staying bounded\n- Baseline: the accepted revision excluding the candidate edit\n- Stopping: stop after the declared attempts and escalate only for a named missing observation\n"
+        ),
+    )
+    .unwrap();
+    commit_all(worktree, "state the predeclared experiment selection");
+}
+
+#[test]
+fn a_predeclared_experiment_selection_is_frozen_before_implementation() {
+    let fixture = Fixture::new("selection-gate");
+    let (root, locator) = write_evidence_root(&fixture);
+    write_selection_policy(&fixture, "real-operation", "local-operation");
+    fixture.write_spec(&[
+        ("evidence_root", json!(root)),
+        (
+            "local_runner",
+            json!({
+                "endpoint": "http://127.0.0.1:45999/v1",
+                "model": "fixture-glyph-1",
+            }),
+        ),
+        (
+            "qualification",
+            json!(fixture.root.join("qualification.json")),
+        ),
+        ("comparison", comparison_declaration(&fixture)),
+    ]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let worktree = fixture.candidate_worktree(&fixture.card);
+    assert!(worktree.is_dir(), "candidate worktree exists");
+
+    // The change qualifies but does not state the predeclared selection: no
+    // planning receipt is retained, no implementation is dispatched, and the
+    // exact missing section is reported.
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let output = text(&resume);
+    assert!(
+        output.contains("does not yet state the predeclared experiment selection"),
+        "{output}"
+    );
+    assert!(
+        output.contains("## Experiment selection"),
+        "the planning brief requires the exact heading: {output}"
+    );
+    assert!(
+        !fixture.run.join("candidate-planning.json").exists(),
+        "the planning receipt was retained without the selection"
+    );
+    let status = fixture.status_json();
+    assert_ne!(status["phase"], "candidate-ready", "{status}");
+    assert!(
+        status["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["role"] != "implementer"),
+        "no implementation is dispatched before the selection is frozen: {status}"
+    );
+
+    // The authored change states the predeclared selection: planning
+    // completes with the frozen section identified.
+    commit_selection_section(
+        &worktree,
+        &fixture.change,
+        "real-operation",
+        "local-operation",
+    );
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let output = text(&resume);
+    assert!(
+        output.contains(
+            "states the predeclared selection method=real-operation claim=local-operation"
+        ),
+        "{output}"
+    );
+    assert!(
+        fixture.run.join("candidate-planning.json").is_file(),
+        "the planning receipt is retained once the selection is stated"
+    );
+}
+
+#[test]
+fn a_change_cannot_substitute_another_predeclared_selection() {
+    let fixture = Fixture::new("selection-mismatch");
+    let (root, locator) = write_evidence_root(&fixture);
+    write_selection_policy(&fixture, "real-operation", "local-operation");
+    fixture.write_spec(&[
+        ("evidence_root", json!(root)),
+        (
+            "local_runner",
+            json!({
+                "endpoint": "http://127.0.0.1:45999/v1",
+                "model": "fixture-glyph-1",
+            }),
+        ),
+        (
+            "qualification",
+            json!(fixture.root.join("qualification.json")),
+        ),
+        ("comparison", comparison_declaration(&fixture)),
+    ]);
+    let start = fixture.start();
+    assert!(start.status.success(), "{}", text(&start));
+    seed_investigator_report(&fixture, &anchored_report(&locator));
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let worktree = fixture.candidate_worktree(&fixture.card);
+
+    // A different but individually sufficient method does not substitute for
+    // the predeclared binding: the plan was fixed before results.
+    commit_selection_section(&worktree, &fixture.change, "agent-task", "local-operation");
+    let resume = fixture.resume();
+    assert!(resume.status.success(), "{}", text(&resume));
+    let output = text(&resume);
+    assert!(
+        output.contains("but the run predeclares method=real-operation claim=local-operation"),
+        "{output}"
+    );
+    assert!(
+        !fixture.run.join("candidate-planning.json").exists(),
+        "a substituted selection never authorizes implementation"
+    );
+    let status = fixture.status_json();
+    assert!(
+        status["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt["role"] != "implementer"),
+        "{status}"
+    );
+}
 
 #[test]
 fn a_declared_measurement_scope_gates_the_baseline_direction_and_rebinds_on_resume() {

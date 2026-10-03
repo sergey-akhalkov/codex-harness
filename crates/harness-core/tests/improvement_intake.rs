@@ -13,8 +13,9 @@ use harness_core::board_hypothesis::{
 use harness_core::improvement_intake::{
     ClaimKind, EvidenceIndex, EvidenceItem, EvidenceOwner, EvidenceRef, IntakeOutcome,
     InvestigatorReport, Proposal, ReadIdentity, RemovalBasis, RemovalClaim, RepeatedReadClaim,
-    RetainedRead, Treatment, WorkloadLink, WorkloadRef, intake,
+    RetainedRead, SelectionDeferral, Treatment, WorkloadLink, WorkloadRef, intake,
 };
+use harness_core::improvement_policy::{EffectPath, ExperimentMethod, ExperimentSelection};
 use serde_json::json;
 use std::{
     fs,
@@ -172,6 +173,27 @@ fn base_proposal(basis: &str) -> Proposal {
         repeated_read: None,
         workload: None,
         next_check: None,
+        selection: Some(selection(ExperimentMethod::RealOperation, EffectPath::LocalOperation)),
+        deferral: None,
+    }
+}
+
+/// One complete, valid experiment-selection declaration for the declared
+/// method and claim path. Individual counterexamples replace only the field
+/// under test.
+fn selection(method: ExperimentMethod, claim: EffectPath) -> ExperimentSelection {
+    ExperimentSelection {
+        method,
+        claim,
+        outcome: "the declared outcome measured through the real operation".to_owned(),
+        rationale: "the unit exercises the claimed mechanism under the declared conditions"
+            .to_owned(),
+        controls: "frozen inputs and the accepted baseline conditions".to_owned(),
+        projection: "one bounded local cycle with the retention cost staying bounded".to_owned(),
+        baseline: "the accepted revision, excluding the candidate edit".to_owned(),
+        stopping:
+            "stop after the declared attempts and escalate only for a named missing observation"
+                .to_owned(),
     }
 }
 
@@ -1018,4 +1040,240 @@ fn skill_usage_review_reuses_owners_and_gates_removal() {
         "the review is a pending candidate, not an applied removal"
     );
     assert!(report_path.is_file(), "nothing was deleted by intake");
+}
+
+/// The declared effect path fixes the smallest sufficient unit, and a
+/// directly selected stronger or equal method is admitted without any
+/// mandatory sequence of cheaper trials.
+#[test]
+fn experiment_selection_selects_the_smallest_sufficient_real_unit() {
+    let bd = bd_executable();
+    let temp = tempfile::tempdir().unwrap();
+    let rollout = write_rollout(temp.path(), "seed.jsonl", false);
+    let index = EvidenceIndex::new(vec![
+        EvidenceItem::read_rollout("rollout:cycle-1#seed", &rollout).unwrap(),
+    ])
+    .unwrap();
+
+    for (name, method, claim) in [
+        (
+            "local-operation",
+            ExperimentMethod::RealOperation,
+            EffectPath::LocalOperation,
+        ),
+        (
+            "agent-choice",
+            ExperimentMethod::AgentTask,
+            EffectPath::AgentChoice,
+        ),
+        (
+            "task-strategy",
+            ExperimentMethod::PairedImplementations,
+            EffectPath::TaskStrategy,
+        ),
+        (
+            "repeated-use",
+            ExperimentMethod::Sequence,
+            EffectPath::RepeatedUse,
+        ),
+    ] {
+        let project = board_project(&temp.path().join(name));
+        let mut candidate = base_proposal("rollout:cycle-1#seed");
+        candidate.selection = Some(selection(method, claim));
+        let outcomes = intake(&bd, &project, &report(candidate), &index).unwrap();
+        assert!(
+            matches!(&outcomes.outcomes[0], IntakeOutcome::Admitted { .. }),
+            "{name}: {:?}",
+            outcomes.outcomes[0]
+        );
+    }
+
+    // The smallest sufficient unit per path; a local build/output treatment
+    // selects a short real operation, agent-choice effects require an agent,
+    // broad strategy selects full paired completion when necessary, and a
+    // repeated-use claim keeps the sequence and state.
+    assert_eq!(
+        EffectPath::LocalOperation.smallest_sufficient(),
+        ExperimentMethod::RealOperation
+    );
+    assert_eq!(
+        EffectPath::AgentChoice.smallest_sufficient(),
+        ExperimentMethod::AgentTask
+    );
+    assert_eq!(
+        EffectPath::TaskStrategy.smallest_sufficient(),
+        ExperimentMethod::PairedImplementations
+    );
+    assert_eq!(
+        EffectPath::RepeatedUse.smallest_sufficient(),
+        ExperimentMethod::Sequence
+    );
+}
+
+/// Insufficient selections are refused with the exact cause and never touch
+/// the board: the paths below cannot exist, so any board access would fail
+/// the intake call instead of producing the expected refusal.
+#[test]
+fn insufficient_experiment_selections_are_refused_without_board_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let rollout = write_rollout(temp.path(), "seed.jsonl", false);
+    let index = EvidenceIndex::new(vec![
+        EvidenceItem::read_rollout("rollout:cycle-1#seed", &rollout).unwrap(),
+    ])
+    .unwrap();
+    let unowned = (Path::new("no-such-bd"), Path::new("no-such-project"));
+
+    let refused = |selection: Option<ExperimentSelection>,
+                   deferral: Option<SelectionDeferral>|
+     -> IntakeOutcome {
+        let mut candidate = base_proposal("rollout:cycle-1#seed");
+        candidate.selection = selection;
+        candidate.deferral = deferral;
+        let outcomes = intake(unowned.0, unowned.1, &report(candidate), &index).unwrap();
+        outcomes.outcomes[0].clone()
+    };
+    let reasons = |outcome: IntakeOutcome| -> Vec<String> {
+        match outcome {
+            IntakeOutcome::Refused { reasons } => reasons,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    };
+
+    // The declaration itself is required before admission.
+    let missing = reasons(refused(None, None));
+    assert!(
+        missing
+            .iter()
+            .any(|reason| reason.contains("experiment-selection declaration is required")),
+        "{missing:?}"
+    );
+
+    // Agent-choice effects require a real agent: a fixed operation bypasses
+    // the choices and a retained replay cannot stand in for the unexercised
+    // agent.
+    let fixed = reasons(refused(
+        Some(selection(
+            ExperimentMethod::RealOperation,
+            EffectPath::AgentChoice,
+        )),
+        None,
+    ));
+    assert!(
+        fixed
+            .iter()
+            .any(|reason| reason.contains("bypasses the agent's choices")),
+        "{fixed:?}"
+    );
+    let replay = reasons(refused(
+        Some(selection(
+            ExperimentMethod::BoundedReplay,
+            EffectPath::AgentChoice,
+        )),
+        None,
+    ));
+    assert!(
+        replay
+            .iter()
+            .any(|reason| reason.contains("cannot stand in for an unexercised agent")),
+        "{replay:?}"
+    );
+
+    // A broad strategy claim needs complete paired implementations.
+    let short = reasons(refused(
+        Some(selection(
+            ExperimentMethod::AgentTask,
+            EffectPath::TaskStrategy,
+        )),
+        None,
+    ));
+    assert!(
+        short
+            .iter()
+            .any(|reason| reason.contains("complete paired task implementations")),
+        "{short:?}"
+    );
+
+    // A repeated-use claim preserves the sequence and state.
+    let single = reasons(refused(
+        Some(selection(
+            ExperimentMethod::RealOperation,
+            EffectPath::RepeatedUse,
+        )),
+        None,
+    ));
+    assert!(
+        single
+            .iter()
+            .any(|reason| reason.contains("sequence and state transitions")),
+        "{single:?}"
+    );
+    let misplaced = reasons(refused(
+        Some(selection(
+            ExperimentMethod::Sequence,
+            EffectPath::LocalOperation,
+        )),
+        None,
+    ));
+    assert!(
+        misplaced
+            .iter()
+            .any(|reason| reason.contains("only for a repeated-use or recovery claim")),
+        "{misplaced:?}"
+    );
+
+    // Fewer lines, files, skills or exposed names never establish benefit.
+    let size_only = reasons(refused(
+        Some(selection(
+            ExperimentMethod::RealOperation,
+            EffectPath::SizeOnly,
+        )),
+        None,
+    ));
+    assert!(
+        size_only.iter().any(|reason| reason
+            .contains("fewer lines, files, skills or exposed names never establish benefit")),
+        "{size_only:?}"
+    );
+}
+
+/// When the sufficient experiment is not worth its cost, the candidate is
+/// deferred with the missing fact and the reconsideration condition instead
+/// of running, adopting without support or repeating an inconclusive trial.
+#[test]
+fn a_costly_low_value_measurement_is_deferred_with_its_reconsideration_condition() {
+    let temp = tempfile::tempdir().unwrap();
+    let rollout = write_rollout(temp.path(), "seed.jsonl", false);
+    let index = EvidenceIndex::new(vec![
+        EvidenceItem::read_rollout("rollout:cycle-1#seed", &rollout).unwrap(),
+    ])
+    .unwrap();
+    let mut candidate = base_proposal("rollout:cycle-1#seed");
+    candidate.deferral = Some(SelectionDeferral {
+        missing_fact: "no owned accepted workload can exercise the sequence within the budget"
+            .to_owned(),
+        reconsideration: "reconsider when an owned accepted workload with that sequence exists"
+            .to_owned(),
+    });
+    let outcomes = intake(
+        Path::new("no-such-bd"),
+        Path::new("no-such-project"),
+        &report(candidate),
+        &index,
+    )
+    .unwrap();
+    let IntakeOutcome::Deferred { reason, next } = &outcomes.outcomes[0] else {
+        panic!("expected a deferral, got {:?}", outcomes.outcomes[0]);
+    };
+    assert!(
+        reason.contains("deferred as not worth its cost"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("no owned accepted workload can exercise the sequence"),
+        "{reason}"
+    );
+    assert_eq!(
+        next, "reconsider when an owned accepted workload with that sequence exists",
+        "{next}"
+    );
 }
